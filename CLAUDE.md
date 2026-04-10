@@ -109,6 +109,35 @@ if !status.success() {
 
 ---
 
+## Planning Workflow
+
+Use [chainlink](https://github.com/nanonite/chainlink) to define issues and milestones before starting an exomonad session. Chainlink provides the task decomposition that the TL uses to scaffold and spawn agents.
+
+```bash
+# 1. Initialize chainlink (database + rules only — no Claude Code hooks)
+chainlink init --no-hooks
+
+# 2. Define milestones (each milestone = one wave of parallel work)
+chainlink milestone create "Phase 1: Core types"
+chainlink milestone create "Phase 2: Handlers"
+
+# 3. Create issues under milestones
+chainlink issue create "Define proto types" --milestone "Phase 1: Core types"
+chainlink issue create "Implement GitHandler" --milestone "Phase 2: Handlers"
+
+# 4. Bootstrap and start exomonad
+exomonad new && exomonad init
+```
+
+Once the TL session is running, it reads chainlink state to determine wave structure:
+- Each **milestone** → one `fork_wave` (or `spawn_gemini`) call
+- Each **issue** → one leaf agent's scope
+- **Scaffold commit** → shared types/interfaces all issues in the wave build against
+
+See `.claude/rules/chainlink.md` for the full protocol, and `.exo/roles/devswarm/context/chainlink.md` for the TL's reference on reading chainlink state.
+
+---
+
 ## Getting Started
 
 ### Session Entry Point
