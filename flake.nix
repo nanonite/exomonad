@@ -92,8 +92,8 @@
               ++ rustPkgs
               ++ orchestrationPkgs
               ++ [ pkgs.sqlite pkgs.duckdb ]
-              ++ [ proto3SuitePkg ]  # For compile-proto-file (Haskell proto codegen)
-              ++ [ notebooklm-mcp ]; # NotebookLM MCP server (opt-in via config.toml)
+              ++ [ proto3SuitePkg ];  # For compile-proto-file (Haskell proto codegen)
+              # notebooklm-mcp excluded from devShell — opt-in via config.toml, available as packages.notebooklm-mcp
 
             shellHook = ''
               # nix mkShell overrides TMPDIR to /tmp/nix-shell.*, which breaks

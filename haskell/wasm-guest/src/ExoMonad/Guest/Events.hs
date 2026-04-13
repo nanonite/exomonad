@@ -45,7 +45,7 @@ data PRReviewEvent
 
 instance FromJSON PRReviewEvent where
   parseJSON = withObject "PRReviewEvent" $ \v -> do
-    kind <- v .: "kind"
+    kind <- asText <$> v .: "kind"
     case kind of
       "review_received" -> ReviewReceived <$> v .: "pr_number" <*> v .: "comments"
       "approved" -> ReviewApproved <$> v .: "pr_number"
@@ -112,6 +112,9 @@ data EventAction
   | NoAction
   deriving (Show, Generic)
 
+asText :: Text -> Text
+asText = id
+
 instance ToJSON EventAction where
   toJSON (InjectMessage msg) = object ["action" .= ("inject_message" :: Text), "message" .= msg]
   toJSON (NotifyParentAction msg pr) = object ["action" .= ("notify_parent" :: Text), "message" .= msg, "pr_number" .= pr]
@@ -119,7 +122,7 @@ instance ToJSON EventAction where
 
 instance FromJSON EventAction where
   parseJSON = withObject "EventAction" $ \v -> do
-    action <- v .: "action"
+    action <- asText <$> v .: "action"
     case action of
       "inject_message" -> InjectMessage <$> v .: "message"
       "notify_parent" -> NotifyParentAction <$> v .: "message" <*> v .: "pr_number"
@@ -154,7 +157,7 @@ data EventInput
 
 instance FromJSON EventInput where
   parseJSON = withObject "EventInput" $ \v -> do
-    eventType <- v .: "event_type"
+    eventType <- asText <$> v .: "event_type"
     payload <- v .: "payload"
     case eventType of
       "pr_review" -> PRReviewInput <$> Aeson.parseJSON payload
