@@ -323,6 +323,7 @@ impl AgentControlService {
         agent_name: &str,
         context_path: Option<&Path>,
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
+        openrouter_proxy_port: Option<u16>,
     ) -> serde_json::Value {
         let mut context_files = vec![serde_json::Value::String("GEMINI.md".to_string())];
         if let Some(path) = context_path {
@@ -393,6 +394,12 @@ impl AgentControlService {
                 servers.insert(k.clone(), v.clone());
             }
         }
+        if let Some(port) = openrouter_proxy_port {
+            settings["baseUrl"] = serde_json::Value::String(format!("http://localhost:{}", port));
+            settings["security"] = serde_json::json!({
+                "auth": { "selectedType": "GATEWAY" }
+            });
+        }
         settings
     }
 
@@ -459,7 +466,8 @@ impl AgentControlService {
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             fs::write(agent_config_dir.join(".birth_branch"), parent_bb.as_str()).await?;
             let context_path = self.resolve_role_context("worker");
-            let settings = Self::generate_gemini_worker_settings(&internal_name, context_path.as_deref(), &self.extra_mcp_servers);
+            let openrouter_proxy_port = self.openrouter_api_key.as_ref().map(|_| self.gemini_proxy_port);
+            let settings = Self::generate_gemini_worker_settings(&internal_name, context_path.as_deref(), &self.extra_mcp_servers, openrouter_proxy_port);
             fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
             info!(
                 path = %settings_path.display(),

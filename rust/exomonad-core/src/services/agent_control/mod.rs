@@ -500,6 +500,10 @@ pub struct AgentControlService {
     pub(crate) wasm_name: String,
     /// Pre-serialized extra MCP servers to include in spawned agent configs.
     pub(crate) extra_mcp_servers: HashMap<String, serde_json::Value>,
+    /// OpenRouter API key. When Some, all LLM calls route through OpenRouter.
+    pub(crate) openrouter_api_key: Option<String>,
+    /// Port for the local Gemini↔OpenAI translation proxy (default: 9876).
+    pub(crate) gemini_proxy_port: u16,
 }
 
 impl AgentControlService {
@@ -522,6 +526,8 @@ impl AgentControlService {
             yolo: false,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: HashMap::new(),
+            openrouter_api_key: None,
+            gemini_proxy_port: 9876,
         }
     }
 
@@ -565,6 +571,14 @@ impl AgentControlService {
     /// Set extra MCP servers to include in spawned agent configs.
     pub fn with_extra_mcp_servers(mut self, servers: HashMap<String, serde_json::Value>) -> Self {
         self.extra_mcp_servers = servers;
+        self
+    }
+
+    /// Enable OpenRouter routing: all Claude CLI agents get ANTHROPIC_BASE_URL injected,
+    /// and Gemini agents are pointed at the local translation proxy.
+    pub fn with_openrouter(mut self, api_key: String, gemini_proxy_port: u16) -> Self {
+        self.openrouter_api_key = Some(api_key);
+        self.gemini_proxy_port = gemini_proxy_port;
         self
     }
 
@@ -642,6 +656,8 @@ impl AgentControlService {
             yolo: false,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: HashMap::new(),
+            openrouter_api_key: None,
+            gemini_proxy_port: 9876,
         })
     }
 

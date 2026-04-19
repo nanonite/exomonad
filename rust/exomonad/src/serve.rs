@@ -871,6 +871,12 @@ Run `exomonad recompile` first to build it.",
     agent_control = agent_control.with_yolo(config.yolo);
     agent_control = agent_control
         .with_extra_mcp_servers(serialize_extra_mcp_servers(&config.extra_mcp_servers));
+    if config.openrouter.enabled {
+        if let Some(api_key) = config.openrouter.resolved_api_key() {
+            agent_control =
+                agent_control.with_openrouter(api_key, config.openrouter.gemini_proxy_port);
+        }
+    }
     let event_session_id = uuid::Uuid::new_v4().to_string();
     let agent_control = Arc::new(agent_control);
 

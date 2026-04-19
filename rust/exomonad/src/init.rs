@@ -427,6 +427,57 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
                 .status();
         }
     }
+
+    // OpenRouter: propagate LLM routing env vars to all windows in this session.
+    // Keys are set via tmux set-environment to keep secrets out of ps/scrollback.
+    if config.openrouter.enabled {
+        if let Some(ref api_key) = config.openrouter.resolved_api_key() {
+            let port = config.openrouter.gemini_proxy_port;
+            // Store key so `exomonad proxy` and child processes can read it via OPENROUTER_API_KEY
+            let _ = std::process::Command::new("tmux")
+                .args(["set-environment", "-t", &session, "OPENROUTER_API_KEY", api_key])
+                .status();
+            // Claude Code: use OpenRouter's Anthropic-compatible endpoint
+            for (var, val) in [
+                ("ANTHROPIC_BASE_URL", "https://openrouter.ai/api"),
+                ("ANTHROPIC_AUTH_TOKEN", api_key.as_str()),
+                ("ANTHROPIC_API_KEY", ""),
+            ] {
+                let _ = std::process::Command::new("tmux")
+                    .args(["set-environment", "-t", &session, var, val])
+                    .status();
+            }
+            // Gemini CLI: placeholder key (proxy handles real auth via OpenRouter)
+            let _ = std::process::Command::new("tmux")
+                .args(["set-environment", "-t", &session, "GEMINI_API_KEY", "gateway-placeholder"])
+                .status();
+            // Write Gemini proxy settings for the root TL window.
+            // Spawned child agents override GEMINI_CLI_SYSTEM_SETTINGS_PATH themselves.
+            let gemini_settings = serde_json::json!({
+                "baseUrl": format!("http://localhost:{}", port),
+                "security": { "auth": { "selectedType": "GATEWAY" } }
+            });
+            let settings_path = cwd.join(".exo/gemini-or-settings.json");
+            tokio::fs::write(
+                &settings_path,
+                serde_json::to_string_pretty(&gemini_settings)?,
+            )
+            .await?;
+            let _ = std::process::Command::new("tmux")
+                .args([
+                    "set-environment",
+                    "-t",
+                    &session,
+                    "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
+                    settings_path.to_string_lossy().as_ref(),
+                ])
+                .status();
+            info!(port = port, "OpenRouter routing enabled: session env vars injected");
+        } else {
+            warn!("openrouter.enabled = true but no API key found (set openrouter.api_key or OPENROUTER_API_KEY)");
+        }
+    }
+
     let serve_cmd = format!("EXOMONAD_TMUX_SESSION={} exomonad serve", &session);
     let send_status = std::process::Command::new("tmux")
         .args([
@@ -443,6 +494,15 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
             "Failed to start server in tmux (send-keys exited with {})",
             send_status
         );
+    }
+
+    // Start Gemini↔OpenAI translation proxy window before TL.
+    // The proxy reads OPENROUTER_API_KEY from the session environment (set above).
+    if config.openrouter.enabled && config.openrouter.resolved_api_key().is_some() {
+        let port = config.openrouter.gemini_proxy_port;
+        let proxy_cmd = format!("exomonad proxy --port {}", port);
+        ipc.new_window("Proxy", &cwd, &shell, &proxy_cmd).await?;
+        info!(port = port, "Started Gemini proxy window");
     }
 
     // Create "TL" window

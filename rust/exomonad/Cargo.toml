@@ -46,6 +46,7 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 futures-util = { workspace = true }
 nix = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

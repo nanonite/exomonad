@@ -11,6 +11,7 @@ mod init;
 mod logging;
 mod mcp_stdio;
 mod new;
+mod proxy;
 mod serve;
 mod uds_client;
 
@@ -116,6 +117,16 @@ enum Commands {
 
     /// Gracefully shut down the running server
     Shutdown,
+
+    /// Run the Gemini↔OpenAI translation proxy for OpenRouter routing.
+    ///
+    /// Translates Gemini native API requests to OpenRouter's OpenAI-compatible API.
+    /// Started automatically by `exomonad init` when openrouter.enabled = true.
+    Proxy {
+        /// Port to listen on (default: from config openrouter.gemini_proxy_port, usually 9876)
+        #[arg(long, default_value = "9876")]
+        port: u16,
+    },
 }
 
 // Main
@@ -312,6 +323,17 @@ async fn main() -> Result<()> {
                 Ok(resp) => println!("Server acknowledged shutdown: {}", resp),
                 Err(e) => eprintln!("Shutdown request failed: {}", e),
             }
+        }
+
+        Commands::Proxy { port } => {
+            let api_key = config
+                .openrouter
+                .resolved_api_key()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "No OpenRouter API key found. Set openrouter.api_key in .exo/config.toml \
+                     or export OPENROUTER_API_KEY."
+                ))?;
+            proxy::run(port, api_key).await?;
         }
     }
 

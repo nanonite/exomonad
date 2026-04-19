@@ -7,6 +7,47 @@ use tracing::{info, warn};
 /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
 pub async fn run(_name: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
+
+    // exomonad serve requires a git repo with at least one commit: it calls
+    // `git branch --show-current` at startup, and child agents use git worktrees
+    // which anchor to the commit graph. Check early so the error is actionable.
+    let git_dir = std::process::Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(&cwd)
+        .output();
+    match git_dir {
+        Err(_) | Ok(std::process::Output { status, .. }) if !status.success() => {
+            anyhow::bail!(
+                "Not a git repository. ExoMonad requires git for worktree-based agent isolation.\n\
+                 Run:\n\
+                 \n\
+                 \  git init\n\
+                 \  git add .\n\
+                 \  git commit -m \"init\"\n\
+                 \n\
+                 Then re-run `exomonad new`."
+            );
+        }
+        _ => {}
+    }
+    let has_commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_commit {
+        anyhow::bail!(
+            "Git repository has no commits. ExoMonad's worktree isolation requires at least one commit.\n\
+             Run:\n\
+             \n\
+             \  git add .\n\
+             \  git commit -m \"init\"\n\
+             \n\
+             Then re-run `exomonad new`."
+        );
+    }
+
     let config_path = cwd.join(".exo/config.toml");
 
     if config_path.exists() {

@@ -591,10 +591,16 @@ impl AgentEffects for AgentHandler {
         // Generate MCP settings for the agent using stdio transport
         let agent_name = &req.name;
         let context_path = self.service.resolve_role_context("worker");
+        let openrouter_proxy_port = self
+            .service
+            .openrouter_api_key
+            .as_ref()
+            .map(|_| self.service.gemini_proxy_port);
         let settings_json = AgentControlService::generate_gemini_worker_settings(
             agent_name,
             context_path.as_deref(),
             &self.service.extra_mcp_servers,
+            openrouter_proxy_port,
         );
 
         // Write settings to agent config dir

@@ -240,6 +240,14 @@ wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one rol
 model = "sonnet"             # optional — passed as --model flag to root TL agent
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
 
+# Route all LLM API calls through OpenRouter for centralized billing and observability.
+# When enabled, Claude agents use ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN, and Gemini
+# agents use a local Gemini↔OpenAI translation proxy (started automatically by init).
+[openrouter]
+enabled = true
+# api_key = "sk-or-..."   # or export OPENROUTER_API_KEY env var
+# gemini_proxy_port = 9876  # local proxy port (default: 9876)
+
 # Extra MCP servers (HTTP or stdio). Included in .mcp.json for all agents.
 [extra_mcp_servers.metacog]
 type = "http"

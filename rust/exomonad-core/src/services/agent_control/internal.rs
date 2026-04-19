@@ -116,6 +116,18 @@ impl AgentControlService {
             }
         }
 
+        // Route Claude CLI calls through OpenRouter when configured.
+        // ANTHROPIC_AUTH_TOKEN + empty ANTHROPIC_API_KEY tells Claude Code to use the token
+        // against ANTHROPIC_BASE_URL (OpenRouter's Anthropic-compatible endpoint).
+        if let Some(ref api_key) = self.openrouter_api_key {
+            env_vars.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://openrouter.ai/api".to_string(),
+            );
+            env_vars.insert("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.clone());
+            env_vars.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        }
+
         env_vars
     }
 
@@ -475,12 +487,14 @@ impl AgentControlService {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
 
+        let openrouter_proxy_port = self.openrouter_api_key.as_ref().map(|_| self.gemini_proxy_port);
         let mcp_content = Self::generate_mcp_config(
             agent_name,
             agent_type,
             role,
             &self.wasm_name,
             &self.extra_mcp_servers,
+            openrouter_proxy_port,
         );
 
         match agent_type {
@@ -613,6 +627,7 @@ impl AgentControlService {
         role: &str,
         wasm_name: &str,
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
+        openrouter_proxy_port: Option<u16>,
     ) -> String {
         match agent_type {
             AgentType::Claude => {
@@ -695,6 +710,13 @@ impl AgentControlService {
                     for (k, v) in extra_mcp_servers {
                         servers.insert(k.clone(), v.clone());
                     }
+                }
+                if let Some(port) = openrouter_proxy_port {
+                    config["baseUrl"] =
+                        serde_json::Value::String(format!("http://localhost:{}", port));
+                    config["security"] = serde_json::json!({
+                        "auth": { "selectedType": "GATEWAY" }
+                    });
                 }
                 serde_json::to_string_pretty(&config).unwrap()
             }
@@ -822,6 +844,7 @@ mod tests {
             "tl",
             "devswarm",
             &HashMap::new(),
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
         assert_eq!(parsed["mcpServers"]["exomonad"]["type"], "stdio");
@@ -841,6 +864,7 @@ mod tests {
             "dev",
             "devswarm",
             &HashMap::new(),
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
         assert_eq!(parsed["mcpServers"]["exomonad"]["command"], "exomonad");
