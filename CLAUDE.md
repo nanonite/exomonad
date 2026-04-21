@@ -216,6 +216,10 @@ poll_interval = 60           # optional — GitHub poll cycle in seconds (defaul
 type = "http"
 url = "http://localhost:8080"
 
+# Opencode agent configuration.
+[opencode]
+use_embedded_key = true  # true = use embedded key in opencode binary, false = use OPENROUTER_API_KEY
+
 [extra_mcp_servers.notebooklm]
 type = "stdio"
 command = "notebooklm-mcp"
@@ -280,7 +284,7 @@ Spawn heterogeneous agent teams as a recursive tree:
 - **`spawn_gemini`** — Spawn Gemini agent in own worktree+branch. Files PR when done. Structured spec fields (steps, verify, boundary, context, read_first).
 - **`spawn_worker`** — Spawn ephemeral Gemini worker in tmux pane. No branch, no PR. Just name + task.
 
-**Agent Types:** `Claude` (🤖), `Gemini` (💎), `Shoal` (🌊). Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
+**Agent Types:** `Claude` (🤖), `Gemini` (💎), `OpenCode` (💻), `Shoal` (🌊). Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
 
 **Multi-WASM:** The server loads multiple WASM modules from `.exo/wasm/`. Convention: if `wasm-guest-{role}.wasm` exists, it's used for that role; otherwise falls back to `wasm-guest-{wasm_name}.wasm` (default). Drop a WASM file, it's available.
 
@@ -447,7 +451,8 @@ All tools implemented in Haskell WASM (`haskell/wasm-guest/src/ExoMonad/Guest/To
 | Tool | Role | Description |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree. Context inherited by default (`fork_session` defaults to `true`). |
-| `spawn_gemini` | root, tl | Spawn Gemini agent in own worktree+branch. Structured spec fields: steps, verify, boundary, context, read_first. |
+| `spawn_gemini` | root, tl | Spawn Gemini agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
+| `spawn_opencode` | root, tl | Spawn OpenCode agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
 | `spawn_worker` | root, tl | Spawn ephemeral Gemini worker in tmux pane (no branch, no PR). Just name + task. |
 | `file_pr` | tl, dev | Create/update PR (auto-detects base branch from naming) |
 | `merge_pr` | root, tl | Merge child PR (gh merge + git fetch) |

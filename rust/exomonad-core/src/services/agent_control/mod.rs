@@ -149,6 +149,9 @@ pub enum AgentType {
     /// Custom binary agent (e.g., shoal-agent).
     Shoal,
 
+    /// OpenCode CLI (spawns with `opencode run "..."`).
+    OpenCode,
+
     /// Plain long-running process (no MCP, no agent identity, no worktree).
     /// Used for companion processes like mock servers, log tailers, etc.
     Process,
@@ -183,6 +186,13 @@ pub(crate) const SHOAL_META: AgentMetadata = AgentMetadata {
     emoji: "\u{1F30A}", // 🌊
 };
 
+pub(crate) const OPENCODE_META: AgentMetadata = AgentMetadata {
+    command: "opencode",
+    prompt_flag: "run",
+    suffix: "opencode",
+    emoji: "\u{1F4BB}", // 💻
+};
+
 pub(crate) const PROCESS_META: AgentMetadata = AgentMetadata {
     command: "",
     prompt_flag: "",
@@ -196,6 +206,7 @@ impl AgentType {
             AgentType::Claude => &CLAUDE_META,
             AgentType::Gemini => &GEMINI_META,
             AgentType::Shoal => &SHOAL_META,
+            AgentType::OpenCode => &OPENCODE_META,
             AgentType::Process => &PROCESS_META,
         }
     }
@@ -234,6 +245,8 @@ impl AgentType {
             AgentType::Claude
         } else if dir_name.ends_with("-shoal") {
             AgentType::Shoal
+        } else if dir_name.ends_with("-opencode") {
+            AgentType::OpenCode
         } else if dir_name.ends_with("-process") {
             AgentType::Process
         } else {
@@ -848,6 +861,7 @@ mod tests {
             "claude" => Some(super::AgentType::Claude),
             "gemini" => Some(super::AgentType::Gemini),
             "shoal" => Some(super::AgentType::Shoal),
+            "opencode" => Some(super::AgentType::OpenCode),
             "process" => Some(super::AgentType::Process),
             _ => None,
         };

@@ -156,6 +156,8 @@ impl<
             );
             env_vars.insert("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.clone());
             env_vars.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+            // OpenCode uses OPENROUTER_API_KEY directly
+            env_vars.insert("OPENROUTER_API_KEY".to_string(), api_key.clone());
         }
 
         env_vars
@@ -234,6 +236,13 @@ impl<
             AgentType::Gemini => {
                 if yolo {
                     " --yolo".to_string()
+                } else {
+                    String::new()
+                }
+            }
+            AgentType::OpenCode => {
+                if yolo {
+                    " --dangerously-skip-permissions".to_string()
                 } else {
                     String::new()
                 }
@@ -546,6 +555,10 @@ impl<
                 fs::write(exo_dir.join("mcp.json"), mcp_content).await?;
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote .exo/mcp.json for Shoal agent");
             }
+            AgentType::OpenCode => {
+                fs::write(agent_dir.join("opencode.json"), mcp_content).await?;
+                info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json for OpenCode agent");
+            }
         }
         Ok(())
     }
@@ -748,6 +761,22 @@ impl<
                 "args": ["mcp-stdio", "--role", role, "--name", name]
             }))
             .unwrap(),
+            AgentType::OpenCode => {
+                let mut config = serde_json::json!({
+                    "mcp": {
+                        "exomonad": {
+                            "type": "local",
+                            "command": ["exomonad", "mcp-stdio", "--role", role, "--name", name]
+                        }
+                    }
+                });
+                if let Some(mcp) = config["mcp"].as_object_mut() {
+                    for (k, v) in extra_mcp_servers {
+                        mcp.insert(k.clone(), v.clone());
+                    }
+                }
+                serde_json::to_string_pretty(&config).unwrap()
+            }
             AgentType::Process => String::new(),
         }
     }

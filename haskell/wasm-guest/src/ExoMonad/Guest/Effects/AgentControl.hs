@@ -20,6 +20,7 @@ module ExoMonad.Guest.Effects.AgentControl
     spawnLeafSubtree,
     spawnWorker,
     spawnAcp,
+    spawnOpencode,
 
     -- * Interpreters
     runAgentControlSuspend,
@@ -33,6 +34,7 @@ module ExoMonad.Guest.Effects.AgentControl
     SpawnLeafSubtreeConfig (..),
     SpawnWorkerConfig (..),
     SpawnAcpConfig (..),
+    SpawnOpencodeConfig (..),
   )
 where
 
@@ -57,19 +59,21 @@ import Proto3.Suite.Types (Enumerated (..))
 -- ============================================================================
 
 -- | Agent type for spawned agents.
-data AgentType = Claude | Gemini | Shoal
+data AgentType = Claude | Gemini | Shoal | OpenCode
   deriving (Show, Eq, Generic)
 
 instance ToJSON AgentType where
   toJSON Claude = "claude"
   toJSON Gemini = "gemini"
   toJSON Shoal = "shoal"
+  toJSON OpenCode = "opencode"
 
 instance FromJSON AgentType where
   parseJSON = withText "AgentType" $ \case
     "claude" -> pure Claude
     "gemini" -> pure Gemini
     "shoal" -> pure Shoal
+    "opencode" -> pure OpenCode
     other -> fail $ "Invalid agent type: " <> T.unpack other
 
 -- | Result of spawning an agent.
@@ -160,12 +164,23 @@ data SpawnAcpConfig = SpawnAcpConfig
   }
   deriving (Show, Eq, Generic)
 
+-- | Configuration for spawning an OpenCode agent.
+data SpawnOpencodeConfig = SpawnOpencodeConfig
+  { socTask :: Text,
+    socBranchName :: Text,
+    socRole :: Maybe Text,
+    socStandaloneRepo :: Bool,
+    socAllowedDirs :: [Text]
+  }
+  deriving (Show, Eq, Generic)
+
 -- | Agent control effect for spawning agents.
 data AgentControl a where
   SpawnSubtreeC :: SpawnSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnLeafSubtreeC :: SpawnLeafSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnWorkerC :: SpawnWorkerConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnAcpC :: SpawnAcpConfig -> AgentControl (Either EffectError SpawnResult)
+  SpawnOpencodeC :: SpawnOpencodeConfig -> AgentControl (Either EffectError SpawnResult)
 
 -- Smart constructors (manually written - makeSem doesn't work with WASM cross-compilation)
 spawnSubtree :: (Member AgentControl r) => SpawnSubtreeConfig -> Eff r (Either EffectError SpawnResult)
@@ -179,6 +194,9 @@ spawnWorker cfg = send (SpawnWorkerC cfg)
 
 spawnAcp :: (Member AgentControl r) => SpawnAcpConfig -> Eff r (Either EffectError SpawnResult)
 spawnAcp cfg = send (SpawnAcpC cfg)
+
+spawnOpencode :: (Member AgentControl r) => SpawnOpencodeConfig -> Eff r (Either EffectError SpawnResult)
+spawnOpencode cfg = send (SpawnOpencodeC cfg)
 
 -- ============================================================================
 -- Interpreter (uses yield_effect via Effect typeclass)
@@ -260,6 +278,21 @@ runAgentControlSuspend = interpret $ \case
       Right resp -> case PA.spawnAcpResponseAgent resp of
         Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnAcp succeeded but no agent info returned"))))
         Just info -> Right (protoAgentInfoToSpawnResult info)
+  SpawnOpencodeC cfg -> do
+    let req =
+          PA.SpawnOpencodeRequest
+            { PA.spawnOpencodeRequestTask = fromText (socTask cfg),
+              PA.spawnOpencodeRequestBranchName = fromText (socBranchName cfg),
+              PA.spawnOpencodeRequestRole = fromText (fromMaybe "" (socRole cfg)),
+              PA.spawnOpencodeRequestStandaloneRepo = socStandaloneRepo cfg,
+              PA.spawnOpencodeRequestAllowedDirs = V.fromList (map fromText (socAllowedDirs cfg))
+            }
+    result <- suspendEffect @Agent.AgentSpawnOpencode req
+    pure $ case result of
+      Left err -> Left err
+      Right resp -> case PA.spawnOpencodeResponseAgent resp of
+        Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnOpencode succeeded but no agent info returned"))))
+        Just info -> Right (protoAgentInfoToSpawnResult info)
 
 -- ============================================================================
 -- Conversion helpers
@@ -269,6 +302,7 @@ toProtoAgentType :: AgentType -> PA.AgentType
 toProtoAgentType Claude = PA.AgentTypeAGENT_TYPE_CLAUDE
 toProtoAgentType Gemini = PA.AgentTypeAGENT_TYPE_GEMINI
 toProtoAgentType Shoal = PA.AgentTypeAGENT_TYPE_SHOAL
+toProtoAgentType OpenCode = PA.AgentTypeAGENT_TYPE_OPENCODE
 
 permissionsToProto :: ClaudePermissions -> PA.Permissions
 permissionsToProto perms =
@@ -288,5 +322,6 @@ protoAgentInfoToSpawnResult info =
         Enumerated (Right PA.AgentTypeAGENT_TYPE_CLAUDE) -> "claude"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_GEMINI) -> "gemini"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_SHOAL) -> "shoal"
+        Enumerated (Right PA.AgentTypeAGENT_TYPE_OPENCODE) -> "opencode"
         _ -> "unknown"
     }

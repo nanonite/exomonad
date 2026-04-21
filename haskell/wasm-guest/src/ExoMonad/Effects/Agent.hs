@@ -13,6 +13,7 @@ module ExoMonad.Effects.Agent
     AgentSpawnWorker,
     AgentSpawnSubtree,
     AgentSpawnLeafSubtree,
+    AgentSpawnOpencode,
     AgentSpawnAcp,
     AgentCleanup,
     AgentCleanupBatch,
@@ -74,6 +75,13 @@ instance Effect AgentSpawnLeafSubtree where
   type Input AgentSpawnLeafSubtree = SpawnLeafSubtreeRequest
   type Output AgentSpawnLeafSubtree = SpawnLeafSubtreeResponse
   effectId = "agent.spawn_leaf_subtree"
+
+data AgentSpawnOpencode
+
+instance Effect AgentSpawnOpencode where
+  type Input AgentSpawnOpencode = SpawnOpencodeRequest
+  type Output AgentSpawnOpencode = SpawnOpencodeResponse
+  effectId = "agent.spawn_opencode"
 
 data AgentSpawnAcp
 

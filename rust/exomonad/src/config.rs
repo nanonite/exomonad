@@ -67,6 +67,16 @@ impl OpenRouterConfig {
     }
 }
 
+/// Opencode agent configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OpencodeConfig {
+    /// When true, use the embedded API key in the opencode binary.
+    /// When false, redirect opencode to use the OpenRouter API key
+    /// (from openrouter config or OPENROUTER_API_KEY env var).
+    #[serde(default)]
+    pub use_embedded_key: bool,
+}
+
 /// Raw configuration from file (supports both config.toml and config.local.toml fields).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RawConfig {
@@ -132,6 +142,10 @@ pub struct RawConfig {
     /// OpenRouter routing configuration.
     #[serde(default)]
     pub openrouter: Option<OpenRouterConfig>,
+
+    /// Opencode agent configuration.
+    #[serde(default)]
+    pub opencode: Option<OpencodeConfig>,
 }
 
 /// Final resolved configuration.
@@ -174,6 +188,9 @@ pub struct Config {
 
     /// OpenRouter routing configuration.
     pub openrouter: OpenRouterConfig,
+
+    /// Opencode agent configuration.
+    pub opencode: OpencodeConfig,
 }
 
 impl Config {
@@ -314,6 +331,12 @@ impl Config {
             .or(global_raw.openrouter)
             .unwrap_or_default();
 
+        // Resolve opencode: local > global > default
+        let opencode = local_raw
+            .opencode
+            .or(global_raw.opencode)
+            .unwrap_or_default();
+
         Ok(Self {
             project_dir,
             role,
@@ -333,6 +356,7 @@ impl Config {
             model,
             poll_interval,
             openrouter,
+            opencode,
         })
     }
 
@@ -369,6 +393,7 @@ impl Default for Config {
             model: None,
             poll_interval: None,
             openrouter: OpenRouterConfig::default(),
+            opencode: OpencodeConfig::default(),
         }
     }
 }

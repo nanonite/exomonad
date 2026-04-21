@@ -487,6 +487,14 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
             }
             (AgentType::Shoal, Some(prompt)) => format!("shoal-agent --exo root --prompt '{}'", prompt.replace('\'', "'\\''")),
             (AgentType::Shoal, None) => "shoal-agent --exo root".to_string(),
+            (AgentType::OpenCode, Some(prompt)) => {
+                let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
+                format!("opencode run{} '{}'", yolo, prompt.replace('\'', "'\\''"))
+            }
+            (AgentType::OpenCode, None) => {
+                let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
+                format!("opencode run{}", yolo)
+            }
             (AgentType::Process, _) => unreachable!("Process is for companions only, not root agent"),
         }
     };
@@ -730,6 +738,20 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
                     )?;
                 }
                 AgentType::Shoal => {}
+                AgentType::OpenCode => {
+                    let opencode_config = serde_json::json!({
+                        "mcp": {
+                            "exomonad": {
+                                "type": "local",
+                                "command": ["exomonad", "mcp-stdio", "--role", &companion.role, "--name", &companion.name]
+                            }
+                        }
+                    });
+                    std::fs::write(
+                        agent_dir.join("opencode.json"),
+                        serde_json::to_string_pretty(&opencode_config)?,
+                    )?;
+                }
                 AgentType::Claude | AgentType::Process => unreachable!(),
             }
 
@@ -785,6 +807,14 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
                     None => String::new(),
                 };
                 format!("{env_prefix}{}{}", companion.command, task_part)
+            }
+            AgentType::OpenCode => {
+                let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
+                let task_part = match &escaped_task {
+                    Some(t) => format!(" '{}'", t),
+                    None => String::new(),
+                };
+                format!("{env_prefix}opencode run{}{}", yolo, task_part)
             }
             AgentType::Process => unreachable!("Process companions handled above"),
         };

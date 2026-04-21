@@ -87,6 +87,7 @@ impl<
                 AgentType::Claude => crate::domain::Role::tl(),
                 AgentType::Gemini => crate::domain::Role::dev(),
                 AgentType::Shoal => crate::domain::Role::shoal(),
+                AgentType::OpenCode => crate::domain::Role::dev(),
                 AgentType::Process => unreachable!("Process agents are not spawned via effects"),
             };
             self.write_agent_mcp_config(
@@ -672,7 +673,7 @@ impl<
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy Gemini role context (non-fatal)"),
                         }
                     }
-                    AgentType::Shoal | AgentType::Process => {}
+                    AgentType::Shoal | AgentType::OpenCode | AgentType::Process => {}
                 }
             }
 
@@ -932,6 +933,133 @@ impl<
         })??;
 
         info!(branch_name = %options.branch_name, "spawn_leaf_subtree completed successfully");
+        Ok(result)
+    }
+
+    /// Spawn an OpenCode agent in a new git worktree.
+    #[instrument(skip_all, fields(slug = %options.branch_name, agent_type = "opencode"))]
+    pub async fn spawn_opencode(
+        &self,
+        options: &SpawnLeafOptions,
+        caller_bb: &BirthBranch,
+    ) -> Result<SpawnResult> {
+        info!(branch_name = %options.branch_name, timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_opencode");
+
+        let result = timeout(SPAWN_TIMEOUT, async {
+            self.resolve_tmux_session()?;
+
+            let effective_birth = self.effective_birth_branch(Some(caller_bb));
+            let effective_project_dir = self.project_dir();
+
+            let current_branch = BranchName::from(effective_birth.as_parent_branch());
+
+            let agent_type = AgentType::OpenCode;
+            let identity = AgentIdentity::new(slugify(&options.branch_name), agent_type);
+            let agent_name = identity.internal_name();
+            let display_name = identity.display_name();
+
+            let tab_alive = self.is_tmux_window_alive(&display_name).await;
+            if tab_alive {
+                info!(slug = %identity.slug(), "OpenCode subtree already running, returning existing");
+                return Ok(SpawnResult {
+                    agent_dir: self.worktree_base.join(agent_name.as_str()),
+                    agent_name,
+                    issue_title: options.branch_name.clone(),
+                    agent_type,
+                });
+            }
+
+            ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
+
+            let child_birth = effective_birth.child(agent_name.as_str());
+            let branch_name = BranchName::from(child_birth.to_string().as_str());
+
+            let worktree_path = self.worktree_base.join(agent_name.as_str());
+
+            if options.standalone_repo {
+                self.init_standalone_repo(&worktree_path).await?;
+                if !options.allowed_dirs.is_empty() {
+                    self.copy_allowed_dirs(&worktree_path, &options.allowed_dirs).await?;
+                }
+            } else {
+                self.create_worktree_checked(&worktree_path, &branch_name, &current_branch).await?;
+            }
+
+            self.create_socket_symlink(&worktree_path).await;
+
+            let default_dev = crate::domain::Role::dev();
+            let role = options.role.as_ref().unwrap_or(&default_dev);
+            let env_vars = self.common_spawn_env(&agent_name, &branch_name, role);
+            self.write_agent_mcp_config(effective_project_dir, &worktree_path, agent_type, role)
+                .await?;
+
+            if let Some(context_src) = self.resolve_role_context(role) {
+                let dest_dir = worktree_path.join(format!(".exo/roles/{}/context", self.wasm_name));
+                let _ = fs::create_dir_all(&dest_dir).await;
+                let dest = dest_dir.join(format!("{}.md", role));
+                let _ = fs::remove_file(&dest).await;
+                match fs::copy(&context_src, &dest).await {
+                    Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into OpenCode worktree"),
+                    Err(e) => warn!(role = %role, error = %e, "Failed to copy role context (non-fatal)"),
+                }
+            }
+
+            let mut task = options.task.clone();
+            if options.standalone_repo && !options.allowed_dirs.is_empty() {
+                task.push_str("\n\nShared technical dependencies are available as read-only reference in `.exo/context/`. Do not modify files in this directory.");
+            }
+
+            let agent_config_dir = self.project_dir().join(".exo").join("agents").join(agent_name.as_str());
+            let window_id = match self.new_tmux_window(
+                &display_name,
+                &worktree_path,
+                agent_type,
+                Some(&task),
+                env_vars,
+            )
+            .await {
+                Ok(wid) => wid,
+                Err(e) => {
+                    warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
+                    let _ = fs::remove_dir_all(&agent_config_dir).await;
+                    if worktree_path.exists() {
+                        let git_wt = self.git_wt().clone();
+                        let path = worktree_path.clone();
+                        let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
+                    }
+                    return Err(e);
+                }
+            };
+
+            let routing = RoutingInfo::window(window_id);
+            let identity_record = AgentIdentityRecord {
+                agent_name: agent_name.clone(),
+                slug: Slug::from(identity.slug()),
+                agent_type,
+                birth_branch: child_birth,
+                parent_branch: effective_birth,
+                working_dir: worktree_path.clone(),
+                display_name: display_name.clone(),
+                topology: Topology::WorktreePerAgent,
+            };
+            self.finalize_spawn(&agent_name, routing, Some(identity_record))
+                .await?;
+
+            Ok::<SpawnResult, anyhow::Error>(SpawnResult {
+                agent_dir: worktree_path.clone(),
+                agent_name,
+                issue_title: options.branch_name.clone(),
+                agent_type,
+            })
+        })
+        .await
+        .map_err(|_| {
+            let msg = format!("spawn_opencode timed out after {}s", SPAWN_TIMEOUT.as_secs());
+            warn!(branch_name = %options.branch_name, error = %msg, "spawn_opencode timed out");
+            anyhow::Error::new(TimeoutError { message: msg })
+        })??;
+
+        info!(branch_name = %options.branch_name, "spawn_opencode completed successfully");
         Ok(result)
     }
 }

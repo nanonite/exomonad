@@ -243,8 +243,9 @@ fn convert_agent_type(t: AgentType) -> EffectResult<ServiceAgentType> {
         AgentType::Claude => Ok(ServiceAgentType::Claude),
         AgentType::Gemini => Ok(ServiceAgentType::Gemini),
         AgentType::Shoal => Ok(ServiceAgentType::Shoal),
+        AgentType::Opencode => Ok(ServiceAgentType::OpenCode),
         AgentType::Unspecified => Err(EffectError::invalid_input(
-            "agent_type is required (must be 'claude', 'gemini', or 'shoal', got UNSPECIFIED)",
+            "agent_type is required (must be 'claude', 'gemini', 'shoal', or 'opencode', got UNSPECIFIED)",
         )),
     }
 }
@@ -578,6 +579,61 @@ impl<
         })
     }
 
+    async fn spawn_opencode(
+        &self,
+        req: SpawnOpencodeRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SpawnOpencodeResponse> {
+        let options = SpawnLeafOptions {
+            task: req.task.clone(),
+            branch_name: req.branch_name.clone(),
+            role: non_empty(req.role.clone()).map(crate::domain::Role::new),
+            agent_type: ServiceAgentType::OpenCode,
+            claude_flags: claude_spawn_flags(
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            standalone_repo: req.standalone_repo,
+            allowed_dirs: req.allowed_dirs,
+        };
+
+        let result = self
+            .service
+            .spawn_opencode(&options, &ctx.birth_branch)
+            .await
+            .effect_err_preserve("agent")?;
+
+        let agent_info = leaf_subtree_result_to_proto(&req.branch_name, &result);
+
+        tracing::info!(
+            otel.name = "agent.spawned",
+            child_agent = %agent_info.id,
+            agent_type = %AgentType::try_from(agent_info.agent_type).map(|t| format!("{:?}", t)).unwrap_or_else(|_| "unknown".to_string()),
+            branch = %agent_info.branch_name,
+            spawn_type = "opencode",
+            "[event] agent.spawned"
+        );
+        if let Some(log) = self.ctx.event_log() {
+            let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &serde_json::json!({
+                "child_agent": agent_info.id, "agent_type": "opencode", "spawn_type": "opencode",
+                "branch": agent_info.branch_name,
+            }));
+        }
+
+        let opencode_identity = crate::services::agent_control::AgentIdentity::new(
+            crate::services::agent_control::slugify(&req.branch_name),
+            crate::services::agent_control::AgentType::OpenCode,
+        );
+        self.register_synthetic_member(&opencode_identity.internal_name(), "opencode-leaf", ctx)
+            .await;
+        self.register_child_supervisor(&req.branch_name, ctx).await;
+
+        Ok(SpawnOpencodeResponse {
+            agent: Some(agent_info),
+        })
+    }
+
     async fn spawn_acp(
         &self,
         req: SpawnAcpRequest,
@@ -769,7 +825,7 @@ impl<
         // is a band-aid — the real fix is making agent_name consistent between MCP config
         // and routing.json (either always include the suffix, or never).
         let candidates = std::iter::once(agent_key.clone()).chain(
-            ["gemini", "claude", "shoal"]
+            ["gemini", "claude", "shoal", "opencode"]
                 .iter()
                 .map(|suffix| format!("{}-{}", agent_key, suffix)),
         );
@@ -989,6 +1045,7 @@ fn service_agent_type_to_proto(at: ServiceAgentType) -> i32 {
         ServiceAgentType::Claude => AgentType::Claude as i32,
         ServiceAgentType::Gemini => AgentType::Gemini as i32,
         ServiceAgentType::Shoal => AgentType::Shoal as i32,
+        ServiceAgentType::OpenCode => AgentType::Opencode as i32,
         ServiceAgentType::Process => AgentType::Unspecified as i32,
     }
 }
@@ -998,6 +1055,7 @@ fn service_info_to_proto(info: &AgentInfo) -> exomonad_proto::effects::agent::Ag
         Some(ServiceAgentType::Claude) => AgentType::Claude as i32,
         Some(ServiceAgentType::Gemini) => AgentType::Gemini as i32,
         Some(ServiceAgentType::Shoal) => AgentType::Shoal as i32,
+        Some(ServiceAgentType::OpenCode) => AgentType::Opencode as i32,
         Some(ServiceAgentType::Process) => AgentType::Unspecified as i32,
         None => AgentType::Unspecified as i32,
     };
