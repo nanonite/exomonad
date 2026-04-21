@@ -7,12 +7,12 @@ default:
 # Format all code (Haskell + Rust)
 fmt:
     nix develop --command bash -c 'cd haskell && ormolu --mode inplace --ghc-opt -XImportQualifiedPost $(find . -name "*.hs" -not -path "./vendor/*")'
-    cargo fmt --all
+    nix develop --command cargo fmt --all
 
 # Check formatting (fails if unformatted — run `just fmt` to fix)
 check-fmt:
     nix develop --command bash -c 'cd haskell && ormolu --mode check --ghc-opt -XImportQualifiedPost $(find . -name "*.hs" -not -path "./vendor/*")'
-    cargo fmt --all --check
+    nix develop --command cargo fmt --all --check
 
 # Lint Haskell code
 lint:
@@ -20,16 +20,16 @@ lint:
 
 # Run fast tests only (Rust unit tests)
 test-fast:
-    cargo test --workspace --lib
+    nix develop --command cargo test --workspace --lib
 
 # Run tests: Rust unit tests, cargo check, WASM build, proto freshness
 test:
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/4] Rust unit tests..."
-    cargo test --workspace --lib
+    nix develop --command cargo test --workspace --lib
     echo ">>> [2/4] Rust check (all targets)..."
-    cargo check --workspace --all-targets
+    nix develop --command cargo check --workspace --all-targets
     echo ">>> [3/4] WASM build..."
     just wasm-all
     echo ">>> [4/4] Proto freshness check..."
@@ -141,7 +141,7 @@ proto-gen-haskell:
 
 # Regenerate Rust proto types (part of normal cargo build)
 proto-gen-rust:
-    cargo build -p exomonad-proto
+    nix develop --command cargo build -p exomonad-proto
 
 # Full proto regeneration (includes formatting so proto-check passes)
 proto-gen: proto-gen-haskell proto-gen-rust
@@ -153,7 +153,7 @@ proto-test:
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> Running Rust proto wire format tests..."
-    cargo test -p exomonad-proto
+    nix develop --command cargo test -p exomonad-proto
     echo ">>> Running Haskell proto tests..."
     nix develop --command cabal test exomonad-proto || echo "No tests defined yet"
     echo ">>> Running proto wire format compatibility test..."
@@ -178,7 +178,7 @@ e2e-hook-rewrite:
 
 # Run live E2E Teams messaging test (requires active CC team "teams-e2e")
 live-teams-e2e:
-    cargo test -p claude-teams-bridge --test integration -- live_teams_e2e --ignored --nocapture
+    nix develop --command cargo test -p claude-teams-bridge --test integration -- live_teams_e2e --ignored --nocapture
 
 # Validate Gemini settings against schema
 validate-settings:
