@@ -146,6 +146,18 @@ impl<
             }
         }
 
+        // Route Claude CLI calls through OpenRouter when configured.
+        // ANTHROPIC_AUTH_TOKEN + empty ANTHROPIC_API_KEY tells Claude Code to use the token
+        // against ANTHROPIC_BASE_URL (OpenRouter's Anthropic-compatible endpoint).
+        if let Some(ref api_key) = self.openrouter_api_key {
+            env_vars.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://openrouter.ai/api".to_string(),
+            );
+            env_vars.insert("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.clone());
+            env_vars.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        }
+
         env_vars
     }
 

@@ -12,10 +12,16 @@ use tracing::warn;
 ///
 /// Handles chat completions with support for tools, system prompts, and
 /// automatic retry (exponential backoff) for 529 Overloaded errors.
+///
+/// Supports two auth modes:
+/// - `x-api-key` header (direct Anthropic)
+/// - `Authorization: Bearer` header (OpenRouter)
 pub struct AnthropicService {
     client: Client,
     api_key: String,
     base_url: Url,
+    /// When true, use `Authorization: Bearer` and prefix model names with `anthropic/`.
+    use_bearer_auth: bool,
 }
 
 impl AnthropicService {
@@ -31,6 +37,7 @@ impl AnthropicService {
             client: Client::new(),
             api_key,
             base_url,
+            use_bearer_auth: false,
         })
     }
 
@@ -42,7 +49,25 @@ impl AnthropicService {
             client: Client::new(),
             api_key,
             base_url,
+            use_bearer_auth: false,
         }
+    }
+
+    /// Create an Anthropic-compatible service routed through OpenRouter.
+    ///
+    /// Uses `Authorization: Bearer` auth and prefixes model names with `anthropic/`.
+    pub fn with_openrouter(api_key: String) -> Result<Self, ServiceError> {
+        let base_url =
+            Url::parse("https://openrouter.ai/api").map_err(|e| ServiceError::Api {
+                code: 500,
+                message: format!("Invalid hardcoded URL: {}", e),
+            })?;
+        Ok(Self {
+            client: Client::new(),
+            api_key,
+            base_url,
+            use_bearer_auth: true,
+        })
     }
 
     /// Create a new Anthropic service from environment variables.
@@ -56,6 +81,17 @@ impl AnthropicService {
         let base_url = Url::parse(&base_url_str)?;
 
         Ok(Self::with_base_url(api_key, base_url))
+    }
+
+    /// Qualify a model name for the current endpoint.
+    ///
+    /// OpenRouter requires `anthropic/claude-*` format. Direct Anthropic uses bare names.
+    fn qualify_model(&self, model: &str) -> String {
+        if self.use_bearer_auth && !model.contains('/') {
+            format!("anthropic/{}", model)
+        } else {
+            model.to_string()
+        }
     }
 }
 
@@ -103,7 +139,7 @@ impl ExternalService for AnthropicService {
         };
 
         let payload = AnthropicRequestPayload {
-            model,
+            model: self.qualify_model(&model),
             messages,
             max_tokens,
             tools,
@@ -133,15 +169,18 @@ impl ExternalService for AnthropicService {
         );
 
         let result = crate::services::resilience::retry(&policy, || async {
-            let response = self
+            let mut request = self
                 .client
                 .post(url.clone())
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&payload)
-                .send()
-                .await
+                .header("content-type", "application/json");
+            request = if self.use_bearer_auth {
+                request.header("authorization", format!("Bearer {}", self.api_key))
+            } else {
+                request
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01")
+            };
+            let response = request.json(&payload).send().await
                 .map_err(ServiceError::from)?;
 
             if response.status().as_u16() == 529 {

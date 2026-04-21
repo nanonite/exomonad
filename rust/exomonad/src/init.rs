@@ -429,6 +429,25 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
                 .status();
         }
     }
+
+    // OpenRouter: propagate LLM routing env vars to all windows in this session.
+    if config.openrouter.enabled {
+        if let Some(ref api_key) = config.openrouter.resolved_api_key() {
+            for (var, val) in [
+                ("ANTHROPIC_BASE_URL", "https://openrouter.ai/api"),
+                ("ANTHROPIC_AUTH_TOKEN", api_key.as_str()),
+                ("ANTHROPIC_API_KEY", ""),
+            ] {
+                let _ = std::process::Command::new("tmux")
+                    .args(["set-environment", "-t", &session, var, val])
+                    .status();
+            }
+            info!("OpenRouter routing enabled: session env vars injected");
+        } else {
+            warn!("openrouter.enabled = true but no API key found (set openrouter.api_key or OPENROUTER_API_KEY)");
+        }
+    }
+
     let serve_cmd = format!("EXOMONAD_TMUX_SESSION={} exomonad serve", &session);
     let send_status = std::process::Command::new("tmux")
         .args([

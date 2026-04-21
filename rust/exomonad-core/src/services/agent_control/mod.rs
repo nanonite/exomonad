@@ -525,6 +525,8 @@ pub struct AgentControlService<C> {
     pub(crate) wasm_name: String,
     /// Pre-serialized extra MCP servers to include in spawned agent configs.
     pub(crate) extra_mcp_servers: HashMap<String, serde_json::Value>,
+    /// OpenRouter API key. When Some, all LLM calls route through OpenRouter.
+    pub(crate) openrouter_api_key: Option<String>,
 }
 
 impl<
@@ -549,6 +551,7 @@ impl<
             yolo: false,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: HashMap::new(),
+            openrouter_api_key: None,
         }
     }
 
@@ -586,6 +589,12 @@ impl<
     /// Set extra MCP servers to include in spawned agent configs.
     pub fn with_extra_mcp_servers(mut self, servers: HashMap<String, serde_json::Value>) -> Self {
         self.extra_mcp_servers = servers;
+        self
+    }
+
+    /// Enable OpenRouter routing: all Claude CLI agents get ANTHROPIC_BASE_URL injected.
+    pub fn with_openrouter(mut self, api_key: String) -> Self {
+        self.openrouter_api_key = Some(api_key);
         self
     }
 

@@ -48,6 +48,25 @@ fn default_companion_role() -> String {
     "worker".to_string()
 }
 
+/// Configuration for routing LLM calls through OpenRouter.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OpenRouterConfig {
+    /// When false (default), all calls go direct to Anthropic/Google.
+    #[serde(default)]
+    pub enabled: bool,
+    /// API key. Falls back to OPENROUTER_API_KEY env var if absent.
+    pub api_key: Option<String>,
+}
+
+impl OpenRouterConfig {
+    /// Resolve the API key: config field first, then OPENROUTER_API_KEY env var.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        self.api_key
+            .clone()
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+    }
+}
+
 /// Raw configuration from file (supports both config.toml and config.local.toml fields).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RawConfig {
@@ -109,6 +128,10 @@ pub struct RawConfig {
 
     /// GitHub poller interval in seconds (default: 60).
     pub poll_interval: Option<u64>,
+
+    /// OpenRouter routing configuration.
+    #[serde(default)]
+    pub openrouter: Option<OpenRouterConfig>,
 }
 
 /// Final resolved configuration.
@@ -148,6 +171,9 @@ pub struct Config {
 
     /// GitHub poller interval in seconds (default: 60).
     pub poll_interval: Option<u64>,
+
+    /// OpenRouter routing configuration.
+    pub openrouter: OpenRouterConfig,
 }
 
 impl Config {
@@ -282,6 +308,12 @@ impl Config {
         // Resolve poll_interval: local > global
         let poll_interval = local_raw.poll_interval.or(global_raw.poll_interval);
 
+        // Resolve openrouter: local > global > default
+        let openrouter = local_raw
+            .openrouter
+            .or(global_raw.openrouter)
+            .unwrap_or_default();
+
         Ok(Self {
             project_dir,
             role,
@@ -300,6 +332,7 @@ impl Config {
             otlp_endpoint,
             model,
             poll_interval,
+            openrouter,
         })
     }
 
@@ -335,6 +368,7 @@ impl Default for Config {
             otlp_endpoint: None,
             model: None,
             poll_interval: None,
+            openrouter: OpenRouterConfig::default(),
         }
     }
 }
