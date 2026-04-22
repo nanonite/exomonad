@@ -146,6 +146,11 @@ pub struct RawConfig {
     /// Opencode agent configuration.
     #[serde(default)]
     pub opencode: Option<OpencodeConfig>,
+
+    /// Use OpenCode as the root TL agent instead of Claude.
+    /// Can be set via CLI flag --opencode-as-tl.
+    #[serde(default)]
+    pub opencode_as_tl: Option<bool>,
 }
 
 /// Final resolved configuration.
@@ -191,6 +196,9 @@ pub struct Config {
 
     /// Opencode agent configuration.
     pub opencode: OpencodeConfig,
+
+    /// Use OpenCode as the root TL agent instead of Claude.
+    pub opencode_as_tl: bool,
 }
 
 impl Config {
@@ -337,6 +345,9 @@ impl Config {
             .or(global_raw.opencode)
             .unwrap_or_default();
 
+        // Resolve opencode_as_tl: local > global > false
+        let opencode_as_tl = local_raw.opencode_as_tl.or(global_raw.opencode_as_tl).unwrap_or(false);
+
         Ok(Self {
             project_dir,
             role,
@@ -357,6 +368,7 @@ impl Config {
             poll_interval,
             openrouter,
             opencode,
+            opencode_as_tl,
         })
     }
 
@@ -394,6 +406,7 @@ impl Default for Config {
             poll_interval: None,
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
+            opencode_as_tl: false,
         }
     }
 }

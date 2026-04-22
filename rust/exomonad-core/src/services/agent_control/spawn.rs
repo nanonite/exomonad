@@ -432,6 +432,34 @@ impl<
         settings
     }
 
+    /// Generate opencode.json content for an OpenCode TL agent.
+    ///
+    /// Constructs the JSON configuration including MCP server connection.
+    /// Note: opencode does not support `hooks` or `allowedPaths` keys.
+    pub(crate) fn generate_opencode_tl_settings(
+        agent_name: &str,
+        role: &str,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+        _binary_path: Option<&std::path::Path>,
+        _parent_dir: Option<&Path>,
+    ) -> serde_json::Value {
+        let mut mcp_servers = serde_json::Map::new();
+        mcp_servers.insert(
+            "exomonad".to_string(),
+            serde_json::json!({
+                "type": "local",
+                "command": ["exomonad", "mcp-stdio", "--role", role, "--name", agent_name]
+            }),
+        );
+        for (k, v) in extra_mcp_servers {
+            mcp_servers.insert(k.clone(), v.clone());
+        }
+
+        serde_json::json!({
+            "mcp": mcp_servers
+        })
+    }
+
     /// Spawn a Gemini worker agent (Phase 2/3).
     ///
     /// Creates a new git worktree and branch for isolation.
@@ -673,61 +701,95 @@ impl<
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy Gemini role context (non-fatal)"),
                         }
                     }
-                    AgentType::Shoal | AgentType::OpenCode | AgentType::Process => {}
+                    AgentType::OpenCode => {
+                        // OpenCode: .claude/rules/exomonad_role.md (same layout as Claude for rules discovery)
+                        let rules_dir = worktree_path.join(".claude/rules");
+                        let _ = fs::create_dir_all(&rules_dir).await;
+                        let dest = rules_dir.join("exomonad_role.md");
+                        let _ = fs::remove_file(&dest).await;
+                        match fs::copy(&context_src, &dest).await {
+                            Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into OpenCode worktree"),
+                            Err(e) => warn!(role = %role, error = %e, "Failed to copy OpenCode role context (non-fatal)"),
+                        }
+                    }
+                    AgentType::Shoal | AgentType::Process => {}
                 }
             }
 
             let session_branch = BranchName::from(branch_name.as_str());
             let mut env_vars = self.common_spawn_env(&agent_name, &session_branch, role);
-            // Enable Claude Code Agent Teams for native inter-agent messaging
-            env_vars.insert(
-                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".to_string(),
-                "1".to_string(),
-            );
+
+            // Write agent MCP config
             self.write_agent_mcp_config(effective_project_dir, &worktree_path, agent_type, role)
                 .await?;
 
+            match agent_type {
+                AgentType::Claude => {
+                    // Enable Claude Code Agent Teams for native inter-agent messaging
+                    env_vars.insert(
+                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".to_string(),
+                        "1".to_string(),
+                    );
 
-            // Write .claude/settings.local.json with hooks (SessionStart registers UUID for --fork-session)
-            let binary_path = crate::util::find_exomonad_binary();
-            crate::hooks::HookConfig::write_persistent(&worktree_path, &binary_path, options.permissions.as_ref(), Some(self.project_dir()))
-                .map_err(|e| anyhow!("Failed to write hook config in worktree: {}", e))?;
-            info!(worktree = %worktree_path.display(), "Wrote hook configuration for spawned Claude agent");
+                    // Write .claude/settings.local.json with hooks (SessionStart registers UUID for --fork-session)
+                    let binary_path = crate::util::find_exomonad_binary();
+                    crate::hooks::HookConfig::write_persistent(&worktree_path, &binary_path, options.permissions.as_ref(), Some(self.project_dir()))
+                        .map_err(|e| anyhow!("Failed to write hook config in worktree: {}", e))?;
+                    info!(worktree = %worktree_path.display(), "Wrote hook configuration for spawned Claude agent");
 
-            // Symlink Claude project dir so child can discover parent's sessions for --fork-session.
-            // Claude Code encodes paths via [^a-zA-Z0-9] → '-' (lossy regex replacement).
-            // Without this symlink, --resume --fork-session fails with "no conversation ID found".
-            {
-                let claude_projects_dir = dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".claude")
-                    .join("projects");
-                let encode_path = |p: &Path| -> String {
-                    p.to_string_lossy()
-                        .chars()
-                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                        .collect()
-                };
-                let canonical_project_dir = self.project_dir().canonicalize().unwrap_or_else(|_| self.project_dir().to_path_buf());
-                let parent_encoded = encode_path(&canonical_project_dir);
-                let worktree_encoded = encode_path(&worktree_path);
-                let parent_project = claude_projects_dir.join(&parent_encoded);
-                let child_project = claude_projects_dir.join(&worktree_encoded);
-                if parent_project.exists() && !child_project.exists() {
-                    match std::os::unix::fs::symlink(&parent_project, &child_project) {
-                        Ok(()) => info!(
-                            parent = %parent_encoded,
-                            child = %worktree_encoded,
-                            "Symlinked Claude project dir for session inheritance"
-                        ),
-                        Err(e) => warn!(
-                            parent = %parent_encoded,
-                            child = %worktree_encoded,
-                            error = %e,
-                            "Failed to symlink Claude project dir (fork-session may not work)"
-                        ),
+                    // Symlink Claude project dir so child can discover parent's sessions for --fork-session.
+                    // Claude Code encodes paths via [^a-zA-Z0-9] → '-' (lossy regex replacement).
+                    // Without this symlink, --resume --fork-session fails with "no conversation ID found".
+                    {
+                        let claude_projects_dir = dirs::home_dir()
+                            .unwrap_or_default()
+                            .join(".claude")
+                            .join("projects");
+                        let encode_path = |p: &Path| -> String {
+                            p.to_string_lossy()
+                                .chars()
+                                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                                .collect()
+                        };
+                        let canonical_project_dir = self.project_dir().canonicalize().unwrap_or_else(|_| self.project_dir().to_path_buf());
+                        let parent_encoded = encode_path(&canonical_project_dir);
+                        let worktree_encoded = encode_path(&worktree_path);
+                        let parent_project = claude_projects_dir.join(&parent_encoded);
+                        let child_project = claude_projects_dir.join(&worktree_encoded);
+                        if parent_project.exists() && !child_project.exists() {
+                            match std::os::unix::fs::symlink(&parent_project, &child_project) {
+                                Ok(()) => info!(
+                                    parent = %parent_encoded,
+                                    child = %worktree_encoded,
+                                    "Symlinked Claude project dir for session inheritance"
+                                ),
+                                Err(e) => warn!(
+                                    parent = %parent_encoded,
+                                    child = %worktree_encoded,
+                                    error = %e,
+                                    "Failed to symlink Claude project dir (fork-session may not work)"
+                                ),
+                            }
+                        }
                     }
                 }
+                AgentType::OpenCode => {
+                    // Write opencode.json with hooks for OpenCode TL agents
+                    let binary_path = crate::util::find_exomonad_binary();
+                    let opencode_config = Self::generate_opencode_tl_settings(
+                        agent_name.as_str(),
+                        role.as_str(),
+                        &self.extra_mcp_servers,
+                        Some(&binary_path),
+                        Some(self.project_dir()),
+                    );
+                    fs::write(
+                        worktree_path.join("opencode.json"),
+                        serde_json::to_string_pretty(&opencode_config)?,
+                    ).await?;
+                    info!(worktree = %worktree_path.display(), "Wrote opencode.json with hooks for OpenCode TL agent");
+                }
+                _ => {}
             }
 
             // Build task prompt with worktree context warning
@@ -740,21 +802,35 @@ impl<
                 task_with_context.push_str("\n\nShared technical dependencies are available as read-only reference in `.exo/context/`. Do not modify files in this directory.");
             }
 
-            // Determine fork mode from parent_session_id
-            let fork_id = options.parent_session_id.as_ref().map(|id| id.as_str());
-
             // Open tmux window with cwd = worktree_path
             let agent_config_dir = self.project_dir().join(".exo").join("agents").join(agent_name.as_str());
-            let window_id = match self.new_tmux_window_inner(
-                &display_name,
-                &worktree_path,
-                agent_type,
-                Some(&task_with_context),
-                env_vars,
-                fork_id,
-                Some(&options.claude_flags),
-            )
-            .await {
+            let window_id = match agent_type {
+                AgentType::Claude => {
+                    // Determine fork mode from parent_session_id
+                    let fork_id = options.parent_session_id.as_ref().map(|id| id.as_str());
+                    self.new_tmux_window_inner(
+                        &display_name,
+                        &worktree_path,
+                        agent_type,
+                        Some(&task_with_context),
+                        env_vars,
+                        fork_id,
+                        Some(&options.claude_flags),
+                    )
+                    .await
+                }
+                _ => {
+                    self.new_tmux_window(
+                        &display_name,
+                        &worktree_path,
+                        agent_type,
+                        Some(&task_with_context),
+                        env_vars,
+                    )
+                    .await
+                }
+            };
+            let window_id = match window_id {
                 Ok(wid) => wid,
                 Err(e) => {
                     warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");

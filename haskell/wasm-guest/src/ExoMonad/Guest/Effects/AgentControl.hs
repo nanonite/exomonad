@@ -35,11 +35,15 @@ module ExoMonad.Guest.Effects.AgentControl
     SpawnWorkerConfig (..),
     SpawnAcpConfig (..),
     SpawnOpencodeConfig (..),
+
+    -- * Helpers
+    agentTypeLabel,
   )
 where
 
 import Control.Monad.Freer (Eff, Member, interpret, send)
-import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, withText, (.:), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, withText, (.:), (.=))
+import Data.Aeson qualified as Aeson
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -48,6 +52,7 @@ import Effects.Agent qualified as PA
 import Effects.EffectError (EffectError (..), EffectErrorKind (..), InvalidInput (..))
 import ExoMonad.Effects.Agent qualified as Agent
 import ExoMonad.Guest.Proto (fromText, toText)
+import ExoMonad.Guest.Tool.Schema (JsonSchema (..))
 import ExoMonad.Guest.Tool.Suspend.Types (SuspendYield)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
 import ExoMonad.Guest.Types.Permissions
@@ -75,6 +80,12 @@ instance FromJSON AgentType where
     "shoal" -> pure Shoal
     "opencode" -> pure OpenCode
     other -> fail $ "Invalid agent type: " <> T.unpack other
+
+instance JsonSchema AgentType where
+  toSchema = object
+    [ "type" .= ("string" :: Text),
+      "enum" .= (["claude", "opencode"] :: [Text])
+    ]
 
 -- | Result of spawning an agent.
 data SpawnResult = SpawnResult
@@ -303,6 +314,12 @@ toProtoAgentType Claude = PA.AgentTypeAGENT_TYPE_CLAUDE
 toProtoAgentType Gemini = PA.AgentTypeAGENT_TYPE_GEMINI
 toProtoAgentType Shoal = PA.AgentTypeAGENT_TYPE_SHOAL
 toProtoAgentType OpenCode = PA.AgentTypeAGENT_TYPE_OPENCODE
+
+agentTypeLabel :: AgentType -> Text
+agentTypeLabel Claude = "claude"
+agentTypeLabel Gemini = "gemini"
+agentTypeLabel Shoal = "shoal"
+agentTypeLabel OpenCode = "opencode"
 
 permissionsToProto :: ClaudePermissions -> PA.Permissions
 permissionsToProto perms =

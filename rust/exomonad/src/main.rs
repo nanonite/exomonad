@@ -61,9 +61,15 @@ enum Commands {
         /// Optionally override session name (default: from config)
         #[arg(long)]
         session: Option<String>,
-        /// Delete existing session and create fresh (use after binary/layout updates)
+        /// Delete existing session and create fresh
         #[arg(long)]
         recreate: bool,
+        /// Use OpenCode as the root TL agent (default: Claude)
+        #[arg(long)]
+        opencode_as_tl: bool,
+        /// Enable OpenRouter for LLM routing
+        #[arg(long)]
+        openrouter: bool,
     },
 
     /// Initialize a new exomonad project in the current directory.
@@ -228,8 +234,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Init { session, recreate } => {
-            init::run(session, recreate).await?;
+        Commands::Init { session, recreate, opencode_as_tl, openrouter } => {
+            init::run(session, recreate, opencode_as_tl, openrouter).await?;
         }
 
         Commands::New { name } => {

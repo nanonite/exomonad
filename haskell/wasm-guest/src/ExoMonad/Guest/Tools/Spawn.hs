@@ -115,7 +115,8 @@ data ForkWave
 data ForkWaveChild = ForkWaveChild
   { fwcSlug :: Text,
     fwcTask :: Text,
-    fwcForkSession :: Maybe Bool
+    fwcForkSession :: Maybe Bool,
+    fwcAgentType :: Maybe AC.AgentType
   }
   deriving (Show, Eq, Generic)
 
@@ -125,6 +126,7 @@ instance FromJSON ForkWaveChild where
       <$> v .: "slug"
       <*> v .: "task"
       <*> v .:? "fork_session"
+      <*> v .:? "agent_type"
 
 instance JsonSchema ForkWaveChild where
   toSchema =
@@ -132,7 +134,8 @@ instance JsonSchema ForkWaveChild where
       genericToolSchemaWith @ForkWaveChild
         [ ("slug", "Branch name suffix (will be prefixed with current branch)"),
           ("task", "One-line task description — the child inherits your full context, so keep it brief"),
-          ("fork_session", "Inherit parent conversation context via --fork-session (default: true). Set false to start the child with a fresh context window.")
+          ("fork_session", "Inherit parent conversation context via --fork-session (default: true). Set false to start the child with a fresh context window."),
+          ("agent_type", "Agent type for the child: 'claude' (default) or 'opencode'. OpenCode children get TL role and can spawn their own children.")
         ]
 
 data ForkWaveArgs = ForkWaveArgs
@@ -186,13 +189,14 @@ forkWaveCore args = do
         _ -> do
           -- Spawn each child
           results <- forM (fwaChildren args) $ \child -> do
-            let cfg =
+            let childAgentType = fromMaybe AC.Claude (fwcAgentType child)
+                cfg =
                   AC.SpawnSubtreeConfig
                     { AC.stcTask = fwcTask child,
                       AC.stcBranchName = fwcSlug child,
                       AC.stcForkSession = fromMaybe True (fwcForkSession child),
                       AC.stcRole = Nothing,
-                      AC.stcAgentType = AC.Claude,
+                      AC.stcAgentType = childAgentType,
                       AC.stcPerms = AC.defaultPermFlags,
                       AC.stcWorkingDir = Nothing,
                       AC.stcPermissions = Nothing,
@@ -208,11 +212,11 @@ forkWaveCore args = do
                 case result' of
                   Left err' -> pure (Left (spawnErrorMessage err'))
                   Right spawnResult -> do
-                    emitSpawnEvent retrySlug "claude" (fwcTask child)
+                    emitSpawnEvent retrySlug (AC.agentTypeLabel childAgentType) (fwcTask child)
                     pure (Right (retrySlug, spawnResult))
               Left err -> pure (Left (spawnErrorMessage err))
               Right spawnResult -> do
-                emitSpawnEvent (fwcSlug child) "claude" (fwcTask child)
+                emitSpawnEvent (fwcSlug child) (AC.agentTypeLabel childAgentType) (fwcTask child)
                 pure (Right (fwcSlug child, spawnResult))
 
           let (errs, successes) = partitionEithers results

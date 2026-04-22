@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Run the init command: create or attach to tmux session.
-pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()> {
+pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
     use exomonad_core::services::{resolve_role_context_path, AgentType};
     use std::io::{IsTerminal, Write};
@@ -17,7 +17,16 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
     }
 
     // Resolve config
-    let config = Config::discover()?;
+    let mut config = Config::discover()?;
+
+    // CLI flags override config
+    if opencode_as_tl {
+        config.opencode_as_tl = true;
+        config.root_agent_type = AgentType::OpenCode;
+    }
+    if openrouter {
+        config.openrouter.enabled = true;
+    }
 
     // Check OTel endpoint reachability if configured
     if let Some(ref endpoint) = config.otlp_endpoint {
@@ -161,10 +170,26 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
     }
 
     // Write hook configuration (SessionStart registers Claude UUID for --fork-session)
+    // For OpenCode TL, write opencode.json MCP config instead of Claude hooks
     let binary_path = exomonad_core::find_exomonad_binary();
-    exomonad_core::hooks::HookConfig::write_persistent(&cwd, &binary_path, None, None)
-        .context("Failed to write hook configuration")?;
-    info!("Hook configuration written to .claude/settings.local.json");
+    if config.root_agent_type == AgentType::OpenCode {
+        let opencode_config = serde_json::json!({
+            "mcp": {
+                "exomonad": {
+                    "type": "local",
+                    "command": ["exomonad", "mcp-stdio", "--role", "root", "--name", "root"]
+                }
+            }
+        });
+        let opencode_dir = cwd.join(".exo/agents/root");
+        std::fs::create_dir_all(&opencode_dir)?;
+        std::fs::write(opencode_dir.join("opencode.json"), serde_json::to_string_pretty(&opencode_config)?)?;
+        info!("OpenCode MCP configuration written to .exo/agents/root/opencode.json");
+    } else {
+        exomonad_core::hooks::HookConfig::write_persistent(&cwd, &binary_path, None, None)
+            .context("Failed to write hook configuration")?;
+        info!("Hook configuration written to .claude/settings.local.json");
+    }
 
     // Copy Claude rules template if available and not already present
     {
@@ -318,40 +343,42 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
     // Create fresh session
     info!(session = %session, "Creating session");
 
-    // 1. Write .mcp.json
-    let mut mcp_servers = serde_json::Map::new();
-    mcp_servers.insert(
-        "exomonad".to_string(),
-        serde_json::json!({
-            "type": "stdio",
-            "command": "exomonad",
-            "args": ["mcp-stdio", "--role", "root", "--name", "root"]
-        }),
-    );
+    // 1. Write .mcp.json (for Claude Code discovery)
+    if config.root_agent_type == AgentType::Claude {
+        let mut mcp_servers = serde_json::Map::new();
+        mcp_servers.insert(
+            "exomonad".to_string(),
+            serde_json::json!({
+                "type": "stdio",
+                "command": "exomonad",
+                "args": ["mcp-stdio", "--role", "root", "--name", "root"]
+            }),
+        );
 
-    // Add extra MCP servers from config
-    for (name, server) in &config.extra_mcp_servers {
-        let entry = match server {
-            exomonad::config::McpServerConfig::Http { url, headers } => {
-                let mut e = serde_json::json!({"type": "http", "url": url});
-                if !headers.is_empty() {
-                    e["headers"] = serde_json::to_value(headers)?;
+        // Add extra MCP servers from config
+        for (name, server) in &config.extra_mcp_servers {
+            let entry = match server {
+                exomonad::config::McpServerConfig::Http { url, headers } => {
+                    let mut e = serde_json::json!({"type": "http", "url": url});
+                    if !headers.is_empty() {
+                        e["headers"] = serde_json::to_value(headers)?;
+                    }
+                    e
                 }
-                e
-            }
-            exomonad::config::McpServerConfig::Stdio { command, args } => {
-                serde_json::json!({"type": "stdio", "command": command, "args": args})
-            }
-        };
-        mcp_servers.insert(name.clone(), entry);
-    }
+                exomonad::config::McpServerConfig::Stdio { command, args } => {
+                    serde_json::json!({"type": "stdio", "command": command, "args": args})
+                }
+            };
+            mcp_servers.insert(name.clone(), entry);
+        }
 
-    let mcp_json = serde_json::json!({ "mcpServers": mcp_servers });
-    std::fs::write(
-        cwd.join(".mcp.json"),
-        serde_json::to_string_pretty(&mcp_json)?,
-    )?;
-    info!("Wrote .mcp.json with {} MCP server(s)", mcp_servers.len());
+        let mcp_json = serde_json::json!({ "mcpServers": mcp_servers });
+        std::fs::write(
+            cwd.join(".mcp.json"),
+            serde_json::to_string_pretty(&mcp_json)?,
+        )?;
+        info!("Wrote .mcp.json with {} MCP server(s)", mcp_servers.len());
+    }
 
     // 2. Create session in background
     let server_window_id = TmuxIpc::new_session(&session, &cwd).await?;
@@ -467,6 +494,138 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
     }
 
     // Create "TL" window
+    let tl_cwd = if config.root_agent_type == AgentType::OpenCode {
+        // OpenCode TL gets a worktree for isolation, same as Claude companions
+        let worktree_path = cwd.join(".exo/worktrees/root-opencode");
+        let branch_name = format!("root-opencode");
+
+        if !worktree_path.exists() {
+            let head_valid = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "HEAD"])
+                .current_dir(&cwd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if !head_valid {
+                info!("No commits in repo, creating initial commit for worktree support");
+                let _ = std::process::Command::new("git")
+                    .args(["commit", "--allow-empty", "-m", "initial commit"])
+                    .current_dir(&cwd)
+                    .output();
+            }
+
+            let branch_exists = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", &branch_name])
+                .current_dir(&cwd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            std::fs::create_dir_all(cwd.join(".exo/worktrees"))?;
+
+            let worktree_result = if branch_exists {
+                std::process::Command::new("git")
+                    .args(["worktree", "add"])
+                    .arg(&worktree_path)
+                    .arg(&branch_name)
+                    .current_dir(&cwd)
+                    .output()
+            } else {
+                std::process::Command::new("git")
+                    .args(["worktree", "add", "-b", &branch_name])
+                    .arg(&worktree_path)
+                    .arg("HEAD")
+                    .current_dir(&cwd)
+                    .output()
+            };
+
+            match worktree_result {
+                Ok(output) if output.status.success() => {
+                    info!(
+                        path = %worktree_path.display(),
+                        branch = %branch_name,
+                        "Created OpenCode TL worktree"
+                    );
+                }
+                Ok(output) => {
+                    anyhow::bail!(
+                        "Failed to create worktree for OpenCode TL: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "Failed to run git worktree add for OpenCode TL: {}",
+                        e
+                    );
+                }
+            }
+        } else {
+            info!(
+                path = %worktree_path.display(),
+                "Reusing existing OpenCode TL worktree"
+            );
+        }
+
+        // Write opencode.json MCP config into worktree
+        let mut opencode_mcp_servers = serde_json::Map::new();
+        opencode_mcp_servers.insert(
+            "exomonad".to_string(),
+            serde_json::json!({
+                "type": "local",
+                "command": ["exomonad", "mcp-stdio", "--role", "root", "--name", "root"]
+            }),
+        );
+        for (name, server) in &config.extra_mcp_servers {
+            let entry = match server {
+                crate::config::McpServerConfig::Http { url, headers } => {
+                    let mut e = serde_json::json!({"type": "http", "url": url});
+                    if !headers.is_empty() {
+                        e["headers"] = serde_json::to_value(headers)?;
+                    }
+                    e
+                }
+                crate::config::McpServerConfig::Stdio { command, args } => {
+                    serde_json::json!({"type": "stdio", "command": command, "args": args})
+                }
+            };
+            opencode_mcp_servers.insert(name.clone(), entry);
+        }
+        let opencode_config = serde_json::json!({ "mcp": opencode_mcp_servers });
+        std::fs::write(
+            worktree_path.join("opencode.json"),
+            serde_json::to_string_pretty(&opencode_config)?,
+        )?;
+
+        // Copy role context into worktree
+        {
+            let context_source = exomonad_core::services::resolve_role_context_path(&cwd, &config.wasm_name, "root");
+            if let Some(src) = context_source {
+                let rules_dir = worktree_path.join(".claude/rules");
+                let _ = std::fs::create_dir_all(&rules_dir);
+                let dest = rules_dir.join("exomonad_role.md");
+                let _ = std::fs::remove_file(&dest);
+                match std::fs::copy(&src, &dest) {
+                    Ok(_) => info!(src = %src.display(), dest = %dest.display(), "Copied role context for OpenCode TL"),
+                    Err(e) => warn!(error = %e, "Failed to copy role context (non-fatal)"),
+                }
+            }
+        }
+
+        // Symlink server socket
+        let worktree_exo = worktree_path.join(".exo");
+        std::fs::create_dir_all(&worktree_exo)?;
+        let socket_target = worktree_exo.join("server.sock");
+        let _ = std::fs::remove_file(&socket_target);
+        let socket_source = cwd.join(".exo/server.sock");
+        std::os::unix::fs::symlink(&socket_source, &socket_target)?;
+
+        worktree_path
+    } else {
+        cwd.clone()
+    };
+
     let base_command = if let Some(ref cmd) = config.root_command {
         cmd.clone()
     } else {
@@ -493,7 +652,7 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
             }
             (AgentType::OpenCode, None) => {
                 let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
-                format!("opencode run{}", yolo)
+                format!("opencode{}", yolo)
             }
             (AgentType::Process, _) => unreachable!("Process is for companions only, not root agent"),
         }
@@ -504,7 +663,7 @@ pub async fn run(session_override: Option<String>, recreate: bool) -> Result<()>
         None => base_command,
     };
 
-    let _ = ipc.new_window("TL", &cwd, &shell, &tl_command).await?;
+    let _ = ipc.new_window("TL", &tl_cwd, &shell, &tl_command).await?;
 
     // 4. Poll for server socket
     wait_for_server_socket(&cwd).await?;

@@ -254,24 +254,47 @@ impl<
             (Some(pf), Some(session_id)) => {
                 let escaped_session = Self::escape_for_shell_command(session_id);
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
-                format!(
-                    "{}{} --resume {} --fork-session \"$(cat {})\"",
-                    cmd, perms_flags, escaped_session, escaped_path
-                )
+                match agent_type {
+                    AgentType::OpenCode => {
+                        format!(
+                            "{} run{} --resume {} --fork-session \"$(cat {})\"",
+                            cmd, perms_flags, escaped_session, escaped_path
+                        )
+                    }
+                    _ => {
+                        format!(
+                            "{}{} --resume {} --fork-session \"$(cat {})\"",
+                            cmd, perms_flags, escaped_session, escaped_path
+                        )
+                    }
+                }
             }
             (Some(pf), None) => {
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
-                let flag = agent_type.prompt_flag();
-                if flag.is_empty() {
-                    format!("{}{} \"$(cat {})\"", cmd, perms_flags, escaped_path)
-                } else {
-                    format!(
-                        "{}{} {} \"$(cat {})\"",
-                        cmd, perms_flags, flag, escaped_path
-                    )
+                match agent_type {
+                    AgentType::OpenCode => {
+                        format!(
+                            "{} run{} \"$(cat {})\"",
+                            cmd, perms_flags, escaped_path
+                        )
+                    }
+                    _ => {
+                        let flag = agent_type.prompt_flag();
+                        if flag.is_empty() {
+                            format!("{}{} \"$(cat {})\"", cmd, perms_flags, escaped_path)
+                        } else {
+                            format!(
+                                "{}{} {} \"$(cat {})\"",
+                                cmd, perms_flags, flag, escaped_path
+                            )
+                        }
+                    }
                 }
             }
-            _ => format!("{}{}", cmd, perms_flags),
+            _ => match agent_type {
+                AgentType::OpenCode => format!("{}{}", cmd, perms_flags),
+                _ => format!("{}{}", cmd, perms_flags),
+            },
         };
 
         // Prepend env vars
