@@ -35,7 +35,7 @@ instance FromJSON Zone where
     "rust-binary" -> pure RustBinary
     "rust_binary" -> pure RustBinary
     "justfile" -> pure Justfile
-    other -> fail $ "Unknown zone: " <> show other
+    other -> fail $ "Unknown zone: " <> show (other :: Text)
 
 instance ToJSON Zone where
   toJSON Proto = "proto"

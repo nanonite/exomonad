@@ -52,7 +52,7 @@ instance FromJSON PRReviewEvent where
       "timeout" -> ReviewTimeout <$> v .: "pr_number" <*> v .: "minutes_elapsed"
       "fixes_pushed" -> FixesPushed <$> v .: "pr_number" <*> v .: "ci_status"
       "commits_pushed" -> CommitsPushed <$> v .: "pr_number" <*> v .: "ci_status"
-      other -> fail $ "Unknown PRReviewEvent kind: " <> show other
+      other -> fail $ "Unknown PRReviewEvent kind: " <> show (other :: Text)
 
 instance ToJSON PRReviewEvent where
   toJSON (ReviewReceived n c) = object ["kind" .= ("review_received" :: Text), "pr_number" .= n, "comments" .= c]
@@ -124,7 +124,7 @@ instance FromJSON EventAction where
       "inject_message" -> InjectMessage <$> v .: "message"
       "notify_parent" -> NotifyParentAction <$> v .: "message" <*> v .: "pr_number"
       "no_action" -> pure NoAction
-      other -> fail $ "Unknown EventAction: " <> show other
+      other -> fail $ "Unknown EventAction: " <> show (other :: Text)
 
 -- | Configuration for event handlers per role.
 data EventHandlerConfig = EventHandlerConfig
@@ -161,7 +161,7 @@ instance FromJSON EventInput where
       "ci_status" -> CIStatusInput <$> Aeson.parseJSON payload
       "timeout" -> TimeoutInput <$> Aeson.parseJSON payload
       "sibling_merged" -> SiblingMergedInput <$> Aeson.parseJSON payload
-      other -> fail $ "Unknown event_type: " <> show other
+      other -> fail $ "Unknown event_type: " <> show (other :: Text)
 
 -- | Dispatch an event to the appropriate handler.
 dispatchEvent :: EventHandlerConfig -> EventInput -> Eff Effects EventAction
