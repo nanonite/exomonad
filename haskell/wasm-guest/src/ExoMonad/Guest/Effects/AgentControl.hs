@@ -20,7 +20,6 @@ module ExoMonad.Guest.Effects.AgentControl
     spawnLeafSubtree,
     spawnWorker,
     spawnAcp,
-    spawnOpencode,
 
     -- * Interpreters
     runAgentControlSuspend,
@@ -34,7 +33,6 @@ module ExoMonad.Guest.Effects.AgentControl
     SpawnLeafSubtreeConfig (..),
     SpawnWorkerConfig (..),
     SpawnAcpConfig (..),
-    SpawnOpencodeConfig (..),
 
     -- * Helpers
     agentTypeLabel,
@@ -175,23 +173,12 @@ data SpawnAcpConfig = SpawnAcpConfig
   }
   deriving (Show, Eq, Generic)
 
--- | Configuration for spawning an OpenCode agent.
-data SpawnOpencodeConfig = SpawnOpencodeConfig
-  { socTask :: Text,
-    socBranchName :: Text,
-    socRole :: Maybe Text,
-    socStandaloneRepo :: Bool,
-    socAllowedDirs :: [Text]
-  }
-  deriving (Show, Eq, Generic)
-
 -- | Agent control effect for spawning agents.
 data AgentControl a where
   SpawnSubtreeC :: SpawnSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnLeafSubtreeC :: SpawnLeafSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnWorkerC :: SpawnWorkerConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnAcpC :: SpawnAcpConfig -> AgentControl (Either EffectError SpawnResult)
-  SpawnOpencodeC :: SpawnOpencodeConfig -> AgentControl (Either EffectError SpawnResult)
 
 -- Smart constructors (manually written - makeSem doesn't work with WASM cross-compilation)
 spawnSubtree :: (Member AgentControl r) => SpawnSubtreeConfig -> Eff r (Either EffectError SpawnResult)
@@ -205,9 +192,6 @@ spawnWorker cfg = send (SpawnWorkerC cfg)
 
 spawnAcp :: (Member AgentControl r) => SpawnAcpConfig -> Eff r (Either EffectError SpawnResult)
 spawnAcp cfg = send (SpawnAcpC cfg)
-
-spawnOpencode :: (Member AgentControl r) => SpawnOpencodeConfig -> Eff r (Either EffectError SpawnResult)
-spawnOpencode cfg = send (SpawnOpencodeC cfg)
 
 -- ============================================================================
 -- Interpreter (uses yield_effect via Effect typeclass)
@@ -288,21 +272,6 @@ runAgentControlSuspend = interpret $ \case
       Left err -> Left err
       Right resp -> case PA.spawnAcpResponseAgent resp of
         Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnAcp succeeded but no agent info returned"))))
-        Just info -> Right (protoAgentInfoToSpawnResult info)
-  SpawnOpencodeC cfg -> do
-    let req =
-          PA.SpawnOpencodeRequest
-            { PA.spawnOpencodeRequestTask = fromText (socTask cfg),
-              PA.spawnOpencodeRequestBranchName = fromText (socBranchName cfg),
-              PA.spawnOpencodeRequestRole = fromText (fromMaybe "" (socRole cfg)),
-              PA.spawnOpencodeRequestStandaloneRepo = socStandaloneRepo cfg,
-              PA.spawnOpencodeRequestAllowedDirs = V.fromList (map fromText (socAllowedDirs cfg))
-            }
-    result <- suspendEffect @Agent.AgentSpawnOpencode req
-    pure $ case result of
-      Left err -> Left err
-      Right resp -> case PA.spawnOpencodeResponseAgent resp of
-        Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnOpencode succeeded but no agent info returned"))))
         Just info -> Right (protoAgentInfoToSpawnResult info)
 
 -- ============================================================================

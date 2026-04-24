@@ -16,8 +16,7 @@ import ExoMonad.Guest.Tools.MergePR (mergePRCore, mergePRDescription, mergePRSch
 import ExoMonad.Guest.Tools.Spawn
   ( forkWaveCore, forkWaveDescription, forkWaveSchema, forkWaveRender, ForkWaveArgs (..), ForkWaveResult (..),
     spawnGeminiCore, spawnGeminiDescription, spawnGeminiSchema, spawnLeafRender, SpawnGeminiArgs (..),
-    spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
-    spawnOpencodeCore, spawnOpencodeDescription, spawnOpencodeSchema, SpawnOpencodeArgs
+    spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs
   )
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Types (allowResponse, allowStopResponse, BeforeModelOutput (..), AfterModelOutput (..))
@@ -66,22 +65,6 @@ instance MCPTool RootSpawnWorker where
   toolSchema = spawnWorkerToolSchema
   toolHandlerEff args = spawnWorkerToolCore args
 
-data RootSpawnOpencode
-instance MCPTool RootSpawnOpencode where
-  type ToolArgs RootSpawnOpencode = SpawnOpencodeArgs
-  toolName = "spawn_opencode"
-  toolDescription = spawnOpencodeDescription
-  toolSchema = spawnOpencodeSchema
-  toolHandlerEff args = do
-    result <- spawnOpencodeCore args
-    case result of
-      Left err -> pure $ errorResult err
-      Right (slug, sr) -> do
-        let handle = ChildHandle { chSlug = slug, chBranch = branchName sr, chAgentType = agentTypeResult sr }
-        branch <- getCurrentBranch
-        void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
-        pure $ spawnLeafRender (Right (slug, sr))
-
 data RootMergePR
 instance MCPTool RootMergePR where
   type ToolArgs RootMergePR = MergePRArgs
@@ -104,7 +87,6 @@ instance MCPTool RootMergePR where
 data Tools mode = Tools
   { forkWave    :: mode :- RootForkWave,
     spawnGemini :: mode :- RootSpawnGemini,
-    spawnOpencode :: mode :- RootSpawnOpencode,
     spawnWorker :: mode :- RootSpawnWorker,
     mergePr     :: mode :- RootMergePR,
     sendMessage :: mode :- SendMessage
@@ -118,7 +100,6 @@ config =
       tools = Tools
         { forkWave    = mkHandler @RootForkWave,
           spawnGemini = mkHandler @RootSpawnGemini,
-          spawnOpencode = mkHandler @RootSpawnOpencode,
           spawnWorker = mkHandler @RootSpawnWorker,
           mergePr     = mkHandler @RootMergePR,
           sendMessage = mkHandler @SendMessage

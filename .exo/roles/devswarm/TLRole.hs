@@ -24,8 +24,7 @@ import ExoMonad.Guest.Tools.Spawn
     spawnGeminiCore, spawnGeminiDescription, spawnGeminiSchema, SpawnGeminiArgs,
     spawnLeafRender,
     spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
-    spawnAcpCore, SpawnAcpArgs,
-    spawnOpencodeCore, spawnOpencodeDescription, spawnOpencodeSchema, SpawnOpencodeArgs
+    spawnAcpCore, SpawnAcpArgs
   )
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Types (StopDecision(..), StopHookOutput(..), blockStopResponse, allowStopResponse, allowResponse, BeforeModelOutput (..), AfterModelOutput (..))
@@ -128,28 +127,6 @@ instance MCPTool TLSpawnWorker where
   toolSchema = spawnWorkerToolSchema
   toolHandlerEff args = spawnWorkerToolCore args
 
--- | TL-specific spawn_opencode: worktree spawn fires ChildSpawned.
-data TLSpawnOpencode
-
-instance MCPTool TLSpawnOpencode where
-  type ToolArgs TLSpawnOpencode = SpawnOpencodeArgs
-  toolName = "spawn_opencode"
-  toolDescription = spawnOpencodeDescription
-  toolSchema = spawnOpencodeSchema
-  toolHandlerEff args = do
-    result <- spawnOpencodeCore args
-    case result of
-      Left err -> pure $ errorResult err
-      Right (slug, sr) -> do
-        let handle = ChildHandle
-              { chSlug = slug
-              , chBranch = branchName sr
-              , chAgentType = agentTypeResult sr
-              }
-        branch <- getCurrentBranch
-        void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
-        pure $ spawnLeafRender (Right (slug, sr))
-
 -- | TL notify_parent: thin wrapper, no phase transitions.
 data TLNotifyParent
 
@@ -167,7 +144,6 @@ instance MCPTool TLNotifyParent where
 data Tools mode = Tools
   { forkWave :: mode :- TLForkWave,
     spawnGemini :: mode :- TLSpawnGemini,
-    spawnOpencode :: mode :- TLSpawnOpencode,
     spawnWorker :: mode :- TLSpawnWorker,
     pr :: mode :- TLFilePR,
     mergePr :: mode :- TLMergePR,
@@ -184,7 +160,6 @@ config =
         Tools
           { forkWave = mkHandler @TLForkWave,
             spawnGemini = mkHandler @TLSpawnGemini,
-            spawnOpencode = mkHandler @TLSpawnOpencode,
             spawnWorker = mkHandler @TLSpawnWorker,
             pr = mkHandler @TLFilePR,
             mergePr = mkHandler @TLMergePR,

@@ -10,7 +10,6 @@ module ExoMonad.Guest.Tools.Spawn
     SpawnGemini,
     SpawnWorkerTool,
     SpawnAcp,
-    SpawnOpencode,
 
     -- * Args types
     ForkWaveArgs (..),
@@ -22,7 +21,6 @@ module ExoMonad.Guest.Tools.Spawn
     WorkerSpec (..),
     WorkerType (..),
     SpawnAcpArgs (..),
-    SpawnOpencodeArgs (..),
 
     -- * Core functions (role wrappers call these)
     forkWaveCore,
@@ -31,7 +29,6 @@ module ExoMonad.Guest.Tools.Spawn
     spawnGeminiCore,
     spawnWorkerToolCore,
     spawnAcpCore,
-    spawnOpencodeCore,
 
     -- * Result types
     ForkWaveResult (..),
@@ -51,8 +48,6 @@ module ExoMonad.Guest.Tools.Spawn
     spawnGeminiSchema,
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
-    spawnOpencodeDescription,
-    spawnOpencodeSchema,
 
     -- * Helpers (re-exported for role code)
     spawnErrorMessage,
@@ -686,103 +681,3 @@ workerProfileText = "## Completion Protocol (Worker)\nYou are an **ephemeral wor
 -- | Pre-rendered research worker profile text.
 researchProfileText :: Text
 researchProfileText = "## Completion Protocol (Research Worker)\nYou are a **research worker** \x2014 your job is to explore, read, search, and synthesize. You do NOT modify anything.\n\nYour workflow:\n\n1. **Read files** (`Read`, `Glob`, `Grep`) to understand code structure and patterns.\n2. **Search broadly** \x2014 check multiple files, grep for patterns, follow imports and references.\n3. **Synthesize findings** into a clear, structured report.\n4. **Call `notify_parent`** with status `success` and your findings.\n   - Structure your report with headings, bullet points, and code references (file:line).\n   - Lead with the answer, then supporting evidence.\n   - If you cannot find what was asked, call `notify_parent` with status `failure` explaining what you searched and what was missing.\n\n**DO NOT:**\n- Edit, write, or create any files\n- Run git commands (commit, push, checkout, branch)\n- File PRs or run build commands\n- Make changes to the codebase in any way"
-
--- ============================================================================
--- SpawnOpencode (worktree — branch + PR)
--- ============================================================================
-
-data SpawnOpencode
-
-data SpawnOpencodeArgs = SpawnOpencodeArgs
-  { soName :: Text,
-    soTask :: Text,
-    soReadFirst :: Maybe [Text],
-    soSteps :: Maybe [Text],
-    soVerify :: Maybe [Text],
-    soBoundary :: Maybe [Text],
-    soContext :: Maybe Text,
-    soStandaloneRepo :: Maybe Bool,
-    soAllowedDirs :: Maybe [Text]
-  }
-  deriving (Show, Eq, Generic)
-
-instance FromJSON SpawnOpencodeArgs where
-  parseJSON = withObject "SpawnOpencodeArgs" $ \v ->
-    SpawnOpencodeArgs
-      <$> v .: "name"
-      <*> v .: "task"
-      <*> v .:? "read_first"
-      <*> v .:? "steps"
-      <*> v .:? "verify"
-      <*> v .:? "boundary"
-      <*> v .:? "context"
-      <*> v .:? "standalone_repo"
-      <*> v .:? "allowed_dirs"
-
-spawnOpencodeDescription :: Text
-spawnOpencodeDescription = "Spawn an OpenCode agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). OpenCode is a TypeScript/Bun-based agent that supports MCP tools. Use structured fields (steps, verify, boundary) for precise specs. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately — you will be notified when the agent files a PR."
-
-spawnOpencodeSchema :: Aeson.Object
-spawnOpencodeSchema =
-  genericToolSchemaWith @SpawnOpencodeArgs
-    [ ("name", "Branch name suffix (e.g., 'fix-clippy' → 'main.fix-clippy')"),
-      ("task", "What to build. Combined with steps/verify/boundary into structured spec"),
-      ("steps", "Numbered implementation steps with code snippets and exact file paths"),
-      ("verify", "Exact verification commands (e.g., 'cargo test --workspace')"),
-      ("boundary", "DO NOT rules for known failure modes"),
-      ("context", "Freeform context: code snippets, examples, patterns to follow"),
-      ("read_first", "File paths to read before starting (CLAUDE.md, source patterns)"),
-      ("standalone_repo", "When true, creates a standalone git repo instead of a worktree for information isolation."),
-      ("allowed_dirs", "Directories from the parent project to be copied into the agent's context (only for standalone_repo).")
-    ]
-
-spawnOpencodeCore :: SpawnOpencodeArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
-spawnOpencodeCore args = do
-  let renderedTask = buildOpencodeTask args <> "\n\n" <> leafProfileText
-      standaloneRepo = fromMaybe False (soStandaloneRepo args)
-      cfg =
-        AC.SpawnOpencodeConfig
-          { AC.socTask = renderedTask,
-            AC.socBranchName = soName args,
-            AC.socRole = Nothing,
-            AC.socStandaloneRepo = standaloneRepo,
-            AC.socAllowedDirs = fromMaybe [] (soAllowedDirs args)
-          }
-  result <- AC.spawnOpencode cfg
-  case result of
-    Left err | hasCustomCode "worktree.branch_exists" err -> do
-      let retrySlug = soName args <> "-2"
-      let cfg' = cfg {AC.socBranchName = retrySlug}
-      result' <- AC.spawnOpencode cfg'
-      case result' of
-        Left err' -> pure $ Left (spawnErrorMessage err')
-        Right spawnResult -> do
-          emitSpawnEvent retrySlug "opencode" (soTask args)
-          pure $ Right (retrySlug, spawnResult)
-    Left err -> pure $ Left (spawnErrorMessage err)
-    Right spawnResult -> do
-      emitSpawnEvent (soName args) "opencode" (soTask args)
-      pure $ Right (soName args, spawnResult)
-
-buildOpencodeTask :: SpawnOpencodeArgs -> Text
-buildOpencodeTask args =
-  let spec =
-        WorkerSpec
-          { wsName = soName args,
-            wsTask = soTask args,
-            wsReadFirst = soReadFirst args,
-            wsSteps = soSteps args,
-            wsVerify = soVerify args,
-            wsDoneCriteria = Nothing,
-            wsBoundary = soBoundary args,
-            wsContext = soContext args,
-            wsPrompt = Nothing,
-            wsProfiles = Nothing,
-            wsContextFiles = Nothing,
-            wsVerifyTemplates = Nothing,
-            wsType = Nothing,
-            wsPermissionMode = Nothing,
-            wsAllowedTools = Nothing,
-            wsDisallowedTools = Nothing
-          }
-   in renderSpec spec
