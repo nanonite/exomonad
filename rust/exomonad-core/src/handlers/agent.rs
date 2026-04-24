@@ -497,7 +497,7 @@ impl<
                 "agent.spawned",
                 ctx.agent_name.as_ref(),
                 &serde_json::json!({
-                    "child_agent": agent_info.id, "agent_type": "claude", "spawn_type": "subtree",
+                    "child_agent": agent_info.id, "agent_type": format!("{:?}", options.agent_type), "spawn_type": "subtree",
                     "branch": agent_info.branch_name,
                 }),
             );
@@ -508,9 +508,10 @@ impl<
         // Register sub-TL as synthetic member so it can receive Teams inbox messages
         let child_identity = crate::services::agent_control::AgentIdentity::new(
             crate::services::agent_control::slugify(&req.branch_name),
-            crate::services::agent_control::AgentType::Claude,
+            options.agent_type,
         );
-        self.register_synthetic_member(&child_identity.internal_name(), "claude-subtree", ctx)
+        let member_type_suffix = options.agent_type.suffix();
+        self.register_synthetic_member(&child_identity.internal_name(), &format!("{}-subtree", member_type_suffix), ctx)
             .await;
 
         // Propagate parent's team to sub-TL's identity keys so the sub-TL can
@@ -559,18 +560,19 @@ impl<
         );
         if let Some(log) = self.ctx.event_log() {
             let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &serde_json::json!({
-                "child_agent": agent_info.id, "agent_type": "gemini", "spawn_type": "leaf_subtree",
+                "child_agent": agent_info.id, "agent_type": format!("{:?}", options.agent_type), "spawn_type": "leaf_subtree",
                 "branch": agent_info.branch_name,
             }));
         }
 
-        // Register as synthetic team member using internal_name (slug-gemini),
+        // Register as synthetic team member using internal_name (slug-{type}),
         // matching what notify_parent sends as `from`.
         let leaf_identity = crate::services::agent_control::AgentIdentity::new(
             crate::services::agent_control::slugify(&req.branch_name),
-            crate::services::agent_control::AgentType::Gemini,
+            options.agent_type,
         );
-        self.register_synthetic_member(&leaf_identity.internal_name(), "gemini-leaf", ctx)
+        let member_type_suffix = options.agent_type.suffix();
+        self.register_synthetic_member(&leaf_identity.internal_name(), &format!("{}-leaf", member_type_suffix), ctx)
             .await;
         self.register_child_supervisor(&req.branch_name, ctx).await;
 

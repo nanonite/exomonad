@@ -667,7 +667,7 @@ pub async fn deliver_to_agent(
         .unwrap_or(agent_key);
     let agents_dir = project_dir.join(".exo/agents");
     let routing_candidates = std::iter::once(agent_key.to_string()).chain(
-        ["gemini", "claude", "shoal"].iter().flat_map(|suffix| {
+        ["gemini", "claude", "shoal", "opencode"].iter().flat_map(|suffix| {
             [
                 format!("{}-{}", slug, suffix),
                 format!("{}-{}", agent_key, suffix),
