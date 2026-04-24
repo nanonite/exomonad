@@ -284,6 +284,7 @@ pub fn resolve_tab_name_for_agent(
 pub async fn notify_parent_delivery(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
+          + super::HasAgentResolver
           + super::HasEventLog
           + super::HasEventQueue
           + super::HasProjectDir),
@@ -419,6 +420,124 @@ async fn deliver_via_uds(
     }
 }
 
+/// Deliver via tmux STDIN injection (routing.json lookup + fallback to tmux_target).
+/// Used as primary path for OpenCode agents and as fallback for others.
+async fn deliver_via_tmux(
+    project_dir: &std::path::Path,
+    agent_key: &str,
+    tmux_target: &str,
+    from: &crate::domain::AgentName,
+    message: &str,
+) -> DeliveryResult {
+    let slug = agent_key
+        .rsplit_once('.')
+        .map(|(_, s)| s)
+        .unwrap_or(agent_key);
+    let agents_dir = project_dir.join(".exo/agents");
+    let routing_candidates = std::iter::once(agent_key.to_string()).chain(
+        ["gemini", "claude", "shoal", "opencode"].iter().flat_map(|suffix| {
+            [
+                format!("{}-{}", slug, suffix),
+                format!("{}-{}", agent_key, suffix),
+            ]
+        }),
+    );
+
+    let mut routing_target = None;
+    let mut routing_parent_tab = None;
+    let mut matched_dir_name = None;
+    for dir_name in routing_candidates {
+        let path = agents_dir.join(&dir_name).join("routing.json");
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            if let Ok(routing) = serde_json::from_str::<serde_json::Value>(&content) {
+                let target = routing["pane_id"]
+                    .as_str()
+                    .or_else(|| routing["window_id"].as_str())
+                    .or_else(|| routing["parent_tab"].as_str())
+                    .map(|s| s.to_string());
+
+                if let Some(t) = target {
+                    routing_target = Some(t);
+                    routing_parent_tab = routing["parent_tab"].as_str().map(|s| s.to_string());
+                    matched_dir_name = Some(dir_name.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(target) = routing_target {
+        tracing::Span::current().record("delivery_method", "tmux");
+        info!(
+            agent = %agent_key,
+            target = %target,
+            chars = message.len(),
+            "Injecting message via routing.json"
+        );
+        let worktree = if let Some(ref parent_tab) = routing_parent_tab {
+            crate::services::resolve_worktree_from_tab(parent_tab)
+        } else if let Some(ref dir_name) = matched_dir_name {
+            let wt_path = project_dir.join(".exo/worktrees").join(dir_name);
+            if wt_path.exists() {
+                std::path::PathBuf::from(format!(".exo/worktrees/{}/", dir_name))
+            } else {
+                crate::services::resolve_working_dir(agent_key)
+            }
+        } else {
+            crate::services::resolve_working_dir(agent_key)
+        };
+        let effective_pd = project_dir.join(worktree);
+        let outcome = match tmux_events::inject_input(&target, message, &effective_pd).await {
+            Ok(()) => "success",
+            Err(e) => {
+                warn!(target = %target, error = %e, "tmux inject_input failed (routing.json)");
+                "failed"
+            }
+        };
+        tracing::info!(
+            otel.name = "message.delivery",
+            agent_id = %from,
+            recipient = %agent_key,
+            method = "tmux_routing",
+            outcome = outcome,
+            detail = %target,
+            "[event] message.delivery"
+        );
+        return DeliveryResult::Tmux;
+    }
+
+    tracing::Span::current().record("delivery_method", "tmux");
+    debug!(
+        target = %tmux_target,
+        agent = %agent_key,
+        chars = message.len(),
+        "Injecting message into agent pane via tmux"
+    );
+    let worktree = if tmux_target == "TL" {
+        std::path::PathBuf::from(".")
+    } else {
+        crate::services::resolve_worktree_from_tab(tmux_target)
+    };
+    let effective_pd = project_dir.join(worktree);
+    let outcome = match tmux_events::inject_input(tmux_target, message, &effective_pd).await {
+        Ok(()) => "success",
+        Err(e) => {
+            warn!(target = %tmux_target, error = %e, "tmux inject_input failed (fallback)");
+            "failed"
+        }
+    };
+    tracing::info!(
+        otel.name = "message.delivery",
+        agent_id = %from,
+        recipient = %agent_key,
+        method = "tmux_fallback",
+        outcome = outcome,
+        detail = %tmux_target,
+        "[event] message.delivery"
+    );
+    DeliveryResult::Tmux
+}
+
 /// Deliver a message to an agent.
 ///
 /// Tries Teams inbox delivery if a registry and agent key are provided.
@@ -427,7 +546,7 @@ async fn deliver_via_uds(
 /// Falls back to tmux input injection if other delivery methods fail or are not available.
 #[instrument(skip_all, fields(agent_key = %agent_key, from = %from, delivery_method = tracing::field::Empty))]
 pub async fn deliver_to_agent(
-    ctx: &(impl super::HasTeamRegistry + super::HasAcpRegistry + super::HasProjectDir),
+    ctx: &(impl super::HasTeamRegistry + super::HasAcpRegistry + super::HasAgentResolver + super::HasProjectDir),
     agent_key: &str,
     tmux_target: &str,
     from: &crate::domain::AgentName,
@@ -436,7 +555,22 @@ pub async fn deliver_to_agent(
 ) -> DeliveryResult {
     let team_registry = ctx.team_registry();
     let acp_registry = ctx.acp_registry();
+    let agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
+
+    // OpenCode agents have no Teams inbox or ACP (until M4) — use tmux as primary
+    let agent_name = crate::domain::AgentName::from(agent_key);
+    let is_opencode = if let Ok(records) = agent_resolver.records_ref().try_read() {
+        records
+            .get(&agent_name)
+            .map(|r| r.agent_type == crate::services::agent_control::AgentType::OpenCode)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if is_opencode {
+        return deliver_via_tmux(project_dir, agent_key, tmux_target, from, message).await;
+    }
 
     // Batch lookup: sender's team (for Tier 2 scoping) + recipient in-memory check.
     // Single lock acquisition instead of two separate get() calls.
@@ -656,120 +790,8 @@ pub async fn deliver_to_agent(
         }
     }
 
-    // routing.json records tmux identifiers at spawn time: pane_id (%N) for
-    // workers, window_id (@N) for subtrees/leaves. Use slug (last dot-segment)
-    // since agent_control writes routing under the slug, not the full branch name.
-    // Try direct agent_key path first (for peer messaging where key is already
-    // the directory name), then slug with all agent type suffixes.
-    let slug = agent_key
-        .rsplit_once('.')
-        .map(|(_, s)| s)
-        .unwrap_or(agent_key);
-    let agents_dir = project_dir.join(".exo/agents");
-    let routing_candidates = std::iter::once(agent_key.to_string()).chain(
-        ["gemini", "claude", "shoal", "opencode"].iter().flat_map(|suffix| {
-            [
-                format!("{}-{}", slug, suffix),
-                format!("{}-{}", agent_key, suffix),
-            ]
-        }),
-    );
-
-    let mut routing_target = None;
-    let mut routing_parent_tab = None;
-    let mut matched_dir_name = None;
-    for dir_name in routing_candidates {
-        let path = agents_dir.join(&dir_name).join("routing.json");
-        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            if let Ok(routing) = serde_json::from_str::<serde_json::Value>(&content) {
-                // Prefer pane_id (workers), then window_id (subtrees/leaves), then parent_tab
-                let target = routing["pane_id"]
-                    .as_str()
-                    .or_else(|| routing["window_id"].as_str())
-                    .or_else(|| routing["parent_tab"].as_str())
-                    .map(|s| s.to_string());
-
-                if let Some(t) = target {
-                    routing_target = Some(t);
-                    routing_parent_tab = routing["parent_tab"].as_str().map(|s| s.to_string());
-                    matched_dir_name = Some(dir_name.clone());
-                    break;
-                }
-            }
-        }
-    }
-
-    if let Some(target) = routing_target {
-        tracing::Span::current().record("delivery_method", "tmux");
-        info!(
-            agent = %agent_key,
-            target = %target,
-            chars = message.len(),
-            "Injecting message via routing.json"
-        );
-        let worktree = if let Some(ref parent_tab) = routing_parent_tab {
-            crate::services::resolve_worktree_from_tab(parent_tab)
-        } else if let Some(ref dir_name) = matched_dir_name {
-            // Check if a worktree exists with this name (subtree agent)
-            let wt_path = project_dir.join(".exo/worktrees").join(dir_name);
-            if wt_path.exists() {
-                std::path::PathBuf::from(format!(".exo/worktrees/{}/", dir_name))
-            } else {
-                crate::services::resolve_working_dir(agent_key)
-            }
-        } else {
-            crate::services::resolve_working_dir(agent_key)
-        };
-        let effective_pd = project_dir.join(worktree);
-        let outcome = match tmux_events::inject_input(&target, message, &effective_pd).await {
-            Ok(()) => "success",
-            Err(e) => {
-                warn!(target = %target, error = %e, "tmux inject_input failed (routing.json)");
-                "failed"
-            }
-        };
-        tracing::info!(
-            otel.name = "message.delivery",
-            agent_id = %from,
-            recipient = %agent_key,
-            method = "tmux_routing",
-            outcome = outcome,
-            detail = %target,
-            "[event] message.delivery"
-        );
-        return DeliveryResult::Tmux;
-    }
-
-    tracing::Span::current().record("delivery_method", "tmux");
-    debug!(
-        target = %tmux_target,
-        agent = %agent_key,
-        chars = message.len(),
-        "Injecting message into agent pane via tmux"
-    );
-    let worktree = if tmux_target == "TL" {
-        std::path::PathBuf::from(".")
-    } else {
-        crate::services::resolve_worktree_from_tab(tmux_target)
-    };
-    let effective_pd = project_dir.join(worktree);
-    let outcome = match tmux_events::inject_input(tmux_target, message, &effective_pd).await {
-        Ok(()) => "success",
-        Err(e) => {
-            warn!(target = %tmux_target, error = %e, "tmux inject_input failed (fallback)");
-            "failed"
-        }
-    };
-    tracing::info!(
-        otel.name = "message.delivery",
-        agent_id = %from,
-        recipient = %agent_key,
-        method = "tmux_fallback",
-        outcome = outcome,
-        detail = %tmux_target,
-        "[event] message.delivery"
-    );
-    DeliveryResult::Tmux
+    // Fall back to tmux STDIN injection
+    deliver_via_tmux(project_dir, agent_key, tmux_target, from, message).await
 }
 
 #[cfg(test)]
