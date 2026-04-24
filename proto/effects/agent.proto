@@ -235,6 +235,8 @@ message SpawnWorkerRequest {
   repeated string allowed_tools = 4;
   // Tool patterns to disallow. Empty = no restriction.
   repeated string disallowed_tools = 5;
+  // Optional agent type override (default: Gemini).
+  AgentType agent_type = 6;
 }
 
 message SpawnWorkerResponse {

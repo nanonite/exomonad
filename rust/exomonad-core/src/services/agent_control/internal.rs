@@ -121,6 +121,7 @@ impl<
         env_vars.insert("EXOMONAD_AGENT_ID".to_string(), agent_name.to_string());
         env_vars.insert("EXOMONAD_SESSION_ID".to_string(), session_id.to_string());
         env_vars.insert("EXOMONAD_ROLE".to_string(), role.as_str().to_string());
+        env_vars.insert("EXOMONAD_SPAWN_AGENT_TYPE".to_string(), self.spawn_agent_type.suffix().to_string());
         if let Some(ref session) = self.tmux_session {
             env_vars.insert("EXOMONAD_TMUX_SESSION".to_string(), session.clone());
         }
@@ -178,6 +179,27 @@ impl<
             }
         }
         Ok(())
+    }
+
+    /// Copy a role context file with template interpolation.
+    ///
+    /// Replaces `{{spawn_agent_type}}` with the configured spawn agent type suffix.
+    /// Falls back to raw copy if the source is not valid UTF-8.
+    pub(crate) async fn copy_role_context_with_interpolation(
+        src: &std::path::Path,
+        dest: &std::path::Path,
+        spawn_type: &str,
+    ) -> std::io::Result<()> {
+        match tokio::fs::read_to_string(src).await {
+            Ok(content) => {
+                let interpolated = content.replace("{{spawn_agent_type}}", spawn_type);
+                tokio::fs::write(dest, interpolated).await
+            }
+            Err(_) => {
+                tokio::fs::copy(src, dest).await?;
+                Ok(())
+            }
+        }
     }
 
     pub(crate) async fn new_tmux_window(
@@ -268,10 +290,7 @@ impl<
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
                 match agent_type {
                     AgentType::OpenCode => {
-                        format!(
-                            "{} run{} \"$(cat {})\"",
-                            cmd, perms_flags, escaped_path
-                        )
+                        format!("{} run{} \"$(cat {})\"", cmd, perms_flags, escaped_path)
                     }
                     _ => {
                         let flag = agent_type.prompt_flag();

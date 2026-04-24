@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- inject agent.md into sub-agent initial prompt (#31)
+- update tl.md with {{spawn_agent_type}} placeholder (#29)
+- interpolate role context template at spawn time (#28)
+- inject EXOMONAD_SPAWN_AGENT_TYPE in common_spawn_env (#27)
+- add --opencode and --claude-code init flags (#26)
+- add spawn_agent_type to config.rs (#25)
+- Auto-create local bare repo when no git remote is configured (#23)
+- Spawn OpenCode in headless ACP server mode (opencode acp --port 0) (#20)
+- Wire ACP into send_message/notify_parent routing for OpenCode agents (#12)
+- Deliver initial task to OpenCode via ACP connect_and_prompt() (#11)
+- Capture ACP port from opencode acp stdout and register in AcpRegistry (#10)
+- Spawn OpenCode in headless ACP server mode (opencode acp --port 0) (#9)
 - Propagate routing chain to OpenCode children (propagate_team_to_child equivalent) (#5)
 - Server-side auto-register OpenCode agents in AgentStore at spawn time (#3)
 - Propagate routing chain to OpenCode children (propagate_team_to_child equivalent) (#17)
@@ -27,6 +39,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- spawn_worker ignores agent_type: hardcodes AgentType::Gemini in Rust (#24)
+- Replace JSON-RPC HTTP client in opencode_acp.rs with opencode run --attach (#22)
+- Fix opencode_acp.rs: change 'opencode acp' to 'opencode serve' (#21)
 - Remove SpawnOpencodeC effect and spawnOpencodeCore from Haskell (#6)
 - Make tmux STDIN injection primary delivery path for OpenCode agents (#4)
 - Fix fork-session CLI flags for OpenCode: --resume/--fork-session → --session/--fork (#2)

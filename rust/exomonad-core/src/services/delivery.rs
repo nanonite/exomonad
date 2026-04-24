@@ -442,12 +442,14 @@ async fn deliver_via_tmux(
     let routing_candidates = std::iter::once(agent_key.to_string())
         .chain(std::iter::once(slug.to_string()))
         .chain(
-            ["gemini", "claude", "shoal", "opencode"].iter().flat_map(|suffix| {
-                [
-                    format!("{}-{}", slug, suffix),
-                    format!("{}-{}", agent_key, suffix),
-                ]
-            }),
+            ["gemini", "claude", "shoal", "opencode"]
+                .iter()
+                .flat_map(|suffix| {
+                    [
+                        format!("{}-{}", slug, suffix),
+                        format!("{}-{}", agent_key, suffix),
+                    ]
+                }),
         );
 
     let mut routing_target = None;
@@ -554,7 +556,11 @@ async fn deliver_via_tmux(
 /// Falls back to tmux input injection if other delivery methods fail or are not available.
 #[instrument(skip_all, fields(agent_key = %agent_key, from = %from, delivery_method = tracing::field::Empty))]
 pub async fn deliver_to_agent(
-    ctx: &(impl super::HasTeamRegistry + super::HasAcpRegistry + super::HasOpencodeAcpRegistry + super::HasAgentResolver + super::HasProjectDir),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasOpencodeAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
     agent_key: &str,
     tmux_target: &str,
     from: &crate::domain::AgentName,
@@ -564,13 +570,12 @@ pub async fn deliver_to_agent(
     let team_registry = ctx.team_registry();
     let acp_registry = ctx.acp_registry();
     let opencode_acp_registry = ctx.opencode_acp_registry();
-    let agent_resolver = ctx.agent_resolver();
+    let _agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
 
     // Check for OpenCode ACP connection first (HTTP delivery)
-    let agent_name = crate::domain::AgentName::from(agent_key);
     if let Some(conn) = opencode_acp_registry.get(agent_key).await {
-        match super::opencode_acp::send_prompt(&conn.base_url, &conn.session_id, message).await {
+        match super::opencode_acp::send_prompt(&conn.base_url, message).await {
             Ok(()) => {
                 tracing::Span::current().record("delivery_method", "opencode_acp");
                 info!(agent = %agent_key, url = %conn.base_url, "Delivered message via OpenCode ACP");

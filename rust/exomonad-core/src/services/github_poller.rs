@@ -15,8 +15,8 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 use crate::services::{
-    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasGitHubClient, HasOpencodeAcpRegistry, HasProjectDir,
-    HasTeamRegistry,
+    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasGitHubClient,
+    HasOpencodeAcpRegistry, HasProjectDir, HasTeamRegistry,
 };
 
 type PluginMap = Arc<RwLock<HashMap<crate::AgentName, Arc<PluginManager>>>>;

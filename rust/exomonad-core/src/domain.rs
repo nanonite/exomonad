@@ -836,9 +836,6 @@ pub struct RoutingInfo {
     /// HTTP ACP endpoint for OpenCode agents (e.g., "http://127.0.0.1:54321").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_url: Option<String>,
-    /// ACP session ID for OpenCode agents.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acp_session_id: Option<String>,
 }
 
 impl RoutingInfo {
@@ -848,7 +845,6 @@ impl RoutingInfo {
             pane_id: None,
             parent_tab: None,
             acp_url: None,
-            acp_session_id: None,
         }
     }
 
@@ -858,17 +854,15 @@ impl RoutingInfo {
             pane_id: Some(pane_id),
             parent_tab: Some(parent_tab.to_string()),
             acp_url: None,
-            acp_session_id: None,
         }
     }
 
-    pub fn acp(acp_url: String, acp_session_id: String) -> Self {
+    pub fn acp(acp_url: String) -> Self {
         Self {
             window_id: None,
             pane_id: None,
             parent_tab: None,
             acp_url: Some(acp_url),
-            acp_session_id: Some(acp_session_id),
         }
     }
 

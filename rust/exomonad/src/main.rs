@@ -70,6 +70,12 @@ enum Commands {
         /// Enable OpenRouter for LLM routing
         #[arg(long)]
         openrouter: bool,
+        /// Set root agent type (overrides --opencode-as-tl)
+        #[arg(long)]
+        tl: Option<String>,
+        /// Set spawn agent type for workers/teammates
+        #[arg(long)]
+        worker: Option<String>,
     },
 
     /// Initialize a new exomonad project in the current directory.
@@ -234,8 +240,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Init { session, recreate, opencode_as_tl, openrouter } => {
-            init::run(session, recreate, opencode_as_tl, openrouter).await?;
+        Commands::Init { session, recreate, opencode_as_tl, openrouter, tl, worker } => {
+            init::run(session, recreate, opencode_as_tl, openrouter, tl, worker).await?;
         }
 
         Commands::New { name } => {

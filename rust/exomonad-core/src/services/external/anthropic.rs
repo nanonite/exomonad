@@ -57,11 +57,10 @@ impl AnthropicService {
     ///
     /// Uses `Authorization: Bearer` auth and prefixes model names with `anthropic/`.
     pub fn with_openrouter(api_key: String) -> Result<Self, ServiceError> {
-        let base_url =
-            Url::parse("https://openrouter.ai/api").map_err(|e| ServiceError::Api {
-                code: 500,
-                message: format!("Invalid hardcoded URL: {}", e),
-            })?;
+        let base_url = Url::parse("https://openrouter.ai/api").map_err(|e| ServiceError::Api {
+            code: 500,
+            message: format!("Invalid hardcoded URL: {}", e),
+        })?;
         Ok(Self {
             client: Client::new(),
             api_key,
@@ -180,7 +179,10 @@ impl ExternalService for AnthropicService {
                     .header("x-api-key", &self.api_key)
                     .header("anthropic-version", "2023-06-01")
             };
-            let response = request.json(&payload).send().await
+            let response = request
+                .json(&payload)
+                .send()
+                .await
                 .map_err(ServiceError::from)?;
 
             if response.status().as_u16() == 529 {

@@ -64,6 +64,51 @@ pub(crate) async fn ensure_branch_pushed(
     }
 }
 
+/// If no git remote is configured, create a local bare repo and set it as origin.
+/// This enables local-only workflows where agents need a remote for PR creation.
+pub(crate) async fn ensure_remote_exists(project_dir: &Path) {
+    let output = tokio::process::Command::new("git")
+        .args(["remote"])
+        .current_dir(project_dir)
+        .output()
+        .await;
+
+    let has_remote = output
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+
+    if has_remote {
+        return;
+    }
+
+    let dir_name = project_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let bare_path = project_dir
+        .parent()
+        .unwrap_or(project_dir)
+        .join(format!("{}.git-remote", dir_name));
+
+    info!(
+        path = %bare_path.display(),
+        "No git remote configured — creating local bare repo as origin"
+    );
+
+    let _ = tokio::process::Command::new("git")
+        .args(["init", "--bare", bare_path.to_str().unwrap_or("")])
+        .output()
+        .await;
+
+    let _ = tokio::process::Command::new("git")
+        .args(["remote", "add", "origin", bare_path.to_str().unwrap_or("")])
+        .current_dir(project_dir)
+        .output()
+        .await;
+
+    info!(path = %bare_path.display(), "Local bare repo set as origin");
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -363,7 +408,10 @@ pub struct SpawnWorkerOptions {
     pub name: AgentName,
     /// Implementation instructions
     pub prompt: String,
-    /// Claude-specific permission flags (ignored for Gemini).
+    /// Agent type (default: Gemini).
+    #[serde(default)]
+    pub agent_type: AgentType,
+    /// Claude-specific permission flags (ignored for non-Claude agents).
     #[serde(default)]
     pub claude_flags: ClaudeSpawnFlags,
 }
@@ -535,6 +583,8 @@ pub struct AgentControlService<C> {
     pub(crate) birth_branch: BirthBranch,
     /// When true, spawned Gemini agents receive `--yolo` flag.
     pub(crate) yolo: bool,
+    /// Agent type for spawned workers/teammates.
+    pub(crate) spawn_agent_type: AgentType,
     /// WASM name for role context resolution (default: "devswarm").
     pub(crate) wasm_name: String,
     /// Pre-serialized extra MCP servers to include in spawned agent configs.
@@ -564,6 +614,7 @@ impl<
             tmux_ipc: None,
             birth_branch: BirthBranch::from("unset"),
             yolo: false,
+            spawn_agent_type: AgentType::Gemini,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: HashMap::new(),
             openrouter_api_key: None,
@@ -598,6 +649,12 @@ impl<
     /// Enable `--yolo` flag for spawned Gemini agents.
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.yolo = yolo;
+        self
+    }
+
+    /// Set the agent type for spawned workers/teammates.
+    pub fn with_spawn_agent_type(mut self, agent_type: AgentType) -> Self {
+        self.spawn_agent_type = agent_type;
         self
     }
 

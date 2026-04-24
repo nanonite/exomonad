@@ -1,12 +1,13 @@
 use crate::uds_client;
 use anyhow::{Context, Result};
 use exomonad::config::Config;
+use exomonad_core::services::AgentType;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Run the init command: create or attach to tmux session.
-pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool) -> Result<()> {
+pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool, tl: Option<String>, worker: Option<String>) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
     use exomonad_core::services::{resolve_role_context_path, AgentType};
     use std::io::{IsTerminal, Write};
@@ -23,6 +24,12 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
     if opencode_as_tl {
         config.opencode_as_tl = true;
         config.root_agent_type = AgentType::OpenCode;
+    }
+    if let Some(ref tl_type) = tl {
+        config.root_agent_type = parse_agent_type(tl_type)?;
+    }
+    if let Some(ref worker_type) = worker {
+        config.spawn_agent_type = parse_agent_type(worker_type)?;
     }
     if openrouter {
         config.openrouter.enabled = true;
@@ -1070,6 +1077,17 @@ pub async fn wait_for_server_socket(project_dir: &Path) -> Result<()> {
     }
 
     anyhow::bail!("Server socket exists but health check failed.")
+}
+
+/// Parse agent type from CLI string (e.g., "opencode", "claude", "gemini").
+fn parse_agent_type(s: &str) -> Result<AgentType> {
+    match s.to_lowercase().as_str() {
+        "claude" | "claude-code" => Ok(AgentType::Claude),
+        "gemini" => Ok(AgentType::Gemini),
+        "opencode" | "opencode-cli" => Ok(AgentType::OpenCode),
+        "shoal" => Ok(AgentType::Shoal),
+        _ => anyhow::bail!("Unknown agent type: {}. Valid values: claude, gemini, opencode, shoal", s),
+    }
 }
 
 /// Gemini CLI hooks for BeforeTool, BeforeModel, AfterModel, and AfterAgent.

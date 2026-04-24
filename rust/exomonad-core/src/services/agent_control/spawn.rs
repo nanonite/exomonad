@@ -461,22 +461,21 @@ impl<
         })
     }
 
-    /// Spawn a Gemini worker agent (Phase 2/3).
-    ///
-    /// Creates a new git worktree and branch for isolation.
-    #[instrument(skip_all, fields(name = %options.name, agent_type = "gemini"))]
+    /// Spawn a worker agent in the current worktree (no branch/worktree).
+    #[instrument(skip_all, fields(name = %options.name, agent_type = %options.agent_type.suffix()))]
     pub async fn spawn_worker(
         &self,
         options: &SpawnWorkerOptions,
         ctx: &crate::effects::EffectContext,
     ) -> Result<SpawnResult> {
-        info!(name = %options.name, timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_worker");
+        let agent_type = options.agent_type;
+        info!(name = %options.name, agent_type = agent_type.suffix(), timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_worker");
 
         let result = timeout(SPAWN_TIMEOUT, async {
             self.resolve_tmux_session()?;
 
             // Sanitize name and construct typed identity
-            let identity = AgentIdentity::new(slugify(options.name.as_str()), AgentType::Gemini);
+            let identity = AgentIdentity::new(slugify(options.name.as_str()), agent_type);
             let agent_name = identity.internal_name();
             let display_name = identity.display_name();
 
@@ -501,7 +500,7 @@ impl<
                         agent_dir: PathBuf::new(),
                         agent_name,
                         issue_title: options.name.to_string(),
-                        agent_type: AgentType::Gemini,
+                        agent_type,
                     });
                 }
                 // Stale: pane is dead but config dir remains. Clean up and respawn.
@@ -516,7 +515,6 @@ impl<
             let session_branch = BranchName::from(parent_bb.as_str());
             let mut env_vars = self.common_spawn_env(&agent_name, &session_branch, &role);
 
-            // Write Gemini settings to worker config dir in project root
             fs::create_dir_all(&agent_config_dir).await?;
 
             // Legacy .birth_branch file for serve.rs fallback resolution.
@@ -524,39 +522,39 @@ impl<
             // but keep this for backward compatibility with older server instances.
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             fs::write(agent_config_dir.join(".birth_branch"), parent_bb.as_str()).await?;
-            let context_path = self.resolve_role_context(&role);
-            let settings = Self::generate_gemini_worker_settings(agent_name.as_str(), context_path.as_deref(), &self.extra_mcp_servers);
-            fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
-            info!(
-                path = %settings_path.display(),
-                agent_name = %agent_name,
-                "Wrote worker Gemini settings to agent config dir"
-            );
 
-            env_vars.insert(
-                "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
-                settings_path.to_string_lossy().to_string(),
-            );
-
-            // Pre-trust the caller's worktree for Gemini
-            let caller_worktree_for_trust = self.project_dir().join(&ctx.working_dir);
-            Self::gemini_trust_folder(&caller_worktree_for_trust).await;
+            match agent_type {
+                AgentType::Gemini => {
+                    let context_path = self.resolve_role_context(&role);
+                    let settings = Self::generate_gemini_worker_settings(agent_name.as_str(), context_path.as_deref(), &self.extra_mcp_servers);
+                    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
+                    info!(path = %settings_path.display(), agent_name = %agent_name, "Wrote worker Gemini settings to agent config dir");
+                    env_vars.insert(
+                        "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
+                        settings_path.to_string_lossy().to_string(),
+                    );
+                    let caller_worktree_for_trust = self.project_dir().join(&ctx.working_dir);
+                    Self::gemini_trust_folder(&caller_worktree_for_trust).await;
+                }
+                AgentType::OpenCode => {
+                    // OpenCode discovers opencode.json from CWD upward.
+                    // The caller's worktree already has opencode.json written by spawn_subtree.
+                    info!(agent_name = %agent_name, "OpenCode worker uses caller worktree opencode.json");
+                }
+                _ => {}
+            }
 
             // Resolve caller's context (tab and worktree) from its context.
             let caller_tab = resolve_own_tab_name(ctx);
             let caller_worktree = ctx.working_dir.clone();
             let absolute_worktree = self.project_dir().join(caller_worktree);
 
-            // Worker role context is loaded via context.fileName in settings.json.
+            // Workers are panes in the parent's tab — pane_id is the stable identifier.
             // Prompt goes through a temp file to avoid shell quoting issues.
-
-            // Write routing info so send_message can target this pane correctly.
-            // Workers are panes in the parent's tab — pane_id is the stable identifier
-            // Spawn pane in caller's tab, cwd = caller's worktree
             let pane_id = self.new_tmux_pane(
                 &display_name,
                 &absolute_worktree,
-                AgentType::Gemini,
+                agent_type,
                 Some(&options.prompt),
                 env_vars,
                 Some(&caller_tab),
@@ -570,7 +568,7 @@ impl<
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
                 slug: Slug::from(identity.slug()),
-                agent_type: AgentType::Gemini,
+                agent_type,
                 birth_branch: parent_bb.clone(),
                 parent_branch: parent_bb,
                 working_dir: ctx.working_dir.clone(),
@@ -586,7 +584,7 @@ impl<
                 agent_dir: PathBuf::new(),
                 agent_name,
                 issue_title: options.name.to_string(),
-                agent_type: AgentType::Gemini,
+                agent_type,
             })
         })
         .await
@@ -644,6 +642,9 @@ impl<
             // Parent branch derived from typed birth-branch.
             let current_branch = BranchName::from(effective_birth.as_parent_branch());
 
+            // Ensure a remote exists for local-only workflows
+            ensure_remote_exists(effective_project_dir).await;
+
             // Push parent branch so child PRs can reference it as base
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
@@ -679,20 +680,19 @@ impl<
             // Must be a copy, not a symlink — symlinks escape the worktree boundary
             // and cause Claude Code to discover parent context files.
             if let Some(context_src) = self.resolve_role_context(role) {
+                let spawn_type = self.spawn_agent_type.suffix();
                 match agent_type {
                     AgentType::Claude => {
-                        // Claude: .claude/rules/exomonad_role.md (loaded as rules file)
                         let rules_dir = worktree_path.join(".claude/rules");
                         let _ = fs::create_dir_all(&rules_dir).await;
                         let dest = rules_dir.join("exomonad_role.md");
                         let _ = fs::remove_file(&dest).await;
-                        match fs::copy(&context_src, &dest).await {
+                        match Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type).await {
                             Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into worktree"),
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy role context (non-fatal)"),
                         }
                     }
                     AgentType::Gemini => {
-                        // Gemini: .exo/roles/{wasm}/context/{role}.md (matched by context.fileName in settings)
                         let dest_dir = worktree_path.join(format!(".exo/roles/{}/context", self.wasm_name));
                         let _ = fs::create_dir_all(&dest_dir).await;
                         let dest = dest_dir.join(format!("{}.md", role));
@@ -703,12 +703,11 @@ impl<
                         }
                     }
                     AgentType::OpenCode => {
-                        // OpenCode: .claude/rules/exomonad_role.md (same layout as Claude for rules discovery)
                         let rules_dir = worktree_path.join(".claude/rules");
                         let _ = fs::create_dir_all(&rules_dir).await;
                         let dest = rules_dir.join("exomonad_role.md");
                         let _ = fs::remove_file(&dest).await;
-                        match fs::copy(&context_src, &dest).await {
+                        match Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type).await {
                             Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into OpenCode worktree"),
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy OpenCode role context (non-fatal)"),
                         }
@@ -803,6 +802,15 @@ impl<
                 task_with_context.push_str("\n\nShared technical dependencies are available as read-only reference in `.exo/context/`. Do not modify files in this directory.");
             }
 
+            // Inject workspace-level agent.md if present
+            let agent_md_path = self.project_dir().join("agent.md");
+            if agent_md_path.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(&agent_md_path).await {
+                    task_with_context.push_str("\n\n---\n\n# Workspace Context (from agent.md)\n\n");
+                    task_with_context.push_str(&content);
+                }
+            }
+
             // Open tmux window with cwd = worktree_path (or ACP server for OpenCode)
             let agent_config_dir = self.project_dir().join(".exo").join("agents").join(agent_name.as_str());
             let routing = match agent_type {
@@ -817,10 +825,9 @@ impl<
                     ).await {
                         Ok(conn) => {
                             let acp_url = conn.base_url.clone();
-                            let session_id = conn.session_id.clone();
                             // Register in OpencodeAcpRegistry
                             self.opencode_acp_registry().register(conn).await;
-                            RoutingInfo::acp(acp_url, session_id)
+                            RoutingInfo::acp(acp_url)
                         }
                         Err(e) => {
                             warn!(name = %identity.slug(), error = %e, "OpenCode ACP spawn failed, rolling back");
@@ -938,6 +945,9 @@ impl<
                 });
             }
 
+            // Ensure a remote exists for local-only workflows
+            ensure_remote_exists(effective_project_dir).await;
+
             // Push parent branch so child PRs can reference it as base
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
@@ -1033,7 +1043,6 @@ impl<
         info!(branch_name = %options.branch_name, "spawn_leaf_subtree completed successfully");
         Ok(result)
     }
-
 }
 
 #[cfg(test)]

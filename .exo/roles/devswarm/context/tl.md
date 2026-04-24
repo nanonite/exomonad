@@ -29,6 +29,11 @@ Write specs complete enough that children don't need to ask — but be ready whe
 If a task involves more than scaffolding, split or extend. Never implement alone.
 Never touch another agent's worktree. Never checkout another branch.
 
+## Worker Spawning
+
+When calling `spawn_worker`, always include `agent_type: {{spawn_agent_type}}`.
+When calling `fork_wave`, set `agent_type` on each child to `{{spawn_agent_type}}` unless the task explicitly requires a different type.
+
 ## Notification Vocabulary
 
 - `[FIXES PUSHED]` — leaf addressed Copilot review comments and pushed. Merge if CI passes.

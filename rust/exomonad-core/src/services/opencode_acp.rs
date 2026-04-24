@@ -1,11 +1,10 @@
-//! OpenCode HTTP-based ACP integration.
+//! OpenCode ACP integration via `opencode serve` + `opencode run --attach`.
 //!
-//! OpenCode exposes an ACP server via `opencode acp --port 0`. This module
-//! spawns the server, captures the listening port, and provides HTTP-based
-//! prompt delivery.
+//! OpenCode exposes a headless server via `opencode serve --port 0`. This module
+//! spawns the server, captures the listening port, and delivers prompts using
+//! `opencode run --attach <url> "message"`.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -14,19 +13,17 @@ use tokio::sync::RwLock;
 
 use crate::domain::AgentName;
 
-/// Metadata for an OpenCode ACP HTTP endpoint.
+/// Metadata for an OpenCode ACP server connection.
 #[derive(Debug, Clone)]
 pub struct OpencodeAcpConnection {
     pub agent_id: AgentName,
     /// Base URL of the ACP server (e.g., "http://127.0.0.1:54321").
     pub base_url: String,
-    /// ACP session ID.
-    pub session_id: String,
     /// Child process handle (kept alive so the server stays running).
     pub child: Arc<tokio::process::Child>,
 }
 
-/// Registry of OpenCode ACP HTTP connections, keyed by agent name.
+/// Registry of OpenCode ACP connections, keyed by agent name.
 #[derive(Debug, Clone, Default)]
 pub struct OpencodeAcpRegistry {
     connections: Arc<RwLock<std::collections::HashMap<AgentName, Arc<OpencodeAcpConnection>>>>,
@@ -58,78 +55,10 @@ impl OpencodeAcpRegistry {
     }
 }
 
-/// ACP request types for OpenCode HTTP API.
-#[derive(Serialize)]
-struct AcpInitializeRequest {
-    jsonrpc: String,
-    method: String,
-    params: InitializeParams,
-    id: u64,
-}
-
-#[derive(Serialize)]
-struct InitializeParams {
-    protocol_version: String,
-    client_info: ClientInfo,
-}
-
-#[derive(Serialize)]
-struct ClientInfo {
-    name: String,
-    version: String,
-}
-
-#[derive(Serialize)]
-struct AcpNewSessionRequest {
-    jsonrpc: String,
-    method: String,
-    params: NewSessionParams,
-    id: u64,
-}
-
-#[derive(Serialize)]
-struct NewSessionParams {
-    cwd: String,
-}
-
-#[derive(Serialize)]
-struct AcpPromptRequest {
-    jsonrpc: String,
-    method: String,
-    params: PromptParams,
-    id: u64,
-}
-
-#[derive(Serialize)]
-struct PromptParams {
-    session_id: String,
-    prompt: Vec<PromptContent>,
-}
-
-#[derive(Serialize)]
-struct PromptContent {
-    #[serde(rename = "type")]
-    content_type: String,
-    text: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct AcpResponse {
-    result: Option<serde_json::Value>,
-    error: Option<AcpError>,
-    id: Option<u64>,
-}
-
-#[derive(Deserialize, Debug)]
-struct AcpError {
-    message: String,
-}
-
-/// Spawn OpenCode in headless ACP server mode and send the initial prompt.
+/// Spawn OpenCode in headless server mode and send the initial prompt.
 ///
-/// Runs `opencode acp --port 0 --cwd <worktree>`, captures the listening port
-/// from stdout, initializes the ACP connection, creates a session, and sends
-/// the initial prompt.
+/// Runs `opencode serve --port 0 --cwd <worktree>`, captures the listening port
+/// from stdout, and delivers the initial prompt via `opencode run --attach`.
 ///
 /// Returns the OpencodeAcpConnection for registry storage.
 pub async fn spawn_and_prompt(
@@ -141,7 +70,7 @@ pub async fn spawn_and_prompt(
     tracing::info!(agent = %agent_id, cwd = %working_dir.display(), "Spawning OpenCode ACP server");
 
     let mut child = Command::new("opencode")
-        .arg("acp")
+        .arg("serve")
         .arg("--port")
         .arg("0")
         .arg("--cwd")
@@ -152,31 +81,27 @@ pub async fn spawn_and_prompt(
         .stderr(Stdio::inherit())
         .envs(env_vars)
         .spawn()
-        .context("Failed to spawn opencode acp")?;
+        .context("Failed to spawn opencode serve")?;
 
     let stdout = child.stdout.take().context("No stdout on child")?;
 
-    // Capture the port from stdout
     let base_url = capture_port(stdout)
         .await
         .context("Failed to capture OpenCode ACP port")?;
 
     tracing::info!(agent = %agent_id, url = %base_url, "OpenCode ACP server started");
 
-    // Keep child alive
-    let child = Arc::new(child);
-
-    // Initialize ACP connection
-    let session_id = initialize_and_prompt(&base_url, working_dir, initial_prompt)
+    deliver_prompt(&base_url, working_dir, initial_prompt)
         .await
-        .context("Failed to initialize OpenCode ACP session")?;
+        .context("Failed to deliver initial prompt via opencode run --attach")?;
 
-    tracing::info!(agent = %agent_id, session_id = %session_id, "OpenCode ACP session created and prompt sent");
+    tracing::info!(agent = %agent_id, url = %base_url, "OpenCode ACP prompt delivered");
+
+    let child = Arc::new(child);
 
     Ok(OpencodeAcpConnection {
         agent_id,
         base_url,
-        session_id,
         child,
     })
 }
@@ -188,15 +113,12 @@ async fn capture_port(stdout: tokio::process::ChildStdout) -> Result<String> {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
 
-    // Wait up to 10 seconds for the port line
     let timeout = tokio::time::Duration::from_secs(10);
     let result = tokio::time::timeout(timeout, async {
         while let Ok(Some(line)) = lines.next_line().await {
-            // Look for patterns like "Listening on http://127.0.0.1:12345" or "http://localhost:12345"
             if let Some(url) = extract_url(&line) {
                 return Some(url);
             }
-            // Also pass through to stderr so we don't lose debug output
             tracing::debug!(line = %line, "OpenCode ACP startup output");
         }
         None
@@ -212,14 +134,11 @@ async fn capture_port(stdout: tokio::process::ChildStdout) -> Result<String> {
 
 /// Extract URL from a log line like "Listening on http://127.0.0.1:12345"
 fn extract_url(line: &str) -> Option<String> {
-    // Try to find http:// URL in the line
     if let Some(start) = line.find("http://") {
         let rest = &line[start..];
-        // URL ends at whitespace or end of line
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let url = &rest[..end];
-        // Remove trailing punctuation if any
-        let url = url.trim_end_matches(|c: char| c == '.' || c == ',' || c == ':');
+        let url = url.trim_end_matches(['.', ',', ':']);
         if !url.is_empty() {
             return Some(url.to_string());
         }
@@ -227,148 +146,46 @@ fn extract_url(line: &str) -> Option<String> {
     None
 }
 
-/// Initialize ACP, create session, and send initial prompt.
-async fn initialize_and_prompt(
-    base_url: &str,
-    working_dir: &Path,
-    prompt: &str,
-) -> Result<String> {
-    let client = reqwest::Client::new();
-
-    // Step 1: Initialize
-    let init_req = AcpInitializeRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "initialize".to_string(),
-        params: InitializeParams {
-            protocol_version: "2024-11-05".to_string(),
-            client_info: ClientInfo {
-                name: "exomonad".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-        },
-        id: 1,
-    };
-
-    let resp = client
-        .post(format!("{}/acp", base_url))
-        .json(&init_req)
-        .send()
+/// Deliver a prompt to an OpenCode serve instance via `opencode run --attach`.
+///
+/// Writes the prompt to a temp file to avoid shell quoting issues, then runs
+/// `opencode run --attach <url> "$(cat <file>)"`.
+async fn deliver_prompt(base_url: &str, working_dir: &Path, prompt: &str) -> Result<()> {
+    let prompt_file = working_dir.join(".exo").join("opencode_prompt.tmp");
+    tokio::fs::create_dir_all(prompt_file.parent().unwrap())
         .await
-        .context("ACP initialize request failed")?;
-
-    let body: AcpResponse = resp
-        .json()
+        .context("Failed to create .exo directory")?;
+    tokio::fs::write(&prompt_file, prompt)
         .await
-        .context("Failed to parse ACP initialize response")?;
+        .context("Failed to write prompt file")?;
 
-    if let Some(err) = body.error {
-        anyhow::bail!("ACP initialize error: {}", err.message);
-    }
+    let escaped_url = shell_escape::escape(base_url.into());
+    let escaped_file = shell_escape::escape(prompt_file.to_string_lossy());
+    let shell_cmd = format!(
+        "opencode run --attach {} \"$(cat {})\"",
+        escaped_url, escaped_file
+    );
 
-    // Step 2: Create session
-    let session_req = AcpNewSessionRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "session/new".to_string(),
-        params: NewSessionParams {
-            cwd: working_dir
-                .to_string_lossy()
-                .to_string(),
-        },
-        id: 2,
-    };
-
-    let resp = client
-        .post(format!("{}/acp", base_url))
-        .json(&session_req)
-        .send()
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&shell_cmd)
+        .current_dir(working_dir)
+        .status()
         .await
-        .context("ACP session/new request failed")?;
+        .context("Failed to run opencode run --attach")?;
 
-    let body: AcpResponse = resp
-        .json()
-        .await
-        .context("Failed to parse ACP session/new response")?;
+    let _ = tokio::fs::remove_file(&prompt_file).await;
 
-    if let Some(err) = body.error {
-        anyhow::bail!("ACP session/new error: {}", err.message);
-    }
-
-    let session_id = body
-        .result
-        .and_then(|r| r.get("sessionId").and_then(|s| s.as_str()).map(|s| s.to_string()))
-        .context("No sessionId in ACP session/new response")?;
-
-    // Step 3: Send prompt
-    let prompt_req = AcpPromptRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "session/prompt".to_string(),
-        params: PromptParams {
-            session_id: session_id.clone(),
-            prompt: vec![PromptContent {
-                content_type: "text".to_string(),
-                text: prompt.to_string(),
-            }],
-        },
-        id: 3,
-    };
-
-    let resp = client
-        .post(format!("{}/acp", base_url))
-        .json(&prompt_req)
-        .send()
-        .await
-        .context("ACP session/prompt request failed")?;
-
-    let body: AcpResponse = resp
-        .json()
-        .await
-        .context("Failed to parse ACP session/prompt response")?;
-
-    if let Some(err) = body.error {
-        anyhow::bail!("ACP session/prompt error: {}", err.message);
-    }
-
-    Ok(session_id)
-}
-
-/// Send a prompt to an existing OpenCode ACP session via HTTP.
-pub async fn send_prompt(
-    base_url: &str,
-    session_id: &str,
-    prompt: &str,
-) -> Result<()> {
-    let client = reqwest::Client::new();
-
-    let prompt_req = AcpPromptRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "session/prompt".to_string(),
-        params: PromptParams {
-            session_id: session_id.to_string(),
-            prompt: vec![PromptContent {
-                content_type: "text".to_string(),
-                text: prompt.to_string(),
-            }],
-        },
-        id: 4,
-    };
-
-    let resp = client
-        .post(format!("{}/acp", base_url))
-        .json(&prompt_req)
-        .send()
-        .await
-        .context("ACP session/prompt request failed")?;
-
-    let body: AcpResponse = resp
-        .json()
-        .await
-        .context("Failed to parse ACP session/prompt response")?;
-
-    if let Some(err) = body.error {
-        anyhow::bail!("ACP session/prompt error: {}", err.message);
+    if !status.success() {
+        anyhow::bail!("opencode run --attach exited with: {}", status);
     }
 
     Ok(())
+}
+
+/// Send a prompt to an existing OpenCode ACP server via `opencode run --attach`.
+pub async fn send_prompt(base_url: &str, prompt: &str) -> Result<()> {
+    deliver_prompt(base_url, Path::new("."), prompt).await
 }
 
 #[cfg(test)]

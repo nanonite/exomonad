@@ -104,6 +104,9 @@ pub struct RawConfig {
     /// Agent type for the root (TL) tab.
     pub root_agent_type: Option<AgentType>,
 
+    /// Agent type for spawned workers/teammates.
+    pub spawn_agent_type: Option<AgentType>,
+
     /// Optional flake reference to use when building WASM plugin via nix.
     pub flake_ref: Option<String>,
 
@@ -168,6 +171,8 @@ pub struct Config {
     pub wasm_dir: PathBuf,
     /// Agent type for the root (TL) tab.
     pub root_agent_type: AgentType,
+    /// Agent type for spawned workers/teammates.
+    pub spawn_agent_type: AgentType,
     /// Flake reference to use when building WASM plugin via nix.
     pub flake_ref: Option<String>,
     /// Name of the WASM module (default: "devswarm").
@@ -297,6 +302,12 @@ impl Config {
             .or(local_raw.root_agent_type)
             .unwrap_or(AgentType::Claude);
 
+        // Resolve spawn_agent_type: local > global > default (Gemini)
+        let spawn_agent_type = local_raw
+            .spawn_agent_type
+            .or(global_raw.spawn_agent_type)
+            .unwrap_or(AgentType::Gemini);
+
         // Resolve flake_ref: local > global > fallback to None
         let flake_ref = local_raw.flake_ref.or(global_raw.flake_ref);
 
@@ -356,6 +367,7 @@ impl Config {
             shell_command,
             wasm_dir,
             root_agent_type,
+            spawn_agent_type,
             flake_ref,
             wasm_name,
             extra_mcp_servers,
@@ -394,6 +406,7 @@ impl Default for Config {
             shell_command: None,
             wasm_dir: PathBuf::from(".exo/wasm"),
             root_agent_type: AgentType::Claude,
+            spawn_agent_type: AgentType::Gemini,
             flake_ref: None,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: std::collections::HashMap::new(),

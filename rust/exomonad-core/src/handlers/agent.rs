@@ -24,7 +24,8 @@ use tracing::{info, warn};
 
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasGitHubClient,
-    HasGitWorktreeService, HasOpencodeAcpRegistry, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
+    HasGitWorktreeService, HasOpencodeAcpRegistry, HasProjectDir, HasSupervisorRegistry,
+    HasTeamRegistry,
 };
 
 /// Agent effect handler.
@@ -372,6 +373,7 @@ impl<
         let options = SpawnWorkerOptions {
             name: AgentName::from(req.name.as_str()),
             prompt: req.prompt.clone(),
+            agent_type: convert_agent_type(req.agent_type()).unwrap_or(ServiceAgentType::Gemini),
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -400,19 +402,21 @@ impl<
                 "agent.spawned",
                 ctx.agent_name.as_ref(),
                 &serde_json::json!({
-                    "child_agent": agent_info.id, "agent_type": "gemini", "spawn_type": "worker",
+                    "child_agent": agent_info.id,
+                    "agent_type": format!("{:?}", options.agent_type).to_lowercase(),
+                    "spawn_type": "worker",
                     "branch": agent_info.branch_name,
                 }),
             );
         }
 
-        // Register as synthetic team member using internal_name (slug-gemini),
+        // Register as synthetic team member using internal_name (slug-{type}),
         // matching what notify_parent sends as `from`.
         let identity = crate::services::agent_control::AgentIdentity::new(
             crate::services::agent_control::slugify(&req.name),
-            crate::services::agent_control::AgentType::Gemini,
+            options.agent_type,
         );
-        self.register_synthetic_member(&identity.internal_name(), "gemini-worker", ctx)
+        self.register_synthetic_member(&identity.internal_name(), options.agent_type.suffix(), ctx)
             .await;
         self.register_child_supervisor(&req.name, ctx).await;
 
@@ -509,12 +513,17 @@ impl<
             options.agent_type,
         );
         let member_type_suffix = options.agent_type.suffix();
-        self.register_synthetic_member(&child_identity.internal_name(), &format!("{}-subtree", member_type_suffix), ctx)
-            .await;
+        self.register_synthetic_member(
+            &child_identity.internal_name(),
+            &format!("{}-subtree", member_type_suffix),
+            ctx,
+        )
+        .await;
 
         // Propagate parent's team to sub-TL's identity keys so the sub-TL can
         // register its own workers as synthetic members when it spawns them
-        self.propagate_team_to_child(&req.branch_name, options.agent_type, ctx).await;
+        self.propagate_team_to_child(&req.branch_name, options.agent_type, ctx)
+            .await;
 
         Ok(SpawnSubtreeResponse {
             agent: Some(agent_info),
@@ -570,8 +579,12 @@ impl<
             options.agent_type,
         );
         let member_type_suffix = options.agent_type.suffix();
-        self.register_synthetic_member(&leaf_identity.internal_name(), &format!("{}-leaf", member_type_suffix), ctx)
-            .await;
+        self.register_synthetic_member(
+            &leaf_identity.internal_name(),
+            &format!("{}-leaf", member_type_suffix),
+            ctx,
+        )
+        .await;
         self.register_child_supervisor(&req.branch_name, ctx).await;
 
         Ok(SpawnLeafSubtreeResponse {
