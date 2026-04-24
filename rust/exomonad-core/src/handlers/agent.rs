@@ -136,6 +136,7 @@ impl<
     async fn propagate_team_to_child(
         &self,
         child_branch: &str,
+        child_agent_type: crate::services::agent_control::AgentType,
         ctx: &crate::effects::EffectContext,
     ) {
         let team_reg = self.ctx.team_registry();
@@ -153,10 +154,9 @@ impl<
         };
 
         // Derive the sub-TL's identity keys from the branch name.
-        // Compute agent_name first, then use it for birth_branch (unified namespace).
         let child_identity = crate::services::agent_control::AgentIdentity::new(
             crate::services::agent_control::slugify(child_branch),
-            crate::services::agent_control::AgentType::Claude,
+            child_agent_type,
         );
         let child_agent_name = child_identity.internal_name();
         let child_birth_branch = format!("{}.{}", ctx.birth_branch, child_agent_name);
@@ -173,11 +173,6 @@ impl<
             inbox_name: parent_team.inbox_name.clone(),
         };
 
-        // Register under agent_name and slug — NOT birth_branch.
-        // Sub-TLs don't have CC Teams inboxes (they never call TeamCreate),
-        // so registering their birth_branch would cause deliver_to_agent to
-        // write to the parent's inbox (wrong recipient) instead of falling
-        // back to tmux (correct recipient).
         team_reg
             .register(child_agent_name.as_str(), team_info.clone())
             .await;
@@ -516,7 +511,7 @@ impl<
 
         // Propagate parent's team to sub-TL's identity keys so the sub-TL can
         // register its own workers as synthetic members when it spawns them
-        self.propagate_team_to_child(&req.branch_name, ctx).await;
+        self.propagate_team_to_child(&req.branch_name, options.agent_type, ctx).await;
 
         Ok(SpawnSubtreeResponse {
             agent: Some(agent_info),

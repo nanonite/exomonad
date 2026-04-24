@@ -434,14 +434,18 @@ async fn deliver_via_tmux(
         .map(|(_, s)| s)
         .unwrap_or(agent_key);
     let agents_dir = project_dir.join(".exo/agents");
-    let routing_candidates = std::iter::once(agent_key.to_string()).chain(
-        ["gemini", "claude", "shoal", "opencode"].iter().flat_map(|suffix| {
-            [
-                format!("{}-{}", slug, suffix),
-                format!("{}-{}", agent_key, suffix),
-            ]
-        }),
-    );
+    // Try the bare slug directly (handles birth-branch keys like "main.root-tl-opencode"
+    // where the directory is "root-tl-opencode"), then with type suffixes.
+    let routing_candidates = std::iter::once(agent_key.to_string())
+        .chain(std::iter::once(slug.to_string()))
+        .chain(
+            ["gemini", "claude", "shoal", "opencode"].iter().flat_map(|suffix| {
+                [
+                    format!("{}-{}", slug, suffix),
+                    format!("{}-{}", agent_key, suffix),
+                ]
+            }),
+        );
 
     let mut routing_target = None;
     let mut routing_parent_tab = None;
