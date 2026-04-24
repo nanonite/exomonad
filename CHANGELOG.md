@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Strip invalid --dangerously-skip-permissions flag from OpenCode command builder (#13)
 - **Teams inbox delivery** replaces Zellij stdin injection as primary delivery mechanism. `notify_parent` → Teams inbox → native `<teammate-message>` in parent conversation.
 - **`notify_parent` is a message bus**, not a completion signal. Used for status updates, failure escalation, and structured results.
 - **Event-driven PR review flow**: Stop hook and prompts updated for event handler architecture. Leaf agents no longer need to manually call `notify_parent` after Copilot review — the event system handles it.

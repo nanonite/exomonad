@@ -240,13 +240,7 @@ impl<
                     String::new()
                 }
             }
-            AgentType::OpenCode => {
-                if yolo {
-                    " --dangerously-skip-permissions".to_string()
-                } else {
-                    String::new()
-                }
-            }
+            AgentType::OpenCode => String::new(),
             AgentType::Shoal | AgentType::Process => String::new(),
         };
 
