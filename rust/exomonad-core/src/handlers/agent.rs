@@ -576,61 +576,6 @@ impl<
         })
     }
 
-    async fn spawn_opencode(
-        &self,
-        req: SpawnOpencodeRequest,
-        ctx: &crate::effects::EffectContext,
-    ) -> EffectResult<SpawnOpencodeResponse> {
-        let options = SpawnLeafOptions {
-            task: req.task.clone(),
-            branch_name: req.branch_name.clone(),
-            role: non_empty(req.role.clone()).map(crate::domain::Role::new),
-            agent_type: ServiceAgentType::OpenCode,
-            claude_flags: claude_spawn_flags(
-                String::new(),
-                Vec::new(),
-                Vec::new(),
-            ),
-            standalone_repo: req.standalone_repo,
-            allowed_dirs: req.allowed_dirs,
-        };
-
-        let result = self
-            .service
-            .spawn_opencode(&options, &ctx.birth_branch)
-            .await
-            .effect_err_preserve("agent")?;
-
-        let agent_info = leaf_subtree_result_to_proto(&req.branch_name, &result);
-
-        tracing::info!(
-            otel.name = "agent.spawned",
-            child_agent = %agent_info.id,
-            agent_type = %AgentType::try_from(agent_info.agent_type).map(|t| format!("{:?}", t)).unwrap_or_else(|_| "unknown".to_string()),
-            branch = %agent_info.branch_name,
-            spawn_type = "opencode",
-            "[event] agent.spawned"
-        );
-        if let Some(log) = self.ctx.event_log() {
-            let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &serde_json::json!({
-                "child_agent": agent_info.id, "agent_type": "opencode", "spawn_type": "opencode",
-                "branch": agent_info.branch_name,
-            }));
-        }
-
-        let opencode_identity = crate::services::agent_control::AgentIdentity::new(
-            crate::services::agent_control::slugify(&req.branch_name),
-            crate::services::agent_control::AgentType::OpenCode,
-        );
-        self.register_synthetic_member(&opencode_identity.internal_name(), "opencode-leaf", ctx)
-            .await;
-        self.register_child_supervisor(&req.branch_name, ctx).await;
-
-        Ok(SpawnOpencodeResponse {
-            agent: Some(agent_info),
-        })
-    }
-
     async fn spawn_acp(
         &self,
         req: SpawnAcpRequest,

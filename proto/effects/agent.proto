@@ -313,26 +313,6 @@ message SpawnLeafSubtreeResponse {
 }
 
 // ============================================================================
-// SpawnOpencode - Spawn an OpenCode agent in a new git worktree
-// ============================================================================
-
-message SpawnOpencodeRequest {
-  // Full prompt/instructions (collapsed task+context).
-  string task = 1;
-  // Branch name suffix (e.g., "feature-a").
-  string branch_name = 2;
-  string role = 3;        // Optional role override (default: "dev")
-  // When true, creates a standalone git repo instead of a worktree.
-  bool standalone_repo = 4;
-  // Directories from the parent project to be copied into the agent's worktree.
-  repeated string allowed_dirs = 5;
-}
-
-message SpawnOpencodeResponse {
-  AgentInfo agent = 1;
-}
-
-// ============================================================================
 // SpawnAcp - Spawn a Gemini agent via ACP (headless, no tmux window)
 // ============================================================================
 
@@ -378,7 +358,6 @@ service AgentEffects {
   rpc SpawnWorker(SpawnWorkerRequest) returns (SpawnWorkerResponse);
   rpc SpawnSubtree(SpawnSubtreeRequest) returns (SpawnSubtreeResponse);
   rpc SpawnLeafSubtree(SpawnLeafSubtreeRequest) returns (SpawnLeafSubtreeResponse);
-  rpc SpawnOpencode(SpawnOpencodeRequest) returns (SpawnOpencodeResponse);
   rpc SpawnAcp(SpawnAcpRequest) returns (SpawnAcpResponse);
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);
   rpc CleanupBatch(CleanupBatchRequest) returns (CleanupBatchResponse);
