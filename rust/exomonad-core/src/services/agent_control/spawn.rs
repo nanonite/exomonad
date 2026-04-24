@@ -3,6 +3,7 @@ use super::*;
 impl<
         C: super::super::HasGitHubClient
             + super::super::HasAcpRegistry
+            + super::super::HasOpencodeAcpRegistry
             + super::super::HasTeamRegistry
             + super::super::HasAgentResolver
             + super::super::HasProjectDir
@@ -802,13 +803,41 @@ impl<
                 task_with_context.push_str("\n\nShared technical dependencies are available as read-only reference in `.exo/context/`. Do not modify files in this directory.");
             }
 
-            // Open tmux window with cwd = worktree_path
+            // Open tmux window with cwd = worktree_path (or ACP server for OpenCode)
             let agent_config_dir = self.project_dir().join(".exo").join("agents").join(agent_name.as_str());
-            let window_id = match agent_type {
+            let routing = match agent_type {
+                AgentType::OpenCode => {
+                    // Spawn OpenCode in headless ACP mode
+                    let env_vec: Vec<(String, String)> = env_vars.into_iter().collect();
+                    match super::super::opencode_acp::spawn_and_prompt(
+                        agent_name.clone(),
+                        &worktree_path,
+                        &task_with_context,
+                        env_vec,
+                    ).await {
+                        Ok(conn) => {
+                            let acp_url = conn.base_url.clone();
+                            let session_id = conn.session_id.clone();
+                            // Register in OpencodeAcpRegistry
+                            self.opencode_acp_registry().register(conn).await;
+                            RoutingInfo::acp(acp_url, session_id)
+                        }
+                        Err(e) => {
+                            warn!(name = %identity.slug(), error = %e, "OpenCode ACP spawn failed, rolling back");
+                            let _ = fs::remove_dir_all(&agent_config_dir).await;
+                            if worktree_path.exists() {
+                                let git_wt = self.git_wt().clone();
+                                let path = worktree_path.clone();
+                                let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
                 AgentType::Claude => {
                     // Determine fork mode from parent_session_id
                     let fork_id = options.parent_session_id.as_ref().map(|id| id.as_str());
-                    self.new_tmux_window_inner(
+                    let window_id = self.new_tmux_window_inner(
                         &display_name,
                         &worktree_path,
                         agent_type,
@@ -818,9 +847,14 @@ impl<
                         Some(&options.claude_flags),
                     )
                     .await
+                    .map_err(|e| {
+                        warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
+                        e
+                    })?;
+                    RoutingInfo::window(window_id)
                 }
                 _ => {
-                    self.new_tmux_window(
+                    let window_id = self.new_tmux_window(
                         &display_name,
                         &worktree_path,
                         agent_type,
@@ -828,25 +862,13 @@ impl<
                         env_vars,
                     )
                     .await
+                    .map_err(|e| {
+                        warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
+                        e
+                    })?;
+                    RoutingInfo::window(window_id)
                 }
             };
-            let window_id = match window_id {
-                Ok(wid) => wid,
-                Err(e) => {
-                    warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
-                    let _ = fs::remove_dir_all(&agent_config_dir).await;
-                    // Remove worktree if it was created
-                    if worktree_path.exists() {
-                        let git_wt = self.git_wt().clone();
-                        let path = worktree_path.clone();
-                        let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
-                    }
-                    return Err(e);
-                }
-            };
-
-            // Store window_id for message delivery and cleanup
-            let routing = RoutingInfo::window(window_id);
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
                 slug: Slug::from(identity.slug()),

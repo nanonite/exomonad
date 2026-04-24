@@ -24,7 +24,7 @@ use tracing::{info, warn};
 
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasGitHubClient,
-    HasGitWorktreeService, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
+    HasGitWorktreeService, HasOpencodeAcpRegistry, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
 };
 
 /// Agent effect handler.
@@ -39,6 +39,7 @@ pub struct AgentHandler<C> {
 impl<
         C: HasTeamRegistry
             + HasAcpRegistry
+            + HasOpencodeAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir
@@ -188,6 +189,7 @@ impl<
 impl<
         C: HasTeamRegistry
             + HasAcpRegistry
+            + HasOpencodeAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir
@@ -264,6 +266,7 @@ fn parse_repo(repo: &str) -> EffectResult<GithubRepo> {
 impl<
         C: HasTeamRegistry
             + HasAcpRegistry
+            + HasOpencodeAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir

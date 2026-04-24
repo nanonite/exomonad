@@ -153,6 +153,7 @@ impl DeliveryOutcome {
 pub async fn route_message(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
+          + super::HasOpencodeAcpRegistry
           + super::HasAgentResolver
           + super::HasProjectDir),
     address: &Address,
@@ -193,6 +194,7 @@ pub async fn route_message(
 async fn resolve_and_deliver_to_lead(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
+          + super::HasOpencodeAcpRegistry
           + super::HasAgentResolver
           + super::HasProjectDir),
     team_name: &str,
@@ -284,6 +286,7 @@ pub fn resolve_tab_name_for_agent(
 pub async fn notify_parent_delivery(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
+          + super::HasOpencodeAcpRegistry
           + super::HasAgentResolver
           + super::HasEventLog
           + super::HasEventQueue
@@ -544,13 +547,14 @@ async fn deliver_via_tmux(
 
 /// Deliver a message to an agent.
 ///
+/// For OpenCode agents with ACP: HTTP POST to ACP server.
 /// Tries Teams inbox delivery if a registry and agent key are provided.
 /// Attempts ACP prompt delivery if a registry is provided and agent is registered.
 /// Attempts HTTP-over-UDS delivery for custom binary agents (e.g., shoal-agent).
 /// Falls back to tmux input injection if other delivery methods fail or are not available.
 #[instrument(skip_all, fields(agent_key = %agent_key, from = %from, delivery_method = tracing::field::Empty))]
 pub async fn deliver_to_agent(
-    ctx: &(impl super::HasTeamRegistry + super::HasAcpRegistry + super::HasAgentResolver + super::HasProjectDir),
+    ctx: &(impl super::HasTeamRegistry + super::HasAcpRegistry + super::HasOpencodeAcpRegistry + super::HasAgentResolver + super::HasProjectDir),
     agent_key: &str,
     tmux_target: &str,
     from: &crate::domain::AgentName,
@@ -559,21 +563,45 @@ pub async fn deliver_to_agent(
 ) -> DeliveryResult {
     let team_registry = ctx.team_registry();
     let acp_registry = ctx.acp_registry();
+    let opencode_acp_registry = ctx.opencode_acp_registry();
     let agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
 
-    // OpenCode agents have no Teams inbox or ACP (until M4) — use tmux as primary
+    // Check for OpenCode ACP connection first (HTTP delivery)
     let agent_name = crate::domain::AgentName::from(agent_key);
-    let is_opencode = if let Ok(records) = agent_resolver.records_ref().try_read() {
-        records
-            .get(&agent_name)
-            .map(|r| r.agent_type == crate::services::agent_control::AgentType::OpenCode)
-            .unwrap_or(false)
-    } else {
-        false
-    };
-    if is_opencode {
-        return deliver_via_tmux(project_dir, agent_key, tmux_target, from, message).await;
+    if let Some(conn) = opencode_acp_registry.get(agent_key).await {
+        match super::opencode_acp::send_prompt(&conn.base_url, &conn.session_id, message).await {
+            Ok(()) => {
+                tracing::Span::current().record("delivery_method", "opencode_acp");
+                info!(agent = %agent_key, url = %conn.base_url, "Delivered message via OpenCode ACP");
+                tracing::info!(
+                    otel.name = "message.delivery",
+                    agent_id = %from,
+                    recipient = %agent_key,
+                    method = "opencode_acp",
+                    outcome = "success",
+                    detail = %conn.base_url,
+                    "[event] message.delivery"
+                );
+                return DeliveryResult::Acp;
+            }
+            Err(e) => {
+                warn!(
+                    agent = %agent_key,
+                    error = %e,
+                    "OpenCode ACP prompt failed, falling back to tmux"
+                );
+                tracing::info!(
+                    otel.name = "message.delivery",
+                    agent_id = %from,
+                    recipient = %agent_key,
+                    method = "opencode_acp",
+                    outcome = "failed",
+                    detail = ?e,
+                    "[event] message.delivery"
+                );
+            }
+        }
     }
 
     // Batch lookup: sender's team (for Tier 2 scoping) + recipient in-memory check.

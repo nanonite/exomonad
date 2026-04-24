@@ -20,6 +20,7 @@ pub mod local;
 pub mod log;
 pub mod merge_pr;
 pub mod mutex_registry;
+pub mod opencode_acp;
 pub mod repo;
 pub mod resilience;
 pub mod secrets;
@@ -41,6 +42,7 @@ pub use self::filesystem::FileSystemService;
 pub use self::git_worktree::GitWorktreeService;
 pub use self::github::GitHubClient;
 pub use self::mutex_registry::MutexRegistry;
+pub use self::opencode_acp::{OpencodeAcpConnection, OpencodeAcpRegistry};
 pub use self::secrets::Secrets;
 pub use self::supervisor_registry::SupervisorRegistry;
 use claude_teams_bridge::TeamRegistry;
@@ -85,6 +87,9 @@ pub trait HasGitHubClient: Send + Sync {
 pub trait HasGitWorktreeService: Send + Sync {
     fn git_worktree_service(&self) -> &Arc<GitWorktreeService>;
 }
+pub trait HasOpencodeAcpRegistry: Send + Sync {
+    fn opencode_acp_registry(&self) -> &OpencodeAcpRegistry;
+}
 
 // ============================================================================
 // Services — the concrete type that implements all traits
@@ -101,6 +106,7 @@ pub struct Services {
     pub event_log: Option<Arc<EventLog>>,
     pub team_registry: Arc<TeamRegistry>,
     pub acp_registry: Arc<AcpRegistry>,
+    pub opencode_acp_registry: Arc<OpencodeAcpRegistry>,
     pub supervisor_registry: Arc<SupervisorRegistry>,
     pub claude_session_registry: Arc<ClaudeSessionRegistry>,
     pub agent_resolver: Arc<AgentResolver>,
@@ -164,6 +170,11 @@ impl HasGitWorktreeService for Services {
         &self.git_wt
     }
 }
+impl HasOpencodeAcpRegistry for Services {
+    fn opencode_acp_registry(&self) -> &OpencodeAcpRegistry {
+        &self.opencode_acp_registry
+    }
+}
 
 #[cfg(test)]
 impl Services {
@@ -175,6 +186,7 @@ impl Services {
             event_log: None,
             team_registry: Arc::new(TeamRegistry::new()),
             acp_registry: Arc::new(AcpRegistry::new()),
+            opencode_acp_registry: Arc::new(OpencodeAcpRegistry::new()),
             supervisor_registry: Arc::new(SupervisorRegistry::new()),
             claude_session_registry: Arc::new(ClaudeSessionRegistry::new()),
             agent_resolver: Arc::new(AgentResolver::empty()),

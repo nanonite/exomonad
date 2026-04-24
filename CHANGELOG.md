@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Propagate routing chain to OpenCode children (propagate_team_to_child equivalent) (#5)
+- Server-side auto-register OpenCode agents in AgentStore at spawn time (#3)
+- Propagate routing chain to OpenCode children (propagate_team_to_child equivalent) (#17)
+- Server-side auto-register OpenCode agents in AgentStore at spawn time (#15)
 - **FixesPushed event**: Poller fires `fixes_pushed` event when leaf addresses Copilot review and pushes fixes. Copilot does NOT re-review — this is the actionable signal for the TL to merge.
 - **Dual timeout**: 15 minutes for initial Copilot review, 5 minutes after leaf addresses changes (since Copilot won't re-review).
 - **Event handler dispatch**: Third dispatch category alongside tools and hooks. GitHub poller calls WASM `handle_event` for PR review events (reviews, approvals, timeouts, fixes pushed) and sibling merge events.
@@ -23,6 +27,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Remove SpawnOpencodeC effect and spawnOpencodeCore from Haskell (#6)
+- Make tmux STDIN injection primary delivery path for OpenCode agents (#4)
+- Fix fork-session CLI flags for OpenCode: --resume/--fork-session → --session/--fork (#2)
+- Strip invalid --dangerously-skip-permissions flag from OpenCode command builder (#1)
+- Remove spawn_opencode Rust implementation from spawn.rs (#19)
+- Remove spawn_opencode Rust implementation from spawn.rs (#8)
+- Remove spawn_opencode handler in handlers/agent.rs (#7)
+- Remove SpawnOpencodeC effect and spawnOpencodeCore from Haskell (#18)
+- Make tmux STDIN injection primary delivery path for OpenCode agents (#16)
+- Fix fork-session CLI flags for OpenCode: --resume/--fork-session → --session/--fork (#14)
 - Strip invalid --dangerously-skip-permissions flag from OpenCode command builder (#13)
 - **Teams inbox delivery** replaces Zellij stdin injection as primary delivery mechanism. `notify_parent` → Teams inbox → native `<teammate-message>` in parent conversation.
 - **`notify_parent` is a message bus**, not a completion signal. Used for status updates, failure escalation, and structured results.
