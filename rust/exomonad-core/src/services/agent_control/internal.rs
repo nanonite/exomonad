@@ -251,7 +251,7 @@ impl<
                 match agent_type {
                     AgentType::OpenCode => {
                         format!(
-                            "{} run{} --resume {} --fork-session \"$(cat {})\"",
+                            "{} run{} --session {} --fork \"$(cat {})\"",
                             cmd, perms_flags, escaped_session, escaped_path
                         )
                     }
