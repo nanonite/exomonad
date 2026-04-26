@@ -3,6 +3,16 @@
 use anyhow::{Context, Result};
 use exomonad_core::services::AgentType;
 use exomonad_core::Role;
+
+fn parse_agent_type_env(s: &str) -> Option<AgentType> {
+    match s.to_lowercase().as_str() {
+        "claude" | "claude-code" => Some(AgentType::Claude),
+        "gemini" => Some(AgentType::Gemini),
+        "opencode" | "opencode-cli" => Some(AgentType::OpenCode),
+        "shoal" => Some(AgentType::Shoal),
+        _ => None,
+    }
+}
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -296,15 +306,19 @@ impl Config {
             })
             .unwrap_or_else(|| project_root.join(".exo/wasm"));
 
-        // Resolve root_agent_type: global > local > default (Claude)
-        let root_agent_type = global_raw
-            .root_agent_type
+        // Resolve root_agent_type: env > global > local > default (Claude)
+        let root_agent_type = std::env::var("EXOMONAD_ROOT_AGENT_TYPE")
+            .ok()
+            .and_then(|s| parse_agent_type_env(&s))
+            .or(global_raw.root_agent_type)
             .or(local_raw.root_agent_type)
             .unwrap_or(AgentType::Claude);
 
-        // Resolve spawn_agent_type: local > global > default (Gemini)
-        let spawn_agent_type = local_raw
-            .spawn_agent_type
+        // Resolve spawn_agent_type: env > local > global > default (Gemini)
+        let spawn_agent_type = std::env::var("EXOMONAD_SPAWN_AGENT_TYPE")
+            .ok()
+            .and_then(|s| parse_agent_type_env(&s))
+            .or(local_raw.spawn_agent_type)
             .or(global_raw.spawn_agent_type)
             .unwrap_or(AgentType::Gemini);
 

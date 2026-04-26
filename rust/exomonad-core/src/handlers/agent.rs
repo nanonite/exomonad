@@ -370,10 +370,11 @@ impl<
         req: SpawnWorkerRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnWorkerResponse> {
+        let default_type = self.service.default_spawn_agent_type();
         let options = SpawnWorkerOptions {
             name: AgentName::from(req.name.as_str()),
             prompt: req.prompt.clone(),
-            agent_type: convert_agent_type(req.agent_type()).unwrap_or(ServiceAgentType::Gemini),
+            agent_type: convert_agent_type(req.agent_type()).unwrap_or(default_type),
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -457,12 +458,13 @@ impl<
             None
         };
 
+        let default_type = self.service.default_spawn_agent_type();
         let options = SpawnSubtreeOptions {
             task: req.task.clone(),
             branch_name: req.branch_name.clone(),
             parent_session_id,
             role: non_empty(req.role.clone()).map(crate::domain::Role::new),
-            agent_type: convert_agent_type(req.agent_type())?,
+            agent_type: convert_agent_type(req.agent_type()).unwrap_or(default_type),
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -535,11 +537,12 @@ impl<
         req: SpawnLeafSubtreeRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
+        let default_type = self.service.default_spawn_agent_type();
         let options = SpawnLeafOptions {
             task: req.task.clone(),
             branch_name: req.branch_name.clone(),
             role: non_empty(req.role.clone()).map(crate::domain::Role::new),
-            agent_type: convert_agent_type(req.agent_type())?,
+            agent_type: convert_agent_type(req.agent_type()).unwrap_or(default_type),
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -943,10 +946,10 @@ fn worker_result_to_proto(
         issue: String::new(),
         worktree_path: String::new(),
         branch_name: String::new(),
-        agent_type: AgentType::Gemini as i32,
+        agent_type: service_agent_type_to_proto(result.agent_type),
         role: 0,
         alive: true,
-        mux_window: ServiceAgentType::Gemini.tab_display_name(name),
+        mux_window: result.agent_type.tab_display_name(name),
         error: String::new(),
         pr_number: 0,
         pr_url: String::new(),

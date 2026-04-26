@@ -658,6 +658,11 @@ impl<
         self
     }
 
+    /// Get the configured default agent type for spawned workers/teammates.
+    pub fn default_spawn_agent_type(&self) -> AgentType {
+        self.spawn_agent_type
+    }
+
     /// Set extra MCP servers to include in spawned agent configs.
     pub fn with_extra_mcp_servers(mut self, servers: HashMap<String, serde_json::Value>) -> Self {
         self.extra_mcp_servers = servers;

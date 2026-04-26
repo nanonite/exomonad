@@ -482,7 +482,12 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
         }
     }
 
-    let serve_cmd = format!("EXOMONAD_TMUX_SESSION={} exomonad serve", &session);
+    let serve_cmd = format!(
+        "EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} exomonad serve",
+        &session,
+        agent_type_str(config.root_agent_type),
+        agent_type_str(config.spawn_agent_type),
+    );
     let send_status = std::process::Command::new("tmux")
         .args([
             "send-keys",
@@ -1087,6 +1092,16 @@ fn parse_agent_type(s: &str) -> Result<AgentType> {
         "opencode" | "opencode-cli" => Ok(AgentType::OpenCode),
         "shoal" => Ok(AgentType::Shoal),
         _ => anyhow::bail!("Unknown agent type: {}. Valid values: claude, gemini, opencode, shoal", s),
+    }
+}
+
+fn agent_type_str(t: AgentType) -> &'static str {
+    match t {
+        AgentType::Claude => "claude",
+        AgentType::Gemini => "gemini",
+        AgentType::OpenCode => "opencode",
+        AgentType::Shoal => "shoal",
+        AgentType::Process => "process",
     }
 }
 

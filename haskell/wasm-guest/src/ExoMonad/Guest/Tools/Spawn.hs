@@ -184,7 +184,8 @@ forkWaveCore args = do
         _ -> do
           -- Spawn each child
           results <- forM (fwaChildren args) $ \child -> do
-            let childAgentType = fromMaybe AC.Claude (fwcAgentType child)
+            let childAgentType = fwcAgentType child
+                labelStr = maybe "auto" AC.agentTypeLabel childAgentType
                 cfg =
                   AC.SpawnSubtreeConfig
                     { AC.stcTask = fwcTask child,
@@ -207,11 +208,11 @@ forkWaveCore args = do
                 case result' of
                   Left err' -> pure (Left (spawnErrorMessage err'))
                   Right spawnResult -> do
-                    emitSpawnEvent retrySlug (AC.agentTypeLabel childAgentType) (fwcTask child)
+                    emitSpawnEvent retrySlug labelStr (fwcTask child)
                     pure (Right (retrySlug, spawnResult))
               Left err -> pure (Left (spawnErrorMessage err))
               Right spawnResult -> do
-                emitSpawnEvent (fwcSlug child) (AC.agentTypeLabel childAgentType) (fwcTask child)
+                emitSpawnEvent (fwcSlug child) labelStr (fwcTask child)
                 pure (Right (fwcSlug child, spawnResult))
 
           let (errs, successes) = partitionEithers results
@@ -293,7 +294,7 @@ spawnLeafSubtreeCore args = do
           { AC.slcTask = renderedTask,
             AC.slcBranchName = slsBranchName args,
             AC.slcRole = Nothing,
-            AC.slcAgentType = AC.Gemini,
+            AC.slcAgentType = Nothing,
             AC.slcPerms = perms,
             AC.slcStandaloneRepo = standaloneRepo,
             AC.slcAllowedDirs = fromMaybe [] (slsAllowedDirs args)
@@ -307,11 +308,11 @@ spawnLeafSubtreeCore args = do
       case result' of
         Left err' -> pure $ Left (spawnErrorMessage err')
         Right spawnResult -> do
-          emitSpawnEvent retrySlug "gemini" (slsTask args)
+          emitSpawnEvent retrySlug "auto" (slsTask args)
           pure $ Right (retrySlug, spawnResult)
     Left err -> pure $ Left (spawnErrorMessage err)
     Right spawnResult -> do
-      emitSpawnEvent (slsBranchName args) "gemini" (slsTask args)
+      emitSpawnEvent (slsBranchName args) "auto" (slsTask args)
       pure $ Right (slsBranchName args, spawnResult)
 
 -- | Render a spawn leaf result to MCPCallOutput.

@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
+
 ### Added
 - inject agent.md into sub-agent initial prompt (#31)
 - update tl.md with {{spawn_agent_type}} placeholder (#29)
