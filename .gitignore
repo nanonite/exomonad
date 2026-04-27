@@ -68,6 +68,13 @@ rust/.exo/
 rust/exomonad/.exomonad/
 rust/exomonad/.exo/
 
+# GHC TemplateHaskell splice .so dumps (leaked to CWD)
+.*-[0-9]*.so
+
+# Stale Nix shell tempdirs (leak to CWD when shell is killed hard)
+nix-develop-*/
+nix-shell.*/
+
 # Temporary task files for worktree dispatch
 *.md.tmp
 # Prompt temp files (created by spawn, read by agents via $(cat ...))
