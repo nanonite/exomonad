@@ -47,6 +47,7 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 futures-util = { workspace = true }
 nix = { workspace = true }
+shell-escape = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

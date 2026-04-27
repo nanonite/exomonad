@@ -6,6 +6,35 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// Reject `--tl-model` / `--worker-model` values that opencode doesn't recognise.
+/// Caller must only invoke this when the model is `Some` and the agent type is OpenCode.
+async fn validate_opencode_model(model: &str) -> Result<()> {
+    let out = tokio::process::Command::new("opencode")
+        .args(["models"])
+        .output()
+        .await
+        .context("Failed to run `opencode models` for validation")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`opencode models` exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let text = std::str::from_utf8(&out.stdout)?;
+    let known: std::collections::HashSet<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !known.contains(model) {
+        anyhow::bail!(
+            "Unknown opencode model `{model}`. Run `exomonad models` to see the list."
+        );
+    }
+    Ok(())
+}
+
 /// Run the init command: create or attach to tmux session.
 pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool, tl: Option<String>, worker: Option<String>, tl_model: Option<String>, worker_model: Option<String>) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
@@ -39,6 +68,17 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
     }
     if openrouter {
         config.openrouter.enabled = true;
+    }
+
+    if config.root_agent_type == AgentType::OpenCode {
+        if let Some(m) = config.opencode.tl_model.as_deref() {
+            validate_opencode_model(m).await?;
+        }
+    }
+    if config.spawn_agent_type == AgentType::OpenCode {
+        if let Some(m) = config.opencode.worker_model.as_deref() {
+            validate_opencode_model(m).await?;
+        }
     }
 
     // Check OTel endpoint reachability if configured
@@ -652,6 +692,12 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
             .as_ref()
             .map(|m| format!(" --model {}", m))
             .unwrap_or_default();
+        let opencode_model_flag = config
+            .opencode
+            .tl_model
+            .as_deref()
+            .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
+            .unwrap_or_default();
         match (config.root_agent_type, config.initial_prompt.as_deref()) {
             (AgentType::Claude, _) => format!("claude --dangerously-skip-permissions{model_flag} -c || claude --dangerously-skip-permissions{model_flag}; echo; echo [Claude Code exited]; exec bash -l"),
             (AgentType::Gemini, Some(prompt)) => {
@@ -666,11 +712,11 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
             (AgentType::Shoal, None) => "shoal-agent --exo root".to_string(),
             (AgentType::OpenCode, Some(prompt)) => {
                 let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
-                format!("opencode run{} '{}'", yolo, prompt.replace('\'', "'\\''"))
+                format!("opencode run{yolo}{opencode_model_flag} '{}'", prompt.replace('\'', "'\\''"))
             }
             (AgentType::OpenCode, None) => {
                 let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
-                format!("opencode{}", yolo)
+                format!("opencode{opencode_model_flag}{yolo}")
             }
             (AgentType::Process, _) => unreachable!("Process is for companions only, not root agent"),
         }
@@ -987,11 +1033,16 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
             }
             AgentType::OpenCode => {
                 let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
+                let model_flag = companion
+                    .model
+                    .as_deref()
+                    .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
+                    .unwrap_or_default();
                 let task_part = match &escaped_task {
                     Some(t) => format!(" '{}'", t),
                     None => String::new(),
                 };
-                format!("{env_prefix}opencode run{}{}", yolo, task_part)
+                format!("{env_prefix}opencode run{yolo}{model_flag}{task_part}")
             }
             AgentType::Process => unreachable!("Process companions handled above"),
         };
