@@ -66,15 +66,20 @@ pub async fn spawn_and_prompt(
     working_dir: &Path,
     initial_prompt: &str,
     env_vars: Vec<(String, String)>,
+    model: Option<&str>,
 ) -> Result<OpencodeAcpConnection> {
-    tracing::info!(agent = %agent_id, cwd = %working_dir.display(), "Spawning OpenCode ACP server");
+    tracing::info!(agent = %agent_id, cwd = %working_dir.display(), model = ?model, "Spawning OpenCode ACP server");
 
-    let mut child = Command::new("opencode")
-        .arg("serve")
+    let mut cmd = Command::new("opencode");
+    cmd.arg("serve")
         .arg("--port")
         .arg("0")
         .arg("--cwd")
-        .arg(working_dir)
+        .arg(working_dir);
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    let mut child = cmd
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

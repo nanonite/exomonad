@@ -822,6 +822,7 @@ impl<
                         &worktree_path,
                         &task_with_context,
                         env_vec,
+                        self.spawn_agent_model(),
                     ).await {
                         Ok(conn) => {
                             let acp_url = conn.base_url.clone();
