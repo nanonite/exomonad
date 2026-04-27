@@ -85,6 +85,12 @@ pub struct OpencodeConfig {
     /// (from openrouter config or OPENROUTER_API_KEY env var).
     #[serde(default)]
     pub use_embedded_key: bool,
+    /// Model for the root TL when running OpenCode (e.g. "anthropic/claude-sonnet-4-5").
+    /// `None` means let opencode pick its default.
+    pub tl_model: Option<String>,
+    /// Model for spawned workers when running OpenCode.
+    /// `None` means let opencode pick its default.
+    pub worker_model: Option<String>,
 }
 
 /// Raw configuration from file (supports both config.toml and config.local.toml fields).

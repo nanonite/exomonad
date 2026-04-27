@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Run the init command: create or attach to tmux session.
-pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool, tl: Option<String>, worker: Option<String>) -> Result<()> {
+pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool, tl: Option<String>, worker: Option<String>, tl_model: Option<String>, worker_model: Option<String>) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
     use exomonad_core::services::{resolve_role_context_path, AgentType};
     use std::io::{IsTerminal, Write};
@@ -30,6 +30,12 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
     }
     if let Some(ref worker_type) = worker {
         config.spawn_agent_type = parse_agent_type(worker_type)?;
+    }
+    if let Some(m) = tl_model {
+        config.opencode.tl_model = Some(m);
+    }
+    if let Some(m) = worker_model {
+        config.opencode.worker_model = Some(m);
     }
     if openrouter {
         config.openrouter.enabled = true;

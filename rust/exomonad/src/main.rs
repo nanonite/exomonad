@@ -76,6 +76,14 @@ enum Commands {
         /// Set spawn agent type for workers/teammates
         #[arg(long)]
         worker: Option<String>,
+        /// Model for the root TL when --tl=opencode (e.g. anthropic/claude-sonnet-4-5).
+        /// Default: opencode picks (uses its built-in default model).
+        #[arg(long)]
+        tl_model: Option<String>,
+        /// Model for spawned workers when --worker=opencode.
+        /// Default: opencode picks (uses its built-in default model).
+        #[arg(long)]
+        worker_model: Option<String>,
     },
 
     /// Initialize a new exomonad project in the current directory.
@@ -240,8 +248,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Init { session, recreate, opencode_as_tl, openrouter, tl, worker } => {
-            init::run(session, recreate, opencode_as_tl, openrouter, tl, worker).await?;
+        Commands::Init { session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model } => {
+            init::run(session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model).await?;
         }
 
         Commands::New { name } => {
