@@ -585,6 +585,9 @@ pub struct AgentControlService<C> {
     pub(crate) yolo: bool,
     /// Agent type for spawned workers/teammates.
     pub(crate) spawn_agent_type: AgentType,
+    /// Model for spawned OpenCode workers (passed to `opencode serve --model` / `opencode run --model`).
+    /// `None` means let opencode pick.
+    pub(crate) spawn_agent_model: Option<String>,
     /// WASM name for role context resolution (default: "devswarm").
     pub(crate) wasm_name: String,
     /// Pre-serialized extra MCP servers to include in spawned agent configs.
@@ -615,6 +618,7 @@ impl<
             birth_branch: BirthBranch::from("unset"),
             yolo: false,
             spawn_agent_type: AgentType::Gemini,
+            spawn_agent_model: None,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: HashMap::new(),
             openrouter_api_key: None,
@@ -661,6 +665,17 @@ impl<
     /// Get the configured default agent type for spawned workers/teammates.
     pub fn default_spawn_agent_type(&self) -> AgentType {
         self.spawn_agent_type
+    }
+
+    /// Set the model for spawned OpenCode workers.
+    pub fn with_spawn_agent_model(mut self, model: Option<String>) -> Self {
+        self.spawn_agent_model = model;
+        self
+    }
+
+    /// Get the configured model for spawned OpenCode workers, if any.
+    pub fn spawn_agent_model(&self) -> Option<&str> {
+        self.spawn_agent_model.as_deref()
     }
 
     /// Set extra MCP servers to include in spawned agent configs.

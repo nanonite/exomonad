@@ -927,6 +927,7 @@ Run `exomonad recompile` first to build it.",
         event_queue: event_queue.clone(),
         mutex_registry,
         git_wt,
+        opencode_worker_model: config.opencode.worker_model.clone(),
     });
 
     let mut agent_control =
@@ -939,6 +940,7 @@ Run `exomonad recompile` first to build it.",
     agent_control = agent_control.with_tmux_session(config.tmux_session.clone());
     agent_control = agent_control.with_yolo(config.yolo);
     agent_control = agent_control.with_spawn_agent_type(config.spawn_agent_type);
+    agent_control = agent_control.with_spawn_agent_model(config.opencode.worker_model.clone());
     agent_control = agent_control
         .with_extra_mcp_servers(serialize_extra_mcp_servers(&config.extra_mcp_servers));
     let event_session_id = uuid::Uuid::new_v4().to_string();

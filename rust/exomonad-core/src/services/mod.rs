@@ -113,6 +113,16 @@ pub struct Services {
     pub event_queue: Arc<EventQueue>,
     pub mutex_registry: Arc<MutexRegistry>,
     pub git_wt: Arc<GitWorktreeService>,
+    /// Model for spawned OpenCode workers (passed to `opencode serve --model` and `opencode run --model`).
+    /// `None` means let opencode pick.
+    pub opencode_worker_model: Option<String>,
+}
+
+impl Services {
+    /// Read the configured model for spawned OpenCode workers.
+    pub fn opencode_worker_model(&self) -> Option<&str> {
+        self.opencode_worker_model.as_deref()
+    }
 }
 
 impl HasTeamRegistry for Services {
@@ -193,7 +203,26 @@ impl Services {
             event_queue: Arc::new(EventQueue::new()),
             mutex_registry: Arc::new(MutexRegistry::new()),
             git_wt: Arc::new(GitWorktreeService::new(PathBuf::from("."))),
+            opencode_worker_model: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod opencode_worker_model_tests {
+    use super::*;
+
+    #[test]
+    fn accessor_returns_configured_model() {
+        let mut s = Services::test();
+        s.opencode_worker_model = Some("opencode-go/qwen3.6-plus".to_string());
+        assert_eq!(s.opencode_worker_model(), Some("opencode-go/qwen3.6-plus"));
+    }
+
+    #[test]
+    fn accessor_returns_none_when_unset() {
+        let s = Services::test();
+        assert_eq!(s.opencode_worker_model(), None);
     }
 }
 
