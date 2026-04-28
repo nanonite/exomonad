@@ -131,6 +131,13 @@ enum Commands {
         cancel: bool,
     },
 
+    /// List models available to opencode (passes through to `opencode models`).
+    Models {
+        /// Optional provider filter (e.g. "anthropic", "openrouter").
+        #[arg(long)]
+        provider: Option<String>,
+    },
+
     /// Reload WASM plugins (clears plugin cache, next call loads fresh from disk)
     Reload,
 
@@ -286,6 +293,17 @@ async fn main() -> Result<()> {
             let resp: serde_json::Value =
                 client.post_json("/reload", &serde_json::json!({})).await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+
+        Commands::Models { provider } => {
+            let mut cmd = tokio::process::Command::new("opencode");
+            cmd.arg("models");
+            if let Some(p) = &provider {
+                cmd.arg(p);
+            }
+            let status = cmd.status().await
+                .context("Failed to spawn `opencode models` — is opencode on PATH?")?;
+            if !status.success() { std::process::exit(status.code().unwrap_or(1)); }
         }
 
         Commands::Shutdown => {
