@@ -81,8 +81,8 @@ Haskell WASM is a typed configuration DSL — tool schemas, dispatch logic, hook
 
 | Spawn tool | Creates | Isolation | Use case |
 |------------|---------|-----------|----------|
-| `spawn_gemini` (inline) | Gemini panes in your window | Shared directory, no branch | Fast parallel tasks (10-30x cheaper than Opus) |
-| `spawn_gemini` (worktree) | Gemini in own worktree + window | Own branch, files PR | Independent features that need isolation |
+| `spawn_leaf` (inline) | Gemini panes in your window | Shared directory, no branch | Fast parallel tasks (10-30x cheaper than Opus) |
+| `spawn_leaf` (worktree) | Gemini in own worktree + window | Own branch, files PR | Independent features that need isolation |
 | `fork_wave` | Claude in own worktree + window | Own branch, can spawn children | Complex decomposition (TL role, recursive) |
 
 **Communication:** Child agents call `notify_parent` when done. Messages arrive in your Claude conversation as native teammate notifications via the Teams inbox. No polling, no stdin hacks.
@@ -92,7 +92,7 @@ Haskell WASM is a typed configuration DSL — tool schemas, dispatch logic, hook
 | Tool | Role | Description |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree |
-| `spawn_gemini` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
+| `spawn_leaf` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
 | `file_pr` | tl, dev | Create or update a PR for the current branch |
 | `merge_pr` | root, tl | Merge a child agent's PR and fetch changes |
 | `notify_parent` | tl, dev, worker | Send message to parent agent via Teams inbox |

@@ -21,7 +21,7 @@ import ExoMonad.Guest.Tools.Events
 import ExoMonad.Guest.Tools.MergePR (mergePRCore, mergePRDescription, mergePRSchema, mergePRRender, MergePRArgs (..), MergePROutput (..), extractAgentName)
 import ExoMonad.Guest.Tools.Spawn
   ( forkWaveCore, forkWaveDescription, forkWaveSchema, forkWaveRender, ForkWaveArgs (..), ForkWaveResult (..),
-    spawnGeminiCore, spawnGeminiDescription, spawnGeminiSchema, SpawnGeminiArgs,
+    spawnLeafCore, spawnLeafDescription, spawnLeafSchema, SpawnLeafArgs,
     spawnLeafRender,
     spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
     spawnAcpCore, SpawnAcpArgs
@@ -95,16 +95,16 @@ instance MCPTool TLForkWave where
           void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
         pure $ forkWaveRender fwResult
 
--- | TL-specific spawn_gemini: worktree spawn fires ChildSpawned.
-data TLSpawnGemini
+-- | TL-specific spawn_leaf: worktree spawn fires ChildSpawned.
+data TLSpawnLeaf
 
-instance MCPTool TLSpawnGemini where
-  type ToolArgs TLSpawnGemini = SpawnGeminiArgs
-  toolName = "spawn_gemini"
-  toolDescription = spawnGeminiDescription
-  toolSchema = spawnGeminiSchema
+instance MCPTool TLSpawnLeaf where
+  type ToolArgs TLSpawnLeaf = SpawnLeafArgs
+  toolName = "spawn_leaf"
+  toolDescription = spawnLeafDescription
+  toolSchema = spawnLeafSchema
   toolHandlerEff args = do
-    result <- spawnGeminiCore args
+    result <- spawnLeafCore args
     case result of
       Left err -> pure $ errorResult err
       Right (slug, sr) -> do
@@ -143,7 +143,7 @@ instance MCPTool TLNotifyParent where
 
 data Tools mode = Tools
   { forkWave :: mode :- TLForkWave,
-    spawnGemini :: mode :- TLSpawnGemini,
+    spawnLeaf :: mode :- TLSpawnLeaf,
     spawnWorker :: mode :- TLSpawnWorker,
     pr :: mode :- TLFilePR,
     mergePr :: mode :- TLMergePR,
@@ -159,7 +159,7 @@ config =
       tools =
         Tools
           { forkWave = mkHandler @TLForkWave,
-            spawnGemini = mkHandler @TLSpawnGemini,
+            spawnLeaf = mkHandler @TLSpawnLeaf,
             spawnWorker = mkHandler @TLSpawnWorker,
             pr = mkHandler @TLFilePR,
             mergePr = mkHandler @TLMergePR,

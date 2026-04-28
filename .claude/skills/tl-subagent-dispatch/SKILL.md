@@ -16,8 +16,8 @@ description: Use when spawning subagents, monitoring their progress, or interven
 | Tool | Agent | Role | Use When |
 |------|-------|------|----------|
 | `fork_wave` | Claude | TL (can spawn children) | Multi-step work requiring sub-decomposition |
-| `spawn_gemini` (worktree) | Gemini | Dev (files PR) | Focused implementation in isolated worktree |
-| `spawn_gemini` (inline) | Gemini | Worker (ephemeral) | Investigation, hypothesis testing, no commits |
+| `spawn_leaf` (worktree) | Gemini | Dev (files PR) | Focused implementation in isolated worktree |
+| `spawn_leaf` (inline) | Gemini | Worker (ephemeral) | Investigation, hypothesis testing, no commits |
 
 ## Dispatch Protocol
 
@@ -37,15 +37,15 @@ Every spec follows this structure:
 
 ```
 # Focused implementation (own branch, files PR)
-spawn_gemini(
+spawn_leaf(
   name="feature-name",
   task="[full spec here]",
   isolation="worktree"
 )
 
 # Investigation (ephemeral panes, no branch)
-spawn_gemini(name="h1", task="Check if X causes the bug", isolation="inline")
-spawn_gemini(name="h2", task="Check if Y causes the bug", isolation="inline")
+spawn_leaf(name="h1", task="Check if X causes the bug", isolation="inline")
+spawn_leaf(name="h2", task="Check if Y causes the bug", isolation="inline")
 ```
 
 ### 3. Return Immediately

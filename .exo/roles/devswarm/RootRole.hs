@@ -15,7 +15,7 @@ import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.Tools.MergePR (mergePRCore, mergePRDescription, mergePRSchema, mergePRRender, MergePRArgs (..), MergePROutput (..), extractAgentName)
 import ExoMonad.Guest.Tools.Spawn
   ( forkWaveCore, forkWaveDescription, forkWaveSchema, forkWaveRender, ForkWaveArgs (..), ForkWaveResult (..),
-    spawnGeminiCore, spawnGeminiDescription, spawnGeminiSchema, spawnLeafRender, SpawnGeminiArgs (..),
+    spawnLeafCore, spawnLeafDescription, spawnLeafSchema, spawnLeafRender, SpawnLeafArgs (..),
     spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs
   )
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
@@ -41,14 +41,14 @@ instance MCPTool RootForkWave where
           void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
         pure $ forkWaveRender fwResult
 
-data RootSpawnGemini
-instance MCPTool RootSpawnGemini where
-  type ToolArgs RootSpawnGemini = SpawnGeminiArgs
-  toolName = "spawn_gemini"
-  toolDescription = spawnGeminiDescription
-  toolSchema = spawnGeminiSchema
+data RootSpawnLeaf
+instance MCPTool RootSpawnLeaf where
+  type ToolArgs RootSpawnLeaf = SpawnLeafArgs
+  toolName = "spawn_leaf"
+  toolDescription = spawnLeafDescription
+  toolSchema = spawnLeafSchema
   toolHandlerEff args = do
-    result <- spawnGeminiCore args
+    result <- spawnLeafCore args
     case result of
       Left err -> pure $ errorResult err
       Right (slug, sr) -> do
@@ -86,7 +86,7 @@ instance MCPTool RootMergePR where
 
 data Tools mode = Tools
   { forkWave    :: mode :- RootForkWave,
-    spawnGemini :: mode :- RootSpawnGemini,
+    spawnLeaf   :: mode :- RootSpawnLeaf,
     spawnWorker :: mode :- RootSpawnWorker,
     mergePr     :: mode :- RootMergePR,
     sendMessage :: mode :- SendMessage
@@ -99,7 +99,7 @@ config =
     { roleName = "root",
       tools = Tools
         { forkWave    = mkHandler @RootForkWave,
-          spawnGemini = mkHandler @RootSpawnGemini,
+          spawnLeaf   = mkHandler @RootSpawnLeaf,
           spawnWorker = mkHandler @RootSpawnWorker,
           mergePr     = mkHandler @RootMergePR,
           sendMessage = mkHandler @SendMessage

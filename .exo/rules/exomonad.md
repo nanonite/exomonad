@@ -11,7 +11,7 @@ Use exomonad MCP tools for orchestration. Git and GitHub operations use `git` an
 | Tool | Role | What it does |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents (own worktrees, context inherited by default via `fork_session`) |
-| `spawn_gemini` | root, tl | Spawn Gemini agent: `worktree` (branch+PR), `inline` (ephemeral pane), `standalone` (own repo) |
+| `spawn_leaf` | root, tl | Spawn Gemini agent: `worktree` (branch+PR), `inline` (ephemeral pane), `standalone` (own repo) |
 | `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) |
 | `merge_pr` | root, tl | Merge a child's PR |
 | `notify_parent` | tl, dev, worker | Send message to parent agent |
@@ -46,7 +46,7 @@ Commit and push. Children fork from this commit.
 Spawn children for wave N. Zero dependencies between siblings in the same wave.
 
 - **Sub-TLs**: `fork_wave` (Claude). They inherit full conversation context — they already know the plan and the scaffolding.
-- **Devs**: `spawn_gemini` with `isolation: "worktree"` (Gemini). They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
+- **Devs**: `spawn_leaf` with `isolation: "worktree"` (Gemini). They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
 
 ### 3. Converge (merge wave)
 

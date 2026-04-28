@@ -15,7 +15,7 @@ Use exomonad MCP tools for orchestration. Git and GitHub operations use `git` an
 | Tool | Role | What it does |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents (own worktrees, context inherited by default via `fork_session`) |
-| `spawn_gemini` | root, tl | Spawn Gemini agent in own worktree+branch (files PR). Structured spec fields: steps, verify, boundary, context, read_first |
+| `spawn_leaf` | root, tl | Spawn Gemini agent in own worktree+branch (files PR). Structured spec fields: steps, verify, boundary, context, read_first |
 | `spawn_worker` | root, tl | Spawn ephemeral Gemini worker in tmux pane (no branch, no PR). Just name + task |
 | `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) |
 | `merge_pr` | root, tl | Merge a child's PR |
@@ -51,7 +51,7 @@ Commit and push. Children fork from this commit.
 Spawn children for wave N. Zero dependencies between siblings in the same wave.
 
 - **Sub-TLs**: `fork_wave` (Claude). They inherit full conversation context — they already know the plan and the scaffolding.
-- **Devs**: `spawn_gemini` (Gemini, worktree). They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
+- **Devs**: `spawn_leaf` (Gemini, worktree). They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
 - **Workers**: `spawn_worker` (Gemini, ephemeral pane). Research, boilerplate, or non-conflicting edits.
 
 ### 3. Converge (merge wave)

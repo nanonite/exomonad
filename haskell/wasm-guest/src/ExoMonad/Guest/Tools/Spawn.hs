@@ -7,7 +7,7 @@ module ExoMonad.Guest.Tools.Spawn
     ForkWave,
     SpawnLeafSubtree,
     SpawnWorkers,
-    SpawnGemini,
+    SpawnLeaf,
     SpawnWorkerTool,
     SpawnAcp,
 
@@ -16,7 +16,7 @@ module ExoMonad.Guest.Tools.Spawn
     ForkWaveChild (..),
     SpawnLeafSubtreeArgs (..),
     SpawnWorkersArgs (..),
-    SpawnGeminiArgs (..),
+    SpawnLeafArgs (..),
     SpawnWorkerToolArgs (..),
     WorkerSpec (..),
     WorkerType (..),
@@ -26,7 +26,7 @@ module ExoMonad.Guest.Tools.Spawn
     forkWaveCore,
     spawnLeafSubtreeCore,
     spawnWorkersCore,
-    spawnGeminiCore,
+    spawnLeafCore,
     spawnWorkerToolCore,
     spawnAcpCore,
 
@@ -44,8 +44,8 @@ module ExoMonad.Guest.Tools.Spawn
     spawnLeafSubtreeSchema,
     spawnWorkersDescription,
     spawnWorkersSchema,
-    spawnGeminiDescription,
-    spawnGeminiSchema,
+    spawnLeafDescription,
+    spawnLeafSchema,
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
 
@@ -459,22 +459,22 @@ spawnWorkersCore args = do
 -- SpawnGemini (worktree — branch + PR)
 -- ============================================================================
 
-data SpawnGemini
+data SpawnLeaf
 
-data SpawnGeminiArgs = SpawnGeminiArgs
-  { sgName :: Text,
-    sgTask :: Text,
-    sgReadFirst :: Maybe [Text],
-    sgSteps :: Maybe [Text],
-    sgVerify :: Maybe [Text],
-    sgBoundary :: Maybe [Text],
-    sgContext :: Maybe Text
+data SpawnLeafArgs = SpawnLeafArgs
+  { slName :: Text,
+    slTask :: Text,
+    slReadFirst :: Maybe [Text],
+    slSteps :: Maybe [Text],
+    slVerify :: Maybe [Text],
+    slBoundary :: Maybe [Text],
+    slContext :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
-instance FromJSON SpawnGeminiArgs where
-  parseJSON = withObject "SpawnGeminiArgs" $ \v ->
-    SpawnGeminiArgs
+instance FromJSON SpawnLeafArgs where
+  parseJSON = withObject "SpawnLeafArgs" $ \v ->
+    SpawnLeafArgs
       <$> v .: "name"
       <*> v .: "task"
       <*> v .:? "read_first"
@@ -483,12 +483,12 @@ instance FromJSON SpawnGeminiArgs where
       <*> v .:? "boundary"
       <*> v .:? "context"
 
-spawnGeminiDescription :: Text
-spawnGeminiDescription = "Spawn a Gemini agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. Gemini is a capable implementer \x2014 give it acceptance criteria and file paths, not line-by-line instructions. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately \x2014 you will be notified when the agent completes."
+spawnLeafDescription :: Text
+spawnLeafDescription = "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). Agent type is determined by server config (--worker flag). Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately \x2014 you will be notified when the agent completes."
 
-spawnGeminiSchema :: Aeson.Object
-spawnGeminiSchema =
-  genericToolSchemaWith @SpawnGeminiArgs
+spawnLeafSchema :: Aeson.Object
+spawnLeafSchema =
+  genericToolSchemaWith @SpawnLeafArgs
     [ ("name", "Branch name suffix (e.g., 'fix-clippy' \x2192 'main.fix-clippy')"),
       ("task", "What to build. Combined with steps/verify/boundary into structured spec"),
       ("steps", "Numbered implementation steps with code snippets and exact file paths"),
@@ -498,12 +498,12 @@ spawnGeminiSchema =
       ("read_first", "File paths to read before starting (CLAUDE.md, source patterns)")
     ]
 
-spawnGeminiCore :: SpawnGeminiArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
-spawnGeminiCore args = do
+spawnLeafCore :: SpawnLeafArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
+spawnLeafCore args = do
   let leafArgs =
         SpawnLeafSubtreeArgs
-          { slsTask = buildGeminiTask args,
-            slsBranchName = sgName args,
+          { slsTask = buildLeafTask args,
+            slsBranchName = slName args,
             slsPermissionMode = Nothing,
             slsAllowedTools = Nothing,
             slsDisallowedTools = Nothing,
@@ -512,18 +512,18 @@ spawnGeminiCore args = do
           }
   spawnLeafSubtreeCore leafArgs
 
-buildGeminiTask :: SpawnGeminiArgs -> Text
-buildGeminiTask args =
+buildLeafTask :: SpawnLeafArgs -> Text
+buildLeafTask args =
   let spec =
         WorkerSpec
-          { wsName = sgName args,
-            wsTask = sgTask args,
-            wsReadFirst = sgReadFirst args,
-            wsSteps = sgSteps args,
-            wsVerify = sgVerify args,
+          { wsName = slName args,
+            wsTask = slTask args,
+            wsReadFirst = slReadFirst args,
+            wsSteps = slSteps args,
+            wsVerify = slVerify args,
             wsDoneCriteria = Nothing,
-            wsBoundary = sgBoundary args,
-            wsContext = sgContext args,
+            wsBoundary = slBoundary args,
+            wsContext = slContext args,
             wsPrompt = Nothing,
             wsProfiles = Nothing,
             wsContextFiles = Nothing,

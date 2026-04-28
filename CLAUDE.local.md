@@ -16,4 +16,4 @@ Agents that get short directives ("go") tend to drift. Agents that get full cont
 
 ## Implementation Status
 
-All spawn tools production-ready: `fork_wave` (Claude worktree+tab), `spawn_gemini` (unified: worktree/inline/standalone). Per-agent identity resolved via URL path: `/agents/{role}/{name}/tools` and `/agents/{role}/{name}/tools/call`. Four roles: root (human-facing TL), tl (spawned TL), dev (leaf), worker (ephemeral).
+All spawn tools production-ready: `fork_wave` (Claude worktree+tab), `spawn_leaf` (unified: worktree/inline/standalone). Per-agent identity resolved via URL path: `/agents/{role}/{name}/tools` and `/agents/{role}/{name}/tools/call`. Four roles: root (human-facing TL), tl (spawned TL), dev (leaf), worker (ephemeral).

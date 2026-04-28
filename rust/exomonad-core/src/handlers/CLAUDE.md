@@ -97,9 +97,9 @@ Handles effects in the `agent.*` namespace.
 
 ### Capabilities
 
-- **`spawn_gemini_teammate`**: Spawns a Gemini worker pane in the parent directory.
+- **`spawn_leaf_teammate`**: Spawns a Gemini worker pane in the parent directory.
 - **`spawn_subtree`**: Creates a Claude subtree in a new git worktree + tmux window.
-- **`spawn_leaf_subtree`**: Creates a Gemini leaf in a new git worktree + tmux window (used by `spawn_gemini` worktree/standalone modes).
+- **`spawn_leaf_subtree`**: Creates a Gemini leaf in a new git worktree + tmux window (used by `spawn_leaf` worktree/standalone modes).
 - **`cleanup_merged`**: Removes worktrees for merged branches.
 
 ### Type Safety
