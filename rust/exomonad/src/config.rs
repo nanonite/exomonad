@@ -370,11 +370,21 @@ impl Config {
             .or(global_raw.openrouter)
             .unwrap_or_default();
 
-        // Resolve opencode: local > global > default
-        let opencode = local_raw
+        // Resolve opencode: env > local > global > default
+        let mut opencode = local_raw
             .opencode
             .or(global_raw.opencode)
             .unwrap_or_default();
+        if let Ok(m) = std::env::var("EXOMONAD_TL_MODEL") {
+            if !m.is_empty() {
+                opencode.tl_model = Some(m);
+            }
+        }
+        if let Ok(m) = std::env::var("EXOMONAD_WORKER_MODEL") {
+            if !m.is_empty() {
+                opencode.worker_model = Some(m);
+            }
+        }
 
         // Resolve opencode_as_tl: local > global > false
         let opencode_as_tl = local_raw.opencode_as_tl.or(global_raw.opencode_as_tl).unwrap_or(false);

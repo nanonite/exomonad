@@ -9,6 +9,8 @@ mod cleanup;
 mod internal;
 mod spawn;
 
+pub use spawn::OPENCODE_TL_INSTRUCTIONS;
+
 pub(crate) use crate::common::TimeoutError;
 pub(crate) use crate::domain::{
     AgentName, AgentPermissions, BirthBranch, BranchName, ClaudeSessionUuid, ItemState,

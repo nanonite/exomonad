@@ -7,9 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix: update root TL prompt sanity check for headless OpenCode ACP workers (#45)
+- Fix: remove --model from opencode serve, pass to opencode run --attach instead (#44)
+- Bug: --worker-model not forwarded from exomonad init to exomonad serve (#49)
+- Bug: fork_wave still spawns Gemini despite --worker=opencode (binary may predate fix) (#48)
+- Fix: update root TL prompt sanity check for headless OpenCode ACP workers (#45)
+- fork_wave/spawn_subtree handler ignores config.spawn_agent_type (hardcodes Claude fallback) (#34)
+- spawn_worker handler ignores config.spawn_agent_type (hardcodes Gemini fallback) (#33)
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- E2E verify: --worker=opencode spawns OpenCode workers (#35)
+- Add default_spawn_agent_type() getter to AgentControlService (#32)
 - inject agent.md into sub-agent initial prompt (#31)
 - update tl.md with {{spawn_agent_type}} placeholder (#29)
 - interpolate role context template at spawn time (#28)

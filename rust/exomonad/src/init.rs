@@ -232,7 +232,8 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
                     "type": "local",
                     "command": ["exomonad", "mcp-stdio", "--role", "root", "--name", "root"]
                 }
-            }
+            },
+            "instructions": exomonad_core::services::agent_control::OPENCODE_TL_INSTRUCTIONS,
         });
         let opencode_dir = cwd.join(".exo/agents/root");
         std::fs::create_dir_all(&opencode_dir)?;
@@ -528,11 +529,26 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
         }
     }
 
+    let model_env = {
+        let mut parts = Vec::new();
+        if let Some(m) = &config.opencode.tl_model {
+            parts.push(format!("EXOMONAD_TL_MODEL={}", m));
+        }
+        if let Some(m) = &config.opencode.worker_model {
+            parts.push(format!("EXOMONAD_WORKER_MODEL={}", m));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", parts.join(" "))
+        }
+    };
     let serve_cmd = format!(
-        "EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} exomonad serve",
+        "EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={}{} exomonad serve",
         &session,
         agent_type_str(config.root_agent_type),
         agent_type_str(config.spawn_agent_type),
+        model_env,
     );
     let send_status = std::process::Command::new("tmux")
         .args([
