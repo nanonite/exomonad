@@ -76,9 +76,6 @@ pub async fn spawn_and_prompt(
         .arg("0")
         .arg("--cwd")
         .arg(working_dir);
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
     let mut child = cmd
         .current_dir(working_dir)
         .stdin(Stdio::null())
@@ -96,7 +93,7 @@ pub async fn spawn_and_prompt(
 
     tracing::info!(agent = %agent_id, url = %base_url, "OpenCode ACP server started");
 
-    deliver_prompt(&base_url, working_dir, initial_prompt)
+    deliver_prompt(&base_url, working_dir, initial_prompt, model)
         .await
         .context("Failed to deliver initial prompt via opencode run --attach")?;
 
@@ -155,7 +152,7 @@ fn extract_url(line: &str) -> Option<String> {
 ///
 /// Writes the prompt to a temp file to avoid shell quoting issues, then runs
 /// `opencode run --attach <url> "$(cat <file>)"`.
-async fn deliver_prompt(base_url: &str, working_dir: &Path, prompt: &str) -> Result<()> {
+async fn deliver_prompt(base_url: &str, working_dir: &Path, prompt: &str, model: Option<&str>) -> Result<()> {
     let prompt_file = working_dir.join(".exo").join("opencode_prompt.tmp");
     tokio::fs::create_dir_all(prompt_file.parent().unwrap())
         .await
@@ -164,11 +161,14 @@ async fn deliver_prompt(base_url: &str, working_dir: &Path, prompt: &str) -> Res
         .await
         .context("Failed to write prompt file")?;
 
+    let model_flag = model
+        .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
+        .unwrap_or_default();
     let escaped_url = shell_escape::escape(base_url.into());
     let escaped_file = shell_escape::escape(prompt_file.to_string_lossy());
     let shell_cmd = format!(
-        "opencode run --attach {} \"$(cat {})\"",
-        escaped_url, escaped_file
+        "opencode run --attach{}{} \"$(cat {})\"",
+        model_flag, escaped_url, escaped_file
     );
 
     let status = Command::new("sh")
@@ -190,7 +190,7 @@ async fn deliver_prompt(base_url: &str, working_dir: &Path, prompt: &str) -> Res
 
 /// Send a prompt to an existing OpenCode ACP server via `opencode run --attach`.
 pub async fn send_prompt(base_url: &str, prompt: &str) -> Result<()> {
-    deliver_prompt(base_url, Path::new("."), prompt).await
+    deliver_prompt(base_url, Path::new("."), prompt, None).await
 }
 
 #[cfg(test)]
