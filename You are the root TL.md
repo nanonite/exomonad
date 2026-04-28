@@ -22,6 +22,13 @@ Before spawning anything: TeamCreate a team (required for notify_parent
 delivery). Then start with the highest-priority open issue.
 
 Sanity check the new behavior on the FIRST spawn:
-  After the worker comes up, tmux list-windows should show the new pane
-  with suffix "-opencode" (NOT "-gemini"). If you see "-gemini", stop
-  and report — the fix didn't take effect and there's no point continuing.
+  After fork_wave returns, run:
+    ls .exo/agents/
+  You should see a directory named after the spawned worker (e.g. gh-42-fix-claude).
+  If absent, the ACP spawn failed before registration -- stop and report.
+
+  OpenCode workers are headless ACP processes, NOT tmux windows. Do NOT check
+  tmux list-windows for them -- it will always be empty for opencode workers.
+
+  To observe a worker's progress: ps aux | grep 'opencode serve'
+  To manually nudge a stuck worker: opencode run --attach <url> your message
