@@ -229,6 +229,7 @@ impl<
         cwd: &Path,
         claude_flags: Option<&ClaudeSpawnFlags>,
         yolo: bool,
+        opencode_model: Option<&str>,
     ) -> String {
         let cmd = agent_type.command();
 
@@ -267,6 +268,10 @@ impl<
             AgentType::Shoal | AgentType::Process => String::new(),
         };
 
+        let opencode_model_flag = opencode_model
+            .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
+            .unwrap_or_default();
+
         let agent_command = match (prompt_file, fork_session_id) {
             (Some(pf), Some(session_id)) => {
                 let escaped_session = Self::escape_for_shell_command(session_id);
@@ -274,8 +279,8 @@ impl<
                 match agent_type {
                     AgentType::OpenCode => {
                         format!(
-                            "{} run{} --session {} --fork \"$(cat {})\"",
-                            cmd, perms_flags, escaped_session, escaped_path
+                            "{} run{} --session {} --fork \"$(cat {})\"{}",
+                            cmd, perms_flags, escaped_session, escaped_path, opencode_model_flag
                         )
                     }
                     _ => {
@@ -290,7 +295,7 @@ impl<
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
                 match agent_type {
                     AgentType::OpenCode => {
-                        format!("{} run{} \"$(cat {})\"", cmd, perms_flags, escaped_path)
+                        format!("{} run{} \"$(cat {})\"{}", cmd, perms_flags, escaped_path, opencode_model_flag)
                     }
                     _ => {
                         let flag = agent_type.prompt_flag();
@@ -306,7 +311,7 @@ impl<
                 }
             }
             _ => match agent_type {
-                AgentType::OpenCode => format!("{}{}", cmd, perms_flags),
+                AgentType::OpenCode => format!("{}{}{}", cmd, perms_flags, opencode_model_flag),
                 _ => format!("{}{}", cmd, perms_flags),
             },
         };
@@ -384,6 +389,7 @@ impl<
             cwd,
             claude_flags,
             self.yolo,
+            self.spawn_agent_model(),
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let tmux = self.tmux()?;
@@ -493,6 +499,7 @@ impl<
             cwd,
             claude_flags,
             self.yolo,
+            self.spawn_agent_model(),
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let tmux = self.tmux()?;
