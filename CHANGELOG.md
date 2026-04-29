@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Unit tests: build_agent_command for OpenCode agent type (#51)
+- Unit tests: OpenCode config parsing (tl_model, worker_model, opencode_as_tl) (#50)
+- Add exomonad models discovery subcommand (#46)
 - E2E verify: --worker=opencode spawns OpenCode workers (#35)
 - Add default_spawn_agent_type() getter to AgentControlService (#32)
 - inject agent.md into sub-agent initial prompt (#31)

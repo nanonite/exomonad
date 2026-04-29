@@ -1154,4 +1154,100 @@ mod tests {
             "No tmux session should be set when not configured"
         );
     }
+
+    // =========================================================================
+    // build_agent_command — OpenCode tests
+    // =========================================================================
+
+    fn empty_env() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_no_prompt() {
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            None,
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(cmd, "opencode");
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_with_prompt_no_model() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            Some(prompt),
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(cmd, "opencode run \"$(cat '/tmp/test-prompt.txt')\"");
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_with_prompt_and_model() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            Some(prompt),
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            Some("anthropic/claude-sonnet-4-5"),
+        );
+        assert_eq!(
+            cmd,
+            "opencode run \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_fork_session_with_model() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            Some(prompt),
+            Some("main.feature-a-opencode"),
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            Some("anthropic/claude-haiku-4-5"),
+        );
+        assert_eq!(
+            cmd,
+            "opencode run --session 'main.feature-a-opencode' --fork \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-haiku-4-5"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_model_shell_escaping() {
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            None,
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            Some("anthropic/claude's-model"),
+        );
+        // Single quote in model name must be shell-escaped
+        assert_eq!(
+            cmd,
+            "opencode --model 'anthropic/claude'\\''s-model'"
+        );
+    }
 }

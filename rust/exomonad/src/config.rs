@@ -679,4 +679,49 @@ mod tests {
         assert_eq!(raw.companions[0].name, "sleeptime");
         assert!(raw.companions[0].task.is_none());
     }
+
+    #[test]
+    fn test_raw_config_parse_opencode_section() {
+        let content = r#"
+            [opencode]
+            tl_model = "anthropic/claude-sonnet-4-5"
+            worker_model = "anthropic/claude-haiku-4-5"
+            use_embedded_key = true
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        let oc = raw.opencode.expect("opencode section should parse");
+        assert_eq!(oc.tl_model, Some("anthropic/claude-sonnet-4-5".to_string()));
+        assert_eq!(
+            oc.worker_model,
+            Some("anthropic/claude-haiku-4-5".to_string())
+        );
+        assert!(oc.use_embedded_key);
+    }
+
+    #[test]
+    fn test_raw_config_parse_opencode_as_tl() {
+        let content = r#"
+            opencode_as_tl = true
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.opencode_as_tl, Some(true));
+    }
+
+    #[test]
+    fn test_raw_config_parse_root_agent_type_opencode() {
+        let content = r#"
+            root_agent_type = "opencode"
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.root_agent_type, Some(AgentType::OpenCode));
+    }
+
+    #[test]
+    fn test_raw_config_parse_spawn_agent_type_opencode() {
+        let content = r#"
+            spawn_agent_type = "opencode"
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.spawn_agent_type, Some(AgentType::OpenCode));
+    }
 }

@@ -10,6 +10,7 @@ mod app_state;
 mod init;
 mod logging;
 mod mcp_stdio;
+mod models;
 mod new;
 mod serve;
 mod uds_client;
@@ -131,10 +132,13 @@ enum Commands {
         cancel: bool,
     },
 
-    /// List models available to opencode (passes through to `opencode models`).
+    /// List available models per agent harness.
     Models {
-        /// Optional provider filter (e.g. "anthropic", "openrouter").
-        #[arg(long)]
+        /// Harness: opencode, gemini, or claude. Omit for all.
+        #[arg(value_name = "HARNESS")]
+        harness: Option<String>,
+        /// Provider filter (opencode only). E.g. "anthropic", "openai".
+        #[arg(value_name = "PROVIDER")]
         provider: Option<String>,
     },
 
@@ -295,15 +299,8 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
 
-        Commands::Models { provider } => {
-            let mut cmd = tokio::process::Command::new("opencode");
-            cmd.arg("models");
-            if let Some(p) = &provider {
-                cmd.arg(p);
-            }
-            let status = cmd.status().await
-                .context("Failed to spawn `opencode models` — is opencode on PATH?")?;
-            if !status.success() { std::process::exit(status.code().unwrap_or(1)); }
+        Commands::Models { harness, provider } => {
+            return models::run(harness, provider).await;
         }
 
         Commands::Shutdown => {

@@ -176,6 +176,14 @@ e2e-messaging:
 e2e-hook-rewrite:
     ./tests/e2e/hook-rewrite/run.sh
 
+# Run E2E OpenCode TL test (ACP delivery chain: serve → port capture → run --attach → MCP → notify_parent)
+e2e-opencode-tl:
+    ./tests/e2e/opencode-tl/run.sh
+
+# Run E2E OpenCode worker test (fork_wave agent_type=opencode, model forwarding, notify_parent)
+e2e-opencode-worker:
+    ./tests/e2e/opencode-worker/run.sh
+
 # Run live E2E Teams messaging test (requires active CC team "teams-e2e")
 live-teams-e2e:
     nix develop --command cargo test -p claude-teams-bridge --test integration -- live_teams_e2e --ignored --nocapture
