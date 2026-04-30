@@ -865,6 +865,7 @@ impl<
                         agent_name.clone(),
                         &worktree_path,
                         &task_with_context,
+                        self.project_dir(),
                         env_vec,
                         self.spawn_agent_model(),
                     ).await {

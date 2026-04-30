@@ -15,7 +15,23 @@ import ExoMonad
 import ExoMonad.Guest.StateMachine (applyEvent, StopCheckResult(..), checkExit)
 import ExoMonad.Guest.Effects.StopHook (checkUncommittedWork, getCurrentBranch)
 import ExoMonad.Guest.Tools.FilePR (filePRCore, filePRDescription, filePRSchema, FilePRArgs, FilePROutput (..))
-import ExoMonad.Guest.Tools.Chainlink (ChainlinkIssueCreate (..))
+import ExoMonad.Guest.Tools.Chainlink
+  ( ChainlinkIssueCreate (..),
+    ChainlinkIssueShow (..),
+    ChainlinkIssueComment (..),
+    ChainlinkSubissueCreate (..),
+    ChainlinkSessionWork (..),
+    ChainlinkSessionEnd (..),
+    ChainlinkIssueClose (..),
+    ChainlinkIssueList (..),
+    ChainlinkIssueUpdate (..),
+    ChainlinkBlock (..),
+    ChainlinkRelate (..),
+    ChainlinkCascade (..),
+    ChainlinkMilestoneCreate (..),
+    ChainlinkMilestoneList (..),
+    ChainlinkSync (..)
+  )
 import ExoMonad.Guest.Tools.Events
   ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs (..)
   )
@@ -150,25 +166,53 @@ data Tools mode = Tools
     mergePr :: mode :- TLMergePR,
     notifyParent :: mode :- TLNotifyParent,
     sendMessage :: mode :- SendMessage,
-    chainlinkIssueCreate :: mode :- ChainlinkIssueCreate
+    chainlinkIssueCreate :: mode :- ChainlinkIssueCreate,
+    chainlinkIssueShow :: mode :- ChainlinkIssueShow,
+    chainlinkIssueComment :: mode :- ChainlinkIssueComment,
+    chainlinkSubissueCreate :: mode :- ChainlinkSubissueCreate,
+    chainlinkSessionWork :: mode :- ChainlinkSessionWork,
+    chainlinkSessionEnd :: mode :- ChainlinkSessionEnd,
+    chainlinkIssueClose :: mode :- ChainlinkIssueClose,
+    chainlinkIssueList :: mode :- ChainlinkIssueList,
+    chainlinkIssueUpdate :: mode :- ChainlinkIssueUpdate,
+    chainlinkIssueBlock :: mode :- ChainlinkBlock,
+    chainlinkIssueRelate :: mode :- ChainlinkRelate,
+    chainlinkIssueCascade :: mode :- ChainlinkCascade,
+    chainlinkMilestoneCreate :: mode :- ChainlinkMilestoneCreate,
+    chainlinkMilestoneList :: mode :- ChainlinkMilestoneList,
+    chainlinkSync :: mode :- ChainlinkSync
   }
   deriving (Generic)
 
 config :: RoleConfig (Tools AsHandler)
 config =
   RoleConfig
-    { roleName = "tl",
-      tools =
-        Tools
-          { forkWave = mkHandler @TLForkWave,
-            spawnLeaf = mkHandler @TLSpawnLeaf,
-            spawnWorker = mkHandler @TLSpawnWorker,
-            pr = mkHandler @TLFilePR,
-            mergePr = mkHandler @TLMergePR,
-            notifyParent = mkHandler @TLNotifyParent,
-            sendMessage = mkHandler @SendMessage,
-            chainlinkIssueCreate = mkHandler @ChainlinkIssueCreate
-          },
+      { roleName = "tl",
+        tools =
+          Tools
+            { forkWave = mkHandler @TLForkWave,
+              spawnLeaf = mkHandler @TLSpawnLeaf,
+              spawnWorker = mkHandler @TLSpawnWorker,
+              pr = mkHandler @TLFilePR,
+              mergePr = mkHandler @TLMergePR,
+              notifyParent = mkHandler @TLNotifyParent,
+              sendMessage = mkHandler @SendMessage,
+              chainlinkIssueCreate = mkHandler @ChainlinkIssueCreate,
+              chainlinkIssueShow = mkHandler @ChainlinkIssueShow,
+              chainlinkIssueComment = mkHandler @ChainlinkIssueComment,
+              chainlinkSubissueCreate = mkHandler @ChainlinkSubissueCreate,
+              chainlinkSessionWork = mkHandler @ChainlinkSessionWork,
+              chainlinkSessionEnd = mkHandler @ChainlinkSessionEnd,
+              chainlinkIssueClose = mkHandler @ChainlinkIssueClose,
+              chainlinkIssueList = mkHandler @ChainlinkIssueList,
+              chainlinkIssueUpdate = mkHandler @ChainlinkIssueUpdate,
+              chainlinkIssueBlock = mkHandler @ChainlinkBlock,
+              chainlinkIssueRelate = mkHandler @ChainlinkRelate,
+              chainlinkIssueCascade = mkHandler @ChainlinkCascade,
+              chainlinkMilestoneCreate = mkHandler @ChainlinkMilestoneCreate,
+              chainlinkMilestoneList = mkHandler @ChainlinkMilestoneList,
+              chainlinkSync = mkHandler @ChainlinkSync
+            },
       hooks =
         HookConfig
           { preToolUse = \_ -> pure (allowResponse Nothing),

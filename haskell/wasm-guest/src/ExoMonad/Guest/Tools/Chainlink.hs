@@ -54,15 +54,65 @@ module ExoMonad.Guest.Tools.Chainlink
     chainlinkIssueCloseDescription,
     chainlinkIssueCloseSchema,
     ChainlinkIssueCloseArgs (..),
+
+    -- * Issue List
+    ChainlinkIssueList (..),
+    chainlinkIssueListCore,
+    chainlinkIssueListDescription,
+    chainlinkIssueListSchema,
+
+    -- * Issue Update
+    ChainlinkIssueUpdate (..),
+    chainlinkIssueUpdateCore,
+    chainlinkIssueUpdateDescription,
+    chainlinkIssueUpdateSchema,
+
+    -- * Block
+    ChainlinkBlock (..),
+    chainlinkBlockCore,
+    chainlinkBlockDescription,
+    chainlinkBlockSchema,
+
+    -- * Relate
+    ChainlinkRelate (..),
+    chainlinkRelateCore,
+    chainlinkRelateDescription,
+    chainlinkRelateSchema,
+
+    -- * Cascade
+    ChainlinkCascade (..),
+    chainlinkCascadeCore,
+    chainlinkCascadeDescription,
+    chainlinkCascadeSchema,
+
+    -- * Milestone Create
+    ChainlinkMilestoneCreate (..),
+    chainlinkMilestoneCreateCore,
+    chainlinkMilestoneCreateDescription,
+    chainlinkMilestoneCreateSchema,
+
+    -- * Milestone List
+    ChainlinkMilestoneList (..),
+    chainlinkMilestoneListCore,
+    chainlinkMilestoneListDescription,
+    chainlinkMilestoneListSchema,
+
+    -- * Sync
+    ChainlinkSync (..),
+    chainlinkSyncCore,
+    chainlinkSyncDescription,
+    chainlinkSyncSchema,
   )
-where
+  where
 
 import Control.Monad.Freer (Eff)
 import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
+import Data.Int (Int32)
 import Data.Map qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding (encodeUtf8)
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Data.Word (Word64)
@@ -94,7 +144,7 @@ runChainlink cmdArgs = do
     Left err -> pure $ Left (T.pack (show err))
     Right resp -> pure $ Right resp
 
-exitCodeToText :: Int -> Text
+exitCodeToText :: Int32 -> Text
 exitCodeToText = T.pack . show
 
 --------------------------------------------------------------------------------
@@ -211,7 +261,7 @@ chainlinkIssueShowCore args = do
     Left err -> pure $ Left ("chainlink issue show failed: " <> err)
     Right resp
       | Proc.runResponseExitCode resp == 0 ->
-          case Aeson.eitherDecodeStrict (TL.toStrict (Proc.runResponseStdout resp)) of
+          case Aeson.eitherDecodeStrict (encodeUtf8 (TL.toStrict (Proc.runResponseStdout resp))) of
             Right output -> pure $ Right output
             Left parseErr ->
               pure $ Left ("could not parse issue show output: " <> T.pack parseErr)
@@ -523,3 +573,456 @@ instance MCPTool ChainlinkIssueClose where
     case result of
       Left err -> pure $ errorResult err
       Right _ -> pure $ successResult (object ["success" .= True])
+
+--------------------------------------------------------------------------------
+-- Issue List
+--------------------------------------------------------------------------------
+
+instance FromJSON ChainlinkIssueListArgs where
+  parseJSON = withObject "ChainlinkIssueListArgs" $ \v ->
+    ChainlinkIssueListArgs
+      <$> v .:? "status"
+      <*> v .:? "priority"
+      <*> v .:? "labels"
+      <*> v .:? "milestone"
+
+instance ToJSON ChainlinkIssueListArgs where
+  toJSON args =
+    object
+      [ "status" .= cilStatus args,
+        "priority" .= cilPriority args,
+        "labels" .= cilLabels args,
+        "milestone" .= cilMilestone args
+      ]
+
+chainlinkIssueListDescription :: Text
+chainlinkIssueListDescription =
+  "List chainlink issues with optional filters. Returns issues matching the given status, priority, labels, or milestone."
+
+chainlinkIssueListSchema :: Aeson.Object
+chainlinkIssueListSchema =
+  genericToolSchemaWith @ChainlinkIssueListArgs
+    [ ("status", "Optional status filter: open, closed, in_progress, blocked"),
+      ("priority", "Optional priority filter: low, medium, high, critical"),
+      ("labels", "Optional list of labels to filter by"),
+      ("milestone", "Optional milestone name to filter by")
+    ]
+
+chainlinkIssueListCore :: ChainlinkIssueListArgs -> Eff Effects (Either Text [ChainlinkIssueListItem])
+chainlinkIssueListCore args = do
+  let cmdArgs = buildListArgs args
+  result <- runChainlink cmdArgs
+  case result of
+    Left err -> pure $ Left ("chainlink list failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          case Aeson.eitherDecodeStrict (encodeUtf8 (TL.toStrict (Proc.runResponseStdout resp))) of
+            Right items -> pure $ Right items
+            Left parseErr ->
+              pure $ Left ("could not parse issue list output: " <> T.pack parseErr)
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink list failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkIssueList
+
+instance MCPTool ChainlinkIssueList where
+  type ToolArgs ChainlinkIssueList = ChainlinkIssueListArgs
+  toolName = "chainlink_issue_list"
+  toolDescription = chainlinkIssueListDescription
+  toolSchema = chainlinkIssueListSchema
+  toolHandlerEff args = do
+    result <- chainlinkIssueListCore args
+    case result of
+      Left err -> pure $ errorResult err
+      Right items -> pure $ successResult (Aeson.toJSON items)
+
+--------------------------------------------------------------------------------
+-- Issue Update
+--------------------------------------------------------------------------------
+
+instance FromJSON ChainlinkIssueUpdateArgs where
+  parseJSON = withObject "ChainlinkIssueUpdateArgs" $ \v ->
+    ChainlinkIssueUpdateArgs
+      <$> v .: "issue_id"
+      <*> v .:? "status"
+      <*> v .:? "priority"
+      <*> v .:? "labels"
+      <*> v .:? "milestone"
+
+instance ToJSON ChainlinkIssueUpdateArgs where
+  toJSON args =
+    object
+      [ "issue_id" .= ciuIssueId args,
+        "status" .= ciuStatus args,
+        "priority" .= ciuPriority args,
+        "labels" .= ciuLabels args,
+        "milestone" .= ciuMilestone args
+      ]
+
+chainlinkIssueUpdateDescription :: Text
+chainlinkIssueUpdateDescription =
+  "Update a chainlink issue's status, priority, labels, or milestone. Use this to track progress, mark blockers, or change priority."
+
+chainlinkIssueUpdateSchema :: Aeson.Object
+chainlinkIssueUpdateSchema =
+  genericToolSchemaWith @ChainlinkIssueUpdateArgs
+    [ ("issue_id", "The numeric ID of the issue to update"),
+      ("status", "Optional new status: open, in_progress, blocked, closed"),
+      ("priority", "Optional new priority: low, medium, high, critical"),
+      ("labels", "Optional new list of labels to set"),
+      ("milestone", "Optional milestone name to assign")
+    ]
+
+chainlinkIssueUpdateCore :: ChainlinkIssueUpdateArgs -> Eff Effects (Either Text ())
+chainlinkIssueUpdateCore args = do
+  let cmdArgs = buildUpdateArgs args
+  result <- runChainlink cmdArgs
+  case result of
+    Left err -> pure $ Left ("chainlink update failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          pure $ Right ()
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink update failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkIssueUpdate
+
+instance MCPTool ChainlinkIssueUpdate where
+  type ToolArgs ChainlinkIssueUpdate = ChainlinkIssueUpdateArgs
+  toolName = "chainlink_issue_update"
+  toolDescription = chainlinkIssueUpdateDescription
+  toolSchema = chainlinkIssueUpdateSchema
+  toolHandlerEff args = do
+    result <- chainlinkIssueUpdateCore args
+    case result of
+      Left err -> pure $ errorResult err
+      Right _ -> pure $ successResult (object ["success" .= True])
+
+--------------------------------------------------------------------------------
+-- Block
+--------------------------------------------------------------------------------
+
+instance FromJSON ChainlinkBlockArgs where
+  parseJSON = withObject "ChainlinkBlockArgs" $ \v ->
+    ChainlinkBlockArgs
+      <$> v .: "child_id"
+      <*> v .: "blocker_id"
+
+instance ToJSON ChainlinkBlockArgs where
+  toJSON args =
+    object
+      [ "child_id" .= cbChildId args,
+        "blocker_id" .= cbBlockerId args
+      ]
+
+chainlinkBlockDescription :: Text
+chainlinkBlockDescription =
+  "Mark one issue as blocked by another. The child issue cannot proceed until the blocker issue is resolved."
+
+chainlinkBlockSchema :: Aeson.Object
+chainlinkBlockSchema =
+  genericToolSchemaWith @ChainlinkBlockArgs
+    [ ("child_id", "The numeric ID of the issue that is blocked"),
+      ("blocker_id", "The numeric ID of the issue that is blocking progress")
+    ]
+
+chainlinkBlockCore :: ChainlinkBlockArgs -> Eff Effects (Either Text ())
+chainlinkBlockCore args = do
+  let cmdArgs = buildBlockArgs args
+  result <- runChainlink cmdArgs
+  case result of
+    Left err -> pure $ Left ("chainlink block failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          pure $ Right ()
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink block failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkBlock
+
+instance MCPTool ChainlinkBlock where
+  type ToolArgs ChainlinkBlock = ChainlinkBlockArgs
+  toolName = "chainlink_issue_block"
+  toolDescription = chainlinkBlockDescription
+  toolSchema = chainlinkBlockSchema
+  toolHandlerEff args = do
+    result <- chainlinkBlockCore args
+    case result of
+      Left err -> pure $ errorResult err
+      Right _ -> pure $ successResult (object ["success" .= True])
+
+--------------------------------------------------------------------------------
+-- Relate
+--------------------------------------------------------------------------------
+
+instance FromJSON ChainlinkRelateArgs where
+  parseJSON = withObject "ChainlinkRelateArgs" $ \v ->
+    ChainlinkRelateArgs
+      <$> v .: "issue1"
+      <*> v .: "issue2"
+      <*> v .: "relation"
+
+instance ToJSON ChainlinkRelateArgs where
+  toJSON args =
+    object
+      [ "issue1" .= crIssue1 args,
+        "issue2" .= crIssue2 args,
+        "relation" .= crRelation args
+      ]
+
+chainlinkRelateDescription :: Text
+chainlinkRelateDescription =
+  "Relate two issues with a specified relationship type (e.g. duplicates, relates_to, blocks, is_blocked_by)."
+
+chainlinkRelateSchema :: Aeson.Object
+chainlinkRelateSchema =
+  genericToolSchemaWith @ChainlinkRelateArgs
+    [ ("issue1", "The numeric ID of the first issue"),
+      ("issue2", "The numeric ID of the second issue"),
+      ("relation", "The relationship type: duplicates, relates_to, blocks, is_blocked_by")
+    ]
+
+chainlinkRelateCore :: ChainlinkRelateArgs -> Eff Effects (Either Text ())
+chainlinkRelateCore args = do
+  let cmdArgs = buildRelateArgs args
+  result <- runChainlink cmdArgs
+  case result of
+    Left err -> pure $ Left ("chainlink relate failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          pure $ Right ()
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink relate failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkRelate
+
+instance MCPTool ChainlinkRelate where
+  type ToolArgs ChainlinkRelate = ChainlinkRelateArgs
+  toolName = "chainlink_issue_relate"
+  toolDescription = chainlinkRelateDescription
+  toolSchema = chainlinkRelateSchema
+  toolHandlerEff args = do
+    result <- chainlinkRelateCore args
+    case result of
+      Left err -> pure $ errorResult err
+      Right _ -> pure $ successResult (object ["success" .= True])
+
+--------------------------------------------------------------------------------
+-- Cascade
+--------------------------------------------------------------------------------
+
+instance FromJSON ChainlinkCascadeArgs where
+  parseJSON = withObject "ChainlinkCascadeArgs" $ \v ->
+    ChainlinkCascadeArgs <$> v .: "issue_id"
+
+instance ToJSON ChainlinkCascadeArgs where
+  toJSON args =
+    object
+      [ "issue_id" .= ccIssueId args
+      ]
+
+chainlinkCascadeDescription :: Text
+chainlinkCascadeDescription =
+  "Show the falsification cascade for an issue — what downstream work would be affected if this issue's assumptions are wrong."
+
+chainlinkCascadeSchema :: Aeson.Object
+chainlinkCascadeSchema =
+  genericToolSchemaWith @ChainlinkCascadeArgs
+    [ ("issue_id", "The numeric ID of the issue to cascade from")
+    ]
+
+chainlinkCascadeCore :: ChainlinkCascadeArgs -> Eff Effects (Either Text Text)
+chainlinkCascadeCore args = do
+  let cmdArgs = buildCascadeArgs args
+  result <- runChainlink cmdArgs
+  case result of
+    Left err -> pure $ Left ("chainlink cascade failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          pure $ Right (TL.toStrict (Proc.runResponseStdout resp))
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink cascade failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkCascade
+
+instance MCPTool ChainlinkCascade where
+  type ToolArgs ChainlinkCascade = ChainlinkCascadeArgs
+  toolName = "chainlink_issue_cascade"
+  toolDescription = chainlinkCascadeDescription
+  toolSchema = chainlinkCascadeSchema
+  toolHandlerEff args = do
+    result <- chainlinkCascadeCore args
+    case result of
+      Left err -> pure $ errorResult err
+      Right text -> pure $ successResult (object ["cascade" .= text])
+
+--------------------------------------------------------------------------------
+-- Milestone Create
+--------------------------------------------------------------------------------
+
+instance FromJSON ChainlinkMilestoneCreateArgs where
+  parseJSON = withObject "ChainlinkMilestoneCreateArgs" $ \v ->
+    ChainlinkMilestoneCreateArgs
+      <$> v .: "title"
+      <*> v .:? "description"
+
+instance ToJSON ChainlinkMilestoneCreateArgs where
+  toJSON args =
+    object
+      [ "title" .= cmcTitle args,
+        "description" .= cmcDescription args
+      ]
+
+chainlinkMilestoneCreateDescription :: Text
+chainlinkMilestoneCreateDescription =
+  "Create a new milestone for grouping issues. Returns the created milestone ID."
+
+chainlinkMilestoneCreateSchema :: Aeson.Object
+chainlinkMilestoneCreateSchema =
+  genericToolSchemaWith @ChainlinkMilestoneCreateArgs
+    [ ("title", "Milestone title (e.g. M1, M2, Alpha, Beta)"),
+      ("description", "Optional description of the milestone's goals")
+    ]
+
+chainlinkMilestoneCreateCore :: ChainlinkMilestoneCreateArgs -> Eff Effects (Either Text ChainlinkMilestoneCreateOutput)
+chainlinkMilestoneCreateCore args = do
+  let cmdArgs = buildMilestoneCreateArgs args
+  result <- runChainlink cmdArgs
+  case result of
+    Left err -> pure $ Left ("chainlink milestone create failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          case Aeson.eitherDecodeStrict (encodeUtf8 (TL.toStrict (Proc.runResponseStdout resp))) of
+            Right output -> pure $ Right output
+            Left parseErr ->
+              pure $ Left ("could not parse milestone create output: " <> T.pack parseErr)
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink milestone create failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkMilestoneCreate
+
+instance MCPTool ChainlinkMilestoneCreate where
+  type ToolArgs ChainlinkMilestoneCreate = ChainlinkMilestoneCreateArgs
+  toolName = "chainlink_milestone_create"
+  toolDescription = chainlinkMilestoneCreateDescription
+  toolSchema = chainlinkMilestoneCreateSchema
+  toolHandlerEff args = do
+    result <- chainlinkMilestoneCreateCore args
+    case result of
+      Left err -> pure $ errorResult err
+      Right output -> pure $ successResult (Aeson.toJSON output)
+
+--------------------------------------------------------------------------------
+-- Milestone List
+--------------------------------------------------------------------------------
+
+chainlinkMilestoneListDescription :: Text
+chainlinkMilestoneListDescription =
+  "List all milestones with their IDs, titles, and descriptions."
+
+chainlinkMilestoneListSchema :: Aeson.Object
+chainlinkMilestoneListSchema = mempty
+
+chainlinkMilestoneListCore :: Eff Effects (Either Text [ChainlinkMilestoneListItem])
+chainlinkMilestoneListCore = do
+  let cmdArgs = buildMilestoneListArgs
+  result <- runChainlink cmdArgs
+  case result of
+    Left err -> pure $ Left ("chainlink milestone list failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          case Aeson.eitherDecodeStrict (encodeUtf8 (TL.toStrict (Proc.runResponseStdout resp))) of
+            Right items -> pure $ Right items
+            Left parseErr ->
+              pure $ Left ("could not parse milestone list output: " <> T.pack parseErr)
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink milestone list failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkMilestoneList
+
+instance MCPTool ChainlinkMilestoneList where
+  type ToolArgs ChainlinkMilestoneList = ()
+  toolName = "chainlink_milestone_list"
+  toolDescription = chainlinkMilestoneListDescription
+  toolSchema = chainlinkMilestoneListSchema
+  toolHandlerEff _ = do
+    result <- chainlinkMilestoneListCore
+    case result of
+      Left err -> pure $ errorResult err
+      Right items -> pure $ successResult (Aeson.toJSON items)
+
+--------------------------------------------------------------------------------
+-- Sync
+--------------------------------------------------------------------------------
+
+chainlinkSyncDescription :: Text
+chainlinkSyncDescription =
+  "Sync chainlink lock state and coordination status. Use this to ensure all agents have a consistent view of locks and dependencies."
+
+chainlinkSyncSchema :: Aeson.Object
+chainlinkSyncSchema = mempty
+
+chainlinkSyncCore :: Eff Effects (Either Text Text)
+chainlinkSyncCore = do
+  let cmdArgs = buildSyncArgs
+  result <- runChainlink cmdArgs
+  case result of
+    Left err -> pure $ Left ("chainlink sync failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          pure $ Right (TL.toStrict (Proc.runResponseStdout resp))
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink sync failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkSync
+
+instance MCPTool ChainlinkSync where
+  type ToolArgs ChainlinkSync = ()
+  toolName = "chainlink_sync"
+  toolDescription = chainlinkSyncDescription
+  toolSchema = chainlinkSyncSchema
+  toolHandlerEff _ = do
+    result <- chainlinkSyncCore
+    case result of
+      Left err -> pure $ errorResult err
+      Right text -> pure $ successResult (object ["output" .= text])

@@ -28,6 +28,37 @@ module ExoMonad.Chainlink.Pure
     ChainlinkIssueCloseArgs (..),
     buildCloseArgs,
 
+    -- * Issue List
+    ChainlinkIssueListArgs (..),
+    buildListArgs,
+    ChainlinkIssueListItem (..),
+
+    -- * Issue Update
+    ChainlinkIssueUpdateArgs (..),
+    buildUpdateArgs,
+
+    -- * Block
+    ChainlinkBlockArgs (..),
+    buildBlockArgs,
+
+    -- * Relate
+    ChainlinkRelateArgs (..),
+    buildRelateArgs,
+
+    -- * Cascade
+    ChainlinkCascadeArgs (..),
+    buildCascadeArgs,
+
+    -- * Milestone
+    ChainlinkMilestoneCreateArgs (..),
+    buildMilestoneCreateArgs,
+    ChainlinkMilestoneCreateOutput (..),
+    buildMilestoneListArgs,
+    ChainlinkMilestoneListItem (..),
+
+    -- * Sync
+    buildSyncArgs,
+
     -- * Worker Protocol Text
     chainlinkWorkerProtocolText,
 
@@ -118,6 +149,109 @@ data ChainlinkIssueCloseArgs = ChainlinkIssueCloseArgs
   }
   deriving (Generic, Show)
 
+data ChainlinkIssueListArgs = ChainlinkIssueListArgs
+  { cilStatus :: Maybe Text,
+    cilPriority :: Maybe Text,
+    cilLabels :: Maybe [Text],
+    cilMilestone :: Maybe Text
+  }
+  deriving (Generic, Show)
+
+data ChainlinkIssueListItem = ChainlinkIssueListItem
+  { ciliId :: Int,
+    ciliTitle :: Text,
+    ciliStatus :: Text,
+    ciliPriority :: Maybe Text,
+    ciliLabels :: [Text]
+  }
+  deriving (Generic, Show, Eq)
+
+instance FromJSON ChainlinkIssueListItem where
+  parseJSON = withObject "ChainlinkIssueListItem" $ \v ->
+    ChainlinkIssueListItem
+      <$> v .: "id"
+      <*> v .: "title"
+      <*> v .: "status"
+      <*> v .:? "priority"
+      <*> v .:? "labels" .!= []
+
+instance ToJSON ChainlinkIssueListItem where
+  toJSON o =
+    object
+      [ "id" .= ciliId o,
+        "title" .= ciliTitle o,
+        "status" .= ciliStatus o,
+        "priority" .= ciliPriority o,
+        "labels" .= ciliLabels o
+      ]
+
+data ChainlinkIssueUpdateArgs = ChainlinkIssueUpdateArgs
+  { ciuIssueId :: Int,
+    ciuStatus :: Maybe Text,
+    ciuPriority :: Maybe Text,
+    ciuLabels :: Maybe [Text],
+    ciuMilestone :: Maybe Text
+  }
+  deriving (Generic, Show)
+
+data ChainlinkBlockArgs = ChainlinkBlockArgs
+  { cbChildId :: Int,
+    cbBlockerId :: Int
+  }
+  deriving (Generic, Show)
+
+data ChainlinkRelateArgs = ChainlinkRelateArgs
+  { crIssue1 :: Int,
+    crIssue2 :: Int,
+    crRelation :: Text
+  }
+  deriving (Generic, Show)
+
+data ChainlinkCascadeArgs = ChainlinkCascadeArgs
+  { ccIssueId :: Int
+  }
+  deriving (Generic, Show)
+
+data ChainlinkMilestoneCreateArgs = ChainlinkMilestoneCreateArgs
+  { cmcTitle :: Text,
+    cmcDescription :: Maybe Text
+  }
+  deriving (Generic, Show)
+
+data ChainlinkMilestoneCreateOutput = ChainlinkMilestoneCreateOutput
+  { cmcoMilestoneId :: Int
+  }
+  deriving (Generic, Show, Eq)
+
+instance FromJSON ChainlinkMilestoneCreateOutput where
+  parseJSON = withObject "ChainlinkMilestoneCreateOutput" $ \v ->
+    ChainlinkMilestoneCreateOutput <$> v .: "id"
+
+instance ToJSON ChainlinkMilestoneCreateOutput where
+  toJSON o = object ["id" .= cmcoMilestoneId o]
+
+data ChainlinkMilestoneListItem = ChainlinkMilestoneListItem
+  { cmliId :: Int,
+    cmliTitle :: Text,
+    cmliDescription :: Maybe Text
+  }
+  deriving (Generic, Show, Eq)
+
+instance FromJSON ChainlinkMilestoneListItem where
+  parseJSON = withObject "ChainlinkMilestoneListItem" $ \v ->
+    ChainlinkMilestoneListItem
+      <$> v .: "id"
+      <*> v .: "title"
+      <*> v .:? "description"
+
+instance ToJSON ChainlinkMilestoneListItem where
+  toJSON o =
+    object
+      [ "id" .= cmliId o,
+        "title" .= cmliTitle o,
+        "description" .= cmliDescription o
+      ]
+
 -- | Chainlink worker protocol text, injected into worker prompts.
 -- Defined here so it's testable natively (wasm-guest-pure builds on any arch).
 chainlinkWorkerProtocolText :: Text
@@ -171,3 +305,58 @@ buildSessionEndArgs args =
 
 buildCloseArgs :: ChainlinkIssueCloseArgs -> [String]
 buildCloseArgs args = ["close", show (cisIssueId args), "-q"]
+
+buildListArgs :: ChainlinkIssueListArgs -> [String]
+buildListArgs args =
+  ["issue", "list", "--json"]
+    ++ case cilStatus args of
+      Just s -> ["--status", T.unpack s]
+      Nothing -> []
+    ++ case cilPriority args of
+      Just p -> ["--priority", T.unpack p]
+      Nothing -> []
+    ++ case cilLabels args of
+      Just labels -> concatMap (\l -> ["--label", T.unpack l]) labels
+      Nothing -> []
+    ++ case cilMilestone args of
+      Just m -> ["--milestone", T.unpack m]
+      Nothing -> []
+
+buildUpdateArgs :: ChainlinkIssueUpdateArgs -> [String]
+buildUpdateArgs args =
+  ["issue", "update", show (ciuIssueId args)]
+    ++ case ciuStatus args of
+      Just s -> ["-s", T.unpack s]
+      Nothing -> []
+    ++ case ciuPriority args of
+      Just p -> ["-p", T.unpack p]
+      Nothing -> []
+    ++ case ciuLabels args of
+      Just labels -> concatMap (\l -> ["-l", T.unpack l]) labels
+      Nothing -> []
+    ++ case ciuMilestone args of
+      Just m -> ["-m", T.unpack m]
+      Nothing -> []
+
+buildBlockArgs :: ChainlinkBlockArgs -> [String]
+buildBlockArgs args = ["block", show (cbChildId args), show (cbBlockerId args)]
+
+buildRelateArgs :: ChainlinkRelateArgs -> [String]
+buildRelateArgs args =
+  ["relate", show (crIssue1 args), show (crIssue2 args), T.unpack (crRelation args)]
+
+buildCascadeArgs :: ChainlinkCascadeArgs -> [String]
+buildCascadeArgs args = ["cascade", show (ccIssueId args)]
+
+buildMilestoneCreateArgs :: ChainlinkMilestoneCreateArgs -> [String]
+buildMilestoneCreateArgs args =
+  ["milestone", "create", T.unpack (cmcTitle args)]
+    ++ case cmcDescription args of
+      Just d -> ["--description", T.unpack d]
+      Nothing -> []
+
+buildMilestoneListArgs :: [String]
+buildMilestoneListArgs = ["milestone", "list", "--json"]
+
+buildSyncArgs :: [String]
+buildSyncArgs = ["sync"]

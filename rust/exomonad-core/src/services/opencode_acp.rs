@@ -13,6 +13,9 @@ use tokio::sync::RwLock;
 
 use crate::domain::AgentName;
 
+/// Relative path from project root to the chainlink TL protocol context file.
+const CHAINLINK_TL_RELATIVE_PATH: &str = ".exo/roles/devswarm/context/chainlink-tl.md";
+
 /// Metadata for an OpenCode ACP server connection.
 #[derive(Debug, Clone)]
 pub struct OpencodeAcpConnection {
@@ -59,12 +62,14 @@ impl OpencodeAcpRegistry {
 ///
 /// Runs `opencode serve --port 0 --cwd <worktree>`, captures the listening port
 /// from stdout, and delivers the initial prompt via `opencode run --attach`.
+/// Injects the chainlink TL protocol from `project_dir` into the prompt.
 ///
 /// Returns the OpencodeAcpConnection for registry storage.
 pub async fn spawn_and_prompt(
     agent_id: AgentName,
     working_dir: &Path,
     initial_prompt: &str,
+    project_dir: &Path,
     env_vars: Vec<(String, String)>,
     model: Option<&str>,
 ) -> Result<OpencodeAcpConnection> {
@@ -93,7 +98,9 @@ pub async fn spawn_and_prompt(
 
     tracing::info!(agent = %agent_id, url = %base_url, "OpenCode ACP server started");
 
-    deliver_prompt(&base_url, working_dir, initial_prompt, model)
+    let augmented_prompt = inject_chainlink_tl_protocol(initial_prompt, project_dir).await;
+
+    deliver_prompt(&base_url, working_dir, &augmented_prompt, model)
         .await
         .context("Failed to deliver initial prompt via opencode run --attach")?;
 
@@ -106,6 +113,35 @@ pub async fn spawn_and_prompt(
         base_url,
         child,
     })
+}
+
+/// Read chainlink-tl.md from the project directory, strip YAML frontmatter,
+/// and append it to the prompt. Returns the original prompt if the file
+/// cannot be read (non-fatal).
+async fn inject_chainlink_tl_protocol(prompt: &str, project_dir: &Path) -> String {
+    let path = project_dir.join(CHAINLINK_TL_RELATIVE_PATH);
+    let protocol = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => strip_yaml_frontmatter(&content),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "Failed to read chainlink TL protocol (non-fatal)");
+            return prompt.to_string();
+        }
+    };
+
+    format!("{}\n\n---\n\n{}", protocol, prompt)
+}
+
+/// Strip YAML frontmatter (delimited by `---` lines) from markdown content.
+fn strip_yaml_frontmatter(content: &str) -> String {
+    if content.starts_with("---") {
+        if let Some(end) = content[3..].find("---") {
+            content[3 + end + 3..].trim().to_string()
+        } else {
+            content.to_string()
+        }
+    } else {
+        content.to_string()
+    }
 }
 
 /// Read stdout until we find the listening address line.
@@ -208,5 +244,32 @@ mod tests {
             Some("http://localhost:8080".to_string())
         );
         assert_eq!(extract_url("no url here"), None);
+    }
+
+    #[test]
+    fn test_strip_yaml_frontmatter_with_frontmatter() {
+        let md = "---\npaths:\n  - \"**\"\n---\n\n# Title\n\nBody";
+        let stripped = strip_yaml_frontmatter(md);
+        assert_eq!(stripped, "# Title\n\nBody");
+    }
+
+    #[test]
+    fn test_strip_yaml_frontmatter_no_frontmatter() {
+        let md = "# Title\n\nBody";
+        let stripped = strip_yaml_frontmatter(md);
+        assert_eq!(stripped, "# Title\n\nBody");
+    }
+
+    #[test]
+    fn test_strip_yaml_frontmatter_unclosed() {
+        let md = "---\npaths:\n  - \"**\"\n\n# Title\n\nBody";
+        let stripped = strip_yaml_frontmatter(md);
+        assert_eq!(stripped, "---\npaths:\n  - \"**\"\n\n# Title\n\nBody");
+    }
+
+    #[test]
+    fn test_strip_yaml_frontmatter_empty() {
+        let stripped = strip_yaml_frontmatter("");
+        assert_eq!(stripped, "");
     }
 }

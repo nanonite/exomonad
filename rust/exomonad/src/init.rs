@@ -6,6 +6,23 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// Read chainlink-tl.md from the project directory, strip YAML frontmatter,
+/// and return the content. Returns None if the file cannot be read (non-fatal).
+fn read_chainlink_tl_protocol(cwd: &Path) -> Option<String> {
+    let path = cwd.join(".exo/roles/devswarm/context/chainlink-tl.md");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let stripped = if content.starts_with("---") {
+        if let Some(end) = content[3..].find("---") {
+            content[3 + end + 3..].trim().to_string()
+        } else {
+            content
+        }
+    } else {
+        content
+    };
+    if stripped.is_empty() { None } else { Some(stripped) }
+}
+
 /// Reject `--tl-model` / `--worker-model` values that opencode doesn't recognise.
 /// Caller must only invoke this when the model is `Some` and the agent type is OpenCode.
 async fn validate_opencode_model(model: &str) -> Result<()> {
@@ -728,7 +745,12 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
             (AgentType::Shoal, None) => "shoal-agent --exo root".to_string(),
             (AgentType::OpenCode, Some(prompt)) => {
                 let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
-                format!("opencode run{yolo}{opencode_model_flag} '{}'", prompt.replace('\'', "'\\''"))
+                let chainlink_protocol = read_chainlink_tl_protocol(&cwd);
+                let augmented = match chainlink_protocol {
+                    Some(ref protocol) => format!("{}\n\n---\n\n{}", protocol, prompt),
+                    None => prompt.to_string(),
+                };
+                format!("opencode run{yolo}{opencode_model_flag} '{}'", augmented.replace('\'', "'\\''"))
             }
             (AgentType::OpenCode, None) => {
                 let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
