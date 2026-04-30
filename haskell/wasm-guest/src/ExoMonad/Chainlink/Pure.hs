@@ -60,6 +60,11 @@ module ExoMonad.Chainlink.Pure
     -- * Sync
     buildSyncArgs,
 
+    -- * Locks List
+    buildLocksListArgs,
+    LocksListEntry (..),
+    hasActiveLocks,
+
     -- * Worker Protocol Text
     chainlinkWorkerProtocolText,
 
@@ -69,8 +74,10 @@ module ExoMonad.Chainlink.Pure
 where
 
 import Data.Aeson (FromJSON (..), ToJSON (..), Value (Object), object, withObject, (.:), (.:?), (.!=), (.=))
+import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding (encodeUtf8)
 import GHC.Generics (Generic)
 
 data ChainlinkIssueCreateArgs = ChainlinkIssueCreateArgs
@@ -310,6 +317,36 @@ buildCloseArgs args = ["close", show (cisIssueId args), "-q"]
 
 buildLocksReleaseArgs :: ChainlinkIssueCloseArgs -> [String]
 buildLocksReleaseArgs args = ["locks", "release", show (cisIssueId args)]
+
+buildLocksListArgs :: [String]
+buildLocksListArgs = ["locks", "list", "--json"]
+
+data LocksListEntry = LocksListEntry
+  { lleId :: Int,
+    lleIssueId :: Maybe Int
+  }
+  deriving (Generic, Show, Eq)
+
+instance FromJSON LocksListEntry where
+  parseJSON = withObject "LocksListEntry" $ \v ->
+    LocksListEntry
+      <$> v .: "id"
+      <*> v .:? "issue_id"
+
+instance ToJSON LocksListEntry where
+  toJSON o =
+    object
+      [ "id" .= lleId o,
+        "issue_id" .= lleIssueId o
+      ]
+
+-- | Parse locks list JSON and return True if any locks are held.
+hasActiveLocks :: Text -> Bool
+hasActiveLocks json =
+  case Aeson.eitherDecodeStrict (encodeUtf8 json) of
+    Right [] -> False
+    Right (_ :: [LocksListEntry]) -> True
+    Left _err -> False
 
 buildListArgs :: ChainlinkIssueListArgs -> [String]
 buildListArgs args =

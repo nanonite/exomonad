@@ -42,6 +42,21 @@ else
     echo "WARNING: 'Chainlink Worker Protocol' not found in WASM binary. workerProfileText may be missing the chainlink protocol."
 fi
 
+# Check chainlink tool names are compiled into WASM binary (TL + worker tools)
+MISSING_TOOLS=()
+for tool in chainlink_issue_create chainlink_issue_list chainlink_issue_block chainlink_issue_close chainlink_session_end chainlink_milestone_create chainlink_sync; do
+    if grep -q "$tool" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
+        echo "  chainlink tool '$tool': FOUND"
+    else
+        echo "  chainlink tool '$tool': MISSING"
+        MISSING_TOOLS+=("$tool")
+    fi
+done
+if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
+    echo "ERROR: Missing chainlink tools in WASM binary: ${MISSING_TOOLS[*]}"
+    exit 1
+fi
+
 for cmd in tmux git; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: $cmd not found in PATH."

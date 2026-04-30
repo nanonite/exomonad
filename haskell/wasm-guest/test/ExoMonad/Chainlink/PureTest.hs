@@ -222,5 +222,29 @@ pureTests =
                 cmliDescription = Nothing
               }
             decoded = decode (encode item) :: Maybe ChainlinkMilestoneListItem
-        decoded @=? Just item
+        decoded @=? Just item,
+
+      -- buildLocksListArgs
+      testCase "buildLocksListArgs: basic" $
+        buildLocksListArgs @=? ["locks", "list", "--json"],
+
+      -- hasActiveLocks
+      testCase "hasActiveLocks: empty list returns False" $
+        hasActiveLocks "[]" @=? False,
+      testCase "hasActiveLocks: non-empty list returns True" $
+        hasActiveLocks "[{\"id\":1,\"issue_id\":42}]" @=? True,
+      testCase "hasActiveLocks: no issue_id field" $
+        hasActiveLocks "[{\"id\":1}]" @=? True,
+      testCase "hasActiveLocks: invalid JSON returns False" $
+        hasActiveLocks "not json" @=? False,
+
+      -- LocksListEntry JSON roundtrip
+      testCase "LocksListEntry JSON roundtrip: all fields" $ do
+        let entry = LocksListEntry { lleId = 5, lleIssueId = Just 42 }
+            decoded = decode (encode entry) :: Maybe LocksListEntry
+        decoded @=? Just entry,
+      testCase "LocksListEntry JSON roundtrip: no issue_id" $ do
+        let entry = LocksListEntry { lleId = 5, lleIssueId = Nothing }
+            decoded = decode (encode entry) :: Maybe LocksListEntry
+        decoded @=? Just entry
     ]
