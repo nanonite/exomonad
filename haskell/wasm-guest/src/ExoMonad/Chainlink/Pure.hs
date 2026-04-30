@@ -65,16 +65,26 @@ module ExoMonad.Chainlink.Pure
     LocksListEntry (..),
     hasActiveLocks,
 
+    -- * Worker Status
+    buildWorkerStatusIssueListArgs,
+    buildWorkerStatusLocksListArgs,
+    buildWorkerStatusUsageArgs,
+    UsageRecord (..),
+    WorkerStatusEntry (..),
+    parseGitDiffStat,
+    correlateWorkerStatus,
+
     -- * Worker Protocol Text
     chainlinkWorkerProtocolText,
 
     -- * Utilities
     parseIssueId,
   )
-where
+  where
 
 import Data.Aeson (FromJSON (..), ToJSON (..), Value (Object), object, withObject, (.:), (.:?), (.!=), (.=))
 import Data.Aeson qualified as Aeson
+import Data.Maybe (catMaybes, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -347,6 +357,114 @@ hasActiveLocks json =
     Right [] -> False
     Right (_ :: [LocksListEntry]) -> True
     Left _err -> False
+
+----------------------------------------------------------------------
+-- Worker Status
+----------------------------------------------------------------------
+
+buildWorkerStatusIssueListArgs :: [String]
+buildWorkerStatusIssueListArgs = ["issue", "list", "--json", "--status", "open"]
+
+buildWorkerStatusLocksListArgs :: [String]
+buildWorkerStatusLocksListArgs = ["locks", "list", "--json"]
+
+buildWorkerStatusUsageArgs :: [String]
+buildWorkerStatusUsageArgs = ["usage", "list", "--json"]
+
+data UsageRecord = UsageRecord
+  { urIssueId :: Maybe Int,
+    urInputTokens :: Maybe Int,
+    urOutputTokens :: Maybe Int,
+    urEstimatedCostUsd :: Maybe Double
+  }
+  deriving (Generic, Show, Eq)
+
+instance FromJSON UsageRecord where
+  parseJSON = withObject "UsageRecord" $ \v ->
+    UsageRecord
+      <$> v .:? "issue_id"
+      <*> v .:? "input_tokens"
+      <*> v .:? "output_tokens"
+      <*> v .:? "estimated_cost_usd"
+
+instance ToJSON UsageRecord where
+  toJSON o =
+    object
+      [ "issue_id" .= urIssueId o,
+        "input_tokens" .= urInputTokens o,
+        "output_tokens" .= urOutputTokens o,
+        "estimated_cost_usd" .= urEstimatedCostUsd o
+      ]
+
+data WorkerStatusEntry = WorkerStatusEntry
+  { wseAgentId :: Maybe Text,
+    wseIssueId :: Int,
+    wseIssueTitle :: Text,
+    wseLockHeldMinutes :: Maybe Double,
+    wseInputTokens :: Maybe Int,
+    wseOutputTokens :: Maybe Int,
+    wseEstimatedCostUsd :: Maybe Double,
+    wseUncommittedFiles :: [Text]
+  }
+  deriving (Generic, Show, Eq)
+
+instance FromJSON WorkerStatusEntry where
+  parseJSON = withObject "WorkerStatusEntry" $ \v ->
+    WorkerStatusEntry
+      <$> v .:? "agent_id"
+      <*> v .: "issue_id"
+      <*> v .: "issue_title"
+      <*> v .:? "lock_held_minutes"
+      <*> v .:? "input_tokens"
+      <*> v .:? "output_tokens"
+      <*> v .:? "estimated_cost_usd"
+      <*> v .:? "uncommitted_files" .!= []
+
+instance ToJSON WorkerStatusEntry where
+  toJSON o =
+    object
+      [ "agent_id" .= wseAgentId o,
+        "issue_id" .= wseIssueId o,
+        "issue_title" .= wseIssueTitle o,
+        "lock_held_minutes" .= wseLockHeldMinutes o,
+        "input_tokens" .= wseInputTokens o,
+        "output_tokens" .= wseOutputTokens o,
+        "estimated_cost_usd" .= wseEstimatedCostUsd o,
+        "uncommitted_files" .= wseUncommittedFiles o
+      ]
+
+-- | Parse git diff --stat output into file path strings.
+-- Each content line has the form "  path/to/file.ext | N +/-".
+-- We extract the path by taking everything before the pipe character.
+parseGitDiffStat :: Text -> [Text]
+parseGitDiffStat output =
+  [ T.strip $ T.takeWhile (/= '|') line
+    | line <- T.lines output,
+      "|" `T.isInfixOf` line,
+      not (T.null $ T.strip line)
+  ]
+
+-- | Correlate open issues, locks, usage records, and git diff stat into worker status entries.
+-- Each open issue produces one entry, enriched with matching lock and usage data.
+-- Costs come directly from chainlink usage records (CLI-reported), not calculated from tokens.
+correlateWorkerStatus :: [ChainlinkIssueListItem] -> [LocksListEntry] -> [UsageRecord] -> [Text] -> [WorkerStatusEntry]
+correlateWorkerStatus issues locks usage uncommittedFiles =
+  [ WorkerStatusEntry
+      { wseAgentId = Nothing,
+        wseIssueId = ciliId issue,
+        wseIssueTitle = ciliTitle issue,
+        wseLockHeldMinutes = if any (\l -> lleIssueId l == Just (ciliId issue)) locks then Just 0 else Nothing,
+        wseInputTokens = totalInput,
+        wseOutputTokens = totalOutput,
+        wseEstimatedCostUsd = totalCost,
+        wseUncommittedFiles = uncommittedFiles
+      }
+    | issue <- issues,
+      let issueUsage = filter (\u -> urIssueId u == Just (ciliId issue)) usage,
+      let totalInput = case catMaybes (map urInputTokens issueUsage) of { [] -> Nothing; xs -> Just (sum xs) },
+      let totalOutput = case catMaybes (map urOutputTokens issueUsage) of { [] -> Nothing; xs -> Just (sum xs) },
+      let totalCost = case catMaybes (map urEstimatedCostUsd issueUsage) of { [] -> Nothing; xs -> Just (sum xs) }
+  ]
 
 buildListArgs :: ChainlinkIssueListArgs -> [String]
 buildListArgs args =

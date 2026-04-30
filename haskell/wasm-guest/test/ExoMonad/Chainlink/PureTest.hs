@@ -246,5 +246,136 @@ pureTests =
       testCase "LocksListEntry JSON roundtrip: no issue_id" $ do
         let entry = LocksListEntry { lleId = 5, lleIssueId = Nothing }
             decoded = decode (encode entry) :: Maybe LocksListEntry
-        decoded @=? Just entry
+        decoded @=? Just entry,
+
+      ----------------------------------------------------------------------
+      -- Worker Status
+      ----------------------------------------------------------------------
+
+      -- parseGitDiffStat
+      testCase "parseGitDiffStat: single file" $
+        parseGitDiffStat " src/main.rs | 5 +++++\n 1 file changed, 5 insertions(+)\n"
+          @=? ["src/main.rs"],
+      testCase "parseGitDiffStat: multiple files" $
+        parseGitDiffStat " src/a.hs | 2 +-\n src/b.hs | 3 +++\n 2 files changed, 4 insertions(+), 1 deletion(-)\n"
+          @=? ["src/a.hs", "src/b.hs"],
+      testCase "parseGitDiffStat: empty output" $
+        parseGitDiffStat "" @=? [],
+      testCase "parseGitDiffStat: only summary line" $
+        parseGitDiffStat " 0 files changed\n" @=? [],
+      testCase "parseGitDiffStat: no changes" $
+        parseGitDiffStat "" @=? [],
+
+      -- UsageRecord JSON roundtrip
+      testCase "UsageRecord JSON roundtrip: all fields" $ do
+        let record = UsageRecord
+              { urIssueId = Just 42,
+                urInputTokens = Just 1500,
+                urOutputTokens = Just 300,
+                urEstimatedCostUsd = Just 0.015
+              }
+            decoded = decode (encode record) :: Maybe UsageRecord
+        decoded @=? Just record,
+      testCase "UsageRecord JSON roundtrip: no optional fields" $ do
+        let record = UsageRecord
+              { urIssueId = Nothing,
+                urInputTokens = Nothing,
+                urOutputTokens = Nothing,
+                urEstimatedCostUsd = Nothing
+              }
+            decoded = decode (encode record) :: Maybe UsageRecord
+        decoded @=? Just record,
+
+      -- WorkerStatusEntry JSON roundtrip
+      testCase "WorkerStatusEntry JSON roundtrip: all fields" $ do
+        let entry = WorkerStatusEntry
+              { wseAgentId = Just "agent-1",
+                wseIssueId = 42,
+                wseIssueTitle = "Fix bug",
+                wseLockHeldMinutes = Just 15.5,
+                wseInputTokens = Just 5000,
+                wseOutputTokens = Just 1000,
+                wseEstimatedCostUsd = Just 0.05,
+                wseUncommittedFiles = ["src/main.rs"]
+              }
+            decoded = decode (encode entry) :: Maybe WorkerStatusEntry
+        decoded @=? Just entry,
+      testCase "WorkerStatusEntry JSON roundtrip: minimal" $ do
+        let entry = WorkerStatusEntry
+              { wseAgentId = Nothing,
+                wseIssueId = 1,
+                wseIssueTitle = "Task",
+                wseLockHeldMinutes = Nothing,
+                wseInputTokens = Nothing,
+                wseOutputTokens = Nothing,
+                wseEstimatedCostUsd = Nothing,
+                wseUncommittedFiles = []
+              }
+            decoded = decode (encode entry) :: Maybe WorkerStatusEntry
+        decoded @=? Just entry,
+
+      -- correlateWorkerStatus
+      testCase "correlateWorkerStatus: empty inputs returns empty list" $
+        correlateWorkerStatus [] [] [] [] @=? [],
+      testCase "correlateWorkerStatus: one issue, no locks, no usage" $ do
+        let issues = [ChainlinkIssueListItem 1 "Task A" "open" Nothing []]
+            result = correlateWorkerStatus issues [] [] []
+        length result @?= 1
+        result @?=
+          [ WorkerStatusEntry
+              { wseAgentId = Nothing,
+                wseIssueId = 1,
+                wseIssueTitle = "Task A",
+                wseLockHeldMinutes = Nothing,
+                wseInputTokens = Nothing,
+                wseOutputTokens = Nothing,
+                wseEstimatedCostUsd = Nothing,
+                wseUncommittedFiles = []
+              }
+          ],
+      testCase "correlateWorkerStatus: issue with matching lock" $ do
+        let issues = [ChainlinkIssueListItem 1 "Task A" "open" Nothing []]
+            locks = [LocksListEntry 10 (Just 1)]
+            result = correlateWorkerStatus issues locks [] []
+        wseLockHeldMinutes (head result) @?= Just 0,
+      testCase "correlateWorkerStatus: issue with non-matching lock" $ do
+        let issues = [ChainlinkIssueListItem 1 "Task A" "open" Nothing []]
+            locks = [LocksListEntry 10 (Just 99)]
+            result = correlateWorkerStatus issues locks [] []
+        wseLockHeldMinutes (head result) @?= Nothing,
+      testCase "correlateWorkerStatus: issue with usage records" $ do
+        let issues = [ChainlinkIssueListItem 1 "Task A" "open" Nothing []]
+            usage = [UsageRecord (Just 1) (Just 1000) (Just 200) (Just 0.01)]
+            result = correlateWorkerStatus issues [] usage []
+            entry = head result
+        wseInputTokens entry @?= Just 1000
+        wseOutputTokens entry @?= Just 200
+        wseEstimatedCostUsd entry @?= Just 0.01,
+      testCase "correlateWorkerStatus: multiple issues with mixed data" $ do
+        let issues =
+              [ ChainlinkIssueListItem 1 "Task A" "open" Nothing [],
+                ChainlinkIssueListItem 2 "Task B" "open" Nothing []
+              ]
+            locks = [LocksListEntry 10 (Just 1)]
+            usage =
+              [ UsageRecord (Just 1) (Just 500) (Just 100) (Just 0.005),
+                UsageRecord (Just 1) (Just 200) (Just 50) (Just 0.002)
+              ]
+            result = correlateWorkerStatus issues locks usage ["src/lib.rs"]
+            entryA = head result
+            entryB = result !! 1
+        wseLockHeldMinutes entryA @?= Just 0
+        wseLockHeldMinutes entryB @?= Nothing
+        wseInputTokens entryA @?= Just 700  -- 500 + 200
+        wseOutputTokens entryA @?= Just 150  -- 100 + 50
+        wseEstimatedCostUsd entryA @?= Just 0.007  -- 0.005 + 0.002
+        wseInputTokens entryB @?= Nothing
+        wseOutputTokens entryB @?= Nothing
+        wseEstimatedCostUsd entryB @?= Nothing
+        wseUncommittedFiles entryA @?= ["src/lib.rs"]
+        wseUncommittedFiles entryB @?= ["src/lib.rs"],
+      testCase "correlateWorkerStatus: uncommitted files propagated" $ do
+        let issues = [ChainlinkIssueListItem 1 "Task A" "open" Nothing []]
+            result = correlateWorkerStatus issues [] [] ["a.rs", "b.rs"]
+        wseUncommittedFiles (head result) @?= ["a.rs", "b.rs"]
     ]

@@ -44,7 +44,7 @@ fi
 
 # Check chainlink tool names are compiled into WASM binary (TL + worker tools)
 MISSING_TOOLS=()
-for tool in chainlink_issue_create chainlink_issue_list chainlink_issue_block chainlink_issue_close chainlink_session_end chainlink_milestone_create chainlink_sync; do
+for tool in chainlink_issue_create chainlink_issue_list chainlink_issue_block chainlink_issue_close chainlink_session_end chainlink_milestone_create chainlink_sync chainlink_worker_status; do
     if grep -q "$tool" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
         echo "  chainlink tool '$tool': FOUND"
     else

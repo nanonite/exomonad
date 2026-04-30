@@ -102,6 +102,12 @@ module ExoMonad.Guest.Tools.Chainlink
     chainlinkSyncCore,
     chainlinkSyncDescription,
     chainlinkSyncSchema,
+
+    -- * Worker Status
+    ChainlinkWorkerStatus (..),
+    chainlinkWorkerStatusCore,
+    chainlinkWorkerStatusDescription,
+    chainlinkWorkerStatusSchema,
   )
   where
 
@@ -1078,3 +1084,82 @@ instance MCPTool ChainlinkSync where
     case result of
       Left err -> pure $ errorResult err
       Right text -> pure $ successResult (object ["output" .= text])
+
+--------------------------------------------------------------------------------
+-- Worker Status
+--------------------------------------------------------------------------------
+
+chainlinkWorkerStatusDescription :: Text
+chainlinkWorkerStatusDescription =
+  "Aggregate worker status: lists open issues, active locks, usage data, and uncommitted files. "
+    <> "Runs (1) chainlink issue list --status open, (2) chainlink locks list, "
+    <> "(3) chainlink usage list, (4) git diff --stat and correlates by issue_id. "
+    <> "Returns a JSON array of worker summaries."
+
+chainlinkWorkerStatusSchema :: Aeson.Object
+chainlinkWorkerStatusSchema = mempty
+
+chainlinkWorkerStatusCore :: Eff Effects (Either Text [WorkerStatusEntry])
+chainlinkWorkerStatusCore = do
+  -- Run all four commands, each resilient to failure
+  issues <- tryCommand buildWorkerStatusIssueListArgs parseIssueListJson []
+  locks <- tryCommand buildWorkerStatusLocksListArgs parseLocksListJson []
+  usage <- tryCommand buildWorkerStatusUsageArgs parseUsageListJson []
+  diffStat <- tryGitDiffStat
+  -- Correlate and return
+  let uncommittedFiles = parseGitDiffStat diffStat
+  pure $ Right (correlateWorkerStatus issues locks usage uncommittedFiles)
+  where
+    parseIssueListJson txt =
+      case Aeson.eitherDecodeStrict (encodeUtf8 txt) of
+        Right items -> items
+        Left _ -> []
+    parseLocksListJson txt =
+      case Aeson.eitherDecodeStrict (encodeUtf8 txt) of
+        Right items -> items
+        Left _ -> []
+    parseUsageListJson txt =
+      case Aeson.eitherDecodeStrict (encodeUtf8 txt) of
+        Right items -> items
+        Left _ -> []
+
+tryCommand :: [String] -> (Text -> a) -> a -> Eff Effects a
+tryCommand args parseFn defaultVal = do
+  result <- runChainlink args
+  case result of
+    Left _ -> pure defaultVal
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          pure $ parseFn (TL.toStrict (Proc.runResponseStdout resp))
+      | otherwise -> pure defaultVal
+
+tryGitDiffStat :: Eff Effects Text
+tryGitDiffStat = do
+  result <-
+    suspendEffect @ProcessRun
+      ( Proc.RunRequest
+          { Proc.runRequestCommand = "git",
+            Proc.runRequestArgs = V.fromList (TL.pack <$> ["diff", "--stat"]),
+            Proc.runRequestWorkingDir = ".",
+            Proc.runRequestEnv = Map.empty,
+            Proc.runRequestTimeoutMs = 15000
+          }
+      )
+  case result of
+    Left _ -> pure ""
+    Right resp
+      | Proc.runResponseExitCode resp /= 0 -> pure ""
+      | otherwise -> pure $ TL.toStrict (Proc.runResponseStdout resp)
+
+data ChainlinkWorkerStatus
+
+instance MCPTool ChainlinkWorkerStatus where
+  type ToolArgs ChainlinkWorkerStatus = ()
+  toolName = "chainlink_worker_status"
+  toolDescription = chainlinkWorkerStatusDescription
+  toolSchema = chainlinkWorkerStatusSchema
+  toolHandlerEff _ = do
+    result <- chainlinkWorkerStatusCore
+    case result of
+      Left err -> pure $ errorResult err
+      Right entries -> pure $ successResult (Aeson.toJSON entries)

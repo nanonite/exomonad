@@ -30,7 +30,8 @@ import ExoMonad.Guest.Tools.Chainlink
     ChainlinkCascade (..),
     ChainlinkMilestoneCreate (..),
     ChainlinkMilestoneList (..),
-    ChainlinkSync (..)
+    ChainlinkSync (..),
+    ChainlinkWorkerStatus (..)
   )
 import ExoMonad.Guest.Tools.Events
   ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs (..)
@@ -180,7 +181,8 @@ data Tools mode = Tools
     chainlinkIssueCascade :: mode :- ChainlinkCascade,
     chainlinkMilestoneCreate :: mode :- ChainlinkMilestoneCreate,
     chainlinkMilestoneList :: mode :- ChainlinkMilestoneList,
-    chainlinkSync :: mode :- ChainlinkSync
+    chainlinkSync :: mode :- ChainlinkSync,
+    chainlinkWorkerStatus :: mode :- ChainlinkWorkerStatus
   }
   deriving (Generic)
 
@@ -211,7 +213,8 @@ config =
               chainlinkIssueCascade = mkHandler @ChainlinkCascade,
               chainlinkMilestoneCreate = mkHandler @ChainlinkMilestoneCreate,
               chainlinkMilestoneList = mkHandler @ChainlinkMilestoneList,
-              chainlinkSync = mkHandler @ChainlinkSync
+              chainlinkSync = mkHandler @ChainlinkSync,
+              chainlinkWorkerStatus = mkHandler @ChainlinkWorkerStatus
             },
       hooks =
         HookConfig
