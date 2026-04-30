@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# E2E Chainlink Issue Create Test
-# Validates chainlink_issue_create MCP tool:
-#   TL agent calls chainlink_issue_create → shells out to `chainlink create` via ProcessRun
-#   → issue created in chainlink DB → TL writes result → testrunner validates.
+# E2E Chainlink Issue Close Test
+# Validates chainlink_issue_close MCP tool:
+#   TL agent creates an issue, claims it, calls chainlink_issue_close
+#   → close atomically releases locks, closes issue, ends session, notifies parent
+#   → testrunner validates chainlink state + notification
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -36,24 +37,12 @@ if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-g
     exit 1
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
-if grep -q "Chainlink Worker Protocol" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
-    echo "  workerProfileText injection: VERIFIED (chainlink protocol found in WASM binary)"
-else
-    echo "WARNING: 'Chainlink Worker Protocol' not found in WASM binary. workerProfileText may be missing the chainlink protocol."
-fi
 
-# Check chainlink tool names are compiled into WASM binary (TL + worker tools)
-MISSING_TOOLS=()
-for tool in chainlink_issue_create chainlink_issue_list chainlink_issue_block chainlink_issue_close chainlink_session_end chainlink_milestone_create chainlink_sync chainlink_worker_status chainlink_issue_show chainlink_issue_comment chainlink_subissue_create chainlink_session_work chainlink_issue_update chainlink_issue_relate chainlink_issue_cascade; do
-    if grep -q "$tool" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
-        echo "  chainlink tool '$tool': FOUND"
-    else
-        echo "  chainlink tool '$tool': MISSING"
-        MISSING_TOOLS+=("$tool")
-    fi
-done
-if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
-    echo "ERROR: Missing chainlink tools in WASM binary: ${MISSING_TOOLS[*]}"
+# Check chainlink_issue_close tool is compiled into WASM
+if grep -q "chainlink_issue_close" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
+    echo "  chainlink_issue_close: FOUND in WASM"
+else
+    echo "ERROR: chainlink_issue_close not found in WASM binary."
     exit 1
 fi
 
@@ -69,13 +58,13 @@ echo "  tmux, git: OK"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-WORK_DIR="$(mktemp -d /tmp/exomonad-e2e-chainlink.XXXXXXXX)"
+WORK_DIR="$(mktemp -d /tmp/exomonad-e2e-close.XXXXXXXX)"
 echo "  Work dir: $WORK_DIR"
 
 cleanup() {
     echo ""
     echo ">>> [Cleanup] Tearing down..."
-    tmux kill-session -t e2e-chainlink 2>/dev/null || true
+    tmux kill-session -t e2e-chainlink-close 2>/dev/null || true
     echo "  Killed tmux session"
     rm -rf "$WORK_DIR"
     echo "  Removed $WORK_DIR"
@@ -110,20 +99,20 @@ for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
     ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
 done
 
-# Copy chainlink context files
-mkdir -p .exo/roles/devswarm/context
-cp "$PROJECT_ROOT/.exo/roles/devswarm/context/chainlink-tl.md" .exo/roles/devswarm/context/ 2>/dev/null || true
-cp "$PROJECT_ROOT/.exo/roles/devswarm/context/chainlink-worker.md" .exo/roles/devswarm/context/ 2>/dev/null || true
+# Init chainlink in test repo
+if ! chainlink init 2>&1 | sed 's/^/  /'; then
+    echo "ERROR: chainlink init failed."
+    exit 1
+fi
 
 # Write config: TL agent + testrunner companion
 cat > .exo/config.toml <<'EOF'
 default_role = "devswarm"
 wasm_name = "devswarm"
 shell_command = "bash"
-tmux_session = "e2e-chainlink"
+tmux_session = "e2e-chainlink-close"
 root_agent_type = "claude"
 yolo = true
-initial_prompt = "You are an E2E test subject. Do these steps and nothing else: (1) Call the chainlink_issue_create MCP tool with title='E2E chainlink test issue' and priority='low'. (2) Write the returned issue ID to a file named chainlink-e2e-result.txt in the current directory. (3) Call the send_message MCP tool with target_name='test-runner' and message='[CHAINLINK-E2E-DONE] chainlink_issue_create returned issue ID: <replace with actual ID>'. Then stop."
 model = "sonnet"
 
 [[companions]]
@@ -138,7 +127,7 @@ EOF
 # Copy testrunner context into role
 cp "$SCRIPT_DIR/testrunner.md" .exo/roles/devswarm/context/testrunner.md
 
-# e2e-test.md for the testrunner companion
+# Root TL rules
 mkdir -p .claude/rules
 cp "$SCRIPT_DIR/e2e-test.md" .claude/rules/e2e-test.md
 
@@ -157,17 +146,18 @@ echo ">>> [Phase 3] Launching exomonad init..."
 
 echo ""
 echo "============================================"
-echo "  E2E Chainlink Issue Create Test"
-echo "  Session: e2e-chainlink"
+echo "  E2E Chainlink Issue Close Test"
+echo "  Session: e2e-chainlink-close"
 echo "  Work dir: $WORK_DIR/repo"
 echo ""
 echo "  Chain under test:"
 echo "    exomonad init → TL agent starts"
-echo "    → TL calls chainlink_issue_create(title='E2E chainlink test issue')"
-echo "    → ProcessRun shells out to 'chainlink create ...'"
-echo "    → TL writes result to chainlink-e2e-result.txt"
+echo "    → TL calls chainlink_issue_create(title='E2E close test')"
+echo "    → TL claims issue (bash agent init + MCP session work)"
+echo "    → TL calls chainlink_issue_close"
+echo "    → TL writes result to chainlink-close-result.txt"
 echo "    → send_message → Teams inbox → testrunner validates"
 echo "============================================"
 echo ""
 
-"$EXOMONAD_BIN" init --session e2e-chainlink
+"$EXOMONAD_BIN" init --session e2e-chainlink-close
