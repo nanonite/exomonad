@@ -68,6 +68,7 @@ import Data.Text.Lazy qualified as TL
 import Effects.EffectError (Custom (..), EffectError (..), EffectErrorKind (..), InvalidInput (..), NetworkError (..), NotFound (..), PermissionDenied (..), Timeout (..))
 import Effects.Git qualified as Git
 import Effects.Log qualified as Log
+import ExoMonad.Chainlink.Pure (chainlinkWorkerProtocolText)
 import ExoMonad.Effects.Git (GitGetStatus, GitHasUnpushedCommits)
 import ExoMonad.Effects.Log (LogEmitEvent)
 import ExoMonad.Guest.Effects.AgentControl qualified as AC
@@ -677,7 +678,10 @@ leafProfileText = "## Completion Protocol (Leaf Subtree)\nYou are a **leaf agent
 
 -- | Pre-rendered worker profile text.
 workerProfileText :: Text
+workerProfileText :: Text
 workerProfileText = "## Completion Protocol (Worker)\nYou are an **ephemeral worker** \x2014 you run in the parent's directory on the parent's branch. You do NOT have your own worktree or branch.\n\nWhen you are done:\n\n1. **Call `notify_parent`** with status `success` and a DETAILED message containing your complete findings.\n   - Include FULL code snippets, exact file paths with line numbers, and concrete data.\n   - Your parent CANNOT see your terminal output. `notify_parent` is your ONLY communication channel.\n   - A terse summary like \"Task complete\" is useless \x2014 include everything the parent needs to act on your findings.\n   - For research tasks: include the actual code/data you found, not just \"I found it.\"\n   - For implementation tasks: describe exactly what you changed and how to verify it.\n2. If you failed after multiple attempts, call `notify_parent` with status `failure` and explain what went wrong.\n\n**DO NOT:**\n- Commit, push, or file PRs (you are ephemeral \x2014 the parent owns the branch)\n- Create new branches\n- Run `git checkout` or `git switch`\n- Print findings to stdout instead of sending them via `notify_parent`"
+  <> "\n\n"
+  <> chainlinkWorkerProtocolText
 
 -- | Pre-rendered research worker profile text.
 researchProfileText :: Text

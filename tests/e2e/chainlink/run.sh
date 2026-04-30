@@ -36,6 +36,11 @@ if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-g
     exit 1
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
+if grep -q "Chainlink Worker Protocol" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
+    echo "  workerProfileText injection: VERIFIED (chainlink protocol found in WASM binary)"
+else
+    echo "WARNING: 'Chainlink Worker Protocol' not found in WASM binary. workerProfileText may be missing the chainlink protocol."
+fi
 
 for cmd in tmux git; do
     if ! command -v "$cmd" &>/dev/null; then

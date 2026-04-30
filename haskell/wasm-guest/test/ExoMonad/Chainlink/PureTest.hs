@@ -1,9 +1,11 @@
 module ExoMonad.Chainlink.PureTest (pureTests) where
 
 import Data.Aeson (decode, encode)
+import Data.Text (Text)
+import Data.Text qualified as T
 import ExoMonad.Chainlink.Pure
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase, (@=?))
+import Test.Tasty.HUnit (testCase, (@=?), (@?=))
 
 pureTests :: TestTree
 pureTests =
@@ -100,5 +102,15 @@ pureTests =
                 cisoLabels = []
               }
             decoded = decode (encode output) :: Maybe ChainlinkIssueShowOutput
-        decoded @=? Just output
+        decoded @=? Just output,
+
+      -- chainlinkWorkerProtocolText content
+      testCase "chainlinkWorkerProtocolText has correct header" $
+        "# Chainlink Worker Protocol" `T.isPrefixOf` chainlinkWorkerProtocolText @?= True,
+      testCase "chainlinkWorkerProtocolText contains atomic close steps" $
+        "4-step atomic close sequence" `T.isInfixOf` chainlinkWorkerProtocolText @?= True,
+      testCase "chainlinkWorkerProtocolText contains hard rules" $
+        "## Hard Rules" `T.isInfixOf` chainlinkWorkerProtocolText @?= True,
+      testCase "chainlinkWorkerProtocolText contains MCP tools table" $
+        "| Tool | Purpose |" `T.isInfixOf` chainlinkWorkerProtocolText @?= True
     ]
