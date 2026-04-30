@@ -184,6 +184,10 @@ e2e-opencode-tl:
 e2e-opencode-worker:
     ./tests/e2e/opencode-worker/run.sh
 
+# Run E2E chainlink issue create test (chainlink_issue_create MCP tool via ProcessRun)
+e2e-chainlink:
+    ./tests/e2e/chainlink/run.sh
+
 # Run live E2E Teams messaging test (requires active CC team "teams-e2e")
 live-teams-e2e:
     nix develop --command cargo test -p claude-teams-bridge --test integration -- live_teams_e2e --ignored --nocapture
