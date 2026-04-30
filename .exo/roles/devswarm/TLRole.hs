@@ -15,6 +15,7 @@ import ExoMonad
 import ExoMonad.Guest.StateMachine (applyEvent, StopCheckResult(..), checkExit)
 import ExoMonad.Guest.Effects.StopHook (checkUncommittedWork, getCurrentBranch)
 import ExoMonad.Guest.Tools.FilePR (filePRCore, filePRDescription, filePRSchema, FilePRArgs, FilePROutput (..))
+import ExoMonad.Guest.Tools.Chainlink (ChainlinkIssueCreate (..))
 import ExoMonad.Guest.Tools.Events
   ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs (..)
   )
@@ -148,7 +149,8 @@ data Tools mode = Tools
     pr :: mode :- TLFilePR,
     mergePr :: mode :- TLMergePR,
     notifyParent :: mode :- TLNotifyParent,
-    sendMessage :: mode :- SendMessage
+    sendMessage :: mode :- SendMessage,
+    chainlinkIssueCreate :: mode :- ChainlinkIssueCreate
   }
   deriving (Generic)
 
@@ -164,7 +166,8 @@ config =
             pr = mkHandler @TLFilePR,
             mergePr = mkHandler @TLMergePR,
             notifyParent = mkHandler @TLNotifyParent,
-            sendMessage = mkHandler @SendMessage
+            sendMessage = mkHandler @SendMessage,
+            chainlinkIssueCreate = mkHandler @ChainlinkIssueCreate
           },
       hooks =
         HookConfig
