@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Mock GitHub integration tests: update_pr_body + list_check_runs (#56)
+- Integration test: worker completion fires notify_parent via chainlink_issue_close (#68)
+- Integration test: worker completion fires notify_parent via chainlink_issue_close (#68)
 - Implement chainlink issue creation MCP tool via ProcessRun (#75)
 - Add OpenCode unit tests, models subcommand, and E2E test targets (#74)
 - Unit tests: build_agent_command for OpenCode agent type (#51)
@@ -56,6 +59,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Refactor e2e hook-rewrite: replace Gemini root with OpenCode (#53)
+- research: chainlink mcp server support (#30)
+- Test: chainlink_worker_status returns correct aggregated JSON (#71)
+- Expose chainlink_worker_status in TLRole.hs (#70)
+- Implement chainlink_worker_status aggregation tool (#69)
+- Add worker stop hook in WorkerRole.hs blocking exit on active locks (#67)
+- Wire chainlink tools into TLRole.hs and WorkerRole.hs (#65)
+- Verify chainlink_issue_close atomic sequence in Chainlink.hs (#66)
+- Implement TL chainlink MCP tools in Chainlink.hs (#63)
+- Inject chainlink-tl.md into OpenCode TL initial_prompt in opencode_acp.rs (#60)
+- Add tests for chainlink-worker.md injection into workerProfileText (#79)
+- Add tests for chainlink-worker.md injection into workerProfileText (#79)
+- Inject chainlink-worker.md into workerProfileText in Spawn.hs (#59)
+- Implement worker chainlink MCP tools in Chainlink.hs (#64)
+- Add E2E test for chainlink_issue_create MCP tool (#78)
 - Investigate existing RunProcess/ExecCommand effect in wasm-guest Effects/ (#61)
 - Create .exo/roles/devswarm/context/chainlink-worker.md (#58)
 - Create .exo/roles/devswarm/context/chainlink-tl.md (#57)

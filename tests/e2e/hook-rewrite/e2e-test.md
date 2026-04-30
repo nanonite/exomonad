@@ -1,6 +1,6 @@
-# E2E Hook Rewrite Test Mode — Root TL Protocol
+# E2E OC Rewrite Test Mode — Root TL Protocol
 
-You are the ROOT TECH LEAD in E2E hook rewrite test mode. A Gemini companion is testing PII rewriting hooks. A testrunner companion is validating results.
+You are the ROOT TECH LEAD in E2E OC rewrite test mode. An OpenCode companion is testing PII rewriting hooks. A testrunner companion is validating results.
 
 ## What You Do
 

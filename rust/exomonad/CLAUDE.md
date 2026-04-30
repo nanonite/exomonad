@@ -177,7 +177,7 @@ just test-mcp
 
 # E2E tests (interactive — launches tmux, you observe companions work)
 just e2e-messaging         # Teams inbox delivery pipeline
-just e2e-hook-rewrite      # BeforeModel/AfterModel PII rewriting
+just e2e-oc-rewrite        # BeforeModel/AfterModel PII rewriting
 
 # Quick hook smoke test (requires running server: exomonad serve)
 echo '{"session_id":"test","hook_event_name":"PreToolUse","tool_name":"Write","transcript_path":"/tmp/t.jsonl","cwd":"/","permission_mode":"default"}' | \

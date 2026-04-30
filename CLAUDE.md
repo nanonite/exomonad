@@ -501,7 +501,7 @@ cabal test all             # Haskell tests
 
 # E2E tests (interactive — launches tmux session, you observe)
 just e2e-messaging         # Teams inbox delivery pipeline
-just e2e-hook-rewrite      # BeforeModel/AfterModel PII rewriting
+just e2e-oc-rewrite        # BeforeModel/AfterModel PII rewriting
 ```
 
 ### E2E Test Pattern

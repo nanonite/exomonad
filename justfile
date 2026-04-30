@@ -172,8 +172,8 @@ test-e2e:
 e2e-messaging:
     ./tests/e2e/messaging/run.sh
 
-# Run E2E hook rewrite test (BeforeModel/AfterModel PII term rewriting)
-e2e-hook-rewrite:
+# Run E2E OpenCode hook rewrite test (BeforeModel/AfterModel PII term rewriting)
+e2e-oc-rewrite:
     ./tests/e2e/hook-rewrite/run.sh
 
 # Run E2E OpenCode TL test (ACP delivery chain: serve → port capture → run --attach → MCP → notify_parent)

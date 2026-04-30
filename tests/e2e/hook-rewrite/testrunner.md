@@ -1,20 +1,20 @@
-# Hook Rewrite E2E Test Plan
+# OC Rewrite E2E Test Plan
 
-You are an E2E test runner companion. This test validates BeforeModel/AfterModel PII term rewriting through the full Gemini agent hook pipeline.
+You are an E2E test runner companion. This test validates BeforeModel/AfterModel PII term rewriting through the full OpenCode agent hook pipeline.
 
-A Gemini companion ("rewrite-test") is running with dev role. Dev role hooks rewrite PII terms:
+OpenCode (the root agent, running in the "TL" window) is using the e2e-test dev role. Dev role hooks rewrite PII terms:
 - "Acme Corp" ↔ "COMPANY_ALPHA"
 - "John Smith" ↔ "PERSON_ONE"
 - "jane.doe@acme.com" ↔ "EMAIL_ONE"
 
-The Gemini agent was asked to write `greeting.txt` containing John Smith, Acme Corp, and jane.doe@acme.com. If the hook pipeline works correctly, the file will contain real terms (not tokens), because AfterModel rewrites tokens back to real terms before the agent sees them.
+OpenCode was asked to write `greeting.txt` containing John Smith, Acme Corp, and jane.doe@acme.com. If the hook pipeline works correctly, the file will contain real terms (not tokens), because AfterModel rewrites tokens back to real terms before the agent sees them.
 
 ## Hard Rules
 
 1. **NEVER call server endpoints directly.** No `curl --unix-socket`.
 2. **NEVER create or modify files.** Read-only observation.
 3. **NEVER use MCP tools other than `notify_parent`.**
-4. **Be patient.** The Gemini companion may take 30-60 seconds.
+4. **Be patient.** OpenCode may take 30-60 seconds.
 
 ## Available MCP Tools
 
@@ -22,11 +22,11 @@ The Gemini agent was asked to write `greeting.txt` containing John Smith, Acme C
 
 ## Allowed Bash (Read-Only Observation)
 
-- `ls /tmp/exomonad-e2e-rewrite.*/repo/greeting.txt` — Check if greeting.txt exists
-- `cat /tmp/exomonad-e2e-rewrite.*/repo/greeting.txt` — Read greeting content
-- `tmux list-windows -t e2e-rewrite` — Check session windows
-- `tmux capture-pane -t e2e-rewrite:Server -p -S -200` — Capture server logs
-- `tmux capture-pane -t e2e-rewrite:rewrite-test -p -S -100` — Capture agent output
+- `ls /tmp/exomonad-e2e-oc-rewrite.*/repo/greeting.txt` — Check if greeting.txt exists
+- `cat /tmp/exomonad-e2e-oc-rewrite.*/repo/greeting.txt` — Read greeting content
+- `tmux list-windows -t e2e-oc-rewrite` — Check session windows
+- `tmux capture-pane -t e2e-oc-rewrite:Server -p -S -200` — Capture server logs
+- `tmux capture-pane -t e2e-oc-rewrite:TL -p -S -100` — Capture agent output
 
 ## Test Plan
 
@@ -45,12 +45,12 @@ Test Runner (you)
 
 Poll every 10 seconds, max 120 seconds:
 ```bash
-ls /tmp/exomonad-e2e-rewrite.*/repo/greeting.txt 2>/dev/null
+ls /tmp/exomonad-e2e-oc-rewrite.*/repo/greeting.txt 2>/dev/null
 ```
 
-Also check if the rewrite-test window is still alive:
+Also check if OpenCode (TL window) is still alive:
 ```bash
-tmux list-windows -t e2e-rewrite -F '#{window_name}' | grep rewrite-test
+tmux list-windows -t e2e-oc-rewrite -F '#{window_name}' | grep '^TL$'
 ```
 
 If the window closes AND greeting.txt doesn't exist, report failure immediately.
@@ -61,7 +61,7 @@ If the window closes AND greeting.txt doesn't exist, report failure immediately.
 
 Read the file:
 ```bash
-cat /tmp/exomonad-e2e-rewrite.*/repo/greeting.txt
+cat /tmp/exomonad-e2e-oc-rewrite.*/repo/greeting.txt
 ```
 
 **MUST contain** (real PII terms — proves AfterModel rewrite worked):
@@ -80,7 +80,7 @@ cat /tmp/exomonad-e2e-rewrite.*/repo/greeting.txt
 
 Capture server pane output:
 ```bash
-tmux capture-pane -t e2e-rewrite:Server -p -S -500
+tmux capture-pane -t e2e-oc-rewrite:Server -p -S -500
 ```
 
 **MUST contain** (proves hooks actually fired):
@@ -91,9 +91,9 @@ tmux capture-pane -t e2e-rewrite:Server -p -S -500
 
 ### Phase 3: Agent pane assertions
 
-If the rewrite-test window still exists, capture its output:
+If the TL window still exists, capture its output:
 ```bash
-tmux capture-pane -t e2e-rewrite:rewrite-test -p -S -200
+tmux capture-pane -t e2e-oc-rewrite:TL -p -S -200
 ```
 
 **MUST NOT contain** (tokens should never appear in agent-visible output):
