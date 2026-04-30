@@ -79,8 +79,13 @@ pureTests =
 
       -- buildCloseArgs
       testCase "buildCloseArgs: basic" $
-        buildCloseArgs (ChainlinkIssueCloseArgs 42)
+        buildCloseArgs (ChainlinkIssueCloseArgs 42 Nothing)
           @=? ["close", "42", "-q"],
+
+      -- buildLocksReleaseArgs
+      testCase "buildLocksReleaseArgs: basic" $
+        buildLocksReleaseArgs (ChainlinkIssueCloseArgs 42 Nothing)
+          @=? ["locks", "release", "42"],
 
       -- ChainlinkIssueShowOutput JSON roundtrip
       testCase "ChainlinkIssueShowOutput JSON roundtrip: all fields" $ do
@@ -107,8 +112,8 @@ pureTests =
       -- chainlinkWorkerProtocolText content
       testCase "chainlinkWorkerProtocolText has correct header" $
         "# Chainlink Worker Protocol" `T.isPrefixOf` chainlinkWorkerProtocolText @?= True,
-      testCase "chainlinkWorkerProtocolText contains atomic close steps" $
-        "4-step atomic close sequence" `T.isInfixOf` chainlinkWorkerProtocolText @?= True,
+      testCase "chainlinkWorkerProtocolText contains single atomic close step" $
+        "single atomic close tool" `T.isInfixOf` chainlinkWorkerProtocolText @?= True,
       testCase "chainlinkWorkerProtocolText contains hard rules" $
         "## Hard Rules" `T.isInfixOf` chainlinkWorkerProtocolText @?= True,
       testCase "chainlinkWorkerProtocolText contains MCP tools table" $

@@ -110,6 +110,7 @@ import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), 
 import Data.Aeson qualified as Aeson
 import Data.Int (Int32)
 import Data.Map qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -118,6 +119,8 @@ import Data.Vector qualified as V
 import Data.Word (Word64)
 import Effects.Process qualified as Proc
 import ExoMonad.Chainlink.Pure
+import Effects.Events qualified as Events (NotifyParentRequest (..))
+import ExoMonad.Effects.Events (EventsNotifyParent)
 import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
@@ -526,40 +529,89 @@ instance MCPTool ChainlinkSessionEnd where
 
 instance FromJSON ChainlinkIssueCloseArgs where
   parseJSON = withObject "ChainlinkIssueCloseArgs" $ \v ->
-    ChainlinkIssueCloseArgs <$> v .: "issue_id"
+    ChainlinkIssueCloseArgs
+      <$> v .: "issue_id"
+      <*> v .:? "summary"
 
 instance ToJSON ChainlinkIssueCloseArgs where
   toJSON args =
     object
-      [ "issue_id" .= cisIssueId args
+      [ "issue_id" .= cisIssueId args,
+        "summary" .= cisSummary args
       ]
 
 chainlinkIssueCloseDescription :: Text
 chainlinkIssueCloseDescription =
-  "Close a chainlink issue. Use this when a task is completed. The issue will be marked as closed and added to the changelog."
+  "Atomic close sequence: release locks, close the issue, end session, and notify parent. "
+    <> "Use this when a task is completed. The issue will be marked as closed and added to the changelog. "
+    <> "This is the ONLY close tool you should use — never use raw `chainlink close` from the CLI."
 
 chainlinkIssueCloseSchema :: Aeson.Object
 chainlinkIssueCloseSchema =
   genericToolSchemaWith @ChainlinkIssueCloseArgs
-    [ ("issue_id", "The numeric ID of the issue to close")
+    [ ("issue_id", "The numeric ID of the issue to close"),
+      ("summary", "Optional summary of what was completed. Defaults to \"Closed #<id>\" if omitted.")
     ]
 
 chainlinkIssueCloseCore :: ChainlinkIssueCloseArgs -> Eff Effects (Either Text ())
 chainlinkIssueCloseCore args = do
-  let cmdArgs = buildCloseArgs args
-  result <- runChainlink cmdArgs
-  case result of
-    Left err -> pure $ Left ("chainlink close failed: " <> err)
+  let issueId = cisIssueId args
+      summary = fromMaybe ("Closed #" <> T.pack (show issueId)) (cisSummary args)
+  -- Step 1: release locks (idempotent — no-op if none held)
+  step1 <- runChainlink (buildLocksReleaseArgs args)
+  case step1 of
+    Left err -> pure $ Left ("locks release failed: " <> err)
     Right resp
-      | Proc.runResponseExitCode resp == 0 ->
-          pure $ Right ()
-      | otherwise ->
+      | Proc.runResponseExitCode resp /= 0 ->
           pure $
             Left $
-              "chainlink close failed (exit "
+              "locks release failed (exit "
                 <> exitCodeToText (Proc.runResponseExitCode resp)
                 <> "): "
                 <> TL.toStrict (Proc.runResponseStderr resp)
+      | otherwise -> do
+          -- Step 2: close the issue
+          step2 <- runChainlink (buildCloseArgs args)
+          case step2 of
+            Left err -> pure $ Left ("chainlink close failed: " <> err)
+            Right resp2
+              | Proc.runResponseExitCode resp2 /= 0 ->
+                  pure $
+                    Left $
+                      "chainlink close failed (exit "
+                        <> exitCodeToText (Proc.runResponseExitCode resp2)
+                        <> "): "
+                        <> TL.toStrict (Proc.runResponseStderr resp2)
+              | otherwise -> do
+                  -- Step 3: end session
+                  let sessionArgs = ChainlinkSessionEndArgs (Just summary)
+                  step3 <- runChainlink (buildSessionEndArgs sessionArgs)
+                  case step3 of
+                    Left err -> pure $ Left ("session end failed: " <> err)
+                    Right resp3
+                      | Proc.runResponseExitCode resp3 /= 0 ->
+                          pure $
+                            Left $
+                              "session end failed (exit "
+                                <> exitCodeToText (Proc.runResponseExitCode resp3)
+                                <> "): "
+                                <> TL.toStrict (Proc.runResponseStderr resp3)
+                      | otherwise -> do
+                          -- Step 4: notify parent via Events effect
+                          let statusText = "success" :: Text
+                          let message = "Closed #" <> T.pack (show issueId) <> ": " <> summary
+                          step4 <-
+                            suspendEffect @EventsNotifyParent
+                              ( Events.NotifyParentRequest
+                                  { Events.notifyParentRequestAgentId = "",
+                                    Events.notifyParentRequestStatus = TL.fromStrict statusText,
+                                    Events.notifyParentRequestMessage = TL.fromStrict message,
+                                    Events.notifyParentRequestOverrideRecipient = Nothing
+                                  }
+                              )
+                          case step4 of
+                            Left err -> pure $ Left (T.pack (show err))
+                            Right _ -> pure $ Right ()
 
 data ChainlinkIssueClose
 

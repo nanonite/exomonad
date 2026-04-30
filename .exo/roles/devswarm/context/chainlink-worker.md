@@ -40,18 +40,17 @@ This returns the issue description, acceptance criteria, dependencies, and any c
 - If blocked, do NOT silently stall — use `chainlink issue update <id> -s blocked` and `notify_parent("BLOCKED: <reason>")`
 - If scope creep appears, file a `chainlink subissue <parent-id> "New scope"` and notify the parent
 
-### 4. Close Atomically (MCP Only)
+### 4. Close Atomically (Single MCP Call)
 
-When the work is complete, use the **4-step atomic close sequence**:
+When the work is complete, call the **single atomic close tool**:
 
 ```
-step 1: chainlink_locks_release    # Release any claimed locks
-step 2: chainlink_issue_close      # Close the issue (auto-updates CHANGELOG.md)
-step 3: chainlink session end --notes "..."   # End session with handoff context
-step 4: notify_parent("Done: <summary>")      # Notify TL
+chainlink_issue_close issue_id=<id> summary="<what was done>"
 ```
 
-**NEVER use `chainlink close` from the CLI.** Only use the `chainlink_issue_close` MCP tool. The CLI version bypasses the 4-step atomic sequence and leaves dangling locks + no notification.
+The `chainlink_issue_close` tool atomically runs the full close sequence internally: release locks → close issue → end session → notify parent. If any step fails, the sequence stops and the issue remains open (safe to retry).
+
+**NEVER use `chainlink close` from the CLI.** Only use the `chainlink_issue_close` MCP tool. The CLI version bypasses the atomic sequence and leaves dangling locks + no notification.
 
 ## Stuck-Escalation Path
 
