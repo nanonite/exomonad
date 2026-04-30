@@ -4,11 +4,19 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 
--- | Worker role config: notify_parent + task tools, allow-all hooks, no state transitions.
+-- | Worker role config: notify_parent + task tools + chainlink tools, allow-all hooks, no state transitions.
 module WorkerRole (config, Tools) where
 
 import Data.Aeson (object, (.=))
 import ExoMonad
+import ExoMonad.Guest.Tools.Chainlink
+  ( ChainlinkIssueShow (..),
+    ChainlinkIssueComment (..),
+    ChainlinkSubissueCreate (..),
+    ChainlinkSessionWork (..),
+    ChainlinkSessionEnd (..),
+    ChainlinkIssueClose (..)
+  )
 import ExoMonad.Guest.Tools.Events
   ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs
   )
@@ -78,7 +86,13 @@ data Tools mode = Tools
     sendMessage :: mode :- SendMessage,
     taskList :: mode :- WorkerTaskList,
     taskGet :: mode :- WorkerTaskGet,
-    taskUpdate :: mode :- WorkerTaskUpdate
+    taskUpdate :: mode :- WorkerTaskUpdate,
+    chainlinkIssueShow :: mode :- ChainlinkIssueShow,
+    chainlinkIssueComment :: mode :- ChainlinkIssueComment,
+    chainlinkSubissueCreate :: mode :- ChainlinkSubissueCreate,
+    chainlinkSessionWork :: mode :- ChainlinkSessionWork,
+    chainlinkSessionEnd :: mode :- ChainlinkSessionEnd,
+    chainlinkIssueClose :: mode :- ChainlinkIssueClose
   }
   deriving (Generic)
 
@@ -92,7 +106,13 @@ config =
             sendMessage = mkHandler @SendMessage,
             taskList = mkHandler @WorkerTaskList,
             taskGet = mkHandler @WorkerTaskGet,
-            taskUpdate = mkHandler @WorkerTaskUpdate
+            taskUpdate = mkHandler @WorkerTaskUpdate,
+            chainlinkIssueShow = mkHandler @ChainlinkIssueShow,
+            chainlinkIssueComment = mkHandler @ChainlinkIssueComment,
+            chainlinkSubissueCreate = mkHandler @ChainlinkSubissueCreate,
+            chainlinkSessionWork = mkHandler @ChainlinkSessionWork,
+            chainlinkSessionEnd = mkHandler @ChainlinkSessionEnd,
+            chainlinkIssueClose = mkHandler @ChainlinkIssueClose
           },
       hooks =
         HookConfig
