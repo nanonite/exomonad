@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add OpenCode unit tests, models subcommand, and E2E test targets (#74)
 - Unit tests: build_agent_command for OpenCode agent type (#51)
 - Unit tests: OpenCode config parsing (tl_model, worker_model, opencode_as_tl) (#50)
 - Add exomonad models discovery subcommand (#46)
@@ -54,6 +55,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Investigate existing RunProcess/ExecCommand effect in wasm-guest Effects/ (#61)
+- Create .exo/roles/devswarm/context/chainlink-worker.md (#58)
+- Create .exo/roles/devswarm/context/chainlink-tl.md (#57)
 - spawn_worker ignores agent_type: hardcodes AgentType::Gemini in Rust (#24)
 - Replace JSON-RPC HTTP client in opencode_acp.rs with opencode run --attach (#22)
 - Fix opencode_acp.rs: change 'opencode acp' to 'opencode serve' (#21)
