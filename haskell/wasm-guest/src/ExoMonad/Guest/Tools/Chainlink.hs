@@ -25,6 +25,7 @@ import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Data.Word (Word64)
 import Effects.Process qualified as Proc
+import ExoMonad.Chainlink.Pure (ChainlinkIssueCreateArgs (..), buildCreateArgs, parseIssueId)
 import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
@@ -38,14 +39,6 @@ chainlinkTimeoutMs = 30000
 --------------------------------------------------------------------------------
 -- Issue Create
 --------------------------------------------------------------------------------
-
-data ChainlinkIssueCreateArgs = ChainlinkIssueCreateArgs
-  { cicaTitle :: Text,
-    cicaDescription :: Maybe Text,
-    cicaPriority :: Maybe Text,
-    cicaLabels :: Maybe [Text]
-  }
-  deriving (Generic, Show)
 
 instance FromJSON ChainlinkIssueCreateArgs where
   parseJSON = withObject "ChainlinkIssueCreateArgs" $ \v ->
@@ -115,25 +108,6 @@ chainlinkIssueCreateCore args = do
                 <> T.pack (show (Proc.runResponseExitCode resp))
                 <> "): "
                 <> TL.toStrict (Proc.runResponseStderr resp)
-
-buildCreateArgs :: ChainlinkIssueCreateArgs -> [String]
-buildCreateArgs args =
-  ["create", T.unpack (cicaTitle args), "-q"]
-    ++ case cicaPriority args of
-      Just p -> ["-p", T.unpack p]
-      Nothing -> []
-    ++ case cicaLabels args of
-      Just labels -> concatMap (\l -> ["-l", T.unpack l]) labels
-      Nothing -> []
-
-parseIssueId :: Text -> Maybe Int
-parseIssueId output =
-  case T.strip output of
-    t
-      | T.all isDigit t -> Just (read (T.unpack t))
-      | otherwise -> Nothing
-  where
-    isDigit c = c >= '0' && c <= '9'
 
 data ChainlinkIssueCreate
 

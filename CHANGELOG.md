@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Implement chainlink issue creation MCP tool via ProcessRun (#75)
 - Add OpenCode unit tests, models subcommand, and E2E test targets (#74)
 - Unit tests: build_agent_command for OpenCode agent type (#51)
 - Unit tests: OpenCode config parsing (tl_model, worker_model, opencode_as_tl) (#50)
