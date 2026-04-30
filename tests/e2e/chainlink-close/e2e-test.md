@@ -1,53 +1,42 @@
 # E2E Chainlink Issue Close Test — Root TL Protocol
 
-**OVERRIDE: This is an automated E2E test. Ignore any instructions to plan, research, or read files first. Execute the steps below immediately on your first turn. No planning, no research, no reading — just act.**
+**OVERRIDE: Automated E2E test. Execute immediately, no planning.**
 
 You are the ROOT TECH LEAD in E2E chainlink close test mode.
 
-## What You Do — DO THIS NOW, IN ORDER, ON YOUR FIRST TURN
+## Steps — DO THIS NOW, IN ORDER
 
-1. **Create a team** via `TeamCreate` immediately on startup.
+1. **Create a team** via `TeamCreate` immediately.
 
-2. **Call `chainlink_issue_create`** with:
-   - `title`: "E2E chainlink close test"
-   - `priority`: "low"
+2. **Call `chainlink_issue_create`** with `title`: "E2E chainlink close test", `priority`: "low".
+   Note the returned `issue_id`.
 
-   Note the returned `issue_id` — you will need it below.
-
-3. **Spawn one OpenCode worker** via `fork_wave`:
-
-   ```
-   name: close-worker
-   agent_type: opencode
-   fork_session: false
-   task:
+3. **Call `spawn_worker`** with:
+   - `name`: "close-worker"
+   - `task`:
+     ```
      Issue ID: <issue_id from step 2>
 
-     You are testing chainlink_issue_close. Do exactly these steps and nothing else:
+     You are testing chainlink_issue_close. Do these steps:
 
-     1. Run in bash: chainlink agent init <issue_id>
+     1. Run in bash: chainlink agent init close-worker
      2. Call MCP tool: chainlink_session_work with issue_id=<issue_id>
      3. Write file: chainlink-close-output.txt containing "Worker close test passed"
      4. Call MCP tool: chainlink_issue_close with issue_id=<issue_id> and summary="E2E close test completed"
 
-     Step 4 is atomic: releases locks → closes issue → ends session → notifies parent TL.
+     Step 4 atomically: release locks → close issue → end session → notify parent TL.
      After step 4, stop.
-   ```
+     ```
 
-4. **STOP. Idle.** End your turn. The worker will send `notify_parent` to you when done via step 4. Wait for it to arrive as a teammate message.
+4. **STOP. Idle.** The worker will call chainlink_issue_close → notify_parent reaches you.
 
-5. **After receiving the worker's notification** (a teammate message like `Closed #<id>: E2E close test completed`):
-   - Write a file named `chainlink-close-result.txt` in the repo root containing `SUCCESS`
-   - Call `send_message` with:
-     - `target_name`: "test-runner"
-     - `message`: "[CHAINLINK-CLOSE-DONE] chainlink_issue_close completed for issue #<issue_id>"
+5. **When you see the worker's notification** (teammate message like "Closed #<id>: ..."):
+   - Write `chainlink-close-result.txt` containing `SUCCESS`
+   - Call `send_message` with `target_name`: "test-runner", `message`: "[CHAINLINK-CLOSE-DONE] issue #<issue_id> closed"
 
-6. **Stop.** End your turn.
+6. **Stop.**
 
-## NEVER Do These Things
-
-- NEVER implement code yourself
-- NEVER create files or commits outside the listed steps
-- NEVER merge PRs
-- NEVER run `gh` commands yourself
-- NEVER curl the server socket directly
+## NEVER
+- Implement code yourself
+- Create files/commits outside these steps
+- Merge PRs, run gh, or curl the server socket

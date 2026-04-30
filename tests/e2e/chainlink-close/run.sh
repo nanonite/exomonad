@@ -2,17 +2,13 @@
 set -euo pipefail
 
 # E2E Chainlink Issue Close Test
-# Validates chainlink_issue_close MCP tool in a proper TL→worker flow:
-#   TL agent creates issue, spawns OpenCode worker via fork_wave
-#   Worker claims issue, does work, calls chainlink_issue_close
+# Validates chainlink_issue_close MCP tool:
+#   TL creates issue → spawn_worker → worker claims/closes via chainlink_issue_close
 #   → close atomically releases locks, closes issue, ends session, notifies TL
-#   Testrunner validates chainlink state + TL received notification
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
-
-# --- Phase 0: Preconditions ---
 
 echo ">>> [Phase 0] Checking preconditions..."
 
@@ -27,12 +23,6 @@ else
 fi
 echo "  exomonad: $EXOMONAD_BIN"
 
-if ! command -v opencode &>/dev/null; then
-    echo "WARNING: opencode binary not found in PATH. Worker spawn may fail."
-else
-    echo "  opencode: $(command -v opencode)"
-fi
-
 if ! command -v chainlink &>/dev/null; then
     echo "ERROR: chainlink binary not found in PATH."
     exit 1
@@ -40,7 +30,7 @@ fi
 echo "  chainlink: $(command -v chainlink)"
 
 if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm &>/dev/null; then
-    echo "ERROR: No WASM plugins found in $PROJECT_ROOT/.exo/wasm/. Run 'just wasm-all'."
+    echo "ERROR: No WASM plugins in $PROJECT_ROOT/.exo/wasm/. Run 'just wasm-all'."
     exit 1
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
@@ -70,18 +60,14 @@ cleanup() {
     echo ""
     echo ">>> [Cleanup] Tearing down..."
     tmux kill-session -t e2e-chainlink-close 2>/dev/null || true
-    echo "  Killed tmux session"
     rm -rf "$WORK_DIR"
-    echo "  Removed $WORK_DIR"
     echo ">>> Done."
 }
 trap cleanup EXIT
 
-# Create bare remote
 REMOTE_DIR="$WORK_DIR/remote.git"
 git init --bare "$REMOTE_DIR" -q
 
-# Create working repo
 REPO_DIR="$WORK_DIR/repo"
 mkdir -p "$REPO_DIR"
 cd "$REPO_DIR"
@@ -92,38 +78,30 @@ git config user.email "e2e@example.com"
 git commit --allow-empty -m "initial commit" -q
 git push -u origin main -q
 
-# Bootstrap via exomonad new
 if ! "$EXOMONAD_BIN" new 2>&1 | sed 's/^/  /'; then
-    echo "ERROR: 'exomonad new' failed during E2E setup."
+    echo "ERROR: 'exomonad new' failed."
     exit 1
 fi
 
-# Symlink WASM from project
 mkdir -p .exo/wasm
 for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
     ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
 done
 
-# Init chainlink in test repo
 if ! chainlink init 2>&1 | sed 's/^/  /'; then
     echo "ERROR: chainlink init failed."
     exit 1
 fi
 
-# Write config: Claude TL + OpenCode workers + testrunner companion
+# Simple config: Claude TL + testrunner (spawn_worker is built-in, no extra setup)
 cat > .exo/config.toml <<'EOF'
 default_role = "devswarm"
 wasm_name = "devswarm"
 shell_command = "bash"
 tmux_session = "e2e-chainlink-close"
 root_agent_type = "claude"
-spawn_agent_type = "opencode"
-model = "sonnet"
 yolo = true
-
-[opencode]
-worker_model = "opencode-go/deepseek-v4-flash"
-use_embedded_key = true
+model = "sonnet"
 
 [[companions]]
 name = "test-runner"
@@ -134,39 +112,26 @@ command = "claude --dangerously-skip-permissions"
 task = "Execute the test plan from your role context. Start immediately."
 EOF
 
-# Copy testrunner context into role
-mkdir -p .exo/roles/devswarm/context
 cp "$SCRIPT_DIR/testrunner.md" .exo/roles/devswarm/context/testrunner.md
-
-# Root TL rules
 mkdir -p .claude/rules
 cp "$SCRIPT_DIR/e2e-test.md" .claude/rules/e2e-test.md
 
 echo "  Repo: $REPO_DIR"
-echo "  Remote: $REMOTE_DIR"
 
-# --- Phase 2: Set environment ---
+# --- Phase 2: Run ---
 
-echo ">>> [Phase 2] Configuring environment..."
 export GITHUB_TOKEN="test-token-e2e"
-echo "  GITHUB_TOKEN=test-token-e2e"
-
-# --- Phase 3: Run exomonad init ---
-
-echo ">>> [Phase 3] Launching exomonad init..."
 
 echo ""
 echo "============================================"
 echo "  E2E Chainlink Issue Close Test"
 echo "  Session: e2e-chainlink-close"
-echo "  Work dir: $WORK_DIR/repo"
 echo ""
-echo "  Chain under test:"
-echo "    Claude TL creates team + issue"
-echo "    → fork_wave agent_type=opencode"
-echo "    → OpenCode worker claims issue, does work"
-echo "    → chainlink_issue_close → notify_parent to TL"
-echo "    → TL writes result → send_message → testrunner validates"
+echo "  Chain:"
+echo "    Claude TL → chainlink_issue_create"
+echo "    → spawn_worker (Gemini, worker role)"
+echo "    → worker: agent init → session_work → issue_close → notify_parent"
+echo "    → testrunner validates"
 echo "============================================"
 echo ""
 
