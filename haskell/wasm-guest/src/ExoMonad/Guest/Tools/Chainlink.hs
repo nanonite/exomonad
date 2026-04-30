@@ -111,7 +111,6 @@ module ExoMonad.Guest.Tools.Chainlink
   )
   where
 
-import Control.Monad (void)
 import Control.Monad.Freer (Eff)
 import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
@@ -603,19 +602,22 @@ chainlinkIssueCloseCore args = do
                                 <> exitCodeToText (Proc.runResponseExitCode resp3)
                                 <> "): "
                                 <> TL.toStrict (Proc.runResponseStderr resp3)
-                      | otherwise -> do
-                           -- Step 4: notify parent (non-fatal — parent may not exist, e.g. root TL)
+                       | otherwise -> do
+                           -- Step 4: notify parent via Events effect
                            let statusText = "success" :: Text
-                               message = "Closed #" <> T.pack (show issueId) <> ": " <> summary
-                               notifyPayload =
-                                 Events.NotifyParentRequest
+                           let message = "Closed #" <> T.pack (show issueId) <> ": " <> summary
+                           step4 <-
+                             suspendEffect @EventsNotifyParent
+                               ( Events.NotifyParentRequest
                                    { Events.notifyParentRequestAgentId = "",
                                      Events.notifyParentRequestStatus = TL.fromStrict statusText,
                                      Events.notifyParentRequestMessage = TL.fromStrict message,
                                      Events.notifyParentRequestOverrideRecipient = Nothing
                                    }
-                           void $ suspendEffect @EventsNotifyParent notifyPayload
-                           pure $ Right ()
+                               )
+                           case step4 of
+                             Left err -> pure $ Left (T.pack (show err))
+                             Right _ -> pure $ Right ()
 
 data ChainlinkIssueClose
 

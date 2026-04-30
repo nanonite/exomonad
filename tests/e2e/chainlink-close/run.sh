@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # E2E Chainlink Issue Close Test
-# Validates chainlink_issue_close MCP tool:
-#   TL agent creates an issue, claims it, calls chainlink_issue_close
-#   → close atomically releases locks, closes issue, ends session, notifies parent
-#   → testrunner validates chainlink state + notification
+# Validates chainlink_issue_close MCP tool in a proper TL→worker flow:
+#   TL agent creates issue, spawns OpenCode worker via fork_wave
+#   Worker claims issue, does work, calls chainlink_issue_close
+#   → close atomically releases locks, closes issue, ends session, notifies TL
+#   Testrunner validates chainlink state + TL received notification
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -26,6 +27,12 @@ else
 fi
 echo "  exomonad: $EXOMONAD_BIN"
 
+if ! command -v opencode &>/dev/null; then
+    echo "WARNING: opencode binary not found in PATH. Worker spawn may fail."
+else
+    echo "  opencode: $(command -v opencode)"
+fi
+
 if ! command -v chainlink &>/dev/null; then
     echo "ERROR: chainlink binary not found in PATH."
     exit 1
@@ -38,13 +45,11 @@ if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-g
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
 
-# Check chainlink_issue_close tool is compiled into WASM
-if grep -q "chainlink_issue_close" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
-    echo "  chainlink_issue_close: FOUND in WASM"
-else
+if ! grep -q "chainlink_issue_close" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
     echo "ERROR: chainlink_issue_close not found in WASM binary."
     exit 1
 fi
+echo "  chainlink_issue_close: FOUND in WASM"
 
 for cmd in tmux git; do
     if ! command -v "$cmd" &>/dev/null; then
@@ -105,15 +110,20 @@ if ! chainlink init 2>&1 | sed 's/^/  /'; then
     exit 1
 fi
 
-# Write config: TL agent + testrunner companion
+# Write config: Claude TL + OpenCode workers + testrunner companion
 cat > .exo/config.toml <<'EOF'
 default_role = "devswarm"
 wasm_name = "devswarm"
 shell_command = "bash"
 tmux_session = "e2e-chainlink-close"
 root_agent_type = "claude"
-yolo = true
+spawn_agent_type = "opencode"
 model = "sonnet"
+yolo = true
+
+[opencode]
+worker_model = "opencode-go/deepseek-v4-flash"
+use_embedded_key = true
 
 [[companions]]
 name = "test-runner"
@@ -125,6 +135,7 @@ task = "Execute the test plan from your role context. Start immediately."
 EOF
 
 # Copy testrunner context into role
+mkdir -p .exo/roles/devswarm/context
 cp "$SCRIPT_DIR/testrunner.md" .exo/roles/devswarm/context/testrunner.md
 
 # Root TL rules
@@ -151,12 +162,11 @@ echo "  Session: e2e-chainlink-close"
 echo "  Work dir: $WORK_DIR/repo"
 echo ""
 echo "  Chain under test:"
-echo "    exomonad init → TL agent starts"
-echo "    → TL calls chainlink_issue_create(title='E2E close test')"
-echo "    → TL claims issue (bash agent init + MCP session work)"
-echo "    → TL calls chainlink_issue_close"
-echo "    → TL writes result to chainlink-close-result.txt"
-echo "    → send_message → Teams inbox → testrunner validates"
+echo "    Claude TL creates team + issue"
+echo "    → fork_wave agent_type=opencode"
+echo "    → OpenCode worker claims issue, does work"
+echo "    → chainlink_issue_close → notify_parent to TL"
+echo "    → TL writes result → send_message → testrunner validates"
 echo "============================================"
 echo ""
 
