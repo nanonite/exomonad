@@ -8,7 +8,7 @@ import Data.Map qualified as Map
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Effects.Process qualified as Proc
-import ExoMonad.Chainlink.Pure (hasActiveLocks, buildLocksListArgs)
+import ExoMonad.Guest.Tools.Chainlink.Pure (hasActiveLocks, buildLocksListArgs)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
 import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Types (Effects)

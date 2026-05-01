@@ -1,6 +1,6 @@
 module Main where
 
-import ExoMonad.Chainlink.PureTest (pureTests)
+import ExoMonad.Guest.Tools.Chainlink.PureTest (pureTests)
 import Test.Tasty (defaultMain, testGroup)
 
 main :: IO ()

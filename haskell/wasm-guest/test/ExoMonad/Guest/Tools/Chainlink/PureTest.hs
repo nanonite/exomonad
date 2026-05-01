@@ -1,9 +1,9 @@
-module ExoMonad.Chainlink.PureTest (pureTests) where
+module ExoMonad.Guest.Tools.Chainlink.PureTest (pureTests) where
 
 import Data.Aeson (decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
-import ExoMonad.Chainlink.Pure
+import ExoMonad.Guest.Tools.Chainlink.Pure
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase, (@=?), (@?=))
 

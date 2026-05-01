@@ -124,7 +124,7 @@ import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Data.Word (Word64)
 import Effects.Process qualified as Proc
-import ExoMonad.Chainlink.Pure
+import ExoMonad.Guest.Tools.Chainlink.Pure
 import Effects.Events qualified as Events (NotifyParentRequest (..))
 import ExoMonad.Effects.Events (EventsNotifyParent)
 import ExoMonad.Effects.Process (ProcessRun)

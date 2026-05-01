@@ -1,4 +1,4 @@
-module ExoMonad.Chainlink.Pure
+module ExoMonad.Guest.Tools.Chainlink.Pure
   ( -- * Issue Create
     ChainlinkIssueCreateArgs (..),
     buildCreateArgs,

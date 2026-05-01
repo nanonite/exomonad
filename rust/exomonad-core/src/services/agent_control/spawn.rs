@@ -581,9 +581,20 @@ impl<
                     Self::gemini_trust_folder(&caller_worktree_for_trust).await;
                 }
                 AgentType::OpenCode => {
-                    // OpenCode discovers opencode.json from CWD upward.
-                    // The caller's worktree already has opencode.json written by spawn_subtree.
-                    info!(agent_name = %agent_name, "OpenCode worker uses caller worktree opencode.json");
+                    // Write worker-specific opencode.json so the worker gets
+                    // its own role/name (not the caller's root config, which
+                    // lacks notify_parent and other worker tools).
+                    let worker_mcp = serde_json::json!({
+                        "mcp": {
+                            "exomonad": {
+                                "type": "local",
+                                "command": ["exomonad", "mcp-stdio", "--role", "worker", "--name", agent_name.as_str()]
+                            }
+                        }
+                    });
+                    let opencode_json_path = agent_config_dir.join("opencode.json");
+                    fs::write(&opencode_json_path, serde_json::to_string_pretty(&worker_mcp)?).await?;
+                    info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json to agent config dir");
                 }
                 _ => {}
             }
@@ -591,13 +602,21 @@ impl<
             // Resolve caller's context (tab and worktree) from its context.
             let caller_tab = resolve_own_tab_name(ctx);
             let caller_worktree = ctx.working_dir.clone();
-            let absolute_worktree = self.project_dir().join(caller_worktree);
+            let absolute_worktree = self.project_dir().join(&caller_worktree);
+
+            // OpenCode workers run in their agent config dir so they discover
+            // their own opencode.json (with --role worker) rather than the
+            // caller's (which may have --role root, lacking notify_parent).
+            let worker_cwd = match agent_type {
+                AgentType::OpenCode => agent_config_dir.clone(),
+                _ => absolute_worktree.clone(),
+            };
 
             // Workers are panes in the parent's tab — pane_id is the stable identifier.
             // Prompt goes through a temp file to avoid shell quoting issues.
             let pane_id = self.new_tmux_pane(
                 &display_name,
-                &absolute_worktree,
+                &worker_cwd,
                 agent_type,
                 Some(&options.prompt),
                 env_vars,

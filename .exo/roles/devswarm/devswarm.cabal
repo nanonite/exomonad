@@ -60,7 +60,6 @@ executable wasm-guest-devswarm
     build-depends:
         base,
         wasm-guest:wasm-guest-internal,
-        wasm-guest:wasm-guest-pure,
         exomonad-pdk,
         exomonad-proto,
         proto3-runtime,

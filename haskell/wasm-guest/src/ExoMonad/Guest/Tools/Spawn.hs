@@ -68,7 +68,7 @@ import Data.Text.Lazy qualified as TL
 import Effects.EffectError (Custom (..), EffectError (..), EffectErrorKind (..), InvalidInput (..), NetworkError (..), NotFound (..), PermissionDenied (..), Timeout (..))
 import Effects.Git qualified as Git
 import Effects.Log qualified as Log
-import ExoMonad.Chainlink.Pure (chainlinkWorkerProtocolText)
+import ExoMonad.Guest.Tools.Chainlink.Pure (chainlinkWorkerProtocolText)
 import ExoMonad.Effects.Git (GitGetStatus, GitHasUnpushedCommits)
 import ExoMonad.Effects.Log (LogEmitEvent)
 import ExoMonad.Guest.Effects.AgentControl qualified as AC

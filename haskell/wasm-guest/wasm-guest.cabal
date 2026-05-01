@@ -113,23 +113,14 @@ library wasm-guest-internal
         ExoMonad.Types
         -- Permissions
         ExoMonad.Permissions
+        -- Chainlink pure utilities
+        ExoMonad.Guest.Tools.Chainlink.Pure
     -- Additional dependencies (shared stanza provides common deps)
     build-depends:
-        wasm-guest:wasm-guest-pure,
         exomonad-pdk,
         exomonad-proto,
         proto3-runtime,
         vector
-
-library wasm-guest-pure
-    import:           shared
-    visibility:       public
-    hs-source-dirs:   src
-    exposed-modules:
-        ExoMonad.Chainlink.Pure
-    build-depends:
-        text,
-        containers
 
 test-suite wasm-guest-tests
     import:           shared
@@ -137,9 +128,9 @@ test-suite wasm-guest-tests
     hs-source-dirs:   test
     main-is:          Main.hs
     other-modules:
-        ExoMonad.Chainlink.PureTest
+        ExoMonad.Guest.Tools.Chainlink.PureTest
     build-depends:
-        wasm-guest:wasm-guest-pure,
+        wasm-guest:wasm-guest-internal,
         tasty,
         tasty-hunit,
         text,
