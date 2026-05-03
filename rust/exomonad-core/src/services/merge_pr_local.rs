@@ -8,47 +8,11 @@ use crate::domain::{AgentName, BranchName, MergeStrategy, PRNumber};
 use crate::services::file_pr_local::{read_pr_registry, write_pr_registry, PrState};
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::merge_pr::MergePROutput;
+pub use crate::services::review_policy::ReviewPolicy;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
-
-// ============================================================================
-// Review Policy
-// ============================================================================
-
-/// Review policy configuration (loaded from `.exo/review-policy.toml` or defaults).
-#[derive(Debug, Clone, Default)]
-pub struct ReviewPolicy {
-    /// Minimum review rounds before merge is allowed.
-    #[doc(hidden)]
-    pub min_review_rounds: u32,
-    /// Maximum review rounds before Stuck terminal state.
-    #[doc(hidden)]
-    pub reviewer_max_rounds: u32,
-    /// Review must be submitted within this recency window (seconds).
-    #[doc(hidden)]
-    pub review_freshness_window_secs: u64,
-    /// Require a second reviewer for complex PRs.
-    #[doc(hidden)]
-    pub require_second_reviewer_complexity: bool,
-    /// Lines changed threshold to trigger second-reviewer requirement.
-    #[doc(hidden)]
-    pub complexity_line_threshold: u64,
-}
-
-impl ReviewPolicy {
-    /// Returns a sensible default policy: require 1 round, 20 min window.
-    pub fn standard() -> Self {
-        Self {
-            min_review_rounds: 1,
-            reviewer_max_rounds: 5,
-            review_freshness_window_secs: 1200, // 20 min
-            require_second_reviewer_complexity: false,
-            complexity_line_threshold: 500,
-        }
-    }
-}
 
 // ============================================================================
 // Merge Gate Errors
@@ -681,9 +645,9 @@ mod tests {
     // ── Default policy ─────────────────────────────────────────
 
     #[test]
-    fn test_default_policy_is_zero_and_disabled() {
+    fn test_default_policy_requires_one_round() {
         let policy = ReviewPolicy::default();
-        assert_eq!(policy.min_review_rounds, 0);
+        assert_eq!(policy.min_review_rounds, 1);
         assert!(!policy.require_second_reviewer_complexity);
     }
 

@@ -32,6 +32,7 @@ runtime = [
     "dep:chrono",
     "dep:dirs",
     "dep:octocrab",
+    "dep:toml",
     "dep:ollama-rs",
     "dep:reqwest",
     "dep:url",
@@ -95,6 +96,7 @@ claude-teams-bridge = { path = "../claude-teams-bridge", optional = true }
 chrono = { version = "0.4", optional = true }
 dirs = { version = "5.0", optional = true }
 octocrab = { version = "0.38", optional = true }
+toml = { version = "0.8", optional = true }
 ollama-rs = { version = "0.2", optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 url = { version = "2", optional = true }

@@ -1,0 +1,39 @@
+# .exo/review-policy.toml — Sibling-agent review policy
+#
+# Gates merge_pr with policy checks: review rounds, external review triggers,
+# complexity thresholds, timeouts, and rate limits.
+
+# Minimum review rounds before merge is permitted.
+min_review_rounds = 1
+
+# Maximum review rounds before Stuck terminal state.
+# After this many rounds without convergence, the PR is surfaced to a human
+# and cannot be auto-merged.
+reviewer_max_rounds = 5
+
+# Maximum wait time for a reviewer to respond (seconds).
+# If a reviewer doesn't post a review within this window, the PR can be
+# merged with a [REVIEW TIMEOUT] notification.
+reviewer_max_wait_seconds = 1200
+
+# Maximum rate-limit retries for reviewer agents.
+reviewer_max_rate_limit_retries = 2
+
+# A review is considered "fresh" if it was submitted within this window (seconds).
+review_freshness_window_secs = 1200
+
+# Lines changed threshold to trigger a mandatory external/second review.
+# PRs that change more than this many lines require a second reviewer.
+external_review_threshold = 300
+
+# Path globs that always trigger external review regardless of line count.
+external_review_paths = [
+    "proto/**",
+    "rust/exomonad-core/src/handlers/**",
+]
+
+# Require a second reviewer for complex PRs (line count above threshold).
+require_second_reviewer_complexity = false
+
+# Lines changed threshold for complexity-based second-reviewer requirement.
+complexity_line_threshold = 500
