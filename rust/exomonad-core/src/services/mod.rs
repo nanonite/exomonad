@@ -22,6 +22,7 @@ pub mod log;
 pub mod merge_pr;
 pub mod merge_pr_local;
 pub mod mutex_registry;
+pub mod worktree_event_watcher;
 pub mod opencode_acp;
 pub mod repo;
 pub mod resilience;
