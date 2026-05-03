@@ -111,7 +111,7 @@ impl PrRegistry {
 // Registry I/O
 // ============================================================================
 
-async fn read_pr_registry(prs_path: &std::path::Path) -> Result<PrRegistry> {
+pub(crate) async fn read_pr_registry(prs_path: &std::path::Path) -> Result<PrRegistry> {
     if !prs_path.exists() {
         return Ok(PrRegistry::default());
     }
@@ -123,7 +123,7 @@ async fn read_pr_registry(prs_path: &std::path::Path) -> Result<PrRegistry> {
     Ok(registry)
 }
 
-async fn write_pr_registry(prs_path: &std::path::Path, registry: &PrRegistry) -> Result<()> {
+pub(crate) async fn write_pr_registry(prs_path: &std::path::Path, registry: &PrRegistry) -> Result<()> {
     if let Some(parent) = prs_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }

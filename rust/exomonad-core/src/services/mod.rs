@@ -20,6 +20,7 @@ pub mod inbox_watcher;
 pub mod local;
 pub mod log;
 pub mod merge_pr;
+pub mod merge_pr_local;
 pub mod mutex_registry;
 pub mod opencode_acp;
 pub mod repo;
