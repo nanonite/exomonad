@@ -17,6 +17,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Implement sibling-agent review system with ReviewerRole, review policy gates, and Stuck terminal state (#87)
+- Implement complexity_classifier for second-reviewer routing (#94)
+- Add Stuck terminal state and thread tracking to review system (#93)
+- Implement spawn_reviewer_subtree for reviewer agent creation (#92)
+- Add review-policy.toml structures and reviewer role context file (#91)
+- Implement worktree event watcher replacing github_poller and copilot_review (#86)
+- Implement local merge replacing merge_pr GitHub API with git merge + registry update (#85)
+- Implement local PR registry replacing file_pr GitHub API with .exo/prs.json (#84)
+- Add CHAINLINK_DB env var injection to exomonad spawn agents (#90)
+- Add --db global flag to chainlink CLI for worktree-aware issue tracking (#81)
 - Mock GitHub integration tests: update_pr_body + list_check_runs (#56)
 - Integration test: worker completion fires notify_parent via chainlink_issue_close (#68)
 - Integration test: worker completion fires notify_parent via chainlink_issue_close (#68)
