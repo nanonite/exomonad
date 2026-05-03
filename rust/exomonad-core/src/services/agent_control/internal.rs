@@ -126,6 +126,12 @@ impl<
             env_vars.insert("EXOMONAD_TMUX_SESSION".to_string(), session.clone());
         }
 
+        // Path to project root chainlink DB for worktree-aware issue tracking
+        env_vars.insert(
+            "CHAINLINK_DB".to_string(),
+            self.ctx.project_dir().join(".chainlink").display().to_string(),
+        );
+
         // Propagate swarm run_id and parent agent identity for OTel resource attributes
         if let Ok(v) = std::env::var("EXOMONAD_SWARM_RUN_ID") {
             env_vars.insert("EXOMONAD_SWARM_RUN_ID".to_string(), v);
