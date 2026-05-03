@@ -10,6 +10,7 @@ pub mod event_log;
 pub mod event_queue;
 pub mod external;
 pub mod file_pr;
+pub mod file_pr_local;
 pub mod filesystem;
 pub mod git;
 pub mod git_worktree;

@@ -67,7 +67,7 @@ enum FilePrError {
 /// Resolve the base branch for a PR using the `BirthBranch` domain type.
 ///
 /// Priority: explicit override > `BirthBranch::parent()` (dot hierarchy) > "main".
-fn resolve_base_branch(head: &BranchName, explicit: Option<&BranchName>) -> BranchName {
+pub(crate) fn resolve_base_branch(head: &BranchName, explicit: Option<&BranchName>) -> BranchName {
     if let Some(base) = explicit {
         return base.clone();
     }
