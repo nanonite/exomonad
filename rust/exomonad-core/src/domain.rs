@@ -617,6 +617,9 @@ impl Role {
     pub fn shoal() -> Self {
         Self("shoal".into())
     }
+    pub fn reviewer() -> Self {
+        Self("reviewer".into())
+    }
 
     pub fn as_str(&self) -> &str {
         &self.0
@@ -1041,6 +1044,7 @@ mod tests {
         assert_eq!(Role::from("dev"), Role::dev());
         assert_eq!(Role::from("tl"), Role::tl());
         assert_eq!(Role::from("worker"), Role::worker());
+        assert_eq!(Role::from("reviewer"), Role::reviewer());
 
         // Case insensitive (lowercased on construction)
         assert_eq!(Role::from("DEV"), Role::dev());

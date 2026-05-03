@@ -1108,6 +1108,52 @@ impl<
         info!(branch_name = %options.branch_name, "spawn_leaf_subtree completed successfully");
         Ok(result)
     }
+
+    /// Spawn a reviewer agent for a sibling PR.
+    ///
+    /// Creates a tmux window with `role=reviewer` working from the project root.
+    /// The reviewer examines `git diff base..{pr_branch}`, writes review comments
+    /// to `.exo/reviews/pr_{N}.json`, and approves or requests changes.
+    ///
+    /// Use this when the TL receives `[PR READY]` from a child agent.
+    #[instrument(skip_all, fields(pr_number = pr_entry.number))]
+    pub async fn spawn_reviewer_subtree(
+        &self,
+        pr_entry: &crate::services::file_pr_local::PrEntry,
+        caller_bb: &BirthBranch,
+    ) -> Result<SpawnResult> {
+        let task = format!(
+            "Review PR #{}: {}\n\nBranch: {}\nBase: {}\nAuthor: {}",
+            pr_entry.number, pr_entry.title, pr_entry.head_branch,
+            pr_entry.base_branch, pr_entry.author_agent,
+        );
+        let branch_name = format!("review-pr-{}", pr_entry.number);
+
+        let options = SpawnSubtreeOptions {
+            task,
+            branch_name,
+            parent_session_id: None,
+            role: Some(crate::domain::Role::reviewer()),
+            agent_type: self.default_spawn_agent_type(),
+            claude_flags: ClaudeSpawnFlags::default(),
+            working_dir: Some(self.project_dir().to_path_buf()),
+            permissions: Some(AgentPermissions {
+                allow: vec![],
+                deny: vec![
+                    "fork_wave".into(),
+                    "spawn_leaf".into(),
+                    "spawn_worker".into(),
+                    "merge_pr".into(),
+                    "file_pr".into(),
+                ],
+                default_mode: None,
+            }),
+            standalone_repo: false,
+            allowed_dirs: vec![],
+        };
+
+        self.spawn_subtree(&options, caller_bb).await
+    }
 }
 
 #[cfg(test)]
