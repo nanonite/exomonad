@@ -1,7 +1,8 @@
 use crate::domain::{AgentName, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
-use crate::services::file_pr_local::{read_pr_registry, LocalReviewState, PrState};
+use crate::services::file_pr_local::{read_pr_registry, write_pr_registry, LocalReviewState, PrState, PrRegistry};
+use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasOpencodeAcpRegistry,
     HasProjectDir, HasTeamRegistry,
@@ -33,6 +34,8 @@ struct LocalReviewComment {
     body: String,
     path: Option<String>,
     diff_hunk: Option<String>,
+    thread_id: Option<String>,
+    resolved: bool,
 }
 
 /// A local review with typed state.
@@ -54,6 +57,10 @@ enum PendingAction {
         comments: Option<Vec<LocalReviewComment>>,
         reviews: Option<Vec<LocalReview>>,
     },
+    WriteRegistryStuck {
+        pr_number: u64,
+        rounds: u32,
+    },
 }
 
 /// Per-PR state tracked across poll cycles.
@@ -69,6 +76,8 @@ struct WatchState {
     last_sha: String,
     notified_parent_approved: bool,
     addressed_changes: bool,
+    rounds: u32,
+    stuck: bool,
 }
 
 impl WatchState {
@@ -84,6 +93,8 @@ impl WatchState {
             last_sha: sha.to_string(),
             notified_parent_approved: false,
             addressed_changes: false,
+            rounds: 0,
+            stuck: false,
         }
     }
 }
@@ -118,6 +129,10 @@ struct ReviewCommentEntry {
     line: Option<u64>,
     #[serde(default)]
     diff_hunk: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    resolved: bool,
 }
 
 /// Observation collected from local sources for one open PR.
@@ -136,6 +151,7 @@ pub struct WorktreeEventWatcher<C> {
     state: Arc<Mutex<HashMap<u64, WatchState>>>,
     prs_path: std::path::PathBuf,
     plugins: Option<PluginMap>,
+    policy: ReviewPolicy,
 }
 
 impl<C> WorktreeEventWatcher<C>
@@ -157,6 +173,7 @@ where
             state: Arc::new(Mutex::new(HashMap::new())),
             prs_path,
             plugins: None,
+            policy: ReviewPolicy::default(),
         }
     }
 
@@ -167,6 +184,11 @@ where
 
     pub fn with_plugins(mut self, plugins: PluginMap) -> Self {
         self.plugins = Some(plugins);
+        self
+    }
+
+    pub fn with_policy(mut self, policy: ReviewPolicy) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -211,6 +233,17 @@ where
                 }
             }
         }
+    }
+
+    async fn set_pr_stuck(&self, pr_number: u64, rounds: u32) -> anyhow::Result<()> {
+        let mut registry: PrRegistry = read_pr_registry(&self.prs_path).await?;
+        if let Some(pr) = registry.prs.get_mut(&pr_number) {
+            pr.stuck = true;
+            pr.rounds = rounds;
+            write_pr_registry(&self.prs_path, &registry).await?;
+            info!(pr_number, rounds, "Set stuck flag on PR");
+        }
+        Ok(())
     }
 
     #[instrument(skip_all, name = "worktree_event_watcher.poll_cycle")]
@@ -259,6 +292,8 @@ where
                             body: c.body,
                             path: c.path,
                             diff_hunk: c.diff_hunk,
+                            thread_id: c.thread_id,
+                            resolved: c.resolved,
                         }
                     }).collect();
                     (state, lrc)
@@ -315,6 +350,7 @@ where
                         obs.ci_status,
                         branch.as_str(),
                         &|c, r| format_review_message(c, r),
+                        self.policy.reviewer_max_rounds,
                     )
                 } else {
                     state_guard.insert(
@@ -366,6 +402,11 @@ where
                             reviews,
                         )
                         .await;
+                    }
+                    PendingAction::WriteRegistryStuck { pr_number, rounds } => {
+                        if let Err(e) = self.set_pr_stuck(pr_number, rounds).await {
+                            warn!(pr_number, rounds, error = %e, "Failed to set stuck flag on PR");
+                        }
                     }
                 }
             }
@@ -711,11 +752,12 @@ fn compute_pr_actions(
     ci_status: CIStatus,
     branch: &str,
     format_message: &dyn Fn(&[LocalReviewComment], &[LocalReview]) -> String,
+    max_rounds: u32,
 ) -> Vec<PendingAction> {
     let mut pending_actions = Vec::new();
     let comment_count = comments.len() + reviews.len();
 
-    if old_state.notified_parent_approved || old_state.notified_parent_timeout {
+    if old_state.notified_parent_approved || old_state.notified_parent_timeout || old_state.stuck {
         return pending_actions;
     }
 
@@ -789,14 +831,32 @@ fn compute_pr_actions(
         .any(|r| r.state == ReviewState::ChangesRequested);
     if changes_requested && old_state.last_review_state != ReviewState::ChangesRequested {
         old_state.last_review_state = ReviewState::ChangesRequested;
-        pending_actions.push(PendingAction::WasmEvent {
-            event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": "review_received",
-                "pr_number": pr_number.as_u64(),
-                "comments": format_message(comments, reviews),
-            }),
-        });
+        old_state.rounds += 1;
+
+        if old_state.rounds >= max_rounds {
+            old_state.stuck = true;
+            pending_actions.push(PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload: serde_json::json!({
+                    "kind": "stuck",
+                    "pr_number": pr_number.as_u64(),
+                    "rounds": old_state.rounds,
+                }),
+            });
+            pending_actions.push(PendingAction::WriteRegistryStuck {
+                pr_number: pr_number.as_u64(),
+                rounds: old_state.rounds,
+            });
+        } else {
+            pending_actions.push(PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload: serde_json::json!({
+                    "kind": "review_received",
+                    "pr_number": pr_number.as_u64(),
+                    "comments": format_message(comments, reviews),
+                }),
+            });
+        }
     }
 
     if ci_status != old_state.last_ci_status {
@@ -943,6 +1003,8 @@ mod tests {
             body: body.to_string(),
             path: None,
             diff_hunk: None,
+            thread_id: None,
+            resolved: false,
         }
     }
 
@@ -970,6 +1032,7 @@ mod tests {
             CIStatus::Unknown,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "commits_pushed")));
@@ -992,6 +1055,7 @@ mod tests {
             CIStatus::Unknown,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "fixes_pushed")));
@@ -1013,6 +1077,7 @@ mod tests {
             CIStatus::Unknown,
             branch.as_str(),
             &|_, _| "review message".to_string(),
+            5,
         );
         assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "review_received")));
@@ -1033,6 +1098,7 @@ mod tests {
             CIStatus::Unknown,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "approved")));
@@ -1053,6 +1119,7 @@ mod tests {
             CIStatus::Unknown,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert_eq!(state.last_review_state, ReviewState::ChangesRequested);
         assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { event_type: "pr_review", .. })));
@@ -1072,6 +1139,7 @@ mod tests {
             CIStatus::Success,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { event_type: "ci_status", .. })));
         assert_eq!(state.last_ci_status, CIStatus::Success);
@@ -1091,6 +1159,7 @@ mod tests {
             CIStatus::Unknown,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "timeout")));
@@ -1111,6 +1180,7 @@ mod tests {
             CIStatus::Success,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.is_empty());
     }
@@ -1131,6 +1201,7 @@ mod tests {
             CIStatus::Unknown,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.is_empty());
     }
@@ -1152,6 +1223,7 @@ mod tests {
             CIStatus::Unknown,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "approved")));
@@ -1172,6 +1244,7 @@ mod tests {
             CIStatus::Unknown,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "timeout" && payload["minutes_elapsed"] == 5)));
@@ -1191,6 +1264,7 @@ mod tests {
             CIStatus::Success,
             branch.as_str(),
             &|_, _| String::new(),
+            5,
         );
         assert!(actions.is_empty());
     }
@@ -1267,6 +1341,8 @@ mod tests {
                 body: "Fix this typo".to_string(),
                 path: Some("src/main.rs".to_string()),
                 diff_hunk: Some("@@ -1,3 +1,3 @@".to_string()),
+                thread_id: None,
+                resolved: false,
             },
         ];
         let msg = format_review_message(&comments, &[]);
