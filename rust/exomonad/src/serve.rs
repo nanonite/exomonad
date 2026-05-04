@@ -1029,17 +1029,17 @@ Run `exomonad recompile` first to build it.",
     std::fs::write(&server_pid_path, serde_json::to_string_pretty(&pid_info)?)?;
     info!(path = %server_pid_path.display(), "Wrote server.pid");
 
-    // Start GitHub Poller (background service)
-    let mut poller = exomonad_core::services::github_poller::GitHubPoller::new(services.clone())
+    // Start Worktree Event Watcher (background service — replaces GitHub poller + Copilot review)
+    let mut watcher = exomonad_core::services::worktree_event_watcher::WorktreeEventWatcher::new(services.clone())
         .with_plugins(plugins.clone());
     if let Some(interval) = config.poll_interval {
         if interval == 0 {
             anyhow::bail!("Invalid configuration: `poll_interval` must be >= 1 second, got 0");
         }
-        poller = poller.with_poll_interval(Duration::from_secs(interval));
+        watcher = watcher.with_poll_interval(Duration::from_secs(interval));
     }
     tokio::spawn(async move {
-        poller.run().await;
+        watcher.run().await;
     });
 
     let app_state = AppState {

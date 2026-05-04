@@ -9,7 +9,7 @@ use crate::services::github::GitHubService;
 use crate::services::Services;
 
 use super::{
-    AgentHandler, CoordinationHandler, CopilotHandler, EventHandler, FilePRHandler, FsHandler,
+    AgentHandler, CoordinationHandler, EventHandler, FilePRHandler, FsHandler,
     GitHandler, GitHubHandler, KvHandler, LogHandler, MergePRHandler, ProcessHandler,
     SessionHandler, TasksHandler,
 };
@@ -28,14 +28,13 @@ pub fn core_handlers(project_dir: PathBuf, services: Arc<Services>) -> Vec<Box<d
 
 /// Git and GitHub handlers for dev tooling.
 ///
-/// Includes: git, github, file_pr, merge_pr, copilot.
+/// Includes: git, github, file_pr, merge_pr.
 /// GitHub client from `services` is optional — if None, GitHubHandler is not registered.
 pub fn git_handlers(services: Arc<Services>, git: Arc<GitService>) -> Vec<Box<dyn EffectHandler>> {
     let mut handlers: Vec<Box<dyn EffectHandler>> = vec![
         Box::new(GitHandler::new(git)),
         Box::new(FilePRHandler::new(services.clone())),
         Box::new(MergePRHandler::new(services.clone())),
-        Box::new(CopilotHandler::new()),
     ];
     if let Some(ref client) = services.github_client {
         handlers.push(Box::new(GitHubHandler::new(GitHubService::new(
@@ -105,12 +104,11 @@ mod tests {
 
         let services = Arc::new(Services::test());
         let handlers = git_handlers(services, git);
-        assert_eq!(handlers.len(), 4);
+        assert_eq!(handlers.len(), 3);
         let namespaces: Vec<_> = handlers.iter().map(|h| h.namespace()).collect();
         assert!(namespaces.contains(&"git"));
         assert!(namespaces.contains(&"file_pr"));
         assert!(namespaces.contains(&"merge_pr"));
-        assert!(namespaces.contains(&"copilot"));
         assert!(!namespaces.contains(&"github"));
     }
 
@@ -123,7 +121,7 @@ mod tests {
         services_raw.github_client = Some(client);
         let services = Arc::new(services_raw);
         let handlers = git_handlers(services, git);
-        assert_eq!(handlers.len(), 5);
+        assert_eq!(handlers.len(), 4);
         let namespaces: Vec<_> = handlers.iter().map(|h| h.namespace()).collect();
         assert!(namespaces.contains(&"github"));
     }

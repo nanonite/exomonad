@@ -655,7 +655,7 @@ mod tests {
     fn test_standard_policy_requires_one_round() {
         let policy = ReviewPolicy::standard();
         assert_eq!(policy.min_review_rounds, 1);
-        assert_eq!(policy.reviewer_max_rounds, 5);
+        assert_eq!(policy.reviewer_max_rounds, 2);
     }
 
     // ── MergeGateError Display ─────────────────────────────────

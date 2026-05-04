@@ -18,7 +18,6 @@
 
 pub mod agent;
 pub mod coordination;
-pub mod copilot;
 pub mod events;
 pub mod file_pr;
 pub mod fs;
@@ -33,7 +32,6 @@ pub mod session;
 pub mod tasks;
 pub use agent::AgentHandler;
 pub use coordination::CoordinationHandler;
-pub use copilot::CopilotHandler;
 pub use events::EventHandler;
 pub use file_pr::FilePRHandler;
 pub use fs::FsHandler;

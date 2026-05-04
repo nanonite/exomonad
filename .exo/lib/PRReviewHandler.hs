@@ -38,7 +38,13 @@ prReviewHandler (ReviewReceived n comments_) = do
   pure (InjectMessage (Tpl.copilotReviewReceived n comments_))
 
 prReviewHandler (ReviewApproved n) = do
-  logHandler $ "PR #" <> T.pack (show n) <> " approved by Copilot"
+  logHandler $ "PR #" <> T.pack (show n) <> " approved (reviewer agent)"
+  branch <- getCurrentBranch
+  void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewApprovedEv n)
+  pure (NotifyParentAction (Tpl.prReady n) n)
+
+prReviewHandler (ReviewerApproved n) = do
+  logHandler $ "PR #" <> T.pack (show n) <> " approved by reviewer agent"
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewApprovedEv n)
   pure (NotifyParentAction (Tpl.prReady n) n)
@@ -58,6 +64,20 @@ prReviewHandler (CommitsPushed n ci) = do
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CommitsPushedEv n ci)
   pure (NotifyParentAction (Tpl.commitsPushed n ci) n)
+
+prReviewHandler (ReviewerRequestedChanges n comments_) = do
+  logHandler $ "Reviewer requested changes on PR #" <> T.pack (show n)
+  branch <- getCurrentBranch
+  void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
+  pure (InjectMessage (Tpl.copilotReviewReceived n comments_))
+
+prReviewHandler (RateLimited remaining secs) = do
+  logHandler $ "Rate limited: " <> T.pack (show remaining) <> " retries, " <> T.pack (show secs) <> "s until reset"
+  pure NoAction
+
+prReviewHandler (Stuck n rounds_) = do
+  logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
+  pure (NotifyParentAction (Tpl.stuck n rounds_) n)
 
 -- | Handle sibling merged events.
 siblingMergedHandler :: SiblingMergedEvent -> Eff Effects EventAction

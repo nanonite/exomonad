@@ -20,13 +20,15 @@ pub enum DeliveryResult {
 pub enum NotifyStatus {
     Success,
     Failure,
+    Stuck,
 }
 
 impl NotifyStatus {
-    /// Parse from proto/wire string ("failure" → Failure, anything else → Success).
+    /// Parse from proto/wire string ("failure" → Failure, "stuck" → Stuck, anything else → Success).
     pub fn parse(s: &str) -> Self {
         match s {
             "failure" => NotifyStatus::Failure,
+            "stuck" => NotifyStatus::Stuck,
             _ => NotifyStatus::Success,
         }
     }
@@ -35,6 +37,7 @@ impl NotifyStatus {
         match self {
             NotifyStatus::Success => "success",
             NotifyStatus::Failure => "failure",
+            NotifyStatus::Stuck => "stuck",
         }
     }
 }
@@ -46,7 +49,7 @@ impl std::fmt::Display for NotifyStatus {
 }
 
 /// Format a parent-facing notification message.
-/// Failure → `[FAILED: {id}] {msg}`, otherwise → `[from: {id}] {msg}`.
+/// Failure → `[FAILED: {id}] {msg}`, Stuck → `[STUCK: {id}] {msg}`, otherwise → `[from: {id}] {msg}`.
 pub fn format_parent_notification(
     agent_id: &crate::domain::AgentName,
     status: NotifyStatus,
@@ -54,6 +57,7 @@ pub fn format_parent_notification(
 ) -> String {
     let default_msg = match status {
         NotifyStatus::Failure => "Task failed.",
+        NotifyStatus::Stuck => "Review did not converge. Human intervention required.",
         NotifyStatus::Success => "Status update.",
     };
     let msg = if message.is_empty() {
@@ -63,6 +67,7 @@ pub fn format_parent_notification(
     };
     match status {
         NotifyStatus::Failure => format!("[FAILED: {}] {}", agent_id, msg),
+        NotifyStatus::Stuck => format!("[STUCK: {}] {}", agent_id, msg),
         NotifyStatus::Success => format!("[from: {}] {}", agent_id, msg),
     }
 }

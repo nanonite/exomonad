@@ -8,8 +8,37 @@ pub struct ComplexityReport {
     pub total_lines_changed: u64,
     /// Files that match `external_review_paths` patterns.
     pub external_review_path_matches: Vec<String>,
+    /// Code-pattern triggers found in the diff.
+    pub pattern_triggers: Vec<PatternTrigger>,
     /// Recommendation for second-reviewer routing.
     pub recommendation: SecondReviewerRecommendation,
+}
+
+/// Categories of code-pattern triggers from the plan (mergepath #158).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternTrigger {
+    /// State machine pattern (enum State, FSM variants).
+    StateMachine { count: u64 },
+    /// Concurrency patterns (tokio::spawn, async + Mutex, etc.).
+    Concurrency { count: u64 },
+    /// Prompt design / LLM contract changes.
+    PromptDesign,
+    /// Cross-cutting refactor touching multiple call sites.
+    CrossCutting { patterns_found: Vec<String> },
+    /// Validation / invariant enforcement patterns.
+    Validation { count: u64 },
+}
+
+impl PatternTrigger {
+    pub fn name(&self) -> &str {
+        match self {
+            PatternTrigger::StateMachine { .. } => "state-machine",
+            PatternTrigger::Concurrency { .. } => "concurrency",
+            PatternTrigger::PromptDesign => "prompt-design",
+            PatternTrigger::CrossCutting { .. } => "cross-cutting",
+            PatternTrigger::Validation { .. } => "validation",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +59,10 @@ pub enum SecondReviewerRecommendation {
         matching_files: Vec<String>,
         lines_changed: u64,
     },
+    /// Code-pattern match: state machines, concurrency, prompts, etc.
+    PatternMatch {
+        triggers: Vec<PatternTrigger>,
+    },
 }
 
 impl ComplexityReport {
@@ -48,6 +81,10 @@ impl ComplexityReport {
                 self.external_review_path_matches.join(", ")
             ));
         }
+        if !self.pattern_triggers.is_empty() {
+            let names: Vec<&str> = self.pattern_triggers.iter().map(|t| t.name()).collect();
+            parts.push(format!("pattern(s) matched: {}", names.join(", ")));
+        }
         match &self.recommendation {
             SecondReviewerRecommendation::Pass => {
                 parts.push("No second reviewer needed".to_string())
@@ -63,6 +100,13 @@ impl ComplexityReport {
             }
             SecondReviewerRecommendation::MultipleTriggers { .. } => {
                 parts.push("Second reviewer required (multiple triggers)".to_string())
+            }
+            SecondReviewerRecommendation::PatternMatch { triggers } => {
+                let names: Vec<&str> = triggers.iter().map(|t| t.name()).collect();
+                parts.push(format!(
+                    "Second reviewer required (pattern triggers: {})",
+                    names.join(", ")
+                ))
             }
         }
         parts.join("; ")
@@ -87,7 +131,14 @@ pub async fn classify_complexity(
         .cloned()
         .collect();
 
-    let recommendation = if !external_matches.is_empty()
+    // Code-pattern analysis: run full diff and scan for patterns
+    let pattern_triggers = run_pattern_analysis(project_dir, base_branch, head_branch).await?;
+
+    let recommendation = if !pattern_triggers.is_empty() {
+        SecondReviewerRecommendation::PatternMatch {
+            triggers: pattern_triggers.clone(),
+        }
+    } else if !external_matches.is_empty()
         && policy.lines_trigger_external_review(total_lines)
     {
         SecondReviewerRecommendation::MultipleTriggers {
@@ -110,6 +161,7 @@ pub async fn classify_complexity(
     Ok(ComplexityReport {
         total_lines_changed: total_lines,
         external_review_path_matches: external_matches,
+        pattern_triggers,
         recommendation,
     })
 }
@@ -173,6 +225,154 @@ fn parse_numstat_output(output: &str) -> (u64, Vec<String>) {
     (total_added + total_removed, files)
 }
 
+/// Run code-pattern analysis on a full diff between two branches.
+///
+/// Scans the diff content for state machines, concurrency, prompt design,
+/// cross-cutting refactors, and validation patterns per mergepath #158.
+async fn run_pattern_analysis(
+    project_dir: &Path,
+    base_branch: &str,
+    head_branch: &str,
+) -> anyhow::Result<Vec<PatternTrigger>> {
+    let output = tokio::process::Command::new("git")
+        .args([
+            "diff",
+            &format!("{}..{}", base_branch, head_branch),
+        ])
+        .current_dir(project_dir)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Ok(vec![]);
+    }
+
+    let diff = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut triggers = Vec::new();
+
+    // State machine patterns
+    let state_machine_count = count_matches(&diff, &[
+        r"enum\s+\w+State",
+        r"state_machine|StateMachine|Fsm",
+    ]);
+    if state_machine_count > 0 {
+        triggers.push(PatternTrigger::StateMachine {
+            count: state_machine_count,
+        });
+    }
+
+    // Concurrency patterns
+    let concurrency_count = count_matches(&diff, &[
+        r"tokio::spawn",
+        r"async\s+fn\s+.*\bMutex",
+        r"async\s+fn\s+.*\bRwLock",
+        r"rayon::",
+        r"async_std",
+    ]);
+    if concurrency_count > 0 {
+        triggers.push(PatternTrigger::Concurrency {
+            count: concurrency_count,
+        });
+    }
+
+    // Prompt design / LLM contracts
+    let prompt_patterns = &[
+        "prompts",
+        ".v0.md",
+        ".v1.md",
+        ".v2.md",
+        ".claude/",
+    ];
+    let prompt_files_changed = get_changed_files(project_dir, base_branch, head_branch).await?;
+    if prompt_files_changed.iter().any(|f| {
+        prompt_patterns.iter().any(|p| f.contains(p))
+    }) {
+        triggers.push(PatternTrigger::PromptDesign);
+    }
+
+    // Validation / invariant enforcement
+    let validation_count = count_matches(&diff, &[
+        r"invariant",
+        r"must_hold",
+        r"assert_eq!",
+    ]);
+    if validation_count > 0 {
+        triggers.push(PatternTrigger::Validation {
+            count: validation_count,
+        });
+    }
+
+    // Cross-cutting refactor: ≥3 files in same pattern
+    let cross_patterns = count_cross_cutting(&diff);
+    if !cross_patterns.is_empty() {
+        triggers.push(PatternTrigger::CrossCutting {
+            patterns_found: cross_patterns,
+        });
+    }
+
+    Ok(triggers)
+}
+
+/// Count pattern matches in diff content using simple substring matching.
+fn count_matches(text: &str, patterns: &[&str]) -> u64 {
+    patterns
+        .iter()
+        .map(|p| text.matches(p).count() as u64)
+        .sum()
+}
+
+/// Get list of changed file paths between two branches.
+async fn get_changed_files(
+    project_dir: &Path,
+    base_branch: &str,
+    head_branch: &str,
+) -> anyhow::Result<Vec<String>> {
+    let output = tokio::process::Command::new("git")
+        .args([
+            "diff",
+            &format!("{}..{}", base_branch, head_branch),
+            "--name-only",
+        ])
+        .current_dir(project_dir)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Ok(vec![]);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Detect cross-cutting refactor patterns (same identifier in ≥3 diff lines).
+fn count_cross_cutting(diff: &str) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for line in diff.lines() {
+        let trimmed = line.trim();
+        for keyword in ["pub fn ", "pub struct ", "pub enum ", "pub trait "] {
+            if let Some(rest) = trimmed.strip_prefix(keyword) {
+                if let Some(name) = rest.split(|c: char| c == '(' || c == '<' || c == '{' || c.is_whitespace()).next() {
+                    if !name.is_empty() {
+                        *counts.entry(name.to_string()).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    counts
+        .into_iter()
+        .filter(|(_, c)| *c >= 3)
+        .map(|(n, _)| n)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +415,7 @@ mod tests {
         let report = ComplexityReport {
             total_lines_changed: 50,
             external_review_path_matches: vec![],
+            pattern_triggers: vec![],
             recommendation: SecondReviewerRecommendation::Pass,
         };
         assert!(!report.needs_second_reviewer());
@@ -226,6 +427,7 @@ mod tests {
         let report = ComplexityReport {
             total_lines_changed: 50,
             external_review_path_matches: vec!["proto/foo.proto".to_string()],
+            pattern_triggers: vec![],
             recommendation: SecondReviewerRecommendation::PathMatch {
                 matching_files: vec!["proto/foo.proto".to_string()],
             },
@@ -239,6 +441,7 @@ mod tests {
         let report = ComplexityReport {
             total_lines_changed: 400,
             external_review_path_matches: vec![],
+            pattern_triggers: vec![],
             recommendation: SecondReviewerRecommendation::Threshold {
                 lines_changed: 400,
                 threshold: 300,
@@ -253,6 +456,7 @@ mod tests {
         let report = ComplexityReport {
             total_lines_changed: 400,
             external_review_path_matches: vec!["proto/foo.proto".to_string()],
+            pattern_triggers: vec![],
             recommendation: SecondReviewerRecommendation::MultipleTriggers {
                 matching_files: vec!["proto/foo.proto".to_string()],
                 lines_changed: 400,

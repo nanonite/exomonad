@@ -115,7 +115,7 @@ pub use util::{build_prompt, find_exomonad_binary, shell_quote};
 pub use handlers::groups::{core_handlers, git_handlers, orchestration_handlers};
 #[cfg(feature = "runtime")]
 pub use handlers::{
-    AgentHandler, CopilotHandler, EventHandler, FilePRHandler, FsHandler, GitHandler,
+    AgentHandler, EventHandler, FilePRHandler, FsHandler, GitHandler,
     GitHubHandler, KvHandler, LogHandler, MergePRHandler,
 };
 #[cfg(feature = "runtime")]

@@ -41,6 +41,21 @@ data PRReviewEvent
       { prNumber :: Int,
         cpCiStatus :: Text
       }
+  | ReviewerApproved
+      { prNumber :: Int
+      }
+  | ReviewerRequestedChanges
+      { prNumber :: Int,
+        rcComments :: Text
+      }
+  | RateLimited
+      { rlRetriesRemaining :: Int,
+        rlSecondsUntilReset :: Int
+      }
+  | Stuck
+      { prNumber :: Int,
+        stuckRounds :: Int
+      }
   deriving (Show, Generic)
 
 instance FromJSON PRReviewEvent where
@@ -52,6 +67,10 @@ instance FromJSON PRReviewEvent where
       "timeout" -> ReviewTimeout <$> v .: "pr_number" <*> v .: "minutes_elapsed"
       "fixes_pushed" -> FixesPushed <$> v .: "pr_number" <*> v .: "ci_status"
       "commits_pushed" -> CommitsPushed <$> v .: "pr_number" <*> v .: "ci_status"
+      "reviewer_approved" -> ReviewerApproved <$> v .: "pr_number"
+      "reviewer_requested_changes" -> ReviewerRequestedChanges <$> v .: "pr_number" <*> v .: "comments"
+      "rate_limited" -> RateLimited <$> v .: "retries_remaining" <*> v .: "seconds_until_reset"
+      "stuck" -> Stuck <$> v .: "pr_number" <*> v .: "rounds"
       other -> fail $ "Unknown PRReviewEvent kind: " <> show (other :: Text)
 
 instance ToJSON PRReviewEvent where
@@ -60,6 +79,10 @@ instance ToJSON PRReviewEvent where
   toJSON (ReviewTimeout n m) = object ["kind" .= ("timeout" :: Text), "pr_number" .= n, "minutes_elapsed" .= m]
   toJSON (FixesPushed n ci) = object ["kind" .= ("fixes_pushed" :: Text), "pr_number" .= n, "ci_status" .= ci]
   toJSON (CommitsPushed n ci) = object ["kind" .= ("commits_pushed" :: Text), "pr_number" .= n, "ci_status" .= ci]
+  toJSON (ReviewerApproved n) = object ["kind" .= ("reviewer_approved" :: Text), "pr_number" .= n]
+  toJSON (ReviewerRequestedChanges n c) = object ["kind" .= ("reviewer_requested_changes" :: Text), "pr_number" .= n, "comments" .= c]
+  toJSON (RateLimited r s) = object ["kind" .= ("rate_limited" :: Text), "retries_remaining" .= r, "seconds_until_reset" .= s]
+  toJSON (Stuck n r) = object ["kind" .= ("stuck" :: Text), "pr_number" .= n, "rounds" .= r]
 
 -- | CI status event
 data CIStatusEvent = CIStatusEvent

@@ -17,6 +17,7 @@ module ExoMonad.Guest.Events.Templates
     copilotReviewReceived,
     siblingMerged,
     ciStatus,
+    stuck,
   )
 where
 
@@ -116,3 +117,17 @@ commitsPushed n ci =
       "pending" -> " CI running."
       "failure" -> " CI failing."
       _ -> " CI status: " <> ci <> "."
+
+-- | PR stuck after max review rounds — signals TL human intervention needed.
+--
+-- >>> stuck 42 7
+-- "[STUCK: 42, rounds=7] Review did not converge after 7 rounds. Human intervention required."
+stuck :: Int -> Int -> Text
+stuck n rounds_ =
+  "[STUCK: "
+    <> T.pack (show n)
+    <> ", rounds="
+    <> T.pack (show rounds_)
+    <> "] Review did not converge after "
+    <> T.pack (show rounds_)
+    <> " rounds. Human intervention required."
