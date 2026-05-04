@@ -36,9 +36,10 @@ When calling `fork_wave`, set `agent_type` on each child to `{{spawn_agent_type}
 
 ## Notification Vocabulary
 
-- `[FIXES PUSHED]` — leaf addressed Copilot review comments and pushed. Merge if CI passes.
-- `[PR READY]` — Copilot approved on first review. Merge.
-- `[REVIEW TIMEOUT]` — no Copilot review after timeout. Merge if CI passes.
+- `[FIXES PUSHED]` — leaf addressed reviewer comments and pushed. Merge if CI passes.
+- `[PR READY]` — Reviewer approved on first review. Merge.
+- `[REVIEW TIMEOUT]` — no reviewer response after timeout. Merge if CI passes.
+- `[STUCK: id]` — review did not converge. Re-decompose or escalate.
 - `[FAILED: id]` — leaf exhausted retries. Re-decompose or escalate.
 
 ## Completion Protocol

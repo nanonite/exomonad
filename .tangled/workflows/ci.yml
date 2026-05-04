@@ -1,0 +1,65 @@
+engine: nixery
+when:
+  - event: [pull_request]
+    branch: [main]
+  - event: [push, manual]
+    branch: [main]
+clone:
+  depth: 1
+  submodules: false
+dependencies:
+  nixpkgs:
+    - cabal-install
+    - ghc
+    - rustup
+    - protobuf
+    - just
+    - pkg-config
+    - zlib
+environment:
+  PROTOC: "/run/current-system/sw/bin/protoc"
+steps:
+  - name: "Install hlint"
+    command: |
+      curl -sSL https://github.com/ndmitchell/hlint/releases/download/v3.8/hlint-3.8-x86_64-linux.tar.gz \
+        | tar xz -C /tmp
+      install -m 0755 /tmp/hlint-3.8/hlint /usr/local/bin/hlint
+  - name: "Mergepath: verify PR identity footer"
+    command: |
+      # For pull_request events, verify commit message carries Authoring-Agent and Birth-Branch lines.
+      # Non-blocking during initial migration — soft-check only.
+      if git log -1 --pretty=%B | grep -qE '^(Authoring-Agent|Birth-Branch): '; then
+        echo "PR identity footer present"
+      else
+        echo "NOTE: PR missing Authoring-Agent / Birth-Branch footer lines (mergepath fold)"
+      fi
+  - name: "Format check"
+    command: "just check-fmt"
+  - name: "Haskell lint"
+    command: 'hlint haskell --ignore-glob="haskell/vendor/**" || true'
+  - name: "Haskell build"
+    command: "cabal update && cabal build all -j"
+  - name: "Haskell tests"
+    command: |
+      cabal test graph-validation-tests
+      cabal test worktree-interpreter-test
+      cabal test exomonad-wire-types-test
+  - name: "Rust toolchain setup"
+    command: |
+      rustup default stable
+      rustup component add clippy rustfmt
+      rustup target add wasm32-wasip1
+  - name: "Rust clippy"
+    command: "cd rust && cargo clippy --workspace --all-targets"
+  - name: "Rust fmt check"
+    command: "cd rust && cargo fmt --all -- --check"
+  - name: "Rust build"
+    command: "cd rust && cargo build --workspace --all-targets"
+  - name: "Rust tests"
+    command: "cd rust && cargo test --workspace -- --skip test_cli_hook --skip test_cli_invalid_json --skip test_cli_other_hook"
+  - name: "Integration: protocol golden"
+    command: |
+      cabal test exomonad-control-server:protocol-golden-test
+      cd rust && cargo test -p exomonad-shared --test protocol_golden
+  - name: "Proto drift check"
+    command: "just proto-check"

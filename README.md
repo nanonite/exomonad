@@ -2,7 +2,7 @@
 
 Exomonad builds on the agentic loop to provide a Tree-of-agents model where a root 'tech lead' agent forks its context windows across multiple worktrees to recursively unfold an 'agentic tree' that accumulates scaffolding commits and context as it grows. Swarms of fast cheap agents implement specs at the leaf nodes. Each node is an agent that files PRs against its parent over waves of recursively nested trunk based development. Agents form a supervision hierarchy, reviewing and merging PRs filed by their child agents. All agents can communicate with their spawned child agents and their parent agent, using the tree to route messages.
 
-It hooks into Claude Code and Gemini CLI, using their existing binaries and your existing subscription plans. Opus decomposes and dispatches. Gemini implements. Copilot reviews. Each model does what it's best at. All orchestration logic — tool dispatch, hooks, event handling, PR review routing — is defined in Haskell effects executed by a shared Rust server. Agents run in tmux windows and panes, isolated via git worktrees. No Docker, no web dashboard, no new UI to learn.
+It hooks into Claude Code and Gemini CLI, using their existing binaries and your existing subscription plans. Opus decomposes and dispatches. Gemini implements. Reviewer agent reviews. Each model does what it's best at. All orchestration logic — tool dispatch, hooks, event handling, PR review routing — is defined in Haskell effects executed by a shared Rust server. Agents run in tmux windows and panes, isolated via git worktrees. No Docker, no web dashboard, no new UI to learn.
 
 ![tmux devswarm — TL dispatching to three Gemini workers in parallel, each in its own worktree. Bottom panes show workers mid-execution.](img/exomonad_tmux_devswarm.png)
 

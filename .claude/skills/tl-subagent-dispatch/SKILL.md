@@ -7,9 +7,9 @@ description: Use when spawning subagents, monitoring their progress, or interven
 
 ## Core Principles
 
-1. **Fire-and-forget execution.** TL decomposes, specs, spawns, and idles. Convergence is leaf + Copilot + event handlers, not TL.
+1. **Fire-and-forget execution.** TL decomposes, specs, spawns, and idles. Convergence is leaf + reviewer + event handlers, not TL.
 
-2. **Dispatch is heterogeneous.** Claude for decomposition, Gemini for implementation, Copilot for review.
+2. **Dispatch is heterogeneous.** Claude for decomposition, Gemini for implementation, reviewer agent for review.
 
 ## Agent Types
 
@@ -55,14 +55,15 @@ After spawning, idle. Do not watch, poll, or narrate.
 ## Convergence Flow
 
 1. Leaf works → commits → files PR via `file_pr`
-2. Copilot reviews automatically (first review only)
-3. If Copilot posts comments → event handler injects into leaf's pane → leaf fixes → pushes
-4. Event handler fires `[FIXES PUSHED]` to TL (Copilot does NOT re-review)
+2. Reviewer agent reviews automatically on PR creation
+3. If reviewer posts comments → event handler injects into leaf's pane → leaf fixes → pushes
+4. Event handler fires `[FIXES PUSHED]` to TL (reviewer re-checks after fixes)
 5. TL merges if CI passes
 
 **Alternative paths:**
-- Copilot approves first time → `[PR READY]` → TL merges
-- No Copilot review → `[REVIEW TIMEOUT]` after 15min (5min after addressing changes) → TL merges if CI passes
+- Reviewer approves → `[PR READY]` → TL merges
+- No reviewer response → `[REVIEW TIMEOUT]` after timeout → TL merges if CI passes
+- Review stuck → `[STUCK: agent-id]` → human intervention required
 - Leaf fails → `[FAILED: agent-id]` → TL re-decomposes
 
 ## When TL Gets Notified
@@ -72,6 +73,7 @@ After spawning, idle. Do not watch, poll, or narrate.
 | `[FIXES PUSHED]` | Event handler | Merge if CI passes |
 | `[PR READY]` | Event handler | Merge |
 | `[REVIEW TIMEOUT]` | Event handler | Merge if CI passes |
+| `[STUCK: agent-id]` | Event handler | Re-decompose or escalate |
 | `[from: agent-id]` | Agent message | Read, do not auto-merge |
 | `[FAILED: agent-id]` | Agent failure | Re-decompose or escalate |
 
@@ -97,7 +99,7 @@ That exploration belongs in a worker's spec. Spawn a worker to investigate.
 That belongs in a leaf's task. Gemini agents are smart enough.
 
 ### TL manually reviews intermediate output
-Convergence is leaf + Copilot. TL only reviews at merge time.
+Convergence is leaf + reviewer. TL only reviews at merge time.
 
 ### TL iterates on a failing leaf
 Escalation, not iteration. If leaf fails 3+ rounds, re-decompose with a different approach.

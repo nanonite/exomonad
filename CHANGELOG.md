@@ -17,6 +17,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Migrate CI from GitHub Actions to self-hosted Tangled knot+spindle (#83)
+- Implement Combined PR Workflow — local worktree PRs, chainlink --db, Tangled CI (#80)
+- Replace Copilot reviews with Tangled-resident reviewer agent and delete GitHub Actions workflows (#89)
+- Stand up Tangled VM, create .tangled/workflows/ci.yml, and achieve green CI pipeline (#88)
+- Replace GitHub PR lifecycle with local git worktree PR registry and sibling-agent review (#82)
 - Implement sibling-agent review system with ReviewerRole, review policy gates, and Stuck terminal state (#87)
 - Implement complexity_classifier for second-reviewer routing (#94)
 - Add Stuck terminal state and thread tracking to review system (#93)

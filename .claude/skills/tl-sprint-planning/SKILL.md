@@ -95,7 +95,7 @@ Wave 1 parallel: proto-plumbing (proto/) — different subsystem
 When parallel PRs exist:
 
 1. **Merge smallest/most isolated first** — less conflict surface
-2. **Rebase next PR on fresh branch** (or let Copilot flag conflicts)
+2. **Rebase next PR on fresh branch** (or let reviewer flag conflicts)
 3. **Repeat**
 
 ## Commands Reference
@@ -110,7 +110,8 @@ fork_wave                           # Claude in worktree, can sub-spawn
 spawn_leaf(isolation="inline")    # Gemini panes, ephemeral
 
 # Monitoring — idle until messages arrive
-# [PR READY] — Copilot approved, merge
+# [PR READY] — Reviewer approved, merge
 # [FIXES PUSHED] — leaf addressed review, merge if CI passes
 # [REVIEW TIMEOUT] — no review after timeout, merge if CI passes
+# [STUCK: id] — review did not converge, re-decompose
 ```

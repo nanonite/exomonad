@@ -84,15 +84,16 @@ Include complete code snippets. Name every file by full path. Include exact comm
 
 ## Convergence Protocol
 
-The TL does NOT iterate on children's work. Convergence is **leaf + Copilot**, not TL:
+The TL does NOT iterate on children's work. Convergence is **leaf + reviewer**, not TL:
 
 1. Leaf implements spec, commits, files PR
-2. Copilot reviews automatically on PR creation
-3. If Copilot requests changes → injected into leaf's pane → leaf fixes → pushes
-4. System notifies parent: `[FIXES PUSHED]`, `[PR READY]`, or `[REVIEW TIMEOUT]`
+2. Reviewer agent reviews automatically on PR creation
+3. If reviewer requests changes → injected into leaf's pane → leaf fixes → pushes
+4. System notifies parent: `[FIXES PUSHED]`, `[PR READY]`, `[REVIEW TIMEOUT]`, or `[STUCK]`
 5. TL merges when notified
 
 The TL never manually reviews code, never fixes a leaf's implementation.
+See `.exo/review-policy.toml` for review round limits, timeouts, and complexity thresholds.
 
 ## Branch Naming
 

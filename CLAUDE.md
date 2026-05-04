@@ -256,6 +256,26 @@ Gemini agents get settings via `GEMINI_CLI_SYSTEM_SETTINGS_PATH` env var (NOT `.
 
 **Claude Code settings help:** We have a Claude Code configuration specialist (preloaded with official documentation) available as an oracle for hook syntax, settings structure, MCP setup, and debugging.
 
+### Review Policy
+
+The reviewer convergence loop is configured via `.exo/review-policy.toml`:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `min_review_rounds` | 1 | Minimum review rounds before merge is permitted |
+| `reviewer_max_rounds` | 2 | Max rounds before Stuck — PR surfaced to human |
+| `reviewer_max_wait_seconds` | 1200 | Max wait for reviewer response (20 min) |
+| `reviewer_max_rate_limit_retries` | 2 | Max rate-limit retries for reviewer agents |
+| `review_freshness_window_secs` | 1200 | Window for a review to be considered "fresh" |
+| `external_review_threshold` | 300 | Lines changed to trigger mandatory second review |
+| `external_review_paths` | `["proto/**", "rust/../handlers/**"]` | Path globs always requiring second review |
+| `require_second_reviewer_complexity` | false | Require second reviewer for complex PRs |
+| `complexity_line_threshold` | 500 | Line threshold for complexity-based second review |
+
+**Reviewer identity discipline:** Each reviewer agent operates under a distinct git identity (`user.name=exomonad-reviewer-{name}`). The reviewer never commits to a branch it didn't author — the Authoring-Agent line in the PR body establishes traceability. An agent never reviews under the identity that authored the PR.
+
+**Stuck state:** When a PR exceeds `reviewer_max_rounds` without convergence, the watcher fires the `Stuck` event. The parent TL receives `[STUCK: leaf-id]` and must re-decompose or escalate to a human. The PR cannot be auto-merged from this state.
+
 ### Companion Agents
 
 Companion agents are persistent agents spawned alongside the root TL during `exomonad init`. Claude companions get their own git worktree at `.exo/companions/{name}/` on branch `companion/{name}`, providing isolated `.mcp.json` discovery via CWD — the same mechanism that makes `fork_wave` reliable.
@@ -326,8 +346,8 @@ This is **native Claude Code Teams integration**. Messages from child agents arr
 | **ACP messaging** (Gemini agents) | **Built.** Structured JSON-RPC messaging via Agent Client Protocol. `AcpRegistry` manages connections, `connect_and_prompt()` establishes ACP sessions. Delivery priority: Teams inbox → ACP prompt → HTTP-over-UDS → tmux STDIN. Vendor SDK patched for Send safety. |
 | **HTTP-over-UDS delivery** (Shoal/custom agents) | **Built.** `notify_parent` → POST to `.exo/agents/{name}/notify.sock`. Fire-and-forget with 5s timeout. For custom binary agents that run their own HTTP server on a Unix socket. |
 | **Event router** (tmux STDIN fallback) | Built. Fallback path: `notify_parent` → `inject_input` into parent pane via tmux buffer pattern. |
-| **Event handlers** (WASM dispatch for world events) | **Built.** Third dispatch category alongside tools and hooks. GitHub poller calls `handle_event` on agent's PluginManager for PR review events (reviews, approvals, timeouts) and **sibling merge events**. Handlers return `EventAction` (InjectMessage, NotifyParent, NoAction). |
-| **GitHub poller** (PR status → events) | Built. Background service polls PR/CI status, fires WASM event handlers, and injects notifications into agent panes. Tracks `first_seen`, `last_review_state`, and `notified_parent_timeout` per PR. |
+| **Event handlers** (WASM dispatch for world events) | **Built.** Third dispatch category alongside tools and hooks. Worktree event watcher calls `handle_event` on agent's PluginManager for PR review events (reviews, approvals, timeouts) and **sibling merge events**. Handlers return `EventAction` (InjectMessage, NotifyParent, NoAction). |
+| **Worktree event watcher** (PR status → events) | Built. Background service watches local git worktree PRs, fires WASM event handlers, and injects notifications into agent panes. Tracks `first_seen`, `last_review_state`, and `notified_parent_timeout` per PR. |
 | **OTel observability** | **Built.** Axum middleware auto-attributes every agent request span with `agent_id`, `agent.role`, `agent.parent`, `swarm.run_id`. `swarm.run_id` persisted to `.exo/run_id`, set as OTel resource attribute, propagated to children via env. Query all spans in a run: `resource.swarm.run_id = '{id}'`. Reconstruct spawn tree: `groupBy agent.parent, agent_id`. |
 | **Coordination mutexes** | Built. In-memory `MutexRegistry` with FIFO wait queues, TTL auto-expiry, idempotent acquire. Effect-only (`coordination.acquire_mutex`, `coordination.release_mutex`) — no MCP tool exposed. |
 | **Tempo observability** | **Built.** Grafana Tempo for lightweight trace storage (~100-200MB RAM). Agents query traces via `curl` + TraceQL against Tempo's HTTP API (port 3200). Optional Grafana UI at `http://localhost:3000`. |
@@ -435,7 +455,7 @@ Claude Code starts → exomonad hook session-start
 
 **Event Handler Call:**
 ```
-GitHub poller detects world event (Copilot review, CI status, timeout)
+Worktree event watcher detects world event (reviewer agent review, CI status, timeout)
 → Poller resolves agent's PluginManager from plugins map
 → Calls WASM handle_event with { role, event_type, payload }
 → Haskell dispatches to EventHandlerConfig handler → returns EventAction
@@ -561,31 +581,33 @@ Use sub-TLs to keep each context window sharp. If a task decomposes into more th
 
 ### Intelligence Gradient
 
-Claude (Opus) decomposes and dispatches. Gemini implements. Copilot reviews. The TL never implements directly and never manually reviews intermediate output.
+Claude (Opus) decomposes and dispatches. Gemini implements. Reviewer agent reviews. The TL never implements directly and never manually reviews intermediate output.
 
-**Cost model:** Opus tokens are 10-30x Gemini tokens. Every line of code the TL writes is expensive code. Every review cycle the TL performs is an expensive review cycle. The TL's job is producing specs sharp enough that the leaf + Copilot convergence loop handles quality without TL involvement.
+**Cost model:** Opus tokens are 10-30x Gemini tokens. Every line of code the TL writes is expensive code. Every review cycle the TL performs is an expensive review cycle. The TL's job is producing specs sharp enough that the leaf + reviewer convergence loop handles quality without TL involvement.
 
 ### Fire-and-Forget Execution
 
 The TL's workflow is: **decompose → spec → spawn → move on**. The TL does not wait, poll, review intermediate output, or re-spec. It spawns all leaves it can, then idles until messages arrive.
 
-**Convergence is leaf + Copilot + event handlers, not TL:**
+**Convergence is leaf + reviewer + event handlers, not TL:**
 1. TL writes spec, spawns leaf (Gemini), returns immediately
 2. Leaf works → commits → files PR
-3. GitHub poller detects Copilot review comments → fires `handle_event(PRReview::ReviewReceived)` → handler injects comments into leaf's pane
-4. Leaf reads Copilot feedback, fixes, pushes
-5. Poller detects SHA change after `ChangesRequested` → fires `handle_event(PRReview::FixesPushed)` → handler sends `[FIXES PUSHED]` to TL
+3. Worktree event watcher detects reviewer agent review comments → fires `handle_event(PRReview::ReviewReceived)` → handler injects comments into leaf's pane
+4. Leaf reads reviewer feedback, fixes, pushes
+5. Watcher detects SHA change after `ChangesRequested` → fires `handle_event(PRReview::FixesPushed)` → handler sends `[FIXES PUSHED]` to TL
 6. TL sees `[from: leaf-id] [FIXES PUSHED] PR #N — CI passing. Ready to merge.` → merges the PR
 
-**Note:** Copilot's first review is automatic (triggered on PR creation). Subsequent reviews after pushing fixes are NOT — Copilot does not re-review. The `FixesPushed` event is the system's signal that the iteration loop completed.
+**Note:** Unlike Copilot, the reviewer agent can re-review after fixes are pushed. The `FixesPushed` event signals that the leaf has responded to all review comments and the reviewer should re-evaluate.
 
 **Alternative paths:**
-- **Copilot approves first time** → poller fires `handle_event(PRReview::Approved)` → handler sends `[PR READY]` to TL → TL merges
-- **No Copilot review after timeout** → poller fires `handle_event(PRReview::ReviewTimeout)` → handler sends `[REVIEW TIMEOUT]` to TL → TL merges if CI passes (15 min initial, 5 min after addressing changes)
+- **Reviewer approves** → watcher fires `handle_event(PRReview::ReviewerApproved)` → handler sends `[PR READY]` to TL → TL merges
+- **Reviewer requests changes** → watcher fires `handle_event(PRReview::ReviewerRequestedChanges)` → handler injects comments into leaf's pane → leaf fixes → pushes → reviewer re-checks
+- **No reviewer response after timeout** → watcher fires `handle_event(PRReview::ReviewTimeout)` → handler sends `[REVIEW TIMEOUT]` to TL → TL merges if CI passes
 - **Leaf sends status updates** → `notify_parent` delivers `[from: leaf-id] message` to TL → informational, TL reads but does not auto-merge
 - **Leaf fails** → `notify_parent` with `failure` status → delivers `[FAILED: leaf-id] message` to TL → TL re-decomposes
+- **Review is stuck** → after max rounds without convergence, watcher fires `handle_event(PRReview::Stuck)` → handler sends `[STUCK: leaf-id]` to TL → human intervention required
 
-**Escalation, not iteration.** If a leaf fails after 3+ Copilot rounds, it calls `notify_parent` with `failure` status. The TL then decides: re-decompose, try a different approach, or flag for human intervention. The TL never manually fixes a leaf's code.
+**Escalation, not iteration.** If a leaf fails after reaching `reviewer_max_rounds` (see `.exo/review-policy.toml`), the watcher fires the `Stuck` event. The TL then decides: re-decompose, try a different approach, or flag for human intervention. The TL never manually fixes a leaf's code.
 
 ### Spec Quality (You Only Get One Shot)
 
@@ -652,14 +674,15 @@ Spawn multiple leaves when tasks are independent (no file conflicts, no ordering
 ### When TL Gets Notified
 
 The TL is idle between spawning and receiving notifications. It wakes up for:
-- **`[FIXES PUSHED]`** (event handler) — leaf addressed Copilot review comments and pushed fixes. Copilot does NOT re-review, so this is the actionable signal. TL merges if CI passes.
-- **`[PR READY]`** (event handler) — Copilot approved a leaf's PR on first review. TL merges and verifies the result builds cleanly. Multiple leaves landing in parallel may interact.
-- **`[REVIEW TIMEOUT]`** (event handler) — no Copilot review after timeout (15 min initial, 5 min after addressing changes). TL merges if CI passes.
+- **`[FIXES PUSHED]`** (event handler) — leaf addressed reviewer comments and pushed fixes. TL merges if CI passes.
+- **`[PR READY]`** (event handler) — reviewer approved a leaf's PR. TL merges and verifies the result builds cleanly. Multiple leaves landing in parallel may interact.
+- **`[REVIEW TIMEOUT]`** (event handler) — no reviewer response after timeout (configured in `.exo/review-policy.toml`). TL merges if CI passes.
+- **`[STUCK: agent-id]`** — review did not converge within `reviewer_max_rounds`. Human intervention required — the PR cannot be auto-merged.
 - **`[from: agent-id]`** (agent message) — informational update from a leaf. Do not auto-merge; read the message.
 - **`[FAILED: agent-id]`** — leaf exhausted retries. TL re-decomposes or escalates.
-- GitHub poller notifications (CI status, PR merge conflicts).
+- Worktree event watcher notifications (CI status, PR merge conflicts).
 
-The TL does NOT wake up for intermediate progress, Copilot comments, or partial results. The convergence loop (leaf + Copilot) runs without TL involvement.
+The TL does NOT wake up for intermediate progress, reviewer comments, or partial results. The convergence loop (leaf + reviewer) runs without TL involvement.
 
 ---
 

@@ -9,7 +9,7 @@ min_review_rounds = 1
 # Maximum review rounds before Stuck terminal state.
 # After this many rounds without convergence, the PR is surfaced to a human
 # and cannot be auto-merged.
-reviewer_max_rounds = 5
+reviewer_max_rounds = 2
 
 # Maximum wait time for a reviewer to respond (seconds).
 # If a reviewer doesn't post a review within this window, the PR can be
