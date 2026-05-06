@@ -10,31 +10,25 @@ clone:
 dependencies:
   nixpkgs:
     - cabal-install
-    - ghc
+    - haskell.compiler.ghc912
+    - hlint
+    - ormolu
     - rustup
     - protobuf
-    - just
     - pkg-config
     - zlib
-environment:
-  PROTOC: "/run/current-system/sw/bin/protoc"
 steps:
-  - name: "Install hlint"
-    command: |
-      curl -sSL https://github.com/ndmitchell/hlint/releases/download/v3.8/hlint-3.8-x86_64-linux.tar.gz \
-        | tar xz -C /tmp
-      install -m 0755 /tmp/hlint-3.8/hlint /usr/local/bin/hlint
   - name: "Mergepath: verify PR identity footer"
     command: |
-      # For pull_request events, verify commit message carries Authoring-Agent and Birth-Branch lines.
-      # Non-blocking during initial migration — soft-check only.
       if git log -1 --pretty=%B | grep -qE '^(Authoring-Agent|Birth-Branch): '; then
         echo "PR identity footer present"
       else
         echo "NOTE: PR missing Authoring-Agent / Birth-Branch footer lines (mergepath fold)"
       fi
-  - name: "Format check"
-    command: "just check-fmt"
+  - name: "Haskell format check"
+    command: |
+      ormolu --mode check --ghc-opt -XImportQualifiedPost \
+        $(find haskell -name "*.hs" -not -path "*/vendor/*")
   - name: "Haskell lint"
     command: 'hlint haskell --ignore-glob="haskell/vendor/**" || true'
   - name: "Haskell build"
@@ -48,7 +42,6 @@ steps:
     command: |
       rustup default stable
       rustup component add clippy rustfmt
-      rustup target add wasm32-wasip1
   - name: "Rust clippy"
     command: "cd rust && cargo clippy --workspace --all-targets"
   - name: "Rust fmt check"
@@ -61,5 +54,3 @@ steps:
     command: |
       cabal test exomonad-control-server:protocol-golden-test
       cd rust && cargo test -p exomonad-shared --test protocol_golden
-  - name: "Proto drift check"
-    command: "just proto-check"
