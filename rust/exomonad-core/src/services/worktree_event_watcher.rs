@@ -5,10 +5,11 @@ use crate::services::file_pr_local::{read_pr_registry, write_pr_registry, LocalR
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasOpencodeAcpRegistry,
-    HasProjectDir, HasTeamRegistry,
+    HasProjectDir, HasTeamRegistry, ReviewerSpawner,
 };
 use anyhow::Result;
 use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,6 +79,7 @@ struct WatchState {
     addressed_changes: bool,
     rounds: u32,
     stuck: bool,
+    reviewer_spawned: bool,
 }
 
 impl WatchState {
@@ -95,6 +97,7 @@ impl WatchState {
             addressed_changes: false,
             rounds: 0,
             stuck: false,
+            reviewer_spawned: false,
         }
     }
 }
@@ -152,6 +155,14 @@ pub struct WorktreeEventWatcher<C> {
     prs_path: std::path::PathBuf,
     plugins: Option<PluginMap>,
     policy: ReviewPolicy,
+    /// Shared CI status map updated by the spindle subscriber (branch → CIStatus).
+    ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
+    /// WebSocket URL of the Tangled knot (for pipeline→branch mapping).
+    knot_url: Option<String>,
+    /// WebSocket URL of the Tangled spindle (for PipelineStatus events).
+    spindle_url: Option<String>,
+    /// Spawns reviewer agents on PR creation.
+    reviewer_spawner: Option<Arc<dyn ReviewerSpawner>>,
 }
 
 impl<C> WorktreeEventWatcher<C>
@@ -174,6 +185,10 @@ where
             prs_path,
             plugins: None,
             policy: ReviewPolicy::default(),
+            ci_status_map: Arc::new(RwLock::new(HashMap::new())),
+            knot_url: None,
+            spindle_url: None,
+            reviewer_spawner: None,
         }
     }
 
@@ -192,11 +207,36 @@ where
         self
     }
 
+    pub fn with_knot_url(mut self, url: String) -> Self {
+        self.knot_url = Some(url);
+        self
+    }
+
+    pub fn with_spindle_url(mut self, url: String) -> Self {
+        self.spindle_url = Some(url);
+        self
+    }
+
+    pub fn with_reviewer_spawner(mut self, spawner: Arc<dyn ReviewerSpawner>) -> Self {
+        self.reviewer_spawner = Some(spawner);
+        self
+    }
+
     pub async fn run(&self) {
         tracing::info!(
             poll_interval_secs = self.poll_interval.as_secs(),
             "Local worktree event watcher started"
         );
+
+        // Launch CI event subscriber if either URL is configured
+        if self.knot_url.is_some() || self.spindle_url.is_some() {
+            let ci_map = self.ci_status_map.clone();
+            let knot_url = self.knot_url.clone();
+            let spindle_url = self.spindle_url.clone();
+            tokio::spawn(async move {
+                run_ci_subscriber(knot_url, spindle_url, ci_map).await;
+            });
+        }
 
         let base_interval = self.poll_interval;
         let max_backoff = Duration::from_secs(600);
@@ -304,7 +344,10 @@ where
                 }
             };
 
-            let ci_status = CIStatus::Unknown;
+            let ci_status = {
+                let branch = BranchName::from(pr.head_branch.as_str());
+                self.ci_status_map.read().await.get(&branch).copied().unwrap_or(CIStatus::Unknown)
+            };
 
             observations.insert(*number, Observation {
                 head_sha,
@@ -363,6 +406,23 @@ where
                             comment_count,
                         ),
                     );
+                    // Spawn reviewer immediately on first sighting of a new open PR
+                    if let Some(spawner) = &self.reviewer_spawner {
+                        if let Some(pr_entry) = registry.prs.get(pr_number) {
+                            let spawner = spawner.clone();
+                            let pr_clone = pr_entry.clone();
+                            let pr_num = *pr_number;
+                            tokio::spawn(async move {
+                                info!(pr_number = pr_num, "Spawning reviewer agent for new PR");
+                                if let Err(e) = spawner.spawn_reviewer_for_pr(&pr_clone).await {
+                                    warn!(pr_number = pr_num, error = %e, "Failed to spawn reviewer for PR");
+                                }
+                            });
+                            if let Some(ws) = state_guard.get_mut(pr_number) {
+                                ws.reviewer_spawned = true;
+                            }
+                        }
+                    }
                     vec![]
                 };
 
@@ -965,6 +1025,166 @@ fn format_review_message(comments: &[LocalReviewComment], reviews: &[LocalReview
     }
 
     msg
+}
+
+// ============================================================================
+// Tangled CI event subscribers
+// ============================================================================
+
+/// Wire frame for events streamed by both the knot and the spindle.
+#[derive(Deserialize)]
+struct TangledStreamEvent {
+    rkey: String,
+    nsid: String,
+    event: serde_json::Value,
+}
+
+/// Launch background tasks that subscribe to the knot and spindle WebSocket
+/// streams and keep `ci_status_map` up to date.
+async fn run_ci_subscriber(
+    knot_url: Option<String>,
+    spindle_url: Option<String>,
+    ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
+) {
+    // pipeline rkey → branch name, populated from the knot's Pipeline events
+    let pipeline_map: Arc<RwLock<HashMap<String, BranchName>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    let mut handles = Vec::new();
+
+    if let Some(url) = knot_url {
+        let pm = pipeline_map.clone();
+        handles.push(tokio::spawn(async move {
+            run_knot_subscriber(url, pm).await;
+        }));
+    }
+
+    if let Some(url) = spindle_url {
+        let pm = pipeline_map.clone();
+        let cs = ci_status_map.clone();
+        handles.push(tokio::spawn(async move {
+            run_spindle_subscriber(url, pm, cs).await;
+        }));
+    }
+
+    futures::future::join_all(handles).await;
+}
+
+/// Subscribes to the knot's `/events` WebSocket and builds a mapping from
+/// pipeline rkey → branch name by parsing `sh.tangled.pipeline` records.
+async fn run_knot_subscriber(
+    knot_url: String,
+    pipeline_map: Arc<RwLock<HashMap<String, BranchName>>>,
+) {
+    loop {
+        match tokio_tungstenite::connect_async(&knot_url).await {
+            Ok((mut ws, _)) => {
+                info!(url = %knot_url, "Knot CI subscriber connected");
+                while let Some(msg) = ws.next().await {
+                    match msg {
+                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                            if let Ok(ev) = serde_json::from_str::<TangledStreamEvent>(&text) {
+                                if ev.nsid == "sh.tangled.pipeline" {
+                                    if let Some(branch_name) = extract_pipeline_branch(&ev.event) {
+                                        debug!(rkey = %ev.rkey, branch = %branch_name, "Knot: pipeline→branch mapped");
+                                        pipeline_map.write().await.insert(ev.rkey, branch_name);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
+                        Err(e) => {
+                            warn!(url = %knot_url, error = %e, "Knot subscriber error");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                warn!(url = %knot_url, "Knot CI subscriber disconnected, reconnecting in 15s");
+            }
+            Err(e) => {
+                warn!(url = %knot_url, error = %e, "Knot CI subscriber failed to connect, retrying in 15s");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
+/// Subscribes to the spindle's `/events` WebSocket and updates `ci_status_map`
+/// by parsing `sh.tangled.pipeline.status` events.
+async fn run_spindle_subscriber(
+    spindle_url: String,
+    pipeline_map: Arc<RwLock<HashMap<String, BranchName>>>,
+    ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
+) {
+    loop {
+        match tokio_tungstenite::connect_async(&spindle_url).await {
+            Ok((mut ws, _)) => {
+                info!(url = %spindle_url, "Spindle CI subscriber connected");
+                while let Some(msg) = ws.next().await {
+                    match msg {
+                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                            if let Ok(ev) = serde_json::from_str::<TangledStreamEvent>(&text) {
+                                if ev.nsid == "sh.tangled.pipeline.status" {
+                                    if let Some((rkey, status)) = extract_pipeline_status(&ev.event) {
+                                        let branch = pipeline_map.read().await.get(&rkey).cloned();
+                                        if let Some(branch) = branch {
+                                            let ci = CIStatus::parse(&status);
+                                            info!(rkey = %rkey, branch = %branch, status = %status, "Spindle: CI status updated");
+                                            ci_status_map.write().await.insert(branch, ci);
+                                        } else {
+                                            debug!(rkey = %rkey, status = %status, "Spindle: no branch mapping for pipeline rkey yet");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
+                        Err(e) => {
+                            warn!(url = %spindle_url, error = %e, "Spindle subscriber error");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                warn!(url = %spindle_url, "Spindle CI subscriber disconnected, reconnecting in 15s");
+            }
+            Err(e) => {
+                warn!(url = %spindle_url, error = %e, "Spindle CI subscriber failed to connect, retrying in 15s");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
+/// Extracts the branch name from a `sh.tangled.pipeline` event payload.
+/// Returns `None` if the trigger is not a push or has no ref field.
+fn extract_pipeline_branch(event: &serde_json::Value) -> Option<BranchName> {
+    let ref_str = event
+        .get("triggerMetadata")
+        .and_then(|tm| tm.get("push"))
+        .and_then(|push| push.get("ref"))
+        .and_then(|r| r.as_str())?;
+
+    let branch = ref_str.strip_prefix("refs/heads/").unwrap_or(ref_str);
+    if branch.is_empty() {
+        None
+    } else {
+        Some(BranchName::from(branch))
+    }
+}
+
+/// Extracts the pipeline rkey and status string from a `sh.tangled.pipeline.status` event payload.
+/// The pipeline field is an AT-URI; the rkey is the last path segment.
+fn extract_pipeline_status(event: &serde_json::Value) -> Option<(String, String)> {
+    let pipeline_uri = event.get("pipeline").and_then(|p| p.as_str())?;
+    let status = event.get("status").and_then(|s| s.as_str())?;
+    let rkey = pipeline_uri.rsplit('/').next()?.to_string();
+    if rkey.is_empty() {
+        None
+    } else {
+        Some((rkey, status.to_string()))
+    }
 }
 
 async fn git_head_sha(worktree_path: &std::path::Path) -> Result<String> {

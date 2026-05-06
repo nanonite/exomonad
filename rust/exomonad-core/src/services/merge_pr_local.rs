@@ -4,7 +4,7 @@
 // local git merge into the parent (base) branch, pushes to origin,
 // and updates the registry state to Merged.
 
-use crate::domain::{AgentName, BranchName, MergeStrategy, PRNumber};
+use crate::domain::{AgentName, BranchName, CIStatus, MergeStrategy, PRNumber};
 use crate::services::file_pr_local::{read_pr_registry, write_pr_registry, PrState};
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::merge_pr::MergePROutput;
@@ -61,6 +61,12 @@ pub enum MergeGateError {
     NotFound {
         pr_number: u64,
     },
+    /// CI has not passed (spindle reports non-success status).
+    #[error("PR #{pr_number}: CI not passing (status={status})")]
+    CiNotPassed {
+        pr_number: u64,
+        status: String,
+    },
 }
 
 // ============================================================================
@@ -75,6 +81,7 @@ pub fn check_merge_gates(
     merger: &AgentName,
     policy: &ReviewPolicy,
     line_count: Option<u64>,
+    ci_status: Option<CIStatus>,
 ) -> std::result::Result<(), MergeGateError> {
     // Gate 1: Not stuck
     if pr.stuck {
@@ -132,6 +139,16 @@ pub fn check_merge_gates(
                     pr_number: pr.number,
                 });
             }
+        }
+    }
+
+    // Gate 7: CI must pass when spindle status is available
+    if let Some(ci) = ci_status {
+        if ci != CIStatus::Success && ci != CIStatus::Neutral {
+            return Err(MergeGateError::CiNotPassed {
+                pr_number: pr.number,
+                status: ci.as_str().to_string(),
+            });
         }
     }
 
@@ -200,7 +217,7 @@ pub async fn merge_pr_local(
     );
 
     // Gate checks (fail early)
-    if let Err(e) = check_merge_gates(&pr, merger_agent, policy, None) {
+    if let Err(e) = check_merge_gates(&pr, merger_agent, policy, None, None) {
         warn!("Merge gate failed: {}", e);
         return Ok(MergePROutput {
             success: false,
@@ -321,7 +338,7 @@ mod tests {
         pr.rounds = 1;
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(result.is_ok(), "Expected all gates to pass, got: {:?}", result);
     }
 
@@ -332,7 +349,7 @@ mod tests {
         pr.rounds = 3;
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(result.is_ok());
     }
 
@@ -346,7 +363,7 @@ mod tests {
         pr.rounds = 6;
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(
             matches!(result, Err(MergeGateError::Stuck { pr_number: 1, .. })),
             "Expected Stuck, got: {:?}",
@@ -362,7 +379,7 @@ mod tests {
         pr.review_state = LocalReviewState::Approved;
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("STUCK"));
         assert!(msg.contains("rounds=7"));
@@ -378,7 +395,7 @@ mod tests {
         pr.rounds = 2;
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(
             matches!(result, Err(MergeGateError::NeedsHumanReview { pr_number: 1 })),
             "Expected NeedsHumanReview, got: {:?}",
@@ -394,7 +411,7 @@ mod tests {
         pr.rounds = 3;
         pr.reviewer_agent = Some("other-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(result.is_err());
         // needs_human_review is checked before review_state, so it should hit that gate
         assert!(
@@ -412,7 +429,7 @@ mod tests {
         pr.review_state = LocalReviewState::PendingReview;
         pr.rounds = 0;
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(
             matches!(result, Err(MergeGateError::NotApproved { pr_number: 1, .. })),
             "Expected NotApproved, got: {:?}",
@@ -427,7 +444,7 @@ mod tests {
         pr.rounds = 1;
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(
             matches!(result, Err(MergeGateError::NotApproved { .. })),
             "Expected NotApproved, got: {:?}",
@@ -441,7 +458,7 @@ mod tests {
         pr.review_state = LocalReviewState::ChangesRequested;
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("changes_requested"));
     }
@@ -456,7 +473,7 @@ mod tests {
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
         // Author == merger
-        let result = check_merge_gates(&pr, &author_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &author_agent(), &standard_policy(), None, None);
         assert!(
             matches!(
                 result,
@@ -479,7 +496,7 @@ mod tests {
 
         // Third agent merges (not author, not reviewer) — OK
         let merger = AgentName::from("tl-claude");
-        let result = check_merge_gates(&pr, &merger, &standard_policy(), None);
+        let result = check_merge_gates(&pr, &merger, &standard_policy(), None, None);
         assert!(result.is_ok());
     }
 
@@ -493,7 +510,7 @@ mod tests {
         pr.reviewer_agent = Some("feat-gemini".into()); // Same as author
 
         // If the author tries to merge after self-approving
-        let result = check_merge_gates(&pr, &author_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &author_agent(), &standard_policy(), None, None);
         assert!(result.is_err(), "Author should not be able to merge own PR");
     }
 
@@ -506,7 +523,7 @@ mod tests {
         pr.rounds = 0; // 0 rounds, policy requires 1
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(
             matches!(
                 result,
@@ -531,7 +548,7 @@ mod tests {
         pr.rounds = 0;
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &relaxed, None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &relaxed, None, None);
         assert!(result.is_ok(), "Relaxed policy should allow 0 rounds");
     }
 
@@ -545,7 +562,7 @@ mod tests {
         pr.rounds = 2;
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &strict, None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &strict, None, None);
         assert!(
             matches!(result, Err(MergeGateError::InsufficientRounds { rounds: 2, required: 3, .. })),
             "Strict policy should require 3 rounds"
@@ -566,7 +583,7 @@ mod tests {
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
         // 200 lines changed > 100 threshold
-        let result = check_merge_gates(&pr, &reviewer_agent(), &policy, Some(200));
+        let result = check_merge_gates(&pr, &reviewer_agent(), &policy, Some(200), None);
         assert!(
             matches!(
                 result,
@@ -589,7 +606,7 @@ mod tests {
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
         // 50 lines changed < 500 threshold
-        let result = check_merge_gates(&pr, &reviewer_agent(), &policy, Some(50));
+        let result = check_merge_gates(&pr, &reviewer_agent(), &policy, Some(50), None);
         assert!(result.is_ok(), "Small PR should pass complexity gate");
     }
 
@@ -604,7 +621,7 @@ mod tests {
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
         // No line count provided
-        let result = check_merge_gates(&pr, &reviewer_agent(), &policy, None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &policy, None, None);
         assert!(result.is_ok(), "Should skip complexity when no line count");
     }
 
@@ -619,7 +636,7 @@ mod tests {
         pr.review_state = LocalReviewState::PendingReview;
         pr.rounds = 0;
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(
             matches!(result, Err(MergeGateError::Stuck { .. })),
             "Stuck should be caught first, got: {:?}",
@@ -634,7 +651,7 @@ mod tests {
         pr.needs_human_review = true;
         pr.review_state = LocalReviewState::PendingReview;
 
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None);
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(
             matches!(result, Err(MergeGateError::NeedsHumanReview { .. })),
             "NeedsHumanReview should beat NotApproved, got: {:?}",

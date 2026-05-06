@@ -210,6 +210,7 @@ wasm_dir = ".exo/wasm"       # project-local (default), override for shared inst
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
 model = "sonnet"             # optional — passed as --model flag to root TL agent
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
+tangled_spindle_url = "ws://localhost:8080"  # optional — spindle WebSocket for CI status events
 
 # Extra MCP servers (HTTP or stdio). Included in .mcp.json for all agents.
 [extra_mcp_servers.metacog]
@@ -597,7 +598,7 @@ The TL's workflow is: **decompose → spec → spawn → move on**. The TL does 
 5. Watcher detects SHA change after `ChangesRequested` → fires `handle_event(PRReview::FixesPushed)` → handler sends `[FIXES PUSHED]` to TL
 6. TL sees `[from: leaf-id] [FIXES PUSHED] PR #N — CI passing. Ready to merge.` → merges the PR
 
-**Note:** Unlike Copilot, the reviewer agent can re-review after fixes are pushed. The `FixesPushed` event signals that the leaf has responded to all review comments and the reviewer should re-evaluate.
+**Note:** The reviewer agent re-reviews after fixes are pushed. The `FixesPushed` event signals that the leaf has responded to all review comments and the reviewer should re-evaluate.
 
 **Alternative paths:**
 - **Reviewer approves** → watcher fires `handle_event(PRReview::ReviewerApproved)` → handler sends `[PR READY]` to TL → TL merges

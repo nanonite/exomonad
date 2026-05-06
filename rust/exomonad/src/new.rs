@@ -22,6 +22,12 @@ pub async fn run(_name: Option<String>) -> Result<()> {
 ",
     )?;
 
+    let prs_path = cwd.join(".exo/prs.json");
+    if !prs_path.exists() {
+        std::fs::write(&prs_path, "{\"prs\":{},\"next_number\":1}\n")?;
+        info!("Created .exo/prs.json (empty PR registry)");
+    }
+
     // Add gitignore entries
     crate::init::ensure_gitignore(&cwd)?;
 

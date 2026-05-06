@@ -1031,12 +1031,21 @@ Run `exomonad recompile` first to build it.",
 
     // Start Worktree Event Watcher (background service — replaces GitHub poller + Copilot review)
     let mut watcher = exomonad_core::services::worktree_event_watcher::WorktreeEventWatcher::new(services.clone())
-        .with_plugins(plugins.clone());
+        .with_plugins(plugins.clone())
+        .with_reviewer_spawner(agent_control.clone());
     if let Some(interval) = config.poll_interval {
         if interval == 0 {
             anyhow::bail!("Invalid configuration: `poll_interval` must be >= 1 second, got 0");
         }
         watcher = watcher.with_poll_interval(Duration::from_secs(interval));
+    }
+    if let Some(url) = config.tangled_knot_url.clone() {
+        info!(url = %url, "Tangled knot CI subscriber enabled");
+        watcher = watcher.with_knot_url(url);
+    }
+    if let Some(url) = config.tangled_spindle_url.clone() {
+        info!(url = %url, "Tangled spindle CI subscriber enabled");
+        watcher = watcher.with_spindle_url(url);
     }
     tokio::spawn(async move {
         watcher.run().await;

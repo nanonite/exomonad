@@ -17,6 +17,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- C.6: Update CLAUDE.md and rules for Tangled CI (#107)
+- C.5: Populate .exo/review-policy.toml and create .exo/prs.json (#106)
+- C.4: Implement query_local_ci() in worktree_event_watcher.rs (#105)
+- C.2: Create test workspace with local-knot git remote (#103)
+- C.1: Stand up local Tangled knot+spindle via Docker (#102)
 - Migrate CI from GitHub Actions to self-hosted Tangled knot+spindle (#83)
 - Implement Combined PR Workflow — local worktree PRs, chainlink --db, Tangled CI (#80)
 - Replace Copilot reviews with Tangled-resident reviewer agent and delete GitHub Actions workflows (#89)

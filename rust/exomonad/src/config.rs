@@ -170,6 +170,14 @@ pub struct RawConfig {
     /// Can be set via CLI flag --opencode-as-tl.
     #[serde(default)]
     pub opencode_as_tl: Option<bool>,
+
+    /// WebSocket URL of the local Tangled knot (e.g. "ws://localhost:7000").
+    /// When set, exomonad subscribes to the knot's /events for pipeline→branch mappings.
+    pub tangled_knot_url: Option<String>,
+
+    /// WebSocket URL of the local Tangled spindle (e.g. "ws://localhost:8080").
+    /// When set, exomonad subscribes to the spindle's /events for CI status updates.
+    pub tangled_spindle_url: Option<String>,
 }
 
 /// Final resolved configuration.
@@ -220,6 +228,12 @@ pub struct Config {
 
     /// Use OpenCode as the root TL agent instead of Claude.
     pub opencode_as_tl: bool,
+
+    /// WebSocket URL of the local Tangled knot (e.g. "ws://localhost:7000").
+    pub tangled_knot_url: Option<String>,
+
+    /// WebSocket URL of the local Tangled spindle (e.g. "ws://localhost:8080").
+    pub tangled_spindle_url: Option<String>,
 }
 
 impl Config {
@@ -389,6 +403,10 @@ impl Config {
         // Resolve opencode_as_tl: local > global > false
         let opencode_as_tl = local_raw.opencode_as_tl.or(global_raw.opencode_as_tl).unwrap_or(false);
 
+        // Resolve tangled URLs: local > global
+        let tangled_knot_url = local_raw.tangled_knot_url.or(global_raw.tangled_knot_url);
+        let tangled_spindle_url = local_raw.tangled_spindle_url.or(global_raw.tangled_spindle_url);
+
         Ok(Self {
             project_dir,
             role,
@@ -411,6 +429,8 @@ impl Config {
             openrouter,
             opencode,
             opencode_as_tl,
+            tangled_knot_url,
+            tangled_spindle_url,
         })
     }
 
@@ -450,6 +470,8 @@ impl Default for Config {
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
             opencode_as_tl: false,
+            tangled_knot_url: None,
+            tangled_spindle_url: None,
         }
     }
 }

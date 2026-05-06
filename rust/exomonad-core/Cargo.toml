@@ -47,6 +47,7 @@ runtime = [
     "dep:agent-client-protocol-schema",
     "dep:tokio-util",
     "dep:futures",
+    "dep:tokio-tungstenite",
     "dep:claude-teams-bridge",
     "dep:opentelemetry",
     "dep:tracing-opentelemetry",
@@ -80,6 +81,7 @@ agent-client-protocol = { path = "../../vendor/acp-rust-sdk/src/agent-client-pro
 agent-client-protocol-schema = { version = "=0.10.8", optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 futures = { version = "0.3.31", optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 
 # Runtime feature: core framework
 extism = { version = "1.13", optional = true }

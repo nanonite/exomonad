@@ -94,6 +94,14 @@ pub trait HasOpencodeAcpRegistry: Send + Sync {
     fn opencode_acp_registry(&self) -> &OpencodeAcpRegistry;
 }
 
+/// Spawns a reviewer agent for a local PR. Implemented by `AgentControlService`.
+///
+/// Decouples `WorktreeEventWatcher` from the concrete `AgentControlService` type.
+#[async_trait::async_trait]
+pub trait ReviewerSpawner: Send + Sync {
+    async fn spawn_reviewer_for_pr(&self, pr: &file_pr_local::PrEntry) -> anyhow::Result<()>;
+}
+
 // ============================================================================
 // Services — the concrete type that implements all traits
 // ============================================================================

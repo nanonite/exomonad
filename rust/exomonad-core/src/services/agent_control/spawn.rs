@@ -1156,6 +1156,28 @@ impl<
     }
 }
 
+#[async_trait::async_trait]
+impl<
+        C: crate::services::HasGitHubClient
+            + crate::services::HasAcpRegistry
+            + crate::services::HasOpencodeAcpRegistry
+            + crate::services::HasTeamRegistry
+            + crate::services::HasAgentResolver
+            + crate::services::HasProjectDir
+            + crate::services::HasGitWorktreeService
+            + 'static,
+    > crate::services::ReviewerSpawner for AgentControlService<C>
+{
+    async fn spawn_reviewer_for_pr(
+        &self,
+        pr: &crate::services::file_pr_local::PrEntry,
+    ) -> anyhow::Result<()> {
+        let caller_bb = BirthBranch::from(pr.base_branch.as_str());
+        self.spawn_reviewer_subtree(pr, &caller_bb).await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
