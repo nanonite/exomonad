@@ -96,6 +96,35 @@ impl GitWorktreeService {
         }
 
         info!(path = %path.display(), branch = %branch, "Worktree created successfully");
+
+        // Set per-agent git identity so commits are attributed to the agent.
+        // The last dot-segment of the birth-branch is the canonical agent name.
+        let agent_name = branch
+            .as_str()
+            .rsplit('.')
+            .next()
+            .unwrap_or(branch.as_str());
+        let git_user_name = format!("exomonad-{}", agent_name);
+        let git_user_email = format!("{}@exomonad.local", agent_name);
+
+        for (key, value) in [("user.name", git_user_name.as_str()), ("user.email", git_user_email.as_str())] {
+            let out = std::process::Command::new("git")
+                .args(["config", "--local", key, value])
+                .current_dir(path)
+                .output()
+                .map_err(|e| WorktreeError::GitError {
+                    message: format!("Failed to set git config {}: {}", key, e),
+                })?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                error!(key, stderr = %stderr, "git config --local failed");
+                return Err(WorktreeError::GitError {
+                    message: format!("git config --local {} failed: {}", key, stderr),
+                });
+            }
+        }
+        info!(user_name = %git_user_name, user_email = %git_user_email, "Set worktree git identity");
+
         Ok(())
     }
 
