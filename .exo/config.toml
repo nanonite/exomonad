@@ -5,6 +5,10 @@ port = 7433
 yolo = true
 otlp_endpoint = "http://localhost:4317"
 
+# Tangled local dev: knot at localhost:5555, spindle at localhost:6555
+tangled_knot_url = "ws://localhost:5555"
+tangled_spindle_url = "ws://localhost:6555"
+
 [extra_mcp_servers.notebooklm]
 type = "stdio"
 command = "vendor/notebooklm-mcp/result/bin/notebooklm-mcp"

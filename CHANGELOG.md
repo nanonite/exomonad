@@ -79,6 +79,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Move tangled-knot dev scripts into tests/e2e/tangled-ci (#108)
 - Refactor e2e hook-rewrite: replace Gemini root with OpenCode (#53)
 - research: chainlink mcp server support (#30)
 - Test: chainlink_worker_status returns correct aggregated JSON (#71)

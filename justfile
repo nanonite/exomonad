@@ -188,6 +188,10 @@ e2e-opencode-worker:
 e2e-chainlink:
     ./tests/e2e/chainlink/run.sh
 
+# Run Tangled CI integration test (requires local knot+spindle: docker compose up in tangled-knot/)
+e2e-tangled-ci:
+    ./tests/e2e/tangled-ci/setup.sh && ./tests/e2e/tangled-ci/start-spindle.sh
+
 # Run live E2E Teams messaging test (requires active CC team "teams-e2e")
 live-teams-e2e:
     nix develop --command cargo test -p claude-teams-bridge --test integration -- live_teams_e2e --ignored --nocapture
