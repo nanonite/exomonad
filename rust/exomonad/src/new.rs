@@ -28,6 +28,8 @@ pub async fn run(_name: Option<String>) -> Result<()> {
 # tangled_knot_url = \"ws://localhost:5555\"
 # tangled_spindle_url = \"ws://localhost:6555\"
 # tangled_owner_did = \"did:plc:yourDID\"
+# tangled_knot_container = \"tangled-knot-knot-1\"
+# tangled_spindle_db = \"/absolute/path/to/spindle.db\"
 ",
     )?;
 

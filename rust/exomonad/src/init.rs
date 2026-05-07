@@ -349,6 +349,9 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
         .await;
     }
 
+    // Register repo with local Tangled knot (idempotent — no-op if already registered)
+    register_tangled_repo(&cwd, &config).await;
+
     // Validate tmux is available
     let tmux_check = std::process::Command::new("tmux").arg("-V").output();
     match tmux_check {
@@ -1103,6 +1106,175 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
     // 6. Attach
     info!(session = %session, "Attaching to session");
     TmuxIpc::attach_session(&session).await
+}
+
+/// Register the current workspace repo with the local Tangled knot and spindle.
+///
+/// Requires `tangled_knot_container`, `tangled_owner_did`, and `tangled_spindle_db` in config.
+/// Derives the repo name from the `origin` git remote URL (last path segment, `.git` stripped),
+/// falling back to the project directory name.
+///
+/// All steps are idempotent — safe to call on every `exomonad init`. Failures are warnings, not
+/// errors: a missing Docker container or unreachable spindle DB must not prevent the session from
+/// starting.
+async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
+    let (container, owner_did, spindle_db) = match (
+        config.tangled_knot_container.as_deref(),
+        config.tangled_owner_did.as_deref(),
+        config.tangled_spindle_db.as_deref(),
+    ) {
+        (Some(c), Some(d), Some(s)) => (c, d, s),
+        _ => {
+            debug!("Tangled registration skipped: tangled_knot_container / tangled_owner_did / tangled_spindle_db not set");
+            return;
+        }
+    };
+
+    let knot_hostname = config
+        .tangled_knot_url
+        .as_deref()
+        .unwrap_or("localhost:5555")
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .to_string();
+
+    // Derive repo name from git remote origin URL, fall back to directory name.
+    let repo_name = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .and_then(|url| {
+            url.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .map(|s| s.trim_end_matches(".git").to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            cwd.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "repo".to_string());
+
+    info!(
+        container,
+        owner_did,
+        repo_name,
+        "Registering repo with local Tangled knot"
+    );
+
+    // Step 1: create bare repo in knot container.
+    let create_cmd = format!(
+        "mkdir -p /home/git/repositories/owner/{name}.git && \
+         git init --bare /home/git/repositories/owner/{name}.git 2>/dev/null || true && \
+         chown -R git:git /home/git/repositories/owner/{name}.git",
+        name = repo_name
+    );
+    let out = std::process::Command::new("docker")
+        .args(["exec", container, "sh", "-c", &create_cmd])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            info!(repo_name, "Knot: bare repo created/confirmed");
+        }
+        Ok(o) => {
+            warn!(
+                repo_name,
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Knot: docker exec for bare repo returned non-zero (may already exist)"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "Knot: docker exec failed — is Docker running?");
+            return;
+        }
+    }
+
+    // Step 2: create DID-based symlink for HTTP clone routing.
+    let symlink_cmd = format!(
+        "mkdir -p '/home/git/repositories/{did}' && \
+         ln -sfn '../owner/{name}.git' '/home/git/repositories/{did}/{name}'",
+        did = owner_did,
+        name = repo_name
+    );
+    let out = std::process::Command::new("docker")
+        .args(["exec", container, "sh", "-c", &symlink_cmd])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            info!(owner_did, repo_name, "Knot: DID symlink created/confirmed");
+        }
+        Ok(o) => {
+            warn!(
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Knot: DID symlink docker exec returned non-zero"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "Knot: docker exec for DID symlink failed");
+        }
+    }
+
+    // Step 3: seed spindle.db repos table.
+    let sql = format!(
+        "INSERT OR IGNORE INTO repos (knot, owner, name) VALUES ('{knot}', '{did}', '{name}');",
+        knot = knot_hostname,
+        did = owner_did,
+        name = repo_name
+    );
+    let out = std::process::Command::new("sqlite3")
+        .args([spindle_db, &sql])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            info!(
+                spindle_db,
+                repo_name, "Spindle: repo entry seeded"
+            );
+        }
+        Ok(o) => {
+            warn!(
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Spindle: sqlite3 returned non-zero"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "Spindle: sqlite3 failed — is sqlite3 installed?");
+        }
+    }
+
+    // Step 4: set git remote 'tangled' (idempotent).
+    let ssh_url = format!(
+        "git@local-tangled:repositories/owner/{}.git",
+        repo_name
+    );
+    // Remove stale remote first (ignore errors), then add fresh.
+    let _ = std::process::Command::new("git")
+        .args(["remote", "remove", "tangled"])
+        .current_dir(cwd)
+        .output();
+    let out = std::process::Command::new("git")
+        .args(["remote", "add", "tangled", &ssh_url])
+        .current_dir(cwd)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            info!(url = %ssh_url, "Set git remote 'tangled'");
+        }
+        Ok(o) => {
+            warn!(
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Failed to set git remote 'tangled'"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "git remote add tangled failed");
+        }
+    }
 }
 
 pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {

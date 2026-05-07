@@ -182,6 +182,14 @@ pub struct RawConfig {
     /// DID of the repo owner on the Tangled knot (e.g. "did:plc:abc123").
     /// Required alongside tangled_knot_url for XRPC repo registration during init.
     pub tangled_owner_did: Option<String>,
+
+    /// Docker container name for the local Tangled knot (e.g. "tangled-knot-knot-1").
+    /// When set alongside tangled_owner_did, exomonad init registers the repo via docker exec.
+    pub tangled_knot_container: Option<String>,
+
+    /// Absolute path to the spindle SQLite database (e.g. "/home/user/project/spindle.db").
+    /// Used during init to INSERT the repo into the spindle's repos table.
+    pub tangled_spindle_db: Option<String>,
 }
 
 /// Final resolved configuration.
@@ -241,6 +249,12 @@ pub struct Config {
 
     /// DID of the repo owner on the Tangled knot (e.g. "did:plc:abc123").
     pub tangled_owner_did: Option<String>,
+
+    /// Docker container name for the local Tangled knot (e.g. "tangled-knot-knot-1").
+    pub tangled_knot_container: Option<String>,
+
+    /// Absolute path to the spindle SQLite database.
+    pub tangled_spindle_db: Option<String>,
 }
 
 impl Config {
@@ -414,6 +428,8 @@ impl Config {
         let tangled_knot_url = local_raw.tangled_knot_url.or(global_raw.tangled_knot_url);
         let tangled_spindle_url = local_raw.tangled_spindle_url.or(global_raw.tangled_spindle_url);
         let tangled_owner_did = local_raw.tangled_owner_did.or(global_raw.tangled_owner_did);
+        let tangled_knot_container = local_raw.tangled_knot_container.or(global_raw.tangled_knot_container);
+        let tangled_spindle_db = local_raw.tangled_spindle_db.or(global_raw.tangled_spindle_db);
 
         Ok(Self {
             project_dir,
@@ -440,6 +456,8 @@ impl Config {
             tangled_knot_url,
             tangled_spindle_url,
             tangled_owner_did,
+            tangled_knot_container,
+            tangled_spindle_db,
         })
     }
 
@@ -482,6 +500,8 @@ impl Default for Config {
             tangled_knot_url: None,
             tangled_spindle_url: None,
             tangled_owner_did: None,
+            tangled_knot_container: None,
+            tangled_spindle_db: None,
         }
     }
 }
