@@ -18,7 +18,16 @@ pub async fn run(_name: Option<String>) -> Result<()> {
     std::fs::write(
         &config_path,
         "# ExoMonad project config
-# All fields are optional — see docs for overrides
+# All fields are optional — see CLAUDE.md for full reference.
+
+# default_role = \"tl\"
+# tmux_session = \"my-project\"
+# model = \"sonnet\"
+
+# Tangled CI integration (fill in once per workspace, then run exomonad init)
+# tangled_knot_url = \"ws://localhost:5555\"
+# tangled_spindle_url = \"ws://localhost:6555\"
+# tangled_owner_did = \"did:plc:yourDID\"
 ",
     )?;
 

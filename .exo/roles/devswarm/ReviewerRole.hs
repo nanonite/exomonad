@@ -14,7 +14,7 @@ import ExoMonad.Guest.Tools.Events
   ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs
   )
 import ExoMonad.Guest.Types (allowResponse, allowStopResponse, BeforeModelOutput (..), AfterModelOutput (..))
-import ExoMonad.Types (HookConfig (..), defaultSessionStartHook, EventHandlerConfig (..), EventAction (..))
+import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
 import ExoMonad.Guest.Events
   ( PRReviewEvent (..), CIStatusEvent (..), SiblingMergedEvent (..),
     EventHandlerConfig (..), EventAction (..), defaultEventHandlers

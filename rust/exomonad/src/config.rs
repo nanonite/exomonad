@@ -178,6 +178,10 @@ pub struct RawConfig {
     /// WebSocket URL of the local Tangled spindle (e.g. "ws://localhost:8080").
     /// When set, exomonad subscribes to the spindle's /events for CI status updates.
     pub tangled_spindle_url: Option<String>,
+
+    /// DID of the repo owner on the Tangled knot (e.g. "did:plc:abc123").
+    /// Required alongside tangled_knot_url for XRPC repo registration during init.
+    pub tangled_owner_did: Option<String>,
 }
 
 /// Final resolved configuration.
@@ -234,6 +238,9 @@ pub struct Config {
 
     /// WebSocket URL of the local Tangled spindle (e.g. "ws://localhost:8080").
     pub tangled_spindle_url: Option<String>,
+
+    /// DID of the repo owner on the Tangled knot (e.g. "did:plc:abc123").
+    pub tangled_owner_did: Option<String>,
 }
 
 impl Config {
@@ -403,9 +410,10 @@ impl Config {
         // Resolve opencode_as_tl: local > global > false
         let opencode_as_tl = local_raw.opencode_as_tl.or(global_raw.opencode_as_tl).unwrap_or(false);
 
-        // Resolve tangled URLs: local > global
+        // Resolve tangled config: local > global
         let tangled_knot_url = local_raw.tangled_knot_url.or(global_raw.tangled_knot_url);
         let tangled_spindle_url = local_raw.tangled_spindle_url.or(global_raw.tangled_spindle_url);
+        let tangled_owner_did = local_raw.tangled_owner_did.or(global_raw.tangled_owner_did);
 
         Ok(Self {
             project_dir,
@@ -431,6 +439,7 @@ impl Config {
             opencode_as_tl,
             tangled_knot_url,
             tangled_spindle_url,
+            tangled_owner_did,
         })
     }
 
@@ -472,6 +481,7 @@ impl Default for Config {
             opencode_as_tl: false,
             tangled_knot_url: None,
             tangled_spindle_url: None,
+            tangled_owner_did: None,
         }
     }
 }
