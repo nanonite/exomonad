@@ -319,7 +319,7 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
                     "command": ["exomonad", "mcp-stdio", "--role", "root", "--name", "root"]
                 }
             },
-            "instructions": exomonad_core::services::agent_control::OPENCODE_TL_INSTRUCTIONS,
+            "instructions": [exomonad_core::services::agent_control::OPENCODE_TL_INSTRUCTIONS],
         });
         let opencode_dir = cwd.join(".exo/agents/root");
         std::fs::create_dir_all(&opencode_dir)?;

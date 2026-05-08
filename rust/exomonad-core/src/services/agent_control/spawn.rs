@@ -32,15 +32,41 @@ notifications arrive. Merge results.
 - [from: id] — informational. Read, do not merge.
 
 ## Worker Verification
-Workers are headless ACP processes, not tmux windows.
-After fork_wave: run `ls .exo/agents/` — you should see a new directory per worker.
-Do NOT check tmux list-windows for OpenCode workers.
+After fork_wave, workers open as tmux windows (same as Claude workers).
+Run `tmux list-windows -a` to confirm the worker window exists.
 
 ## Key Rules
 - Never implement directly. Decompose and delegate everything.
 - Never checkout another branch or touch another agent's worktree.
 - After spawning, STOP. Wait for notifications.
 - Git/GitHub operations use bash (git, gh CLI), NOT MCP tools.
+";
+
+pub const OPENCODE_DEV_INSTRUCTIONS: &str = "\
+# ExoMonad Dev Agent Protocol
+
+You are a dev agent in an ExoMonad agent tree. You work in your own git worktree on your own branch.
+
+## Your Job
+Implement the spec in your task. File a PR when done. Call notify_parent to report completion or failure.
+
+## MCP Tools Available
+- file_pr: Create/update a PR for your branch. Call this when your implementation is ready.
+- notify_parent: Send a message to your parent TL. Use status 'success' when done, 'failure' if stuck.
+- send_message: Send a message to another agent.
+
+## Workflow
+1. Read the spec carefully. Re-read any files mentioned before editing.
+2. Implement the changes on your branch.
+3. Build and verify (exact commands in your spec).
+4. Call file_pr to create the PR.
+5. Call notify_parent with status='success' and a summary of what you did.
+
+## Key Rules
+- Work only in your worktree. Never checkout another branch.
+- Never call fork_wave or spawn_leaf — you are a leaf, not a TL.
+- Git/GitHub operations use bash (git, gh CLI), NOT MCP tools.
+- If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
 ";
 
 impl<
@@ -499,9 +525,15 @@ impl<
             mcp_servers.insert(k.clone(), v.clone());
         }
 
+        // instructions must be an array per OpenCode's schema.
+        // Only inject TL instructions for root/tl roles; dev/worker roles get no override.
+        let instructions = match role {
+            "root" | "tl" => serde_json::json!([OPENCODE_TL_INSTRUCTIONS]),
+            _ => serde_json::json!([OPENCODE_DEV_INSTRUCTIONS]),
+        };
         serde_json::json!({
             "mcp": mcp_servers,
-            "instructions": OPENCODE_TL_INSTRUCTIONS,
+            "instructions": instructions,
         })
     }
 
