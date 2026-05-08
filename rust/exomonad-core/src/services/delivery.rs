@@ -580,7 +580,7 @@ pub async fn deliver_to_agent(
 
     // Check for OpenCode ACP connection first (HTTP delivery)
     if let Some(conn) = opencode_acp_registry.get(agent_key).await {
-        match super::opencode_acp::send_prompt(&conn.base_url, message).await {
+        match super::opencode_acp::send_prompt(&conn.base_url, &conn.session_id, message).await {
             Ok(()) => {
                 tracing::Span::current().record("delivery_method", "opencode_acp");
                 info!(agent = %agent_key, url = %conn.base_url, "Delivered message via OpenCode ACP");
