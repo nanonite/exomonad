@@ -93,6 +93,10 @@ pub trait HasGitWorktreeService: Send + Sync {
 pub trait HasOpencodeAcpRegistry: Send + Sync {
     fn opencode_acp_registry(&self) -> &OpencodeAcpRegistry;
 }
+pub trait HasCiStatusMap: Send + Sync {
+    fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>>>;
+    fn spindle_url(&self) -> Option<&str>;
+}
 
 /// Spawns a reviewer agent for a local PR. Implemented by `AgentControlService`.
 ///
@@ -127,6 +131,12 @@ pub struct Services {
     /// Model for spawned OpenCode workers (passed to `opencode serve --model` and `opencode run --model`).
     /// `None` means let opencode pick.
     pub opencode_worker_model: Option<String>,
+    /// Shared CI status map updated by the spindle WebSocket subscriber.
+    /// Keyed by branch name; `None` values mean no status received yet.
+    /// Shared with `WorktreeEventWatcher` so both the watcher and merge gate read from the same map.
+    pub ci_status_map: Arc<tokio::sync::RwLock<std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>>>,
+    /// Tangled spindle URL (`ws://...`). Present when spindle CI is configured.
+    pub spindle_url: Option<String>,
 }
 
 impl Services {
@@ -196,6 +206,14 @@ impl HasOpencodeAcpRegistry for Services {
         &self.opencode_acp_registry
     }
 }
+impl HasCiStatusMap for Services {
+    fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>>> {
+        &self.ci_status_map
+    }
+    fn spindle_url(&self) -> Option<&str> {
+        self.spindle_url.as_deref()
+    }
+}
 
 #[cfg(test)]
 impl Services {
@@ -215,6 +233,8 @@ impl Services {
             mutex_registry: Arc::new(MutexRegistry::new()),
             git_wt: Arc::new(GitWorktreeService::new(PathBuf::from("."))),
             opencode_worker_model: None,
+            ci_status_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            spindle_url: None,
         }
     }
 }

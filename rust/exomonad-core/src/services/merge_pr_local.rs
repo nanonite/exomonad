@@ -1,17 +1,19 @@
 // Local PR merge — replaces GitHub merge API with git merge + registry update.
 //
 // Reads PR from .exo/prs.json, applies review policy gates, performs
-// local git merge into the parent (base) branch, pushes to origin,
-// and updates the registry state to Merged.
+// local git merge into the parent (base) branch, pushes to the tangled
+// remote (or origin as fallback), and updates the registry state to Merged.
 
 use crate::domain::{AgentName, BranchName, CIStatus, MergeStrategy, PRNumber};
-use crate::services::file_pr_local::{read_pr_registry, write_pr_registry, PrState};
+use crate::services::file_pr_local::{read_pr_registry, resolve_push_remote, write_pr_registry, PrState};
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::merge_pr::MergePROutput;
 pub use crate::services::review_policy::ReviewPolicy;
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 // ============================================================================
@@ -187,6 +189,8 @@ async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
 ///
 /// `project_dir` is the root of the exomonad project (where `.exo/` lives).
 /// `merger_agent` is the agent requesting the merge (enforces identity separation).
+/// `spindle_url` and `ci_status_map` wire the CI gate: when spindle is configured the branch
+/// must have a `Success` or `Neutral` CI status or the merge is blocked.
 pub async fn merge_pr_local(
     pr_number: PRNumber,
     strategy: &MergeStrategy,
@@ -194,6 +198,8 @@ pub async fn merge_pr_local(
     git_wt: Arc<GitWorktreeService>,
     merger_agent: &AgentName,
     policy: &ReviewPolicy,
+    spindle_url: Option<&str>,
+    ci_status_map: &Arc<RwLock<HashMap<BranchName, CIStatus>>>,
 ) -> Result<MergePROutput> {
     let prs_path = project_dir.join(".exo/prs.json");
 
@@ -216,8 +222,18 @@ pub async fn merge_pr_local(
         "Merging local PR"
     );
 
+    // Resolve CI status for Gate 7: when spindle is configured, missing status blocks the merge.
+    let ci_status = if spindle_url.is_some() {
+        let branch = BranchName::from(head_branch.as_str());
+        let status = ci_status_map.read().await.get(&branch).copied().unwrap_or(CIStatus::Unknown);
+        info!(branch = %head_branch, status = ?status, "CI gate check (spindle configured)");
+        Some(status)
+    } else {
+        None
+    };
+
     // Gate checks (fail early)
-    if let Err(e) = check_merge_gates(&pr, merger_agent, policy, None, None) {
+    if let Err(e) = check_merge_gates(&pr, merger_agent, policy, None, ci_status) {
         warn!("Merge gate failed: {}", e);
         return Ok(MergePROutput {
             success: false,
@@ -255,11 +271,13 @@ pub async fn merge_pr_local(
         }
     }
 
-    // Step 4: Push base branch to origin (local knot)
+    // Step 4: Push base branch to tangled remote if configured, otherwise origin.
     let base = BranchName::from(base_branch.as_str());
     let dir = PathBuf::from(project_dir);
+    let remote = resolve_push_remote(&dir).to_string();
+    info!(remote = %remote, base = %base_branch, "Pushing merged base branch");
     let wt = git_wt.clone();
-    tokio::task::spawn_blocking(move || wt.push_bookmark(&dir, &base))
+    tokio::task::spawn_blocking(move || wt.push_to_remote(&dir, &base, &remote))
         .await
         .context("spawn_blocking failed")?
         .context("push base branch")?;
@@ -697,6 +715,132 @@ mod tests {
         assert!(e.to_string().contains("self-merge"));
     }
 
+    // ── Gate 7: CI status ──────────────────────────────────────
+
+    fn approved_pr_with_rounds() -> PrEntry {
+        let mut pr = test_entry(1, "main.feat-gemini", "main");
+        pr.review_state = LocalReviewState::Approved;
+        pr.rounds = 1;
+        pr
+    }
+
+    #[test]
+    fn test_ci_gate_passes_when_spindle_not_configured() {
+        let pr = approved_pr_with_rounds();
+        // None ci_status = no spindle, gate skipped
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ci_gate_passes_on_success() {
+        let pr = approved_pr_with_rounds();
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Success));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ci_gate_passes_on_neutral() {
+        let pr = approved_pr_with_rounds();
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Neutral));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ci_gate_blocks_on_failure() {
+        let pr = approved_pr_with_rounds();
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Failure));
+        assert!(matches!(result, Err(MergeGateError::CiNotPassed { .. })));
+    }
+
+    #[test]
+    fn test_ci_gate_blocks_on_pending() {
+        let pr = approved_pr_with_rounds();
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Pending));
+        assert!(matches!(result, Err(MergeGateError::CiNotPassed { .. })));
+    }
+
+    #[test]
+    fn test_ci_gate_blocks_on_unknown_when_spindle_configured() {
+        let pr = approved_pr_with_rounds();
+        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Unknown));
+        assert!(matches!(result, Err(MergeGateError::CiNotPassed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_local_ci_gate_blocks_when_spindle_configured_no_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a prs.json with an approved PR
+        let prs_path = tmp.path().join(".exo/prs.json");
+        std::fs::create_dir_all(tmp.path().join(".exo")).unwrap();
+        let mut registry = crate::services::file_pr_local::PrRegistry::default();
+        let mut pr = test_entry(1, "main.feat-gemini", "main");
+        pr.review_state = LocalReviewState::Approved;
+        pr.rounds = 1;
+        registry.prs.insert(1, pr);
+        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry).await.unwrap();
+
+        let git_wt = Arc::new(GitWorktreeService::new(tmp.path().to_path_buf()));
+        let ci_map: Arc<RwLock<HashMap<BranchName, CIStatus>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let result = merge_pr_local(
+            PRNumber::new(1),
+            &MergeStrategy::Squash,
+            tmp.path(),
+            git_wt,
+            &reviewer_agent(),
+            &standard_policy(),
+            Some("ws://localhost:6555"),
+            &ci_map,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.success, "CI gate should block merge when spindle is configured but no status");
+        assert!(result.message.contains("CI"), "Error message should mention CI: {}", result.message);
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_local_ci_gate_passes_with_success_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prs_path = tmp.path().join(".exo/prs.json");
+        std::fs::create_dir_all(tmp.path().join(".exo")).unwrap();
+        let mut registry = crate::services::file_pr_local::PrRegistry::default();
+        let mut pr = test_entry(1, "main.feat-gemini", "main");
+        pr.review_state = LocalReviewState::Approved;
+        pr.rounds = 1;
+        registry.prs.insert(1, pr);
+        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry).await.unwrap();
+
+        let git_wt = Arc::new(GitWorktreeService::new(tmp.path().to_path_buf()));
+        let mut map = HashMap::new();
+        map.insert(BranchName::from("main.feat-gemini"), CIStatus::Success);
+        let ci_map = Arc::new(RwLock::new(map));
+
+        // merge will fail at the git step (no real repo), but gate 7 must pass
+        let result = merge_pr_local(
+            PRNumber::new(1),
+            &MergeStrategy::Squash,
+            tmp.path(),
+            git_wt,
+            &reviewer_agent(),
+            &standard_policy(),
+            Some("ws://localhost:6555"),
+            &ci_map,
+        )
+        .await;
+
+        // Error is expected (git checkout fails), but NOT a gate failure
+        match result {
+            Ok(output) => assert!(
+                output.success || !output.message.contains("CI"),
+                "Unexpected CI gate failure: {}",
+                output.message
+            ),
+            Err(_) => {} // git ops fail without a real repo — that's expected
+        }
+    }
+
     // ── Registry integration test (no git) ─────────────────────
 
     #[tokio::test]
@@ -705,6 +849,7 @@ mod tests {
         let git_wt = Arc::new(GitWorktreeService::new(tmp.path().to_path_buf()));
         let pr_number = PRNumber::new(999);
 
+        let ci_map = Arc::new(RwLock::new(HashMap::new()));
         let result = merge_pr_local(
             pr_number,
             &MergeStrategy::Squash,
@@ -712,6 +857,8 @@ mod tests {
             git_wt,
             &reviewer_agent(),
             &standard_policy(),
+            None,
+            &ci_map,
         )
         .await;
 

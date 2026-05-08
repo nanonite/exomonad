@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- C.3: Verify ci.yml schema and iterate pipeline to green (#104)
+- exomonad init: auto-register repo with tangled knot when tangled_knot_url is configured (#110)
 - Set per-agent git identity (birth-branch) in worktree at spawn time (#109)
 - Add global tangled host config template; exomonad new reads it into workspace config (#111)
 - C.6: Update CLAUDE.md and rules for Tangled CI (#107)
@@ -81,6 +83,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- exomonad init: auto-start spindle as companion using binary copy pattern (#117)
+- exomonad new: write default .exo/review-policy.toml (#116)
+- Auto-spawn reviewer agent on PR creation in worktree_event_watcher (#113)
+- Add CI merge gate (gate 7) to merge_pr_local.rs (#114)
+- Verify file_pr pushes to tangled remote not origin (#115)
+- exomonad init: register repo with knot via docker exec + set tangled remote (#112)
 - Move tangled-knot dev scripts into tests/e2e/tangled-ci (#108)
 - Refactor e2e hook-rewrite: replace Gemini root with OpenCode (#53)
 - research: chainlink mcp server support (#30)

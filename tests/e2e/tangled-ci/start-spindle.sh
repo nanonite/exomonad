@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Starts the local spindle binary, subscribed to the knot at localhost:5555.
-# Run setup-dev.sh first to seed the DBs and inject a pipeline event.
+# Start this in a separate terminal before running: just e2e-tangled-ci
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SPINDLE="$PROJECT_ROOT/tangled-core/cmd/spindle/spindle"
 
 if [[ ! -x "$SPINDLE" ]]; then

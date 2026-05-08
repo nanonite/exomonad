@@ -39,6 +39,27 @@ pub async fn run(_name: Option<String>) -> Result<()> {
         info!("Created .exo/prs.json (empty PR registry)");
     }
 
+    let policy_path = cwd.join(".exo/review-policy.toml");
+    if !policy_path.exists() {
+        std::fs::write(
+            &policy_path,
+            "# Review policy for the worktree event watcher and merge gate.
+# All fields are optional — defaults shown below.
+
+min_review_rounds = 1
+reviewer_max_rounds = 2
+reviewer_max_wait_seconds = 1200
+review_freshness_window_secs = 1200
+external_review_threshold = 300
+external_review_paths = [\"proto/**\", \"rust/exomonad-core/src/handlers/**\"]
+reviewer_max_rate_limit_retries = 2
+require_second_reviewer_complexity = false
+complexity_line_threshold = 500
+",
+        )?;
+        info!("Created .exo/review-policy.toml (default review policy)");
+    }
+
     // Add gitignore entries
     crate::init::ensure_gitignore(&cwd)?;
 

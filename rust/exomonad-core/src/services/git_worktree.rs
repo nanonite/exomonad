@@ -192,6 +192,35 @@ impl GitWorktreeService {
         Ok(())
     }
 
+    /// Push a branch to a named remote.
+    ///
+    /// Equivalent to: `git push {remote} {branch}` (run in workspace_path)
+    pub fn push_to_remote(
+        &self,
+        workspace_path: &Path,
+        branch: &BranchName,
+        remote: &str,
+    ) -> Result<(), WorktreeError> {
+        info!(branch = %branch, remote = %remote, path = %workspace_path.display(), "Pushing branch to remote");
+
+        let output = std::process::Command::new("git")
+            .args(["push", remote, branch.as_str()])
+            .current_dir(workspace_path)
+            .output()
+            .map_err(|e| WorktreeError::GitError {
+                message: format!("Failed to run git push: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(stderr = %stderr, "git push failed");
+            return Err(self.parse_git_stderr(&stderr));
+        }
+
+        info!(branch = %branch, remote = %remote, "Branch pushed successfully");
+        Ok(())
+    }
+
     /// Fetch from remote.
     ///
     /// Equivalent to: `git fetch` (run in workspace_path)
@@ -498,6 +527,63 @@ mod tests {
         let result = service.push_bookmark(temp.path(), &branch);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_push_to_remote_without_remote() {
+        let (temp, service) = init_test_repo();
+        let branch = BranchName::from("test-branch");
+        service.create_bookmark(temp.path(), &branch, None).unwrap();
+
+        let result = service.push_to_remote(temp.path(), &branch, "origin");
+        assert!(result.is_err());
+
+        let result = service.push_to_remote(temp.path(), &branch, "tangled");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_push_to_remote_with_remote() {
+        let bare = TempDir::new().expect("failed to create bare dir");
+        let work = TempDir::new().expect("failed to create work dir");
+        let work_dir = work.path();
+
+        // Create a bare "remote"
+        let run_bare = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(bare.path())
+                .status()
+                .expect("git failed")
+        };
+        run_bare(&["init", "--bare"]);
+
+        // Create working repo with tangled remote pointing at the bare repo
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(work_dir)
+                .status()
+                .expect("git failed");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        run(&["commit", "--allow-empty", "-m", "Initial commit"]);
+        run(&[
+            "remote",
+            "add",
+            "tangled",
+            bare.path().to_str().unwrap(),
+        ]);
+
+        let service = GitWorktreeService::new(work_dir.to_path_buf());
+        let default_branch = get_default_branch(work_dir);
+        let branch = BranchName::from(default_branch.as_str());
+
+        let result = service.push_to_remote(work_dir, &branch, "tangled");
+        assert!(result.is_ok(), "push_to_remote failed: {:?}", result);
     }
 
     /// End-to-end: simulates the file_pr resolution chain.

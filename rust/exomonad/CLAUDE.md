@@ -48,6 +48,8 @@ exomonad shutdown                 # Gracefully shut down the running server
 
 Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is newer (consuming projects only, not source projects with `.exo/roles/`).
 
+**Tangled auto-companion:** When `tangled_owner_did` is set in config, `exomonad init` automatically copies `~/.exo/bin/spindle` → `.exo/bin/spindle` (same pattern as WASM) and spawns spindle as a process companion. The spindle window subscribes to the knot's event stream (`tangled_knot_url/events`) and uses `tangled_spindle_db` as its database path. Declare a companion named `"spindle"` manually to override this behavior. Build spindle: `cd tangled-core && go build -o ~/.exo/bin/spindle ./cmd/spindle`.
+
 Claude MCP is auto-registered during init. For Gemini, register manually (`gemini mcp add ...`).
 
 Use `--recreate` to delete an existing session and create fresh (e.g., after binary updates).

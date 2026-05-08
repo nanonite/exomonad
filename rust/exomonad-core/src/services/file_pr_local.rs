@@ -17,6 +17,25 @@ use super::file_pr::{FilePRInput, FilePROutput};
 use super::tmux_events;
 
 // ============================================================================
+// Push Remote Resolution
+// ============================================================================
+
+/// Resolve which git remote to push to.
+///
+/// Checks whether a `tangled` remote is configured in the workspace.
+/// If present, returns `"tangled"` so CI runs on the local knot.
+/// Falls back to `"origin"` when no tangled remote is configured.
+pub(crate) fn resolve_push_remote(workspace_path: &std::path::Path) -> &'static str {
+    let ok = std::process::Command::new("git")
+        .args(["remote", "get-url", "tangled"])
+        .current_dir(workspace_path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok { "tangled" } else { "origin" }
+}
+
+// ============================================================================
 // Registry Types
 // ============================================================================
 
@@ -111,7 +130,7 @@ impl PrRegistry {
 // Registry I/O
 // ============================================================================
 
-pub(crate) async fn read_pr_registry(prs_path: &std::path::Path) -> Result<PrRegistry> {
+pub async fn read_pr_registry(prs_path: &std::path::Path) -> Result<PrRegistry> {
     if !prs_path.exists() {
         return Ok(PrRegistry::default());
     }
@@ -189,16 +208,21 @@ pub async fn file_pr_local(
 
     info!("[FilePRLocal] head={} base={} dir={}", head, base, dir);
 
-    // Push first (local git — same as before)
+    // Push to tangled remote if configured, otherwise origin.
     {
         let dir_path = std::path::PathBuf::from(dir);
+        let remote = resolve_push_remote(&dir_path);
+        info!("[FilePRLocal] Push remote: {}", remote);
         let bookmark = head.clone();
         let git_wt_clone = git_wt.clone();
-        tokio::task::spawn_blocking(move || git_wt_clone.push_bookmark(&dir_path, &bookmark))
-            .await
-            .context("spawn_blocking failed")?
-            .context("push failed")?;
-        info!("[FilePRLocal] Pushed bookmark: {}", head);
+        let remote_str = remote.to_string();
+        tokio::task::spawn_blocking(move || {
+            git_wt_clone.push_to_remote(&dir_path, &bookmark, &remote_str)
+        })
+        .await
+        .context("spawn_blocking failed")?
+        .context("push failed")?;
+        info!("[FilePRLocal] Pushed bookmark {} to {}", head, remote);
     }
 
     let prs_path = project_dir.join(".exo/prs.json");
@@ -299,6 +323,8 @@ pub async fn file_pr_local(
 mod tests {
     use super::*;
     use crate::domain::BranchName;
+    use std::process::Command;
+    use tempfile::TempDir;
 
     fn test_agent() -> AgentName {
         AgentName::from("test-agent-gemini")
@@ -306,6 +332,46 @@ mod tests {
 
     fn test_role() -> Role {
         Role::dev()
+    }
+
+    fn init_git_repo() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .status()
+                .expect("git failed");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        run(&["commit", "--allow-empty", "-m", "Initial commit"]);
+        tmp
+    }
+
+    #[test]
+    fn test_resolve_push_remote_no_tangled_returns_origin() {
+        let tmp = init_git_repo();
+        assert_eq!(resolve_push_remote(tmp.path()), "origin");
+    }
+
+    #[test]
+    fn test_resolve_push_remote_tangled_configured_returns_tangled() {
+        let tmp = init_git_repo();
+        Command::new("git")
+            .args(["remote", "add", "tangled", "git@local-tangled:repositories/owner/test.git"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert_eq!(resolve_push_remote(tmp.path()), "tangled");
+    }
+
+    #[test]
+    fn test_resolve_push_remote_non_git_dir_returns_origin() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(resolve_push_remote(tmp.path()), "origin");
     }
 
     #[test]

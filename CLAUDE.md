@@ -210,7 +210,11 @@ wasm_dir = ".exo/wasm"       # project-local (default), override for shared inst
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
 model = "sonnet"             # optional — passed as --model flag to root TL agent
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
-tangled_spindle_url = "ws://localhost:8080"  # optional — spindle WebSocket for CI status events
+tangled_spindle_url = "ws://localhost:6555"  # optional — spindle WebSocket for CI status events
+tangled_knot_url = "http://localhost:5555"   # optional — knot HTTP URL (used to derive spindle jetstream endpoint)
+tangled_owner_did = "did:plc:yourkey"        # optional — when set, exomonad init auto-starts spindle as a process companion
+tangled_spindle_db = "spindle.db"            # optional — spindle SQLite path (default: spindle.db in project root)
+tangled_knot_container = "tangled-knot-knot-1"  # optional — knot container name for docker-based repo registration
 
 # Extra MCP servers (HTTP or stdio). Included in .mcp.json for all agents.
 [extra_mcp_servers.metacog]

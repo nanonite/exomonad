@@ -221,6 +221,37 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
         }
     }
 
+    // Copy spindle binary from global install when Tangled is configured
+    if config.tangled_owner_did.is_some() {
+        let spindle_local = cwd.join(".exo/bin/spindle");
+        if !spindle_local.exists() {
+            if let Ok(home) = std::env::var("HOME") {
+                let spindle_global = PathBuf::from(home).join(".exo/bin/spindle");
+                if spindle_global.exists() {
+                    std::fs::create_dir_all(spindle_local.parent().unwrap())?;
+                    std::fs::copy(&spindle_global, &spindle_local)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mut perms = std::fs::metadata(&spindle_local)?.permissions();
+                        perms.set_mode(0o755);
+                        std::fs::set_permissions(&spindle_local, perms)?;
+                    }
+                    info!(
+                        src = %spindle_global.display(),
+                        dst = %spindle_local.display(),
+                        "Copied spindle binary from global install"
+                    );
+                } else {
+                    warn!(
+                        "Tangled configured but spindle not found at ~/.exo/bin/spindle. \
+                        Build it: cd tangled-core && go build -o ~/.exo/bin/spindle ./cmd/spindle"
+                    );
+                }
+            }
+        }
+    }
+
     // Write root agent birth branch so fork_wave resolves the correct parent prefix.
     // Without this, BirthBranch::root() falls back to `git branch --show-current` in the
     // server process CWD, which may differ from the TL's actual branch.
@@ -774,7 +805,23 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
     wait_for_server_socket(&cwd).await?;
 
     // 5. Spawn companion agents
-    for companion in &config.companions {
+    // Auto-inject spindle as a process companion when Tangled is configured, unless the user
+    // has already declared a companion named "spindle".
+    let spindle_path = cwd.join(".exo/bin/spindle");
+    let auto_spindle = build_spindle_companion(
+        config.tangled_owner_did.as_deref(),
+        config.tangled_knot_url.as_deref(),
+        config.tangled_spindle_db.as_deref(),
+        &spindle_path,
+        &config.companions,
+    );
+
+    let companions_to_spawn: Vec<&crate::config::CompanionConfig> = auto_spindle
+        .iter()
+        .chain(config.companions.iter())
+        .collect();
+
+    for companion in companions_to_spawn {
         // Validate companion name (alphanumeric, hyphens, underscores only)
         if !companion
             .name
@@ -1421,4 +1468,226 @@ fn gemini_hooks() -> serde_json::Value {
             }
         ]
     })
+}
+
+/// Builds the auto-injected spindle process companion when Tangled is configured.
+/// Returns None if:
+/// - `owner_did` is not set
+/// - a companion named "spindle" is already declared
+/// - the spindle binary does not exist at `spindle_path`
+fn build_spindle_companion(
+    owner_did: Option<&str>,
+    knot_url: Option<&str>,
+    spindle_db: Option<&str>,
+    spindle_path: &std::path::Path,
+    existing_companions: &[crate::config::CompanionConfig],
+) -> Option<crate::config::CompanionConfig> {
+    let owner_did = owner_did?;
+
+    if existing_companions.iter().any(|c| c.name == "spindle") {
+        return None;
+    }
+
+    if !spindle_path.exists() {
+        warn!(
+            "tangled_owner_did is set but .exo/bin/spindle not found — \
+            spindle will not be auto-started. \
+            Copy the binary to ~/.exo/bin/spindle and re-run exomonad init."
+        );
+        return None;
+    }
+
+    let db = spindle_db.unwrap_or("spindle.db");
+    let jetstream = knot_url
+        .map(|u| {
+            let ws = u
+                .replacen("http://", "ws://", 1)
+                .replacen("https://", "wss://", 1);
+            format!("{}/events", ws.trim_end_matches('/'))
+        })
+        .unwrap_or_else(|| "ws://localhost:5555/events".to_string());
+
+    let cmd = format!(
+        "SPINDLE_SERVER_HOSTNAME=localhost \
+         SPINDLE_SERVER_LISTEN_ADDR=0.0.0.0:6555 \
+         SPINDLE_SERVER_DB_PATH={db} \
+         SPINDLE_SERVER_OWNER={owner_did} \
+         SPINDLE_SERVER_DEV=true \
+         SPINDLE_SERVER_LOG_DIR=/tmp/spindle-logs \
+         SPINDLE_SERVER_JETSTREAM_ENDPOINT={jetstream} \
+         {spindle}",
+        spindle = spindle_path.display()
+    );
+
+    info!(
+        owner_did = %owner_did,
+        jetstream = %jetstream,
+        spindle_db = %db,
+        "Auto-injecting spindle process companion"
+    );
+
+    Some(crate::config::CompanionConfig {
+        name: "spindle".to_string(),
+        role: String::new(),
+        agent_type: Some(AgentType::Process),
+        command: cmd,
+        task: None,
+        model: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CompanionConfig;
+    use exomonad_core::services::AgentType;
+
+    fn spindle_companion(name: &str) -> CompanionConfig {
+        CompanionConfig {
+            name: name.to_string(),
+            role: String::new(),
+            agent_type: Some(AgentType::Process),
+            command: "spindle".to_string(),
+            task: None,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn no_owner_did_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("spindle");
+        std::fs::write(&bin, "").unwrap();
+        assert!(build_spindle_companion(None, None, None, &bin, &[]).is_none());
+    }
+
+    #[test]
+    fn missing_binary_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("spindle"); // does not exist
+        assert!(build_spindle_companion(
+            Some("did:plc:test"),
+            None,
+            None,
+            &bin,
+            &[]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn already_declared_spindle_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("spindle");
+        std::fs::write(&bin, "").unwrap();
+        let companions = vec![spindle_companion("spindle")];
+        assert!(build_spindle_companion(
+            Some("did:plc:test"),
+            None,
+            None,
+            &bin,
+            &companions
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn injects_spindle_companion_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("spindle");
+        std::fs::write(&bin, "").unwrap();
+
+        let companion = build_spindle_companion(
+            Some("did:plc:test"),
+            None,
+            None,
+            &bin,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(companion.name, "spindle");
+        assert_eq!(companion.agent_type, Some(AgentType::Process));
+        assert!(companion.command.contains("SPINDLE_SERVER_OWNER=did:plc:test"));
+        assert!(companion.command.contains("SPINDLE_SERVER_DB_PATH=spindle.db"));
+        assert!(companion
+            .command
+            .contains("SPINDLE_SERVER_JETSTREAM_ENDPOINT=ws://localhost:5555/events"));
+    }
+
+    #[test]
+    fn knot_url_converted_to_ws_jetstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("spindle");
+        std::fs::write(&bin, "").unwrap();
+
+        let companion = build_spindle_companion(
+            Some("did:plc:test"),
+            Some("http://localhost:5555"),
+            None,
+            &bin,
+            &[],
+        )
+        .unwrap();
+
+        assert!(companion
+            .command
+            .contains("SPINDLE_SERVER_JETSTREAM_ENDPOINT=ws://localhost:5555/events"));
+    }
+
+    #[test]
+    fn https_knot_url_converted_to_wss() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("spindle");
+        std::fs::write(&bin, "").unwrap();
+
+        let companion = build_spindle_companion(
+            Some("did:plc:test"),
+            Some("https://knot.example.com"),
+            None,
+            &bin,
+            &[],
+        )
+        .unwrap();
+
+        assert!(companion
+            .command
+            .contains("SPINDLE_SERVER_JETSTREAM_ENDPOINT=wss://knot.example.com/events"));
+    }
+
+    #[test]
+    fn custom_spindle_db_path_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("spindle");
+        std::fs::write(&bin, "").unwrap();
+
+        let companion = build_spindle_companion(
+            Some("did:plc:test"),
+            None,
+            Some("/data/spindle.db"),
+            &bin,
+            &[],
+        )
+        .unwrap();
+
+        assert!(companion.command.contains("SPINDLE_SERVER_DB_PATH=/data/spindle.db"));
+    }
+
+    #[test]
+    fn non_spindle_companion_does_not_suppress_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("spindle");
+        std::fs::write(&bin, "").unwrap();
+        let companions = vec![spindle_companion("mock-github")];
+
+        let companion = build_spindle_companion(
+            Some("did:plc:test"),
+            None,
+            None,
+            &bin,
+            &companions,
+        );
+
+        assert!(companion.is_some());
+    }
 }

@@ -188,9 +188,104 @@ e2e-opencode-worker:
 e2e-chainlink:
     ./tests/e2e/chainlink/run.sh
 
-# Run Tangled CI integration test (requires local knot+spindle: docker compose up in tangled-knot/)
+# Run Tangled CI integration test.
+# Requires only the knot container: docker compose up -d  (in tests/e2e/tangled-ci/)
+# Manages spindle lifecycle entirely: kills any existing instance, starts fresh, cleans up on exit.
 e2e-tangled-ci:
-    ./tests/e2e/tangled-ci/setup.sh && ./tests/e2e/tangled-ci/start-spindle.sh
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PROJECT_ROOT="$(pwd)"
+    SPINDLE_LOG="/tmp/spindle-e2e-$$.log"
+    SPINDLE_PID=""
+
+    cleanup() {
+        echo ""
+        echo "=== Cleanup ==="
+        [[ -n "$SPINDLE_PID" ]] && kill "$SPINDLE_PID" 2>/dev/null || true
+        rm -f "$SPINDLE_LOG"
+        rm -f "$PROJECT_ROOT/spindle.db"
+        rm -f /tmp/tangled-ci-e2e-rkey
+        rm -rf /tmp/spindle-logs
+        echo "Done."
+    }
+    trap cleanup EXIT
+
+    echo "=== Stopping any existing spindle on :6555 ==="
+    pkill -f 'tangled-core/cmd/spindle/spindle' 2>/dev/null || true
+    sleep 1
+
+    ./tests/e2e/tangled-ci/setup.sh
+
+    echo ""
+    echo "=== Starting spindle ==="
+    ./tests/e2e/tangled-ci/start-spindle.sh > "$SPINDLE_LOG" 2>&1 &
+    SPINDLE_PID=$!
+    echo "Spindle PID: $SPINDLE_PID  Log: $SPINDLE_LOG"
+
+    echo "Waiting for spindle to be ready..."
+    for i in $(seq 1 20); do
+        if curl -sf http://localhost:6555/ > /dev/null 2>&1; then break; fi
+        sleep 1
+    done
+    if ! curl -sf http://localhost:6555/ > /dev/null 2>&1; then
+        echo "ERROR: spindle did not come up within 20s. Logs:"
+        cat "$SPINDLE_LOG"
+        exit 1
+    fi
+    echo "Spindle ready."
+
+    RKEY="$(cat /tmp/tangled-ci-e2e-rkey 2>/dev/null)"
+    if [[ -z "$RKEY" ]]; then
+        echo "ERROR: could not read rkey from /tmp/tangled-ci-e2e-rkey"
+        exit 1
+    fi
+    # Spindle writes per-workflow logs to /tmp/spindle-logs/{rkey}-{name}.log
+    WORKFLOW_LOG="/tmp/spindle-logs/localhost-5555-${RKEY}-ci.yml.log"
+    echo ""
+    echo "=== Waiting for pipeline result (rkey=${RKEY}, timeout: 5m) ==="
+    DEADLINE=$((SECONDS + 300))
+    RESULT=""
+    ENQUEUED=0
+    while [[ $SECONDS -lt $DEADLINE ]]; do
+        if [[ $ENQUEUED -eq 0 ]] && grep -q "pipeline enqueued successfully.*${RKEY}" "$SPINDLE_LOG" 2>/dev/null; then
+            echo "  pipeline enqueued"
+            ENQUEUED=1
+        fi
+        if [[ -f "$WORKFLOW_LOG" ]]; then
+            # Last control line with step_status tells us if the final step completed
+            if grep -q '"step_status":"end"' "$WORKFLOW_LOG" && grep -q '"all tests passed"\|"step_status":"end"' "$WORKFLOW_LOG" 2>/dev/null; then
+                if ! grep -q '"step_status":"failed"\|"exit_code":[^0]' "$WORKFLOW_LOG" 2>/dev/null; then
+                    RESULT="pass"
+                    break
+                fi
+            fi
+            if grep -q '"step_status":"failed"' "$WORKFLOW_LOG" 2>/dev/null; then
+                RESULT="fail"
+                break
+            fi
+        fi
+        sleep 2
+    done
+
+    echo ""
+    echo "=== Spindle daemon log ==="
+    cat "$SPINDLE_LOG"
+    echo ""
+    if [[ -f "$WORKFLOW_LOG" ]]; then
+        echo "=== Workflow log ($RKEY) ==="
+        cat "$WORKFLOW_LOG" | python3 tests/e2e/tangled-ci/format-log.py
+    fi
+    echo ""
+
+    if [[ "$RESULT" == "pass" ]]; then
+        echo "PASS: pipeline completed successfully"
+    elif [[ "$RESULT" == "fail" ]]; then
+        echo "FAIL: pipeline step failed (see workflow log above)"
+        exit 1
+    else
+        echo "FAIL: timed out waiting for pipeline result"
+        exit 1
+    fi
 
 # Run live E2E Teams messaging test (requires active CC team "teams-e2e")
 live-teams-e2e:

@@ -129,8 +129,6 @@ struct ReviewCommentEntry {
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
-    line: Option<u64>,
-    #[serde(default)]
     diff_hunk: Option<String>,
     #[serde(default)]
     thread_id: Option<String>,
@@ -219,6 +217,14 @@ where
 
     pub fn with_reviewer_spawner(mut self, spawner: Arc<dyn ReviewerSpawner>) -> Self {
         self.reviewer_spawner = Some(spawner);
+        self
+    }
+
+    /// Use a shared CI status map (e.g. from `Services`) instead of the internal one.
+    ///
+    /// Call this so the merge handler and the watcher read from the same map.
+    pub fn with_ci_status_map(mut self, map: Arc<RwLock<HashMap<BranchName, CIStatus>>>) -> Self {
+        self.ci_status_map = map;
         self
     }
 
@@ -1612,12 +1618,146 @@ mod tests {
         let json = r#"{
             "state": "changes_requested",
             "comments": [
-                {"body": "Needs more tests", "path": "src/lib.rs", "line": 42}
+                {"body": "Needs more tests", "path": "src/lib.rs"}
             ]
         }"#;
         let rf: ReviewFile = serde_json::from_str(json).unwrap();
         assert_eq!(rf.state, "changes_requested");
         assert_eq!(rf.comments.len(), 1);
         assert_eq!(rf.comments[0].body, "Needs more tests");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Reviewer spawner tests
+    // ---------------------------------------------------------------------------
+
+    struct MockReviewerSpawner {
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReviewerSpawner for MockReviewerSpawner {
+        async fn spawn_reviewer_for_pr(
+            &self,
+            _pr: &crate::services::file_pr_local::PrEntry,
+        ) -> anyhow::Result<()> {
+            self.called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn test_pr_entry() -> crate::services::file_pr_local::PrEntry {
+        crate::services::file_pr_local::PrEntry {
+            number: 1,
+            head_branch: "main.feat-gemini".to_string(),
+            base_branch: "main".to_string(),
+            title: "Test PR".to_string(),
+            body: String::new(),
+            author_agent: "feat-gemini".to_string(),
+            author_role: "dev".to_string(),
+            created_at: chrono::Utc::now(),
+            state: crate::services::file_pr_local::PrState::Open,
+            review_state: crate::services::file_pr_local::LocalReviewState::PendingReview,
+            last_review_at: None,
+            last_head_sha: None,
+            reviewer_agent: None,
+            rounds: 0,
+            stuck: false,
+            needs_human_review: false,
+        }
+    }
+
+    fn test_registry(pr: crate::services::file_pr_local::PrEntry) -> crate::services::file_pr_local::PrRegistry {
+        let mut prs = HashMap::new();
+        prs.insert(pr.number, pr);
+        crate::services::file_pr_local::PrRegistry { prs, next_number: 2 }
+    }
+
+    fn test_observation(sha: &str) -> Observation {
+        Observation {
+            head_sha: sha.to_string(),
+            review_state: crate::services::file_pr_local::LocalReviewState::PendingReview,
+            comments: vec![],
+            ci_status: CIStatus::Unknown,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reviewer_spawner_called_for_new_pr() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let called = Arc::new(AtomicBool::new(false));
+        let spawner = Arc::new(MockReviewerSpawner { called: called.clone() });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services))
+            .with_reviewer_spawner(spawner);
+
+        let pr = test_pr_entry();
+        let registry = test_registry(pr);
+        let mut observations = HashMap::new();
+        observations.insert(1u64, test_observation("abc123"));
+
+        watcher.process_observations(&registry, &observations).await.unwrap();
+
+        // Give the tokio::spawn task a moment to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(called.load(Ordering::SeqCst), "spawner should be called for first sighting of new PR");
+
+        let state = watcher.state.lock().await;
+        assert!(
+            state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(false),
+            "reviewer_spawned should be true after first sighting"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reviewer_spawner_not_called_twice() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        struct CountingSpawner {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for CountingSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                _pr: &crate::services::file_pr_local::PrEntry,
+            ) -> anyhow::Result<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let spawner = Arc::new(CountingSpawner { count: call_count.clone() });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services))
+            .with_reviewer_spawner(spawner);
+
+        let pr = test_pr_entry();
+        let registry = test_registry(pr);
+        let mut observations = HashMap::new();
+        observations.insert(1u64, test_observation("abc123"));
+
+        // First call — spawns reviewer
+        watcher.process_observations(&registry, &observations).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Second call — PR is already in state, no second spawn
+        watcher.process_observations(&registry, &observations).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "spawner should only be called once per PR");
     }
 }

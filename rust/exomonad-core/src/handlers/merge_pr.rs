@@ -1,24 +1,26 @@
 use crate::effects::{dispatch_merge_pr_effect, EffectResult, MergePrEffects, ResultExt};
-use crate::services::merge_pr;
+use crate::services::{file_pr_local, merge_pr, merge_pr_local};
 use async_trait::async_trait;
 use exomonad_proto::effects::merge_pr::*;
 use std::sync::Arc;
 use tracing::instrument;
 
-use crate::services::{HasEventLog, HasGitHubClient, HasGitWorktreeService};
+use crate::services::{HasCiStatusMap, HasEventLog, HasGitHubClient, HasGitWorktreeService, HasProjectDir};
 
 pub struct MergePRHandler<C> {
     ctx: Arc<C>,
 }
 
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> MergePRHandler<C> {
+impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + HasCiStatusMap + 'static>
+    MergePRHandler<C>
+{
     pub fn new(ctx: Arc<C>) -> Self {
         Self { ctx }
     }
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static>
+impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + HasCiStatusMap + 'static>
     crate::effects::EffectHandler for MergePRHandler<C>
 {
     fn namespace(&self) -> &str {
@@ -36,8 +38,8 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static>
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> MergePrEffects
-    for MergePRHandler<C>
+impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + HasCiStatusMap + 'static>
+    MergePrEffects for MergePRHandler<C>
 {
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, pr_number = req.pr_number))]
     async fn merge_pr(
@@ -52,15 +54,46 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> MergePr
             strategy = strategy.as_str(),
             "[MergePR] merge_pr starting"
         );
-        let result = merge_pr::merge_pr_async(
-            pr_number,
-            &strategy,
-            &req.working_dir,
-            self.ctx.git_worktree_service().clone(),
-            self.ctx.github_client().map(|arc| arc.as_ref()),
-        )
-        .await
-        .effect_err("merge_pr")?;
+
+        // Route: local registry when .exo/prs.json contains the PR, GitHub otherwise.
+        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
+        let use_local = if prs_path.exists() {
+            match file_pr_local::read_pr_registry(&prs_path).await {
+                Ok(reg) => reg.prs.contains_key(&pr_number.as_u64()),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        let result = if use_local {
+            tracing::info!(pr_number = pr_number.as_u64(), "[MergePR] routing to local registry");
+            let merger = ctx.agent_name.clone();
+            let policy = merge_pr_local::ReviewPolicy::default();
+            merge_pr_local::merge_pr_local(
+                pr_number,
+                &strategy,
+                self.ctx.project_dir(),
+                self.ctx.git_worktree_service().clone(),
+                &merger,
+                &policy,
+                self.ctx.spindle_url(),
+                self.ctx.ci_status_map(),
+            )
+            .await
+            .effect_err("merge_pr")?
+        } else {
+            tracing::info!(pr_number = pr_number.as_u64(), "[MergePR] routing to GitHub");
+            merge_pr::merge_pr_async(
+                pr_number,
+                &strategy,
+                &req.working_dir,
+                self.ctx.git_worktree_service().clone(),
+                self.ctx.github_client().map(|arc| arc.as_ref()),
+            )
+            .await
+            .effect_err("merge_pr")?
+        };
         tracing::info!(
             success = result.success,
             git_fetched = result.git_fetched,

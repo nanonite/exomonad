@@ -913,6 +913,15 @@ Run `exomonad recompile` first to build it.",
     let claude_session_registry =
         Arc::new(exomonad_core::services::claude_session_registry::ClaudeSessionRegistry::new());
 
+    // Shared CI status map — updated by WorktreeEventWatcher's spindle subscriber,
+    // read by MergePRHandler gate 7. Both components hold an Arc to the same map.
+    let ci_status_map = Arc::new(tokio::sync::RwLock::new(
+        std::collections::HashMap::<
+            exomonad_core::domain::BranchName,
+            exomonad_core::domain::CIStatus,
+        >::new(),
+    ));
+
     // Build Services once — all shared registries in one struct
     let services = Arc::new(exomonad_core::services::Services {
         project_dir: project_dir.clone(),
@@ -928,6 +937,8 @@ Run `exomonad recompile` first to build it.",
         mutex_registry,
         git_wt,
         opencode_worker_model: config.opencode.worker_model.clone(),
+        ci_status_map: ci_status_map.clone(),
+        spindle_url: config.tangled_spindle_url.clone(),
     });
 
     let mut agent_control =
@@ -1032,7 +1043,8 @@ Run `exomonad recompile` first to build it.",
     // Start Worktree Event Watcher (background service — replaces GitHub poller + Copilot review)
     let mut watcher = exomonad_core::services::worktree_event_watcher::WorktreeEventWatcher::new(services.clone())
         .with_plugins(plugins.clone())
-        .with_reviewer_spawner(agent_control.clone());
+        .with_reviewer_spawner(agent_control.clone())
+        .with_ci_status_map(ci_status_map.clone());
     if let Some(interval) = config.poll_interval {
         if interval == 0 {
             anyhow::bail!("Invalid configuration: `poll_interval` must be >= 1 second, got 0");
