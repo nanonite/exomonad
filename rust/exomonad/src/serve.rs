@@ -954,6 +954,7 @@ Run `exomonad recompile` first to build it.",
     agent_control = agent_control.with_spawn_agent_model(config.opencode.worker_model.clone());
     agent_control = agent_control.with_reviewer_agent_type(config.reviewer.agent_type);
     agent_control = agent_control.with_reviewer_model(config.reviewer.model.clone());
+    agent_control = agent_control.with_reviewer_context(config.reviewer.context.clone());
     agent_control = agent_control
         .with_extra_mcp_servers(serialize_extra_mcp_servers(&config.extra_mcp_servers));
     let event_session_id = uuid::Uuid::new_v4().to_string();

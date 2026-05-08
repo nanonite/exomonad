@@ -603,6 +603,8 @@ pub struct AgentControlService<C> {
     pub(crate) reviewer_agent_type: AgentType,
     /// Model for the reviewer agent. None = agent picks its default.
     pub(crate) reviewer_model: Option<String>,
+    /// Context file paths injected into the reviewer's task (e.g. CLAUDE.md, reviewer rules).
+    pub(crate) reviewer_context: Vec<String>,
 }
 
 impl<
@@ -633,6 +635,7 @@ impl<
             openrouter_api_key: None,
             reviewer_agent_type: AgentType::Claude,
             reviewer_model: None,
+            reviewer_context: vec![],
         }
     }
 
@@ -698,6 +701,12 @@ impl<
     /// Set the model for the reviewer agent.
     pub fn with_reviewer_model(mut self, model: Option<String>) -> Self {
         self.reviewer_model = model;
+        self
+    }
+
+    /// Set context file paths injected into the reviewer's task.
+    pub fn with_reviewer_context(mut self, context: Vec<String>) -> Self {
+        self.reviewer_context = context;
         self
     }
 

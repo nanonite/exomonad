@@ -25,6 +25,24 @@ fn read_chainlink_tl_protocol(cwd: &Path) -> Option<String> {
 
 /// Reject `--tl-model` / `--worker-model` values that opencode doesn't recognise.
 /// Caller must only invoke this when the model is `Some` and the agent type is OpenCode.
+/// Validate a Claude model string against known aliases and the `claude-*` prefix convention.
+///
+/// Accepts short aliases ("sonnet", "opus", "haiku") and full model IDs ("claude-sonnet-4-6").
+/// Rejects arbitrary strings that match neither pattern — catches typos before a window is opened.
+fn validate_claude_model(model: &str) -> Result<()> {
+    // Aliases from `claude --help --model`: "sonnet" or "opus"
+    const KNOWN_ALIASES: &[&str] = &["sonnet", "opus"];
+    let is_alias = KNOWN_ALIASES.contains(&model);
+    let is_full_id = model.starts_with("claude-");
+    if !is_alias && !is_full_id {
+        anyhow::bail!(
+            "Unknown Claude model `{model}`. Use a short alias ('sonnet', 'opus') \
+             or a full model ID starting with 'claude-' (e.g. 'claude-sonnet-4-6')."
+        );
+    }
+    Ok(())
+}
+
 async fn validate_opencode_model(model: &str) -> Result<()> {
     let out = tokio::process::Command::new("opencode")
         .args(["models"])
@@ -97,10 +115,19 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
             validate_opencode_model(m).await?;
         }
     }
-    if config.reviewer.agent_type == AgentType::OpenCode {
-        if let Some(m) = config.reviewer.model.as_deref() {
-            validate_opencode_model(m).await?;
+    match config.reviewer.agent_type {
+        AgentType::OpenCode => {
+            if let Some(m) = config.reviewer.model.as_deref() {
+                validate_opencode_model(m).await?;
+            }
         }
+        AgentType::Claude => {
+            if let Some(m) = config.reviewer.model.as_deref() {
+                validate_claude_model(m)?;
+            }
+        }
+
+        _ => {}
     }
 
     // Check OTel endpoint reachability if configured
@@ -1694,5 +1721,31 @@ mod tests {
         );
 
         assert!(companion.is_some());
+    }
+
+    // ── validate_claude_model tests ───────────────────────────────────────
+    // Aliases sourced from `claude --help`: 'sonnet' or 'opus'
+    // Full IDs accepted via "claude-" prefix.
+
+    #[test]
+    fn test_validate_claude_model_aliases() {
+        assert!(validate_claude_model("sonnet").is_ok());
+        assert!(validate_claude_model("opus").is_ok());
+    }
+
+    #[test]
+    fn test_validate_claude_model_full_ids() {
+        assert!(validate_claude_model("claude-haiku-4-5-20251001").is_ok());
+        assert!(validate_claude_model("claude-sonnet-4-6").is_ok());
+        assert!(validate_claude_model("claude-opus-4-7").is_ok());
+    }
+
+    #[test]
+    fn test_validate_claude_model_rejects_invalid() {
+        assert!(validate_claude_model("gpt-4o").is_err());
+        assert!(validate_claude_model("anthropic/claude-haiku").is_err());
+        assert!(validate_claude_model("").is_err());
+        assert!(validate_claude_model("haiku").is_err());
+        assert!(validate_claude_model("haiku-model").is_err());
     }
 }
