@@ -669,81 +669,11 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
     }
 
     // Create "TL" window
-    let tl_cwd = if config.root_agent_type == AgentType::OpenCode {
-        // OpenCode TL gets a worktree for isolation, same as Claude companions
-        let worktree_path = cwd.join(".exo/worktrees/root-opencode");
-        let branch_name = format!("root-opencode");
-
-        if !worktree_path.exists() {
-            let head_valid = std::process::Command::new("git")
-                .args(["rev-parse", "--verify", "HEAD"])
-                .current_dir(&cwd)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-            if !head_valid {
-                info!("No commits in repo, creating initial commit for worktree support");
-                let _ = std::process::Command::new("git")
-                    .args(["commit", "--allow-empty", "-m", "initial commit"])
-                    .current_dir(&cwd)
-                    .output();
-            }
-
-            let branch_exists = std::process::Command::new("git")
-                .args(["rev-parse", "--verify", &branch_name])
-                .current_dir(&cwd)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-            std::fs::create_dir_all(cwd.join(".exo/worktrees"))?;
-
-            let worktree_result = if branch_exists {
-                std::process::Command::new("git")
-                    .args(["worktree", "add"])
-                    .arg(&worktree_path)
-                    .arg(&branch_name)
-                    .current_dir(&cwd)
-                    .output()
-            } else {
-                std::process::Command::new("git")
-                    .args(["worktree", "add", "-b", &branch_name])
-                    .arg(&worktree_path)
-                    .arg("HEAD")
-                    .current_dir(&cwd)
-                    .output()
-            };
-
-            match worktree_result {
-                Ok(output) if output.status.success() => {
-                    info!(
-                        path = %worktree_path.display(),
-                        branch = %branch_name,
-                        "Created OpenCode TL worktree"
-                    );
-                }
-                Ok(output) => {
-                    anyhow::bail!(
-                        "Failed to create worktree for OpenCode TL: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                Err(e) => {
-                    anyhow::bail!(
-                        "Failed to run git worktree add for OpenCode TL: {}",
-                        e
-                    );
-                }
-            }
-        } else {
-            info!(
-                path = %worktree_path.display(),
-                "Reusing existing OpenCode TL worktree"
-            );
-        }
-
-        // Write opencode.json MCP config into worktree
+    // OpenCode TL stays on the current branch (same as Claude TL) — workers fork off
+    // it via fork_wave and file PRs back. A separate worktree branch for the TL would
+    // break the parent-branch PR topology.
+    if config.root_agent_type == AgentType::OpenCode {
+        // Write opencode.json to the repo root so the TL window finds it via CWD.
         let mut opencode_mcp_servers = serde_json::Map::new();
         opencode_mcp_servers.insert(
             "exomonad".to_string(),
@@ -769,37 +699,12 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
         }
         let opencode_config = serde_json::json!({ "mcp": opencode_mcp_servers });
         std::fs::write(
-            worktree_path.join("opencode.json"),
+            cwd.join("opencode.json"),
             serde_json::to_string_pretty(&opencode_config)?,
         )?;
-
-        // Copy role context into worktree
-        {
-            let context_source = exomonad_core::services::resolve_role_context_path(&cwd, &config.wasm_name, "root");
-            if let Some(src) = context_source {
-                let rules_dir = worktree_path.join(".claude/rules");
-                let _ = std::fs::create_dir_all(&rules_dir);
-                let dest = rules_dir.join("exomonad_role.md");
-                let _ = std::fs::remove_file(&dest);
-                match std::fs::copy(&src, &dest) {
-                    Ok(_) => info!(src = %src.display(), dest = %dest.display(), "Copied role context for OpenCode TL"),
-                    Err(e) => warn!(error = %e, "Failed to copy role context (non-fatal)"),
-                }
-            }
-        }
-
-        // Symlink server socket
-        let worktree_exo = worktree_path.join(".exo");
-        std::fs::create_dir_all(&worktree_exo)?;
-        let socket_target = worktree_exo.join("server.sock");
-        let _ = std::fs::remove_file(&socket_target);
-        let socket_source = cwd.join(".exo/server.sock");
-        std::os::unix::fs::symlink(&socket_source, &socket_target)?;
-
-        worktree_path
-    } else {
-        cwd.clone()
-    };
+        info!("Wrote opencode.json to repo root for OpenCode TL");
+    }
+    let tl_cwd = cwd.clone();
 
     let base_command = if let Some(ref cmd) = config.root_command {
         cmd.clone()
