@@ -85,6 +85,12 @@ enum Commands {
         /// Default: opencode picks (uses its built-in default model).
         #[arg(long)]
         worker_model: Option<String>,
+        /// Set reviewer agent type (claude|opencode). Overrides [reviewer] in config.toml.
+        #[arg(long)]
+        reviewer: Option<String>,
+        /// Model for the reviewer agent. Validated against the agent type.
+        #[arg(long)]
+        reviewer_model: Option<String>,
     },
 
     /// Initialize a new exomonad project in the current directory.
@@ -259,8 +265,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Init { session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model } => {
-            init::run(session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model).await?;
+        Commands::Init { session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model } => {
+            init::run(session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model).await?;
         }
 
         Commands::New { name } => {

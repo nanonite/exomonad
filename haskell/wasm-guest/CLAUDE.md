@@ -27,7 +27,7 @@ The guest exports MCP tools that agents can call. These are defined in `ExoMonad
 
 ### Spawn Tools (`ExoMonad.Guest.Tools.Spawn`)
 
-- **`fork_wave`**: Fork N parallel Claude agents, each in its own worktree. Context inherited by default (`fork_session` defaults to `true`). Requires clean git state.
+- **`fork_wave`**: Fork N parallel agents in isolated worktrees (branch + PR). Agent type defaults to the server's `--worker` setting; omit `agent_type` to use the default. Claude agents get context inheritance via `--fork-session`; OpenCode agents use headless ACP mode. Requires clean git state.
 - **`spawn_leaf`**: Spawn Gemini agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first.
 - **`spawn_worker`**: Spawn ephemeral Gemini worker in tmux pane. No branch, no PR. Just name + task.
 - **`spawn_leaf_subtree`** (SDK core): Lower-level worktree/standalone spawn used by `spawn_leaf`.

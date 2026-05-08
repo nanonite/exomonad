@@ -295,6 +295,33 @@ pub async fn merge_pr_local(
         "PR merged and registry updated"
     );
 
+    // Step 6: Clean up the agent's worktree and identity dir now that the branch is merged.
+    // The worktree path follows the naming convention: .exo/worktrees/{last-dot-segment}/
+    // Non-fatal — log warnings but don't fail the merge.
+    let agent_slug = head_branch
+        .rsplit('.')
+        .next()
+        .unwrap_or(&head_branch)
+        .to_string();
+    let worktree_path = project_dir.join(".exo/worktrees").join(&agent_slug);
+    if worktree_path.exists() {
+        let wt = git_wt.clone();
+        let wt_path = worktree_path.clone();
+        match tokio::task::spawn_blocking(move || wt.remove_workspace(&wt_path)).await {
+            Ok(Ok(())) => info!(path = %worktree_path.display(), "Removed merged worktree"),
+            Ok(Err(e)) => warn!(error = %e, path = %worktree_path.display(), "Failed to remove worktree (non-fatal)"),
+            Err(e) => warn!(error = %e, "spawn_blocking failed for worktree removal"),
+        }
+    }
+    let agent_dir = project_dir.join(".exo/agents").join(&agent_slug);
+    if agent_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&agent_dir) {
+            warn!(error = %e, path = %agent_dir.display(), "Failed to remove agent dir (non-fatal)");
+        } else {
+            info!(path = %agent_dir.display(), "Removed merged agent dir");
+        }
+    }
+
     Ok(MergePROutput {
         success: true,
         message: format!("PR #{} merged via {}", pr_number, strategy),

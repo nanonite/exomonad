@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Configurable PR reviewer agent in exomonad init (agent type, model, headless) + Tangled as local forge backend (#118)
 - C.3: Verify ci.yml schema and iterate pipeline to green (#104)
 - exomonad init: auto-register repo with tangled knot when tangled_knot_url is configured (#110)
 - Set per-agent git identity (birth-branch) in worktree at spawn time (#109)
@@ -83,6 +84,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Investigate spindle event idempotency for persistent spindle.db across exomonad init sessions (#119)
 - exomonad init: auto-start spindle as companion using binary copy pattern (#117)
 - exomonad new: write default .exo/review-policy.toml (#116)
 - Auto-spawn reviewer agent on PR creation in worktree_event_watcher (#113)

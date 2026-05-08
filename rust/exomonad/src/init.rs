@@ -71,7 +71,7 @@ async fn validate_opencode_model(model: &str) -> Result<()> {
 }
 
 /// Run the init command: create or attach to tmux session.
-pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool, tl: Option<String>, worker: Option<String>, tl_model: Option<String>, worker_model: Option<String>) -> Result<()> {
+pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool, tl: Option<String>, worker: Option<String>, tl_model: Option<String>, worker_model: Option<String>, reviewer: Option<String>, reviewer_model: Option<String>) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
     use exomonad_core::services::{resolve_role_context_path, AgentType};
     use std::io::{IsTerminal, Write};
@@ -100,6 +100,12 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
     }
     if let Some(m) = worker_model {
         config.opencode.worker_model = Some(m);
+    }
+    if let Some(ref reviewer_type) = reviewer {
+        config.reviewer.agent_type = parse_agent_type(reviewer_type)?;
+    }
+    if let Some(m) = reviewer_model {
+        config.reviewer.model = Some(m);
     }
     if openrouter {
         config.openrouter.enabled = true;
@@ -545,6 +551,18 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
             String::from_utf8_lossy(&env_output.stderr)
         );
     }
+
+    // Anchor chainlink to the root workspace DB so worktree windows don't create their own
+    let chainlink_db = cwd.join(".chainlink/issues.db");
+    let _ = std::process::Command::new("tmux")
+        .args([
+            "set-environment",
+            "-t",
+            &session,
+            "CHAINLINK_DB",
+            chainlink_db.to_str().unwrap_or_default(),
+        ])
+        .status();
 
     // Set EXOMONAD_ROLE=root so hook CLI passes &role=root to server
     let role_output = std::process::Command::new("tmux")
