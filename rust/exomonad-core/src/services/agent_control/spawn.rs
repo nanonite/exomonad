@@ -874,38 +874,30 @@ impl<
                 }
             }
 
-            // Open tmux window with cwd = worktree_path (or ACP server for OpenCode)
+            // Open tmux window with cwd = worktree_path
             let agent_config_dir = self.project_dir().join(".exo").join("agents").join(agent_name.as_str());
             let routing = match agent_type {
                 AgentType::OpenCode => {
-                    // Spawn OpenCode in headless ACP mode
-                    let env_vec: Vec<(String, String)> = env_vars.into_iter().collect();
-                    let oc_model = options.model.as_deref().or_else(|| self.spawn_agent_model());
-                    match super::super::opencode_acp::spawn_and_prompt(
-                        agent_name.clone(),
+                    // OpenCode workers run in a tmux window like Claude workers.
+                    // `build_agent_command` generates `opencode run "$(cat '<prompt_file>')"`.
+                    // MCP is configured via opencode.json in the worktree.
+                    // Messages are delivered via tmux STDIN injection (same as all other agents).
+                    let window_id = self.new_tmux_window_inner(
+                        &display_name,
                         &worktree_path,
-                        &task_with_context,
-                        self.project_dir(),
-                        env_vec,
-                        oc_model,
-                    ).await {
-                        Ok(conn) => {
-                            let acp_url = conn.base_url.clone();
-                            // Register in OpencodeAcpRegistry
-                            self.opencode_acp_registry().register(conn).await;
-                            RoutingInfo::acp(acp_url)
-                        }
-                        Err(e) => {
-                            warn!(name = %identity.slug(), error = %e, "OpenCode ACP spawn failed, rolling back");
-                            let _ = fs::remove_dir_all(&agent_config_dir).await;
-                            if worktree_path.exists() {
-                                let git_wt = self.git_wt().clone();
-                                let path = worktree_path.clone();
-                                let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
-                            }
-                            return Err(e);
-                        }
-                    }
+                        agent_type,
+                        Some(&task_with_context),
+                        env_vars,
+                        None, // no fork_session for OpenCode
+                        None, // no claude_flags
+                        options.model.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
+                        e
+                    })?;
+                    RoutingInfo::window(window_id)
                 }
                 AgentType::Claude => {
                     // Determine fork mode from parent_session_id
