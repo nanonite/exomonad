@@ -77,6 +77,35 @@ impl OpenRouterConfig {
     }
 }
 
+/// Configuration for the PR reviewer agent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewerConfig {
+    /// Agent type for the reviewer. Accepts "claude" or "opencode". Default: claude.
+    #[serde(default = "default_reviewer_agent_type")]
+    pub agent_type: AgentType,
+    /// Model string passed to the reviewer agent
+    /// (e.g. "claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5").
+    /// `None` means the agent picks its own default.
+    pub model: Option<String>,
+    /// Context file paths injected into the reviewer's session.
+    #[serde(default)]
+    pub context: Vec<String>,
+}
+
+fn default_reviewer_agent_type() -> AgentType {
+    AgentType::Claude
+}
+
+impl Default for ReviewerConfig {
+    fn default() -> Self {
+        Self {
+            agent_type: AgentType::Claude,
+            model: None,
+            context: vec![],
+        }
+    }
+}
+
 /// Opencode agent configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct OpencodeConfig {
@@ -190,6 +219,10 @@ pub struct RawConfig {
     /// Absolute path to the spindle SQLite database (e.g. "/home/user/project/spindle.db").
     /// Used during init to INSERT the repo into the spindle's repos table.
     pub tangled_spindle_db: Option<String>,
+
+    /// PR reviewer agent configuration.
+    #[serde(default)]
+    pub reviewer: Option<ReviewerConfig>,
 }
 
 /// Final resolved configuration.
@@ -255,6 +288,9 @@ pub struct Config {
 
     /// Absolute path to the spindle SQLite database.
     pub tangled_spindle_db: Option<String>,
+
+    /// PR reviewer agent configuration.
+    pub reviewer: ReviewerConfig,
 }
 
 impl Config {
@@ -431,6 +467,9 @@ impl Config {
         let tangled_knot_container = local_raw.tangled_knot_container.or(global_raw.tangled_knot_container);
         let tangled_spindle_db = local_raw.tangled_spindle_db.or(global_raw.tangled_spindle_db);
 
+        // Resolve reviewer: local > global > default
+        let reviewer = local_raw.reviewer.or(global_raw.reviewer).unwrap_or_default();
+
         Ok(Self {
             project_dir,
             role,
@@ -458,6 +497,7 @@ impl Config {
             tangled_owner_did,
             tangled_knot_container,
             tangled_spindle_db,
+            reviewer,
         })
     }
 
@@ -502,6 +542,7 @@ impl Default for Config {
             tangled_owner_did: None,
             tangled_knot_container: None,
             tangled_spindle_db: None,
+            reviewer: ReviewerConfig::default(),
         }
     }
 }
@@ -775,5 +816,65 @@ mod tests {
         "#;
         let raw: RawConfig = toml::from_str(content).unwrap();
         assert_eq!(raw.spawn_agent_type, Some(AgentType::OpenCode));
+    }
+
+    // ── Reviewer config tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_reviewer_config_absent_means_none() {
+        let raw: RawConfig = toml::from_str("default_role = \"tl\"").unwrap();
+        assert!(raw.reviewer.is_none());
+    }
+
+    #[test]
+    fn test_reviewer_config_empty_section_uses_defaults() {
+        let raw: RawConfig = toml::from_str("[reviewer]").unwrap();
+        let rc = raw.reviewer.unwrap();
+        assert_eq!(rc.agent_type, AgentType::Claude);
+        assert!(rc.model.is_none());
+        assert!(rc.context.is_empty());
+    }
+
+    #[test]
+    fn test_reviewer_config_claude_with_model() {
+        let content = r#"
+[reviewer]
+agent_type = "claude"
+model = "claude-haiku-4-5-20251001"
+"#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        let rc = raw.reviewer.unwrap();
+        assert_eq!(rc.agent_type, AgentType::Claude);
+        assert_eq!(rc.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn test_reviewer_config_opencode_with_model_and_context() {
+        let content = r#"
+[reviewer]
+agent_type = "opencode"
+model = "anthropic/claude-haiku-4-5"
+context = ["CLAUDE.md", ".exo/rules/reviewer.md"]
+"#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        let rc = raw.reviewer.unwrap();
+        assert_eq!(rc.agent_type, AgentType::OpenCode);
+        assert_eq!(rc.model.as_deref(), Some("anthropic/claude-haiku-4-5"));
+        assert_eq!(rc.context, vec!["CLAUDE.md", ".exo/rules/reviewer.md"]);
+    }
+
+    #[test]
+    fn test_reviewer_config_invalid_agent_type_rejected() {
+        let content = "[reviewer]\nagent_type = \"invalid\"\n";
+        let result: Result<RawConfig, _> = toml::from_str(content);
+        assert!(result.is_err(), "Unknown agent_type should fail to deserialize");
+    }
+
+    #[test]
+    fn test_reviewer_config_default_is_claude() {
+        let config = Config::default();
+        assert_eq!(config.reviewer.agent_type, AgentType::Claude);
+        assert!(config.reviewer.model.is_none());
+        assert!(config.reviewer.context.is_empty());
     }
 }

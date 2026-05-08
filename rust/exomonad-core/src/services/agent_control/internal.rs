@@ -216,7 +216,7 @@ impl<
         prompt: Option<&str>,
         env_vars: HashMap<String, String>,
     ) -> Result<super::tmux_ipc::WindowId> {
-        self.new_tmux_window_inner(name, cwd, agent_type, prompt, env_vars, None, None)
+        self.new_tmux_window_inner(name, cwd, agent_type, prompt, env_vars, None, None, None)
             .await
     }
 
@@ -235,7 +235,7 @@ impl<
         cwd: &Path,
         claude_flags: Option<&ClaudeSpawnFlags>,
         yolo: bool,
-        opencode_model: Option<&str>,
+        model: Option<&str>,
     ) -> String {
         let cmd = agent_type.command();
 
@@ -274,7 +274,7 @@ impl<
             AgentType::Shoal | AgentType::Process => String::new(),
         };
 
-        let opencode_model_flag = opencode_model
+        let model_flag = model
             .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
             .unwrap_or_default();
 
@@ -286,13 +286,13 @@ impl<
                     AgentType::OpenCode => {
                         format!(
                             "{} run{} --session {} --fork \"$(cat {})\"{}",
-                            cmd, perms_flags, escaped_session, escaped_path, opencode_model_flag
+                            cmd, perms_flags, escaped_session, escaped_path, model_flag
                         )
                     }
                     _ => {
                         format!(
-                            "{}{} --resume {} --fork-session \"$(cat {})\"",
-                            cmd, perms_flags, escaped_session, escaped_path
+                            "{}{}{} --resume {} --fork-session \"$(cat {})\"",
+                            cmd, perms_flags, model_flag, escaped_session, escaped_path
                         )
                     }
                 }
@@ -301,25 +301,22 @@ impl<
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
                 match agent_type {
                     AgentType::OpenCode => {
-                        format!("{} run{} \"$(cat {})\"{}", cmd, perms_flags, escaped_path, opencode_model_flag)
+                        format!("{} run{} \"$(cat {})\"{}", cmd, perms_flags, escaped_path, model_flag)
                     }
                     _ => {
                         let flag = agent_type.prompt_flag();
                         if flag.is_empty() {
-                            format!("{}{} \"$(cat {})\"", cmd, perms_flags, escaped_path)
+                            format!("{}{}{} \"$(cat {})\"", cmd, perms_flags, model_flag, escaped_path)
                         } else {
                             format!(
-                                "{}{} {} \"$(cat {})\"",
-                                cmd, perms_flags, flag, escaped_path
+                                "{}{}{} {} \"$(cat {})\"",
+                                cmd, perms_flags, model_flag, flag, escaped_path
                             )
                         }
                     }
                 }
             }
-            _ => match agent_type {
-                AgentType::OpenCode => format!("{}{}{}", cmd, perms_flags, opencode_model_flag),
-                _ => format!("{}{}", cmd, perms_flags),
-            },
+            _ => format!("{}{}{}", cmd, perms_flags, model_flag),
         };
 
         // Prepend env vars
@@ -378,6 +375,7 @@ impl<
         env_vars: HashMap<String, String>,
         fork_session_id: Option<&str>,
         claude_flags: Option<&ClaudeSpawnFlags>,
+        model_override: Option<&str>,
     ) -> Result<super::tmux_ipc::WindowId> {
         info!(name, cwd = %cwd.display(), agent_type = ?agent_type, fork = fork_session_id.is_some(), "Creating tmux window");
 
@@ -387,6 +385,7 @@ impl<
             None => None,
         };
 
+        let model = model_override.or_else(|| self.spawn_agent_model());
         let full_command = Self::build_agent_command(
             agent_type,
             prompt_file.as_deref(),
@@ -395,7 +394,7 @@ impl<
             cwd,
             claude_flags,
             self.yolo,
-            self.spawn_agent_model(),
+            model,
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let tmux = self.tmux()?;

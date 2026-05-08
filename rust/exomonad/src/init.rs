@@ -97,6 +97,11 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
             validate_opencode_model(m).await?;
         }
     }
+    if config.reviewer.agent_type == AgentType::OpenCode {
+        if let Some(m) = config.reviewer.model.as_deref() {
+            validate_opencode_model(m).await?;
+        }
+    }
 
     // Check OTel endpoint reachability if configured
     if let Some(ref endpoint) = config.otlp_endpoint {

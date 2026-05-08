@@ -442,6 +442,9 @@ pub struct SpawnSubtreeOptions {
     pub standalone_repo: bool,
     /// Directories from the parent project to be copied into the agent's worktree.
     pub allowed_dirs: Vec<String>,
+    /// Model override for this spawn. None = use service default (spawn_agent_model).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Options for spawning a Gemini leaf subtree agent.
@@ -596,6 +599,10 @@ pub struct AgentControlService<C> {
     pub(crate) extra_mcp_servers: HashMap<String, serde_json::Value>,
     /// OpenRouter API key. When Some, all LLM calls route through OpenRouter.
     pub(crate) openrouter_api_key: Option<String>,
+    /// Agent type for the reviewer. Default: Claude.
+    pub(crate) reviewer_agent_type: AgentType,
+    /// Model for the reviewer agent. None = agent picks its default.
+    pub(crate) reviewer_model: Option<String>,
 }
 
 impl<
@@ -624,6 +631,8 @@ impl<
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: HashMap::new(),
             openrouter_api_key: None,
+            reviewer_agent_type: AgentType::Claude,
+            reviewer_model: None,
         }
     }
 
@@ -678,6 +687,18 @@ impl<
     /// Get the configured model for spawned OpenCode workers, if any.
     pub fn spawn_agent_model(&self) -> Option<&str> {
         self.spawn_agent_model.as_deref()
+    }
+
+    /// Set the agent type for the reviewer.
+    pub fn with_reviewer_agent_type(mut self, agent_type: AgentType) -> Self {
+        self.reviewer_agent_type = agent_type;
+        self
+    }
+
+    /// Set the model for the reviewer agent.
+    pub fn with_reviewer_model(mut self, model: Option<String>) -> Self {
+        self.reviewer_model = model;
+        self
     }
 
     /// Set extra MCP servers to include in spawned agent configs.

@@ -880,13 +880,14 @@ impl<
                 AgentType::OpenCode => {
                     // Spawn OpenCode in headless ACP mode
                     let env_vec: Vec<(String, String)> = env_vars.into_iter().collect();
+                    let oc_model = options.model.as_deref().or_else(|| self.spawn_agent_model());
                     match super::super::opencode_acp::spawn_and_prompt(
                         agent_name.clone(),
                         &worktree_path,
                         &task_with_context,
                         self.project_dir(),
                         env_vec,
-                        self.spawn_agent_model(),
+                        oc_model,
                     ).await {
                         Ok(conn) => {
                             let acp_url = conn.base_url.clone();
@@ -917,6 +918,7 @@ impl<
                         env_vars,
                         fork_id,
                         Some(&options.claude_flags),
+                        options.model.as_deref(),
                     )
                     .await
                     .map_err(|e| {
@@ -1134,7 +1136,7 @@ impl<
             branch_name,
             parent_session_id: None,
             role: Some(crate::domain::Role::reviewer()),
-            agent_type: self.default_spawn_agent_type(),
+            agent_type: self.reviewer_agent_type,
             claude_flags: ClaudeSpawnFlags::default(),
             working_dir: Some(self.project_dir().to_path_buf()),
             permissions: Some(AgentPermissions {
@@ -1150,6 +1152,7 @@ impl<
             }),
             standalone_repo: false,
             allowed_dirs: vec![],
+            model: self.reviewer_model.clone(),
         };
 
         self.spawn_subtree(&options, caller_bb).await
