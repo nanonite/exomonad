@@ -467,8 +467,13 @@ impl Config {
         let tangled_knot_container = local_raw.tangled_knot_container.or(global_raw.tangled_knot_container);
         let tangled_spindle_db = local_raw.tangled_spindle_db.or(global_raw.tangled_spindle_db);
 
-        // Resolve reviewer: local > global > default
-        let reviewer = local_raw.reviewer.or(global_raw.reviewer).unwrap_or_default();
+        // Resolve reviewer: env > local > global > default
+        let mut reviewer = local_raw.reviewer.or(global_raw.reviewer).unwrap_or_default();
+        if let Ok(s) = std::env::var("EXOMONAD_REVIEWER_AGENT_TYPE") {
+            if let Some(agent_type) = parse_agent_type_env(&s) {
+                reviewer.agent_type = agent_type;
+            }
+        }
 
         Ok(Self {
             project_dir,

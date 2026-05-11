@@ -41,7 +41,7 @@ Workers open as tmux windows. Run `tmux list-windows -a` to confirm they exist.
 - Never implement directly. Decompose and delegate everything.
 - Never checkout another branch or touch another agent's worktree.
 - After spawning, STOP. Wait for notifications.
-- Git/GitHub operations use bash (git, gh CLI), NOT MCP tools.
+- Git operations (status, commit, push) use bash. Never use `gh pr create` — file_pr MCP is the PR tool.
 ";
 
 pub const OPENCODE_DEV_INSTRUCTIONS: &str = "\
@@ -67,7 +67,7 @@ Implement the spec in your task. File a PR when done. Call notify_parent to repo
 ## Key Rules
 - Work only in your worktree. Never checkout another branch.
 - Never call fork_wave or spawn_leaf — you are a leaf, not a TL.
-- Git/GitHub operations use bash (git, gh CLI), NOT MCP tools.
+- Git operations (status, commit, push) use bash. EXCEPTION: file_pr is the MCP tool for PRs — never use `gh pr create`.
 - If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
 ";
 
@@ -1165,6 +1165,12 @@ impl<
         );
         let branch_name = format!("review-pr-{}", pr_entry.number);
 
+        // Use the author's worktree as the reviewer's working directory.
+        // It's already on the PR branch so the reviewer can diff against the base directly.
+        // spawn_subtree skips worktree creation when working_dir is Some, so this
+        // reuses the existing worktree and writes reviewer identity (.mcp.json) into it.
+        let reviewer_cwd = self.worktree_base.join(&pr_entry.author_agent);
+
         let options = SpawnSubtreeOptions {
             task,
             branch_name,
@@ -1172,7 +1178,7 @@ impl<
             role: Some(crate::domain::Role::reviewer()),
             agent_type: self.reviewer_agent_type,
             claude_flags: ClaudeSpawnFlags::default(),
-            working_dir: Some(self.project_dir().to_path_buf()),
+            working_dir: Some(reviewer_cwd),
             permissions: Some(AgentPermissions {
                 allow: vec![],
                 deny: vec![
@@ -1209,6 +1215,18 @@ impl<
         &self,
         pr: &crate::services::file_pr_local::PrEntry,
     ) -> anyhow::Result<()> {
+        // Guard: if the author's worktree is gone, this PR is stale from a previous
+        // session (crash or --recreate). Skip — no agent will respond to feedback.
+        let worktree_path = self.worktree_base.join(&pr.author_agent);
+        if !worktree_path.exists() {
+            tracing::warn!(
+                pr_number = pr.number,
+                agent = %pr.author_agent,
+                path = %worktree_path.display(),
+                "Skipping reviewer spawn — author worktree absent (stale PR from previous session)"
+            );
+            return Ok(());
+        }
         let caller_bb = BirthBranch::from(pr.base_branch.as_str());
         self.spawn_reviewer_subtree(pr, &caller_bb).await?;
         Ok(())

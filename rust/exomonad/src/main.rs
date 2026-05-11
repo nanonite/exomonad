@@ -266,7 +266,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::Init { session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model } => {
-            init::run(session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model).await?;
+            if let Err(e) = init::run(session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model).await {
+                tracing::error!(error = %e, "exomonad init failed: {:#}", e);
+                return Err(e);
+            }
         }
 
         Commands::New { name } => {

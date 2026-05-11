@@ -108,7 +108,9 @@ _install profile:
     echo ">>> [3/3] Installing binaries..."
     mkdir -p ~/.cargo/bin
     mkdir -p ~/.exo/wasm
-    cp "target/${TARGET_DIR}/exomonad" ~/.cargo/bin/
+    # Atomic rename so install works even when the binary is in use (e.g. mcp-stdio running)
+    cp "target/${TARGET_DIR}/exomonad" ~/.cargo/bin/exomonad.new
+    mv ~/.cargo/bin/exomonad.new ~/.cargo/bin/exomonad
     cp .exo/wasm/wasm-guest-devswarm.wasm ~/.exo/wasm/
     [ -f .exo/wasm/wasm-guest-e2e-test.wasm ] && cp .exo/wasm/wasm-guest-e2e-test.wasm ~/.exo/wasm/ || true
 
@@ -127,6 +129,10 @@ _install profile:
     echo "Installed:"
     ls -lh ~/.cargo/bin/exomonad
     ls -lh .exo/wasm/wasm-guest-devswarm.wasm
+
+# Build Rust binary only (no WASM, no install) — fast iteration
+build:
+    nix develop --command cargo build -p exomonad
 
 # Install everything: Rust binaries + WASM plugins (release build)
 install-all: (_install "release")

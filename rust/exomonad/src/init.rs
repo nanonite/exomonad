@@ -466,11 +466,28 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
                 }
             }
         }
-        // Clean up stale socket
+        // Clean up server socket and pid unconditionally — old server is dead or dying.
         let sock = cwd.join(".exo/server.sock");
-        if sock.exists() {
-            info!("Removing stale server socket");
-            let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&pid_path);
+        info!("Cleaned up server socket and pid");
+
+        // Clear stale session state: PR registry and non-root agent entries.
+        // These are per-session — the old agents are dead and their PRs will never
+        // be updated, so carrying them forward causes spurious reviewer spawns.
+        let prs_path = cwd.join(".exo/prs.json");
+        if prs_path.exists() {
+            let _ = std::fs::remove_file(&prs_path);
+            info!("Cleared stale prs.json");
+        }
+        let agents_dir = cwd.join(".exo/agents");
+        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name() != "root" {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+            info!("Cleared stale agent entries (kept root)");
         }
 
         if session_alive {
@@ -645,10 +662,11 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
         }
     };
     let serve_cmd = format!(
-        "EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={}{} exomonad serve",
+        "EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE={}{} exomonad serve",
         &session,
         agent_type_str(config.root_agent_type),
         agent_type_str(config.spawn_agent_type),
+        agent_type_str(config.reviewer.agent_type),
         model_env,
     );
     let send_status = std::process::Command::new("tmux")

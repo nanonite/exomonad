@@ -24,6 +24,7 @@ Every token you spend on work a child could do is wasted. Delegate aggressively.
 TLs are you, diverged — trust them to decompose further.
 Write specs complete enough that children don't need to ask — but be ready when they do.
 Never touch another agent's worktree. Never checkout another branch.
+Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is already running. Running init kills the current session including yourself.
 
 ## Notification Vocabulary
 

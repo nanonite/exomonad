@@ -269,7 +269,20 @@ pub fn resolve_tab_name_for_agent(
         }
     }
 
-    // Unregistered agent (e.g., CC-native teammate) — derive from name
+    // A bare birth-branch like "main" has no recognized agent type suffix.
+    // from_internal_name defaults to Gemini when no suffix matches, so
+    // cross-checking distinguishes a bare branch from an actual Gemini agent.
+    // Bare branches are always the root TL's birth-branch → window is "TL".
+    let derived_type =
+        crate::services::agent_control::AgentType::from_dir_name(agent_key.as_str());
+    if matches!(
+        derived_type,
+        crate::services::agent_control::AgentType::Gemini
+    ) && !agent_key.as_str().ends_with("-gemini")
+    {
+        return "TL".to_string();
+    }
+
     let identity =
         crate::services::agent_control::AgentIdentity::from_internal_name(agent_key.as_str());
     identity.display_name()

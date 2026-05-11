@@ -8,12 +8,13 @@ use crate::effects::{
     dispatch_file_pr_effect, EffectHandler, EffectResult, FilePrEffects, ResultExt,
 };
 use crate::services::file_pr::{self, FilePRInput};
+use crate::services::file_pr_local;
 use async_trait::async_trait;
 use exomonad_proto::effects::file_pr::*;
 use std::sync::Arc;
 use tracing::instrument;
 
-use crate::services::{HasEventLog, HasGitHubClient, HasGitWorktreeService};
+use crate::services::{HasEventLog, HasGitHubClient, HasGitWorktreeService, HasProjectDir};
 
 /// File PR effect handler.
 ///
@@ -23,15 +24,17 @@ pub struct FilePRHandler<C> {
     ctx: Arc<C>,
 }
 
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> FilePRHandler<C> {
+impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 'static>
+    FilePRHandler<C>
+{
     pub fn new(ctx: Arc<C>) -> Self {
         Self { ctx }
     }
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> EffectHandler
-    for FilePRHandler<C>
+impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 'static>
+    EffectHandler for FilePRHandler<C>
 {
     fn namespace(&self) -> &str {
         "file_pr"
@@ -48,8 +51,8 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> EffectH
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> FilePrEffects
-    for FilePRHandler<C>
+impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 'static>
+    FilePrEffects for FilePRHandler<C>
 {
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, pr_title = %req.title))]
     async fn file_pr(
@@ -69,13 +72,26 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> FilePrE
             working_dir: Some(working_dir.to_string_lossy().to_string()),
         };
 
-        let output = file_pr::file_pr_async(
-            &input,
-            self.ctx.git_worktree_service().clone(),
-            self.ctx.github_client().map(|arc| arc.as_ref()),
-        )
-        .await
-        .effect_err("file_pr")?;
+        let output = if self.ctx.github_client().is_some() {
+            file_pr::file_pr_async(
+                &input,
+                self.ctx.git_worktree_service().clone(),
+                self.ctx.github_client().map(|arc| arc.as_ref()),
+            )
+            .await
+            .effect_err("file_pr")?
+        } else {
+            tracing::info!("[FilePR] No GitHub client — routing to local PR flow");
+            file_pr_local::file_pr_local(
+                &input,
+                self.ctx.git_worktree_service().clone(),
+                self.ctx.project_dir(),
+                &crate::domain::Role::dev(),
+                &ctx.agent_name,
+            )
+            .await
+            .effect_err("file_pr")?
+        };
 
         tracing::info!(
             pr_number = output.pr_number.as_u64(),

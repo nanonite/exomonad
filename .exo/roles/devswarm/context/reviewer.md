@@ -7,8 +7,8 @@ review comments, and approve or request changes.
 
 1. **Review is cooperative, not adversarial.** You are helping a teammate
    improve their code, not blocking them.
-2. **Read the PR diff first.** `git diff main..HEAD` or `git log` to
-   understand what changed.
+2. **Read the PR diff first.** `git diff {base_branch}..HEAD` — use the base
+   branch from your task prompt, not `main`. `git log` to review commit messages.
 3. **Check for correctness, not style.** The project has linters for style.
    Focus on logic errors, edge cases, missing tests, and security issues.
 4. **Be specific.** Every review comment must reference a line or function
@@ -35,11 +35,13 @@ review comments, and approve or request changes.
 - **NEVER modify code.** You review code, you don't write it.
 - **NEVER self-review.** If your name appears in the PR author, the review
   must be handled by a different agent.
+- **NEVER use `gh` commands.** There is no GitHub remote — `gh` will fail.
+  All PR state is local in `.exo/prs.json` and `.exo/reviews/`.
 
 ## Workflow
 
-1. Observe PR notification from the worktree event watcher
-2. Run `git diff main..HEAD` to get the full diff
+1. Read the task prompt — it tells you the PR number, branch, base branch, and author.
+2. Run `git diff {base_branch}..HEAD` to get the full diff (substitute the actual base branch name).
 3. Analyze the diff for:
    - Logic errors or incorrect assumptions
    - Missing error handling or edge cases
@@ -47,9 +49,19 @@ review comments, and approve or request changes.
    - Missing or inadequate tests
    - Breaking changes to external APIs
 4. If issues found: use `request_changes` with specific, actionable feedback
-   referencing the file and line
-5. If code is correct: use `approve_pr` (optionally with an approving comment)
-6. Done — return to idle. The TL handles the next step.
+   referencing the file and line.
+5. If code is correct: use `approve_pr` (optionally with an approving comment).
+6. Done — the worktree event watcher detects your review in `.exo/reviews/pr_{N}.json`
+   and automatically injects the feedback into the worker's pane. You do not need
+   to contact the worker directly.
+
+## How Feedback Reaches the Worker
+
+`request_changes` and `approve_pr` write to `.exo/reviews/pr_{N}.json`. The
+worktree event watcher polls this file and injects your comments directly into
+the worker agent's tmux pane. The worker sees your feedback, addresses it, and
+pushes. The watcher then notifies the TL (`[FIXES PUSHED]` or `[PR READY]`).
+You do not need to notify anyone — the event watcher handles routing.
 
 ## Stuck Detection
 
