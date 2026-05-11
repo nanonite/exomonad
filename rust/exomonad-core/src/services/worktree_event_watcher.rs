@@ -239,8 +239,9 @@ where
             let ci_map = self.ci_status_map.clone();
             let knot_url = self.knot_url.clone();
             let spindle_url = self.spindle_url.clone();
+            let worktrees_dir = self.ctx.project_dir().join(".exo/worktrees");
             tokio::spawn(async move {
-                run_ci_subscriber(knot_url, spindle_url, ci_map).await;
+                run_ci_subscriber(knot_url, spindle_url, ci_map, worktrees_dir).await;
             });
         }
 
@@ -888,6 +889,7 @@ fn compute_pr_actions(
             payload: serde_json::json!({
                 "kind": "approved",
                 "pr_number": pr_number.as_u64(),
+                "ci_status": ci_status.as_str(),
             }),
         });
     }
@@ -956,6 +958,7 @@ fn compute_pr_actions(
                 "kind": "timeout",
                 "pr_number": pr_number.as_u64(),
                 "minutes_elapsed": timeout_minutes,
+                "ci_status": ci_status.as_str(),
             }),
         });
     }
@@ -1051,6 +1054,7 @@ async fn run_ci_subscriber(
     knot_url: Option<String>,
     spindle_url: Option<String>,
     ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
+    worktrees_dir: std::path::PathBuf,
 ) {
     // pipeline rkey → branch name, populated from the knot's Pipeline events
     let pipeline_map: Arc<RwLock<HashMap<String, BranchName>>> =
@@ -1060,16 +1064,18 @@ async fn run_ci_subscriber(
 
     if let Some(url) = knot_url {
         let pm = pipeline_map.clone();
+        let wd = worktrees_dir.clone();
         handles.push(tokio::spawn(async move {
-            run_knot_subscriber(url, pm).await;
+            run_knot_subscriber(url, pm, wd).await;
         }));
     }
 
     if let Some(url) = spindle_url {
         let pm = pipeline_map.clone();
         let cs = ci_status_map.clone();
+        let wd = worktrees_dir.clone();
         handles.push(tokio::spawn(async move {
-            run_spindle_subscriber(url, pm, cs).await;
+            run_spindle_subscriber(url, pm, cs, wd).await;
         }));
     }
 
@@ -1081,6 +1087,7 @@ async fn run_ci_subscriber(
 async fn run_knot_subscriber(
     knot_url: String,
     pipeline_map: Arc<RwLock<HashMap<String, BranchName>>>,
+    worktrees_dir: std::path::PathBuf,
 ) {
     loop {
         match tokio_tungstenite::connect_async(&knot_url).await {
@@ -1092,7 +1099,13 @@ async fn run_knot_subscriber(
                             if let Ok(ev) = serde_json::from_str::<TangledStreamEvent>(&text) {
                                 if ev.nsid == "sh.tangled.pipeline" {
                                     if let Some(branch_name) = extract_pipeline_branch(&ev.event) {
-                                        debug!(rkey = %ev.rkey, branch = %branch_name, "Knot: pipeline→branch mapped");
+                                        let worktree = worktrees_dir.join(branch_name.as_str());
+                                        info!(
+                                            rkey = %ev.rkey,
+                                            branch = %branch_name,
+                                            worktree = %worktree.display(),
+                                            "Spindle: CI initiated for worktree"
+                                        );
                                         pipeline_map.write().await.insert(ev.rkey, branch_name);
                                     }
                                 }
@@ -1122,6 +1135,7 @@ async fn run_spindle_subscriber(
     spindle_url: String,
     pipeline_map: Arc<RwLock<HashMap<String, BranchName>>>,
     ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
+    worktrees_dir: std::path::PathBuf,
 ) {
     loop {
         match tokio_tungstenite::connect_async(&spindle_url).await {
@@ -1136,7 +1150,14 @@ async fn run_spindle_subscriber(
                                         let branch = pipeline_map.read().await.get(&rkey).cloned();
                                         if let Some(branch) = branch {
                                             let ci = CIStatus::parse(&status);
-                                            info!(rkey = %rkey, branch = %branch, status = %status, "Spindle: CI status updated");
+                                            let worktree = worktrees_dir.join(branch.as_str());
+                                            info!(
+                                                rkey = %rkey,
+                                                branch = %branch,
+                                                status = %status,
+                                                worktree = %worktree.display(),
+                                                "Spindle: CI status updated"
+                                            );
                                             ci_status_map.write().await.insert(branch, ci);
                                         } else {
                                             debug!(rkey = %rkey, status = %status, "Spindle: no branch mapping for pipeline rkey yet");

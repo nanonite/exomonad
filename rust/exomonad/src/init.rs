@@ -822,12 +822,21 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
 
         // Process companions: plain command in a tmux window, no agent infrastructure
         if agent_type == AgentType::Process {
-            info!(name = %companion.name, agent_type = ?agent_type, "Spawning companion process");
             let companion_cmd = &companion.command;
+            info!(
+                name = %companion.name,
+                cmd = %companion_cmd,
+                "Spawning companion process"
+            );
             let window_id = ipc
                 .new_window(&companion.name, &cwd, &shell, companion_cmd)
                 .await?;
-            info!(name = %companion.name, window = %window_id.as_str(), "Companion process spawned");
+            info!(
+                name = %companion.name,
+                window = %window_id.as_str(),
+                cmd = %companion_cmd,
+                "Companion process spawned"
+            );
             continue;
         }
 
