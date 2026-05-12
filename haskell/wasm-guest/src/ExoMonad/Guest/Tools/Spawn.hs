@@ -68,13 +68,13 @@ import Data.Text.Lazy qualified as TL
 import Effects.EffectError (Custom (..), EffectError (..), EffectErrorKind (..), InvalidInput (..), NetworkError (..), NotFound (..), PermissionDenied (..), Timeout (..))
 import Effects.Git qualified as Git
 import Effects.Log qualified as Log
-import ExoMonad.Guest.Tools.Chainlink.Pure (chainlinkWorkerProtocolText)
 import ExoMonad.Effects.Git (GitGetStatus, GitHasUnpushedCommits)
 import ExoMonad.Effects.Log (LogEmitEvent)
 import ExoMonad.Guest.Effects.AgentControl qualified as AC
 import ExoMonad.Guest.Tool.Class (MCPCallOutput (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (JsonSchema (..), genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
+import ExoMonad.Guest.Tools.Chainlink.Pure (chainlinkWorkerProtocolText)
 import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
 
@@ -242,6 +242,7 @@ data SpawnLeafSubtree
 data SpawnLeafSubtreeArgs = SpawnLeafSubtreeArgs
   { slsTask :: Text,
     slsBranchName :: Text,
+    slsAgentType :: Maybe AC.AgentType,
     slsPermissionMode :: Maybe Text,
     slsAllowedTools :: Maybe [Text],
     slsDisallowedTools :: Maybe [Text],
@@ -255,6 +256,7 @@ instance FromJSON SpawnLeafSubtreeArgs where
     SpawnLeafSubtreeArgs
       <$> v .: "task"
       <*> v .: "branch_name"
+      <*> v .:? "agent_type"
       <*> v .:? "permission_mode"
       <*> v .:? "allowed_tools"
       <*> v .:? "disallowed_tools"
@@ -271,6 +273,7 @@ spawnLeafSubtreeSchema =
   genericToolSchemaWith @SpawnLeafSubtreeArgs
     [ ("task", "Description of the sub-problem to solve"),
       ("branch_name", "Branch name suffix (will be prefixed with current branch)"),
+      ("agent_type", "Agent type for the leaf: 'claude' or 'opencode'. Omit to use the server default."),
       ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
       ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
       ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction."),
@@ -295,7 +298,7 @@ spawnLeafSubtreeCore args = do
           { AC.slcTask = renderedTask,
             AC.slcBranchName = slsBranchName args,
             AC.slcRole = Nothing,
-            AC.slcAgentType = Nothing,
+            AC.slcAgentType = slsAgentType args,
             AC.slcPerms = perms,
             AC.slcStandaloneRepo = standaloneRepo,
             AC.slcAllowedDirs = fromMaybe [] (slsAllowedDirs args)
@@ -465,6 +468,7 @@ data SpawnLeaf
 data SpawnLeafArgs = SpawnLeafArgs
   { slName :: Text,
     slTask :: Text,
+    slAgentType :: Maybe AC.AgentType,
     slReadFirst :: Maybe [Text],
     slSteps :: Maybe [Text],
     slVerify :: Maybe [Text],
@@ -478,6 +482,7 @@ instance FromJSON SpawnLeafArgs where
     SpawnLeafArgs
       <$> v .: "name"
       <*> v .: "task"
+      <*> v .:? "agent_type"
       <*> v .:? "read_first"
       <*> v .:? "steps"
       <*> v .:? "verify"
@@ -485,13 +490,14 @@ instance FromJSON SpawnLeafArgs where
       <*> v .:? "context"
 
 spawnLeafDescription :: Text
-spawnLeafDescription = "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). Agent type is determined by server config (--worker flag). Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately \x2014 you will be notified when the agent completes."
+spawnLeafDescription = "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). Agent type defaults to the server config; pass agent_type only when this leaf needs a specific supported runtime. Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately \x2014 you will be notified when the agent completes."
 
 spawnLeafSchema :: Aeson.Object
 spawnLeafSchema =
   genericToolSchemaWith @SpawnLeafArgs
     [ ("name", "Branch name suffix (e.g., 'fix-clippy' \x2192 'main.fix-clippy')"),
       ("task", "What to build. Combined with steps/verify/boundary into structured spec"),
+      ("agent_type", "Agent type for the leaf: 'claude' or 'opencode'. Omit to use the server default."),
       ("steps", "Numbered implementation steps with code snippets and exact file paths"),
       ("verify", "Exact verification commands (e.g., 'cargo test --workspace')"),
       ("boundary", "DO NOT rules for known failure modes"),
@@ -505,6 +511,7 @@ spawnLeafCore args = do
         SpawnLeafSubtreeArgs
           { slsTask = buildLeafTask args,
             slsBranchName = slName args,
+            slsAgentType = slAgentType args,
             slsPermissionMode = Nothing,
             slsAllowedTools = Nothing,
             slsDisallowedTools = Nothing,
@@ -678,9 +685,10 @@ leafProfileText = "## Completion Protocol (Leaf Subtree)\nYou are a **leaf agent
 
 -- | Pre-rendered worker profile text.
 workerProfileText :: Text
-workerProfileText = "## Completion Protocol (Worker)\nYou are an **ephemeral worker** \x2014 you run in the parent's directory on the parent's branch. You do NOT have your own worktree or branch.\n\nWhen you are done:\n\n1. **Call `notify_parent`** with status `success` and a DETAILED message containing your complete findings.\n   - Include FULL code snippets, exact file paths with line numbers, and concrete data.\n   - Your parent CANNOT see your terminal output. `notify_parent` is your ONLY communication channel.\n   - A terse summary like \"Task complete\" is useless \x2014 include everything the parent needs to act on your findings.\n   - For research tasks: include the actual code/data you found, not just \"I found it.\"\n   - For implementation tasks: describe exactly what you changed and how to verify it.\n2. If you failed after multiple attempts, call `notify_parent` with status `failure` and explain what went wrong.\n\n**DO NOT:**\n- Commit, push, or file PRs (you are ephemeral \x2014 the parent owns the branch)\n- Create new branches\n- Run `git checkout` or `git switch`\n- Print findings to stdout instead of sending them via `notify_parent`"
-  <> "\n\n"
-  <> chainlinkWorkerProtocolText
+workerProfileText =
+  "## Completion Protocol (Worker)\nYou are an **ephemeral worker** \x2014 you run in the parent's directory on the parent's branch. You do NOT have your own worktree or branch.\n\nWhen you are done:\n\n1. **Call `notify_parent`** with status `success` and a DETAILED message containing your complete findings.\n   - Include FULL code snippets, exact file paths with line numbers, and concrete data.\n   - Your parent CANNOT see your terminal output. `notify_parent` is your ONLY communication channel.\n   - A terse summary like \"Task complete\" is useless \x2014 include everything the parent needs to act on your findings.\n   - For research tasks: include the actual code/data you found, not just \"I found it.\"\n   - For implementation tasks: describe exactly what you changed and how to verify it.\n2. If you failed after multiple attempts, call `notify_parent` with status `failure` and explain what went wrong.\n\n**DO NOT:**\n- Commit, push, or file PRs (you are ephemeral \x2014 the parent owns the branch)\n- Create new branches\n- Run `git checkout` or `git switch`\n- Print findings to stdout instead of sending them via `notify_parent`"
+    <> "\n\n"
+    <> chainlinkWorkerProtocolText
 
 -- | Pre-rendered research worker profile text.
 researchProfileText :: Text

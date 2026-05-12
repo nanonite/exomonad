@@ -13,7 +13,7 @@ Use exomonad MCP tools for orchestration. Git operations use `git` CLI. **Never 
 | Tool | Role | What it does |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents (own worktrees, context inherited by default via `fork_session`) |
-| `spawn_leaf` | root, tl | Spawn a leaf agent in its own worktree+branch (files PR when done). Agent type set by server config — do NOT pass `agent_type` explicitly. |
+| `spawn_leaf` | root, tl | Spawn a leaf agent in its own worktree+branch (files PR when done). Agent type defaults to server config; pass `agent_type` only when this leaf needs a specific supported runtime. |
 | `spawn_worker` | root, tl | Spawn an ephemeral worker in a tmux pane (no branch, no PR). Research or in-place edits. |
 | `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming). Works locally via `.exo/prs.json` when no GitHub remote. |
 | `merge_pr` | root, tl | Merge a child's PR |

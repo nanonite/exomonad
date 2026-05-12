@@ -35,7 +35,7 @@ A minimal but complete test exercising all 3 spawn types + the review cycle with
 ```
 Root TL (you instruct this)
 ├── [Scaffold] pre-created by run.sh (src/alpha.py, src/beta.py with stubs)
-├── [Wave 1] fork_wave → 1 Claude sub-TL + spawn_leaf → 1 Gemini leaf (parallel)
+├── [Wave 1] fork_wave → 1 Claude sub-TL + spawn_leaf → 1 leaf agent (parallel)
 │   ├── Sub-TL "alpha" (worktree 1) → spawn_worker × 1 (inline)
 │   │   └── worker: implement functions in src/alpha.py
 │   │   └── sub-TL commits, pushes, files PR to root
@@ -44,7 +44,7 @@ Root TL (you instruct this)
 └── Root merges both PRs
 ```
 
-This exercises: `spawn_worker` (ephemeral pane), `fork_wave` (Claude subtree), `spawn_leaf` (Gemini worktree leaf), and the review cycle — with only 2 worktrees and minimal Gemini usage.
+This exercises: `spawn_worker` (ephemeral pane), `fork_wave` (Claude subtree), `spawn_leaf` (worktree leaf), and the review cycle — with only 2 worktrees and minimal leaf-agent usage.
 
 ---
 

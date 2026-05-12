@@ -22,6 +22,15 @@ lint:
 test-fast:
     nix develop --command cargo test --workspace --lib
 
+# Run every Rust test target through the dev shell
+test-cargo-all:
+    nix develop --command cargo test --workspace
+
+# Build WASM, then run the Rust host ↔ Haskell WASM integration tests
+test-wasm-integration:
+    just wasm-all
+    nix develop --command cargo test -p exomonad-core --test wasm_integration
+
 # Run tests: Rust unit tests, cargo check, WASM build, proto freshness
 test:
     #!/usr/bin/env bash

@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use exomonad_core::{EffectError, EffectHandler, EffectResult, RuntimeBuilder};
 use prost::Message;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use serial_test::serial;
 
 // ============================================================================
@@ -204,7 +204,7 @@ impl EffectHandler for MockAgentHandler {
     async fn handle(
         &self,
         effect_type: &str,
-        _payload: &[u8],
+        payload: &[u8],
         _ctx: &exomonad_core::effects::EffectContext,
     ) -> EffectResult<Vec<u8>> {
         use exomonad_proto::effects::agent::*;
@@ -228,12 +228,14 @@ impl EffectHandler for MockAgentHandler {
                 Ok(SpawnSubtreeResponse { agent: Some(agent) }.encode_to_vec())
             }
             "agent.spawn_leaf_subtree" => {
+                let req = SpawnLeafSubtreeRequest::decode(payload)
+                    .expect("mock agent handler should decode spawn_leaf_subtree request");
                 let agent = AgentInfo {
                     id: "test-leaf-gemini".into(),
                     issue: String::new(),
                     worktree_path: "/tmp/test-leaf-worktree".into(),
                     branch_name: "main.test-leaf".into(),
-                    agent_type: 2,
+                    agent_type: req.agent_type,
                     role: 2,
                     alive: true,
                     mux_window: "test-leaf".into(),
@@ -542,8 +544,8 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
 
     for expected in [
         "fork_wave",
-        "spawn_leaf_subtree",
-        "spawn_workers",
+        "spawn_leaf",
+        "spawn_worker",
         "merge_pr",
         "file_pr",
         "notify_parent",
@@ -643,42 +645,61 @@ async fn wasm_fork_wave_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn wasm_spawn_leaf_subtree_roundtrip() {
+async fn wasm_spawn_leaf_roundtrip() {
     let runtime = build_test_runtime().await;
 
     let output = call_tool(
         &runtime,
         "tl",
-        "spawn_leaf_subtree",
+        "spawn_leaf",
         json!({
+            "name": "rust-handler",
             "task": "Implement the Rust handler",
-            "branch_name": "rust-handler"
         }),
     )
     .await;
 
-    assert_tool_success(&output, "spawn_leaf_subtree");
+    assert_tool_success(&output, "spawn_leaf");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn wasm_spawn_workers_roundtrip() {
+async fn wasm_spawn_leaf_passes_agent_type() {
     let runtime = build_test_runtime().await;
 
     let output = call_tool(
         &runtime,
         "tl",
-        "spawn_workers",
+        "spawn_leaf",
         json!({
-            "specs": [{
-                "name": "rust-impl",
-                "task": "Implement the Rust side"
-            }]
+            "name": "rust-handler",
+            "task": "Implement the Rust handler",
+            "agent_type": "opencode"
         }),
     )
     .await;
 
-    assert_tool_success(&output, "spawn_workers");
+    assert_tool_success(&output, "spawn_leaf");
+    assert_eq!(output["result"]["agent_type"], "opencode");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_worker_roundtrip() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_worker",
+        json!({
+            "name": "rust-impl",
+            "task": "Implement the Rust side"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_worker");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1013,11 +1034,11 @@ async fn wasm_fork_wave_multiline_text() {
     }
 }
 
-/// Diagnostic: spawn_leaf_subtree with timeout to observe trampoline logs.
-/// Calls fork_wave first to warm up the WASM runtime, then tries spawn_leaf_subtree.
+/// Diagnostic: spawn_leaf with timeout to observe trampoline logs.
+/// Calls fork_wave first to warm up the WASM runtime, then tries spawn_leaf.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn wasm_spawn_leaf_subtree_timeout_diagnostic() {
+async fn wasm_spawn_leaf_timeout_diagnostic() {
     let runtime = build_test_runtime().await;
 
     // Warm up: call fork_wave first (this works)
@@ -1031,17 +1052,17 @@ async fn wasm_spawn_leaf_subtree_timeout_diagnostic() {
     .await;
     eprintln!("=== Warmup completed: success={} ===", warmup["success"]);
 
-    eprintln!("=== DIAGNOSTIC: Starting spawn_leaf_subtree call ===");
+    eprintln!("=== DIAGNOSTIC: Starting spawn_leaf call ===");
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         call_tool(
             &runtime,
             "tl",
-            "spawn_leaf_subtree",
+            "spawn_leaf",
             json!({
+                "name": "test-leaf",
                 "task": "Test task",
-                "branch_name": "test-leaf"
             }),
         ),
     )
@@ -1049,35 +1070,33 @@ async fn wasm_spawn_leaf_subtree_timeout_diagnostic() {
 
     match result {
         Ok(output) => {
-            eprintln!("=== DIAGNOSTIC: spawn_leaf_subtree completed: {output:#} ===");
-            assert_tool_success(&output, "spawn_leaf_subtree (diagnostic)");
+            eprintln!("=== DIAGNOSTIC: spawn_leaf completed: {output:#} ===");
+            assert_tool_success(&output, "spawn_leaf (diagnostic)");
         }
         Err(_) => {
-            eprintln!("=== DIAGNOSTIC: spawn_leaf_subtree TIMED OUT after 30s ===");
-            panic!("spawn_leaf_subtree hung — check trampoline logs above");
+            eprintln!("=== DIAGNOSTIC: spawn_leaf TIMED OUT after 30s ===");
+            panic!("spawn_leaf hung — check trampoline logs above");
         }
     }
 }
 
-/// Diagnostic: spawn_workers with timeout.
+/// Diagnostic: spawn_worker with timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn wasm_spawn_workers_timeout_diagnostic() {
+async fn wasm_spawn_worker_timeout_diagnostic() {
     let runtime = build_test_runtime().await;
 
-    eprintln!("=== DIAGNOSTIC: Starting spawn_workers call ===");
+    eprintln!("=== DIAGNOSTIC: Starting spawn_worker call ===");
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         call_tool(
             &runtime,
             "tl",
-            "spawn_workers",
+            "spawn_worker",
             json!({
-                "specs": [{
-                    "name": "diag-worker",
-                    "task": "Test task"
-                }]
+                "name": "diag-worker",
+                "task": "Test task"
             }),
         ),
     )
@@ -1085,12 +1104,12 @@ async fn wasm_spawn_workers_timeout_diagnostic() {
 
     match result {
         Ok(output) => {
-            eprintln!("=== DIAGNOSTIC: spawn_workers completed: {output:#} ===");
-            assert_tool_success(&output, "spawn_workers (diagnostic)");
+            eprintln!("=== DIAGNOSTIC: spawn_worker completed: {output:#} ===");
+            assert_tool_success(&output, "spawn_worker (diagnostic)");
         }
         Err(_) => {
-            eprintln!("=== DIAGNOSTIC: spawn_workers TIMED OUT after 30s ===");
-            panic!("spawn_workers hung — check trampoline logs above");
+            eprintln!("=== DIAGNOSTIC: spawn_worker TIMED OUT after 30s ===");
+            panic!("spawn_worker hung — check trampoline logs above");
         }
     }
 }
