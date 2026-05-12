@@ -94,6 +94,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - Ignore local lolearn database (#150)
 - spawn_leaf: add optional agent_type param (default to server spawn_agent_type) (#120)
+- remove Gemini-specific language from all spawn tool docs and CLAUDE.md (#123)
+- Audit GeminiBeforeModel/GeminiAfterModel naming for spawn-agnosticism (#136)
 - Add HookRuntime::OpenCode to protocol (#129)
 - Investigate spindle event idempotency for persistent spindle.db across exomonad init sessions (#119)
 - exomonad init: auto-start spindle as companion using binary copy pattern (#117)
