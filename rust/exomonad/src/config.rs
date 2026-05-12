@@ -9,6 +9,7 @@ fn parse_agent_type_env(s: &str) -> Option<AgentType> {
         "claude" | "claude-code" => Some(AgentType::Claude),
         "gemini" => Some(AgentType::Gemini),
         "opencode" | "opencode-cli" => Some(AgentType::OpenCode),
+        "codex" => Some(AgentType::Codex),
         "shoal" => Some(AgentType::Shoal),
         _ => None,
     }

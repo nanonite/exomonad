@@ -242,8 +242,9 @@ fn convert_agent_type(t: AgentType) -> EffectResult<ServiceAgentType> {
         AgentType::Gemini => Ok(ServiceAgentType::Gemini),
         AgentType::Shoal => Ok(ServiceAgentType::Shoal),
         AgentType::Opencode => Ok(ServiceAgentType::OpenCode),
+        AgentType::Codex => Ok(ServiceAgentType::Codex),
         AgentType::Unspecified => Err(EffectError::invalid_input(
-            "agent_type is required (must be 'claude', 'gemini', 'shoal', or 'opencode', got UNSPECIFIED)",
+            "agent_type is required (must be 'claude', 'gemini', 'shoal', 'opencode', or 'codex', got UNSPECIFIED)",
         )),
     }
 }
@@ -1008,6 +1009,7 @@ fn service_agent_type_to_proto(at: ServiceAgentType) -> i32 {
         ServiceAgentType::Gemini => AgentType::Gemini as i32,
         ServiceAgentType::Shoal => AgentType::Shoal as i32,
         ServiceAgentType::OpenCode => AgentType::Opencode as i32,
+        ServiceAgentType::Codex => AgentType::Codex as i32,
         ServiceAgentType::Process => AgentType::Unspecified as i32,
     }
 }
@@ -1018,6 +1020,7 @@ fn service_info_to_proto(info: &AgentInfo) -> exomonad_proto::effects::agent::Ag
         Some(ServiceAgentType::Gemini) => AgentType::Gemini as i32,
         Some(ServiceAgentType::Shoal) => AgentType::Shoal as i32,
         Some(ServiceAgentType::OpenCode) => AgentType::Opencode as i32,
+        Some(ServiceAgentType::Codex) => AgentType::Codex as i32,
         Some(ServiceAgentType::Process) => AgentType::Unspecified as i32,
         None => AgentType::Unspecified as i32,
     };
@@ -1067,6 +1070,10 @@ mod tests {
         assert_eq!(
             convert_agent_type(AgentType::Gemini).unwrap(),
             ServiceAgentType::Gemini
+        );
+        assert_eq!(
+            convert_agent_type(AgentType::Codex).unwrap(),
+            ServiceAgentType::Codex
         );
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
     }

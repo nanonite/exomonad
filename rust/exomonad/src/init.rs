@@ -780,6 +780,7 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
                 let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
                 format!("opencode{opencode_model_flag}{yolo}")
             }
+            (AgentType::Codex, _) => "echo 'Codex root agent startup is not implemented yet'; exec bash -l".to_string(),
             (AgentType::Process, _) => unreachable!("Process is for companions only, not root agent"),
         }
     };
@@ -1062,6 +1063,7 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
                         serde_json::to_string_pretty(&opencode_config)?,
                     )?;
                 }
+                AgentType::Codex => {}
                 AgentType::Claude | AgentType::Process => unreachable!(),
             }
 
@@ -1131,6 +1133,7 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
                 };
                 format!("{env_prefix}opencode run{yolo}{model_flag}{task_part}")
             }
+            AgentType::Codex => format!("{env_prefix}echo 'Codex companion startup is not implemented yet'; exec bash -l"),
             AgentType::Process => unreachable!("Process companions handled above"),
         };
         let window_id = ipc
@@ -1403,8 +1406,9 @@ fn parse_agent_type(s: &str) -> Result<AgentType> {
         "claude" | "claude-code" => Ok(AgentType::Claude),
         "gemini" => Ok(AgentType::Gemini),
         "opencode" | "opencode-cli" => Ok(AgentType::OpenCode),
+        "codex" => Ok(AgentType::Codex),
         "shoal" => Ok(AgentType::Shoal),
-        _ => anyhow::bail!("Unknown agent type: {}. Valid values: claude, gemini, opencode, shoal", s),
+        _ => anyhow::bail!("Unknown agent type: {}. Valid values: claude, gemini, opencode, codex, shoal", s),
     }
 }
 
@@ -1413,6 +1417,7 @@ fn agent_type_str(t: AgentType) -> &'static str {
         AgentType::Claude => "claude",
         AgentType::Gemini => "gemini",
         AgentType::OpenCode => "opencode",
+        AgentType::Codex => "codex",
         AgentType::Shoal => "shoal",
         AgentType::Process => "process",
     }

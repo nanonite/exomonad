@@ -270,6 +270,7 @@ impl<
                     String::new()
                 }
             }
+            AgentType::Codex => String::new(),
             AgentType::OpenCode => String::new(),
             AgentType::Shoal | AgentType::Process => String::new(),
         };
@@ -608,6 +609,9 @@ impl<
                 fs::write(agent_dir.join("opencode.json"), mcp_content).await?;
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json for OpenCode agent");
             }
+            AgentType::Codex => {
+                return Err(anyhow!("Codex MCP config generation is not implemented yet"));
+            }
         }
         Ok(())
     }
@@ -826,6 +830,7 @@ impl<
                 }
                 serde_json::to_string_pretty(&config).unwrap()
             }
+            AgentType::Codex => String::new(),
             AgentType::Process => String::new(),
         }
     }

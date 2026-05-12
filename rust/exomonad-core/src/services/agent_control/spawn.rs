@@ -160,6 +160,7 @@ impl<
                 AgentType::Gemini => crate::domain::Role::dev(),
                 AgentType::Shoal => crate::domain::Role::shoal(),
                 AgentType::OpenCode => crate::domain::Role::dev(),
+                AgentType::Codex => crate::domain::Role::dev(),
                 AgentType::Process => unreachable!("Process agents are not spawned via effects"),
             };
             self.write_agent_mcp_config(
@@ -821,7 +822,7 @@ impl<
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy OpenCode role context (non-fatal)"),
                         }
                     }
-                    AgentType::Shoal | AgentType::Process => {}
+                    AgentType::Codex | AgentType::Shoal | AgentType::Process => {}
                 }
             }
 

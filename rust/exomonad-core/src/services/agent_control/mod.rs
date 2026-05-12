@@ -200,6 +200,9 @@ pub enum AgentType {
     /// OpenCode CLI (spawns with `opencode run "..."`).
     OpenCode,
 
+    /// OpenAI Codex CLI.
+    Codex,
+
     /// Plain long-running process (no MCP, no agent identity, no worktree).
     /// Used for companion processes like mock servers, log tailers, etc.
     Process,
@@ -241,6 +244,13 @@ pub(crate) const OPENCODE_META: AgentMetadata = AgentMetadata {
     emoji: "\u{1F4BB}", // 💻
 };
 
+pub(crate) const CODEX_META: AgentMetadata = AgentMetadata {
+    command: "codex",
+    prompt_flag: "",
+    suffix: "codex",
+    emoji: "\u{1F916}", // 🤖
+};
+
 pub(crate) const PROCESS_META: AgentMetadata = AgentMetadata {
     command: "",
     prompt_flag: "",
@@ -255,6 +265,7 @@ impl AgentType {
             AgentType::Gemini => &GEMINI_META,
             AgentType::Shoal => &SHOAL_META,
             AgentType::OpenCode => &OPENCODE_META,
+            AgentType::Codex => &CODEX_META,
             AgentType::Process => &PROCESS_META,
         }
     }
@@ -295,6 +306,8 @@ impl AgentType {
             AgentType::Shoal
         } else if dir_name.ends_with("-opencode") {
             AgentType::OpenCode
+        } else if dir_name.ends_with("-codex") {
+            AgentType::Codex
         } else if dir_name.ends_with("-process") {
             AgentType::Process
         } else {
@@ -978,6 +991,7 @@ mod tests {
             "gemini" => Some(super::AgentType::Gemini),
             "shoal" => Some(super::AgentType::Shoal),
             "opencode" => Some(super::AgentType::OpenCode),
+            "codex" => Some(super::AgentType::Codex),
             "process" => Some(super::AgentType::Process),
             _ => None,
         };
@@ -1000,6 +1014,7 @@ mod tests {
     fn test_agent_type_command() {
         assert_eq!(AgentType::Claude.command(), "claude");
         assert_eq!(AgentType::Gemini.command(), "gemini");
+        assert_eq!(AgentType::Codex.command(), "codex");
     }
 
     #[test]
@@ -1012,6 +1027,7 @@ mod tests {
     fn test_agent_type_suffix() {
         assert_eq!(AgentType::Claude.suffix(), "claude");
         assert_eq!(AgentType::Gemini.suffix(), "gemini");
+        assert_eq!(AgentType::Codex.suffix(), "codex");
     }
 
     #[test]
@@ -1057,6 +1073,9 @@ mod tests {
         let gemini: AgentType = serde_json::from_str("\"gemini\"").unwrap();
         assert_eq!(gemini, AgentType::Gemini);
 
+        let codex: AgentType = serde_json::from_str("\"codex\"").unwrap();
+        assert_eq!(codex, AgentType::Codex);
+
         // Invalid agent type should fail at parse boundary
         let invalid = serde_json::from_str::<AgentType>("\"invalid\"");
         assert!(invalid.is_err());
@@ -1076,6 +1095,14 @@ mod tests {
         assert_eq!(parsed.issue_id, "456");
         assert_eq!(parsed.slug, "add-feature");
         assert_eq!(parsed.agent_type, Some(AgentType::Gemini));
+    }
+
+    #[test]
+    fn test_parse_agent_dir_name_codex() {
+        let parsed = parse_agent_dir_name("gh-456-add-feature-codex").unwrap();
+        assert_eq!(parsed.issue_id, "456");
+        assert_eq!(parsed.slug, "add-feature");
+        assert_eq!(parsed.agent_type, Some(AgentType::Codex));
     }
 
     #[test]

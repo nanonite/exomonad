@@ -586,6 +586,7 @@ where
             AgentType::Gemini => "dev",
             AgentType::Shoal => "dev",
             AgentType::OpenCode => "dev",
+            AgentType::Codex => "dev",
             AgentType::Process => return Ok(None),
         };
 
