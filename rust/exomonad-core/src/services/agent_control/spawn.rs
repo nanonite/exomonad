@@ -1174,20 +1174,36 @@ impl<
         );
         let branch_name = format!("review-pr-{}", pr_entry.number);
 
-        // Use the author's worktree as the reviewer's working directory.
-        // It's already on the PR branch so the reviewer can diff against the base directly.
-        // spawn_subtree skips worktree creation when working_dir is Some, so this
-        // reuses the existing worktree and writes reviewer identity (.mcp.json) into it.
-        let reviewer_cwd = self.worktree_base.join(&pr_entry.author_agent);
+        // Compute the reviewer's own identity and path — same derivation spawn_subtree uses
+        // internally so the MCP config agent_name matches the directory name.
+        let agent_type = self.reviewer_agent_type;
+        let identity = AgentIdentity::new(slugify(&branch_name), agent_type);
+        let reviewer_path = self.worktree_base.join(identity.internal_name().as_str());
+
+        // Create a detached-HEAD worktree at the PR branch tip unless it already exists.
+        // Detached so we don't compete with the worker's branch; the reviewer never commits.
+        // This prevents clobbering the worker's opencode.json/MCP config while both run.
+        if !reviewer_path.exists() {
+            let git_wt = self.git_wt().clone();
+            let path = reviewer_path.clone();
+            let at_ref = pr_entry.head_branch.clone();
+            let name = identity.internal_name().to_string();
+            tokio::task::spawn_blocking(move || {
+                git_wt.create_workspace_detached(&path, &at_ref, &name)
+            })
+            .await
+            .context("tokio join error creating reviewer worktree")?
+            .context("Failed to create reviewer worktree")?;
+        }
 
         let options = SpawnSubtreeOptions {
             task,
             branch_name,
             parent_session_id: None,
             role: Some(crate::domain::Role::reviewer()),
-            agent_type: self.reviewer_agent_type,
+            agent_type,
             claude_flags: ClaudeSpawnFlags::default(),
-            working_dir: Some(reviewer_cwd),
+            working_dir: Some(reviewer_path),
             permissions: Some(AgentPermissions {
                 allow: vec![],
                 deny: vec![

@@ -128,6 +128,51 @@ impl GitWorktreeService {
         Ok(())
     }
 
+    /// Create a detached-HEAD worktree at the tip of an existing branch or ref.
+    ///
+    /// Unlike `create_workspace`, this does not create a new branch — the
+    /// worktree is in detached HEAD state. Used for read-only agents (reviewers)
+    /// that need the same code as a worker without competing for the branch.
+    pub fn create_workspace_detached(
+        &self,
+        path: &Path,
+        at_ref: &str,
+        identity_name: &str,
+    ) -> Result<(), WorktreeError> {
+        info!(path = %path.display(), at_ref, "Creating detached reviewer worktree");
+
+        let output = std::process::Command::new("git")
+            .args(["worktree", "add", "--detach", &path.to_string_lossy(), at_ref])
+            .current_dir(&self.project_dir)
+            .output()
+            .map_err(|e| WorktreeError::GitError {
+                message: format!("Failed to run git worktree add --detach: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(stderr = %stderr, "git worktree add --detach failed");
+            return Err(self.parse_git_stderr(&stderr));
+        }
+
+        let git_user_name = format!("exomonad-{}", identity_name);
+        let git_user_email = format!("{}@exomonad.local", identity_name);
+        for (key, value) in [("user.name", git_user_name.as_str()), ("user.email", git_user_email.as_str())] {
+            let out = std::process::Command::new("git")
+                .args(["config", "--local", key, value])
+                .current_dir(path)
+                .output()
+                .map_err(|e| WorktreeError::GitError {
+                    message: format!("Failed to set git config {}: {}", key, e),
+                })?;
+            if !out.status.success() {
+                warn!(key, stderr = %String::from_utf8_lossy(&out.stderr), "git config --local failed in reviewer worktree (non-fatal)");
+            }
+        }
+        info!(path = %path.display(), at_ref, "Reviewer worktree created (detached HEAD)");
+        Ok(())
+    }
+
     /// Remove a git worktree.
     ///
     /// Equivalent to: `git worktree remove --force {path}`
