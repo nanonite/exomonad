@@ -97,6 +97,9 @@ tests/integration/external-consumer/.exo/wasm/
 .jj/
 .gemini/settings.json
 
+# Local lolearn database
+.lolearn/knowledge.db
+
 # Generated symlinks (provisioned by init/spawn, source in .exo/roles/)
 .claude/rules/exomonad_*.md
 

@@ -92,6 +92,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Ignore local lolearn database (#150)
 - spawn_leaf: add optional agent_type param (default to server spawn_agent_type) (#120)
 - Add HookRuntime::OpenCode to protocol (#129)
 - Investigate spindle event idempotency for persistent spindle.db across exomonad init sessions (#119)
