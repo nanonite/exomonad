@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add --verbose flag to exomonad init with comprehensive observability logging (#140)
 - Implement explicit allow/deny handling in OpenCode plugin tool.execute.before (#139)
 - Add deny logic to OpenCode TypeScript plugin (#137)
 - Add hook activation logging to exomonad serve (#138)

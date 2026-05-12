@@ -71,7 +71,7 @@ async fn validate_opencode_model(model: &str) -> Result<()> {
 }
 
 /// Run the init command: create or attach to tmux session.
-pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool, tl: Option<String>, worker: Option<String>, tl_model: Option<String>, worker_model: Option<String>, reviewer: Option<String>, reviewer_model: Option<String>) -> Result<()> {
+pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool, tl: Option<String>, worker: Option<String>, tl_model: Option<String>, worker_model: Option<String>, reviewer: Option<String>, reviewer_model: Option<String>, verbose: bool) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
     use exomonad_core::services::{resolve_role_context_path, AgentType};
     use std::io::{IsTerminal, Write};
@@ -594,6 +594,16 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
         );
     }
 
+    // Propagate verbose/hook-trace flags session-wide so spawned worktrees inherit them
+    if verbose {
+        for (var, val) in [("EXOMONAD_VERBOSE", "1"), ("EXOMONAD_HOOK_TRACE", "1")] {
+            let _ = std::process::Command::new("tmux")
+                .args(["set-environment", "-t", &session, var, val])
+                .status();
+        }
+        info!("Verbose mode enabled: EXOMONAD_VERBOSE=1 EXOMONAD_HOOK_TRACE=1 set in session environment");
+    }
+
     // Set terminal window title to project/session name
     let _ = std::process::Command::new("tmux")
         .args(["set-option", "-t", &session, "set-titles", "on"])
@@ -662,8 +672,14 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
             format!(" {}", parts.join(" "))
         }
     };
+    let verbose_prefix = if verbose {
+        "RUST_LOG=info EXOMONAD_HOOK_TRACE=1 "
+    } else {
+        ""
+    };
     let serve_cmd = format!(
-        "EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE={}{} exomonad serve",
+        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE={}{} exomonad serve",
+        verbose_prefix,
         &session,
         agent_type_str(config.root_agent_type),
         agent_type_str(config.spawn_agent_type),

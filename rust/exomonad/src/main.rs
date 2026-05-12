@@ -91,6 +91,10 @@ enum Commands {
         /// Model for the reviewer agent. Validated against the agent type.
         #[arg(long)]
         reviewer_model: Option<String>,
+        /// Enable verbose observability logging: hook activations, decisions, reviewer spawns, spindle events.
+        /// Sets RUST_LOG=info and EXOMONAD_HOOK_TRACE=1 on the server; EXOMONAD_VERBOSE=1 session-wide.
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Initialize a new exomonad project in the current directory.
@@ -265,8 +269,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Init { session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model } => {
-            if let Err(e) = init::run(session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model).await {
+        Commands::Init { session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model, verbose } => {
+            if let Err(e) = init::run(session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model, verbose).await {
                 tracing::error!(error = %e, "exomonad init failed: {:#}", e);
                 return Err(e);
             }

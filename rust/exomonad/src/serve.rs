@@ -379,10 +379,22 @@ pub async fn handle_hook_inner(
         }
     }
 
+    let hook_trace = std::env::var("EXOMONAD_HOOK_TRACE").is_ok();
+
     // Parse and inject runtime
     let mut hook_input: HookInput =
         serde_json::from_str(body).context("Failed to parse hook input")?;
     hook_input.runtime = Some(runtime);
+
+    if hook_trace {
+        info!(
+            runtime = ?runtime,
+            event = ?event_type,
+            tool = hook_input.tool_name.as_ref().map(|t| t.as_str()).unwrap_or("-"),
+            agent = params.agent_id.as_deref().unwrap_or("root"),
+            "[hook] received"
+        );
+    }
 
     // Classify hook event into dispatch category. Exhaustive match ensures new
     // event types get handled explicitly rather than silently falling through.
@@ -614,6 +626,18 @@ pub async fn handle_hook_inner(
                 serde_json::to_string(&output).context("Failed to serialize output")?;
 
             let exit_code = if output.continue_ { 0 } else { 2 };
+
+            if hook_trace {
+                info!(
+                    runtime = ?runtime,
+                    event = ?event_type,
+                    tool = hook_input.tool_name.as_ref().map(|t| t.as_str()).unwrap_or("-"),
+                    agent = params.agent_id.as_deref().unwrap_or("root"),
+                    exit_code,
+                    response = %output_json,
+                    "[hook] dispatched"
+                );
+            }
 
             Ok(HookEnvelope {
                 stdout: output_json,
