@@ -35,7 +35,9 @@ repository head.hackage
 if arch(wasm32)
   -- COMPATIBILITY: Fix upstream 'time' package C99 compliance blocker.
   -- Forces Cabal to use patched version instead of boot library.
-  constraints: time >= 1.14
+  -- COMPATIBILITY: semialign-1.4 added Unzip as superclass of Semialign,
+  -- breaking aeson-2.2.4.1's KeyMap instance.
+  constraints: time >= 1.14, semialign < 1.4
 
   -- OPTIMIZATION: Binary size reduction
   -- Note: -Os not supported in GHC 9.12 WASM, use -O1 instead

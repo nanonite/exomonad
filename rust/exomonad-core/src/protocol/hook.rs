@@ -384,6 +384,8 @@ impl InternalStopHookOutput {
                 .unwrap_or_else(|_| r#"{"continue":true}"#.to_string()),
             Runtime::Gemini => serde_json::to_string(&self.to_gemini())
                 .unwrap_or_else(|_| r#"{"decision":"allow"}"#.to_string()),
+            Runtime::OpenCode => serde_json::to_string(&self.to_claude())
+                .unwrap_or_else(|_| r#"{"continue":true}"#.to_string()),
         }
     }
 }
@@ -680,7 +682,7 @@ mod proptest_tests {
     }
 
     fn arb_runtime() -> impl Strategy<Value = Runtime> {
-        prop_oneof![Just(Runtime::Claude), Just(Runtime::Gemini)]
+        prop_oneof![Just(Runtime::Claude), Just(Runtime::Gemini), Just(Runtime::OpenCode)]
     }
 
     fn arb_permission_mode() -> impl Strategy<Value = PermissionMode> {

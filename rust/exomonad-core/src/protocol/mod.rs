@@ -50,6 +50,11 @@ pub enum Runtime {
     Claude,
     /// Google's Gemini CLI.
     Gemini,
+    /// SST OpenCode CLI.
+    #[value(name = "opencode")]
+    #[serde(rename = "opencode")]
+    #[strum(serialize = "opencode")]
+    OpenCode,
 }
 
 /// Hook event type for CLI hooks.
@@ -116,6 +121,15 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_opencode_serialization() {
+        let val = Runtime::OpenCode;
+        let json = serde_json::to_string(&val).unwrap();
+        assert_eq!(json, "\"opencode\"");
+        let display = val.to_string();
+        assert_eq!(display, "opencode");
+    }
+
+    #[test]
     fn test_runtime_roundtrip() {
         let val = Runtime::Gemini;
         let json = serde_json::to_string(&val).unwrap();
@@ -127,6 +141,7 @@ mod tests {
     fn test_runtime_display() {
         assert_eq!(Runtime::Claude.to_string(), "claude");
         assert_eq!(Runtime::Gemini.to_string(), "gemini");
+        assert_eq!(Runtime::OpenCode.to_string(), "opencode");
     }
 
     #[test]
@@ -159,6 +174,7 @@ mod proptest_tests {
         fn test_runtime_roundtrip_proptest(val in prop_oneof![
             Just(Runtime::Claude),
             Just(Runtime::Gemini),
+            Just(Runtime::OpenCode),
         ]) {
             let json = serde_json::to_string(&val).unwrap();
             let back: Runtime = serde_json::from_str(&json).unwrap();

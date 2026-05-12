@@ -63,6 +63,8 @@ pub mod ffi;
 #[cfg(feature = "runtime")]
 pub mod hooks;
 #[cfg(feature = "runtime")]
+pub mod opencode_plugin;
+#[cfg(feature = "runtime")]
 pub mod logging;
 #[cfg(feature = "runtime")]
 pub mod protocol;

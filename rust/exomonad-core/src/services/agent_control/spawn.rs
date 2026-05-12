@@ -504,16 +504,15 @@ impl<
         settings
     }
 
-    /// Generate opencode.json content for an OpenCode TL agent.
+    /// Generate opencode.json content for an OpenCode agent.
     ///
-    /// Constructs the JSON configuration including MCP server connection.
-    /// Note: opencode does not support `hooks` or `allowedPaths` keys.
-    pub(crate) fn generate_opencode_tl_settings(
+    /// Constructs the JSON configuration including MCP server connection, role instructions,
+    /// and plugin registration pointing at `.exo/opencode-plugin`. The plugin package files
+    /// must be written separately via `write_opencode_plugin_files`.
+    pub fn generate_opencode_tl_settings(
         agent_name: &str,
         role: &str,
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
-        _binary_path: Option<&std::path::Path>,
-        _parent_dir: Option<&Path>,
     ) -> serde_json::Value {
         let mut mcp_servers = serde_json::Map::new();
         mcp_servers.insert(
@@ -536,7 +535,22 @@ impl<
         serde_json::json!({
             "mcp": mcp_servers,
             "instructions": instructions,
+            "plugin": ["./.exo/opencode-plugin"],
         })
+    }
+
+    /// Write the exomonad OpenCode plugin package to `<dir>/.exo/opencode-plugin/`.
+    ///
+    /// Creates `index.ts` (the TypeScript bridge) and `package.json`. The plugin
+    /// is referenced by `opencode.json` via `"plugin": ["./.exo/opencode-plugin"]`.
+    pub async fn write_opencode_plugin_files(dir: &Path) -> Result<()> {
+        use crate::opencode_plugin::{OPENCODE_PLUGIN_PKG_JSON, OPENCODE_PLUGIN_TS};
+        let plugin_dir = dir.join(".exo/opencode-plugin");
+        fs::create_dir_all(&plugin_dir).await?;
+        fs::write(plugin_dir.join("index.ts"), OPENCODE_PLUGIN_TS).await?;
+        fs::write(plugin_dir.join("package.json"), OPENCODE_PLUGIN_PKG_JSON).await?;
+        info!(path = %plugin_dir.display(), "Wrote OpenCode plugin files");
+        Ok(())
     }
 
     /// Spawn a worker agent in the current worktree (no branch/worktree).
@@ -618,17 +632,15 @@ impl<
                     // Write worker-specific opencode.json so the worker gets
                     // its own role/name (not the caller's root config, which
                     // lacks notify_parent and other worker tools).
-                    let worker_mcp = serde_json::json!({
-                        "mcp": {
-                            "exomonad": {
-                                "type": "local",
-                                "command": ["exomonad", "mcp-stdio", "--role", "worker", "--name", agent_name.as_str()]
-                            }
-                        }
-                    });
+                    let worker_config = Self::generate_opencode_tl_settings(
+                        agent_name.as_str(),
+                        "worker",
+                        &self.extra_mcp_servers,
+                    );
                     let opencode_json_path = agent_config_dir.join("opencode.json");
-                    fs::write(&opencode_json_path, serde_json::to_string_pretty(&worker_mcp)?).await?;
-                    info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json to agent config dir");
+                    fs::write(&opencode_json_path, serde_json::to_string_pretty(&worker_config)?).await?;
+                    Self::write_opencode_plugin_files(&agent_config_dir).await?;
+                    info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json and plugin to agent config dir");
                 }
                 _ => {}
             }
@@ -871,20 +883,17 @@ impl<
                     }
                 }
                 AgentType::OpenCode => {
-                    // Write opencode.json with hooks for OpenCode TL agents
-                    let binary_path = crate::util::find_exomonad_binary();
                     let opencode_config = Self::generate_opencode_tl_settings(
                         agent_name.as_str(),
                         role.as_str(),
                         &self.extra_mcp_servers,
-                        Some(&binary_path),
-                        Some(self.project_dir()),
                     );
                     fs::write(
                         worktree_path.join("opencode.json"),
                         serde_json::to_string_pretty(&opencode_config)?,
                     ).await?;
-                    info!(worktree = %worktree_path.display(), "Wrote opencode.json with hooks for OpenCode TL agent");
+                    Self::write_opencode_plugin_files(&worktree_path).await?;
+                    info!(worktree = %worktree_path.display(), "Wrote opencode.json and plugin for OpenCode TL agent");
                 }
                 _ => {}
             }

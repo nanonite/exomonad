@@ -309,22 +309,23 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
     }
 
     // Write hook configuration (SessionStart registers Claude UUID for --fork-session)
-    // For OpenCode TL, write opencode.json MCP config instead of Claude hooks
+    // For OpenCode TL, write opencode.json + TypeScript plugin instead of Claude hooks
     let binary_path = exomonad_core::find_exomonad_binary();
     if config.root_agent_type == AgentType::OpenCode {
-        let opencode_config = serde_json::json!({
-            "mcp": {
-                "exomonad": {
-                    "type": "local",
-                    "command": ["exomonad", "mcp-stdio", "--role", "root", "--name", "root"]
-                }
-            },
-            "instructions": [exomonad_core::services::agent_control::OPENCODE_TL_INSTRUCTIONS],
-        });
+        use exomonad_core::services::agent_control::AgentControlService;
+        use exomonad_core::services::Services;
+        let extra_mcp_servers = std::collections::HashMap::new();
+        let opencode_config = AgentControlService::<Services>::generate_opencode_tl_settings(
+            "root",
+            "root",
+            &extra_mcp_servers,
+        );
         let opencode_dir = cwd.join(".exo/agents/root");
         std::fs::create_dir_all(&opencode_dir)?;
         std::fs::write(opencode_dir.join("opencode.json"), serde_json::to_string_pretty(&opencode_config)?)?;
-        info!("OpenCode MCP configuration written to .exo/agents/root/opencode.json");
+        AgentControlService::<Services>::write_opencode_plugin_files(&opencode_dir).await
+            .context("Failed to write OpenCode plugin files to .exo/agents/root")?;
+        info!("OpenCode configuration written to .exo/agents/root/");
     } else {
         exomonad_core::hooks::HookConfig::write_persistent(&cwd, &binary_path, None, None)
             .context("Failed to write hook configuration")?;
@@ -691,15 +692,11 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
     // it via fork_wave and file PRs back. A separate worktree branch for the TL would
     // break the parent-branch PR topology.
     if config.root_agent_type == AgentType::OpenCode {
-        // Write opencode.json to the repo root so the TL window finds it via CWD.
-        let mut opencode_mcp_servers = serde_json::Map::new();
-        opencode_mcp_servers.insert(
-            "exomonad".to_string(),
-            serde_json::json!({
-                "type": "local",
-                "command": ["exomonad", "mcp-stdio", "--role", "root", "--name", "root"]
-            }),
-        );
+        use exomonad_core::services::agent_control::AgentControlService;
+        use exomonad_core::services::Services;
+        // Build extra MCP servers map from config (same servers exposed to all agents).
+        let mut extra_mcp: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
         for (name, server) in &config.extra_mcp_servers {
             let entry = match server {
                 crate::config::McpServerConfig::Http { url, headers } => {
@@ -713,14 +710,18 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
                     serde_json::json!({"type": "stdio", "command": command, "args": args})
                 }
             };
-            opencode_mcp_servers.insert(name.clone(), entry);
+            extra_mcp.insert(name.clone(), entry);
         }
-        let opencode_config = serde_json::json!({ "mcp": opencode_mcp_servers });
+        // Write opencode.json to repo root so the TL window discovers it via CWD.
+        let opencode_config =
+            AgentControlService::<Services>::generate_opencode_tl_settings("root", "root", &extra_mcp);
         std::fs::write(
             cwd.join("opencode.json"),
             serde_json::to_string_pretty(&opencode_config)?,
         )?;
-        info!("Wrote opencode.json to repo root for OpenCode TL");
+        AgentControlService::<Services>::write_opencode_plugin_files(&cwd).await
+            .context("Failed to write OpenCode plugin files to repo root")?;
+        info!("Wrote opencode.json and plugin to repo root for OpenCode TL");
     }
     let tl_cwd = cwd.clone();
 

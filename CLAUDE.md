@@ -357,6 +357,7 @@ This is **native Claude Code Teams integration**. Messages from child agents arr
 | **Coordination mutexes** | Built. In-memory `MutexRegistry` with FIFO wait queues, TTL auto-expiry, idempotent acquire. Effect-only (`coordination.acquire_mutex`, `coordination.release_mutex`) — no MCP tool exposed. |
 | **Tempo observability** | **Built.** Grafana Tempo for lightweight trace storage (~100-200MB RAM). Agents query traces via `curl` + TraceQL against Tempo's HTTP API (port 3200). Optional Grafana UI at `http://localhost:3000`. |
 | **NotebookLM MCP** (optional) | **Vendored.** `vendor/notebooklm-mcp/` — stdio MCP server that automates Google NotebookLM via browser automation. Source-grounded, citation-backed answers from uploaded documentation. Opt-in via `extra_mcp_servers` in `config.toml`. |
+| **OpenCode hooks** (TypeScript plugin bridge) | **Built.** OpenCode agents get `tool.execute.before` / `tool.execute.after` / `event` hooks via a Bun TypeScript plugin written to `.exo/opencode-plugin/` at spawn time. The plugin shells out to `exomonad hook <event> --runtime opencode`, routing to the same WASM dispatch path as Claude Code and Gemini hooks. Enables role-based tool filtering and MCP call context steering (e.g. enforcing `file_pr` body format, `notify_parent` vocabulary). See `docs/decisions/opencode-hooks.md`. |
 
 ### Tempo Observability
 
