@@ -19,6 +19,44 @@
 //! `@opencode-ai/plugin` types are bundled with OpenCode itself.
 
 /// The `index.ts` entry point for the exomonad OpenCode plugin.
+///
+/// ## Response shape from WASM (Claude format, used for OpenCode)
+///
+/// ```json
+/// {
+///   "continue": true,
+///   "hookSpecificOutput": {
+///     "hookEventName": "PreToolUse",
+///     "permissionDecision": "allow" | "deny",
+///     "permissionDecisionReason": "...",
+///     "updatedInput": { ... }
+///   }
+/// }
+/// ```
+///
+/// ## Deny mechanism
+///
+/// OpenCode's `tool.execute.before` hook has no built-in deny signal — only
+/// `output.args` mutation is supported by the API. Denial is implemented by
+/// throwing an error, which OpenCode surfaces as a tool execution failure to
+/// the agent. `exomonad serve` is unaffected: it already returned the
+/// `HookEnvelope` response before the throw occurs.
+///
+/// ## Execution sequence (deny path)
+///
+/// ```text
+/// OpenCode (Bun, in-process TypeScript plugin)
+///   → tool.execute.before fires
+///   → Bun $`exomonad hook pre-tool-use --runtime opencode` (subprocess)
+///       → subprocess makes one HTTP request to exomonad serve via UDS
+///       → exomonad serve returns HookEnvelope { stdout: '{"continue":true,...}', exit_code: 0 }
+///       → subprocess exits 0
+///   ← Bun reads subprocess stdout
+///   → plugin parses JSON, sees permissionDecision = "deny"
+///   → plugin throws new Error("reason")   ← inside Bun/OpenCode only
+///   → OpenCode catches the throw, blocks that tool call
+///   → OpenCode continues running normally
+/// ```
 pub const OPENCODE_PLUGIN_TS: &str = r#"import type { Plugin } from "@opencode-ai/plugin";
 
 async function callHook(
@@ -47,8 +85,38 @@ export const server: Plugin = async (input) => ({
       args: output.args,
     };
     const result = await callHook(input.$, "pre-tool-use", payload);
-    if (result && typeof result === "object" && "args" in result) {
-      Object.assign(output, result);
+    if (!result || typeof result !== "object") return;
+
+    const r = result as Record<string, unknown>;
+
+    // Hard block: continue=false means the session should not proceed at all.
+    if (r["continue"] === false) {
+      const reason =
+        typeof r["stopReason"] === "string"
+          ? r["stopReason"]
+          : "Tool blocked by ExoMonad hook";
+      throw new Error(reason);
+    }
+
+    const specific = r["hookSpecificOutput"];
+    if (!specific || typeof specific !== "object") return;
+    const s = specific as Record<string, unknown>;
+    if (s["hookEventName"] !== "PreToolUse") return;
+
+    if (s["permissionDecision"] === "deny") {
+      const reason =
+        typeof s["permissionDecisionReason"] === "string"
+          ? s["permissionDecisionReason"]
+          : "Tool denied by ExoMonad hook";
+      throw new Error(reason);
+    }
+
+    if (
+      s["permissionDecision"] === "allow" &&
+      s["updatedInput"] != null &&
+      typeof s["updatedInput"] === "object"
+    ) {
+      Object.assign(output.args, s["updatedInput"]);
     }
   },
 
