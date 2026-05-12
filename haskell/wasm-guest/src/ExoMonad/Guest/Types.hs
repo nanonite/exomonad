@@ -319,8 +319,9 @@ blockStopResponse msg =
 -- Gemini-Specific Hook Types
 -- ============================================================================
 
--- | BeforeModel hook response (Gemini-specific).
--- Can bypass the LLM call entirely with a synthetic response.
+-- | BeforeModel hook response.
+-- Fires before the LLM call. Can modify the request or bypass the LLM entirely
+-- with a synthetic response. Currently triggered by Gemini; runtime-agnostic.
 data BeforeModelOutput
   = -- | Allow with optional modified llm_request
     BeforeModelAllow (Maybe Value)
@@ -362,8 +363,9 @@ denyBeforeModel = BeforeModelDeny
 syntheticBeforeModel :: Value -> BeforeModelOutput
 syntheticBeforeModel = BeforeModelSynthetic
 
--- | AfterModel hook response (Gemini-specific).
+-- | AfterModel hook response.
 -- Fires per LLM response chunk. Can rewrite, discard, or halt.
+-- Currently triggered by Gemini; runtime-agnostic.
 data AfterModelOutput
   = -- | Allow with optional rewritten llm_response chunk
     AfterModelAllow (Maybe Value)

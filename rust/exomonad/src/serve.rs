@@ -406,9 +406,10 @@ pub async fn handle_hook_inner(
         ToolUse,
         /// Worker exit: WASM handles notifyParent as side effect, returns simple allow
         WorkerExit,
-        /// Gemini BeforeModel/AfterModel: passed through to WASM, response serialized as-is
-        GeminiBeforeModel,
-        GeminiAfterModel,
+        /// BeforeModel/AfterModel: passed through to WASM, response serialized as-is.
+        /// Currently only Gemini fires these; the dispatch arm is runtime-agnostic.
+        BeforeModel,
+        AfterModel,
     }
 
     let dispatch = match event_type {
@@ -417,8 +418,8 @@ pub async fn handle_hook_inner(
         HookEventType::SessionEnd => HookDispatch::Stop,
         HookEventType::PreToolUse => HookDispatch::ToolUse,
         HookEventType::BeforeTool => HookDispatch::ToolUse,
-        HookEventType::BeforeModel => HookDispatch::GeminiBeforeModel,
-        HookEventType::AfterModel => HookDispatch::GeminiAfterModel,
+        HookEventType::BeforeModel => HookDispatch::BeforeModel,
+        HookEventType::AfterModel => HookDispatch::AfterModel,
         HookEventType::PostToolUse => HookDispatch::ToolUse,
         HookEventType::WorkerExit => HookDispatch::WorkerExit,
         HookEventType::SessionStart => HookDispatch::ToolUse,
@@ -582,7 +583,7 @@ pub async fn handle_hook_inner(
             })
         }
 
-        HookDispatch::GeminiBeforeModel => {
+        HookDispatch::BeforeModel => {
             let output: InternalBeforeModelOutput = plugin
                 .call("handle_pre_tool_use", &hook_input_value)
                 .await
@@ -599,7 +600,7 @@ pub async fn handle_hook_inner(
             })
         }
 
-        HookDispatch::GeminiAfterModel => {
+        HookDispatch::AfterModel => {
             let output: InternalAfterModelOutput = plugin
                 .call("handle_pre_tool_use", &hook_input_value)
                 .await
