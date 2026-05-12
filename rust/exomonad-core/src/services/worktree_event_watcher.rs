@@ -421,8 +421,9 @@ where
                             let pr_num = *pr_number;
                             tokio::spawn(async move {
                                 info!(pr_number = pr_num, "Spawning reviewer agent for new PR");
-                                if let Err(e) = spawner.spawn_reviewer_for_pr(&pr_clone).await {
-                                    warn!(pr_number = pr_num, error = %e, "Failed to spawn reviewer for PR");
+                                match spawner.spawn_reviewer_for_pr(&pr_clone).await {
+                                    Ok(_) => info!(pr_number = pr_num, "Reviewer agent spawned successfully"),
+                                    Err(e) => warn!(pr_number = pr_num, error = %e, "Failed to spawn reviewer for PR"),
                                 }
                             });
                             if let Some(ws) = state_guard.get_mut(pr_number) {
@@ -1160,7 +1161,7 @@ async fn run_spindle_subscriber(
                                             );
                                             ci_status_map.write().await.insert(branch, ci);
                                         } else {
-                                            debug!(rkey = %rkey, status = %status, "Spindle: no branch mapping for pipeline rkey yet");
+                                            info!(rkey = %rkey, status = %status, "Spindle: CI event received but no branch mapping for rkey yet (pipeline may not have registered)");
                                         }
                                     }
                                 }
