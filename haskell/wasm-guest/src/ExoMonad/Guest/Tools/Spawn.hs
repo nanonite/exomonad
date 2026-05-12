@@ -263,7 +263,7 @@ instance FromJSON SpawnLeafSubtreeArgs where
 
 -- | Shared tool description for spawn_leaf_subtree.
 spawnLeafSubtreeDescription :: Text
-spawnLeafSubtreeDescription = "Fork a Gemini agent into its own worktree and tmux window. Gets dev role (files PR, cannot spawn children). Gemini is a capable implementer — give it acceptance criteria and file paths, not line-by-line instructions. IMPORTANT: You MUST create a team using TeamCreate BEFORE calling any spawn tool — without a team, child agent messages will not be delivered to you. After spawning, return immediately — you will be notified when the agent sends updates or when Copilot approves their PR."
+spawnLeafSubtreeDescription = "Fork a leaf agent into its own worktree and tmux window. Gets dev role (files PR, cannot spawn children). Leaf agents are capable implementers — give them acceptance criteria and file paths, not line-by-line instructions. IMPORTANT: You MUST create a team using TeamCreate BEFORE calling any spawn tool — without a team, child agent messages will not be delivered to you. After spawning, return immediately — you will be notified when the agent sends updates or when the reviewer approves their PR."
 
 -- | Shared tool schema for spawn_leaf_subtree.
 spawnLeafSubtreeSchema :: Aeson.Object
@@ -412,7 +412,7 @@ instance FromJSON SpawnWorkersArgs where
 
 -- | Shared tool description for spawn_workers.
 spawnWorkersDescription :: Text
-spawnWorkersDescription = "Spawn multiple Gemini worker agents in one call. PREFER WORKERS OVER DOING WORK YOURSELF — Gemini costs 10-30x less than your Opus tokens. Any task you can specify clearly (implementation, research, file edits, test writing) should be a worker. If it touches 2+ files or takes more than 5 tool calls, spawn a worker. Give them acceptance criteria, key file paths, and anti-patterns, not step-by-step code. Each gets a tmux pane in YOUR window, working in YOUR directory on YOUR branch (ephemeral, no isolation, no PR). Workers send messages via notify_parent. Set type to 'research' for read-only exploration workers that search, read, and report findings without modifying anything. IMPORTANT: You MUST create a team using TeamCreate BEFORE calling any spawn tool — without a team, child agent messages will not be delivered to you. After spawning, return immediately — do not poll or wait."
+spawnWorkersDescription = "Spawn multiple worker agents in one call. PREFER WORKERS OVER DOING WORK YOURSELF — worker tokens cost far less than TL tokens. Any task you can specify clearly (implementation, research, file edits, test writing) should be a worker. If it touches 2+ files or takes more than 5 tool calls, spawn a worker. Give them acceptance criteria, key file paths, and anti-patterns, not step-by-step code. Each gets a tmux pane in YOUR window, working in YOUR directory on YOUR branch (ephemeral, no isolation, no PR). Workers send messages via notify_parent. Set type to 'research' for read-only exploration workers that search, read, and report findings without modifying anything. IMPORTANT: You MUST create a team using TeamCreate BEFORE calling any spawn tool — without a team, child agent messages will not be delivered to you. After spawning, return immediately — do not poll or wait."
 
 -- | Shared tool schema for spawn_workers.
 spawnWorkersSchema :: Aeson.Object
@@ -445,7 +445,7 @@ spawnWorkersCore args = do
             }
     r <- AC.spawnWorker cfg
     case r of
-      Right _ -> emitSpawnEvent (wsName spec) "gemini-worker" (wsTask spec)
+      Right _ -> emitSpawnEvent (wsName spec) "worker" (wsTask spec)
       Left _ -> pure ()
     pure r
   let (errs, successes) = partitionEithers results
@@ -457,7 +457,7 @@ spawnWorkersCore args = do
         ]
 
 -- ============================================================================
--- SpawnGemini (worktree — branch + PR)
+-- SpawnLeaf (worktree — branch + PR)
 -- ============================================================================
 
 data SpawnLeaf
@@ -555,7 +555,7 @@ instance FromJSON SpawnWorkerToolArgs where
       <*> v .: "task"
 
 spawnWorkerToolDescription :: Text
-spawnWorkerToolDescription = "Spawn an ephemeral Gemini worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 Gemini costs 10-30x less than your Opus tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately."
+spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately."
 
 spawnWorkerToolSchema :: Aeson.Object
 spawnWorkerToolSchema =
@@ -631,7 +631,7 @@ spawnAcpCore args = do
   case result of
     Left err -> pure $ errorResult (spawnErrorMessage err)
     Right spawnResult -> do
-      emitSpawnEvent (saName args) "gemini-acp" (saName args)
+      emitSpawnEvent (saName args) "leaf-acp" (saName args)
       pure $ successResult $ Aeson.toJSON spawnResult
 
 -- | Helper to emit 'agent.spawned' event to the host.

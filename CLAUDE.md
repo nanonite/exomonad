@@ -306,8 +306,8 @@ What you can do with exomonad right now, end-to-end.
 Spawn heterogeneous agent teams as a recursive tree:
 
 - **`fork_wave`** — Fork N parallel Claude agents, each in its own worktree. Context inherited by default (`fork_session` defaults to `true`); set `false` for fresh-start children. Requires clean git state (committed and pushed).
-- **`spawn_leaf`** — Spawn Gemini agent in own worktree+branch. Files PR when done. Structured spec fields (steps, verify, boundary, context, read_first).
-- **`spawn_worker`** — Spawn ephemeral Gemini worker in tmux pane. No branch, no PR. Just name + task.
+- **`spawn_leaf`** — Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config. Structured spec fields (steps, verify, boundary, context, read_first).
+- **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
 
 **Agent Types:** `Claude` (🤖), `Gemini` (💎), `OpenCode` (💻), `Shoal` (🌊). Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
 
@@ -428,7 +428,7 @@ Human in tmux session
 
 **Worktrees + tmux = Isolation/Multiplexing**
 - Git worktrees for code isolation (no Docker containers)
-- tmux windows for Claude subtrees, panes for Gemini workers
+- tmux windows for Claude subtrees, panes for ephemeral workers
 - Each agent = worktree + window (or pane), managed by Rust runtime
 
 ### Data Flows
@@ -477,9 +477,9 @@ All tools implemented in Haskell WASM (`haskell/wasm-guest/src/ExoMonad/Guest/To
 | Tool | Role | Description |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree. Context inherited by default (`fork_session` defaults to `true`). |
-| `spawn_leaf` | root, tl | Spawn Gemini agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
+| `spawn_leaf` | root, tl | Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config. Structured spec fields: steps, verify, boundary, context, read_first. |
 | `spawn_opencode` | root, tl | Spawn OpenCode agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
-| `spawn_worker` | root, tl | Spawn ephemeral Gemini worker in tmux pane (no branch, no PR). Just name + task. |
+| `spawn_worker` | root, tl | Spawn an ephemeral worker in a tmux pane (no branch, no PR). Just name + task. |
 | `file_pr` | tl, dev | Create/update PR (auto-detects base branch from naming) |
 | `merge_pr` | root, tl | Merge child PR (gh merge + git fetch) |
 | `notify_parent` | tl, dev, worker | Send message to parent agent. Auto-routed via Teams inbox (primary) or tmux STDIN (fallback) |
@@ -658,8 +658,8 @@ The recursive execution pattern. Every TL at every level follows this protocol:
 
 2. **Fork** — Spawn wave N children. Zero deps between siblings in the same wave.
    - Sub-TLs: `fork_wave` (Claude, context inherited by default) — they already know the plan
-   - Devs: `spawn_leaf` (Gemini, worktree+PR) — they get CLAUDE.md from scaffolding
-   - Workers: `spawn_worker` (Gemini, ephemeral pane) — research or non-conflicting edits
+   - Devs: `spawn_leaf` (worktree+PR, agent type from config) — they get CLAUDE.md from scaffolding
+   - Workers: `spawn_worker` (ephemeral pane) — research or non-conflicting edits
 
 3. **Converge** — Wait for child notifications. Merge their PRs. Write an integration commit:
    - Wire children's outputs together
