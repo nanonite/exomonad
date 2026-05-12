@@ -92,6 +92,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- spawn_worker: add optional agent_type param (default to server spawn_agent_type) (#121)
 - Ignore local lolearn database (#150)
 - spawn_leaf: add optional agent_type param (default to server spawn_agent_type) (#120)
 - remove Gemini-specific language from all spawn tool docs and CLAUDE.md (#123)

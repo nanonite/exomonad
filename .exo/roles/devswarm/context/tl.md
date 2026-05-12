@@ -31,7 +31,7 @@ Never touch another agent's worktree. Never checkout another branch.
 
 ## Worker Spawning
 
-When calling `spawn_worker`, always include `agent_type: {{spawn_agent_type}}`.
+When calling `spawn_worker`, omit `agent_type` to use `{{spawn_agent_type}}`; set it only when the task explicitly requires a different type.
 When calling `fork_wave`, set `agent_type` on each child to `{{spawn_agent_type}}` unless the task explicitly requires a different type.
 
 ## Notification Vocabulary

@@ -2656,7 +2656,8 @@ data SpawnWorkerRequest
     spawnWorkerRequestPrompt :: Hs.Text,
     spawnWorkerRequestPermissionMode :: Hs.Text,
     spawnWorkerRequestAllowedTools :: (Hs.Vector Hs.Text),
-    spawnWorkerRequestDisallowedTools :: (Hs.Vector Hs.Text)
+    spawnWorkerRequestDisallowedTools :: (Hs.Vector Hs.Text),
+    spawnWorkerRequestAgentType :: (HsProtobuf.Enumerated Effects.Agent.AgentType)
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -2675,50 +2676,57 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
         spawnWorkerRequestPrompt,
         spawnWorkerRequestPermissionMode,
         spawnWorkerRequestAllowedTools,
-        spawnWorkerRequestDisallowedTools
+        spawnWorkerRequestDisallowedTools,
+        spawnWorkerRequestAgentType
       } =
       Hs.mappend
         ( Hs.mappend
             ( Hs.mappend
                 ( Hs.mappend
-                    ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 1)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            spawnWorkerRequestName
+                    ( Hs.mappend
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 1)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                spawnWorkerRequestName
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 2)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                spawnWorkerRequestPrompt
+                            )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 2)
+                        (HsProtobuf.FieldNumber 3)
                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            spawnWorkerRequestPrompt
+                            spawnWorkerRequestPermissionMode
                         )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 3)
-                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        spawnWorkerRequestPermissionMode
+                    (HsProtobuf.FieldNumber 4)
+                    ( ( Hs.coerce
+                          @(Hs.Vector Hs.Text)
+                          @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      )
+                        spawnWorkerRequestAllowedTools
                     )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 4)
+                (HsProtobuf.FieldNumber 5)
                 ( ( Hs.coerce
                       @(Hs.Vector Hs.Text)
                       @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                   )
-                    spawnWorkerRequestAllowedTools
+                    spawnWorkerRequestDisallowedTools
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 5)
-            ( ( Hs.coerce
-                  @(Hs.Vector Hs.Text)
-                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-              )
-                spawnWorkerRequestDisallowedTools
-            )
+            (HsProtobuf.FieldNumber 6)
+            spawnWorkerRequestAgentType
         )
   decodeMessage _ =
     Hs.pure SpawnWorkerRequest
@@ -2758,6 +2766,9 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
                   (HsProtobuf.FieldNumber 5)
               )
           )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 6)
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -2788,11 +2799,19 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
         (HsProtobufAST.Repeated HsProtobufAST.String)
         (HsProtobufAST.Single "disallowed_tools")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "AgentType"))
+        )
+        (HsProtobufAST.Single "agent_type")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB SpawnWorkerRequest) where
-  toJSONPB (SpawnWorkerRequest f1 f2 f3 f4 f5) =
+  toJSONPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6) =
     HsJSONPB.object
       [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "prompt" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -2811,9 +2830,10 @@ instance (HsJSONPB.ToJSONPB SpawnWorkerRequest) where
                    @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                )
                  f5
-             )
+             ),
+        "agent_type" .= f6
       ]
-  toEncodingPB (SpawnWorkerRequest f1 f2 f3 f4 f5) =
+  toEncodingPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6) =
     HsJSONPB.pairs
       [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "prompt" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -2832,7 +2852,8 @@ instance (HsJSONPB.ToJSONPB SpawnWorkerRequest) where
                    @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                )
                  f5
-             )
+             ),
+        "agent_type" .= f6
       ]
 
 instance (HsJSONPB.FromJSONPB SpawnWorkerRequest) where
@@ -2862,6 +2883,7 @@ instance (HsJSONPB.FromJSONPB SpawnWorkerRequest) where
                   )
                     (obj .: "disallowed_tools")
                 )
+            <*> obj .: "agent_type"
       )
 
 instance (HsJSONPB.ToJSON SpawnWorkerRequest) where
@@ -4075,286 +4097,6 @@ instance (HsJSONPB.ToJSON SpawnLeafSubtreeResponse) where
   toEncoding = HsJSONPB.toAesonEncoding
 
 instance (HsJSONPB.FromJSON SpawnLeafSubtreeResponse) where
-  parseJSON = HsJSONPB.parseJSONPB
-
-data SpawnOpencodeRequest
-  = SpawnOpencodeRequest
-  { spawnOpencodeRequestTask :: Hs.Text,
-    spawnOpencodeRequestBranchName :: Hs.Text,
-    spawnOpencodeRequestRole :: Hs.Text,
-    spawnOpencodeRequestStandaloneRepo :: Hs.Bool,
-    spawnOpencodeRequestAllowedDirs :: (Hs.Vector Hs.Text)
-  }
-  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
-
-instance (Hs.NFData SpawnOpencodeRequest)
-
-instance (HsProtobuf.Named SpawnOpencodeRequest) where
-  nameOf _ = Hs.fromString "SpawnOpencodeRequest"
-
-instance (HsProtobuf.HasDefault SpawnOpencodeRequest)
-
-instance (HsProtobuf.Message SpawnOpencodeRequest) where
-  encodeMessage
-    _
-    SpawnOpencodeRequest
-      { spawnOpencodeRequestTask,
-        spawnOpencodeRequestBranchName,
-        spawnOpencodeRequestRole,
-        spawnOpencodeRequestStandaloneRepo,
-        spawnOpencodeRequestAllowedDirs
-      } =
-      Hs.mappend
-        ( Hs.mappend
-            ( Hs.mappend
-                ( Hs.mappend
-                    ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 1)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            spawnOpencodeRequestTask
-                        )
-                    )
-                    ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 2)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            spawnOpencodeRequestBranchName
-                        )
-                    )
-                )
-                ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 3)
-                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        spawnOpencodeRequestRole
-                    )
-                )
-            )
-            ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 4)
-                spawnOpencodeRequestStandaloneRepo
-            )
-        )
-        ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 5)
-            ( ( Hs.coerce
-                  @(Hs.Vector Hs.Text)
-                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-              )
-                spawnOpencodeRequestAllowedDirs
-            )
-        )
-  decodeMessage _ =
-    Hs.pure SpawnOpencodeRequest
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 1)
-              )
-          )
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 2)
-              )
-          )
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 3)
-              )
-          )
-      <*> HsProtobuf.at
-        HsProtobuf.decodeMessageField
-        (HsProtobuf.FieldNumber 4)
-      <*> ( ( HsProtobuf.coerceOver
-                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                @(Hs.Vector Hs.Text)
-            )
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 5)
-              )
-          )
-  dotProto _ =
-    [ HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 1)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "task")
-        []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 2)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "branch_name")
-        []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 3)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "role")
-        []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 4)
-        (HsProtobufAST.Prim HsProtobufAST.Bool)
-        (HsProtobufAST.Single "standalone_repo")
-        []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 5)
-        (HsProtobufAST.Repeated HsProtobufAST.String)
-        (HsProtobufAST.Single "allowed_dirs")
-        []
-        ""
-    ]
-
-instance (HsJSONPB.ToJSONPB SpawnOpencodeRequest) where
-  toJSONPB (SpawnOpencodeRequest f1 f2 f3 f4 f5) =
-    HsJSONPB.object
-      [ "task" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
-        "branch_name"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
-        "role" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
-        "standalone_repo" .= f4,
-        "allowed_dirs"
-          .= ( ( Hs.coerce
-                   @(Hs.Vector Hs.Text)
-                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-               )
-                 f5
-             )
-      ]
-  toEncodingPB (SpawnOpencodeRequest f1 f2 f3 f4 f5) =
-    HsJSONPB.pairs
-      [ "task" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
-        "branch_name"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
-        "role" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
-        "standalone_repo" .= f4,
-        "allowed_dirs"
-          .= ( ( Hs.coerce
-                   @(Hs.Vector Hs.Text)
-                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-               )
-                 f5
-             )
-      ]
-
-instance (HsJSONPB.FromJSONPB SpawnOpencodeRequest) where
-  parseJSONPB =
-    HsJSONPB.withObject
-      "SpawnOpencodeRequest"
-      ( \obj ->
-          Hs.pure SpawnOpencodeRequest
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "task")
-                )
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "branch_name")
-                )
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "role")
-                )
-            <*> obj .: "standalone_repo"
-            <*> ( ( HsProtobuf.coerceOver
-                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                      @(Hs.Vector Hs.Text)
-                  )
-                    (obj .: "allowed_dirs")
-                )
-      )
-
-instance (HsJSONPB.ToJSON SpawnOpencodeRequest) where
-  toJSON = HsJSONPB.toAesonValue
-  toEncoding = HsJSONPB.toAesonEncoding
-
-instance (HsJSONPB.FromJSON SpawnOpencodeRequest) where
-  parseJSON = HsJSONPB.parseJSONPB
-
-newtype SpawnOpencodeResponse
-  = SpawnOpencodeResponse {spawnOpencodeResponseAgent :: (Hs.Maybe Effects.Agent.AgentInfo)}
-  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
-
-instance (Hs.NFData SpawnOpencodeResponse)
-
-instance (HsProtobuf.Named SpawnOpencodeResponse) where
-  nameOf _ = Hs.fromString "SpawnOpencodeResponse"
-
-instance (HsProtobuf.HasDefault SpawnOpencodeResponse)
-
-instance (HsProtobuf.Message SpawnOpencodeResponse) where
-  encodeMessage _ SpawnOpencodeResponse {spawnOpencodeResponseAgent} =
-    ( HsProtobuf.encodeMessageField
-        (HsProtobuf.FieldNumber 1)
-        ( ( Hs.coerce
-              @(Hs.Maybe Effects.Agent.AgentInfo)
-              @(HsProtobuf.Nested Effects.Agent.AgentInfo)
-          )
-            spawnOpencodeResponseAgent
-        )
-    )
-  decodeMessage _ =
-    Hs.pure SpawnOpencodeResponse
-      <*> ( ( HsProtobuf.coerceOver
-                @(HsProtobuf.Nested Effects.Agent.AgentInfo)
-                @(Hs.Maybe Effects.Agent.AgentInfo)
-            )
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 1)
-              )
-          )
-  dotProto _ =
-    [ HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 1)
-        ( HsProtobufAST.Prim
-            (HsProtobufAST.Named (HsProtobufAST.Single "AgentInfo"))
-        )
-        (HsProtobufAST.Single "agent")
-        []
-        ""
-    ]
-
-instance (HsJSONPB.ToJSONPB SpawnOpencodeResponse) where
-  toJSONPB (SpawnOpencodeResponse f1) =
-    HsJSONPB.object
-      [ "agent"
-          .= ( ( Hs.coerce
-                   @(Hs.Maybe Effects.Agent.AgentInfo)
-                   @(HsProtobuf.Nested Effects.Agent.AgentInfo)
-               )
-                 f1
-             )
-      ]
-  toEncodingPB (SpawnOpencodeResponse f1) =
-    HsJSONPB.pairs
-      [ "agent"
-          .= ( ( Hs.coerce
-                   @(Hs.Maybe Effects.Agent.AgentInfo)
-                   @(HsProtobuf.Nested Effects.Agent.AgentInfo)
-               )
-                 f1
-             )
-      ]
-
-instance (HsJSONPB.FromJSONPB SpawnOpencodeResponse) where
-  parseJSONPB =
-    HsJSONPB.withObject
-      "SpawnOpencodeResponse"
-      ( \obj ->
-          Hs.pure SpawnOpencodeResponse
-            <*> ( ( HsProtobuf.coerceOver
-                      @(HsProtobuf.Nested Effects.Agent.AgentInfo)
-                      @(Hs.Maybe Effects.Agent.AgentInfo)
-                  )
-                    (obj .: "agent")
-                )
-      )
-
-instance (HsJSONPB.ToJSON SpawnOpencodeResponse) where
-  toJSON = HsJSONPB.toAesonValue
-  toEncoding = HsJSONPB.toAesonEncoding
-
-instance (HsJSONPB.FromJSON SpawnOpencodeResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
 data SpawnAcpRequest

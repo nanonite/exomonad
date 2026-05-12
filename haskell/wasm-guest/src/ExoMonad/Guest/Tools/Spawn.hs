@@ -356,6 +356,7 @@ data WorkerSpec = WorkerSpec
     wsContextFiles :: Maybe [Text],
     wsVerifyTemplates :: Maybe [Text],
     wsType :: Maybe WorkerType,
+    wsAgentType :: Maybe AC.AgentType,
     wsPermissionMode :: Maybe Text,
     wsAllowedTools :: Maybe [Text],
     wsDisallowedTools :: Maybe [Text]
@@ -379,6 +380,7 @@ instance JsonSchema WorkerSpec where
           ("context_files", "Paths to files to include in context"),
           ("verify_templates", "Verification script templates"),
           ("type", "Worker type: 'implementation' (default) or 'research'. Research workers are read-only — they explore, search, and report findings via notify_parent."),
+          ("agent_type", "Agent type for the worker: 'claude' or 'opencode'. Omit to use the server default."),
           ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
           ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
           ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction.")
@@ -400,6 +402,7 @@ instance FromJSON WorkerSpec where
       <*> v .:? "context_files"
       <*> v .:? "verify_templates"
       <*> v .:? "type"
+      <*> v .:? "agent_type"
       <*> v .:? "permission_mode"
       <*> v .:? "allowed_tools"
       <*> v .:? "disallowed_tools"
@@ -444,6 +447,7 @@ spawnWorkersCore args = do
           AC.SpawnWorkerConfig
             { AC.swcName = wsName spec,
               AC.swcPrompt = prompt,
+              AC.swcAgentType = wsAgentType spec,
               AC.swcPerms = perms
             }
     r <- AC.spawnWorker cfg
@@ -537,6 +541,7 @@ buildLeafTask args =
             wsContextFiles = Nothing,
             wsVerifyTemplates = Nothing,
             wsType = Nothing,
+            wsAgentType = Nothing,
             wsPermissionMode = Nothing,
             wsAllowedTools = Nothing,
             wsDisallowedTools = Nothing
@@ -551,7 +556,8 @@ data SpawnWorkerTool
 
 data SpawnWorkerToolArgs = SpawnWorkerToolArgs
   { swtName :: Text,
-    swtTask :: Text
+    swtTask :: Text,
+    swtAgentType :: Maybe AC.AgentType
   }
   deriving (Show, Eq, Generic)
 
@@ -560,15 +566,17 @@ instance FromJSON SpawnWorkerToolArgs where
     SpawnWorkerToolArgs
       <$> v .: "name"
       <*> v .: "task"
+      <*> v .:? "agent_type"
 
 spawnWorkerToolDescription :: Text
-spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately."
+spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately."
 
 spawnWorkerToolSchema :: Aeson.Object
 spawnWorkerToolSchema =
   genericToolSchemaWith @SpawnWorkerToolArgs
     [ ("name", "Worker name (pane title, messaging identity)"),
-      ("task", "The full prompt. Everything the worker needs in one string")
+      ("task", "The full prompt. Everything the worker needs in one string"),
+      ("agent_type", "Agent type for the worker: 'claude' or 'opencode'. Omit to use the server default.")
     ]
 
 spawnWorkerToolCore :: SpawnWorkerToolArgs -> Eff Effects MCPCallOutput
@@ -588,6 +596,7 @@ spawnWorkerToolCore args = do
             wsContextFiles = Nothing,
             wsVerifyTemplates = Nothing,
             wsType = Nothing,
+            wsAgentType = swtAgentType args,
             wsPermissionMode = Nothing,
             wsAllowedTools = Nothing,
             wsDisallowedTools = Nothing

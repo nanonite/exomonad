@@ -161,6 +161,7 @@ data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
 data SpawnWorkerConfig = SpawnWorkerConfig
   { swcName :: Text,
     swcPrompt :: Text,
+    swcAgentType :: Maybe AgentType,
     swcPerms :: PermissionFlags
   }
   deriving (Show, Eq, Generic)
@@ -250,7 +251,8 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnWorkerRequestPrompt = fromText (swcPrompt cfg),
               PA.spawnWorkerRequestPermissionMode = fromText (fromMaybe "" (permMode (swcPerms cfg))),
               PA.spawnWorkerRequestAllowedTools = V.fromList (map fromText (allowedTools (swcPerms cfg))),
-              PA.spawnWorkerRequestDisallowedTools = V.fromList (map fromText (disallowedTools (swcPerms cfg)))
+              PA.spawnWorkerRequestDisallowedTools = V.fromList (map fromText (disallowedTools (swcPerms cfg))),
+              PA.spawnWorkerRequestAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (swcAgentType cfg)))
             }
     result <- suspendEffect @Agent.AgentSpawnWorker req
     pure $ case result of

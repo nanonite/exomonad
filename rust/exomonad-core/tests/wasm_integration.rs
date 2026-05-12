@@ -247,12 +247,14 @@ impl EffectHandler for MockAgentHandler {
                 Ok(SpawnLeafSubtreeResponse { agent: Some(agent) }.encode_to_vec())
             }
             "agent.spawn_worker" => {
+                let req = SpawnWorkerRequest::decode(payload)
+                    .map_err(|e| EffectError::invalid_input(format!("decode: {e}")))?;
                 let agent = AgentInfo {
                     id: "test-worker-gemini".into(),
                     issue: String::new(),
                     worktree_path: String::new(),
                     branch_name: String::new(),
-                    agent_type: 2,
+                    agent_type: req.agent_type,
                     role: 0,
                     alive: true,
                     mux_window: "test-worker".into(),
@@ -700,6 +702,27 @@ async fn wasm_spawn_worker_roundtrip() {
     .await;
 
     assert_tool_success(&output, "spawn_worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_worker_passes_agent_type() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_worker",
+        json!({
+            "name": "rust-impl",
+            "task": "Implement the Rust side",
+            "agent_type": "opencode"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_worker");
+    assert_eq!(output["result"]["spawned"][0]["agent_type"], "opencode");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

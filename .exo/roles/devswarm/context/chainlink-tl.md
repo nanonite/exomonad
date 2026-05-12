@@ -31,12 +31,11 @@ When calling `spawn_worker` or `spawn_leaf`, include the chainlink issue ID in t
 
 ```
 spawn_worker(
-  task="Implement X (chainlink issue #42)",
-  agent_type="{{spawn_agent_type}}"
+  task="Implement X (chainlink issue #42)"
 )
 ```
 
-Always set `agent_type` to `{{spawn_agent_type}}` unless the task explicitly requires a different type.
+Omit `agent_type` to use `{{spawn_agent_type}}`; set it only when the task explicitly requires a different type.
 
 ### 3. Supervise via chainlink_worker_status
 
