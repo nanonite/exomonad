@@ -69,6 +69,25 @@ checkPragmaCorruption (Replace fp old new)
         <> "Re-do this edit preserving all `{-# LANGUAGE ... #-}` pragma syntax exactly."
 checkPragmaCorruption _ = Nothing
 
+-- ============================================================================
+-- Chainlink Guards
+-- ============================================================================
+
+-- | Block direct sqlite access to Chainlink state from dev agents.
+-- Dev agents should use the scoped Chainlink MCP tools exposed by DevRole.
+checkChainlinkSqlAccess :: HookInput -> Maybe Text
+checkChainlinkSqlAccess hookInput =
+  case hiToolInput hookInput of
+    Just (Object obj)
+      | Just (String cmd) <- KM.lookup "command" obj,
+        let normalized = T.toCaseFold cmd,
+        "sqlite3" `T.isInfixOf` normalized,
+        ".chainlink" `T.isInfixOf` normalized ->
+          Just $
+            "BLOCKED: Do not access .chainlink/issues.db directly via sqlite3. "
+              <> "Use the chainlink MCP tools (chainlink_issue_show, chainlink_issue_close) instead."
+    _ -> Nothing
+
 -- | Apply a check only when the agent is Gemini.
 geminiOnly :: (GeminiTool -> Maybe Text) -> HookInput -> GeminiTool -> Maybe Text
 geminiOnly check hookInput tool =
@@ -133,7 +152,10 @@ permissionCascade hookInput = do
   case geminiOnly checkPragmaCorruption hookInput geminiTool of
     Just reason -> pure (denyResponse reason)
     Nothing ->
-      case checkAgentPermissions "dev" tool args of
-        Allowed -> pure (allowResponse Nothing)
-        Escalate -> pure (allowResponse (Just "escalation-needed"))
-        Denied reason -> pure (denyResponse reason)
+      case checkChainlinkSqlAccess hookInput of
+        Just reason -> pure (denyResponse reason)
+        Nothing ->
+          case checkAgentPermissions "dev" tool args of
+            Allowed -> pure (allowResponse Nothing)
+            Escalate -> pure (allowResponse (Just "escalation-needed"))
+            Denied reason -> pure (denyResponse reason)
