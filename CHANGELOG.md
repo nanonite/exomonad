@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add chainlink_issue_show and chainlink_issue_close to dev role (#161)
 - Use Codex MCP reviewer panes for reviewer agents (#160)
 - Add CODEX_REVIEWER_INSTRUCTIONS and wire reviewer role in write_codex_config_files (#159)
 - Add Codex model setting to generated agent config (#152)

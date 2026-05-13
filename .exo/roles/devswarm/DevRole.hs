@@ -11,6 +11,10 @@ import Control.Monad (void)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as Aeson
 import ExoMonad
+import ExoMonad.Guest.Tools.Chainlink
+  ( ChainlinkIssueClose (..),
+    ChainlinkIssueShow (..),
+  )
 import ExoMonad.Guest.Tools.FilePR (filePRCore, filePRDescription, filePRSchema, FilePRArgs, FilePROutput (..))
 import ExoMonad.Guest.Tools.Events
   ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs (..), NotifyStatus (..)
@@ -108,7 +112,9 @@ data Tools mode = Tools
     sendMessage :: mode :- SendMessage,
     taskList :: mode :- DevTaskList,
     taskGet :: mode :- DevTaskGet,
-    taskUpdate :: mode :- DevTaskUpdate
+    taskUpdate :: mode :- DevTaskUpdate,
+    chainlinkIssueShow :: mode :- ChainlinkIssueShow,
+    chainlinkIssueClose :: mode :- ChainlinkIssueClose
   }
   deriving (Generic)
 
@@ -123,7 +129,9 @@ config =
             sendMessage = mkHandler @SendMessage,
             taskList = mkHandler @DevTaskList,
             taskGet = mkHandler @DevTaskGet,
-            taskUpdate = mkHandler @DevTaskUpdate
+            taskUpdate = mkHandler @DevTaskUpdate,
+            chainlinkIssueShow = mkHandler @ChainlinkIssueShow,
+            chainlinkIssueClose = mkHandler @ChainlinkIssueClose
           },
       hooks = httpDevHooks,
       eventHandlers = prReviewEventHandlers
