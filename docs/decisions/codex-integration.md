@@ -87,6 +87,18 @@ Do not use `codex exec review` for ExoMonad reviewer agents. That subcommand emi
 
 The reviewer identity discipline still applies: reviewer agents use distinct git identities and never review under the identity that authored the PR.
 
+### `codex exec review` Research
+
+Local CLI/source research for #163 found that `codex exec review` is useful as a standalone Codex review mode, but it is not an ExoMonad reviewer transport:
+
+- Supported targets are mutually exclusive: `--uncommitted`, `--base <BRANCH>`, `--commit <SHA>`, or a positional custom prompt. If none is supplied, the CLI errors.
+- `--base <BRANCH>` resolves the merge base with `HEAD` and prompts Codex to inspect `git diff <merge_base_sha>`, so it is a valid standalone diff-review primitive.
+- The command accepts normal exec options including `--model`, `--json`, `--output-last-message <FILE>`, and `--dangerously-bypass-approvals-and-sandbox`.
+- Output is Codex-native review-mode data rendered as plain text or JSONL events. It does not call ExoMonad review MCP tools and does not write `.exo/reviews/pr_N.json`.
+- Exit status indicates execution success or failure only; it does not encode approve versus changes-requested.
+
+If ExoMonad ever wants to use `codex exec review` directly, it needs an explicit translator from the Codex review output into `.exo/reviews/pr_N.json`. Until then, Codex reviewer agents must run through the normal `role=reviewer` MCP path.
+
 ## Authentication
 
 Codex authentication is system-wide and configured with:
