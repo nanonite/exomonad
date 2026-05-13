@@ -73,7 +73,7 @@ When a model is configured, ExoMonad adds `--model <model>` to the generated com
 
 Codex receives stable role instructions through `.codex/config.toml` as `developer_instructions`. The task-specific spawn prompt remains in the prompt file passed to `codex exec`.
 
-TL/root Codex agents receive `CODEX_TL_INSTRUCTIONS`; dev/leaf/worker Codex agents receive `CODEX_DEV_INSTRUCTIONS`. Role context is also copied to `.codex/exomonad_role.md` for local inspection.
+TL/root Codex agents receive `CODEX_TL_INSTRUCTIONS`, which are the shared TL protocol plus Codex runtime notes for shell hooks, manual restart flags, and `codex fork` context inheritance. Dev/leaf/worker Codex agents receive `CODEX_DEV_INSTRUCTIONS`. Role context is also copied to `.codex/exomonad_role.md` for local inspection.
 
 ## Reviewer
 
