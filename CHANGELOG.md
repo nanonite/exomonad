@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix reviewer spawning in the project root instead of an isolated worktree (#127)
+- Fix reviewer server socket self-symlinks from project-root spawns (#128)
 - Codex TL: hook review prompt appears when Codex is restarted manually after init (#158)
 - Update root TL prompt for all coding harnesses (#157)
 - Fix Codex root TL startup (#156)
