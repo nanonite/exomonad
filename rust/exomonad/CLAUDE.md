@@ -41,7 +41,7 @@ exomonad shutdown                 # Gracefully shut down the running server
 
 `exomonad init` creates a tmux session with:
 - **Server window**: Runs `exomonad serve` (binds .exo/server.sock)
-- **TL window**: Runs the configured shell command (focused by default)
+- **TL window**: Runs the configured root agent (Claude by default; `--tl codex` writes `.codex/config.toml` + `.codex/hooks.json` and launches Codex with `--cd` in the project root)
 - **Companion windows**: One per `[[companions]]` entry in config. Claude companions get isolated git worktrees at `.exo/companions/{name}/` with `.mcp.json`, hooks, and socket symlink. Worktrees persist across `--recreate`. Process companions (`agent_type = "process"`) run a plain command — no MCP, no worktree, no agent identity.
 
 `exomonad init` requires `exomonad new` to have been run first to bootstrap the project configuration and WASM plugins.

@@ -333,6 +333,8 @@ Push-based parallel worker coordination via **Claude Code Teams inbox**:
 
 This is **native Claude Code Teams integration**. Messages from child agents arrive exactly like messages from Claude Code teammates — structured, attributed, and delivered through the official inbox mechanism. The TL doesn't poll, doesn't block, and doesn't parse raw text. It gets a proper teammate notification.
 
+Teams inbox registration and delivery are Claude Code-only. OpenCode, Codex, Gemini, and Shoal agents use their supported non-Teams delivery paths until those runtimes expose native team inbox support.
+
 **Pipeline:** `notify_parent` → server resolves parent via `TeamRegistry` → `teams_mailbox::write_to_inbox()` → CC InboxPoller → `<teammate-message>` delivered to parent conversation.
 
 **Bidirectional Messaging:** The `send_message` tool enables arbitrary bidirectional messaging between any exomonad-spawned agents, routing via Teams inbox, ACP, UDS, or tmux fallback depending on the target agent's type and connection status.

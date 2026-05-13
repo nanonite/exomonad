@@ -2,6 +2,7 @@ use crate::uds_client;
 use anyhow::{Context, Result};
 use exomonad::config::Config;
 use exomonad_core::services::AgentType;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -25,6 +26,71 @@ fn read_chainlink_tl_protocol(cwd: &Path) -> Option<String> {
     } else {
         Some(stripped)
     }
+}
+
+fn extra_mcp_server_to_json(server: &crate::config::McpServerConfig) -> Result<Value> {
+    Ok(match server {
+        crate::config::McpServerConfig::Http { url, headers } => {
+            let mut entry = serde_json::json!({"type": "http", "url": url});
+            if !headers.is_empty() {
+                entry["headers"] = serde_json::to_value(headers)?;
+            }
+            entry
+        }
+        crate::config::McpServerConfig::Stdio { command, args } => {
+            serde_json::json!({"type": "stdio", "command": command, "args": args})
+        }
+    })
+}
+
+fn extra_mcp_servers_to_json(
+    servers: &std::collections::HashMap<String, crate::config::McpServerConfig>,
+) -> Result<std::collections::HashMap<String, Value>> {
+    servers
+        .iter()
+        .map(|(name, server)| Ok((name.clone(), extra_mcp_server_to_json(server)?)))
+        .collect()
+}
+
+fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
+    let codex_dir = cwd.join(".codex");
+    std::fs::create_dir_all(&codex_dir)?;
+    let extra_mcp_servers = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
+    let codex_config = exomonad_core::codex_config::render_codex_config(
+        "root",
+        "root",
+        exomonad_core::services::agent_control::CODEX_TL_INSTRUCTIONS,
+        config.model.as_deref(),
+        &extra_mcp_servers,
+    );
+    std::fs::write(codex_dir.join("config.toml"), codex_config)?;
+    std::fs::write(
+        codex_dir.join("hooks.json"),
+        exomonad_core::codex_config::CODEX_HOOKS_JSON,
+    )?;
+    info!("Codex configuration written to .codex/");
+    Ok(())
+}
+
+fn build_codex_root_command(
+    cwd: &Path,
+    model: Option<&str>,
+    initial_prompt: Option<&str>,
+) -> String {
+    let escaped_dir = shell_escape::escape(cwd.display().to_string().into());
+    let model_flag = model
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" --model {}", shell_escape::escape(value.into())))
+        .unwrap_or_default();
+    let prompt = initial_prompt
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" {}", shell_escape::escape(value.into())))
+        .unwrap_or_default();
+
+    format!(
+        "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
+        escaped_dir, model_flag, prompt
+    )
 }
 
 /// Reject `--tl-model` / `--worker-model` values that opencode doesn't recognise.
@@ -110,6 +176,9 @@ pub async fn run(
         config.spawn_agent_type = parse_agent_type(worker_type)?;
     }
     if let Some(m) = tl_model {
+        if config.root_agent_type == AgentType::Codex {
+            config.model = Some(m.clone());
+        }
         config.opencode.tl_model = Some(m);
     }
     if let Some(m) = worker_model {
@@ -322,32 +391,37 @@ pub async fn run(
         info!(branch = %current_branch, "Wrote root agent birth branch");
     }
 
-    // Write hook configuration (SessionStart registers Claude UUID for --fork-session)
-    // For OpenCode TL, write opencode.json + TypeScript plugin instead of Claude hooks
+    // Write root runtime configuration.
     let binary_path = exomonad_core::find_exomonad_binary();
-    if config.root_agent_type == AgentType::OpenCode {
-        use exomonad_core::services::agent_control::AgentControlService;
-        use exomonad_core::services::Services;
-        let extra_mcp_servers = std::collections::HashMap::new();
-        let opencode_config = AgentControlService::<Services>::generate_opencode_tl_settings(
-            "root",
-            "root",
-            &extra_mcp_servers,
-        );
-        let opencode_dir = cwd.join(".exo/agents/root");
-        std::fs::create_dir_all(&opencode_dir)?;
-        std::fs::write(
-            opencode_dir.join("opencode.json"),
-            serde_json::to_string_pretty(&opencode_config)?,
-        )?;
-        AgentControlService::<Services>::write_opencode_plugin_files(&opencode_dir)
-            .await
-            .context("Failed to write OpenCode plugin files to .exo/agents/root")?;
-        info!("OpenCode configuration written to .exo/agents/root/");
-    } else {
-        exomonad_core::hooks::HookConfig::write_persistent(&cwd, &binary_path, None, None)
-            .context("Failed to write hook configuration")?;
-        info!("Hook configuration written to .claude/settings.local.json");
+    match config.root_agent_type {
+        AgentType::OpenCode => {
+            use exomonad_core::services::agent_control::AgentControlService;
+            use exomonad_core::services::Services;
+            let extra_mcp_servers = std::collections::HashMap::new();
+            let opencode_config = AgentControlService::<Services>::generate_opencode_tl_settings(
+                "root",
+                "root",
+                &extra_mcp_servers,
+            );
+            let opencode_dir = cwd.join(".exo/agents/root");
+            std::fs::create_dir_all(&opencode_dir)?;
+            std::fs::write(
+                opencode_dir.join("opencode.json"),
+                serde_json::to_string_pretty(&opencode_config)?,
+            )?;
+            AgentControlService::<Services>::write_opencode_plugin_files(&opencode_dir)
+                .await
+                .context("Failed to write OpenCode plugin files to .exo/agents/root")?;
+            info!("OpenCode configuration written to .exo/agents/root/");
+        }
+        AgentType::Codex => {
+            write_codex_root_config(&config, &cwd).context("Failed to write Codex root config")?;
+        }
+        _ => {
+            exomonad_core::hooks::HookConfig::write_persistent(&cwd, &binary_path, None, None)
+                .context("Failed to write hook configuration")?;
+            info!("Hook configuration written to .claude/settings.local.json");
+        }
     }
 
     // Copy Claude rules template if available and not already present
@@ -381,11 +455,14 @@ pub async fn run(
     {
         let context_source = resolve_role_context_path(&cwd, &config.wasm_name, "root");
         if let Some(src) = context_source {
-            let rules_dir = cwd.join(".claude/rules");
+            let rules_dir = match config.root_agent_type {
+                AgentType::Codex => cwd.join(".codex"),
+                _ => cwd.join(".claude/rules"),
+            };
             std::fs::create_dir_all(&rules_dir)?;
             let link = rules_dir.join("exomonad_role.md");
             let _ = std::fs::remove_file(&link); // idempotent
-                                                 // Compute relative path from .claude/rules/ to the source
+                                                 // Compute relative path from the role dir to the source
             let relative = pathdiff::diff_paths(&src, &rules_dir).unwrap_or(src.clone());
             match std::os::unix::fs::symlink(&relative, &link) {
                 Ok(()) => {
@@ -728,24 +805,7 @@ pub async fn run(
     if config.root_agent_type == AgentType::OpenCode {
         use exomonad_core::services::agent_control::AgentControlService;
         use exomonad_core::services::Services;
-        // Build extra MCP servers map from config (same servers exposed to all agents).
-        let mut extra_mcp: std::collections::HashMap<String, serde_json::Value> =
-            std::collections::HashMap::new();
-        for (name, server) in &config.extra_mcp_servers {
-            let entry = match server {
-                crate::config::McpServerConfig::Http { url, headers } => {
-                    let mut e = serde_json::json!({"type": "http", "url": url});
-                    if !headers.is_empty() {
-                        e["headers"] = serde_json::to_value(headers)?;
-                    }
-                    e
-                }
-                crate::config::McpServerConfig::Stdio { command, args } => {
-                    serde_json::json!({"type": "stdio", "command": command, "args": args})
-                }
-            };
-            extra_mcp.insert(name.clone(), entry);
-        }
+        let extra_mcp = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
         // Write opencode.json to repo root so the TL window discovers it via CWD.
         let opencode_config = AgentControlService::<Services>::generate_opencode_tl_settings(
             "root", "root", &extra_mcp,
@@ -800,7 +860,9 @@ pub async fn run(
                 let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
                 format!("opencode{opencode_model_flag}{yolo}")
             }
-            (AgentType::Codex, _) => "echo 'Codex root agent startup is not implemented yet'; exec bash -l".to_string(),
+            (AgentType::Codex, prompt) => {
+                build_codex_root_command(&cwd, config.model.as_deref(), prompt)
+            }
             (AgentType::Process, _) => unreachable!("Process is for companions only, not root agent"),
         }
     };
@@ -1723,5 +1785,20 @@ mod tests {
         assert!(validate_claude_model("").is_err());
         assert!(validate_claude_model("haiku").is_err());
         assert!(validate_claude_model("haiku-model").is_err());
+    }
+
+    #[test]
+    fn codex_root_command_launches_codex_tl() {
+        let command = build_codex_root_command(
+            Path::new("/tmp/exomonad repo"),
+            Some("gpt-5.2"),
+            Some("Plan the next wave"),
+        );
+
+        assert_eq!(
+            command,
+            "codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/exomonad repo' --model gpt-5.2 'Plan the next wave'"
+        );
+        assert!(!command.contains("not implemented"));
     }
 }

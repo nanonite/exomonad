@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix Codex root TL startup (#156)
 - Fix: update root TL prompt sanity check for headless OpenCode ACP workers (#45)
 - Fix: remove --model from opencode serve, pass to opencode run --attach instead (#44)
 - Bug: --worker-model not forwarded from exomonad init to exomonad serve (#49)
