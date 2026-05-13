@@ -687,6 +687,47 @@ async fn wasm_spawn_leaf_passes_agent_type() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn wasm_spawn_leaf_passes_codex_agent_type() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_leaf",
+        json!({
+            "name": "rust-handler",
+            "task": "Implement the Rust handler",
+            "agent_type": "codex"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_leaf");
+    assert_eq!(output["result"]["agent_type"], "codex");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_codex_roundtrip() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_codex",
+        json!({
+            "branch_name": "rust-codex",
+            "task": "Implement the Rust handler"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_codex");
+    assert_eq!(output["result"]["agent_type"], "codex");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn wasm_spawn_worker_roundtrip() {
     let runtime = build_test_runtime().await;
 
@@ -723,6 +764,27 @@ async fn wasm_spawn_worker_passes_agent_type() {
 
     assert_tool_success(&output, "spawn_worker");
     assert_eq!(output["result"]["spawned"][0]["agent_type"], "opencode");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_worker_passes_codex_agent_type() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_worker",
+        json!({
+            "name": "rust-impl",
+            "task": "Implement the Rust side",
+            "agent_type": "codex"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_worker");
+    assert_eq!(output["result"]["spawned"][0]["agent_type"], "codex");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

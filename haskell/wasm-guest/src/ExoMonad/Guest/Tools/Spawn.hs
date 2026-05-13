@@ -131,7 +131,7 @@ instance JsonSchema ForkWaveChild where
         [ ("slug", "Branch name suffix (will be prefixed with current branch)"),
           ("task", "One-line task description — the child inherits your full context, so keep it brief"),
           ("fork_session", "Inherit parent conversation context via --fork-session (default: true). Set false to start the child with a fresh context window."),
-          ("agent_type", "Agent type for the child: 'claude' (default) or 'opencode'. OpenCode children get TL role and can spawn their own children.")
+          ("agent_type", "Agent type for the child: 'claude' (default), 'opencode', or 'codex'. OpenCode and Codex children get TL role and can spawn their own children.")
         ]
 
 data ForkWaveArgs = ForkWaveArgs
@@ -151,7 +151,7 @@ data ForkWaveResult = ForkWaveResult
 
 -- | Shared tool description for fork_wave.
 forkWaveDescription :: Text
-forkWaveDescription = "Fork any number of parallel Claude agents. Each starts in a worktree branched off your branch. Children inherit your full context window by default (fork_session defaults to true). Set fork_session: false for children that need a fresh start. Requires clean git state (committed and pushed). IMPORTANT: Create a team using TeamCreate BEFORE calling."
+forkWaveDescription = "Fork any number of parallel agents. Each starts in a worktree branched off your branch. Children inherit your full context window by default when supported (fork_session defaults to true). Set fork_session: false for children that need a fresh start. Requires clean git state (committed and pushed). Claude Code parents should create a team using TeamCreate before spawning Claude Code children."
 
 -- | Shared tool schema for fork_wave.
 forkWaveSchema :: Aeson.Object
@@ -265,7 +265,7 @@ instance FromJSON SpawnLeafSubtreeArgs where
 
 -- | Shared tool description for spawn_leaf_subtree.
 spawnLeafSubtreeDescription :: Text
-spawnLeafSubtreeDescription = "Fork a leaf agent into its own worktree and tmux window. Gets dev role (files PR, cannot spawn children). Leaf agents are capable implementers — give them acceptance criteria and file paths, not line-by-line instructions. IMPORTANT: You MUST create a team using TeamCreate BEFORE calling any spawn tool — without a team, child agent messages will not be delivered to you. After spawning, return immediately — you will be notified when the agent sends updates or when the reviewer approves their PR."
+spawnLeafSubtreeDescription = "Fork a leaf agent into its own worktree and tmux window. Gets dev role (files PR, cannot spawn children). Leaf agents are capable implementers — give them acceptance criteria and file paths, not line-by-line instructions. Claude Code parents should create a team using TeamCreate before spawning Claude Code children. After spawning, return immediately."
 
 -- | Shared tool schema for spawn_leaf_subtree.
 spawnLeafSubtreeSchema :: Aeson.Object
@@ -273,7 +273,7 @@ spawnLeafSubtreeSchema =
   genericToolSchemaWith @SpawnLeafSubtreeArgs
     [ ("task", "Description of the sub-problem to solve"),
       ("branch_name", "Branch name suffix (will be prefixed with current branch)"),
-      ("agent_type", "Agent type for the leaf: 'claude' or 'opencode'. Omit to use the server default."),
+      ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
       ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
       ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
       ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction."),
@@ -380,7 +380,7 @@ instance JsonSchema WorkerSpec where
           ("context_files", "Paths to files to include in context"),
           ("verify_templates", "Verification script templates"),
           ("type", "Worker type: 'implementation' (default) or 'research'. Research workers are read-only — they explore, search, and report findings via notify_parent."),
-          ("agent_type", "Agent type for the worker: 'claude' or 'opencode'. Omit to use the server default."),
+          ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
           ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
           ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
           ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction.")
@@ -418,7 +418,7 @@ instance FromJSON SpawnWorkersArgs where
 
 -- | Shared tool description for spawn_workers.
 spawnWorkersDescription :: Text
-spawnWorkersDescription = "Spawn multiple worker agents in one call. PREFER WORKERS OVER DOING WORK YOURSELF — worker tokens cost far less than TL tokens. Any task you can specify clearly (implementation, research, file edits, test writing) should be a worker. If it touches 2+ files or takes more than 5 tool calls, spawn a worker. Give them acceptance criteria, key file paths, and anti-patterns, not step-by-step code. Each gets a tmux pane in YOUR window, working in YOUR directory on YOUR branch (ephemeral, no isolation, no PR). Workers send messages via notify_parent. Set type to 'research' for read-only exploration workers that search, read, and report findings without modifying anything. IMPORTANT: You MUST create a team using TeamCreate BEFORE calling any spawn tool — without a team, child agent messages will not be delivered to you. After spawning, return immediately — do not poll or wait."
+spawnWorkersDescription = "Spawn multiple worker agents in one call. PREFER WORKERS OVER DOING WORK YOURSELF — worker tokens cost far less than TL tokens. Any task you can specify clearly (implementation, research, file edits, test writing) should be a worker. If it touches 2+ files or takes more than 5 tool calls, spawn a worker. Give them acceptance criteria, key file paths, and anti-patterns, not step-by-step code. Each gets a tmux pane in YOUR window, working in YOUR directory on YOUR branch (ephemeral, no isolation, no PR). Workers send messages via notify_parent. Set type to 'research' for read-only exploration workers that search, read, and report findings without modifying anything. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately — do not poll or wait."
 
 -- | Shared tool schema for spawn_workers.
 spawnWorkersSchema :: Aeson.Object
@@ -494,14 +494,14 @@ instance FromJSON SpawnLeafArgs where
       <*> v .:? "context"
 
 spawnLeafDescription :: Text
-spawnLeafDescription = "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). Agent type defaults to the server config; pass agent_type only when this leaf needs a specific supported runtime. Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately \x2014 you will be notified when the agent completes."
+spawnLeafDescription = "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). Agent type defaults to the server config; pass agent_type only when this leaf needs a specific supported runtime. Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. Claude Code parents should create a team using TeamCreate before spawning Claude Code leaves. After spawning, return immediately."
 
 spawnLeafSchema :: Aeson.Object
 spawnLeafSchema =
   genericToolSchemaWith @SpawnLeafArgs
     [ ("name", "Branch name suffix (e.g., 'fix-clippy' \x2192 'main.fix-clippy')"),
       ("task", "What to build. Combined with steps/verify/boundary into structured spec"),
-      ("agent_type", "Agent type for the leaf: 'claude' or 'opencode'. Omit to use the server default."),
+      ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
       ("steps", "Numbered implementation steps with code snippets and exact file paths"),
       ("verify", "Exact verification commands (e.g., 'cargo test --workspace')"),
       ("boundary", "DO NOT rules for known failure modes"),
@@ -569,14 +569,14 @@ instance FromJSON SpawnWorkerToolArgs where
       <*> v .:? "agent_type"
 
 spawnWorkerToolDescription :: Text
-spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately."
+spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately."
 
 spawnWorkerToolSchema :: Aeson.Object
 spawnWorkerToolSchema =
   genericToolSchemaWith @SpawnWorkerToolArgs
     [ ("name", "Worker name (pane title, messaging identity)"),
       ("task", "The full prompt. Everything the worker needs in one string"),
-      ("agent_type", "Agent type for the worker: 'claude' or 'opencode'. Omit to use the server default.")
+      ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default.")
     ]
 
 spawnWorkerToolCore :: SpawnWorkerToolArgs -> Eff Effects MCPCallOutput

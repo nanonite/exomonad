@@ -128,6 +128,18 @@ impl<
         }
     }
 
+    async fn register_claude_team_child(
+        &self,
+        member_name: &AgentName,
+        member_type: &str,
+        supervisor_key: &str,
+        ctx: &crate::effects::EffectContext,
+    ) {
+        self.register_synthetic_member(member_name, member_type, ctx)
+            .await;
+        self.register_child_supervisor(supervisor_key, ctx).await;
+    }
+
     /// Propagate the parent's team registration to a spawned sub-TL's identity keys.
     ///
     /// Sub-TLs don't call TeamCreate — they're part of the parent's team. But when
@@ -412,15 +424,20 @@ impl<
             );
         }
 
-        // Register as synthetic team member using internal_name (slug-{type}),
-        // matching what notify_parent sends as `from`.
-        let identity = crate::services::agent_control::AgentIdentity::new(
-            crate::services::agent_control::slugify(&req.name),
-            options.agent_type,
-        );
-        self.register_synthetic_member(&identity.internal_name(), options.agent_type.suffix(), ctx)
+        if options.agent_type == ServiceAgentType::Claude {
+            // Claude Code workers can participate in Claude Teams inboxes.
+            let identity = crate::services::agent_control::AgentIdentity::new(
+                crate::services::agent_control::slugify(&req.name),
+                options.agent_type,
+            );
+            self.register_claude_team_child(
+                &identity.internal_name(),
+                options.agent_type.suffix(),
+                &req.name,
+                ctx,
+            )
             .await;
-        self.register_child_supervisor(&req.name, ctx).await;
+        }
 
         Ok(SpawnWorkerResponse {
             agent: Some(agent_info),
@@ -509,25 +526,25 @@ impl<
             );
         }
 
-        self.register_child_supervisor(&req.branch_name, ctx).await;
-
-        // Register sub-TL as synthetic member so it can receive Teams inbox messages
-        let child_identity = crate::services::agent_control::AgentIdentity::new(
-            crate::services::agent_control::slugify(&req.branch_name),
-            options.agent_type,
-        );
-        let member_type_suffix = options.agent_type.suffix();
-        self.register_synthetic_member(
-            &child_identity.internal_name(),
-            &format!("{}-subtree", member_type_suffix),
-            ctx,
-        )
-        .await;
-
-        // Propagate parent's team to sub-TL's identity keys so the sub-TL can
-        // register its own workers as synthetic members when it spawns them
-        self.propagate_team_to_child(&req.branch_name, options.agent_type, ctx)
+        if options.agent_type == ServiceAgentType::Claude {
+            let child_identity = crate::services::agent_control::AgentIdentity::new(
+                crate::services::agent_control::slugify(&req.branch_name),
+                options.agent_type,
+            );
+            let member_type_suffix = options.agent_type.suffix();
+            self.register_claude_team_child(
+                &child_identity.internal_name(),
+                &format!("{}-subtree", member_type_suffix),
+                &req.branch_name,
+                ctx,
+            )
             .await;
+
+            // Propagate parent's team to sub-TL's identity keys so the sub-TL can
+            // register its own Claude Code workers as synthetic members.
+            self.propagate_team_to_child(&req.branch_name, options.agent_type, ctx)
+                .await;
+        }
 
         Ok(SpawnSubtreeResponse {
             agent: Some(agent_info),
@@ -577,20 +594,21 @@ impl<
             }));
         }
 
-        // Register as synthetic team member using internal_name (slug-{type}),
-        // matching what notify_parent sends as `from`.
-        let leaf_identity = crate::services::agent_control::AgentIdentity::new(
-            crate::services::agent_control::slugify(&req.branch_name),
-            options.agent_type,
-        );
-        let member_type_suffix = options.agent_type.suffix();
-        self.register_synthetic_member(
-            &leaf_identity.internal_name(),
-            &format!("{}-leaf", member_type_suffix),
-            ctx,
-        )
-        .await;
-        self.register_child_supervisor(&req.branch_name, ctx).await;
+        if options.agent_type == ServiceAgentType::Claude {
+            // Claude Code leaves can participate in Claude Teams inboxes.
+            let leaf_identity = crate::services::agent_control::AgentIdentity::new(
+                crate::services::agent_control::slugify(&req.branch_name),
+                options.agent_type,
+            );
+            let member_type_suffix = options.agent_type.suffix();
+            self.register_claude_team_child(
+                &leaf_identity.internal_name(),
+                &format!("{}-leaf", member_type_suffix),
+                &req.branch_name,
+                ctx,
+            )
+            .await;
+        }
 
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
@@ -657,10 +675,6 @@ impl<
 
         registry.register(conn).await;
 
-        // Register as synthetic team member (uses TL's actual team, not hardcoded exo-{branch})
-        self.register_synthetic_member(&agent_name, "gemini-acp", ctx)
-            .await;
-
         info!(agent = %agent_name, "ACP agent spawned and registered");
 
         let agent_info = exomonad_proto::effects::agent::AgentInfo {
@@ -696,8 +710,6 @@ impl<
                 }),
             );
         }
-
-        self.register_child_supervisor(&req.name, ctx).await;
 
         Ok(SpawnAcpResponse {
             agent: Some(agent_info),

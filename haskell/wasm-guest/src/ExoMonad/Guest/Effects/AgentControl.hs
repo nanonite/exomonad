@@ -62,7 +62,7 @@ import Proto3.Suite.Types (Enumerated (..))
 -- ============================================================================
 
 -- | Agent type for spawned agents.
-data AgentType = Claude | Gemini | Shoal | OpenCode
+data AgentType = Claude | Gemini | Shoal | OpenCode | Codex
   deriving (Show, Eq, Generic)
 
 instance ToJSON AgentType where
@@ -70,6 +70,7 @@ instance ToJSON AgentType where
   toJSON Gemini = "gemini"
   toJSON Shoal = "shoal"
   toJSON OpenCode = "opencode"
+  toJSON Codex = "codex"
 
 instance FromJSON AgentType where
   parseJSON = withText "AgentType" $ \case
@@ -77,13 +78,14 @@ instance FromJSON AgentType where
     "gemini" -> pure Gemini
     "shoal" -> pure Shoal
     "opencode" -> pure OpenCode
+    "codex" -> pure Codex
     other -> fail $ "Invalid agent type: " <> T.unpack other
 
 instance JsonSchema AgentType where
   toSchema =
     object
       [ "type" .= ("string" :: Text),
-        "enum" .= (["claude", "opencode"] :: [Text])
+        "enum" .= (["claude", "opencode", "codex"] :: [Text])
       ]
 
 -- | Result of spawning an agent.
@@ -286,12 +288,14 @@ toProtoAgentType Claude = PA.AgentTypeAGENT_TYPE_CLAUDE
 toProtoAgentType Gemini = PA.AgentTypeAGENT_TYPE_GEMINI
 toProtoAgentType Shoal = PA.AgentTypeAGENT_TYPE_SHOAL
 toProtoAgentType OpenCode = PA.AgentTypeAGENT_TYPE_OPENCODE
+toProtoAgentType Codex = PA.AgentTypeAGENT_TYPE_CODEX
 
 agentTypeLabel :: AgentType -> Text
 agentTypeLabel Claude = "claude"
 agentTypeLabel Gemini = "gemini"
 agentTypeLabel Shoal = "shoal"
 agentTypeLabel OpenCode = "opencode"
+agentTypeLabel Codex = "codex"
 
 permissionsToProto :: ClaudePermissions -> PA.Permissions
 permissionsToProto perms =
@@ -312,5 +316,6 @@ protoAgentInfoToSpawnResult info =
         Enumerated (Right PA.AgentTypeAGENT_TYPE_GEMINI) -> "gemini"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_SHOAL) -> "shoal"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_OPENCODE) -> "opencode"
+        Enumerated (Right PA.AgentTypeAGENT_TYPE_CODEX) -> "codex"
         _ -> "unknown"
     }

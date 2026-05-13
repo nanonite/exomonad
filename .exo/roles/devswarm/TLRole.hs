@@ -39,11 +39,12 @@ import ExoMonad.Guest.Tools.Events
 import ExoMonad.Guest.Tools.MergePR (mergePRCore, mergePRDescription, mergePRSchema, mergePRRender, MergePRArgs (..), MergePROutput (..), extractAgentName)
 import ExoMonad.Guest.Tools.Spawn
   ( forkWaveCore, forkWaveDescription, forkWaveSchema, forkWaveRender, ForkWaveArgs (..), ForkWaveResult (..),
-    spawnLeafCore, spawnLeafDescription, spawnLeafSchema, SpawnLeafArgs,
+    spawnLeafCore, spawnLeafDescription, spawnLeafSchema, SpawnLeafArgs, SpawnLeafSubtreeArgs,
     spawnLeafRender,
     spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
     spawnAcpCore, SpawnAcpArgs
   )
+import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription, spawnCodexSchema, SpawnCodex)
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Types (StopDecision(..), StopHookOutput(..), blockStopResponse, allowStopResponse, allowResponse, BeforeModelOutput (..), AfterModelOutput (..))
 import ExoMonad.Types (HookConfig (..), Effects, defaultSessionStartHook, teamRegistrationPostToolUse)
@@ -145,6 +146,27 @@ instance MCPTool TLSpawnWorker where
   toolSchema = spawnWorkerToolSchema
   toolHandlerEff args = spawnWorkerToolCore args
 
+data TLSpawnCodex
+
+instance MCPTool TLSpawnCodex where
+  type ToolArgs TLSpawnCodex = SpawnLeafSubtreeArgs
+  toolName = "spawn_codex"
+  toolDescription = spawnCodexDescription
+  toolSchema = spawnCodexSchema
+  toolHandlerEff args = do
+    result <- handleSpawnCodex args
+    case result of
+      Left err -> pure $ errorResult err
+      Right (slug, sr) -> do
+        let handle = ChildHandle
+              { chSlug = slug
+              , chBranch = branchName sr
+              , chAgentType = agentTypeResult sr
+              }
+        branch <- getCurrentBranch
+        void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
+        pure $ spawnLeafRender (Right (slug, sr))
+
 -- | TL notify_parent: thin wrapper, no phase transitions.
 data TLNotifyParent
 
@@ -163,6 +185,7 @@ data Tools mode = Tools
   { forkWave :: mode :- TLForkWave,
     spawnLeaf :: mode :- TLSpawnLeaf,
     spawnWorker :: mode :- TLSpawnWorker,
+    spawnCodex :: mode :- TLSpawnCodex,
     pr :: mode :- TLFilePR,
     mergePr :: mode :- TLMergePR,
     notifyParent :: mode :- TLNotifyParent,
@@ -195,6 +218,7 @@ config =
             { forkWave = mkHandler @TLForkWave,
               spawnLeaf = mkHandler @TLSpawnLeaf,
               spawnWorker = mkHandler @TLSpawnWorker,
+              spawnCodex = mkHandler @TLSpawnCodex,
               pr = mkHandler @TLFilePR,
               mergePr = mkHandler @TLMergePR,
               notifyParent = mkHandler @TLNotifyParent,

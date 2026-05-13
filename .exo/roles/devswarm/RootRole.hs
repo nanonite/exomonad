@@ -16,8 +16,10 @@ import ExoMonad.Guest.Tools.MergePR (mergePRCore, mergePRDescription, mergePRSch
 import ExoMonad.Guest.Tools.Spawn
   ( forkWaveCore, forkWaveDescription, forkWaveSchema, forkWaveRender, ForkWaveArgs (..), ForkWaveResult (..),
     spawnLeafCore, spawnLeafDescription, spawnLeafSchema, spawnLeafRender, SpawnLeafArgs (..),
-    spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs
+    spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
+    SpawnLeafSubtreeArgs
   )
+import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription, spawnCodexSchema, SpawnCodex)
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Types (allowResponse, allowStopResponse, BeforeModelOutput (..), AfterModelOutput (..))
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
@@ -65,6 +67,22 @@ instance MCPTool RootSpawnWorker where
   toolSchema = spawnWorkerToolSchema
   toolHandlerEff args = spawnWorkerToolCore args
 
+data RootSpawnCodex
+instance MCPTool RootSpawnCodex where
+  type ToolArgs RootSpawnCodex = SpawnLeafSubtreeArgs
+  toolName = "spawn_codex"
+  toolDescription = spawnCodexDescription
+  toolSchema = spawnCodexSchema
+  toolHandlerEff args = do
+    result <- handleSpawnCodex args
+    case result of
+      Left err -> pure $ errorResult err
+      Right (slug, sr) -> do
+        let handle = ChildHandle { chSlug = slug, chBranch = branchName sr, chAgentType = agentTypeResult sr }
+        branch <- getCurrentBranch
+        void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
+        pure $ spawnLeafRender (Right (slug, sr))
+
 data RootMergePR
 instance MCPTool RootMergePR where
   type ToolArgs RootMergePR = MergePRArgs
@@ -88,6 +106,7 @@ data Tools mode = Tools
   { forkWave    :: mode :- RootForkWave,
     spawnLeaf   :: mode :- RootSpawnLeaf,
     spawnWorker :: mode :- RootSpawnWorker,
+    spawnCodex  :: mode :- RootSpawnCodex,
     mergePr     :: mode :- RootMergePR,
     sendMessage :: mode :- SendMessage
   }
@@ -101,6 +120,7 @@ config =
         { forkWave    = mkHandler @RootForkWave,
           spawnLeaf   = mkHandler @RootSpawnLeaf,
           spawnWorker = mkHandler @RootSpawnWorker,
+          spawnCodex  = mkHandler @RootSpawnCodex,
           mergePr     = mkHandler @RootMergePR,
           sendMessage = mkHandler @SendMessage
         },
