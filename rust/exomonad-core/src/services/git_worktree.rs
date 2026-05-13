@@ -107,7 +107,10 @@ impl GitWorktreeService {
         let git_user_name = format!("exomonad-{}", agent_name);
         let git_user_email = format!("{}@exomonad.local", agent_name);
 
-        for (key, value) in [("user.name", git_user_name.as_str()), ("user.email", git_user_email.as_str())] {
+        for (key, value) in [
+            ("user.name", git_user_name.as_str()),
+            ("user.email", git_user_email.as_str()),
+        ] {
             let out = std::process::Command::new("git")
                 .args(["config", "--local", key, value])
                 .current_dir(path)
@@ -142,7 +145,13 @@ impl GitWorktreeService {
         info!(path = %path.display(), at_ref, "Creating detached reviewer worktree");
 
         let output = std::process::Command::new("git")
-            .args(["worktree", "add", "--detach", &path.to_string_lossy(), at_ref])
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                &path.to_string_lossy(),
+                at_ref,
+            ])
             .current_dir(&self.project_dir)
             .output()
             .map_err(|e| WorktreeError::GitError {
@@ -157,7 +166,10 @@ impl GitWorktreeService {
 
         let git_user_name = format!("exomonad-{}", identity_name);
         let git_user_email = format!("{}@exomonad.local", identity_name);
-        for (key, value) in [("user.name", git_user_name.as_str()), ("user.email", git_user_email.as_str())] {
+        for (key, value) in [
+            ("user.name", git_user_name.as_str()),
+            ("user.email", git_user_email.as_str()),
+        ] {
             let out = std::process::Command::new("git")
                 .args(["config", "--local", key, value])
                 .current_dir(path)
@@ -616,12 +628,7 @@ mod tests {
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test User"]);
         run(&["commit", "--allow-empty", "-m", "Initial commit"]);
-        run(&[
-            "remote",
-            "add",
-            "tangled",
-            bare.path().to_str().unwrap(),
-        ]);
+        run(&["remote", "add", "tangled", bare.path().to_str().unwrap()]);
 
         let service = GitWorktreeService::new(work_dir.to_path_buf());
         let default_branch = get_default_branch(work_dir);

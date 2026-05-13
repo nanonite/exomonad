@@ -4,6 +4,7 @@ pub mod agent_control;
 pub mod agent_resolver;
 pub mod claude_session_registry;
 pub mod command;
+pub mod complexity_classifier;
 pub mod delivery;
 pub mod event_log;
 pub mod event_queue;
@@ -20,17 +21,16 @@ pub mod log;
 pub mod merge_pr;
 pub mod merge_pr_local;
 pub mod mutex_registry;
-pub mod worktree_event_watcher;
-pub mod review_policy;
-pub mod complexity_classifier;
 pub mod opencode_acp;
 pub mod repo;
 pub mod resilience;
+pub mod review_policy;
 pub mod secrets;
 pub mod supervisor_registry;
 pub mod synthetic_members;
 pub mod tmux_events;
 pub mod tmux_ipc;
+pub mod worktree_event_watcher;
 
 pub use self::acp_registry::AcpRegistry;
 pub use self::agent_control::{
@@ -94,7 +94,13 @@ pub trait HasOpencodeAcpRegistry: Send + Sync {
     fn opencode_acp_registry(&self) -> &OpencodeAcpRegistry;
 }
 pub trait HasCiStatusMap: Send + Sync {
-    fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>>>;
+    fn ci_status_map(
+        &self,
+    ) -> &Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>,
+        >,
+    >;
     fn spindle_url(&self) -> Option<&str>;
 }
 
@@ -134,7 +140,11 @@ pub struct Services {
     /// Shared CI status map updated by the spindle WebSocket subscriber.
     /// Keyed by branch name; `None` values mean no status received yet.
     /// Shared with `WorktreeEventWatcher` so both the watcher and merge gate read from the same map.
-    pub ci_status_map: Arc<tokio::sync::RwLock<std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>>>,
+    pub ci_status_map: Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>,
+        >,
+    >,
     /// Tangled spindle URL (`ws://...`). Present when spindle CI is configured.
     pub spindle_url: Option<String>,
 }
@@ -207,7 +217,13 @@ impl HasOpencodeAcpRegistry for Services {
     }
 }
 impl HasCiStatusMap for Services {
-    fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>>> {
+    fn ci_status_map(
+        &self,
+    ) -> &Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>,
+        >,
+    > {
         &self.ci_status_map
     }
     fn spindle_url(&self) -> Option<&str> {

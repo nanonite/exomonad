@@ -104,7 +104,10 @@ pub async fn spawn_and_prompt(
         .spawn()
         .context("Failed to spawn opencode serve")?;
 
-    let stdout = child.stdout.take().context("No stdout on opencode serve child")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("No stdout on opencode serve child")?;
     let base_url = capture_port(stdout)
         .await
         .context("Failed to capture OpenCode server port")?;
@@ -157,7 +160,10 @@ async fn create_session(http: &reqwest::Client, base_url: &str, title: &str) -> 
         anyhow::bail!("POST /session returned {}: {}", status, body);
     }
 
-    let body: serde_json::Value = resp.json().await.context("Failed to parse session response")?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("Failed to parse session response")?;
     let id = body["id"]
         .as_str()
         .context("Session response missing 'id' field")?

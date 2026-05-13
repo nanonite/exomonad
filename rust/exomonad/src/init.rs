@@ -20,7 +20,11 @@ fn read_chainlink_tl_protocol(cwd: &Path) -> Option<String> {
     } else {
         content
     };
-    if stripped.is_empty() { None } else { Some(stripped) }
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped)
+    }
 }
 
 /// Reject `--tl-model` / `--worker-model` values that opencode doesn't recognise.
@@ -63,15 +67,25 @@ async fn validate_opencode_model(model: &str) -> Result<()> {
         .filter(|l| !l.is_empty())
         .collect();
     if !known.contains(model) {
-        anyhow::bail!(
-            "Unknown opencode model `{model}`. Run `exomonad models` to see the list."
-        );
+        anyhow::bail!("Unknown opencode model `{model}`. Run `exomonad models` to see the list.");
     }
     Ok(())
 }
 
 /// Run the init command: create or attach to tmux session.
-pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_tl: bool, openrouter: bool, tl: Option<String>, worker: Option<String>, tl_model: Option<String>, worker_model: Option<String>, reviewer: Option<String>, reviewer_model: Option<String>, verbose: bool) -> Result<()> {
+pub async fn run(
+    session_override: Option<String>,
+    recreate: bool,
+    opencode_as_tl: bool,
+    openrouter: bool,
+    tl: Option<String>,
+    worker: Option<String>,
+    tl_model: Option<String>,
+    worker_model: Option<String>,
+    reviewer: Option<String>,
+    reviewer_model: Option<String>,
+    verbose: bool,
+) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
     use exomonad_core::services::{resolve_role_context_path, AgentType};
     use std::io::{IsTerminal, Write};
@@ -322,8 +336,12 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
         );
         let opencode_dir = cwd.join(".exo/agents/root");
         std::fs::create_dir_all(&opencode_dir)?;
-        std::fs::write(opencode_dir.join("opencode.json"), serde_json::to_string_pretty(&opencode_config)?)?;
-        AgentControlService::<Services>::write_opencode_plugin_files(&opencode_dir).await
+        std::fs::write(
+            opencode_dir.join("opencode.json"),
+            serde_json::to_string_pretty(&opencode_config)?,
+        )?;
+        AgentControlService::<Services>::write_opencode_plugin_files(&opencode_dir)
+            .await
             .context("Failed to write OpenCode plugin files to .exo/agents/root")?;
         info!("OpenCode configuration written to .exo/agents/root/");
     } else {
@@ -729,13 +747,15 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
             extra_mcp.insert(name.clone(), entry);
         }
         // Write opencode.json to repo root so the TL window discovers it via CWD.
-        let opencode_config =
-            AgentControlService::<Services>::generate_opencode_tl_settings("root", "root", &extra_mcp);
+        let opencode_config = AgentControlService::<Services>::generate_opencode_tl_settings(
+            "root", "root", &extra_mcp,
+        );
         std::fs::write(
             cwd.join("opencode.json"),
             serde_json::to_string_pretty(&opencode_config)?,
         )?;
-        AgentControlService::<Services>::write_opencode_plugin_files(&cwd).await
+        AgentControlService::<Services>::write_opencode_plugin_files(&cwd)
+            .await
             .context("Failed to write OpenCode plugin files to repo root")?;
         info!("Wrote opencode.json and plugin to repo root for OpenCode TL");
     }
@@ -1121,7 +1141,11 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
                 format!("{env_prefix}{}{}", companion.command, task_part)
             }
             AgentType::OpenCode => {
-                let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
+                let yolo = if config.yolo {
+                    " --dangerously-skip-permissions"
+                } else {
+                    ""
+                };
                 let model_flag = companion
                     .model
                     .as_deref()
@@ -1133,7 +1157,9 @@ pub async fn run(session_override: Option<String>, recreate: bool, opencode_as_t
                 };
                 format!("{env_prefix}opencode run{yolo}{model_flag}{task_part}")
             }
-            AgentType::Codex => format!("{env_prefix}echo 'Codex companion startup is not implemented yet'; exec bash -l"),
+            AgentType::Codex => format!(
+                "{env_prefix}echo 'Codex companion startup is not implemented yet'; exec bash -l"
+            ),
             AgentType::Process => unreachable!("Process companions handled above"),
         };
         let window_id = ipc
@@ -1211,9 +1237,7 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
 
     info!(
         container,
-        owner_did,
-        repo_name,
-        "Registering repo with local Tangled knot"
+        owner_did, repo_name, "Registering repo with local Tangled knot"
     );
 
     // Step 1: create bare repo in knot container.
@@ -1280,10 +1304,7 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
         .output();
     match out {
         Ok(o) if o.status.success() => {
-            info!(
-                spindle_db,
-                repo_name, "Spindle: repo entry seeded"
-            );
+            info!(spindle_db, repo_name, "Spindle: repo entry seeded");
         }
         Ok(o) => {
             warn!(
@@ -1297,10 +1318,7 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
     }
 
     // Step 4: set git remote 'tangled' (idempotent).
-    let ssh_url = format!(
-        "git@local-tangled:repositories/owner/{}.git",
-        repo_name
-    );
+    let ssh_url = format!("git@local-tangled:repositories/owner/{}.git", repo_name);
     // Remove stale remote first (ignore errors), then add fresh.
     let _ = std::process::Command::new("git")
         .args(["remote", "remove", "tangled"])
@@ -1408,7 +1426,10 @@ fn parse_agent_type(s: &str) -> Result<AgentType> {
         "opencode" | "opencode-cli" => Ok(AgentType::OpenCode),
         "codex" => Ok(AgentType::Codex),
         "shoal" => Ok(AgentType::Shoal),
-        _ => anyhow::bail!("Unknown agent type: {}. Valid values: claude, gemini, opencode, codex, shoal", s),
+        _ => anyhow::bail!(
+            "Unknown agent type: {}. Valid values: claude, gemini, opencode, codex, shoal",
+            s
+        ),
     }
 }
 
@@ -1569,14 +1590,7 @@ mod tests {
     fn missing_binary_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("spindle"); // does not exist
-        assert!(build_spindle_companion(
-            Some("did:plc:test"),
-            None,
-            None,
-            &bin,
-            &[]
-        )
-        .is_none());
+        assert!(build_spindle_companion(Some("did:plc:test"), None, None, &bin, &[]).is_none());
     }
 
     #[test]
@@ -1585,14 +1599,9 @@ mod tests {
         let bin = dir.path().join("spindle");
         std::fs::write(&bin, "").unwrap();
         let companions = vec![spindle_companion("spindle")];
-        assert!(build_spindle_companion(
-            Some("did:plc:test"),
-            None,
-            None,
-            &bin,
-            &companions
-        )
-        .is_none());
+        assert!(
+            build_spindle_companion(Some("did:plc:test"), None, None, &bin, &companions).is_none()
+        );
     }
 
     #[test]
@@ -1601,19 +1610,17 @@ mod tests {
         let bin = dir.path().join("spindle");
         std::fs::write(&bin, "").unwrap();
 
-        let companion = build_spindle_companion(
-            Some("did:plc:test"),
-            None,
-            None,
-            &bin,
-            &[],
-        )
-        .unwrap();
+        let companion =
+            build_spindle_companion(Some("did:plc:test"), None, None, &bin, &[]).unwrap();
 
         assert_eq!(companion.name, "spindle");
         assert_eq!(companion.agent_type, Some(AgentType::Process));
-        assert!(companion.command.contains("SPINDLE_SERVER_OWNER=did:plc:test"));
-        assert!(companion.command.contains("SPINDLE_SERVER_DB_PATH=spindle.db"));
+        assert!(companion
+            .command
+            .contains("SPINDLE_SERVER_OWNER=did:plc:test"));
+        assert!(companion
+            .command
+            .contains("SPINDLE_SERVER_DB_PATH=spindle.db"));
         assert!(companion
             .command
             .contains("SPINDLE_SERVER_JETSTREAM_ENDPOINT=ws://localhost:5555/events"));
@@ -1674,7 +1681,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(companion.command.contains("SPINDLE_SERVER_DB_PATH=/data/spindle.db"));
+        assert!(companion
+            .command
+            .contains("SPINDLE_SERVER_DB_PATH=/data/spindle.db"));
     }
 
     #[test]
@@ -1684,13 +1693,8 @@ mod tests {
         std::fs::write(&bin, "").unwrap();
         let companions = vec![spindle_companion("mock-github")];
 
-        let companion = build_spindle_companion(
-            Some("did:plc:test"),
-            None,
-            None,
-            &bin,
-            &companions,
-        );
+        let companion =
+            build_spindle_companion(Some("did:plc:test"), None, None, &bin, &companions);
 
         assert!(companion.is_some());
     }

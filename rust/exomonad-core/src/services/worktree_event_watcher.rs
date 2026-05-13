@@ -1,7 +1,9 @@
 use crate::domain::{AgentName, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
-use crate::services::file_pr_local::{read_pr_registry, write_pr_registry, LocalReviewState, PrState, PrRegistry};
+use crate::services::file_pr_local::{
+    read_pr_registry, write_pr_registry, LocalReviewState, PrRegistry, PrState,
+};
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasOpencodeAcpRegistry,
@@ -83,7 +85,13 @@ struct WatchState {
 }
 
 impl WatchState {
-    fn new(branch: &BranchName, agent_type: AgentType, sha: &str, ci_status: CIStatus, comment_count: usize) -> Self {
+    fn new(
+        branch: &BranchName,
+        agent_type: AgentType,
+        sha: &str,
+        ci_status: CIStatus,
+        comment_count: usize,
+    ) -> Self {
         Self {
             last_comment_count: comment_count,
             last_ci_status: ci_status,
@@ -262,20 +270,30 @@ where
             match self.poll_cycle().await {
                 Ok(()) => {
                     if consecutive_failures > 0 {
-                        info!(previous_failures = consecutive_failures, "Watcher recovered");
+                        info!(
+                            previous_failures = consecutive_failures,
+                            "Watcher recovered"
+                        );
                     }
                     consecutive_failures = 0;
                 }
                 Err(e) => {
                     consecutive_failures += 1;
                     let next_retry_secs = {
-                        let backoff = base_interval * 2u32.saturating_pow(consecutive_failures.min(6));
+                        let backoff =
+                            base_interval * 2u32.saturating_pow(consecutive_failures.min(6));
                         backoff.min(max_backoff).as_secs()
                     };
                     if consecutive_failures <= 3 {
-                        warn!(consecutive_failures, next_retry_secs, "Watcher cycle failed: {}", e);
+                        warn!(
+                            consecutive_failures,
+                            next_retry_secs, "Watcher cycle failed: {}", e
+                        );
                     } else {
-                        debug!(consecutive_failures, next_retry_secs, "Watcher cycle failed: {}", e);
+                        debug!(
+                            consecutive_failures,
+                            next_retry_secs, "Watcher cycle failed: {}", e
+                        );
                     }
                 }
             }
@@ -311,7 +329,10 @@ where
         Ok(())
     }
 
-    async fn collect_observations(&self, registry: &crate::services::file_pr_local::PrRegistry) -> Result<HashMap<u64, Observation>> {
+    async fn collect_observations(
+        &self,
+        registry: &crate::services::file_pr_local::PrRegistry,
+    ) -> Result<HashMap<u64, Observation>> {
         let mut observations = HashMap::new();
         let project_dir = self.ctx.project_dir().to_path_buf();
 
@@ -320,9 +341,7 @@ where
                 continue;
             }
 
-            let worktree_path = project_dir
-                .join(".exo/worktrees")
-                .join(&pr.author_agent);
+            let worktree_path = project_dir.join(".exo/worktrees").join(&pr.author_agent);
 
             let head_sha = git_head_sha(&worktree_path).await.unwrap_or_default();
 
@@ -334,15 +353,17 @@ where
                         "changes_requested" => LocalReviewState::ChangesRequested,
                         _ => LocalReviewState::PendingReview,
                     };
-                    let lrc: Vec<LocalReviewComment> = rf.comments.into_iter().map(|c| {
-                        LocalReviewComment {
+                    let lrc: Vec<LocalReviewComment> = rf
+                        .comments
+                        .into_iter()
+                        .map(|c| LocalReviewComment {
                             body: c.body,
                             path: c.path,
                             diff_hunk: c.diff_hunk,
                             thread_id: c.thread_id,
                             resolved: c.resolved,
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     (state, lrc)
                 }
                 None => {
@@ -353,15 +374,23 @@ where
 
             let ci_status = {
                 let branch = BranchName::from(pr.head_branch.as_str());
-                self.ci_status_map.read().await.get(&branch).copied().unwrap_or(CIStatus::Unknown)
+                self.ci_status_map
+                    .read()
+                    .await
+                    .get(&branch)
+                    .copied()
+                    .unwrap_or(CIStatus::Unknown)
             };
 
-            observations.insert(*number, Observation {
-                head_sha,
-                review_state,
-                comments,
-                ci_status,
-            });
+            observations.insert(
+                *number,
+                Observation {
+                    head_sha,
+                    review_state,
+                    comments,
+                    ci_status,
+                },
+            );
         }
 
         Ok(observations)
@@ -422,8 +451,13 @@ where
                             tokio::spawn(async move {
                                 info!(pr_number = pr_num, "Spawning reviewer agent for new PR");
                                 match spawner.spawn_reviewer_for_pr(&pr_clone).await {
-                                    Ok(_) => info!(pr_number = pr_num, "Reviewer agent spawned successfully"),
-                                    Err(e) => warn!(pr_number = pr_num, error = %e, "Failed to spawn reviewer for PR"),
+                                    Ok(_) => info!(
+                                        pr_number = pr_num,
+                                        "Reviewer agent spawned successfully"
+                                    ),
+                                    Err(e) => {
+                                        warn!(pr_number = pr_num, error = %e, "Failed to spawn reviewer for PR")
+                                    }
                                 }
                             });
                             if let Some(ws) = state_guard.get_mut(pr_number) {
@@ -452,15 +486,24 @@ where
         for (_pr_number, actions, branch, agent_type) in pending_actions {
             for action in actions {
                 match action {
-                    PendingAction::WasmEvent { event_type, payload } => {
+                    PendingAction::WasmEvent {
+                        event_type,
+                        payload,
+                    } => {
                         if let Ok(Some(response)) = self
                             .call_handle_event(branch.as_str(), agent_type, event_type, payload)
                             .await
                         {
-                            self.handle_event_action(response, branch.as_str(), agent_type).await;
+                            self.handle_event_action(response, branch.as_str(), agent_type)
+                                .await;
                         }
                     }
-                    PendingAction::EmitEvent { status, message, comments, reviews } => {
+                    PendingAction::EmitEvent {
+                        status,
+                        message,
+                        comments,
+                        reviews,
+                    } => {
                         self.emit_event(
                             branch.as_str(),
                             &status,
@@ -516,9 +559,7 @@ where
                     .rsplit_once('.')
                     .map(|(p, _)| p)
                     .unwrap_or("main");
-                if sib_parent == parent_branch
-                    && registry.prs.contains_key(sib_num)
-                {
+                if sib_parent == parent_branch && registry.prs.contains_key(sib_num) {
                     let payload = serde_json::json!({
                         "merged_branch": branch.as_str(),
                         "parent_branch": parent_branch,
@@ -684,15 +725,16 @@ where
         match action {
             EventActionResponse::InjectMessage { message } => {
                 let agent_name = AgentName::from(branch);
-                let tab_name = if let Ok(records) = self.ctx.agent_resolver().records_ref().try_read() {
-                    records.get(&agent_name).map(|r| r.display_name.clone())
-                } else {
-                    None
-                }
-                .unwrap_or_else(|| {
-                    let slug = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
-                    agent_type.tab_display_name(slug)
-                });
+                let tab_name =
+                    if let Ok(records) = self.ctx.agent_resolver().records_ref().try_read() {
+                        records.get(&agent_name).map(|r| r.display_name.clone())
+                    } else {
+                        None
+                    }
+                    .unwrap_or_else(|| {
+                        let slug = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
+                        agent_type.tab_display_name(slug)
+                    });
                 crate::services::delivery::deliver_to_agent(
                     &*self.ctx,
                     branch,
@@ -703,7 +745,10 @@ where
                 )
                 .await;
             }
-            EventActionResponse::NotifyParent { message, pr_number: _pr_number } => {
+            EventActionResponse::NotifyParent {
+                message,
+                pr_number: _pr_number,
+            } => {
                 let agent_slug = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
                 let parent_session_id = branch
                     .rsplit_once('.')
@@ -1148,7 +1193,8 @@ async fn run_spindle_subscriber(
                         Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                             if let Ok(ev) = serde_json::from_str::<TangledStreamEvent>(&text) {
                                 if ev.nsid == "sh.tangled.pipeline.status" {
-                                    if let Some((rkey, status)) = extract_pipeline_status(&ev.event) {
+                                    if let Some((rkey, status)) = extract_pipeline_status(&ev.event)
+                                    {
                                         let branch = pipeline_map.read().await.get(&rkey).cloned();
                                         if let Some(branch) = branch {
                                             let ci = CIStatus::parse(&status);
@@ -1283,7 +1329,9 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "commits_pushed")));
         assert_eq!(state.last_sha, "def456");
     }
@@ -1306,7 +1354,9 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "fixes_pushed")));
         assert!(state.addressed_changes);
         assert_eq!(state.last_review_state, ReviewState::None);
@@ -1328,7 +1378,9 @@ mod tests {
             &|_, _| "review message".to_string(),
             5,
         );
-        assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "review_received")));
         assert_eq!(state.last_comment_count, 1);
     }
@@ -1349,7 +1401,9 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "approved")));
         assert!(state.notified_parent_approved);
     }
@@ -1371,7 +1425,13 @@ mod tests {
             5,
         );
         assert_eq!(state.last_review_state, ReviewState::ChangesRequested);
-        assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { event_type: "pr_review", .. })));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "pr_review",
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -1390,7 +1450,13 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { event_type: "ci_status", .. })));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "ci_status",
+                ..
+            }
+        )));
         assert_eq!(state.last_ci_status, CIStatus::Success);
     }
 
@@ -1410,7 +1476,9 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "timeout")));
         assert!(state.notified_parent_timeout);
     }
@@ -1474,7 +1542,9 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "approved")));
     }
 
@@ -1495,7 +1565,9 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions.iter().any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "timeout" && payload["minutes_elapsed"] == 5)));
     }
 
@@ -1558,7 +1630,9 @@ mod tests {
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ReviewState::ChangesRequested);
-        assert!(reviews.iter().any(|r| r.state == ReviewState::ChangesRequested));
+        assert!(reviews
+            .iter()
+            .any(|r| r.state == ReviewState::ChangesRequested));
     }
 
     // ---------------------------------------------------------------------------
@@ -1574,8 +1648,14 @@ mod tests {
     #[test]
     fn test_format_message_with_reviews() {
         let reviews = vec![
-            LocalReview { body: "LGTM!".to_string(), state: ReviewState::Approved },
-            LocalReview { body: "Good work.".to_string(), state: ReviewState::None },
+            LocalReview {
+                body: "LGTM!".to_string(),
+                state: ReviewState::Approved,
+            },
+            LocalReview {
+                body: "Good work.".to_string(),
+                state: ReviewState::None,
+            },
         ];
         let msg = format_review_message(&[], &reviews);
         assert!(msg.contains("Review summary:"));
@@ -1585,15 +1665,13 @@ mod tests {
 
     #[test]
     fn test_format_message_with_inline_comments() {
-        let comments = vec![
-            LocalReviewComment {
-                body: "Fix this typo".to_string(),
-                path: Some("src/main.rs".to_string()),
-                diff_hunk: Some("@@ -1,3 +1,3 @@".to_string()),
-                thread_id: None,
-                resolved: false,
-            },
-        ];
+        let comments = vec![LocalReviewComment {
+            body: "Fix this typo".to_string(),
+            path: Some("src/main.rs".to_string()),
+            diff_hunk: Some("@@ -1,3 +1,3 @@".to_string()),
+            thread_id: None,
+            resolved: false,
+        }];
         let msg = format_review_message(&comments, &[]);
         assert!(msg.contains("Inline comments:"));
         assert!(msg.contains("Fix this typo"));
@@ -1664,8 +1742,7 @@ mod tests {
             &self,
             _pr: &crate::services::file_pr_local::PrEntry,
         ) -> anyhow::Result<()> {
-            self.called
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1691,10 +1768,15 @@ mod tests {
         }
     }
 
-    fn test_registry(pr: crate::services::file_pr_local::PrEntry) -> crate::services::file_pr_local::PrRegistry {
+    fn test_registry(
+        pr: crate::services::file_pr_local::PrEntry,
+    ) -> crate::services::file_pr_local::PrRegistry {
         let mut prs = HashMap::new();
         prs.insert(pr.number, pr);
-        crate::services::file_pr_local::PrRegistry { prs, next_number: 2 }
+        crate::services::file_pr_local::PrRegistry {
+            prs,
+            next_number: 2,
+        }
     }
 
     fn test_observation(sha: &str) -> Observation {
@@ -1711,26 +1793,33 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let called = Arc::new(AtomicBool::new(false));
-        let spawner = Arc::new(MockReviewerSpawner { called: called.clone() });
+        let spawner = Arc::new(MockReviewerSpawner {
+            called: called.clone(),
+        });
 
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
 
-        let watcher = WorktreeEventWatcher::new(Arc::new(services))
-            .with_reviewer_spawner(spawner);
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
 
         let pr = test_pr_entry();
         let registry = test_registry(pr);
         let mut observations = HashMap::new();
         observations.insert(1u64, test_observation("abc123"));
 
-        watcher.process_observations(&registry, &observations).await.unwrap();
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
 
         // Give the tokio::spawn task a moment to complete.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        assert!(called.load(Ordering::SeqCst), "spawner should be called for first sighting of new PR");
+        assert!(
+            called.load(Ordering::SeqCst),
+            "spawner should be called for first sighting of new PR"
+        );
 
         let state = watcher.state.lock().await;
         assert!(
@@ -1759,14 +1848,15 @@ mod tests {
             }
         }
 
-        let spawner = Arc::new(CountingSpawner { count: call_count.clone() });
+        let spawner = Arc::new(CountingSpawner {
+            count: call_count.clone(),
+        });
 
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
 
-        let watcher = WorktreeEventWatcher::new(Arc::new(services))
-            .with_reviewer_spawner(spawner);
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
 
         let pr = test_pr_entry();
         let registry = test_registry(pr);
@@ -1774,13 +1864,23 @@ mod tests {
         observations.insert(1u64, test_observation("abc123"));
 
         // First call — spawns reviewer
-        watcher.process_observations(&registry, &observations).await.unwrap();
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Second call — PR is already in state, no second spawn
-        watcher.process_observations(&registry, &observations).await.unwrap();
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "spawner should only be called once per PR");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "spawner should only be called once per PR"
+        );
     }
 }

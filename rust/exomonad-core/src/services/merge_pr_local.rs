@@ -5,7 +5,9 @@
 // remote (or origin as fallback), and updates the registry state to Merged.
 
 use crate::domain::{AgentName, BranchName, CIStatus, MergeStrategy, PRNumber};
-use crate::services::file_pr_local::{read_pr_registry, resolve_push_remote, write_pr_registry, PrState};
+use crate::services::file_pr_local::{
+    read_pr_registry, resolve_push_remote, write_pr_registry, PrState,
+};
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::merge_pr::MergePROutput;
 pub use crate::services::review_policy::ReviewPolicy;
@@ -25,15 +27,10 @@ use tracing::{info, warn};
 pub enum MergeGateError {
     /// PR is in the Stuck terminal state — must surface to human.
     #[error("PR #{pr_number} is STUCK (rounds={rounds}) — requires human intervention")]
-    Stuck {
-        pr_number: u64,
-        rounds: u32,
-    },
+    Stuck { pr_number: u64, rounds: u32 },
     /// PR has the `needs_human_review` flag set.
     #[error("PR #{pr_number} requires human review")]
-    NeedsHumanReview {
-        pr_number: u64,
-    },
+    NeedsHumanReview { pr_number: u64 },
     /// PR review state is not Approved.
     #[error("PR #{pr_number} not approved (review_state={review_state})")]
     NotApproved {
@@ -42,10 +39,7 @@ pub enum MergeGateError {
     },
     /// Author and merger are the same agent — identity separation violated.
     #[error("PR #{pr_number}: author {author} cannot self-merge")]
-    SelfMerge {
-        pr_number: u64,
-        author: String,
-    },
+    SelfMerge { pr_number: u64, author: String },
     /// Not enough review rounds completed.
     #[error("PR #{pr_number}: {rounds} review round(s) completed, {required} required")]
     InsufficientRounds {
@@ -55,20 +49,13 @@ pub enum MergeGateError {
     },
     /// Complex PR requires a second reviewer but only one has reviewed.
     #[error("PR #{pr_number}: requires second reviewer (complexity threshold exceeded)")]
-    SecondReviewerRequired {
-        pr_number: u64,
-    },
+    SecondReviewerRequired { pr_number: u64 },
     /// PR not found in the registry.
     #[error("PR #{pr_number} not found in local registry")]
-    NotFound {
-        pr_number: u64,
-    },
+    NotFound { pr_number: u64 },
     /// CI has not passed (spindle reports non-success status).
     #[error("PR #{pr_number}: CI not passing (status={status})")]
-    CiNotPassed {
-        pr_number: u64,
-        status: String,
-    },
+    CiNotPassed { pr_number: u64, status: String },
 }
 
 // ============================================================================
@@ -225,7 +212,12 @@ pub async fn merge_pr_local(
     // Resolve CI status for Gate 7: when spindle is configured, missing status blocks the merge.
     let ci_status = if spindle_url.is_some() {
         let branch = BranchName::from(head_branch.as_str());
-        let status = ci_status_map.read().await.get(&branch).copied().unwrap_or(CIStatus::Unknown);
+        let status = ci_status_map
+            .read()
+            .await
+            .get(&branch)
+            .copied()
+            .unwrap_or(CIStatus::Unknown);
         info!(branch = %head_branch, status = ?status, "CI gate check (spindle configured)");
         Some(status)
     } else {
@@ -309,7 +301,9 @@ pub async fn merge_pr_local(
         let wt_path = worktree_path.clone();
         match tokio::task::spawn_blocking(move || wt.remove_workspace(&wt_path)).await {
             Ok(Ok(())) => info!(path = %worktree_path.display(), "Removed merged worktree"),
-            Ok(Err(e)) => warn!(error = %e, path = %worktree_path.display(), "Failed to remove worktree (non-fatal)"),
+            Ok(Err(e)) => {
+                warn!(error = %e, path = %worktree_path.display(), "Failed to remove worktree (non-fatal)")
+            }
             Err(e) => warn!(error = %e, "spawn_blocking failed for worktree removal"),
         }
     }
@@ -384,7 +378,11 @@ mod tests {
         pr.reviewer_agent = Some("reviewer-gemini".into());
 
         let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
-        assert!(result.is_ok(), "Expected all gates to pass, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Expected all gates to pass, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -442,7 +440,10 @@ mod tests {
 
         let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(
-            matches!(result, Err(MergeGateError::NeedsHumanReview { pr_number: 1 })),
+            matches!(
+                result,
+                Err(MergeGateError::NeedsHumanReview { pr_number: 1 })
+            ),
             "Expected NeedsHumanReview, got: {:?}",
             result
         );
@@ -476,7 +477,10 @@ mod tests {
 
         let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, None);
         assert!(
-            matches!(result, Err(MergeGateError::NotApproved { pr_number: 1, .. })),
+            matches!(
+                result,
+                Err(MergeGateError::NotApproved { pr_number: 1, .. })
+            ),
             "Expected NotApproved, got: {:?}",
             result
         );
@@ -609,7 +613,14 @@ mod tests {
 
         let result = check_merge_gates(&pr, &reviewer_agent(), &strict, None, None);
         assert!(
-            matches!(result, Err(MergeGateError::InsufficientRounds { rounds: 2, required: 3, .. })),
+            matches!(
+                result,
+                Err(MergeGateError::InsufficientRounds {
+                    rounds: 2,
+                    required: 3,
+                    ..
+                })
+            ),
             "Strict policy should require 3 rounds"
         );
     }
@@ -762,35 +773,65 @@ mod tests {
     #[test]
     fn test_ci_gate_passes_on_success() {
         let pr = approved_pr_with_rounds();
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Success));
+        let result = check_merge_gates(
+            &pr,
+            &reviewer_agent(),
+            &standard_policy(),
+            None,
+            Some(CIStatus::Success),
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_ci_gate_passes_on_neutral() {
         let pr = approved_pr_with_rounds();
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Neutral));
+        let result = check_merge_gates(
+            &pr,
+            &reviewer_agent(),
+            &standard_policy(),
+            None,
+            Some(CIStatus::Neutral),
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_ci_gate_blocks_on_failure() {
         let pr = approved_pr_with_rounds();
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Failure));
+        let result = check_merge_gates(
+            &pr,
+            &reviewer_agent(),
+            &standard_policy(),
+            None,
+            Some(CIStatus::Failure),
+        );
         assert!(matches!(result, Err(MergeGateError::CiNotPassed { .. })));
     }
 
     #[test]
     fn test_ci_gate_blocks_on_pending() {
         let pr = approved_pr_with_rounds();
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Pending));
+        let result = check_merge_gates(
+            &pr,
+            &reviewer_agent(),
+            &standard_policy(),
+            None,
+            Some(CIStatus::Pending),
+        );
         assert!(matches!(result, Err(MergeGateError::CiNotPassed { .. })));
     }
 
     #[test]
     fn test_ci_gate_blocks_on_unknown_when_spindle_configured() {
         let pr = approved_pr_with_rounds();
-        let result = check_merge_gates(&pr, &reviewer_agent(), &standard_policy(), None, Some(CIStatus::Unknown));
+        let result = check_merge_gates(
+            &pr,
+            &reviewer_agent(),
+            &standard_policy(),
+            None,
+            Some(CIStatus::Unknown),
+        );
         assert!(matches!(result, Err(MergeGateError::CiNotPassed { .. })));
     }
 
@@ -805,10 +846,13 @@ mod tests {
         pr.review_state = LocalReviewState::Approved;
         pr.rounds = 1;
         registry.prs.insert(1, pr);
-        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry).await.unwrap();
+        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry)
+            .await
+            .unwrap();
 
         let git_wt = Arc::new(GitWorktreeService::new(tmp.path().to_path_buf()));
-        let ci_map: Arc<RwLock<HashMap<BranchName, CIStatus>>> = Arc::new(RwLock::new(HashMap::new()));
+        let ci_map: Arc<RwLock<HashMap<BranchName, CIStatus>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         let result = merge_pr_local(
             PRNumber::new(1),
@@ -823,8 +867,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!result.success, "CI gate should block merge when spindle is configured but no status");
-        assert!(result.message.contains("CI"), "Error message should mention CI: {}", result.message);
+        assert!(
+            !result.success,
+            "CI gate should block merge when spindle is configured but no status"
+        );
+        assert!(
+            result.message.contains("CI"),
+            "Error message should mention CI: {}",
+            result.message
+        );
     }
 
     #[tokio::test]
@@ -837,7 +888,9 @@ mod tests {
         pr.review_state = LocalReviewState::Approved;
         pr.rounds = 1;
         registry.prs.insert(1, pr);
-        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry).await.unwrap();
+        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry)
+            .await
+            .unwrap();
 
         let git_wt = Arc::new(GitWorktreeService::new(tmp.path().to_path_buf()));
         let mut map = HashMap::new();

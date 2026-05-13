@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use exomonad_core::{EffectError, EffectHandler, EffectResult, RuntimeBuilder};
 use prost::Message;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use serial_test::serial;
 
 // ============================================================================

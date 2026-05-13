@@ -9,9 +9,9 @@ use crate::services::github::GitHubService;
 use crate::services::Services;
 
 use super::{
-    AgentHandler, CoordinationHandler, EventHandler, FilePRHandler, FsHandler,
-    GitHandler, GitHubHandler, KvHandler, LogHandler, MergePRHandler, ProcessHandler,
-    SessionHandler, TasksHandler,
+    AgentHandler, CoordinationHandler, EventHandler, FilePRHandler, FsHandler, GitHandler,
+    GitHubHandler, KvHandler, LogHandler, MergePRHandler, ProcessHandler, SessionHandler,
+    TasksHandler,
 };
 
 /// Core handlers every consumer needs: logging, key-value store, filesystem.

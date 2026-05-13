@@ -459,17 +459,29 @@ impl Config {
         }
 
         // Resolve opencode_as_tl: local > global > false
-        let opencode_as_tl = local_raw.opencode_as_tl.or(global_raw.opencode_as_tl).unwrap_or(false);
+        let opencode_as_tl = local_raw
+            .opencode_as_tl
+            .or(global_raw.opencode_as_tl)
+            .unwrap_or(false);
 
         // Resolve tangled config: local > global
         let tangled_knot_url = local_raw.tangled_knot_url.or(global_raw.tangled_knot_url);
-        let tangled_spindle_url = local_raw.tangled_spindle_url.or(global_raw.tangled_spindle_url);
+        let tangled_spindle_url = local_raw
+            .tangled_spindle_url
+            .or(global_raw.tangled_spindle_url);
         let tangled_owner_did = local_raw.tangled_owner_did.or(global_raw.tangled_owner_did);
-        let tangled_knot_container = local_raw.tangled_knot_container.or(global_raw.tangled_knot_container);
-        let tangled_spindle_db = local_raw.tangled_spindle_db.or(global_raw.tangled_spindle_db);
+        let tangled_knot_container = local_raw
+            .tangled_knot_container
+            .or(global_raw.tangled_knot_container);
+        let tangled_spindle_db = local_raw
+            .tangled_spindle_db
+            .or(global_raw.tangled_spindle_db);
 
         // Resolve reviewer: env > local > global > default
-        let mut reviewer = local_raw.reviewer.or(global_raw.reviewer).unwrap_or_default();
+        let mut reviewer = local_raw
+            .reviewer
+            .or(global_raw.reviewer)
+            .unwrap_or_default();
         if let Ok(s) = std::env::var("EXOMONAD_REVIEWER_AGENT_TYPE") {
             if let Some(agent_type) = parse_agent_type_env(&s) {
                 reviewer.agent_type = agent_type;
@@ -873,7 +885,10 @@ context = ["CLAUDE.md", ".exo/rules/reviewer.md"]
     fn test_reviewer_config_invalid_agent_type_rejected() {
         let content = "[reviewer]\nagent_type = \"invalid\"\n";
         let result: Result<RawConfig, _> = toml::from_str(content);
-        assert!(result.is_err(), "Unknown agent_type should fail to deserialize");
+        assert!(
+            result.is_err(),
+            "Unknown agent_type should fail to deserialize"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! These tests start mock_github.py on an ephemeral port, point octocrab at it
 //! via GITHUB_API_URL, and verify the PR lifecycle (list, create, list-with-filter).
 
-use octocrab::{params, OctocrabBuilder, params::repos::Commitish};
+use octocrab::{params, params::repos::Commitish, OctocrabBuilder};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;

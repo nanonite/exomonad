@@ -109,7 +109,7 @@ module ExoMonad.Guest.Tools.Chainlink
     chainlinkWorkerStatusDescription,
     chainlinkWorkerStatusSchema,
   )
-  where
+where
 
 import Control.Monad.Freer (Eff)
 import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.=))
@@ -123,14 +123,14 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Data.Word (Word64)
-import Effects.Process qualified as Proc
-import ExoMonad.Guest.Tools.Chainlink.Pure
 import Effects.Events qualified as Events (NotifyParentRequest (..))
+import Effects.Process qualified as Proc
 import ExoMonad.Effects.Events (EventsNotifyParent)
 import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
+import ExoMonad.Guest.Tools.Chainlink.Pure
 import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
 
@@ -602,22 +602,22 @@ chainlinkIssueCloseCore args = do
                                 <> exitCodeToText (Proc.runResponseExitCode resp3)
                                 <> "): "
                                 <> TL.toStrict (Proc.runResponseStderr resp3)
-                       | otherwise -> do
-                           -- Step 4: notify parent via Events effect
-                           let statusText = "success" :: Text
-                           let message = "Closed #" <> T.pack (show issueId) <> ": " <> summary
-                           step4 <-
-                             suspendEffect @EventsNotifyParent
-                               ( Events.NotifyParentRequest
-                                   { Events.notifyParentRequestAgentId = "",
-                                     Events.notifyParentRequestStatus = TL.fromStrict statusText,
-                                     Events.notifyParentRequestMessage = TL.fromStrict message,
-                                     Events.notifyParentRequestOverrideRecipient = Nothing
-                                   }
-                               )
-                           case step4 of
-                             Left err -> pure $ Left (T.pack (show err))
-                             Right _ -> pure $ Right ()
+                      | otherwise -> do
+                          -- Step 4: notify parent via Events effect
+                          let statusText = "success" :: Text
+                          let message = "Closed #" <> T.pack (show issueId) <> ": " <> summary
+                          step4 <-
+                            suspendEffect @EventsNotifyParent
+                              ( Events.NotifyParentRequest
+                                  { Events.notifyParentRequestAgentId = "",
+                                    Events.notifyParentRequestStatus = TL.fromStrict statusText,
+                                    Events.notifyParentRequestMessage = TL.fromStrict message,
+                                    Events.notifyParentRequestOverrideRecipient = Nothing
+                                  }
+                              )
+                          case step4 of
+                            Left err -> pure $ Left (T.pack (show err))
+                            Right _ -> pure $ Right ()
 
 data ChainlinkIssueClose
 

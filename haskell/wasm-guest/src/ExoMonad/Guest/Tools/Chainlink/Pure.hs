@@ -80,9 +80,9 @@ module ExoMonad.Guest.Tools.Chainlink.Pure
     -- * Utilities
     parseIssueId,
   )
-  where
+where
 
-import Data.Aeson (FromJSON (..), ToJSON (..), Value (Object), object, withObject, (.:), (.:?), (.!=), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value (Object), object, withObject, (.!=), (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Maybe (catMaybes, mapMaybe)
 import Data.Text (Text)
@@ -439,9 +439,9 @@ instance ToJSON WorkerStatusEntry where
 parseGitDiffStat :: Text -> [Text]
 parseGitDiffStat output =
   [ T.strip $ T.takeWhile (/= '|') line
-    | line <- T.lines output,
-      "|" `T.isInfixOf` line,
-      not (T.null $ T.strip line)
+  | line <- T.lines output,
+    "|" `T.isInfixOf` line,
+    not (T.null $ T.strip line)
   ]
 
 -- | Correlate open issues, locks, usage records, and git diff stat into worker status entries.
@@ -459,11 +459,11 @@ correlateWorkerStatus issues locks usage uncommittedFiles =
         wseEstimatedCostUsd = totalCost,
         wseUncommittedFiles = uncommittedFiles
       }
-    | issue <- issues,
-      let issueUsage = filter (\u -> urIssueId u == Just (ciliId issue)) usage,
-      let totalInput = case catMaybes (map urInputTokens issueUsage) of { [] -> Nothing; xs -> Just (sum xs) },
-      let totalOutput = case catMaybes (map urOutputTokens issueUsage) of { [] -> Nothing; xs -> Just (sum xs) },
-      let totalCost = case catMaybes (map urEstimatedCostUsd issueUsage) of { [] -> Nothing; xs -> Just (sum xs) }
+  | issue <- issues,
+    let issueUsage = filter (\u -> urIssueId u == Just (ciliId issue)) usage,
+    let totalInput = case catMaybes (map urInputTokens issueUsage) of [] -> Nothing; xs -> Just (sum xs),
+    let totalOutput = case catMaybes (map urOutputTokens issueUsage) of [] -> Nothing; xs -> Just (sum xs),
+    let totalCost = case catMaybes (map urEstimatedCostUsd issueUsage) of [] -> Nothing; xs -> Just (sum xs)
   ]
 
 buildListArgs :: ChainlinkIssueListArgs -> [String]

@@ -5,14 +5,22 @@ use exomonad_proto::effects::merge_pr::*;
 use std::sync::Arc;
 use tracing::instrument;
 
-use crate::services::{HasCiStatusMap, HasEventLog, HasGitHubClient, HasGitWorktreeService, HasProjectDir};
+use crate::services::{
+    HasCiStatusMap, HasEventLog, HasGitHubClient, HasGitWorktreeService, HasProjectDir,
+};
 
 pub struct MergePRHandler<C> {
     ctx: Arc<C>,
 }
 
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + HasCiStatusMap + 'static>
-    MergePRHandler<C>
+impl<
+        C: HasGitHubClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasCiStatusMap
+            + 'static,
+    > MergePRHandler<C>
 {
     pub fn new(ctx: Arc<C>) -> Self {
         Self { ctx }
@@ -20,8 +28,14 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + HasCiStatusMap + 'static>
-    crate::effects::EffectHandler for MergePRHandler<C>
+impl<
+        C: HasGitHubClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasCiStatusMap
+            + 'static,
+    > crate::effects::EffectHandler for MergePRHandler<C>
 {
     fn namespace(&self) -> &str {
         "merge_pr"
@@ -38,8 +52,14 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + HasCiStatusMap + 'static>
-    MergePrEffects for MergePRHandler<C>
+impl<
+        C: HasGitHubClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasCiStatusMap
+            + 'static,
+    > MergePrEffects for MergePRHandler<C>
 {
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, pr_number = req.pr_number))]
     async fn merge_pr(
@@ -67,7 +87,10 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
         };
 
         let result = if use_local {
-            tracing::info!(pr_number = pr_number.as_u64(), "[MergePR] routing to local registry");
+            tracing::info!(
+                pr_number = pr_number.as_u64(),
+                "[MergePR] routing to local registry"
+            );
             let merger = ctx.agent_name.clone();
             let policy = merge_pr_local::ReviewPolicy::default();
             merge_pr_local::merge_pr_local(
@@ -83,7 +106,10 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
             .await
             .effect_err("merge_pr")?
         } else {
-            tracing::info!(pr_number = pr_number.as_u64(), "[MergePR] routing to GitHub");
+            tracing::info!(
+                pr_number = pr_number.as_u64(),
+                "[MergePR] routing to GitHub"
+            );
             merge_pr::merge_pr_async(
                 pr_number,
                 &strategy,

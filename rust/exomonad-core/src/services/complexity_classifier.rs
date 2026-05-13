@@ -46,23 +46,16 @@ pub enum SecondReviewerRecommendation {
     /// No second reviewer needed.
     Pass,
     /// Path-based match: at least one changed file matches `external_review_paths`.
-    PathMatch {
-        matching_files: Vec<String>,
-    },
+    PathMatch { matching_files: Vec<String> },
     /// Line-count threshold exceeded.
-    Threshold {
-        lines_changed: u64,
-        threshold: u64,
-    },
+    Threshold { lines_changed: u64, threshold: u64 },
     /// Both path match and threshold exceeded.
     MultipleTriggers {
         matching_files: Vec<String>,
         lines_changed: u64,
     },
     /// Code-pattern match: state machines, concurrency, prompts, etc.
-    PatternMatch {
-        triggers: Vec<PatternTrigger>,
-    },
+    PatternMatch { triggers: Vec<PatternTrigger> },
 }
 
 impl ComplexityReport {
@@ -92,12 +85,13 @@ impl ComplexityReport {
             SecondReviewerRecommendation::PathMatch { .. } => {
                 parts.push("Second reviewer required (path policy)".to_string())
             }
-            SecondReviewerRecommendation::Threshold { lines_changed, threshold } => {
-                parts.push(format!(
-                    "Second reviewer required ({} lines > {} threshold)",
-                    lines_changed, threshold
-                ))
-            }
+            SecondReviewerRecommendation::Threshold {
+                lines_changed,
+                threshold,
+            } => parts.push(format!(
+                "Second reviewer required ({} lines > {} threshold)",
+                lines_changed, threshold
+            )),
             SecondReviewerRecommendation::MultipleTriggers { .. } => {
                 parts.push("Second reviewer required (multiple triggers)".to_string())
             }
@@ -138,9 +132,7 @@ pub async fn classify_complexity(
         SecondReviewerRecommendation::PatternMatch {
             triggers: pattern_triggers.clone(),
         }
-    } else if !external_matches.is_empty()
-        && policy.lines_trigger_external_review(total_lines)
-    {
+    } else if !external_matches.is_empty() && policy.lines_trigger_external_review(total_lines) {
         SecondReviewerRecommendation::MultipleTriggers {
             matching_files: external_matches.clone(),
             lines_changed: total_lines,
@@ -235,10 +227,7 @@ async fn run_pattern_analysis(
     head_branch: &str,
 ) -> anyhow::Result<Vec<PatternTrigger>> {
     let output = tokio::process::Command::new("git")
-        .args([
-            "diff",
-            &format!("{}..{}", base_branch, head_branch),
-        ])
+        .args(["diff", &format!("{}..{}", base_branch, head_branch)])
         .current_dir(project_dir)
         .output()
         .await?;
@@ -251,10 +240,10 @@ async fn run_pattern_analysis(
     let mut triggers = Vec::new();
 
     // State machine patterns
-    let state_machine_count = count_matches(&diff, &[
-        r"enum\s+\w+State",
-        r"state_machine|StateMachine|Fsm",
-    ]);
+    let state_machine_count = count_matches(
+        &diff,
+        &[r"enum\s+\w+State", r"state_machine|StateMachine|Fsm"],
+    );
     if state_machine_count > 0 {
         triggers.push(PatternTrigger::StateMachine {
             count: state_machine_count,
@@ -262,13 +251,16 @@ async fn run_pattern_analysis(
     }
 
     // Concurrency patterns
-    let concurrency_count = count_matches(&diff, &[
-        r"tokio::spawn",
-        r"async\s+fn\s+.*\bMutex",
-        r"async\s+fn\s+.*\bRwLock",
-        r"rayon::",
-        r"async_std",
-    ]);
+    let concurrency_count = count_matches(
+        &diff,
+        &[
+            r"tokio::spawn",
+            r"async\s+fn\s+.*\bMutex",
+            r"async\s+fn\s+.*\bRwLock",
+            r"rayon::",
+            r"async_std",
+        ],
+    );
     if concurrency_count > 0 {
         triggers.push(PatternTrigger::Concurrency {
             count: concurrency_count,
@@ -276,26 +268,17 @@ async fn run_pattern_analysis(
     }
 
     // Prompt design / LLM contracts
-    let prompt_patterns = &[
-        "prompts",
-        ".v0.md",
-        ".v1.md",
-        ".v2.md",
-        ".claude/",
-    ];
+    let prompt_patterns = &["prompts", ".v0.md", ".v1.md", ".v2.md", ".claude/"];
     let prompt_files_changed = get_changed_files(project_dir, base_branch, head_branch).await?;
-    if prompt_files_changed.iter().any(|f| {
-        prompt_patterns.iter().any(|p| f.contains(p))
-    }) {
+    if prompt_files_changed
+        .iter()
+        .any(|f| prompt_patterns.iter().any(|p| f.contains(p)))
+    {
         triggers.push(PatternTrigger::PromptDesign);
     }
 
     // Validation / invariant enforcement
-    let validation_count = count_matches(&diff, &[
-        r"invariant",
-        r"must_hold",
-        r"assert_eq!",
-    ]);
+    let validation_count = count_matches(&diff, &[r"invariant", r"must_hold", r"assert_eq!"]);
     if validation_count > 0 {
         triggers.push(PatternTrigger::Validation {
             count: validation_count,
@@ -357,7 +340,10 @@ fn count_cross_cutting(diff: &str) -> Vec<String> {
         let trimmed = line.trim();
         for keyword in ["pub fn ", "pub struct ", "pub enum ", "pub trait "] {
             if let Some(rest) = trimmed.strip_prefix(keyword) {
-                if let Some(name) = rest.split(|c: char| c == '(' || c == '<' || c == '{' || c.is_whitespace()).next() {
+                if let Some(name) = rest
+                    .split(|c: char| c == '(' || c == '<' || c == '{' || c.is_whitespace())
+                    .next()
+                {
                     if !name.is_empty() {
                         *counts.entry(name.to_string()).or_default() += 1;
                     }

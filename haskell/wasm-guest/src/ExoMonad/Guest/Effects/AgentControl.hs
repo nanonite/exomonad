@@ -80,10 +80,11 @@ instance FromJSON AgentType where
     other -> fail $ "Invalid agent type: " <> T.unpack other
 
 instance JsonSchema AgentType where
-  toSchema = object
-    [ "type" .= ("string" :: Text),
-      "enum" .= (["claude", "opencode"] :: [Text])
-    ]
+  toSchema =
+    object
+      [ "type" .= ("string" :: Text),
+        "enum" .= (["claude", "opencode"] :: [Text])
+      ]
 
 -- | Result of spawning an agent.
 data SpawnResult = SpawnResult

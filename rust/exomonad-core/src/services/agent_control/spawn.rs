@@ -1247,15 +1247,23 @@ impl<
         let context_section = if self.reviewer_context.is_empty() {
             String::new()
         } else {
-            format!("\n\nRead first:\n{}", self.reviewer_context.iter()
-                .map(|p| format!("- {p}"))
-                .collect::<Vec<_>>()
-                .join("\n"))
+            format!(
+                "\n\nRead first:\n{}",
+                self.reviewer_context
+                    .iter()
+                    .map(|p| format!("- {p}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         };
         let task = format!(
             "Review PR #{}: {}\n\nBranch: {}\nBase: {}\nAuthor: {}{}",
-            pr_entry.number, pr_entry.title, pr_entry.head_branch,
-            pr_entry.base_branch, pr_entry.author_agent, context_section,
+            pr_entry.number,
+            pr_entry.title,
+            pr_entry.head_branch,
+            pr_entry.base_branch,
+            pr_entry.author_agent,
+            context_section,
         );
         let branch_name = format!("review-pr-{}", pr_entry.number);
 

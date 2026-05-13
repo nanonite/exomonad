@@ -32,7 +32,11 @@ pub(crate) fn resolve_push_remote(workspace_path: &std::path::Path) -> &'static 
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    if ok { "tangled" } else { "origin" }
+    if ok {
+        "tangled"
+    } else {
+        "origin"
+    }
 }
 
 // ============================================================================
@@ -137,12 +141,14 @@ pub async fn read_pr_registry(prs_path: &std::path::Path) -> Result<PrRegistry> 
     let data = tokio::fs::read_to_string(prs_path)
         .await
         .context("Failed to read prs.json")?;
-    let registry: PrRegistry =
-        serde_json::from_str(&data).context("Failed to parse prs.json")?;
+    let registry: PrRegistry = serde_json::from_str(&data).context("Failed to parse prs.json")?;
     Ok(registry)
 }
 
-pub(crate) async fn write_pr_registry(prs_path: &std::path::Path, registry: &PrRegistry) -> Result<()> {
+pub(crate) async fn write_pr_registry(
+    prs_path: &std::path::Path,
+    registry: &PrRegistry,
+) -> Result<()> {
     if let Some(parent) = prs_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -198,11 +204,12 @@ pub async fn file_pr_local(
 
     // Get branch from the agent's working directory
     let git_wt_clone = git_wt.clone();
-    let head_str = tokio::task::spawn_blocking(move || git_wt_clone.get_workspace_bookmark(&dir_path))
-        .await
-        .context("spawn_blocking failed")?
-        .context("Failed to get workspace bookmark")?
-        .ok_or_else(|| anyhow::anyhow!("No bookmark found for workspace at {}", dir))?;
+    let head_str =
+        tokio::task::spawn_blocking(move || git_wt_clone.get_workspace_bookmark(&dir_path))
+            .await
+            .context("spawn_blocking failed")?
+            .context("Failed to get workspace bookmark")?
+            .ok_or_else(|| anyhow::anyhow!("No bookmark found for workspace at {}", dir))?;
     let head = BranchName::from(head_str.as_str());
     let base = resolve_base_branch(&head, input.base_branch.as_ref());
 
@@ -229,9 +236,7 @@ pub async fn file_pr_local(
     let mut registry = read_pr_registry(&prs_path).await?;
 
     // Check for existing PR on this head_branch
-    let existing_number = registry
-        .find_by_branch(&head)
-        .map(|pr| pr.number);
+    let existing_number = registry.find_by_branch(&head).map(|pr| pr.number);
     if let Some(number) = existing_number {
         let pr_number = PRNumber::new(number);
         info!("[FilePRLocal] Updating existing PR #{}", pr_number);
@@ -361,7 +366,12 @@ mod tests {
     fn test_resolve_push_remote_tangled_configured_returns_tangled() {
         let tmp = init_git_repo();
         Command::new("git")
-            .args(["remote", "add", "tangled", "git@local-tangled:repositories/owner/test.git"])
+            .args([
+                "remote",
+                "add",
+                "tangled",
+                "git@local-tangled:repositories/owner/test.git",
+            ])
             .current_dir(tmp.path())
             .status()
             .unwrap();
@@ -521,7 +531,8 @@ mod tests {
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
         };
 
-        let result = file_pr_local(&input, git_wt, temp_dir.path(), &test_role(), &test_agent()).await;
+        let result =
+            file_pr_local(&input, git_wt, temp_dir.path(), &test_role(), &test_agent()).await;
         assert!(result.is_err());
         Ok(())
     }

@@ -273,8 +273,7 @@ pub fn resolve_tab_name_for_agent(
     // from_internal_name defaults to Gemini when no suffix matches, so
     // cross-checking distinguishes a bare branch from an actual Gemini agent.
     // Bare branches are always the root TL's birth-branch → window is "TL".
-    let derived_type =
-        crate::services::agent_control::AgentType::from_dir_name(agent_key.as_str());
+    let derived_type = crate::services::agent_control::AgentType::from_dir_name(agent_key.as_str());
     if matches!(
         derived_type,
         crate::services::agent_control::AgentType::Gemini
