@@ -87,10 +87,19 @@ fn build_codex_root_command(
         .map(|value| format!(" {}", shell_escape::escape(value.into())))
         .unwrap_or_default();
 
-    format!(
+    let command = format!(
         "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
         escaped_dir, model_flag, prompt
-    )
+    );
+    let restart_hint = shell_escape::escape(
+        format!(
+            "[Codex exited - restart with: codex --dangerously-bypass-approvals-and-sandbox --cd {}{}]",
+            escaped_dir, model_flag
+        )
+        .into(),
+    );
+
+    format!("{command}; echo; printf '%s\\n' {restart_hint}; exec bash -l")
 }
 
 /// Reject `--tl-model` / `--worker-model` values that opencode doesn't recognise.
@@ -1801,8 +1810,9 @@ mod tests {
 
         assert_eq!(
             command,
-            "codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/exomonad repo' --model gpt-5.2 'Plan the next wave'"
+            "codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/exomonad repo' --model gpt-5.2 'Plan the next wave'; echo; printf '%s\\n' '[Codex exited - restart with: codex --dangerously-bypass-approvals-and-sandbox --cd '\\''/tmp/exomonad repo'\\'' --model gpt-5.2]'; exec bash -l"
         );
         assert!(!command.contains("not implemented"));
+        assert!(command.ends_with("exec bash -l"));
     }
 }

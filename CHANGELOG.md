@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Codex TL: hook review prompt appears when Codex is restarted manually after init (#158)
 - Update root TL prompt for all coding harnesses (#157)
 - Fix Codex root TL startup (#156)
 - Fix: update root TL prompt sanity check for headless OpenCode ACP workers (#45)
