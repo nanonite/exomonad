@@ -889,6 +889,10 @@ pub async fn run(
         &config.companions,
     );
 
+    if auto_spindle.is_none() && !config.companions.iter().any(|c| c.name == "spindle") {
+        warn!("Tangled CI not configured (tangled_owner_did missing from .exo/config.toml) — CI status events will not be tracked this session");
+    }
+
     let companions_to_spawn: Vec<&crate::config::CompanionConfig> = auto_spindle
         .iter()
         .chain(config.companions.iter())
