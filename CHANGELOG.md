@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add Codex model setting to generated agent config (#152)
 - Add --verbose flag to exomonad init with comprehensive observability logging (#140)
 - Implement explicit allow/deny handling in OpenCode plugin tool.execute.before (#139)
 - Add deny logic to OpenCode TypeScript plugin (#137)
@@ -92,6 +93,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Codex: hook runtime dispatch (--runtime codex) (#144)
 - Codex: write_codex_config_files + build_codex_command (#143)
 - Codex: research hook wire format (#142)
 - Codex: proto + Rust exhaustive match stubs (#141)

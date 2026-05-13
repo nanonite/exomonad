@@ -38,7 +38,7 @@ pub const CODEX_HOOKS_JSON: &str = r#"{
   }
 }"#;
 
-pub const CODEX_CONFIG_TEMPLATE: &str = r#"approval_policy = "never"
+pub const CODEX_CONFIG_TEMPLATE: &str = r#"{model_config}approval_policy = "never"
 developer_instructions = """
 {instructions}
 """
@@ -53,6 +53,7 @@ pub fn render_codex_config(
     agent_name: &str,
     role: &str,
     instructions: &str,
+    model: Option<&str>,
     extra_mcp_servers: &HashMap<String, Value>,
 ) -> String {
     let mut mcp_servers = toml::map::Map::new();
@@ -76,11 +77,26 @@ pub fn render_codex_config(
     }
 
     CODEX_CONFIG_TEMPLATE
+        .replace("{model_config}", &model_config_toml(model))
         .replace(
             "{instructions}",
             &escape_multiline_basic_string(instructions),
         )
         .replace("{mcp_servers}", &mcp_servers_to_toml(&mcp_servers))
+}
+
+fn model_config_toml(model: Option<&str>) -> String {
+    match model.filter(|value| !value.is_empty()) {
+        Some(model) => {
+            let mut root = toml::map::Map::new();
+            root.insert("model".to_string(), toml::Value::String(model.to_string()));
+            let mut rendered = toml::to_string(&toml::Value::Table(root))
+                .expect("Codex model config should serialize");
+            rendered.push('\n');
+            rendered
+        }
+        None => String::new(),
+    }
 }
 
 fn exomonad_mcp_server(agent_name: &str, role: &str) -> toml::map::Map<String, toml::Value> {
@@ -174,6 +190,7 @@ mod tests {
             "worker-1-codex",
             "dev",
             "Use ExoMonad tools.",
+            None,
             &HashMap::new(),
         );
 
@@ -213,7 +230,7 @@ mod tests {
             }),
         );
 
-        let config = render_codex_config("agent", "tl", "Plan.", &extra);
+        let config = render_codex_config("agent", "tl", "Plan.", None, &extra);
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
         let docs = &parsed["mcp_servers"]["docs"];
@@ -227,5 +244,34 @@ mod tests {
         );
         assert_eq!(docs["env"]["DOCS_ROOT"].as_str(), Some("/tmp/docs"));
         assert!(docs.get("type").is_none());
+    }
+
+    #[test]
+    fn renders_model_when_provided() {
+        let config = render_codex_config(
+            "worker-1-codex",
+            "dev",
+            "Use ExoMonad tools.",
+            Some("gpt-5.2"),
+            &HashMap::new(),
+        );
+
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
+        assert!(config.starts_with("model = \"gpt-5.2\"\n\napproval_policy"));
+    }
+
+    #[test]
+    fn omits_model_when_not_provided() {
+        let config = render_codex_config(
+            "worker-1-codex",
+            "dev",
+            "Use ExoMonad tools.",
+            None,
+            &HashMap::new(),
+        );
+
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+        assert!(parsed.get("model").is_none());
     }
 }

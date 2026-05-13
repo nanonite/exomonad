@@ -23,7 +23,10 @@ use clap::{Parser, Subcommand};
 use exomonad_core::protocol::{Runtime as HookRuntime, ServiceRequest};
 use std::time::{Duration, Instant};
 
-use exomonad_core::{HookEnvelope, HookEventType};
+use exomonad_core::{
+    codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload, HookEnvelope,
+    HookEventType,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tracing::warn;
@@ -200,6 +203,11 @@ async fn main() -> Result<()> {
         }
 
         Commands::Hook { event, runtime } => {
+            let fail_open_stdout = || match runtime {
+                HookRuntime::Codex => codex_noop_envelope().stdout,
+                _ => r#"{"continue":true}"#.to_string(),
+            };
+
             let mut path = format!("/hook?event={}&runtime={}", event, runtime);
             if let Ok(agent_id) = std::env::var("EXOMONAD_AGENT_ID") {
                 path.push_str(&format!("&agent_id={}", encode(&agent_id)));
@@ -232,7 +240,7 @@ async fn main() -> Result<()> {
                 match found {
                     Some(s) => s,
                     None => {
-                        println!(r#"{{"continue":true}}"#);
+                        println!("{}", fail_open_stdout());
                         return Ok(());
                     }
                 }
@@ -240,7 +248,7 @@ async fn main() -> Result<()> {
                 match uds_client::find_server_socket() {
                     Ok(s) => s,
                     Err(_) => {
-                        println!(r#"{{"continue":true}}"#);
+                        println!("{}", fail_open_stdout());
                         return Ok(());
                     }
                 }
@@ -254,23 +262,56 @@ async fn main() -> Result<()> {
                     serde_json::json!({})
                 }
             };
+            let json_body = match runtime {
+                HookRuntime::Codex => normalize_codex_hook_payload(event, json_body),
+                _ => json_body,
+            };
 
             match client
                 .post_json::<serde_json::Value, HookEnvelope>(&path, &json_body)
                 .await
             {
-                Ok(resp) => {
+                Ok(mut resp) => {
+                    if runtime == HookRuntime::Codex {
+                        resp = format_codex_hook_response(event, resp);
+                    }
                     print!("{}", resp.stdout);
                     if resp.exit_code != 0 {
                         std::process::exit(resp.exit_code);
                     }
                 }
-                Err(_) => println!(r#"{{"continue":true}}"#),
+                Err(_) => println!("{}", fail_open_stdout()),
             }
         }
 
-        Commands::Init { session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model, verbose } => {
-            if let Err(e) = init::run(session, recreate, opencode_as_tl, openrouter, tl, worker, tl_model, worker_model, reviewer, reviewer_model, verbose).await {
+        Commands::Init {
+            session,
+            recreate,
+            opencode_as_tl,
+            openrouter,
+            tl,
+            worker,
+            tl_model,
+            worker_model,
+            reviewer,
+            reviewer_model,
+            verbose,
+        } => {
+            if let Err(e) = init::run(
+                session,
+                recreate,
+                opencode_as_tl,
+                openrouter,
+                tl,
+                worker,
+                tl_model,
+                worker_model,
+                reviewer,
+                reviewer_model,
+                verbose,
+            )
+            .await
+            {
                 tracing::error!(error = %e, "exomonad init failed: {:#}", e);
                 return Err(e);
             }

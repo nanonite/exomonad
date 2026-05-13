@@ -98,16 +98,20 @@ instance FromJSON HookEventType where
     "AfterModel" -> pure AfterModel
     other -> fail $ "Unknown hook event type: " <> T.unpack other
 
--- | Runtime environment (Claude or Gemini).
-data Runtime = Claude | Gemini
+-- | Runtime environment (Claude, Gemini, OpenCode, or Codex).
+data Runtime = Claude | Gemini | OpenCode | Codex
   deriving (Show, Eq, Generic)
 
 instance FromJSON Runtime where
   parseJSON = Aeson.withText "Runtime" $ \case
     "claude" -> pure Claude
     "gemini" -> pure Gemini
+    "opencode" -> pure OpenCode
+    "codex" -> pure Codex
     "Claude" -> pure Claude
     "Gemini" -> pure Gemini
+    "OpenCode" -> pure OpenCode
+    "Codex" -> pure Codex
     other -> fail $ "Unknown runtime: " <> T.unpack other
 
 -- | Input for a hook event.

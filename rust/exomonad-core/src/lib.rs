@@ -45,9 +45,9 @@ pub mod ui_protocol;
 
 // === Framework (requires runtime feature) ===
 #[cfg(feature = "runtime")]
-pub mod common;
-#[cfg(feature = "runtime")]
 pub mod codex_config;
+#[cfg(feature = "runtime")]
+pub mod common;
 #[cfg(feature = "runtime")]
 pub mod effects;
 #[cfg(feature = "runtime")]
@@ -65,9 +65,9 @@ pub mod ffi;
 #[cfg(feature = "runtime")]
 pub mod hooks;
 #[cfg(feature = "runtime")]
-pub mod opencode_plugin;
-#[cfg(feature = "runtime")]
 pub mod logging;
+#[cfg(feature = "runtime")]
+pub mod opencode_plugin;
 #[cfg(feature = "runtime")]
 pub mod protocol;
 #[cfg(feature = "runtime")]
@@ -106,6 +106,7 @@ pub use hooks::HookConfig;
 pub use logging::{init_logging, init_logging_with_default};
 #[cfg(feature = "runtime")]
 pub use protocol::{
+    codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload,
     ClaudePreToolUseOutput, ClaudeStopHookOutput, GeminiStopHookOutput, HookEnvelope,
     HookEventType, HookInput, HookSpecificOutput, InternalAfterModelOutput,
     InternalBeforeModelOutput, InternalStopHookOutput, PermissionDecision,
@@ -119,8 +120,8 @@ pub use util::{build_prompt, find_exomonad_binary, shell_quote};
 pub use handlers::groups::{core_handlers, git_handlers, orchestration_handlers};
 #[cfg(feature = "runtime")]
 pub use handlers::{
-    AgentHandler, EventHandler, FilePRHandler, FsHandler, GitHandler,
-    GitHubHandler, KvHandler, LogHandler, MergePRHandler,
+    AgentHandler, EventHandler, FilePRHandler, FsHandler, GitHandler, GitHubHandler, KvHandler,
+    LogHandler, MergePRHandler,
 };
 #[cfg(feature = "runtime")]
 pub use services::{

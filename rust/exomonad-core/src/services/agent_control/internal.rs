@@ -121,7 +121,10 @@ impl<
         env_vars.insert("EXOMONAD_AGENT_ID".to_string(), agent_name.to_string());
         env_vars.insert("EXOMONAD_SESSION_ID".to_string(), session_id.to_string());
         env_vars.insert("EXOMONAD_ROLE".to_string(), role.as_str().to_string());
-        env_vars.insert("EXOMONAD_SPAWN_AGENT_TYPE".to_string(), self.spawn_agent_type.suffix().to_string());
+        env_vars.insert(
+            "EXOMONAD_SPAWN_AGENT_TYPE".to_string(),
+            self.spawn_agent_type.suffix().to_string(),
+        );
         if let Some(ref session) = self.tmux_session {
             env_vars.insert("EXOMONAD_TMUX_SESSION".to_string(), session.clone());
         }
@@ -129,7 +132,11 @@ impl<
         // Path to project root chainlink DB for worktree-aware issue tracking
         env_vars.insert(
             "CHAINLINK_DB".to_string(),
-            self.ctx.project_dir().join(".chainlink").display().to_string(),
+            self.ctx
+                .project_dir()
+                .join(".chainlink")
+                .display()
+                .to_string(),
         );
 
         // Propagate swarm run_id and parent agent identity for OTel resource attributes
@@ -306,12 +313,18 @@ impl<
                 match agent_type {
                     AgentType::Codex => Self::build_codex_command(cwd, Some(pf), model, None),
                     AgentType::OpenCode => {
-                        format!("{} run{} \"$(cat {})\"{}", cmd, perms_flags, escaped_path, model_flag)
+                        format!(
+                            "{} run{} \"$(cat {})\"{}",
+                            cmd, perms_flags, escaped_path, model_flag
+                        )
                     }
                     _ => {
                         let flag = agent_type.prompt_flag();
                         if flag.is_empty() {
-                            format!("{}{}{} \"$(cat {})\"", cmd, perms_flags, model_flag, escaped_path)
+                            format!(
+                                "{}{}{} \"$(cat {})\"",
+                                cmd, perms_flags, model_flag, escaped_path
+                            )
                         } else {
                             format!(
                                 "{}{}{} {} \"$(cat {})\"",
@@ -671,7 +684,7 @@ impl<
         dir: &Path,
         role: &crate::domain::Role,
         agent_name: &AgentName,
-        _model: Option<&str>,
+        model: Option<&str>,
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
     ) -> Result<()> {
         let codex_dir = dir.join(".codex");
@@ -685,11 +698,16 @@ impl<
             agent_name.as_str(),
             role.as_str(),
             instructions,
+            model,
             extra_mcp_servers,
         );
 
         fs::write(codex_dir.join("config.toml"), config).await?;
-        fs::write(codex_dir.join("hooks.json"), crate::codex_config::CODEX_HOOKS_JSON).await?;
+        fs::write(
+            codex_dir.join("hooks.json"),
+            crate::codex_config::CODEX_HOOKS_JSON,
+        )
+        .await?;
         info!(agent_dir = %dir.display(), role = %role.as_str(), "Wrote .codex/config.toml and .codex/hooks.json for Codex agent");
         Ok(())
     }
@@ -1333,10 +1351,7 @@ mod tests {
             Some("anthropic/claude's-model"),
         );
         // Single quote in model name must be shell-escaped
-        assert_eq!(
-            cmd,
-            "opencode --model 'anthropic/claude'\\''s-model'"
-        );
+        assert_eq!(cmd, "opencode --model 'anthropic/claude'\\''s-model'");
     }
 
     #[test]
@@ -1372,7 +1387,10 @@ mod tests {
     #[test]
     fn test_build_agent_command_codex_includes_env_prefix() {
         let mut env = HashMap::new();
-        env.insert("EXOMONAD_AGENT_ID".to_string(), "worker-1-codex".to_string());
+        env.insert(
+            "EXOMONAD_AGENT_ID".to_string(),
+            "worker-1-codex".to_string(),
+        );
 
         let cmd = ACS::build_agent_command(
             AgentType::Codex,
