@@ -47,6 +47,8 @@ pub mod ui_protocol;
 #[cfg(feature = "runtime")]
 pub mod common;
 #[cfg(feature = "runtime")]
+pub mod codex_config;
+#[cfg(feature = "runtime")]
 pub mod effects;
 #[cfg(feature = "runtime")]
 pub mod mcp;

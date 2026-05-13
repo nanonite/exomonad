@@ -71,6 +71,61 @@ Implement the spec in your task. File a PR when done. Call notify_parent to repo
 - If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
 ";
 
+pub const CODEX_TL_INSTRUCTIONS: &str = "\
+# ExoMonad Root TL Protocol
+
+You are a Codex TL inside an ExoMonad agent tree. You have access to the `exomonad` MCP server.
+
+## Your Job
+Decompose the request into independent tasks. Spawn implementation workers via spawn_leaf. \
+Idle until notifications arrive. Merge results.
+
+## Spawn Tool Selection
+- spawn_leaf: Use this for implementation tasks. Each worker gets its own worktree+branch, \
+implements the spec, files a PR, and calls notify_parent when done. This is the primary tool.
+- fork_wave: Use this only for sub-TLs that need to further decompose and spawn children.
+- spawn_worker: Ephemeral pane. Research or quick in-place edits only.
+
+## Workflow
+1. PLAN: Research until decomposition is clear.
+2. SPAWN: Call spawn_leaf for each independent implementation task. Do NOT set agent_type.
+3. IDLE: Stop immediately after spawning. Do NOT poll or check status.
+4. MERGE: On [PR READY] or [REVIEW TIMEOUT] with green CI, call merge_pr.
+
+## Key Rules
+- Never implement directly. Decompose and delegate everything.
+- Never checkout another branch or touch another agent's worktree.
+- After spawning, STOP. Wait for notifications.
+- Git operations use shell commands. Use file_pr for PR creation.
+";
+
+pub const CODEX_DEV_INSTRUCTIONS: &str = "\
+# ExoMonad Dev Agent Protocol
+
+You are a Codex dev agent in an ExoMonad agent tree. You work in your own git worktree on your own branch.
+
+## Your Job
+Implement the spec in your task. File a PR when done. Call notify_parent to report completion or failure.
+
+## MCP Tools Available
+- file_pr: Create/update a PR for your branch. Call this when your implementation is ready.
+- notify_parent: Send a message to your parent TL. Use status 'success' when done, 'failure' if stuck.
+- send_message: Send a message to another agent.
+
+## Workflow
+1. Read the spec carefully. Re-read any files mentioned before editing.
+2. Implement the changes on your branch.
+3. Build and verify using the exact commands in your spec.
+4. Call file_pr to create the PR.
+5. Call notify_parent with status='success' and a summary of what you did.
+
+## Key Rules
+- Work only in your worktree. Never checkout another branch.
+- Never call fork_wave or spawn_leaf; you are a leaf, not a TL.
+- Git operations use shell commands. Use file_pr for PR creation.
+- If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
+";
+
 impl<
         C: super::super::HasGitHubClient
             + super::super::HasAcpRegistry
@@ -822,7 +877,17 @@ impl<
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy OpenCode role context (non-fatal)"),
                         }
                     }
-                    AgentType::Codex | AgentType::Shoal | AgentType::Process => {}
+                    AgentType::Codex => {
+                        let dest_dir = worktree_path.join(".codex");
+                        let _ = fs::create_dir_all(&dest_dir).await;
+                        let dest = dest_dir.join("exomonad_role.md");
+                        let _ = fs::remove_file(&dest).await;
+                        match Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type).await {
+                            Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into Codex worktree"),
+                            Err(e) => warn!(role = %role, error = %e, "Failed to copy Codex role context (non-fatal)"),
+                        }
+                    }
+                    AgentType::Shoal | AgentType::Process => {}
                 }
             }
 
@@ -934,6 +999,25 @@ impl<
                         env_vars,
                         None, // no fork_session for OpenCode
                         None, // no claude_flags
+                        options.model.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
+                        e
+                    })?;
+                    RoutingInfo::window(window_id)
+                }
+                AgentType::Codex => {
+                    let fork_id = options.parent_session_id.as_ref().map(|id| id.as_str());
+                    let window_id = self.new_tmux_window_inner(
+                        &display_name,
+                        &worktree_path,
+                        agent_type,
+                        Some(&task_with_context),
+                        env_vars,
+                        fork_id,
+                        None,
                         options.model.as_deref(),
                     )
                     .await

@@ -92,6 +92,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Codex: write_codex_config_files + build_codex_command (#143)
 - Codex: research hook wire format (#142)
 - Codex: proto + Rust exhaustive match stubs (#141)
 - spawn_worker: add optional agent_type param (default to server spawn_agent_type) (#121)

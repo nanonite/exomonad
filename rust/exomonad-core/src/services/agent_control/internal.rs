@@ -284,6 +284,9 @@ impl<
                 let escaped_session = Self::escape_for_shell_command(session_id);
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
                 match agent_type {
+                    AgentType::Codex => {
+                        Self::build_codex_command(cwd, Some(pf), model, Some(session_id))
+                    }
                     AgentType::OpenCode => {
                         format!(
                             "{} run{} --session {} --fork \"$(cat {})\"{}",
@@ -301,6 +304,7 @@ impl<
             (Some(pf), None) => {
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
                 match agent_type {
+                    AgentType::Codex => Self::build_codex_command(cwd, Some(pf), model, None),
                     AgentType::OpenCode => {
                         format!("{} run{} \"$(cat {})\"{}", cmd, perms_flags, escaped_path, model_flag)
                     }
@@ -317,7 +321,10 @@ impl<
                     }
                 }
             }
-            _ => format!("{}{}{}", cmd, perms_flags, model_flag),
+            _ => match agent_type {
+                AgentType::Codex => Self::build_codex_command(cwd, None, model, fork_session_id),
+                _ => format!("{}{}{}", cmd, perms_flags, model_flag),
+            },
         };
 
         // Prepend env vars
@@ -339,6 +346,41 @@ impl<
             format!("nix develop -c sh -c '{}'", escaped)
         } else {
             full_command
+        }
+    }
+
+    pub(crate) fn build_codex_command(
+        worktree_dir: &Path,
+        prompt_file: Option<&Path>,
+        model: Option<&str>,
+        fork_session_id: Option<&str>,
+    ) -> String {
+        let escaped_dir = Self::escape_for_shell_command(&worktree_dir.display().to_string());
+        let model_flag = model
+            .map(|model| format!(" --model {}", shell_escape::escape(model.into())))
+            .unwrap_or_default();
+
+        match fork_session_id {
+            Some(session_id) => format!(
+                "codex fork {} --dangerously-bypass-approvals-and-sandbox --cd {}{}",
+                Self::escape_for_shell_command(session_id),
+                escaped_dir,
+                model_flag
+            ),
+            None => {
+                let prompt = prompt_file
+                    .map(|path| {
+                        format!(
+                            " \"$(cat {})\"",
+                            Self::escape_for_shell_command(&path.display().to_string())
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "codex exec --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
+                    escaped_dir, model_flag, prompt
+                )
+            }
         }
     }
 
@@ -566,6 +608,7 @@ impl<
     /// Write MCP config for the agent directory.
     ///
     /// Claude agents get `.mcp.json`. Gemini agents get `.gemini/settings.json`.
+    /// Codex agents get `.codex/config.toml` and `.codex/hooks.json`.
     /// Uses stdio transport via `exomonad mcp-stdio`.
     pub(crate) async fn write_agent_mcp_config(
         &self,
@@ -610,9 +653,44 @@ impl<
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json for OpenCode agent");
             }
             AgentType::Codex => {
-                return Err(anyhow!("Codex MCP config generation is not implemented yet"));
+                self.write_codex_config_files(
+                    agent_dir,
+                    role,
+                    &AgentName::from(agent_name),
+                    self.spawn_agent_model(),
+                    &self.extra_mcp_servers,
+                )
+                .await?;
             }
         }
+        Ok(())
+    }
+
+    pub(crate) async fn write_codex_config_files(
+        &self,
+        dir: &Path,
+        role: &crate::domain::Role,
+        agent_name: &AgentName,
+        _model: Option<&str>,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        let codex_dir = dir.join(".codex");
+        fs::create_dir_all(&codex_dir).await?;
+
+        let instructions = match role.as_str() {
+            "tl" | "root" => super::spawn::CODEX_TL_INSTRUCTIONS,
+            _ => super::spawn::CODEX_DEV_INSTRUCTIONS,
+        };
+        let config = crate::codex_config::render_codex_config(
+            agent_name.as_str(),
+            role.as_str(),
+            instructions,
+            extra_mcp_servers,
+        );
+
+        fs::write(codex_dir.join("config.toml"), config).await?;
+        fs::write(codex_dir.join("hooks.json"), crate::codex_config::CODEX_HOOKS_JSON).await?;
+        info!(agent_dir = %dir.display(), role = %role.as_str(), "Wrote .codex/config.toml and .codex/hooks.json for Codex agent");
         Ok(())
     }
 
@@ -1258,6 +1336,58 @@ mod tests {
         assert_eq!(
             cmd,
             "opencode --model 'anthropic/claude'\\''s-model'"
+        );
+    }
+
+    #[test]
+    fn test_build_codex_command_fresh_with_prompt_and_model() {
+        let cmd = ACS::build_codex_command(
+            Path::new("/tmp/worktree"),
+            Some(Path::new("/tmp/test-prompt.txt")),
+            Some("gpt-5.2"),
+            None,
+        );
+
+        assert_eq!(
+            cmd,
+            "codex exec --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' --model gpt-5.2 \"$(cat '/tmp/test-prompt.txt')\""
+        );
+    }
+
+    #[test]
+    fn test_build_codex_command_fork_with_model() {
+        let cmd = ACS::build_codex_command(
+            Path::new("/tmp/worktree"),
+            Some(Path::new("/tmp/test-prompt.txt")),
+            Some("gpt-5.2"),
+            Some("session-123"),
+        );
+
+        assert_eq!(
+            cmd,
+            "codex fork 'session-123' --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' --model gpt-5.2"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_codex_includes_env_prefix() {
+        let mut env = HashMap::new();
+        env.insert("EXOMONAD_AGENT_ID".to_string(), "worker-1-codex".to_string());
+
+        let cmd = ACS::build_agent_command(
+            AgentType::Codex,
+            Some(Path::new("/tmp/test-prompt.txt")),
+            None,
+            &env,
+            Path::new("/tmp/worktree"),
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(
+            cmd,
+            "EXOMONAD_AGENT_ID=worker-1-codex codex exec --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' \"$(cat '/tmp/test-prompt.txt')\""
         );
     }
 }
