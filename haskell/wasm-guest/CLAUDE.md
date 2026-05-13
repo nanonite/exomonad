@@ -29,6 +29,7 @@ The guest exports MCP tools that agents can call. These are defined in `ExoMonad
 
 - **`fork_wave`**: Fork N parallel agents in isolated worktrees (branch + PR). Agent type defaults to the server's `--worker` setting; omit `agent_type` to use the default. Claude agents get context inheritance via `--fork-session`; OpenCode agents use headless ACP mode. Requires clean git state.
 - **`spawn_leaf`**: Spawn a leaf agent in its own worktree+branch. Files PR when done. Agent type defaults to the server's worker setting; pass `agent_type` only for a specific supported runtime. Structured spec fields: steps, verify, boundary, context, read_first.
+- **`spawn_codex`**: Spawn a Codex leaf agent in its own worktree+branch. Files PR when done. Uses the same structured fields as `spawn_leaf` but forces `agent_type = codex`.
 - **`spawn_worker`**: Spawn an ephemeral worker in a tmux pane. No branch, no PR. Agent type defaults to the server's worker setting; pass `agent_type` only for a specific supported runtime.
 - **`spawn_leaf_subtree`** (SDK core): Lower-level worktree/standalone spawn used by `spawn_leaf`.
 - **`spawn_workers`** (SDK core): Lower-level batch inline pane spawn used by `spawn_worker`.
@@ -82,6 +83,7 @@ The SDK (`wasm-guest`) exports **core I/O functions** and **shared descriptions/
 | `Tools.Events` | `notifyParentCore`, `shutdownCore`, descriptions/schemas, `MCPTool SendMessage` | `DevNotifyParent`, `TLNotifyParent`, `WorkerNotifyParent` |
 | `Tools.MergePR` | `mergePRCore`, `mergePRRender`, description/schema, `extractAgentName` | `TLMergePR` |
 | `Tools.Spawn` | `forkWaveCore`, `spawnGeminiCore`, `spawnWorkerToolCore`, `spawnLeafSubtreeCore`, `spawnWorkersCore`, descriptions/schemas, render functions | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnWorker`, `RootForkWave`, `RootSpawnLeaf`, `RootSpawnWorker` |
+| `Tools.SpawnCodex` | `handleSpawnCodex`, `spawnCodexDescription`, `spawnCodexSchema`, `SpawnCodex` | `TLSpawnCodex`, `RootSpawnCodex` |
 | `Tools.Tasks` | `taskListCore`, `taskGetCore`, `taskUpdateCore`, descriptions/schemas | `DevTaskList`, `DevTaskGet`, `DevTaskUpdate`, `WorkerTaskList`, `WorkerTaskGet`, `WorkerTaskUpdate` |
 
 `SendMessage` is the only tool with an `MCPTool` instance in the SDK (no state transitions needed).
@@ -90,8 +92,8 @@ The SDK (`wasm-guest`) exports **core I/O functions** and **shared descriptions/
 
 | Role | Tools | State Machine | Spawned by |
 |------|-------|---------------|------------|
-| **root** | `RootForkWave`, `RootSpawnLeaf`, `RootSpawnWorker`, `RootMergePR`, `SendMessage` | `TLPhase` (tracks children via `ChildSpawned`/`ChildCompleted`) | `exomonad init` (human-facing TL) |
-| **tl** | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnWorker`, `TLMergePR`, `TLFilePR`, `TLNotifyParent`, `SendMessage` | `TLPhase` | `fork_wave` |
+| **root** | `RootForkWave`, `RootSpawnLeaf`, `RootSpawnCodex`, `RootSpawnWorker`, `RootMergePR`, `SendMessage` | `TLPhase` (tracks children via `ChildSpawned`/`ChildCompleted`) | `exomonad init` (human-facing TL) |
+| **tl** | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnCodex`, `TLSpawnWorker`, `TLMergePR`, `TLFilePR`, `TLNotifyParent`, `SendMessage` | `TLPhase` | `fork_wave` |
 | **dev** | `DevFilePR`, `DevNotifyParent`, `SendMessage`, `DevTaskList`, `DevTaskGet`, `DevTaskUpdate` | `DevPhase` (tracks PR lifecycle, parent controls agent exit) | `spawn_leaf` (worktree) |
 | **worker** | `WorkerNotifyParent`, `SendMessage`, `WorkerTaskList`, `WorkerTaskGet`, `WorkerTaskUpdate` | None (ephemeral, parent controls exit) | `spawn_worker` |
 | **testrunner** | `Instruct`, `TestrunnerNotifyParent` | None (allow-all hooks) | Companion config |

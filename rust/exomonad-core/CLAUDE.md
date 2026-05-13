@@ -12,6 +12,7 @@ ExoMonad core is the unified library providing the effect system framework, WASM
 | `services/external/` | External API clients (anthropic, github/octocrab, ollama, otel) |
 | `mcp/` | MCP types (ToolDefinition) and tools module |
 | `protocol/` | Wire format types (hook, mcp, service) |
+| `codex_config.rs` | Codex runtime config rendering: `.codex/config.toml`, MCP server entries, model field, developer instructions, extra MCP servers, and shell-native hook command JSON |
 
 ## Feature Flags
 

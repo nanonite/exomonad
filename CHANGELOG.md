@@ -93,6 +93,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Codex: documentation pass (#148)
 - Codex: Haskell WASM spawn_codex tool + hook handler (#145)
 - Codex: hook runtime dispatch (--runtime codex) (#144)
 - Codex: write_codex_config_files + build_codex_command (#143)
