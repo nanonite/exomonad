@@ -692,6 +692,7 @@ impl<
 
         let instructions = match role.as_str() {
             "tl" | "root" => super::spawn::CODEX_TL_INSTRUCTIONS,
+            "reviewer" => super::spawn::CODEX_REVIEWER_INSTRUCTIONS,
             _ => super::spawn::CODEX_DEV_INSTRUCTIONS,
         };
         let config = crate::codex_config::render_codex_config(
@@ -1173,6 +1174,40 @@ mod tests {
         services.project_dir = project_dir;
         services.git_wt = git_wt;
         Arc::new(services)
+    }
+
+    #[tokio::test]
+    async fn test_codex_reviewer_config_uses_reviewer_instructions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let services = test_services(project_dir.clone());
+        let service = AgentControlService::new(services);
+        let agent_dir = project_dir.join("reviewer-agent");
+
+        service
+            .write_codex_config_files(
+                &agent_dir,
+                &crate::domain::Role::reviewer(),
+                &AgentName::from("reviewer-agent"),
+                Some("gpt-5.2"),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let config = tokio::fs::read_to_string(agent_dir.join(".codex/config.toml"))
+            .await
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+        let instructions = parsed["developer_instructions"]
+            .as_str()
+            .expect("developer instructions are rendered");
+
+        assert!(instructions.contains("# ExoMonad Reviewer Agent Protocol"));
+        assert!(instructions.contains("approve_pr"));
+        assert!(instructions.contains("request_changes"));
+        assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
     }
 
     #[tokio::test]

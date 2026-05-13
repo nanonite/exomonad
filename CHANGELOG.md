@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add CODEX_REVIEWER_INSTRUCTIONS and wire reviewer role in write_codex_config_files (#159)
 - Add Codex model setting to generated agent config (#152)
 - Add --verbose flag to exomonad init with comprehensive observability logging (#140)
 - Implement explicit allow/deny handling in OpenCode plugin tool.execute.before (#139)
