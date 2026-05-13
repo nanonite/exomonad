@@ -73,17 +73,19 @@ When a model is configured, ExoMonad adds `--model <model>` to the generated com
 
 Codex receives stable role instructions through `.codex/config.toml` as `developer_instructions`. The task-specific spawn prompt remains in the prompt file passed to `codex exec`.
 
-TL/root Codex agents receive `CODEX_TL_INSTRUCTIONS`, which are the shared TL protocol plus Codex runtime notes for shell hooks, manual restart flags, and `codex fork` context inheritance. Dev/leaf/worker Codex agents receive `CODEX_DEV_INSTRUCTIONS`. Role context is also copied to `.codex/exomonad_role.md` for local inspection.
+TL/root Codex agents receive `CODEX_TL_INSTRUCTIONS`, which are the shared TL protocol plus Codex runtime notes for shell hooks, manual restart flags, and `codex fork` context inheritance. Dev/leaf/worker Codex agents receive `CODEX_DEV_INSTRUCTIONS`. Reviewer Codex agents receive `CODEX_REVIEWER_INSTRUCTIONS` so they use ExoMonad review MCP tools. Role context is also copied to `.codex/exomonad_role.md` for local inspection.
 
 ## Reviewer
 
-Codex has a native review command:
+Codex reviewers run as ordinary ExoMonad reviewer agents in tmux with `role=reviewer`:
 
 ```bash
-codex exec review --dangerously-bypass-approvals-and-sandbox --cd <worktree_dir>
+codex exec --dangerously-bypass-approvals-and-sandbox --cd <worktree_dir> "$(cat <prompt_file>)"
 ```
 
-Use that subcommand for Codex reviewer integration instead of wrapping reviewer instructions into a generic prompt. The reviewer identity discipline still applies: reviewer agents use distinct git identities and never review under the identity that authored the PR.
+Do not use `codex exec review` for ExoMonad reviewer agents. That subcommand emits Codex-native review output, but it does not write ExoMonad's `.exo/reviews/pr_N.json` files. ExoMonad reviewer convergence depends on the reviewer agent calling the MCP review tools (`approve_pr`, `request_changes`, or `post_review_comment`) from the `role=reviewer` configuration.
+
+The reviewer identity discipline still applies: reviewer agents use distinct git identities and never review under the identity that authored the PR.
 
 ## Authentication
 

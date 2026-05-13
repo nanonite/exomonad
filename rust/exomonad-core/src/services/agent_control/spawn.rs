@@ -147,6 +147,7 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 - Never merge a PR; only the TL merges.
 - Never spawn agents; reviewer is a leaf role.
 - Never review your own PR. If the PR author is you, report failure with notify_parent.
+- Do not use `codex exec review`; it emits Codex-native review text and does not write ExoMonad review files.
 - Prefer 3-5 high-impact comments over exhaustive style feedback.
 ";
 
