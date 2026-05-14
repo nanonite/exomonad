@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# E2E Codex Hooks Test
-# Validates Codex root/TL/dev/reviewer hook configuration and live hook dispatch
-# through the production devswarm roles.
+# E2E Chainlink Codex Test
+# Validates Codex TL + Codex worker Chainlink MCP flow:
+#   TL creates issue and checks session status
+#   worker marks session work, comments, ends session
+#   TL closes issue without Chainlink locks after worker notify_parent
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -22,11 +24,15 @@ else
 fi
 echo "  exomonad: $EXOMONAD_BIN"
 
-if ! command -v codex &>/dev/null; then
-    echo "ERROR: codex binary not found in PATH."
-    exit 1
-fi
+for cmd in codex chainlink tmux git python3; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "ERROR: $cmd not found in PATH."
+        exit 1
+    fi
+done
 echo "  codex: $(command -v codex)"
+echo "  chainlink: $(command -v chainlink)"
+echo "  tmux, git, python3: OK"
 
 if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm &>/dev/null; then
     echo "ERROR: No WASM plugins found in $PROJECT_ROOT/.exo/wasm/. Run 'just wasm-all'."
@@ -34,18 +40,19 @@ if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-g
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
 
-for cmd in tmux git python3; do
-    if ! command -v "$cmd" &>/dev/null; then
-        echo "ERROR: $cmd not found in PATH."
+for tool in chainlink_issue_create chainlink_session_status chainlink_session_start chainlink_session_work chainlink_issue_comment chainlink_session_end chainlink_issue_close spawn_worker; do
+    if grep -q "$tool" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
+        echo "  MCP tool '$tool': FOUND"
+    else
+        echo "ERROR: MCP tool '$tool' missing from WASM binary."
         exit 1
     fi
 done
-echo "  tmux, git, python3: OK"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-WORK_DIR="$(mktemp -d /tmp/exomonad-e2e-codex-hooks.XXXXXXXX)"
-SESSION="e2e-codex-hooks"
+WORK_DIR="$(mktemp -d /tmp/exomonad-e2e-chainlink-codex.XXXXXXXX)"
+SESSION="e2e-chainlink-codex"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
@@ -80,9 +87,9 @@ git config user.name "Exomonad E2E"
 git config user.email "e2e@example.com"
 
 cat > README.md <<'EOF'
-# Codex Hooks E2E Fixture
+# Chainlink Codex E2E Fixture
 
-This repository is created by tests/e2e/codex-hooks/run.sh.
+This repository is created by tests/e2e/chainlink-codex/run.sh.
 EOF
 git add README.md
 git commit -m "initial commit" -q
@@ -90,6 +97,11 @@ git push -u origin main -q
 
 if ! "$EXOMONAD_BIN" new 2>&1 | sed 's/^/  /'; then
     echo "ERROR: 'exomonad new' failed during E2E setup."
+    exit 1
+fi
+
+if ! chainlink init 2>&1 | sed 's/^/  /'; then
+    echo "ERROR: chainlink init failed during E2E setup."
     exit 1
 fi
 
@@ -124,17 +136,11 @@ initial_prompt = """
 $ROOT_PROMPT
 """
 
-[reviewer]
-agent_type = "codex"
-
 [[companions]]
-name = "codex-hooks-validator"
+name = "chainlink-codex-validator"
 agent_type = "process"
 command = "$SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE'"
 EOF
-
-mkdir -p .exo/roles/devswarm/context
-cp "$SCRIPT_DIR/testrunner.md" .exo/roles/devswarm/context/testrunner.md
 
 if [[ -f "$HOME/.codex/auth.json" ]]; then
     cp -p "$HOME/.codex/auth.json" "$CODEX_HOME_DIR/auth.json"
@@ -147,13 +153,10 @@ cat > "$CODEX_HOME_DIR/config.toml" <<EOF
 [projects."$REPO_DIR"]
 trust_level = "trusted"
 
-[projects."$REPO_DIR/.exo/worktrees/codex-hooks-tl-codex"]
+[projects."$REPO_DIR/.exo/worktrees/chainlink-codex-tl-codex"]
 trust_level = "trusted"
 
-[projects."$REPO_DIR/.exo/worktrees/codex-hooks-dev-codex"]
-trust_level = "trusted"
-
-[projects."$REPO_DIR/.exo/worktrees/review-pr-1-codex"]
+[projects."$REPO_DIR/.exo/agents/chainlink-codex-worker-codex"]
 trust_level = "trusted"
 EOF
 
@@ -167,26 +170,27 @@ unset GITHUB_TOKEN
 unset GITHUB_API_URL
 export CODEX_HOME="$CODEX_HOME_DIR"
 export EXOMONAD_LOG_FORMAT=""
-echo "  GitHub auth unset; file_pr should use local .exo/prs.json flow"
+echo "  GitHub auth unset"
 echo "  Codex config isolated to $CODEX_HOME"
 
 echo ">>> [Phase 3] Launching exomonad init..."
 echo ""
 echo "============================================"
-echo "  E2E Codex Hooks Test Ready"
+echo "  E2E Chainlink Codex Test Ready"
 echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
 echo ""
 echo "  Chain under test:"
-echo "    Codex root hook config and MCP hook dispatch"
-echo "    -> Codex TL hook config and MCP hook dispatch"
-echo "    -> Codex dev leaf hook dispatch via notify_parent"
-echo "    -> Codex reviewer config/context and hook dispatch"
+echo "    Codex root -> Codex TL"
+echo "    Codex TL -> chainlink_issue_create + chainlink_session_status"
+echo "    Codex TL -> spawn_worker(agent_type=codex)"
+echo "    Codex worker -> session_work + comment + session_end"
+echo "    Codex worker -> notify_parent, then TL closes issue"
 echo "============================================"
 echo ""
 
 set +e
-"$EXOMONAD_BIN" init --verbose --session "$SESSION" --reviewer codex
+"$EXOMONAD_BIN" init --verbose --session "$SESSION"
 INIT_STATUS=$?
 set -e
 

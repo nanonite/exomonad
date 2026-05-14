@@ -84,9 +84,9 @@ checkChainlinkSqlAccess hookInput =
         let normalized = T.toCaseFold cmd,
         "sqlite3" `T.isInfixOf` normalized,
         ".chainlink" `T.isInfixOf` normalized ->
-          Just $
-            "BLOCKED: Do not access .chainlink/issues.db directly via sqlite3. "
-              <> "Use the chainlink MCP tools (chainlink_issue_show, chainlink_issue_close) instead."
+            Just $
+              "BLOCKED: Do not access .chainlink/issues.db directly via sqlite3. "
+                <> "Use the scoped chainlink MCP tools such as chainlink_issue_show and chainlink_issue_comment instead."
     _ -> Nothing
 
 -- | Apply a check only when the agent is Gemini.

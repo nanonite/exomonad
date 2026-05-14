@@ -12,8 +12,14 @@ import Data.Aeson (object, (.=))
 import Data.Aeson qualified as Aeson
 import ExoMonad
 import ExoMonad.Guest.Tools.Chainlink
-  ( ChainlinkIssueClose (..),
+  ( ChainlinkSessionStart (..),
+    ChainlinkSessionStatus (..),
     ChainlinkIssueShow (..),
+    ChainlinkIssueComment (..),
+    ChainlinkSubissueCreate (..),
+    ChainlinkSessionWork (..),
+    ChainlinkSessionEnd (..),
+    ChainlinkSubissueClose (..)
   )
 import ExoMonad.Guest.Tools.FilePR (filePRCore, filePRDescription, filePRSchema, FilePRArgs, FilePROutput (..))
 import ExoMonad.Guest.Tools.Events
@@ -113,8 +119,14 @@ data Tools mode = Tools
     taskList :: mode :- DevTaskList,
     taskGet :: mode :- DevTaskGet,
     taskUpdate :: mode :- DevTaskUpdate,
+    chainlinkSessionStart :: mode :- ChainlinkSessionStart,
+    chainlinkSessionStatus :: mode :- ChainlinkSessionStatus,
     chainlinkIssueShow :: mode :- ChainlinkIssueShow,
-    chainlinkIssueClose :: mode :- ChainlinkIssueClose
+    chainlinkIssueComment :: mode :- ChainlinkIssueComment,
+    chainlinkSubissueCreate :: mode :- ChainlinkSubissueCreate,
+    chainlinkSessionWork :: mode :- ChainlinkSessionWork,
+    chainlinkSessionEnd :: mode :- ChainlinkSessionEnd,
+    chainlinkSubissueClose :: mode :- ChainlinkSubissueClose
   }
   deriving (Generic)
 
@@ -130,8 +142,14 @@ config =
             taskList = mkHandler @DevTaskList,
             taskGet = mkHandler @DevTaskGet,
             taskUpdate = mkHandler @DevTaskUpdate,
+            chainlinkSessionStart = mkHandler @ChainlinkSessionStart,
+            chainlinkSessionStatus = mkHandler @ChainlinkSessionStatus,
             chainlinkIssueShow = mkHandler @ChainlinkIssueShow,
-            chainlinkIssueClose = mkHandler @ChainlinkIssueClose
+            chainlinkIssueComment = mkHandler @ChainlinkIssueComment,
+            chainlinkSubissueCreate = mkHandler @ChainlinkSubissueCreate,
+            chainlinkSessionWork = mkHandler @ChainlinkSessionWork,
+            chainlinkSessionEnd = mkHandler @ChainlinkSessionEnd,
+            chainlinkSubissueClose = mkHandler @ChainlinkSubissueClose
           },
       hooks = httpDevHooks,
       eventHandlers = prReviewEventHandlers

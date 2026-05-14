@@ -18,7 +18,6 @@ pub(crate) use crate::domain::{
 };
 pub(crate) use crate::effects::EffectError;
 pub(crate) use crate::ffi::FFIBoundary;
-pub(crate) use crate::services::OpencodeAcpRegistry;
 pub(crate) use crate::{GithubOwner, GithubRepo, IssueNumber};
 pub(crate) use anyhow::{anyhow, Context, Result};
 pub(crate) use serde::{Deserialize, Serialize};
@@ -753,11 +752,6 @@ impl<
     /// Team registry (from capability context).
     pub(crate) fn team_registry(&self) -> &TeamRegistry {
         self.ctx.team_registry()
-    }
-
-    /// OpenCode ACP registry (from capability context).
-    pub(crate) fn opencode_acp_registry(&self) -> &OpencodeAcpRegistry {
-        self.ctx.opencode_acp_registry()
     }
 
     /// Agent resolver (from capability context).

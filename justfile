@@ -208,9 +208,40 @@ check-e2e-codex-hooks:
     bash -n tests/e2e/codex-hooks/run.sh
     bash -n tests/e2e/codex-hooks/validate.sh
 
+# Run E2E Codex messaging test (send_message + notify_parent tmux delivery)
+e2e-codex-messaging:
+    ./tests/e2e/codex-messaging/run.sh
+
+# Check E2E Codex messaging harness scripts without launching Codex/tmux
+check-e2e-codex-messaging:
+    bash -n tests/e2e/codex-messaging/run.sh
+    bash -n tests/e2e/codex-messaging/validate.sh
+
 # Run E2E chainlink issue create test (chainlink_issue_create MCP tool via ProcessRun)
 e2e-chainlink:
     ./tests/e2e/chainlink/run.sh
+
+# Run E2E Chainlink Codex flow test (Codex TL + Codex worker Chainlink MCP flow)
+e2e-chainlink-codex:
+    ./tests/e2e/chainlink-codex/run.sh
+
+# Check E2E Chainlink Codex harness scripts without launching Codex/tmux
+check-e2e-chainlink-codex:
+    bash -n tests/e2e/chainlink-codex/run.sh
+    bash -n tests/e2e/chainlink-codex/validate.sh
+
+# Run E2E Chainlink sqlite direct DB access block test
+e2e-chainlink-sqlite-block:
+    ./tests/e2e/chainlink-sqlite-block/run.sh
+
+# Check E2E Chainlink sqlite block harness script without launching the server
+check-e2e-chainlink-sqlite-block:
+    bash -n tests/e2e/chainlink-sqlite-block/run.sh
+
+# Check Chainlink timer/session role scoping without launching agents
+check-e2e-chainlink-timer-role-scope:
+    bash -n tests/e2e/chainlink-timer-role-scope/validate.sh
+    bash tests/e2e/chainlink-timer-role-scope/validate.sh
 
 # Run Tangled CI integration test.
 # Requires only the knot container: docker compose up -d  (in tests/e2e/tangled-ci/)

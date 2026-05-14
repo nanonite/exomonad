@@ -13,6 +13,18 @@ module ExoMonad.Guest.Tools.Chainlink
     ChainlinkIssueCreateArgs (..),
     ChainlinkIssueCreateOutput (..),
 
+    -- * Session Start
+    ChainlinkSessionStart (..),
+    chainlinkSessionStartCore,
+    chainlinkSessionStartDescription,
+    chainlinkSessionStartSchema,
+
+    -- * Session Status
+    ChainlinkSessionStatus (..),
+    chainlinkSessionStatusCore,
+    chainlinkSessionStatusDescription,
+    chainlinkSessionStatusSchema,
+
     -- * Issue Show
     ChainlinkIssueShow (..),
     chainlinkIssueShowCore,
@@ -55,6 +67,25 @@ module ExoMonad.Guest.Tools.Chainlink
     chainlinkIssueCloseSchema,
     ChainlinkIssueCloseArgs (..),
 
+    -- * Subissue Close
+    ChainlinkSubissueClose (..),
+    chainlinkSubissueCloseDescription,
+    chainlinkSubissueCloseSchema,
+
+    -- * Timer
+    ChainlinkTimerStart (..),
+    ChainlinkTimerStop (..),
+    ChainlinkTimerStatus (..),
+    chainlinkTimerStartCore,
+    chainlinkTimerStopCore,
+    chainlinkTimerStatusCore,
+    chainlinkTimerStartDescription,
+    chainlinkTimerStopDescription,
+    chainlinkTimerStatusDescription,
+    chainlinkTimerStartSchema,
+    chainlinkTimerStopSchema,
+    chainlinkTimerStatusSchema,
+
     -- * Issue List
     ChainlinkIssueList (..),
     chainlinkIssueListCore,
@@ -96,18 +127,6 @@ module ExoMonad.Guest.Tools.Chainlink
     chainlinkMilestoneListCore,
     chainlinkMilestoneListDescription,
     chainlinkMilestoneListSchema,
-
-    -- * Sync
-    ChainlinkSync (..),
-    chainlinkSyncCore,
-    chainlinkSyncDescription,
-    chainlinkSyncSchema,
-
-    -- * Worker Status
-    ChainlinkWorkerStatus (..),
-    chainlinkWorkerStatusCore,
-    chainlinkWorkerStatusDescription,
-    chainlinkWorkerStatusSchema,
   )
 where
 
@@ -116,16 +135,13 @@ import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), 
 import Data.Aeson qualified as Aeson
 import Data.Int (Int32)
 import Data.Map qualified as Map
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Data.Word (Word64)
-import Effects.Events qualified as Events (NotifyParentRequest (..))
 import Effects.Process qualified as Proc
-import ExoMonad.Effects.Events (EventsNotifyParent)
 import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
@@ -232,6 +248,88 @@ instance MCPTool ChainlinkIssueCreate where
     case result of
       Left err -> pure $ errorResult err
       Right output -> pure $ successResult (Aeson.toJSON output)
+
+--------------------------------------------------------------------------------
+-- Session Start
+--------------------------------------------------------------------------------
+
+chainlinkSessionStartDescription :: Text
+chainlinkSessionStartDescription =
+  "Start a chainlink work session for the current agent. Call this before chainlink_session_work."
+
+chainlinkSessionStartSchema :: Aeson.Object
+chainlinkSessionStartSchema = mempty
+
+chainlinkSessionStartCore :: Eff Effects (Either Text ())
+chainlinkSessionStartCore = do
+  result <- runChainlink buildSessionStartArgs
+  case result of
+    Left err -> pure $ Left ("chainlink session start failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          pure $ Right ()
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink session start failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkSessionStart
+
+instance MCPTool ChainlinkSessionStart where
+  type ToolArgs ChainlinkSessionStart = ()
+  toolName = "chainlink_session_start"
+  toolDescription = chainlinkSessionStartDescription
+  toolSchema = chainlinkSessionStartSchema
+  toolHandlerEff _ = do
+    result <- chainlinkSessionStartCore
+    case result of
+      Left err -> pure $ errorResult err
+      Right _ -> pure $ successResult (object ["success" .= True])
+
+--------------------------------------------------------------------------------
+-- Session Status
+--------------------------------------------------------------------------------
+
+chainlinkSessionStatusDescription :: Text
+chainlinkSessionStatusDescription =
+  "Read the current Chainlink session status. Coordinators use this for work-state telemetry; it does not mutate issue state."
+
+chainlinkSessionStatusSchema :: Aeson.Object
+chainlinkSessionStatusSchema = mempty
+
+chainlinkSessionStatusCore :: Eff Effects (Either Text Value)
+chainlinkSessionStatusCore = do
+  result <- runChainlink buildSessionStatusArgs
+  case result of
+    Left err -> pure $ Left ("chainlink session status failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 ->
+          case Aeson.eitherDecodeStrict (encodeUtf8 (TL.toStrict (Proc.runResponseStdout resp))) of
+            Right value -> pure $ Right value
+            Left err -> pure $ Left ("chainlink session status returned invalid JSON: " <> T.pack err)
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink session status failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+data ChainlinkSessionStatus
+
+instance MCPTool ChainlinkSessionStatus where
+  type ToolArgs ChainlinkSessionStatus = ()
+  toolName = "chainlink_session_status"
+  toolDescription = chainlinkSessionStatusDescription
+  toolSchema = chainlinkSessionStatusSchema
+  toolHandlerEff _ = do
+    result <- chainlinkSessionStatusCore
+    case result of
+      Left err -> pure $ errorResult err
+      Right value -> pure $ successResult value
 
 --------------------------------------------------------------------------------
 -- Issue Show
@@ -548,9 +646,8 @@ instance ToJSON ChainlinkIssueCloseArgs where
 
 chainlinkIssueCloseDescription :: Text
 chainlinkIssueCloseDescription =
-  "Atomic close sequence: release locks, close the issue, end session, and notify parent. "
-    <> "Use this when a task is completed. The issue will be marked as closed and added to the changelog. "
-    <> "This is the ONLY close tool you should use — never use raw `chainlink close` from the CLI."
+  "Coordinator-only close tool. Use after the implementing agent ended its session and PR review, CI, and merge conditions are satisfied. "
+    <> "This runs only `chainlink close`; it never touches Chainlink locks or agent identity."
 
 chainlinkIssueCloseSchema :: Aeson.Object
 chainlinkIssueCloseSchema =
@@ -561,63 +658,18 @@ chainlinkIssueCloseSchema =
 
 chainlinkIssueCloseCore :: ChainlinkIssueCloseArgs -> Eff Effects (Either Text ())
 chainlinkIssueCloseCore args = do
-  let issueId = cisIssueId args
-      summary = fromMaybe ("Closed #" <> T.pack (show issueId)) (cisSummary args)
-  -- Step 1: release locks (idempotent — no-op if none held)
-  step1 <- runChainlink (buildLocksReleaseArgs args)
-  case step1 of
-    Left err -> pure $ Left ("locks release failed: " <> err)
+  result <- runChainlink (buildCloseArgs args)
+  case result of
+    Left err -> pure $ Left ("chainlink close failed: " <> err)
     Right resp
-      | Proc.runResponseExitCode resp /= 0 ->
+      | Proc.runResponseExitCode resp == 0 -> pure $ Right ()
+      | otherwise ->
           pure $
             Left $
-              "locks release failed (exit "
+              "chainlink close failed (exit "
                 <> exitCodeToText (Proc.runResponseExitCode resp)
                 <> "): "
                 <> TL.toStrict (Proc.runResponseStderr resp)
-      | otherwise -> do
-          -- Step 2: close the issue
-          step2 <- runChainlink (buildCloseArgs args)
-          case step2 of
-            Left err -> pure $ Left ("chainlink close failed: " <> err)
-            Right resp2
-              | Proc.runResponseExitCode resp2 /= 0 ->
-                  pure $
-                    Left $
-                      "chainlink close failed (exit "
-                        <> exitCodeToText (Proc.runResponseExitCode resp2)
-                        <> "): "
-                        <> TL.toStrict (Proc.runResponseStderr resp2)
-              | otherwise -> do
-                  -- Step 3: end session
-                  let sessionArgs = ChainlinkSessionEndArgs (Just summary)
-                  step3 <- runChainlink (buildSessionEndArgs sessionArgs)
-                  case step3 of
-                    Left err -> pure $ Left ("session end failed: " <> err)
-                    Right resp3
-                      | Proc.runResponseExitCode resp3 /= 0 ->
-                          pure $
-                            Left $
-                              "session end failed (exit "
-                                <> exitCodeToText (Proc.runResponseExitCode resp3)
-                                <> "): "
-                                <> TL.toStrict (Proc.runResponseStderr resp3)
-                      | otherwise -> do
-                          -- Step 4: notify parent via Events effect
-                          let statusText = "success" :: Text
-                          let message = "Closed #" <> T.pack (show issueId) <> ": " <> summary
-                          step4 <-
-                            suspendEffect @EventsNotifyParent
-                              ( Events.NotifyParentRequest
-                                  { Events.notifyParentRequestAgentId = "",
-                                    Events.notifyParentRequestStatus = TL.fromStrict statusText,
-                                    Events.notifyParentRequestMessage = TL.fromStrict message,
-                                    Events.notifyParentRequestOverrideRecipient = Nothing
-                                  }
-                              )
-                          case step4 of
-                            Left err -> pure $ Left (T.pack (show err))
-                            Right _ -> pure $ Right ()
 
 data ChainlinkIssueClose
 
@@ -631,6 +683,128 @@ instance MCPTool ChainlinkIssueClose where
     case result of
       Left err -> pure $ errorResult err
       Right _ -> pure $ successResult (object ["success" .= True])
+
+--------------------------------------------------------------------------------
+-- Subissue Close
+--------------------------------------------------------------------------------
+
+chainlinkSubissueCloseDescription :: Text
+chainlinkSubissueCloseDescription =
+  "Coordinator-only close tool for child subissues. A dev leaf uses this only after reviewing a worker's ended session and accepting the child work."
+
+chainlinkSubissueCloseSchema :: Aeson.Object
+chainlinkSubissueCloseSchema = chainlinkIssueCloseSchema
+
+data ChainlinkSubissueClose
+
+instance MCPTool ChainlinkSubissueClose where
+  type ToolArgs ChainlinkSubissueClose = ChainlinkIssueCloseArgs
+  toolName = "chainlink_subissue_close"
+  toolDescription = chainlinkSubissueCloseDescription
+  toolSchema = chainlinkSubissueCloseSchema
+  toolHandlerEff args = do
+    result <- chainlinkIssueCloseCore args
+    case result of
+      Left err -> pure $ errorResult err
+      Right _ -> pure $ successResult (object ["success" .= True])
+
+--------------------------------------------------------------------------------
+-- Timer
+--------------------------------------------------------------------------------
+
+instance FromJSON ChainlinkTimerStartArgs where
+  parseJSON = withObject "ChainlinkTimerStartArgs" $ \v ->
+    ChainlinkTimerStartArgs <$> v .: "issue_id"
+
+instance ToJSON ChainlinkTimerStartArgs where
+  toJSON args = object ["issue_id" .= ctsIssueId args]
+
+chainlinkTimerStartDescription :: Text
+chainlinkTimerStartDescription =
+  "TL/SubTL-only timer start. Starts Chainlink timing for a coordinator-owned task lifecycle."
+
+chainlinkTimerStartSchema :: Aeson.Object
+chainlinkTimerStartSchema =
+  genericToolSchemaWith @ChainlinkTimerStartArgs
+    [("issue_id", "The numeric issue ID whose coordinator-owned lifecycle timer should start")]
+
+chainlinkTimerStopDescription :: Text
+chainlinkTimerStopDescription =
+  "TL/SubTL-only timer stop. Stops the active Chainlink timer after coordinator validation and merge."
+
+chainlinkTimerStopSchema :: Aeson.Object
+chainlinkTimerStopSchema = mempty
+
+chainlinkTimerStatusDescription :: Text
+chainlinkTimerStatusDescription =
+  "TL/SubTL-only timer status. Shows the active Chainlink timer for scope/time monitoring."
+
+chainlinkTimerStatusSchema :: Aeson.Object
+chainlinkTimerStatusSchema = mempty
+
+runChainlinkText :: Text -> [String] -> Eff Effects (Either Text Text)
+runChainlinkText label args = do
+  result <- runChainlink args
+  case result of
+    Left err -> pure $ Left (label <> " failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 -> pure $ Right (TL.toStrict (Proc.runResponseStdout resp))
+      | otherwise ->
+          pure $
+            Left $
+              label
+                <> " failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+chainlinkTimerStartCore :: ChainlinkTimerStartArgs -> Eff Effects (Either Text Text)
+chainlinkTimerStartCore args = runChainlinkText "chainlink timer start" (buildTimerStartArgs args)
+
+chainlinkTimerStopCore :: Eff Effects (Either Text Text)
+chainlinkTimerStopCore = runChainlinkText "chainlink timer stop" buildTimerStopArgs
+
+chainlinkTimerStatusCore :: Eff Effects (Either Text Text)
+chainlinkTimerStatusCore = runChainlinkText "chainlink timer status" buildTimerStatusArgs
+
+data ChainlinkTimerStart
+
+instance MCPTool ChainlinkTimerStart where
+  type ToolArgs ChainlinkTimerStart = ChainlinkTimerStartArgs
+  toolName = "chainlink_timer_start"
+  toolDescription = chainlinkTimerStartDescription
+  toolSchema = chainlinkTimerStartSchema
+  toolHandlerEff args = do
+    result <- chainlinkTimerStartCore args
+    case result of
+      Left err -> pure $ errorResult err
+      Right output -> pure $ successResult (object ["output" .= output])
+
+data ChainlinkTimerStop
+
+instance MCPTool ChainlinkTimerStop where
+  type ToolArgs ChainlinkTimerStop = ()
+  toolName = "chainlink_timer_stop"
+  toolDescription = chainlinkTimerStopDescription
+  toolSchema = chainlinkTimerStopSchema
+  toolHandlerEff _ = do
+    result <- chainlinkTimerStopCore
+    case result of
+      Left err -> pure $ errorResult err
+      Right output -> pure $ successResult (object ["output" .= output])
+
+data ChainlinkTimerStatus
+
+instance MCPTool ChainlinkTimerStatus where
+  type ToolArgs ChainlinkTimerStatus = ()
+  toolName = "chainlink_timer_status"
+  toolDescription = chainlinkTimerStatusDescription
+  toolSchema = chainlinkTimerStatusSchema
+  toolHandlerEff _ = do
+    result <- chainlinkTimerStatusCore
+    case result of
+      Left err -> pure $ errorResult err
+      Right output -> pure $ successResult (object ["output" .= output])
 
 --------------------------------------------------------------------------------
 -- Issue List
@@ -1043,123 +1217,3 @@ instance MCPTool ChainlinkMilestoneList where
     case result of
       Left err -> pure $ errorResult err
       Right items -> pure $ successResult (Aeson.toJSON items)
-
---------------------------------------------------------------------------------
--- Sync
---------------------------------------------------------------------------------
-
-chainlinkSyncDescription :: Text
-chainlinkSyncDescription =
-  "Sync chainlink lock state and coordination status. Use this to ensure all agents have a consistent view of locks and dependencies."
-
-chainlinkSyncSchema :: Aeson.Object
-chainlinkSyncSchema = mempty
-
-chainlinkSyncCore :: Eff Effects (Either Text Text)
-chainlinkSyncCore = do
-  let cmdArgs = buildSyncArgs
-  result <- runChainlink cmdArgs
-  case result of
-    Left err -> pure $ Left ("chainlink sync failed: " <> err)
-    Right resp
-      | Proc.runResponseExitCode resp == 0 ->
-          pure $ Right (TL.toStrict (Proc.runResponseStdout resp))
-      | otherwise ->
-          pure $
-            Left $
-              "chainlink sync failed (exit "
-                <> exitCodeToText (Proc.runResponseExitCode resp)
-                <> "): "
-                <> TL.toStrict (Proc.runResponseStderr resp)
-
-data ChainlinkSync
-
-instance MCPTool ChainlinkSync where
-  type ToolArgs ChainlinkSync = ()
-  toolName = "chainlink_sync"
-  toolDescription = chainlinkSyncDescription
-  toolSchema = chainlinkSyncSchema
-  toolHandlerEff _ = do
-    result <- chainlinkSyncCore
-    case result of
-      Left err -> pure $ errorResult err
-      Right text -> pure $ successResult (object ["output" .= text])
-
---------------------------------------------------------------------------------
--- Worker Status
---------------------------------------------------------------------------------
-
-chainlinkWorkerStatusDescription :: Text
-chainlinkWorkerStatusDescription =
-  "Aggregate worker status: lists open issues, active locks, usage data, and uncommitted files. "
-    <> "Runs (1) chainlink issue list --status open, (2) chainlink locks list, "
-    <> "(3) chainlink usage list, (4) git diff --stat and correlates by issue_id. "
-    <> "Returns a JSON array of worker summaries."
-
-chainlinkWorkerStatusSchema :: Aeson.Object
-chainlinkWorkerStatusSchema = mempty
-
-chainlinkWorkerStatusCore :: Eff Effects (Either Text [WorkerStatusEntry])
-chainlinkWorkerStatusCore = do
-  -- Run all four commands, each resilient to failure
-  issues <- tryCommand buildWorkerStatusIssueListArgs parseIssueListJson []
-  locks <- tryCommand buildWorkerStatusLocksListArgs parseLocksListJson []
-  usage <- tryCommand buildWorkerStatusUsageArgs parseUsageListJson []
-  diffStat <- tryGitDiffStat
-  -- Correlate and return
-  let uncommittedFiles = parseGitDiffStat diffStat
-  pure $ Right (correlateWorkerStatus issues locks usage uncommittedFiles)
-  where
-    parseIssueListJson txt =
-      case Aeson.eitherDecodeStrict (encodeUtf8 txt) of
-        Right items -> items
-        Left _ -> []
-    parseLocksListJson txt =
-      case Aeson.eitherDecodeStrict (encodeUtf8 txt) of
-        Right items -> items
-        Left _ -> []
-    parseUsageListJson txt =
-      case Aeson.eitherDecodeStrict (encodeUtf8 txt) of
-        Right items -> items
-        Left _ -> []
-
-tryCommand :: [String] -> (Text -> a) -> a -> Eff Effects a
-tryCommand args parseFn defaultVal = do
-  result <- runChainlink args
-  case result of
-    Left _ -> pure defaultVal
-    Right resp
-      | Proc.runResponseExitCode resp == 0 ->
-          pure $ parseFn (TL.toStrict (Proc.runResponseStdout resp))
-      | otherwise -> pure defaultVal
-
-tryGitDiffStat :: Eff Effects Text
-tryGitDiffStat = do
-  result <-
-    suspendEffect @ProcessRun
-      ( Proc.RunRequest
-          { Proc.runRequestCommand = "git",
-            Proc.runRequestArgs = V.fromList (TL.pack <$> ["diff", "--stat"]),
-            Proc.runRequestWorkingDir = ".",
-            Proc.runRequestEnv = Map.empty,
-            Proc.runRequestTimeoutMs = 15000
-          }
-      )
-  case result of
-    Left _ -> pure ""
-    Right resp
-      | Proc.runResponseExitCode resp /= 0 -> pure ""
-      | otherwise -> pure $ TL.toStrict (Proc.runResponseStdout resp)
-
-data ChainlinkWorkerStatus
-
-instance MCPTool ChainlinkWorkerStatus where
-  type ToolArgs ChainlinkWorkerStatus = ()
-  toolName = "chainlink_worker_status"
-  toolDescription = chainlinkWorkerStatusDescription
-  toolSchema = chainlinkWorkerStatusSchema
-  toolHandlerEff _ = do
-    result <- chainlinkWorkerStatusCore
-    case result of
-      Left err -> pure $ errorResult err
-      Right entries -> pure $ successResult (Aeson.toJSON entries)

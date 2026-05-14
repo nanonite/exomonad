@@ -121,6 +121,38 @@ Implement the spec in your task. File a PR when done. Call notify_parent to repo
 - If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
 ";
 
+pub const CODEX_WORKER_INSTRUCTIONS: &str = "\
+# ExoMonad Worker Agent Protocol
+
+You are a Codex worker in an ExoMonad agent tree. You run in a shared workspace pane and do not have your own branch.
+
+## Your Job
+Complete the narrow task assigned by your parent TL. Report completion through the provided MCP tools.
+
+## MCP Tools Available
+- chainlink_session_start: Start the Chainlink session before marking work active.
+- chainlink_session_work: Mark the assigned Chainlink issue as the active work item.
+- chainlink_issue_comment: Post progress on the assigned Chainlink issue.
+- chainlink_session_end: End the Chainlink session with handoff notes.
+- notify_parent: Send a direct message to your parent TL when needed.
+- send_message: Send messages to other agents when explicitly instructed.
+
+## Workflow
+1. Read the prompt carefully and use the issue ID provided by the TL.
+2. Call chainlink_session_start.
+3. Call chainlink_session_work before doing the requested work.
+4. Call chainlink_issue_comment for the required progress marker.
+5. Call chainlink_session_end with concise handoff notes when done.
+6. Call notify_parent with status='success' and include the issue ID.
+
+## Key Rules
+- Never spawn agents; workers are leaf executors.
+- Never create Chainlink issues; only the parent TL creates issues.
+- Never initialize Chainlink agent identity; ExoMonad branch/session identity is authoritative.
+- Never close Chainlink issues; your parent coordinator reviews the handoff and closes.
+- Never create branches, commits, or PRs unless explicitly instructed.
+";
+
 pub const CODEX_REVIEWER_INSTRUCTIONS: &str = "\
 # ExoMonad Reviewer Agent Protocol
 
@@ -140,7 +172,7 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 3. Review for correctness, edge cases, security issues, missing tests, and broken contracts.
 4. If issues are found, call request_changes with specific, actionable feedback that references files and functions or lines.
 5. If the code is correct, call approve_pr with a concise approving comment.
-6. Stop after recording the review. The ExoMonad watcher reads `.exo/reviews/pr_{N}.json` and routes the result.
+6. Call notify_parent with status='success' after recording the review, then stop. The ExoMonad watcher also reads `.exo/reviews/pr_{N}.json` and routes the review result.
 
 ## Key Rules
 - Never modify code; reviewers only review.
@@ -723,6 +755,17 @@ impl<
                     Self::write_opencode_plugin_files(&agent_config_dir).await?;
                     info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json and plugin to agent config dir");
                 }
+                AgentType::Codex => {
+                    self.write_codex_config_files(
+                        &agent_config_dir,
+                        &role,
+                        &agent_name,
+                        self.spawn_agent_model(),
+                        &self.extra_mcp_servers,
+                    )
+                    .await?;
+                    info!(path = %agent_config_dir.join(".codex/config.toml").display(), agent_name = %agent_name, "Wrote worker Codex config to agent config dir");
+                }
                 _ => {}
             }
 
@@ -731,11 +774,11 @@ impl<
             let caller_worktree = ctx.working_dir.clone();
             let absolute_worktree = self.project_dir().join(&caller_worktree);
 
-            // OpenCode workers run in their agent config dir so they discover
-            // their own opencode.json (with --role worker) rather than the
-            // caller's (which may have --role root, lacking notify_parent).
+            // Config-discovered runtimes run in their agent config dir so they
+            // receive the worker role/name instead of inheriting the caller's
+            // project config.
             let worker_cwd = match agent_type {
-                AgentType::OpenCode => agent_config_dir.clone(),
+                AgentType::OpenCode | AgentType::Codex => agent_config_dir.clone(),
                 _ => absolute_worktree.clone(),
             };
 
@@ -1009,7 +1052,6 @@ impl<
             }
 
             // Open tmux window with cwd = worktree_path
-            let agent_config_dir = self.project_dir().join(".exo").join("agents").join(agent_name.as_str());
             let routing = match agent_type {
                 AgentType::OpenCode => {
                     // OpenCode workers run in a tmux window like Claude workers.

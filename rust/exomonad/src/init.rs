@@ -62,6 +62,7 @@ fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
         exomonad_core::services::agent_control::CODEX_TL_INSTRUCTIONS,
         config.model.as_deref(),
         &extra_mcp_servers,
+        &codex_dir.join("hooks.json"),
     );
     std::fs::write(codex_dir.join("config.toml"), codex_config)?;
     std::fs::write(
@@ -698,14 +699,18 @@ pub async fn run(
         );
     }
 
-    // Propagate verbose/hook-trace flags session-wide so spawned worktrees inherit them
+    // Propagate verbose trace flags session-wide so spawned worktrees inherit them
     if verbose {
-        for (var, val) in [("EXOMONAD_VERBOSE", "1"), ("EXOMONAD_HOOK_TRACE", "1")] {
+        for (var, val) in [
+            ("EXOMONAD_VERBOSE", "1"),
+            ("EXOMONAD_HOOK_TRACE", "1"),
+            ("EXOMONAD_CHAINLINK_TRACE", "1"),
+        ] {
             let _ = std::process::Command::new("tmux")
                 .args(["set-environment", "-t", &session, var, val])
                 .status();
         }
-        info!("Verbose mode enabled: EXOMONAD_VERBOSE=1 EXOMONAD_HOOK_TRACE=1 set in session environment");
+        info!("Verbose mode enabled: EXOMONAD_VERBOSE=1 EXOMONAD_HOOK_TRACE=1 EXOMONAD_CHAINLINK_TRACE=1 set in session environment");
     }
 
     // Set terminal window title to project/session name
@@ -777,7 +782,7 @@ pub async fn run(
         }
     };
     let verbose_prefix = if verbose {
-        "RUST_LOG=info EXOMONAD_HOOK_TRACE=1 "
+        "RUST_LOG=info EXOMONAD_HOOK_TRACE=1 EXOMONAD_CHAINLINK_TRACE=1 "
     } else {
         ""
     };

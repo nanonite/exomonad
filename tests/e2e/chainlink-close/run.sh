@@ -3,8 +3,8 @@ set -euo pipefail
 
 # E2E Chainlink Issue Close Test
 # Validates chainlink_issue_close MCP tool:
-#   TL creates issue → spawn_worker → worker claims/closes via chainlink_issue_close
-#   → close atomically releases locks, closes issue, ends session, notifies TL
+#   TL creates issue → spawn_worker → worker session_start/work/end + notify_parent
+#   → TL closes issue via chainlink_issue_close after worker handoff
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -40,6 +40,10 @@ if ! grep -q "chainlink_issue_close" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswar
     exit 1
 fi
 echo "  chainlink_issue_close: FOUND in WASM"
+if grep -q "chainlink_agent_init" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
+    echo "ERROR: chainlink_agent_init should not be compiled into the devswarm WASM binary."
+    exit 1
+fi
 
 for cmd in tmux git; do
     if ! command -v "$cmd" &>/dev/null; then
@@ -130,8 +134,9 @@ echo ""
 echo "  Chain:"
 echo "    Claude TL → chainlink_issue_create"
 echo "    → spawn_worker (Gemini, worker role)"
-echo "    → worker: agent init → session_work → issue_close → notify_parent"
-echo "    → testrunner validates"
+echo "    → worker: session_start → session_work → session_end → notify_parent"
+echo "    → TL: chainlink_issue_close after handoff"
+echo "    → testrunner validates closed issue and no lock worktree"
 echo "============================================"
 echo ""
 

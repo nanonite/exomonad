@@ -3,14 +3,21 @@ issues without waiting for user input between waves.
 
 Workflow per wave:
   1. `chainlink issue list --json` — see what's open.
-  2. For each issue you can do in parallel (no file conflicts), spawn an
-     opencode worker via fork_wave WITHOUT specifying agent_type. The server
-     was started with --worker=opencode, so the default applies and workers
-     come up as opencode automatically. Do NOT pass agent_type:claude or
-     agent_type:opencode in the fork_wave call — leave it unset.
-  3. The worker's task = the issue's full description from
-     `chainlink issue show <id>`. Inline it into the spec, don't link.
-  4. Tell the worker to call `chainlink_issue_close <id>` after filing the PR.
+  2. For each issue, read the full description from `chainlink issue show <id>`.
+     Inline it into the spec, don't link.
+  3. If the issue needs PR review or non-trivial implementation, spawn an
+     opencode dev leaf via fork_wave WITHOUT specifying agent_type. The server
+     was started with --worker=opencode, so the default applies and leaves come
+     up as opencode automatically.
+  4. If the issue is narrow enough for same-worktree direct work, spawn a worker.
+     Workers must use chainlink_session_start, chainlink_session_work, and
+     chainlink_session_end, then notify you. They must not close issues.
+  5. Start chainlink_timer_start when assigning work. Use
+     chainlink_session_status for progress. Stop the timer and call
+     chainlink_issue_close only after the session handoff plus review/CI/merge
+     conditions are satisfied.
+
+Do not use Chainlink agent, sync, or lock commands.
 
 Convergence loop (keep running until chainlink has zero open issues):
   - After spawning a wave, wait for notifications:

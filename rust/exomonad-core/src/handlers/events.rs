@@ -14,6 +14,27 @@ use crate::services::{
     HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
 };
 
+fn structural_parent_session_id(
+    agent_name: &crate::domain::AgentName,
+    birth_branch: &crate::domain::BirthBranch,
+    identity: Option<&crate::services::agent_resolver::AgentIdentityRecord>,
+) -> String {
+    if let Some(identity) = identity {
+        if identity.topology == crate::services::agent_control::Topology::SharedDir {
+            return identity.parent_branch.to_string();
+        }
+    }
+
+    if agent_name.is_gemini_worker() {
+        birth_branch.to_string()
+    } else {
+        birth_branch
+            .parent()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "root".to_string())
+    }
+}
+
 /// Events effect handler.
 ///
 /// Handles all effects in the `events.*` namespace.
@@ -245,15 +266,11 @@ impl<
             return Ok(NotifyParentResponse { ack: true });
         }
 
-        // Structural fallback: birth-branch parent
-        let parent_session_id = if agent_name.is_gemini_worker() {
-            birth_branch.to_string()
-        } else {
-            birth_branch
-                .parent()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "root".to_string())
-        };
+        // Structural fallback: worktree agents notify the parent branch;
+        // shared-dir workers notify the exact parent branch recorded at spawn.
+        let identity = self.ctx.agent_resolver().get(&agent_id).await;
+        let parent_session_id =
+            structural_parent_session_id(agent_name, birth_branch, identity.as_ref());
 
         tracing::info!(
             birth_branch = %birth_branch,
@@ -341,11 +358,47 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{AgentName, BirthBranch, Slug};
+    use crate::services::agent_control::{AgentType, Topology};
+    use crate::services::agent_resolver::AgentIdentityRecord;
+    use std::path::PathBuf;
 
     #[test]
     fn test_event_handler_namespace() {
         let services = Arc::new(crate::services::Services::test());
         let handler = EventHandler::new(services, None);
         assert_eq!(handler.namespace(), "events");
+    }
+
+    #[test]
+    fn shared_dir_worker_notifies_recorded_parent_branch() {
+        let agent_name = AgentName::from("chainlink-codex-worker-codex");
+        let birth_branch = BirthBranch::from("main.chainlink-codex-tl-codex");
+        let identity = AgentIdentityRecord {
+            agent_name: agent_name.clone(),
+            slug: Slug::from("chainlink-codex-worker"),
+            agent_type: AgentType::Codex,
+            birth_branch: birth_branch.clone(),
+            parent_branch: BirthBranch::from("main.chainlink-codex-tl-codex"),
+            working_dir: PathBuf::from(".exo/worktrees/chainlink-codex-tl-codex"),
+            display_name: "🤖 chainlink-codex-worker-codex".to_string(),
+            topology: Topology::SharedDir,
+        };
+
+        assert_eq!(
+            structural_parent_session_id(&agent_name, &birth_branch, Some(&identity)),
+            "main.chainlink-codex-tl-codex"
+        );
+    }
+
+    #[test]
+    fn worktree_agent_notifies_birth_branch_parent() {
+        let agent_name = AgentName::from("codex-leaf-codex");
+        let birth_branch = BirthBranch::from("main.codex-tl-codex.codex-leaf-codex");
+
+        assert_eq!(
+            structural_parent_session_id(&agent_name, &birth_branch, None),
+            "main.codex-tl-codex"
+        );
     }
 }

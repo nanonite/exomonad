@@ -17,6 +17,7 @@ use exomonad_core::{EffectError, EffectHandler, EffectResult, RuntimeBuilder};
 use prost::Message;
 use serde_json::{json, Value};
 use serial_test::serial;
+use std::collections::BTreeSet;
 
 // ============================================================================
 // Test Infrastructure
@@ -85,6 +86,37 @@ fn assert_tool_error(output: &Value, tool_name: &str) {
         output["success"], false,
         "{tool_name} should fail: {output:#}"
     );
+}
+
+async fn list_tool_names(runtime: &exomonad_core::Runtime, role: &str) -> BTreeSet<String> {
+    let tools: Vec<Value> = runtime
+        .plugin_manager()
+        .call("handle_list_tools", &json!({"role": role}))
+        .await
+        .unwrap_or_else(|e| panic!("handle_list_tools failed for {role}: {e}"));
+
+    tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn assert_tools_present(role: &str, names: &BTreeSet<String>, expected: &[&str]) {
+    for tool in expected {
+        assert!(
+            names.contains(*tool),
+            "{role} role missing tool '{tool}'. Got: {names:?}"
+        );
+    }
+}
+
+fn assert_tools_absent(role: &str, names: &BTreeSet<String>, forbidden: &[&str]) {
+    for tool in forbidden {
+        assert!(
+            !names.contains(*tool),
+            "{role} role should not expose tool '{tool}'. Got: {names:?}"
+        );
+    }
 }
 
 // ============================================================================
@@ -621,6 +653,183 @@ async fn wasm_worker_tools_include_notify_parent() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_reviewer_tools_include_review_commands() {
+    let runtime = build_test_runtime().await;
+
+    let tools: Vec<Value> = runtime
+        .plugin_manager()
+        .call("handle_list_tools", &json!({"role": "reviewer"}))
+        .await
+        .expect("handle_list_tools failed for reviewer");
+
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+
+    for expected in [
+        "approve_pr",
+        "request_changes",
+        "post_review_comment",
+        "notify_parent",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "Reviewer role missing tool '{expected}'. Got: {names:?}"
+        );
+    }
+
+    assert!(
+        !names.contains(&"fork_wave"),
+        "Reviewer should not have fork_wave"
+    );
+    assert!(
+        !names.contains(&"file_pr"),
+        "Reviewer should not have file_pr"
+    );
+    assert!(
+        !names.contains(&"merge_pr"),
+        "Reviewer should not have merge_pr"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_chainlink_tools_are_scoped_by_role() {
+    let runtime = build_test_runtime().await;
+
+    let all_chainlink_tools = [
+        "chainlink_issue_create",
+        "chainlink_session_start",
+        "chainlink_session_status",
+        "chainlink_issue_show",
+        "chainlink_issue_comment",
+        "chainlink_subissue_create",
+        "chainlink_session_work",
+        "chainlink_session_end",
+        "chainlink_issue_close",
+        "chainlink_subissue_close",
+        "chainlink_timer_start",
+        "chainlink_timer_stop",
+        "chainlink_timer_status",
+        "chainlink_issue_list",
+        "chainlink_issue_update",
+        "chainlink_issue_block",
+        "chainlink_issue_relate",
+        "chainlink_issue_cascade",
+        "chainlink_milestone_create",
+        "chainlink_milestone_list",
+    ];
+    let dropped_chainlink_tools = [
+        "chainlink_agent_init",
+        "chainlink_sync",
+        "chainlink_worker_status",
+    ];
+
+    let tl_tools = list_tool_names(&runtime, "tl").await;
+    assert_tools_present(
+        "tl",
+        &tl_tools,
+        &[
+            "chainlink_issue_create",
+            "chainlink_session_start",
+            "chainlink_session_status",
+            "chainlink_issue_show",
+            "chainlink_issue_comment",
+            "chainlink_subissue_create",
+            "chainlink_session_work",
+            "chainlink_session_end",
+            "chainlink_issue_close",
+            "chainlink_timer_start",
+            "chainlink_timer_stop",
+            "chainlink_timer_status",
+            "chainlink_issue_list",
+            "chainlink_issue_update",
+            "chainlink_issue_block",
+            "chainlink_issue_relate",
+            "chainlink_issue_cascade",
+            "chainlink_milestone_create",
+            "chainlink_milestone_list",
+        ],
+    );
+    assert_tools_absent("tl", &tl_tools, &dropped_chainlink_tools);
+
+    let dev_tools = list_tool_names(&runtime, "dev").await;
+    assert_tools_present(
+        "dev",
+        &dev_tools,
+        &[
+            "chainlink_session_start",
+            "chainlink_session_status",
+            "chainlink_issue_show",
+            "chainlink_issue_comment",
+            "chainlink_subissue_create",
+            "chainlink_session_work",
+            "chainlink_session_end",
+            "chainlink_subissue_close",
+        ],
+    );
+    assert_tools_absent("dev", &dev_tools, &dropped_chainlink_tools);
+    assert_tools_absent(
+        "dev",
+        &dev_tools,
+        &[
+            "chainlink_issue_create",
+            "chainlink_issue_close",
+            "chainlink_timer_start",
+            "chainlink_timer_stop",
+            "chainlink_timer_status",
+            "chainlink_issue_list",
+            "chainlink_issue_update",
+            "chainlink_issue_block",
+            "chainlink_issue_relate",
+            "chainlink_issue_cascade",
+            "chainlink_milestone_create",
+            "chainlink_milestone_list",
+        ],
+    );
+
+    let worker_tools = list_tool_names(&runtime, "worker").await;
+    assert_tools_present(
+        "worker",
+        &worker_tools,
+        &[
+            "chainlink_issue_show",
+            "chainlink_session_start",
+            "chainlink_issue_comment",
+            "chainlink_session_work",
+            "chainlink_session_end",
+        ],
+    );
+    assert_tools_absent(
+        "worker",
+        &worker_tools,
+        &[
+            "chainlink_issue_create",
+            "chainlink_session_status",
+            "chainlink_subissue_create",
+            "chainlink_subissue_close",
+            "chainlink_issue_close",
+            "chainlink_timer_start",
+            "chainlink_timer_stop",
+            "chainlink_timer_status",
+            "chainlink_issue_list",
+            "chainlink_issue_update",
+            "chainlink_issue_block",
+            "chainlink_issue_relate",
+            "chainlink_issue_cascade",
+            "chainlink_milestone_create",
+            "chainlink_milestone_list",
+        ],
+    );
+    assert_tools_absent("worker", &worker_tools, &dropped_chainlink_tools);
+
+    for role in ["root", "reviewer", "testrunner"] {
+        let names = list_tool_names(&runtime, role).await;
+        assert_tools_absent(role, &names, &all_chainlink_tools);
+        assert_tools_absent(role, &names, &dropped_chainlink_tools);
+    }
+}
+
 // ============================================================================
 // Tool Roundtrip Tests (multi-effect trampoline)
 // ============================================================================
@@ -1050,7 +1259,10 @@ async fn wasm_hook_pre_tool_use_blocks_gh_commands_for_dev() {
         .await
         .expect("PreToolUse hook failed");
 
-    assert_eq!(output["continue"], false, "gh command should be blocked: {output:#}");
+    assert_eq!(
+        output["continue"], false,
+        "gh command should be blocked: {output:#}"
+    );
     assert!(
         output["stopReason"]
             .as_str()
@@ -1059,9 +1271,73 @@ async fn wasm_hook_pre_tool_use_blocks_gh_commands_for_dev() {
         "gh command denial should explain the policy: {output:#}"
     );
     assert_eq!(
-        output["hookSpecificOutput"]["permissionDecision"],
-        "deny",
+        output["hookSpecificOutput"]["permissionDecision"], "deny",
         "gh command should return a deny permission decision: {output:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_pre_tool_use_blocks_chainlink_sqlite_for_all_agent_roles() {
+    let runtime = build_test_runtime().await;
+
+    for role in ["root", "tl", "dev", "worker", "reviewer"] {
+        let hook_input = json!({
+            "role": role,
+            "session_id": "test-session",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "bash",
+            "tool_input": {
+                "command": "sqlite3 .chainlink/issues.db 'select * from issues'"
+            }
+        });
+
+        let output: Value = runtime
+            .plugin_manager()
+            .call("handle_pre_tool_use", &hook_input)
+            .await
+            .unwrap_or_else(|e| panic!("PreToolUse hook failed for {role}: {e}"));
+
+        assert_eq!(
+            output["continue"], false,
+            "{role} should block direct Chainlink sqlite access: {output:#}"
+        );
+        assert!(
+            output["stopReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Do not access Chainlink sqlite databases directly"),
+            "{role} sqlite denial should explain the policy: {output:#}"
+        );
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{role} sqlite command should return a deny permission decision: {output:#}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_pre_tool_use_allows_chainlink_cli_commands() {
+    let runtime = build_test_runtime().await;
+
+    let hook_input = json!({
+        "role": "tl",
+        "session_id": "test-session",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "bash",
+        "tool_input": {"command": "chainlink issue list --json"}
+    });
+
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &hook_input)
+        .await
+        .expect("PreToolUse hook failed");
+
+    assert_eq!(
+        output["continue"], true,
+        "chainlink CLI command should be allowed: {output:#}"
     );
 }
 
@@ -1084,7 +1360,10 @@ async fn wasm_hook_pre_tool_use_allows_words_containing_gh() {
         .await
         .expect("PreToolUse hook failed");
 
-    assert_eq!(output["continue"], true, "non-gh command should be allowed: {output:#}");
+    assert_eq!(
+        output["continue"], true,
+        "non-gh command should be allowed: {output:#}"
+    );
 }
 
 // ============================================================================

@@ -211,7 +211,8 @@ main() {
         fi
     fi
 
-    wait_for "dev notify_parent message delivered" "grep -R 'CODEX-HOOKS-DEV-DONE' \"\$HOME/.claude/teams\" 2>/dev/null | grep -q ."
+    wait_for "dev notify_parent event recorded" "grep -R 'CODEX-HOOKS-DEV-DONE' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
+    wait_for "dev notify_parent tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'codex-hooks-dev-codex' | grep 'main.codex-hooks-tl-codex' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
 
     wait_for "local PR registry created" "[[ -f '$REPO_DIR/.exo/prs.json' ]] && grep -q 'codex-hooks' '$REPO_DIR/.exo/prs.json'"
 
@@ -224,9 +225,8 @@ main() {
         validate_codex_config "reviewer" "$reviewer_config" "reviewer" "$reviewer_agent" "ExoMonad Reviewer Agent Protocol"
     fi
 
-    wait_for "root Codex hook received" "grep -R '\\[hook\\] received' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'runtime=Codex' | grep 'agent=root' | grep -q ."
-    wait_for "dev Codex hook received" "grep -R '\\[hook\\] received' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'runtime=Codex' | grep 'agent=.*codex-hooks-dev' | grep -q ."
-    wait_for "reviewer Codex hook received" "grep -R '\\[hook\\] received' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'runtime=Codex' | grep 'agent=.*reviewer' | grep -q ."
+    wait_for "reviewer approval recorded" "[[ -f '$REPO_DIR/.exo/reviews/pr_1.json' ]] && grep -q 'approved' '$REPO_DIR/.exo/reviews/pr_1.json'"
+    wait_for "reviewer notify_parent tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'review-pr-1-codex' | grep 'main.codex-hooks-tl-codex' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
 
     {
         printf 'Codex hooks E2E validation completed at %s\n' "$(date -Iseconds)"

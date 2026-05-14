@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add TL-only Chainlink timer MCP lifecycle tracking (#196)
 - Block direct sqlite3 access to .chainlink/ in dev role permissionCascade (#162)
 - Add chainlink_issue_show and chainlink_issue_close to dev role (#161)
 - Use Codex MCP reviewer panes for reviewer agents (#160)
@@ -102,6 +103,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Codex: E2E test — messaging (#147)
 - Codex: documentation pass (#148)
 - Codex: Haskell WASM spawn_codex tool + hook handler (#145)
 - Codex: hook runtime dispatch (--runtime codex) (#144)

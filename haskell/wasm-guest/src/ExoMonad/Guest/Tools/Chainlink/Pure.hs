@@ -3,6 +3,12 @@ module ExoMonad.Guest.Tools.Chainlink.Pure
     ChainlinkIssueCreateArgs (..),
     buildCreateArgs,
 
+    -- * Session Start
+    buildSessionStartArgs,
+
+    -- * Session Status
+    buildSessionStatusArgs,
+
     -- * Issue Show
     ChainlinkIssueShowOutput (..),
     buildShowArgs,
@@ -27,7 +33,12 @@ module ExoMonad.Guest.Tools.Chainlink.Pure
     -- * Issue Close
     ChainlinkIssueCloseArgs (..),
     buildCloseArgs,
-    buildLocksReleaseArgs,
+
+    -- * Timer
+    ChainlinkTimerStartArgs (..),
+    buildTimerStartArgs,
+    buildTimerStopArgs,
+    buildTimerStatusArgs,
 
     -- * Issue List
     ChainlinkIssueListArgs (..),
@@ -57,23 +68,6 @@ module ExoMonad.Guest.Tools.Chainlink.Pure
     buildMilestoneListArgs,
     ChainlinkMilestoneListItem (..),
 
-    -- * Sync
-    buildSyncArgs,
-
-    -- * Locks List
-    buildLocksListArgs,
-    LocksListEntry (..),
-    hasActiveLocks,
-
-    -- * Worker Status
-    buildWorkerStatusIssueListArgs,
-    buildWorkerStatusLocksListArgs,
-    buildWorkerStatusUsageArgs,
-    UsageRecord (..),
-    WorkerStatusEntry (..),
-    parseGitDiffStat,
-    correlateWorkerStatus,
-
     -- * Worker Protocol Text
     chainlinkWorkerProtocolText,
 
@@ -82,12 +76,10 @@ module ExoMonad.Guest.Tools.Chainlink.Pure
   )
 where
 
-import Data.Aeson (FromJSON (..), ToJSON (..), Value (Object), object, withObject, (.!=), (.:), (.:?), (.=))
-import Data.Aeson qualified as Aeson
-import Data.Maybe (catMaybes, mapMaybe)
+import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.!=), (.:), (.:?), (.=))
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding (encodeUtf8)
 import GHC.Generics (Generic)
 
 data ChainlinkIssueCreateArgs = ChainlinkIssueCreateArgs
@@ -165,6 +157,11 @@ data ChainlinkSessionEndArgs = ChainlinkSessionEndArgs
 data ChainlinkIssueCloseArgs = ChainlinkIssueCloseArgs
   { cisIssueId :: Int,
     cisSummary :: Maybe Text
+  }
+  deriving (Generic, Show)
+
+data ChainlinkTimerStartArgs = ChainlinkTimerStartArgs
+  { ctsIssueId :: Int
   }
   deriving (Generic, Show)
 
@@ -274,7 +271,93 @@ instance ToJSON ChainlinkMilestoneListItem where
 -- | Chainlink worker protocol text, injected into worker prompts.
 -- Defined here so it's testable natively (wasm-guest-pure builds on any arch).
 chainlinkWorkerProtocolText :: Text
-chainlinkWorkerProtocolText = "# Chainlink Worker Protocol\n\nYou are a worker enhanced with chainlink for structured task tracking and completion.\n\nChainlink is your contract with your parent TL. Claim the issue, do the work, report progress, close atomically.\n\n## Worker Chainlink Workflow\n\n### 1. Claim Your Issue\n\nImmediately on spawn, claim the chainlink issue that was assigned to you:\n\n```\nchainlink agent init <issue-id>     # Link this agent session to the issue\nchainlink session start             # Start timing\nchainlink_issue_claim               # Mark issue as claimed (prevents double-work)\n```\n\nThe issue ID should be embedded in your task description from the TL.\n\n### 2. Read the Spec\n\nRead the full issue spec before doing any work:\n\n```\nchainlink_issue_show\n```\n\nThis returns the issue description, acceptance criteria, dependencies, and any comments from the TL.\n\n### 3. Do the Work\n\n- Stay within the files listed in the issue spec\n- Use `chainlink issue comment <text>` to post progress updates after meaningful milestones\n- If blocked, do NOT silently stall \x2014 use `chainlink issue update <id> -s blocked` and `notify_parent(\"BLOCKED: <reason>\")`\n- If scope creep appears, file a `chainlink subissue <parent-id> \"New scope\"` and notify the parent\n\n### 4. Close Atomically (Single MCP Call)\n\nWhen the work is complete, call the **single atomic close tool**:\n\n```\nchainlink_issue_close issue_id=<id> summary=\"<what was done>\"\n```\n\nThe `chainlink_issue_close` tool atomically runs the full close sequence internally: release locks \x2192 close issue \x2192 end session \x2192 notify parent. If any step fails, the sequence stops and the issue remains open (safe to retry).\n\n**NEVER use `chainlink close` from the CLI.** Only use the `chainlink_issue_close` MCP tool. The CLI version bypasses the atomic sequence and leaves dangling locks + no notification.\n\n## Stuck-Escalation Path\n\nIf you are stuck (blocked, confused, or the spec is ambiguous):\n\n1. `chainlink issue update <id> -s blocked`\n2. `notify_parent(\"BLOCKED: <specific reason>\")`\n3. If no response within a reasonable time, `send_message` to the TL's team channel\n\nDo not guess. Do not implement past the ambiguity. Report exactly what is unclear.\n\n## Scope-Creep Path\n\nIf the task grows beyond the original issue spec (TL adds extra requests, or you discover prerequisite work):\n\n1. File a new sub-issue: `chainlink subissue <parent-id> \"New scope description\"`\n2. `notify_parent(\"SCOPE: Created subissue #<new-id> for <description>\")`\n3. Continue on the original issue unless redirected\n\n## Available MCP Tools\n\n| Tool | Purpose |\n|------|---------|\n| `chainlink_issue_claim` | Claim an issue (prevents double-work) |\n| `chainlink_issue_show` | Read full issue spec including description and comments |\n| `chainlink_issue_close` | Close the issue with atomic 4-step sequence |\n| `chainlink_issue_comment` | Post a progress comment on the issue |\n| `chainlink_issue_update` | Update issue status (blocked, in_progress, etc.) |\n| `chainlink_subissue_create` | Create a child issue for scope creep |\n| `chainlink_locks_release` | Release claimed locks |\n| `chainlink_locks_status` | Check what locks you hold |\n| `chainlink_timer_start` | Start a timer for time tracking |\n| `chainlink_timer_show` | Show current timer state |\n| `chainlink_session_end` | End session with optional handoff notes |\n| `notify_parent` | Report results or issues to parent TL |\n| `send_message` | Send messages to TL's team channel |\n\n## Hard Rules\n\n- Claim the issue first thing on spawn \x2014 never start work without claiming\n- Never use `chainlink close` CLI \x2014 always use `chainlink_issue_close` MCP\n- Always complete the 4-step atomic sequence (locks \x2192 close \x2192 session end \x2192 notify)\n- Never create branches or commit unless explicitly instructed\n- If blocked, report immediately \x2014 never wait more than 2 minutes before escalating\n- If scope creep appears, file a subissue \x2014 do not absorb extra work silently"
+chainlinkWorkerProtocolText =
+  T.unlines
+    [ "# Chainlink Worker Protocol",
+      "",
+      "You are a worker enhanced with chainlink for structured task tracking and completion.",
+      "",
+      "Chainlink is your contract with your parent TL. Start a session, mark the assigned issue as active work, report progress, and end the session with handoff notes.",
+      "",
+      "## Worker Chainlink Workflow",
+      "",
+      "### 1. Start Your Session",
+      "",
+      "Immediately on spawn, start a session and mark the assigned issue as active work:",
+      "",
+      "```",
+      "chainlink_session_start",
+      "chainlink_session_work issue_id=<assigned issue id>",
+      "```",
+      "",
+      "The issue ID should be embedded in your task description from the TL.",
+      "",
+      "### 2. Read the Spec",
+      "",
+      "Read the full issue spec before doing any work:",
+      "",
+      "```",
+      "chainlink_issue_show issue_id=<assigned issue id>",
+      "```",
+      "",
+      "This returns the issue title, status, priority, labels, and any supported issue metadata.",
+      "",
+      "### 3. Do the Work",
+      "",
+      "- Stay within the files listed in the issue spec.",
+      "- Use `chainlink_issue_comment` to post progress updates after meaningful milestones.",
+      "- If blocked, do not silently stall. Use `chainlink_issue_comment` to record the blocker and `notify_parent` with `BLOCKED: <reason>`.",
+      "- If scope creep appears, notify the parent.",
+      "",
+      "### 4. End The Session",
+      "",
+      "When the work is complete, end the session with handoff notes and notify the parent:",
+      "",
+      "```",
+      "chainlink_session_end notes=\"<what was done>\"",
+      "notify_parent status=success message=\"<assigned issue id> ready for parent close\"",
+      "```",
+      "",
+      "Do not close your assigned issue. Close authority belongs to the parent coordinator after review.",
+      "",
+      "## Stuck-Escalation Path",
+      "",
+      "If you are stuck, blocked, confused, or the spec is ambiguous:",
+      "",
+      "1. `chainlink_issue_comment issue_id=<id> message=\"BLOCKED: <specific reason>\"`",
+      "2. `notify_parent` with `BLOCKED: <specific reason>`",
+      "3. If direct coordination is required, use `send_message` to the TL.",
+      "",
+      "Do not implement past ambiguity. Report exactly what is unclear.",
+      "",
+      "## Scope-Creep Path",
+      "",
+      "If the task grows beyond the original issue spec:",
+      "",
+      "1. File a new subissue with `chainlink_subissue_create`.",
+      "2. `notify_parent` with `SCOPE: Created subissue #<new-id> for <description>`.",
+      "3. Continue on the original issue unless redirected.",
+      "",
+      "## Available MCP Tools",
+      "",
+      "| Tool | Purpose |",
+      "|------|---------|",
+      "| `chainlink_session_start` | Start a chainlink work session |",
+      "| `chainlink_session_work` | Mark an issue as the active work item |",
+      "| `chainlink_issue_show` | Read issue details |",
+      "| `chainlink_issue_comment` | Post a progress comment on the issue |",
+      "| `chainlink_session_end` | End session with optional handoff notes |",
+      "| `notify_parent` | Report results or issues to parent TL |",
+      "| `send_message` | Send messages to the TL when coordination is needed |",
+      "",
+      "## Hard Rules",
+      "",
+      "- Start a session before marking work active.",
+      "- Never close your assigned issue; end the session with handoff notes for the parent coordinator.",
+      "- Never create branches or commit unless explicitly instructed.",
+      "- If blocked, report immediately.",
+      "- If scope creep appears, report it; do not absorb extra work silently."
+    ]
 
 parseIssueId :: Text -> Maybe Int
 parseIssueId output =
@@ -294,6 +377,12 @@ buildCreateArgs args =
     ++ case cicaLabels args of
       Just labels -> concatMap (\l -> ["-l", T.unpack l]) labels
       Nothing -> []
+
+buildSessionStartArgs :: [String]
+buildSessionStartArgs = ["session", "start"]
+
+buildSessionStatusArgs :: [String]
+buildSessionStatusArgs = ["session", "status", "--json"]
 
 buildShowArgs :: Int -> [String]
 buildShowArgs issueId = ["issue", "show", show issueId, "--json"]
@@ -325,146 +414,14 @@ buildSessionEndArgs args =
 buildCloseArgs :: ChainlinkIssueCloseArgs -> [String]
 buildCloseArgs args = ["close", show (cisIssueId args), "-q"]
 
-buildLocksReleaseArgs :: ChainlinkIssueCloseArgs -> [String]
-buildLocksReleaseArgs args = ["locks", "release", show (cisIssueId args)]
+buildTimerStartArgs :: ChainlinkTimerStartArgs -> [String]
+buildTimerStartArgs args = ["timer", "start", show (ctsIssueId args)]
 
-buildLocksListArgs :: [String]
-buildLocksListArgs = ["locks", "list", "--json"]
+buildTimerStopArgs :: [String]
+buildTimerStopArgs = ["timer", "stop"]
 
-data LocksListEntry = LocksListEntry
-  { lleId :: Int,
-    lleIssueId :: Maybe Int
-  }
-  deriving (Generic, Show, Eq)
-
-instance FromJSON LocksListEntry where
-  parseJSON = withObject "LocksListEntry" $ \v ->
-    LocksListEntry
-      <$> v .: "id"
-      <*> v .:? "issue_id"
-
-instance ToJSON LocksListEntry where
-  toJSON o =
-    object
-      [ "id" .= lleId o,
-        "issue_id" .= lleIssueId o
-      ]
-
--- | Parse locks list JSON and return True if any locks are held.
-hasActiveLocks :: Text -> Bool
-hasActiveLocks json =
-  case Aeson.eitherDecodeStrict (encodeUtf8 json) of
-    Right [] -> False
-    Right (_ :: [LocksListEntry]) -> True
-    Left _err -> False
-
-----------------------------------------------------------------------
--- Worker Status
-----------------------------------------------------------------------
-
-buildWorkerStatusIssueListArgs :: [String]
-buildWorkerStatusIssueListArgs = ["issue", "list", "--json", "--status", "open"]
-
-buildWorkerStatusLocksListArgs :: [String]
-buildWorkerStatusLocksListArgs = ["locks", "list", "--json"]
-
-buildWorkerStatusUsageArgs :: [String]
-buildWorkerStatusUsageArgs = ["usage", "list", "--json"]
-
-data UsageRecord = UsageRecord
-  { urIssueId :: Maybe Int,
-    urInputTokens :: Maybe Int,
-    urOutputTokens :: Maybe Int,
-    urEstimatedCostUsd :: Maybe Double
-  }
-  deriving (Generic, Show, Eq)
-
-instance FromJSON UsageRecord where
-  parseJSON = withObject "UsageRecord" $ \v ->
-    UsageRecord
-      <$> v .:? "issue_id"
-      <*> v .:? "input_tokens"
-      <*> v .:? "output_tokens"
-      <*> v .:? "estimated_cost_usd"
-
-instance ToJSON UsageRecord where
-  toJSON o =
-    object
-      [ "issue_id" .= urIssueId o,
-        "input_tokens" .= urInputTokens o,
-        "output_tokens" .= urOutputTokens o,
-        "estimated_cost_usd" .= urEstimatedCostUsd o
-      ]
-
-data WorkerStatusEntry = WorkerStatusEntry
-  { wseAgentId :: Maybe Text,
-    wseIssueId :: Int,
-    wseIssueTitle :: Text,
-    wseLockHeldMinutes :: Maybe Double,
-    wseInputTokens :: Maybe Int,
-    wseOutputTokens :: Maybe Int,
-    wseEstimatedCostUsd :: Maybe Double,
-    wseUncommittedFiles :: [Text]
-  }
-  deriving (Generic, Show, Eq)
-
-instance FromJSON WorkerStatusEntry where
-  parseJSON = withObject "WorkerStatusEntry" $ \v ->
-    WorkerStatusEntry
-      <$> v .:? "agent_id"
-      <*> v .: "issue_id"
-      <*> v .: "issue_title"
-      <*> v .:? "lock_held_minutes"
-      <*> v .:? "input_tokens"
-      <*> v .:? "output_tokens"
-      <*> v .:? "estimated_cost_usd"
-      <*> v .:? "uncommitted_files" .!= []
-
-instance ToJSON WorkerStatusEntry where
-  toJSON o =
-    object
-      [ "agent_id" .= wseAgentId o,
-        "issue_id" .= wseIssueId o,
-        "issue_title" .= wseIssueTitle o,
-        "lock_held_minutes" .= wseLockHeldMinutes o,
-        "input_tokens" .= wseInputTokens o,
-        "output_tokens" .= wseOutputTokens o,
-        "estimated_cost_usd" .= wseEstimatedCostUsd o,
-        "uncommitted_files" .= wseUncommittedFiles o
-      ]
-
--- | Parse git diff --stat output into file path strings.
--- Each content line has the form "  path/to/file.ext | N +/-".
--- We extract the path by taking everything before the pipe character.
-parseGitDiffStat :: Text -> [Text]
-parseGitDiffStat output =
-  [ T.strip $ T.takeWhile (/= '|') line
-  | line <- T.lines output,
-    "|" `T.isInfixOf` line,
-    not (T.null $ T.strip line)
-  ]
-
--- | Correlate open issues, locks, usage records, and git diff stat into worker status entries.
--- Each open issue produces one entry, enriched with matching lock and usage data.
--- Costs come directly from chainlink usage records (CLI-reported), not calculated from tokens.
-correlateWorkerStatus :: [ChainlinkIssueListItem] -> [LocksListEntry] -> [UsageRecord] -> [Text] -> [WorkerStatusEntry]
-correlateWorkerStatus issues locks usage uncommittedFiles =
-  [ WorkerStatusEntry
-      { wseAgentId = Nothing,
-        wseIssueId = ciliId issue,
-        wseIssueTitle = ciliTitle issue,
-        wseLockHeldMinutes = if any (\l -> lleIssueId l == Just (ciliId issue)) locks then Just 0 else Nothing,
-        wseInputTokens = totalInput,
-        wseOutputTokens = totalOutput,
-        wseEstimatedCostUsd = totalCost,
-        wseUncommittedFiles = uncommittedFiles
-      }
-  | issue <- issues,
-    let issueUsage = filter (\u -> urIssueId u == Just (ciliId issue)) usage,
-    let totalInput = case catMaybes (map urInputTokens issueUsage) of [] -> Nothing; xs -> Just (sum xs),
-    let totalOutput = case catMaybes (map urOutputTokens issueUsage) of [] -> Nothing; xs -> Just (sum xs),
-    let totalCost = case catMaybes (map urEstimatedCostUsd issueUsage) of [] -> Nothing; xs -> Just (sum xs)
-  ]
+buildTimerStatusArgs :: [String]
+buildTimerStatusArgs = ["timer", "show"]
 
 buildListArgs :: ChainlinkIssueListArgs -> [String]
 buildListArgs args =
@@ -517,6 +474,3 @@ buildMilestoneCreateArgs args =
 
 buildMilestoneListArgs :: [String]
 buildMilestoneListArgs = ["milestone", "list", "--json"]
-
-buildSyncArgs :: [String]
-buildSyncArgs = ["sync"]

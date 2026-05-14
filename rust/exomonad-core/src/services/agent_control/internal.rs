@@ -390,7 +390,7 @@ impl<
                     })
                     .unwrap_or_default();
                 format!(
-                    "codex exec --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
+                    "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
                     escaped_dir, model_flag, prompt
                 )
             }
@@ -692,6 +692,7 @@ impl<
 
         let instructions = match role.as_str() {
             "tl" | "root" => super::spawn::CODEX_TL_INSTRUCTIONS,
+            "worker" => super::spawn::CODEX_WORKER_INSTRUCTIONS,
             "reviewer" => super::spawn::CODEX_REVIEWER_INSTRUCTIONS,
             _ => super::spawn::CODEX_DEV_INSTRUCTIONS,
         };
@@ -701,6 +702,7 @@ impl<
             instructions,
             model,
             extra_mcp_servers,
+            &codex_dir.join("hooks.json"),
         );
 
         fs::write(codex_dir.join("config.toml"), config).await?;
@@ -1211,6 +1213,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_codex_worker_config_uses_worker_instructions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let services = test_services(project_dir.clone());
+        let service = AgentControlService::new(services);
+        let agent_dir = project_dir.join("worker-agent");
+
+        service
+            .write_codex_config_files(
+                &agent_dir,
+                &crate::domain::Role::worker(),
+                &AgentName::from("worker-agent"),
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let config = tokio::fs::read_to_string(agent_dir.join(".codex/config.toml"))
+            .await
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+        let instructions = parsed["developer_instructions"]
+            .as_str()
+            .expect("developer instructions are rendered");
+
+        assert!(instructions.contains("# ExoMonad Worker Agent Protocol"));
+        assert!(instructions.contains("chainlink_session_work"));
+        assert!(instructions.contains("chainlink_session_end"));
+        assert!(!instructions.contains("chainlink_issue_close"));
+        assert!(!instructions.contains("chainlink_agent_init"));
+        assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
+    }
+
+    #[tokio::test]
     async fn test_create_socket_symlink() {
         let temp_dir = tempfile::tempdir().unwrap();
         let project_dir = temp_dir.path().to_path_buf();
@@ -1400,7 +1437,7 @@ mod tests {
 
         assert_eq!(
             cmd,
-            "codex exec --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' --model gpt-5.2 \"$(cat '/tmp/test-prompt.txt')\""
+            "codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' --model gpt-5.2 \"$(cat '/tmp/test-prompt.txt')\""
         );
     }
 
@@ -1440,7 +1477,7 @@ mod tests {
 
         assert_eq!(
             cmd,
-            "EXOMONAD_AGENT_ID=worker-1-codex codex exec --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' \"$(cat '/tmp/test-prompt.txt')\""
+            "EXOMONAD_AGENT_ID=worker-1-codex codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' \"$(cat '/tmp/test-prompt.txt')\""
         );
     }
 }

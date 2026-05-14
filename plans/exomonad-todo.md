@@ -51,6 +51,6 @@ Moved from top-level `ExoMonad.Chainlink.Pure` to `ExoMonad.Guest.Tools.Chainlin
 - [ ] E2E test for OpenCode worker `notify_parent` delivery
 - [ ] E2E test for autonomous TL loop (chainlink issue → worker → notify_parent → merge_pr → cleanup)
 - [ ] Worker chainlink protocol injection into opencode worker prompt (currently only in workerProfileText for Gemini)
-- [ ] TL observability: `chainlink_worker_status` integration with autonomous dispatch loop
+- [ ] TL observability: `chainlink_session_status` integration with autonomous dispatch loop
 - [ ] Rate-limiting / max parallel workers in autonomous mode
 - [ ] Session persistence across server restarts for in-flight waves

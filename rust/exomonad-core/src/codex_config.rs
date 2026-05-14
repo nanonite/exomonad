@@ -1,5 +1,7 @@
 use serde_json::Value;
+use sha2::Digest;
 use std::collections::HashMap;
+use std::path::Path;
 
 pub const CODEX_HOOKS_JSON: &str = r#"{
   "hooks": {
@@ -46,6 +48,7 @@ developer_instructions = """
 [features]
 hooks = true
 
+{hook_state}
 {mcp_servers}
 "#;
 
@@ -55,6 +58,7 @@ pub fn render_codex_config(
     instructions: &str,
     model: Option<&str>,
     extra_mcp_servers: &HashMap<String, Value>,
+    hooks_json_path: &Path,
 ) -> String {
     let mut mcp_servers = toml::map::Map::new();
     mcp_servers.insert(
@@ -82,7 +86,103 @@ pub fn render_codex_config(
             "{instructions}",
             &escape_multiline_basic_string(instructions),
         )
+        .replace(
+            "{hook_state}",
+            &codex_generated_hook_state_toml(hooks_json_path),
+        )
         .replace("{mcp_servers}", &mcp_servers_to_toml(&mcp_servers))
+}
+
+fn codex_generated_hook_state_toml(hooks_json_path: &Path) -> String {
+    let source = hooks_json_path.display().to_string();
+    let hooks = [
+        (
+            "pre_tool_use",
+            Some("*"),
+            "exomonad hook pre-tool-use --runtime codex",
+        ),
+        (
+            "post_tool_use",
+            Some("*"),
+            "exomonad hook post-tool-use --runtime codex",
+        ),
+        ("stop", None, "exomonad hook stop --runtime codex"),
+    ];
+
+    let mut state = String::new();
+    for (index, (event_key, matcher, command)) in hooks.into_iter().enumerate() {
+        let key = format!("{source}:{event_key}:0:0");
+        let hash = generated_command_hook_hash(event_key, matcher, command);
+        if index > 0 {
+            state.push('\n');
+        }
+        state.push_str(&format!(
+            "[hooks.state.\"{}\"]\ntrusted_hash = \"{}\"\n",
+            escape_toml_quoted_key(&key),
+            hash
+        ));
+    }
+    state.push('\n');
+    state
+}
+
+fn generated_command_hook_hash(event_name: &str, matcher: Option<&str>, command: &str) -> String {
+    let mut handler = serde_json::Map::new();
+    handler.insert("type".to_string(), Value::String("command".to_string()));
+    handler.insert("command".to_string(), Value::String(command.to_string()));
+    handler.insert("timeout".to_string(), Value::Number(600.into()));
+    handler.insert("async".to_string(), Value::Bool(false));
+
+    let mut group = serde_json::Map::new();
+    if let Some(matcher) = matcher {
+        group.insert("matcher".to_string(), Value::String(matcher.to_string()));
+    }
+    group.insert(
+        "hooks".to_string(),
+        Value::Array(vec![Value::Object(handler)]),
+    );
+
+    let mut identity = serde_json::Map::new();
+    identity.insert(
+        "event_name".to_string(),
+        Value::String(event_name.to_string()),
+    );
+    identity.insert("group".to_string(), Value::Object(group));
+
+    version_for_json(&Value::Object(identity))
+}
+
+fn version_for_json(value: &Value) -> String {
+    let canonical = canonical_json(value);
+    let serialized = serde_json::to_vec(&canonical).expect("canonical JSON should serialize");
+    let hash = sha2::Sha256::digest(serialized);
+    let hex = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hex}")
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = map.get(key) {
+                    sorted.insert(key.clone(), canonical_json(value));
+                }
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        other => other.clone(),
+    }
+}
+
+fn escape_toml_quoted_key(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn model_config_toml(model: Option<&str>) -> String {
@@ -192,6 +292,7 @@ mod tests {
             "Use ExoMonad tools.",
             None,
             &HashMap::new(),
+            Path::new("/tmp/repo/.codex/hooks.json"),
         );
 
         assert!(config.contains("approval_policy = \"never\""));
@@ -230,7 +331,14 @@ mod tests {
             }),
         );
 
-        let config = render_codex_config("agent", "tl", "Plan.", None, &extra);
+        let config = render_codex_config(
+            "agent",
+            "tl",
+            "Plan.",
+            None,
+            &extra,
+            Path::new("/tmp/repo/.codex/hooks.json"),
+        );
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
         let docs = &parsed["mcp_servers"]["docs"];
@@ -254,6 +362,7 @@ mod tests {
             "Use ExoMonad tools.",
             Some("gpt-5.2"),
             &HashMap::new(),
+            Path::new("/tmp/repo/.codex/hooks.json"),
         );
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
@@ -269,9 +378,35 @@ mod tests {
             "Use ExoMonad tools.",
             None,
             &HashMap::new(),
+            Path::new("/tmp/repo/.codex/hooks.json"),
         );
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
         assert!(parsed.get("model").is_none());
+    }
+
+    #[test]
+    fn renders_trusted_state_for_generated_hooks() {
+        let config = render_codex_config(
+            "worker-1-codex",
+            "dev",
+            "Use ExoMonad tools.",
+            None,
+            &HashMap::new(),
+            Path::new("/tmp/repo/.codex/hooks.json"),
+        );
+
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+        let state = parsed["hooks"]["state"]
+            .as_table()
+            .expect("hook state table");
+        for key in [
+            "/tmp/repo/.codex/hooks.json:pre_tool_use:0:0",
+            "/tmp/repo/.codex/hooks.json:post_tool_use:0:0",
+            "/tmp/repo/.codex/hooks.json:stop:0:0",
+        ] {
+            let trusted_hash = state[key]["trusted_hash"].as_str().expect("trusted hash");
+            assert!(trusted_hash.starts_with("sha256:"));
+        }
     }
 }

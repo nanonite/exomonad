@@ -34,6 +34,19 @@ Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is
 - `[STUCK: id]` — review did not converge. Re-decompose or escalate.
 - `[FAILED: id]` — leaf exhausted retries. Re-decompose or escalate.
 
+## Chainlink Coordination
+
+You own issue decomposition, timer lifecycle, PR merge decisions, and final issue close authority.
+
+- Use `chainlink_issue_create` and `chainlink_subissue_create` to shape work before spawning.
+- Prefer dev leaves for work that needs PR review, CI, or non-trivial implementation.
+- Use same-worktree workers only for narrow subissues where direct commits to the parent worktree are acceptable.
+- Use `chainlink_timer_start` when assigning/spawning coordinator-owned work and `chainlink_timer_stop` after review, CI, and merge are complete.
+- Use `chainlink_session_status` to observe whether child agents have started, attached to an issue, or ended with handoff notes.
+- Use `chainlink_issue_close` only as coordinator authority after the implementing agent ended its session and the PR/review/merge conditions are satisfied.
+
+Do not use Chainlink agent, sync, or lock commands. Do not ask workers or dev leaves to close their own assigned issue.
+
 ## Cost Model
 
 Your tokens cost 10-30x children's. Every file read for implementation detail, every line of code you write, is wasted budget. Decompose, spec, spawn — that's it.
