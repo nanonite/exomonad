@@ -177,6 +177,16 @@ validate_codex_config() {
         || record_failure "$label hooks missing PostToolUse command"
     contains "$hooks_file" 'exomonad hook stop --runtime codex' \
         || record_failure "$label hooks missing Stop command"
+    contains "$hooks_file" '"timeout": 600' \
+        || record_failure "$label hooks missing explicit timeout for trust hash stability"
+    contains "$hooks_file" '"async": false' \
+        || record_failure "$label hooks missing explicit async=false for trust hash stability"
+    contains "$config" ':pre_tool_use:0:0"]' \
+        || record_failure "$label config missing trusted PreToolUse hook state"
+    contains "$config" ':post_tool_use:0:0"]' \
+        || record_failure "$label config missing trusted PostToolUse hook state"
+    contains "$config" ':stop:0:0"]' \
+        || record_failure "$label config missing trusted Stop hook state"
 }
 
 main() {

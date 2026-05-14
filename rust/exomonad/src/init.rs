@@ -1373,11 +1373,14 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
     }
 
     // Step 3: seed spindle.db repos table.
+    let knot_sql = escape_sql_string(&knot_hostname);
+    let owner_sql = escape_sql_string(owner_did);
+    let repo_sql = escape_sql_string(&repo_name);
     let sql = format!(
         "INSERT OR IGNORE INTO repos (knot, owner, name) VALUES ('{knot}', '{did}', '{name}');",
-        knot = knot_hostname,
-        did = owner_did,
-        name = repo_name
+        knot = knot_sql,
+        did = owner_sql,
+        name = repo_sql
     );
     let out = std::process::Command::new("sqlite3")
         .args([spindle_db, &sql])
@@ -1397,7 +1400,52 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
         }
     }
 
-    // Step 4: set git remote 'tangled' (idempotent).
+    // Step 4: verify spindle.db contains the repo row before spindle starts.
+    let verify_sql = format!(
+        "SELECT COUNT(*) FROM repos WHERE knot = '{knot}' AND owner = '{did}' AND name = '{name}';",
+        knot = knot_sql,
+        did = owner_sql,
+        name = repo_sql
+    );
+    let out = std::process::Command::new("sqlite3")
+        .args([spindle_db, &verify_sql])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let count = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if count == "0" {
+                warn!(
+                    spindle_db,
+                    repo_name,
+                    knot = %knot_hostname,
+                    owner_did,
+                    repo_found = false,
+                    "Spindle: repo entry verification failed"
+                );
+            } else {
+                info!(
+                    spindle_db,
+                    repo_name,
+                    knot = %knot_hostname,
+                    owner_did,
+                    repo_found = true,
+                    row_count = %count,
+                    "Spindle: repo entry verified"
+                );
+            }
+        }
+        Ok(o) => {
+            warn!(
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Spindle: repo verification sqlite3 returned non-zero"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "Spindle: sqlite3 verification failed — is sqlite3 installed?");
+        }
+    }
+
+    // Step 5: set git remote 'tangled' (idempotent).
     let ssh_url = format!("git@local-tangled:repositories/owner/{}.git", repo_name);
     // Remove stale remote first (ignore errors), then add fresh.
     let _ = std::process::Command::new("git")
@@ -1422,6 +1470,10 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
             warn!(error = %e, "git remote add tangled failed");
         }
     }
+}
+
+fn escape_sql_string(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
@@ -1764,6 +1816,11 @@ mod tests {
         assert!(companion
             .command
             .contains("SPINDLE_SERVER_DB_PATH=/data/spindle.db"));
+    }
+
+    #[test]
+    fn sql_string_escape_doubles_quotes() {
+        assert_eq!(escape_sql_string("owner's repo"), "owner''s repo");
     }
 
     #[test]

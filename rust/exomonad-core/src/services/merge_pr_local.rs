@@ -6,7 +6,7 @@
 
 use crate::domain::{AgentName, BranchName, CIStatus, MergeStrategy, PRNumber};
 use crate::services::file_pr_local::{
-    read_pr_registry, resolve_push_remote, write_pr_registry, PrState,
+    read_pr_registry, resolve_push_remote, write_pr_registry, PrRegistry, PrState,
 };
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::merge_pr::MergePROutput;
@@ -226,13 +226,20 @@ pub async fn merge_pr_local(
 
     // Gate checks (fail early)
     if let Err(e) = check_merge_gates(&pr, merger_agent, policy, None, ci_status) {
-        warn!("Merge gate failed: {}", e);
+        let blocked_on_ci = matches!(e, MergeGateError::CiNotPassed { .. });
+        if blocked_on_ci {
+            set_merge_blocked_on_ci(&prs_path, pr_number.as_u64(), true).await?;
+        }
+        warn!(blocked_on_ci, "Merge gate failed: {}", e);
         return Ok(MergePROutput {
             success: false,
             message: e.to_string(),
             git_fetched: false,
             branch_name: BranchName::from(head_branch.as_str()),
         });
+    }
+    if pr.merge_blocked_on_ci {
+        set_merge_blocked_on_ci(&prs_path, pr_number.as_u64(), false).await?;
     }
 
     // --- Local git merge ---
@@ -324,6 +331,20 @@ pub async fn merge_pr_local(
     })
 }
 
+async fn set_merge_blocked_on_ci(prs_path: &Path, pr_number: u64, blocked: bool) -> Result<()> {
+    let mut registry: PrRegistry = read_pr_registry(prs_path).await?;
+    if let Some(pr) = registry.prs.get_mut(&pr_number) {
+        pr.merge_blocked_on_ci = blocked;
+        write_pr_registry(prs_path, &registry).await?;
+        info!(
+            pr_number,
+            merge_blocked_on_ci = blocked,
+            "Updated local PR CI merge-blocked state"
+        );
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -353,6 +374,7 @@ mod tests {
             rounds: 0,
             stuck: false,
             needs_human_review: false,
+            merge_blocked_on_ci: false,
         }
     }
 

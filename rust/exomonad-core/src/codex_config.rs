@@ -11,7 +11,9 @@ pub const CODEX_HOOKS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "exomonad hook pre-tool-use --runtime codex"
+            "command": "exomonad hook pre-tool-use --runtime codex",
+            "timeout": 600,
+            "async": false
           }
         ]
       }
@@ -22,7 +24,9 @@ pub const CODEX_HOOKS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "exomonad hook post-tool-use --runtime codex"
+            "command": "exomonad hook post-tool-use --runtime codex",
+            "timeout": 600,
+            "async": false
           }
         ]
       }
@@ -32,7 +36,9 @@ pub const CODEX_HOOKS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "exomonad hook stop --runtime codex"
+            "command": "exomonad hook stop --runtime codex",
+            "timeout": 600,
+            "async": false
           }
         ]
       }
@@ -407,6 +413,46 @@ mod tests {
         ] {
             let trusted_hash = state[key]["trusted_hash"].as_str().expect("trusted hash");
             assert!(trusted_hash.starts_with("sha256:"));
+        }
+    }
+
+    #[test]
+    fn trusted_hook_hashes_match_generated_hooks_json() {
+        let hooks: Value = serde_json::from_str(CODEX_HOOKS_JSON).expect("valid hooks json");
+        let hooks = hooks["hooks"].as_object().expect("hooks object");
+
+        for (codex_name, event_key) in [
+            ("PreToolUse", "pre_tool_use"),
+            ("PostToolUse", "post_tool_use"),
+            ("Stop", "stop"),
+        ] {
+            let group = hooks[codex_name][0].clone();
+            let mut identity = serde_json::Map::new();
+            identity.insert(
+                "event_name".to_string(),
+                Value::String(event_key.to_string()),
+            );
+            identity.insert("group".to_string(), group);
+
+            let actual = version_for_json(&Value::Object(identity));
+            let expected = match event_key {
+                "pre_tool_use" => generated_command_hook_hash(
+                    "pre_tool_use",
+                    Some("*"),
+                    "exomonad hook pre-tool-use --runtime codex",
+                ),
+                "post_tool_use" => generated_command_hook_hash(
+                    "post_tool_use",
+                    Some("*"),
+                    "exomonad hook post-tool-use --runtime codex",
+                ),
+                "stop" => {
+                    generated_command_hook_hash("stop", None, "exomonad hook stop --runtime codex")
+                }
+                _ => unreachable!(),
+            };
+
+            assert_eq!(actual, expected, "hash mismatch for {codex_name}");
         }
     }
 }

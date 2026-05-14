@@ -14,10 +14,11 @@ use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
@@ -150,6 +151,19 @@ struct Observation {
     review_state: LocalReviewState,
     comments: Vec<LocalReviewComment>,
     ci_status: CIStatus,
+}
+
+#[derive(Debug, Clone)]
+struct PipelineContext {
+    branch_name: BranchName,
+    pr_number: Option<u64>,
+    agent_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CiSubscriberKind {
+    Knot,
+    Spindle,
 }
 
 /// Replaces `github_poller.rs` and `copilot_review.rs` by observing the local
@@ -402,7 +416,8 @@ where
         observations: &HashMap<u64, Observation>,
     ) -> Result<Vec<u64>> {
         let mut removed_prs = Vec::new();
-        let mut pending_actions: Vec<(u64, Vec<PendingAction>, BranchName, AgentType)> = Vec::new();
+        let mut pending_actions: Vec<(u64, Vec<PendingAction>, BranchName, AgentType, String)> =
+            Vec::new();
 
         {
             let mut state_guard = self.state.lock().await;
@@ -427,6 +442,7 @@ where
                         &obs.comments,
                         &local_reviews,
                         obs.ci_status,
+                        pr.merge_blocked_on_ci,
                         branch.as_str(),
                         &|c, r| format_review_message(c, r),
                         self.policy.reviewer_max_rounds,
@@ -469,7 +485,13 @@ where
                 };
 
                 if !actions.is_empty() {
-                    pending_actions.push((*pr_number, actions, branch, agent_type));
+                    pending_actions.push((
+                        *pr_number,
+                        actions,
+                        branch,
+                        agent_type,
+                        agent_name.clone(),
+                    ));
                 }
             }
 
@@ -483,13 +505,22 @@ where
             }
         }
 
-        for (_pr_number, actions, branch, agent_type) in pending_actions {
+        for (pr_number, actions, branch, agent_type, agent_name) in pending_actions {
             for action in actions {
                 match action {
                     PendingAction::WasmEvent {
                         event_type,
                         payload,
                     } => {
+                        if event_type == "ci_status" {
+                            info!(
+                                pr_number,
+                                agent_name = %agent_name,
+                                branch = %branch,
+                                status = payload.get("status").and_then(|value| value.as_str()).unwrap_or("unknown"),
+                                "Local PR CI status event dispatching"
+                            );
+                        }
                         if let Ok(Some(response)) = self
                             .call_handle_event(branch.as_str(), agent_type, event_type, payload)
                             .await
@@ -864,6 +895,7 @@ fn compute_pr_actions(
     comments: &[LocalReviewComment],
     reviews: &[LocalReview],
     ci_status: CIStatus,
+    merge_blocked_on_ci: bool,
     branch: &str,
     format_message: &dyn Fn(&[LocalReviewComment], &[LocalReview]) -> String,
     max_rounds: u32,
@@ -871,7 +903,13 @@ fn compute_pr_actions(
     let mut pending_actions = Vec::new();
     let comment_count = comments.len() + reviews.len();
 
-    if old_state.notified_parent_approved || old_state.notified_parent_timeout || old_state.stuck {
+    let ci_changed = ci_status != old_state.last_ci_status;
+    let ci_now_mergeable = ci_status == CIStatus::Success || ci_status == CIStatus::Neutral;
+    let recover_after_ci_block = merge_blocked_on_ci && ci_changed && ci_now_mergeable;
+
+    if (old_state.notified_parent_approved || old_state.notified_parent_timeout || old_state.stuck)
+        && !recover_after_ci_block
+    {
         return pending_actions;
     }
 
@@ -974,13 +1012,14 @@ fn compute_pr_actions(
         }
     }
 
-    if ci_status != old_state.last_ci_status {
+    if ci_changed {
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "ci_status",
             payload: serde_json::json!({
                 "pr_number": pr_number.as_u64(),
                 "status": ci_status.as_str(),
                 "branch": branch,
+                "merge_blocked_on_ci": merge_blocked_on_ci,
             }),
         });
         pending_actions.push(PendingAction::EmitEvent {
@@ -1104,16 +1143,24 @@ async fn run_ci_subscriber(
     worktrees_dir: std::path::PathBuf,
 ) {
     // pipeline rkey → branch name, populated from the knot's Pipeline events
-    let pipeline_map: Arc<RwLock<HashMap<String, BranchName>>> =
+    let pipeline_map: Arc<RwLock<HashMap<String, PipelineContext>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let (ready_tx, ready_rx) = mpsc::channel(2);
+    tokio::spawn(log_ci_pipeline_readiness(
+        knot_url.clone(),
+        spindle_url.clone(),
+        worktrees_dir.clone(),
+        ready_rx,
+    ));
 
     let mut handles = Vec::new();
 
     if let Some(url) = knot_url {
         let pm = pipeline_map.clone();
         let wd = worktrees_dir.clone();
+        let ready = ready_tx.clone();
         handles.push(tokio::spawn(async move {
-            run_knot_subscriber(url, pm, wd).await;
+            run_knot_subscriber(url, pm, wd, ready).await;
         }));
     }
 
@@ -1121,39 +1168,105 @@ async fn run_ci_subscriber(
         let pm = pipeline_map.clone();
         let cs = ci_status_map.clone();
         let wd = worktrees_dir.clone();
+        let ready = ready_tx.clone();
         handles.push(tokio::spawn(async move {
-            run_spindle_subscriber(url, pm, cs, wd).await;
+            run_spindle_subscriber(url, pm, cs, wd, ready).await;
         }));
     }
+    drop(ready_tx);
 
     futures::future::join_all(handles).await;
+}
+
+async fn log_ci_pipeline_readiness(
+    knot_url: Option<String>,
+    spindle_url: Option<String>,
+    worktrees_dir: std::path::PathBuf,
+    mut ready_rx: mpsc::Receiver<CiSubscriberKind>,
+) {
+    let mut knot_ready = knot_url.is_none();
+    let mut spindle_ready = spindle_url.is_none();
+    let repo = worktrees_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let deadline = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(deadline);
+
+    loop {
+        if knot_ready && spindle_ready {
+            info!(
+                knot = knot_url.as_deref().unwrap_or("disabled"),
+                spindle = spindle_url.as_deref().unwrap_or("disabled"),
+                repo,
+                "CI pipeline ready"
+            );
+            return;
+        }
+
+        tokio::select! {
+            maybe_kind = ready_rx.recv() => {
+                match maybe_kind {
+                    Some(CiSubscriberKind::Knot) => knot_ready = true,
+                    Some(CiSubscriberKind::Spindle) => spindle_ready = true,
+                    None => return,
+                }
+            }
+            _ = &mut deadline => {
+                warn!(
+                    knot = knot_url.as_deref().unwrap_or("disabled"),
+                    spindle = spindle_url.as_deref().unwrap_or("disabled"),
+                    knot_ready,
+                    spindle_ready,
+                    repo,
+                    "CI pipeline degraded: subscriber connection not ready after 30s"
+                );
+                return;
+            }
+        }
+    }
 }
 
 /// Subscribes to the knot's `/events` WebSocket and builds a mapping from
 /// pipeline rkey → branch name by parsing `sh.tangled.pipeline` records.
 async fn run_knot_subscriber(
     knot_url: String,
-    pipeline_map: Arc<RwLock<HashMap<String, BranchName>>>,
+    pipeline_map: Arc<RwLock<HashMap<String, PipelineContext>>>,
     worktrees_dir: std::path::PathBuf,
+    ready_tx: mpsc::Sender<CiSubscriberKind>,
 ) {
+    let mut reported_ready = false;
     loop {
         match tokio_tungstenite::connect_async(&knot_url).await {
             Ok((mut ws, _)) => {
                 info!(url = %knot_url, "Knot CI subscriber connected");
+                if !reported_ready {
+                    let _ = ready_tx.send(CiSubscriberKind::Knot).await;
+                    reported_ready = true;
+                }
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                             if let Ok(ev) = serde_json::from_str::<TangledStreamEvent>(&text) {
                                 if ev.nsid == "sh.tangled.pipeline" {
                                     if let Some(branch_name) = extract_pipeline_branch(&ev.event) {
-                                        let worktree = worktrees_dir.join(branch_name.as_str());
+                                        let context =
+                                            lookup_pipeline_context(&worktrees_dir, branch_name)
+                                                .await;
+                                        let worktree =
+                                            worktrees_dir.join(context.branch_name.as_str());
                                         info!(
                                             rkey = %ev.rkey,
-                                            branch = %branch_name,
+                                            branch = %context.branch_name,
+                                            pr_number = context.pr_number,
+                                            agent_name = context.agent_name.as_deref().unwrap_or("unknown"),
                                             worktree = %worktree.display(),
                                             "Spindle: CI initiated for worktree"
                                         );
-                                        pipeline_map.write().await.insert(ev.rkey, branch_name);
+                                        pipeline_map.write().await.insert(ev.rkey, context);
                                     }
                                 }
                             }
@@ -1180,14 +1293,20 @@ async fn run_knot_subscriber(
 /// by parsing `sh.tangled.pipeline.status` events.
 async fn run_spindle_subscriber(
     spindle_url: String,
-    pipeline_map: Arc<RwLock<HashMap<String, BranchName>>>,
+    pipeline_map: Arc<RwLock<HashMap<String, PipelineContext>>>,
     ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
     worktrees_dir: std::path::PathBuf,
+    ready_tx: mpsc::Sender<CiSubscriberKind>,
 ) {
+    let mut reported_ready = false;
     loop {
         match tokio_tungstenite::connect_async(&spindle_url).await {
             Ok((mut ws, _)) => {
                 info!(url = %spindle_url, "Spindle CI subscriber connected");
+                if !reported_ready {
+                    let _ = ready_tx.send(CiSubscriberKind::Spindle).await;
+                    reported_ready = true;
+                }
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
@@ -1195,18 +1314,24 @@ async fn run_spindle_subscriber(
                                 if ev.nsid == "sh.tangled.pipeline.status" {
                                     if let Some((rkey, status)) = extract_pipeline_status(&ev.event)
                                     {
-                                        let branch = pipeline_map.read().await.get(&rkey).cloned();
-                                        if let Some(branch) = branch {
+                                        let context = pipeline_map.read().await.get(&rkey).cloned();
+                                        if let Some(context) = context {
                                             let ci = CIStatus::parse(&status);
-                                            let worktree = worktrees_dir.join(branch.as_str());
+                                            let worktree =
+                                                worktrees_dir.join(context.branch_name.as_str());
                                             info!(
                                                 rkey = %rkey,
-                                                branch = %branch,
+                                                branch = %context.branch_name,
+                                                pr_number = context.pr_number,
+                                                agent_name = context.agent_name.as_deref().unwrap_or("unknown"),
                                                 status = %status,
                                                 worktree = %worktree.display(),
                                                 "Spindle: CI status updated"
                                             );
-                                            ci_status_map.write().await.insert(branch, ci);
+                                            ci_status_map
+                                                .write()
+                                                .await
+                                                .insert(context.branch_name, ci);
                                         } else {
                                             info!(rkey = %rkey, status = %status, "Spindle: CI event received but no branch mapping for rkey yet (pipeline may not have registered)");
                                         }
@@ -1229,6 +1354,47 @@ async fn run_spindle_subscriber(
             }
         }
         tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
+async fn lookup_pipeline_context(worktrees_dir: &Path, branch_name: BranchName) -> PipelineContext {
+    let Some(prs_path) = worktrees_dir
+        .parent()
+        .map(|exo_dir| exo_dir.join("prs.json"))
+    else {
+        return PipelineContext {
+            branch_name,
+            pr_number: None,
+            agent_name: None,
+        };
+    };
+
+    match read_pr_registry(&prs_path).await {
+        Ok(registry) => registry
+            .find_by_branch(&branch_name)
+            .map(|pr| PipelineContext {
+                branch_name: branch_name.clone(),
+                pr_number: Some(pr.number),
+                agent_name: Some(pr.author_agent.clone()),
+            })
+            .unwrap_or(PipelineContext {
+                branch_name,
+                pr_number: None,
+                agent_name: None,
+            }),
+        Err(error) => {
+            debug!(
+                path = %prs_path.display(),
+                branch = %branch_name,
+                error = %error,
+                "Unable to enrich CI pipeline event from local PR registry"
+            );
+            PipelineContext {
+                branch_name,
+                pr_number: None,
+                agent_name: None,
+            }
+        }
     }
 }
 
@@ -1325,6 +1491,7 @@ mod tests {
             &[],
             &[],
             CIStatus::Unknown,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1350,6 +1517,7 @@ mod tests {
             &[],
             &[],
             CIStatus::Unknown,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1374,6 +1542,7 @@ mod tests {
             &comments,
             &[],
             CIStatus::Unknown,
+            false,
             branch.as_str(),
             &|_, _| "review message".to_string(),
             5,
@@ -1397,6 +1566,7 @@ mod tests {
             &[],
             &reviews,
             CIStatus::Unknown,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1420,6 +1590,7 @@ mod tests {
             &[],
             &reviews,
             CIStatus::Unknown,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1446,6 +1617,7 @@ mod tests {
             &[],
             &[],
             CIStatus::Success,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1472,6 +1644,7 @@ mod tests {
             &[],
             &[],
             CIStatus::Unknown,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1488,6 +1661,7 @@ mod tests {
         let branch = BranchName::from("main.feat-gemini");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
+        state.last_ci_status = CIStatus::Pending;
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
@@ -1495,11 +1669,42 @@ mod tests {
             &[test_comment("late")],
             &[test_review("late review", ReviewState::Approved)],
             CIStatus::Success,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
         );
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_ci_success_after_merge_block_bypasses_stale_guard() {
+        let branch = BranchName::from("main.feat-gemini");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.notified_parent_approved = true;
+        state.last_ci_status = CIStatus::Pending;
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &[],
+            CIStatus::Success,
+            true,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "ci_status",
+                payload,
+            } if payload["merge_blocked_on_ci"] == true && payload["status"] == "success"
+        )));
+        assert_eq!(state.last_ci_status, CIStatus::Success);
     }
 
     #[test]
@@ -1516,6 +1721,7 @@ mod tests {
             &[],
             &reviews,
             CIStatus::Unknown,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1538,6 +1744,7 @@ mod tests {
             &[],
             &reviews,
             CIStatus::Unknown,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1561,6 +1768,7 @@ mod tests {
             &[],
             &[],
             CIStatus::Unknown,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1583,6 +1791,7 @@ mod tests {
             &[],
             &[],
             CIStatus::Success,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
@@ -1765,6 +1974,7 @@ mod tests {
             rounds: 0,
             stuck: false,
             needs_human_review: false,
+            merge_blocked_on_ci: false,
         }
     }
 

@@ -17,6 +17,7 @@ module ExoMonad.Guest.Events.Templates
     copilotReviewReceived,
     siblingMerged,
     ciStatus,
+    mergeReady,
     stuck,
   )
 where
@@ -102,6 +103,17 @@ ciStatus n status branch =
       "success" -> "\n\nCI passed."
       "failure" -> "\n\nCI failed. Check the logs and fix the issue before proceeding."
       _ -> ""
+
+-- | CI passed after a previous merge attempt was blocked by CI.
+mergeReady :: Int -> Text -> Text -> Text
+mergeReady n status branch =
+  "[MERGE READY] PR #"
+    <> T.pack (show n)
+    <> " on branch "
+    <> branch
+    <> " has CI status "
+    <> status
+    <> " after a previous merge attempt was blocked. Merge with `merge_pr` tool."
 
 -- | New commits pushed to a PR — informational notification to parent.
 --

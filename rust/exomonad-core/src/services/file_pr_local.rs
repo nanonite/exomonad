@@ -99,6 +99,8 @@ pub struct PrEntry {
     pub stuck: bool,
     #[serde(default)]
     pub needs_human_review: bool,
+    #[serde(default)]
+    pub merge_blocked_on_ci: bool,
 }
 
 /// Local PR registry stored at `.exo/prs.json`.
@@ -281,6 +283,7 @@ pub async fn file_pr_local(
         rounds: 0,
         stuck: false,
         needs_human_review: false,
+        merge_blocked_on_ci: false,
     };
 
     let pr_number = PRNumber::new(number);
@@ -413,6 +416,7 @@ mod tests {
                 rounds: 0,
                 stuck: false,
                 needs_human_review: false,
+                merge_blocked_on_ci: false,
             },
         );
 
@@ -461,6 +465,7 @@ mod tests {
                 rounds: 0,
                 stuck: false,
                 needs_human_review: false,
+                merge_blocked_on_ci: false,
             },
         );
         reg.next_number = 2;
@@ -497,6 +502,7 @@ mod tests {
                 rounds: 0,
                 stuck: false,
                 needs_human_review: false,
+                merge_blocked_on_ci: false,
             },
         );
 

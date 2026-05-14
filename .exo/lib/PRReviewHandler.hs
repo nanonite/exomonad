@@ -87,9 +87,11 @@ siblingMergedHandler (SiblingMergedEvent merged parent _prNum) = do
 
 -- | Handle CI status events.
 ciStatusHandler :: CIStatusEvent -> Eff Effects EventAction
-ciStatusHandler (CIStatusEvent n status_ branch_) = do
+ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI) = do
   logHandler $ "CI status changed on PR #" <> T.pack (show n) <> ": " <> status_
-  pure (InjectMessage (Tpl.ciStatus n status_ branch_))
+  if mergeBlockedOnCI && status_ `elem` ["success", "neutral"]
+    then pure (NotifyParentAction (Tpl.mergeReady n status_ branch_) n)
+    else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
 
 -- | Helper to log handler entry.
 logHandler :: Text -> Eff Effects ()

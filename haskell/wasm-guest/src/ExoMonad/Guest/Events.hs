@@ -14,7 +14,7 @@ module ExoMonad.Guest.Events
 where
 
 import Control.Monad.Freer (Eff)
-import Data.Aeson (FromJSON, ToJSON, Value, object, withObject, (.:), (.=))
+import Data.Aeson (FromJSON, ToJSON, Value, object, withObject, (.!=), (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import ExoMonad.Guest.Types (Effects)
@@ -88,16 +88,21 @@ instance ToJSON PRReviewEvent where
 data CIStatusEvent = CIStatusEvent
   { ciPrNumber :: Int,
     ciStatus :: Text,
-    ciBranch :: Text
+    ciBranch :: Text,
+    ciMergeBlockedOnCI :: Bool
   }
   deriving (Show, Generic)
 
 instance FromJSON CIStatusEvent where
   parseJSON = withObject "CIStatusEvent" $ \v ->
-    CIStatusEvent <$> v .: "pr_number" <*> v .: "status" <*> v .: "branch"
+    CIStatusEvent
+      <$> v .: "pr_number"
+      <*> v .: "status"
+      <*> v .: "branch"
+      <*> v .:? "merge_blocked_on_ci" .!= False
 
 instance ToJSON CIStatusEvent where
-  toJSON (CIStatusEvent n s b) = object ["pr_number" .= n, "status" .= s, "branch" .= b]
+  toJSON (CIStatusEvent n s b blocked) = object ["pr_number" .= n, "status" .= s, "branch" .= b, "merge_blocked_on_ci" .= blocked]
 
 -- | Timeout event
 data TimeoutEvent = TimeoutEvent
