@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::services::{
-    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasOpencodeAcpRegistry,
-    HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
+    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasProjectDir,
+    HasSupervisorRegistry, HasTeamRegistry,
 };
 
 fn structural_parent_session_id(
@@ -54,11 +54,32 @@ impl<C: HasEventQueue> EventHandler<C> {
     }
 }
 
+impl<C: HasSupervisorRegistry> EventHandler<C> {
+    async fn lookup_supervisor(
+        &self,
+        agent_id: &crate::domain::AgentName,
+        birth_branch: &crate::domain::BirthBranch,
+    ) -> Option<crate::services::supervisor_registry::SupervisorInfo> {
+        if let Some(info) = self
+            .ctx
+            .supervisor_registry()
+            .lookup(agent_id.as_str())
+            .await
+        {
+            return Some(info);
+        }
+
+        self.ctx
+            .supervisor_registry()
+            .lookup(birth_branch.as_str())
+            .await
+    }
+}
+
 #[async_trait]
 impl<
         C: HasTeamRegistry
             + HasAcpRegistry
-            + HasOpencodeAcpRegistry
             + HasAgentResolver
             + HasEventLog
             + HasEventQueue
@@ -85,7 +106,6 @@ impl<
 impl<
         C: HasTeamRegistry
             + HasAcpRegistry
-            + HasOpencodeAcpRegistry
             + HasAgentResolver
             + HasEventLog
             + HasEventQueue
@@ -232,13 +252,8 @@ impl<
             return Ok(NotifyParentResponse { ack: true });
         }
 
-        // Check SupervisorRegistry for this agent's birth-branch
-        if let Some(info) = self
-            .ctx
-            .supervisor_registry()
-            .lookup(birth_branch.as_str())
-            .await
-        {
+        // Check SupervisorRegistry by concrete agent ID first, then legacy birth-branch key.
+        if let Some(info) = self.lookup_supervisor(&agent_id, birth_branch).await {
             tracing::info!(
                 supervisor = %info.supervisor,
                 team = %info.team,

@@ -6,8 +6,8 @@ use crate::services::file_pr_local::{
 };
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
-    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasOpencodeAcpRegistry,
-    HasProjectDir, HasTeamRegistry, ReviewerSpawner,
+    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasProjectDir, HasTeamRegistry,
+    ReviewerSpawner,
 };
 use anyhow::Result;
 use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
+const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Review state derived from local review files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,6 +84,9 @@ struct WatchState {
     rounds: u32,
     stuck: bool,
     reviewer_spawned: bool,
+    review_approved_at: Option<Instant>,
+    ci_mergeable_at: Option<Instant>,
+    merge_ready_notified: bool,
 }
 
 impl WatchState {
@@ -107,6 +111,13 @@ impl WatchState {
             rounds: 0,
             stuck: false,
             reviewer_spawned: false,
+            review_approved_at: None,
+            ci_mergeable_at: if matches!(ci_status, CIStatus::Success | CIStatus::Neutral) {
+                Some(Instant::now())
+            } else {
+                None
+            },
+            merge_ready_notified: false,
         }
     }
 }
@@ -189,7 +200,6 @@ impl<C> WorktreeEventWatcher<C>
 where
     C: HasTeamRegistry
         + HasAcpRegistry
-        + HasOpencodeAcpRegistry
         + HasAgentResolver
         + HasEventLog
         + HasEventQueue
@@ -903,12 +913,22 @@ fn compute_pr_actions(
     let mut pending_actions = Vec::new();
     let comment_count = comments.len() + reviews.len();
 
+    let now = Instant::now();
     let ci_changed = ci_status != old_state.last_ci_status;
     let ci_now_mergeable = ci_status == CIStatus::Success || ci_status == CIStatus::Neutral;
+    if ci_changed {
+        old_state.ci_mergeable_at = if ci_now_mergeable { Some(now) } else { None };
+    }
+    let merge_ready_now = !old_state.merge_ready_notified
+        && signals_within_merge_ready_window(
+            old_state.review_approved_at,
+            old_state.ci_mergeable_at,
+        );
     let recover_after_ci_block = merge_blocked_on_ci && ci_changed && ci_now_mergeable;
 
     if (old_state.notified_parent_approved || old_state.notified_parent_timeout || old_state.stuck)
         && !recover_after_ci_block
+        && !merge_ready_now
     {
         return pending_actions;
     }
@@ -969,12 +989,27 @@ fn compute_pr_actions(
     if approved && old_state.last_review_state != ReviewState::Approved {
         old_state.last_review_state = ReviewState::Approved;
         old_state.notified_parent_approved = true;
+        old_state.review_approved_at = Some(now);
+        let merge_ready_now = !old_state.merge_ready_notified
+            && signals_within_merge_ready_window(
+                old_state.review_approved_at,
+                old_state.ci_mergeable_at,
+            );
+        let kind = if merge_ready_now {
+            "merge_ready"
+        } else {
+            "approved"
+        };
+        if merge_ready_now {
+            old_state.merge_ready_notified = true;
+        }
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
             payload: serde_json::json!({
-                "kind": "approved",
+                "kind": kind,
                 "pr_number": pr_number.as_u64(),
                 "ci_status": ci_status.as_str(),
+                "branch": branch,
             }),
         });
     }
@@ -1013,6 +1048,15 @@ fn compute_pr_actions(
     }
 
     if ci_changed {
+        let reviewer_approved = old_state.notified_parent_approved;
+        let ci_completed_merge_ready = !old_state.merge_ready_notified
+            && signals_within_merge_ready_window(
+                old_state.review_approved_at,
+                old_state.ci_mergeable_at,
+            );
+        if ci_completed_merge_ready {
+            old_state.merge_ready_notified = true;
+        }
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "ci_status",
             payload: serde_json::json!({
@@ -1020,6 +1064,8 @@ fn compute_pr_actions(
                 "status": ci_status.as_str(),
                 "branch": branch,
                 "merge_blocked_on_ci": merge_blocked_on_ci,
+                "reviewer_approved": reviewer_approved,
+                "merge_ready": ci_completed_merge_ready,
             }),
         });
         pending_actions.push(PendingAction::EmitEvent {
@@ -1081,6 +1127,22 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<LocalReview>, ReviewState) {
     }
 
     (reviews, state)
+}
+
+fn signals_within_merge_ready_window(
+    review_approved_at: Option<Instant>,
+    ci_mergeable_at: Option<Instant>,
+) -> bool {
+    let (Some(review_approved_at), Some(ci_mergeable_at)) = (review_approved_at, ci_mergeable_at)
+    else {
+        return false;
+    };
+
+    if review_approved_at >= ci_mergeable_at {
+        review_approved_at.duration_since(ci_mergeable_at) <= MERGE_READY_SIGNAL_WINDOW
+    } else {
+        ci_mergeable_at.duration_since(review_approved_at) <= MERGE_READY_SIGNAL_WINDOW
+    }
 }
 
 fn format_review_message(comments: &[LocalReviewComment], reviews: &[LocalReview]) -> String {
@@ -1576,6 +1638,96 @@ mod tests {
             .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "approved")));
         assert!(state.notified_parent_approved);
+    }
+
+    #[test]
+    fn test_approval_after_green_ci_fires_merge_ready() {
+        let branch = BranchName::from("main.feat-gemini");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.last_ci_status = CIStatus::Success;
+        state.ci_mergeable_at = Some(Instant::now() - Duration::from_secs(60));
+        let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &reviews,
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload,
+            } if payload["kind"] == "merge_ready" && payload["ci_status"] == "success"
+        )));
+        assert!(state.merge_ready_notified);
+    }
+
+    #[test]
+    fn test_green_ci_after_approval_fires_merge_ready_ci_event() {
+        let branch = BranchName::from("main.feat-gemini");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.notified_parent_approved = true;
+        state.last_review_state = ReviewState::Approved;
+        state.review_approved_at = Some(Instant::now() - Duration::from_secs(60));
+        state.last_ci_status = CIStatus::Pending;
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &[],
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "ci_status",
+                payload,
+            } if payload["merge_ready"] == true && payload["reviewer_approved"] == true
+        )));
+        assert!(state.merge_ready_notified);
+    }
+
+    #[test]
+    fn test_green_ci_after_stale_approval_does_not_fire_merge_ready() {
+        let branch = BranchName::from("main.feat-gemini");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.notified_parent_approved = true;
+        state.last_review_state = ReviewState::Approved;
+        state.review_approved_at =
+            Some(Instant::now() - MERGE_READY_SIGNAL_WINDOW - Duration::from_secs(1));
+        state.last_ci_status = CIStatus::Pending;
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &[],
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.is_empty());
+        assert!(!state.merge_ready_notified);
     }
 
     #[test]

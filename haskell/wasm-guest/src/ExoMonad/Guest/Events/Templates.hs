@@ -104,7 +104,7 @@ ciStatus n status branch =
       "failure" -> "\n\nCI failed. Check the logs and fix the issue before proceeding."
       _ -> ""
 
--- | CI passed after a previous merge attempt was blocked by CI.
+-- | Review and CI are both satisfied, so the TL can merge.
 mergeReady :: Int -> Text -> Text -> Text
 mergeReady n status branch =
   "[MERGE READY] PR #"
@@ -113,7 +113,7 @@ mergeReady n status branch =
     <> branch
     <> " has CI status "
     <> status
-    <> " after a previous merge attempt was blocked. Merge with `merge_pr` tool."
+    <> " and reviewer approval. Merge with `merge_pr` tool."
 
 -- | New commits pushed to a PR — informational notification to parent.
 --

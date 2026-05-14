@@ -56,6 +56,11 @@ data PRReviewEvent
       { prNumber :: Int,
         stuckRounds :: Int
       }
+  | MergeReady
+      { prNumber :: Int,
+        mrCiStatus :: Text,
+        mrBranch :: Text
+      }
   deriving (Show, Generic)
 
 instance FromJSON PRReviewEvent where
@@ -71,6 +76,7 @@ instance FromJSON PRReviewEvent where
       "reviewer_requested_changes" -> ReviewerRequestedChanges <$> v .: "pr_number" <*> v .: "comments"
       "rate_limited" -> RateLimited <$> v .: "retries_remaining" <*> v .: "seconds_until_reset"
       "stuck" -> Stuck <$> v .: "pr_number" <*> v .: "rounds"
+      "merge_ready" -> MergeReady <$> v .: "pr_number" <*> v .: "ci_status" <*> v .: "branch"
       other -> fail $ "Unknown PRReviewEvent kind: " <> show (other :: Text)
 
 instance ToJSON PRReviewEvent where
@@ -83,13 +89,16 @@ instance ToJSON PRReviewEvent where
   toJSON (ReviewerRequestedChanges n c) = object ["kind" .= ("reviewer_requested_changes" :: Text), "pr_number" .= n, "comments" .= c]
   toJSON (RateLimited r s) = object ["kind" .= ("rate_limited" :: Text), "retries_remaining" .= r, "seconds_until_reset" .= s]
   toJSON (Stuck n r) = object ["kind" .= ("stuck" :: Text), "pr_number" .= n, "rounds" .= r]
+  toJSON (MergeReady n ci branch) = object ["kind" .= ("merge_ready" :: Text), "pr_number" .= n, "ci_status" .= ci, "branch" .= branch]
 
 -- | CI status event
 data CIStatusEvent = CIStatusEvent
   { ciPrNumber :: Int,
     ciStatus :: Text,
     ciBranch :: Text,
-    ciMergeBlockedOnCI :: Bool
+    ciMergeBlockedOnCI :: Bool,
+    ciReviewerApproved :: Bool,
+    ciMergeReady :: Bool
   }
   deriving (Show, Generic)
 
@@ -100,9 +109,12 @@ instance FromJSON CIStatusEvent where
       <*> v .: "status"
       <*> v .: "branch"
       <*> v .:? "merge_blocked_on_ci" .!= False
+      <*> v .:? "reviewer_approved" .!= False
+      <*> v .:? "merge_ready" .!= False
 
 instance ToJSON CIStatusEvent where
-  toJSON (CIStatusEvent n s b blocked) = object ["pr_number" .= n, "status" .= s, "branch" .= b, "merge_blocked_on_ci" .= blocked]
+  toJSON (CIStatusEvent n s b blocked approved ready) =
+    object ["pr_number" .= n, "status" .= s, "branch" .= b, "merge_blocked_on_ci" .= blocked, "reviewer_approved" .= approved, "merge_ready" .= ready]
 
 -- | Timeout event
 data TimeoutEvent = TimeoutEvent

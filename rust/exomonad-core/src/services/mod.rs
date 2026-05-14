@@ -21,7 +21,6 @@ pub mod log;
 pub mod merge_pr;
 pub mod merge_pr_local;
 pub mod mutex_registry;
-pub mod opencode_acp;
 pub mod repo;
 pub mod resilience;
 pub mod review_policy;
@@ -45,7 +44,6 @@ pub use self::filesystem::FileSystemService;
 pub use self::git_worktree::GitWorktreeService;
 pub use self::github::GitHubClient;
 pub use self::mutex_registry::MutexRegistry;
-pub use self::opencode_acp::{OpencodeAcpConnection, OpencodeAcpRegistry};
 pub use self::secrets::Secrets;
 pub use self::supervisor_registry::SupervisorRegistry;
 use claude_teams_bridge::TeamRegistry;
@@ -90,9 +88,6 @@ pub trait HasGitHubClient: Send + Sync {
 pub trait HasGitWorktreeService: Send + Sync {
     fn git_worktree_service(&self) -> &Arc<GitWorktreeService>;
 }
-pub trait HasOpencodeAcpRegistry: Send + Sync {
-    fn opencode_acp_registry(&self) -> &OpencodeAcpRegistry;
-}
 pub trait HasCiStatusMap: Send + Sync {
     fn ci_status_map(
         &self,
@@ -127,14 +122,13 @@ pub struct Services {
     pub event_log: Option<Arc<EventLog>>,
     pub team_registry: Arc<TeamRegistry>,
     pub acp_registry: Arc<AcpRegistry>,
-    pub opencode_acp_registry: Arc<OpencodeAcpRegistry>,
     pub supervisor_registry: Arc<SupervisorRegistry>,
     pub claude_session_registry: Arc<ClaudeSessionRegistry>,
     pub agent_resolver: Arc<AgentResolver>,
     pub event_queue: Arc<EventQueue>,
     pub mutex_registry: Arc<MutexRegistry>,
     pub git_wt: Arc<GitWorktreeService>,
-    /// Model for spawned OpenCode workers (passed to `opencode serve --model` and `opencode run --model`).
+    /// Model for spawned OpenCode workers (passed to `opencode run --model`).
     /// `None` means let opencode pick.
     pub opencode_worker_model: Option<String>,
     /// Shared CI status map updated by the spindle WebSocket subscriber.
@@ -211,11 +205,6 @@ impl HasGitWorktreeService for Services {
         &self.git_wt
     }
 }
-impl HasOpencodeAcpRegistry for Services {
-    fn opencode_acp_registry(&self) -> &OpencodeAcpRegistry {
-        &self.opencode_acp_registry
-    }
-}
 impl HasCiStatusMap for Services {
     fn ci_status_map(
         &self,
@@ -241,7 +230,6 @@ impl Services {
             event_log: None,
             team_registry: Arc::new(TeamRegistry::new()),
             acp_registry: Arc::new(AcpRegistry::new()),
-            opencode_acp_registry: Arc::new(OpencodeAcpRegistry::new()),
             supervisor_registry: Arc::new(SupervisorRegistry::new()),
             claude_session_registry: Arc::new(ClaudeSessionRegistry::new()),
             agent_resolver: Arc::new(AgentResolver::empty()),

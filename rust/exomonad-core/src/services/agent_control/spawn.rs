@@ -186,7 +186,6 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 impl<
         C: super::super::HasGitHubClient
             + super::super::HasAcpRegistry
-            + super::super::HasOpencodeAcpRegistry
             + super::super::HasTeamRegistry
             + super::super::HasAgentResolver
             + super::super::HasProjectDir
@@ -1402,7 +1401,6 @@ impl<
 impl<
         C: crate::services::HasGitHubClient
             + crate::services::HasAcpRegistry
-            + crate::services::HasOpencodeAcpRegistry
             + crate::services::HasTeamRegistry
             + crate::services::HasAgentResolver
             + crate::services::HasProjectDir

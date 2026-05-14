@@ -24,8 +24,7 @@ use tracing::{info, warn};
 
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasGitHubClient,
-    HasGitWorktreeService, HasOpencodeAcpRegistry, HasProjectDir, HasSupervisorRegistry,
-    HasTeamRegistry,
+    HasGitWorktreeService, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
 };
 
 /// Agent effect handler.
@@ -40,7 +39,6 @@ pub struct AgentHandler<C> {
 impl<
         C: HasTeamRegistry
             + HasAcpRegistry
-            + HasOpencodeAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir
@@ -71,12 +69,14 @@ impl<
         } else if let Some(info) = team_reg.get(ctx.birth_branch.as_ref()).await {
             TeamName::from(info.team_name.as_str())
         } else {
-            warn!(
+            let fallback = TeamName::from(format!("exo-{}", ctx.birth_branch.as_ref()).as_str());
+            info!(
                 agent = %agent_key,
                 child = %child_key,
-                "No team found for agent — skipping supervisor registration"
+                team = %fallback,
+                "No team found for agent — registering supervisor with synthetic team"
             );
-            return;
+            fallback
         };
 
         sup_reg
@@ -202,7 +202,6 @@ impl<
 impl<
         C: HasTeamRegistry
             + HasAcpRegistry
-            + HasOpencodeAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir
@@ -280,7 +279,6 @@ fn parse_repo(repo: &str) -> EffectResult<GithubRepo> {
 impl<
         C: HasTeamRegistry
             + HasAcpRegistry
-            + HasOpencodeAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir
@@ -437,6 +435,9 @@ impl<
                 ctx,
             )
             .await;
+        } else {
+            self.register_child_supervisor(agent_info.id.as_str(), ctx)
+                .await;
         }
 
         Ok(SpawnWorkerResponse {
@@ -544,6 +545,9 @@ impl<
             // register its own Claude Code workers as synthetic members.
             self.propagate_team_to_child(&req.branch_name, options.agent_type, ctx)
                 .await;
+        } else {
+            self.register_child_supervisor(agent_info.id.as_str(), ctx)
+                .await;
         }
 
         Ok(SpawnSubtreeResponse {
@@ -608,6 +612,9 @@ impl<
                 ctx,
             )
             .await;
+        } else {
+            self.register_child_supervisor(agent_info.id.as_str(), ctx)
+                .await;
         }
 
         Ok(SpawnLeafSubtreeResponse {

@@ -50,6 +50,6 @@ Sanity check the new behavior on the FIRST spawn:
   You should see a directory named after the spawned worker.
   If absent, the spawn failed before worktree creation — stop and report.
 
-  OpenCode workers run in tmux windows, same as all other agents.
-  To observe a worker's progress: tmux list-windows
-  To see what a worker is doing: tmux attach -t <session>:<window>
+  OpenCode workers run interactively in tmux panes under the parent TL tab.
+  To observe a worker's progress: tmux list-panes -a
+  To see what a worker is doing: tmux attach -t <session>

@@ -79,6 +79,12 @@ prReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
   pure (NotifyParentAction (Tpl.stuck n rounds_) n)
 
+prReviewHandler (MergeReady n ci branch_) = do
+  logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
+  branch <- getCurrentBranch
+  void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewApprovedEv n)
+  pure (NotifyParentAction (Tpl.mergeReady n ci branch_) n)
+
 -- | Handle sibling merged events.
 siblingMergedHandler :: SiblingMergedEvent -> Eff Effects EventAction
 siblingMergedHandler (SiblingMergedEvent merged parent _prNum) = do
@@ -87,9 +93,9 @@ siblingMergedHandler (SiblingMergedEvent merged parent _prNum) = do
 
 -- | Handle CI status events.
 ciStatusHandler :: CIStatusEvent -> Eff Effects EventAction
-ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI) = do
+ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerApproved mergeReady_) = do
   logHandler $ "CI status changed on PR #" <> T.pack (show n) <> ": " <> status_
-  if mergeBlockedOnCI && status_ `elem` ["success", "neutral"]
+  if (mergeBlockedOnCI || mergeReady_) && status_ `elem` ["success", "neutral"]
     then pure (NotifyParentAction (Tpl.mergeReady n status_ branch_) n)
     else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
 

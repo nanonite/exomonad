@@ -4,7 +4,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 /// Message in a Claude Code Teams inbox file.
@@ -41,10 +41,7 @@ pub(crate) fn write_to_inbox_at_base(
 ) -> io::Result<String> {
     let inbox_dir = paths::inbox_dir_at(base, team);
 
-    if !inbox_dir.exists() {
-        std::fs::create_dir_all(&inbox_dir)?;
-        info!(dir = %inbox_dir.display(), "Created Teams inbox directory");
-    }
+    std::fs::create_dir_all(&inbox_dir)?;
 
     let inbox_file = inbox_dir.join(format!("{}.json", recipient));
 
@@ -83,7 +80,7 @@ pub(crate) fn write_to_inbox_at_base(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Atomic write: temp file + fsync + rename (stable name under lock)
-    let tmp_file = inbox_dir.join(format!(".{}.json.tmp", recipient));
+    let tmp_file = unique_tmp_file(&inbox_dir, recipient, "json");
     {
         let f = std::fs::File::create(&tmp_file)?;
         use std::io::Write;
@@ -182,7 +179,7 @@ pub(crate) fn compact_inbox_at_base(base: &Path, team: &str, recipient: &str) ->
 
     let json = serde_json::to_string_pretty(&compacted)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let tmp_file = inbox_dir.join(format!(".{}.compact.json.tmp", recipient));
+    let tmp_file = unique_tmp_file(&inbox_dir, recipient, "compact.json");
     {
         let f = std::fs::File::create(&tmp_file)?;
         use std::io::Write;
@@ -202,6 +199,20 @@ pub(crate) fn compact_inbox_at_base(base: &Path, team: &str, recipient: &str) ->
 
 fn is_idle_notification(msg: &TeamsMessage) -> bool {
     msg.summary.to_lowercase().contains("idle") || msg.text.to_lowercase().contains("idle")
+}
+
+fn unique_tmp_file(dir: &Path, recipient: &str, suffix: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    dir.join(format!(
+        ".{}.{}.{}.{}.tmp",
+        recipient,
+        std::process::id(),
+        nanos,
+        suffix
+    ))
 }
 
 /// Read all messages from an inbox.

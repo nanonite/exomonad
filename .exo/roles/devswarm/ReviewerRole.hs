@@ -323,6 +323,10 @@ reviewerPRReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
   pure (NotifyParentAction ("[STUCK: " <> T.pack (show n) <> ", rounds=" <> T.pack (show rounds_) <> "] PR requires human intervention") n)
 
+reviewerPRReviewHandler (MergeReady n ci branch_) = do
+  logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
+  pure (NotifyParentAction ("[MERGE READY] PR #" <> T.pack (show n) <> " on branch " <> branch_ <> " has CI status " <> ci) n)
+
 reviewerSiblingMergedHandler :: SiblingMergedEvent -> Eff Effects EventAction
 reviewerSiblingMergedHandler ev = do
   logHandler $ "Sibling merged: " <> mergedBranch ev

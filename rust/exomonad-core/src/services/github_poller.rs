@@ -16,7 +16,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasGitHubClient,
-    HasOpencodeAcpRegistry, HasProjectDir, HasTeamRegistry,
+    HasProjectDir, HasTeamRegistry,
 };
 
 type PluginMap = Arc<RwLock<HashMap<crate::AgentName, Arc<PluginManager>>>>;
@@ -276,7 +276,6 @@ enum EventActionResponse {
 impl<
         C: HasTeamRegistry
             + HasAcpRegistry
-            + HasOpencodeAcpRegistry
             + HasAgentResolver
             + HasEventLog
             + HasEventQueue

@@ -38,8 +38,8 @@ Sanity check the new behavior on the FIRST spawn:
   You should see a directory named after each spawned worker (e.g. gh-42-fix-claude).
   If absent, the ACP spawn failed before registration — stop and report.
 
-  OpenCode workers are headless ACP processes, NOT tmux windows. Do NOT check
-  tmux list-windows for them — it will always be empty for opencode workers.
+  OpenCode workers run interactively in tmux panes under the parent TL tab.
+  Do not use OpenCode ACP or `opencode serve` for worker delivery.
 
-  To observe a worker's progress: ps aux | grep 'opencode serve'
-  To manually nudge a stuck worker: opencode run --attach <url> your message
+  To observe a worker's progress: tmux list-panes -a
+  To manually nudge a stuck worker: attach to the parent TL tmux session

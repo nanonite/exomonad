@@ -158,7 +158,6 @@ impl DeliveryOutcome {
 pub async fn route_message(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
-          + super::HasOpencodeAcpRegistry
           + super::HasAgentResolver
           + super::HasProjectDir),
     address: &Address,
@@ -199,7 +198,6 @@ pub async fn route_message(
 async fn resolve_and_deliver_to_lead(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
-          + super::HasOpencodeAcpRegistry
           + super::HasAgentResolver
           + super::HasProjectDir),
     team_name: &str,
@@ -303,7 +301,6 @@ pub fn resolve_tab_name_for_agent(
 pub async fn notify_parent_delivery(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
-          + super::HasOpencodeAcpRegistry
           + super::HasAgentResolver
           + super::HasEventLog
           + super::HasEventQueue
@@ -575,7 +572,6 @@ async fn deliver_via_tmux(
 pub async fn deliver_to_agent(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
-          + super::HasOpencodeAcpRegistry
           + super::HasAgentResolver
           + super::HasProjectDir),
     agent_key: &str,
@@ -586,45 +582,8 @@ pub async fn deliver_to_agent(
 ) -> DeliveryResult {
     let team_registry = ctx.team_registry();
     let acp_registry = ctx.acp_registry();
-    let opencode_acp_registry = ctx.opencode_acp_registry();
     let _agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
-
-    // Check for OpenCode ACP connection first (HTTP delivery)
-    if let Some(conn) = opencode_acp_registry.get(agent_key).await {
-        match super::opencode_acp::send_prompt(&conn.base_url, &conn.session_id, message).await {
-            Ok(()) => {
-                tracing::Span::current().record("delivery_method", "opencode_acp");
-                info!(agent = %agent_key, url = %conn.base_url, "Delivered message via OpenCode ACP");
-                tracing::info!(
-                    otel.name = "message.delivery",
-                    agent_id = %from,
-                    recipient = %agent_key,
-                    method = "opencode_acp",
-                    outcome = "success",
-                    detail = %conn.base_url,
-                    "[event] message.delivery"
-                );
-                return DeliveryResult::Acp;
-            }
-            Err(e) => {
-                warn!(
-                    agent = %agent_key,
-                    error = %e,
-                    "OpenCode ACP prompt failed, falling back to tmux"
-                );
-                tracing::info!(
-                    otel.name = "message.delivery",
-                    agent_id = %from,
-                    recipient = %agent_key,
-                    method = "opencode_acp",
-                    outcome = "failed",
-                    detail = ?e,
-                    "[event] message.delivery"
-                );
-            }
-        }
-    }
 
     // Batch lookup: sender's team (for Tier 2 scoping) + recipient in-memory check.
     // Single lock acquisition instead of two separate get() calls.
