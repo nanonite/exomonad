@@ -15,6 +15,7 @@ import ExoMonad.Guest.Tools.Events
   )
 import ExoMonad.Guest.Types (allowResponse, allowStopResponse, BeforeModelOutput (..), AfterModelOutput (..))
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
+import HookPolicy (preToolUseWithGhBlock)
 import ExoMonad.Guest.Events
   ( PRReviewEvent (..), CIStatusEvent (..), SiblingMergedEvent (..),
     EventHandlerConfig (..), EventAction (..), defaultEventHandlers
@@ -59,7 +60,7 @@ config =
           },
       hooks =
         HookConfig
-          { preToolUse = \_ -> pure (allowResponse Nothing),
+          { preToolUse = preToolUseWithGhBlock (\_ -> pure (allowResponse Nothing)),
             postToolUse = \_ -> pure (allowResponse Nothing),
             onStop = \_ -> pure allowStopResponse,
             onSubagentStop = \_ -> pure allowStopResponse,

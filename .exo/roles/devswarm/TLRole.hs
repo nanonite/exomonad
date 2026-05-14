@@ -48,6 +48,7 @@ import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription,
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Types (StopDecision(..), StopHookOutput(..), blockStopResponse, allowStopResponse, allowResponse, BeforeModelOutput (..), AfterModelOutput (..))
 import ExoMonad.Types (HookConfig (..), Effects, defaultSessionStartHook, teamRegistrationPostToolUse)
+import HookPolicy (preToolUseWithGhBlock)
 import PRReviewHandler (prReviewEventHandlers)
 import TLPhase (TLPhase (..), TLEvent (..), ChildHandle (..))
 import TLStopCheck (tlStopCheck)
@@ -242,7 +243,7 @@ config =
             },
       hooks =
         HookConfig
-          { preToolUse = \_ -> pure (allowResponse Nothing),
+          { preToolUse = preToolUseWithGhBlock (\_ -> pure (allowResponse Nothing)),
             postToolUse = teamRegistrationPostToolUse,
             onStop = \_ -> tlStopCheck,
             onSubagentStop = \_ -> tlStopCheck,

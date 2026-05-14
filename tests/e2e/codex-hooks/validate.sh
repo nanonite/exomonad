@@ -99,6 +99,25 @@ logs_contain() {
     grep -R "$pattern" "$REPO_DIR/.exo/logs" 2>/dev/null | grep -q .
 }
 
+codex_gh_command_is_blocked() {
+    local payload
+    local output
+    payload='{"session_id":"codex-hooks-validator","hook_event_name":"PreToolUse","tool":"bash","args":{"command":"gh auth status"}}'
+
+    output="$(
+        cd "$REPO_DIR" && {
+            printf '%s' "$payload" | \
+                EXOMONAD_ROLE=root \
+                EXOMONAD_AGENT_ID=root \
+                EXOMONAD_SESSION_ID=main \
+                exomonad hook pre-tool-use --runtime codex 2>/dev/null
+        } || true
+    )"
+
+    grep -Fq '"permissionDecision":"deny"' <<<"$output" \
+        && grep -Fq 'Do not run gh commands' <<<"$output"
+}
+
 wait_for() {
     local label="$1"
     local command="$2"
@@ -113,6 +132,21 @@ wait_for() {
     done
 
     record_failure "$label timed out after ${TIMEOUT_SECONDS}s"
+    return 1
+}
+
+wait_for_gh_command_blocked() {
+    local deadline=$((SECONDS + TIMEOUT_SECONDS))
+
+    while (( SECONDS < deadline )); do
+        if codex_gh_command_is_blocked; then
+            log "OK: Codex gh command hook blocks gh auth status"
+            return 0
+        fi
+        sleep "$POLL_SECONDS"
+    done
+
+    record_failure "Codex gh command hook blocks gh auth status timed out after ${TIMEOUT_SECONDS}s"
     return 1
 }
 
@@ -149,6 +183,7 @@ main() {
     log "waiting for root Codex config"
     wait_for "root Codex config exists" "[[ -f '$REPO_DIR/.codex/config.toml' ]]"
     validate_codex_config "root" "$REPO_DIR/.codex/config.toml" "root" "root" "ExoMonad Root TL Protocol"
+    wait_for_gh_command_blocked
 
     wait_for_config_role "Codex TL worktree config exists" "tl"
     tl_config="$(find_config_by_role tl || true)"

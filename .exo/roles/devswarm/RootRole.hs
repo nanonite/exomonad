@@ -23,6 +23,7 @@ import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription,
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Types (allowResponse, allowStopResponse, BeforeModelOutput (..), AfterModelOutput (..))
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
+import HookPolicy (preToolUseWithGhBlock)
 import PRReviewHandler (prReviewEventHandlers)
 import TLPhase (TLPhase (..), TLEvent (..), ChildHandle (..))
 
@@ -125,7 +126,7 @@ config =
           sendMessage = mkHandler @SendMessage
         },
       hooks = HookConfig
-        { preToolUse       = \_ -> pure (allowResponse Nothing),
+        { preToolUse       = preToolUseWithGhBlock (\_ -> pure (allowResponse Nothing)),
           postToolUse      = teamRegistrationPostToolUse,
           onStop           = \_ -> pure allowStopResponse,
           onSubagentStop   = \_ -> pure allowStopResponse,

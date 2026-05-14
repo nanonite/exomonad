@@ -29,6 +29,7 @@ import ExoMonad.Guest.Types (HookInput (..), HookOutput (..), Runtime (..), Stop
 import ExoMonad.Permissions (PermissionCheck (..), checkAgentPermissions)
 import ExoMonad.Types (HookConfig (..), Effects, defaultSessionStartHook)
 import DevPhase (DevPhase(..), DevEvent)
+import HookPolicy (preToolUseWithGhBlock)
 
 -- ============================================================================
 -- Gemini Tool Types
@@ -102,7 +103,7 @@ geminiOnly check hookInput tool =
 httpDevHooks :: HookConfig
 httpDevHooks =
   HookConfig
-    { preToolUse = permissionCascade,
+    { preToolUse = preToolUseWithGhBlock permissionCascade,
       postToolUse = \_ -> pure (postToolUseResponse Nothing),
       onStop = \_ -> devStopCheck,
       onSubagentStop = \_ -> devStopCheck,

@@ -27,6 +27,7 @@ import ExoMonad.Guest.Tools.Tasks
   )
 import ExoMonad.Guest.Types (allowResponse, allowStopResponse, postToolUseResponse, BeforeModelOutput (..), AfterModelOutput (..))
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
+import HookPolicy (preToolUseWithGhBlock)
 import WorkerStopCheck (workerStopCheck)
 
 -- | Worker notify_parent: thin wrapper, no phase transitions.
@@ -117,7 +118,7 @@ config =
           },
       hooks =
         HookConfig
-          { preToolUse = \_ -> pure (allowResponse Nothing),
+          { preToolUse = preToolUseWithGhBlock (\_ -> pure (allowResponse Nothing)),
             postToolUse = \_ -> pure (postToolUseResponse Nothing),
             onStop = \_ -> workerStopCheck,
             onSubagentStop = \_ -> pure allowStopResponse,

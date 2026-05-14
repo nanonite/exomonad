@@ -1031,6 +1031,62 @@ async fn wasm_hook_pre_tool_use_allow() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_pre_tool_use_blocks_gh_commands_for_dev() {
+    let runtime = build_test_runtime().await;
+
+    let hook_input = json!({
+        "role": "dev",
+        "session_id": "test-session",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "bash",
+        "tool_input": {"command": "gh auth status"}
+    });
+
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &hook_input)
+        .await
+        .expect("PreToolUse hook failed");
+
+    assert_eq!(output["continue"], false, "gh command should be blocked: {output:#}");
+    assert!(
+        output["stopReason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Do not run gh commands"),
+        "gh command denial should explain the policy: {output:#}"
+    );
+    assert_eq!(
+        output["hookSpecificOutput"]["permissionDecision"],
+        "deny",
+        "gh command should return a deny permission decision: {output:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_pre_tool_use_allows_words_containing_gh() {
+    let runtime = build_test_runtime().await;
+
+    let hook_input = json!({
+        "role": "dev",
+        "session_id": "test-session",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "bash",
+        "tool_input": {"command": "printf '%s\\n' ghost"}
+    });
+
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &hook_input)
+        .await
+        .expect("PreToolUse hook failed");
+
+    assert_eq!(output["continue"], true, "non-gh command should be allowed: {output:#}");
+}
+
 // ============================================================================
 // Multi-Suspend Verification
 // ============================================================================
