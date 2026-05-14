@@ -199,6 +199,15 @@ e2e-opencode-tl:
 e2e-opencode-worker:
     ./tests/e2e/opencode-worker/run.sh
 
+# Run E2E Codex hooks test (root/TL/dev/reviewer hook config and dispatch)
+e2e-codex-hooks:
+    ./tests/e2e/codex-hooks/run.sh
+
+# Check E2E Codex hooks harness scripts without launching Codex/tmux
+check-e2e-codex-hooks:
+    bash -n tests/e2e/codex-hooks/run.sh
+    bash -n tests/e2e/codex-hooks/validate.sh
+
 # Run E2E chainlink issue create test (chainlink_issue_create MCP tool via ProcessRun)
 e2e-chainlink:
     ./tests/e2e/chainlink/run.sh
