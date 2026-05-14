@@ -1167,14 +1167,29 @@ impl<
             let branch_name = BranchName::from(child_birth.to_string().as_str());
 
             let worktree_path = self.worktree_base.join(agent_name.as_str());
+            let mut remove_worktree_on_spawn_failure = false;
 
             if options.standalone_repo {
                 self.init_standalone_repo(&worktree_path).await?;
+                remove_worktree_on_spawn_failure = true;
                 if !options.allowed_dirs.is_empty() {
                     self.copy_allowed_dirs(&worktree_path, &options.allowed_dirs).await?;
                 }
+            } else if worktree_path.exists() {
+                if !worktree_path.is_dir() {
+                    return Err(anyhow!(
+                        "Existing leaf worktree path is not a directory: {}",
+                        worktree_path.display()
+                    ));
+                }
+                info!(
+                    worktree_path = %worktree_path.display(),
+                    branch_name = %branch_name,
+                    "Reusing existing leaf worktree"
+                );
             } else {
                 self.create_worktree_checked(&worktree_path, &branch_name, &current_branch).await?;
+                remove_worktree_on_spawn_failure = true;
             }
 
             self.create_socket_symlink(&worktree_path).await;
@@ -1213,8 +1228,7 @@ impl<
                 Err(e) => {
                     warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
                     let _ = fs::remove_dir_all(&agent_config_dir).await;
-                    // Remove worktree if it was created
-                    if worktree_path.exists() {
+                    if remove_worktree_on_spawn_failure && worktree_path.exists() {
                         let git_wt = self.git_wt().clone();
                         let path = worktree_path.clone();
                         let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
