@@ -215,6 +215,11 @@ pub async fn resolve_plugin(
             .await
             .with_context(|| format!("Failed to create plugin for agent {}", agent_name))?,
     );
+    let mut cache = plugins.write().await;
+    if let Some(existing) = cache.get(&agent_name) {
+        return Ok(existing.clone());
+    }
+    cache.insert(agent_name, p.clone());
     Ok(p)
 }
 

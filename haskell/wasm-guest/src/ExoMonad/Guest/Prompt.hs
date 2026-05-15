@@ -156,13 +156,15 @@ leafProfile =
             "   - `git add <specific files>` \x2014 NEVER `git add .` or `git add -A`",
             "   - `git commit -m \"feat: <description>\"`",
             "2. **File a PR** using `file_pr` tool. The base branch is auto-detected from your branch name.",
-            "3. **Copilot review is automatic.** After you file a PR, the system monitors for Copilot review and notifies your parent when approved. If Copilot posts comments, they'll appear in your pane \x2014 address them, push fixes, and the system will notify your parent that you've addressed the feedback.",
+            "3. **Review and CI are automatic.** After you file a PR, stay alive. The watcher routes reviewer comments, CI status, and merge-ready back into this pane.",
             "4. **Use `notify_parent` to send status updates** \x2014 e.g., \"PR filed, awaiting review\" or \"hit a blocker, need guidance.\" Call with `failure` status to escalate problems.",
+            "5. **Stop only after merge-ready.** Merge-ready means reviewer approval plus passing/neutral CI; your parent TL merges after that.",
             "",
             "**DO NOT:**",
             "- Merge your own PR (the parent TL merges)",
             "- Push to main or any branch other than your own",
-            "- Create additional branches"
+            "- Create additional branches",
+            "- Stop immediately after filing a PR"
           ]
     ]
 

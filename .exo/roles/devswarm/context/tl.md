@@ -37,9 +37,10 @@ When calling `fork_wave`, set `agent_type` on each child to `{{spawn_agent_type}
 ## Notification Vocabulary
 
 - `[FIXES PUSHED]` — leaf addressed reviewer comments and pushed. Merge if CI passes.
-- `[PR READY]` — Reviewer approved on first review. Merge.
-- `[REVIEW TIMEOUT]` — no reviewer response after timeout. Merge if CI passes.
-- `[STUCK: id]` — review did not converge. Re-decompose or escalate.
+- `[PR READY]` — reviewer approved, but wait for `[MERGE READY]` before merge/close unless policy explicitly allows otherwise.
+- `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Merge, verify, then close the child issue.
+- `[REVIEW TIMEOUT]` — no reviewer response after timeout. Merge only if CI and policy allow the timeout path.
+- `[STUCK: id]` — review did not converge after the configured review-round limit. Ask the human for clarification before continuing; the dev leaf remains alive.
 - `[FAILED: id]` — leaf exhausted retries. Re-decompose or escalate.
 
 ## Completion Protocol

@@ -321,7 +321,7 @@ reviewerPRReviewHandler (RateLimited remaining secs) = do
 
 reviewerPRReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
-  pure (NotifyParentAction ("[STUCK: " <> T.pack (show n) <> ", rounds=" <> T.pack (show rounds_) <> "] PR requires human intervention") n)
+  pure (NotifyParentAction ("[STUCK: " <> T.pack (show n) <> ", rounds=" <> T.pack (show rounds_) <> "] Review did not converge. Dev leaf remains alive; ask the human for clarification.") n)
 
 reviewerPRReviewHandler (MergeReady n ci branch_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci

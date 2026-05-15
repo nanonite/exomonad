@@ -243,6 +243,18 @@ check-e2e-chainlink-timer-role-scope:
     bash -n tests/e2e/chainlink-timer-role-scope/validate.sh
     bash tests/e2e/chainlink-timer-role-scope/validate.sh
 
+# Run Tangled PR integration test through Codex root/TL/worker/dev/reviewer roles.
+# Requires the local knot container: docker compose up -d  (in tests/e2e/tangled-ci/)
+e2e-tangled-pr-codex:
+    ./tests/e2e/tangled-pr-codex/run.sh
+
+# Check Tangled PR Codex E2E scripts without launching agents or containers.
+check-e2e-tangled-pr-codex:
+    bash -n tests/e2e/tangled-pr-codex/run.sh
+    bash -n tests/e2e/tangled-pr-codex/validate.sh
+    bash -n tests/e2e/tangled-pr-codex/deferred-spindle.sh
+    python3 -m py_compile tests/e2e/tangled-pr-codex/knot-event-relay.py
+
 # Run Tangled CI integration test.
 # Requires only the knot container: docker compose up -d  (in tests/e2e/tangled-ci/)
 # Manages spindle lifecycle entirely: kills any existing instance, starts fresh, cleans up on exit.

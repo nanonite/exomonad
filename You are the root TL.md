@@ -13,8 +13,10 @@ Workflow per issue:
      — leave it unset.
   5. Start a Chainlink timer when you assign/spawn work. Use
      chainlink_session_status to observe child session progress.
-  6. Stop the timer and close the Chainlink issue only after the implementing
-     agent has ended its session and the PR/review/merge requirements are done.
+  6. Wait for `[MERGE READY]` before merge/close. Merge-ready means reviewer
+     approval plus CI success/neutral in the configured readiness window.
+  7. Stop the timer and close the Chainlink issue only after merge-ready,
+     merge, verification, and the implementing agent session end are complete.
 
 Do not use Chainlink agent, sync, or lock commands. Do not tell workers or dev
 leaves to close their own assigned issue.
@@ -34,14 +36,21 @@ SERVER MANAGEMENT: NEVER run `exomonad init`, `exomonad serve`, or
 
 Convergence:
   - Do NOT poll. Return after spawning. Wait for [PR READY] / [FIXES PUSHED]
-    / [REVIEW TIMEOUT] / [from: ...] notifications.
-  - On [PR READY] or [REVIEW TIMEOUT] with green CI: merge_pr.
+    / [MERGE READY] / [REVIEW TIMEOUT] / [STUCK: ...] / [from: ...]
+    notifications.
+  - On [MERGE READY]: merge_pr, verify, then close the Chainlink issue.
+  - On [PR READY]: keep waiting for CI and the merge-ready signal unless policy
+    explicitly allows another path.
+  - On [REVIEW TIMEOUT] with green CI: merge only if timeout policy allows it.
+  - On [STUCK: ...]: ask the human for clarification before continuing. The
+    dev leaf remains alive because it owns the PR worktree.
   - On [FAILED: ...]: re-spec or escalate, do not hand-fix.
 
 PR STATUS: There is no GitHub remote. Do NOT use `gh` commands — they will
   fail. The local PR registry is at .exo/prs.json. To check what has been
   filed: `cat .exo/prs.json`. The worktree event watcher automatically spawns
-  a reviewer and delivers [PR READY] / [FIXES PUSHED] to you when done.
+  a reviewer and delivers [PR READY] / [FIXES PUSHED] / [MERGE READY] /
+  [STUCK: ...] to you when done.
   You do not need to check PR status manually.
 
 Sanity check the new behavior on the FIRST spawn:

@@ -441,7 +441,6 @@ where
                 let agent_name = &pr.author_agent;
                 let agent_type = AgentType::from_dir_name(agent_name);
                 let branch = BranchName::from(pr.head_branch.as_str());
-                let comment_count = obs.comments.len();
                 let (local_reviews, _local_review_state) = obs_to_review_parts(obs);
 
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
@@ -460,13 +459,21 @@ where
                 } else {
                     state_guard.insert(
                         *pr_number,
-                        WatchState::new(
-                            &branch,
-                            agent_type,
-                            &obs.head_sha,
-                            obs.ci_status,
-                            comment_count,
-                        ),
+                        WatchState::new(&branch, agent_type, &obs.head_sha, CIStatus::Unknown, 0),
+                    );
+                    let actions = compute_pr_actions(
+                        state_guard
+                            .get_mut(pr_number)
+                            .expect("watch state inserted above"),
+                        PRNumber::new(*pr_number),
+                        &obs.head_sha,
+                        &obs.comments,
+                        &local_reviews,
+                        obs.ci_status,
+                        pr.merge_blocked_on_ci,
+                        branch.as_str(),
+                        &|c, r| format_review_message(c, r),
+                        self.policy.reviewer_max_rounds,
                     );
                     // Spawn reviewer immediately on first sighting of a new open PR
                     if let Some(spawner) = &self.reviewer_spawner {
@@ -491,7 +498,7 @@ where
                             }
                         }
                     }
-                    vec![]
+                    actions
                 };
 
                 if !actions.is_empty() {
@@ -522,6 +529,7 @@ where
                         event_type,
                         payload,
                     } => {
+                        let release_message = merge_ready_release_message(&payload);
                         if event_type == "ci_status" {
                             info!(
                                 pr_number,
@@ -537,6 +545,10 @@ where
                         {
                             self.handle_event_action(response, branch.as_str(), agent_type)
                                 .await;
+                            if let Some(message) = release_message {
+                                self.deliver_release_message(branch.as_str(), agent_type, &message)
+                                    .await;
+                            }
                         }
                     }
                     PendingAction::EmitEvent {
@@ -816,6 +828,29 @@ where
             }
             EventActionResponse::NoAction => {}
         }
+    }
+
+    async fn deliver_release_message(&self, branch: &str, agent_type: AgentType, message: &str) {
+        let agent_name = AgentName::from(branch);
+        let tab_name = if let Ok(records) = self.ctx.agent_resolver().records_ref().try_read() {
+            records.get(&agent_name).map(|r| r.display_name.clone())
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            let slug = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
+            agent_type.tab_display_name(slug)
+        });
+
+        crate::services::delivery::deliver_to_agent(
+            &*self.ctx,
+            branch,
+            &tab_name,
+            &AgentName::from("event-handler"),
+            message,
+            "Merge-ready release",
+        )
+        .await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1143,6 +1178,41 @@ fn signals_within_merge_ready_window(
     } else {
         ci_mergeable_at.duration_since(review_approved_at) <= MERGE_READY_SIGNAL_WINDOW
     }
+}
+
+fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
+    let kind_is_merge_ready = payload
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .is_some_and(|kind| kind == "merge_ready");
+    let ci_event_is_merge_ready = payload
+        .get("merge_ready")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    if !kind_is_merge_ready && !ci_event_is_merge_ready {
+        return None;
+    }
+
+    let pr_number = payload
+        .get("pr_number")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let status = payload
+        .get("ci_status")
+        .or_else(|| payload.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("success");
+    let branch = payload
+        .get("branch")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+
+    Some(format!(
+        "[MERGE READY] PR #{} on {} has reviewer approval and CI {}. You may stop; the parent TL owns merge.",
+        pr_number, branch, status
+    ))
 }
 
 fn format_review_message(comments: &[LocalReviewComment], reviews: &[LocalReview]) -> String {
@@ -1513,10 +1583,6 @@ async fn git_head_sha(worktree_path: &std::path::Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn test_branch(name: &str, _at: AgentType) -> BranchName {
-        BranchName::from(name)
-    }
-
     fn test_state(branch: &BranchName, agent_type: AgentType, sha: &str) -> WatchState {
         WatchState::new(branch, agent_type, sha, CIStatus::Unknown, 0)
     }
@@ -1672,6 +1738,42 @@ mod tests {
     }
 
     #[test]
+    fn test_initial_approved_green_ci_observation_fires_merge_ready() {
+        let branch = BranchName::from("main.feat-gemini");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &reviews,
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload,
+            } if payload["kind"] == "merge_ready"
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "ci_status",
+                payload,
+            } if payload["status"] == "success"
+        )));
+        assert!(state.merge_ready_notified);
+    }
+
+    #[test]
     fn test_green_ci_after_approval_fires_merge_ready_ci_event() {
         let branch = BranchName::from("main.feat-gemini");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
@@ -1701,6 +1803,47 @@ mod tests {
             } if payload["merge_ready"] == true && payload["reviewer_approved"] == true
         )));
         assert!(state.merge_ready_notified);
+    }
+
+    #[test]
+    fn test_merge_ready_review_payload_builds_dev_release_message() {
+        let payload = serde_json::json!({
+            "kind": "merge_ready",
+            "pr_number": 7,
+            "ci_status": "success",
+            "branch": "main.feature.dev",
+        });
+
+        let message = merge_ready_release_message(&payload).unwrap();
+
+        assert!(message.contains("[MERGE READY] PR #7"));
+        assert!(message.contains("main.feature.dev"));
+        assert!(message.contains("You may stop"));
+    }
+
+    #[test]
+    fn test_merge_ready_ci_payload_builds_dev_release_message() {
+        let payload = serde_json::json!({
+            "pr_number": 8,
+            "status": "neutral",
+            "branch": "main.feature.dev",
+            "merge_ready": true,
+        });
+
+        let message = merge_ready_release_message(&payload).unwrap();
+
+        assert!(message.contains("[MERGE READY] PR #8"));
+        assert!(message.contains("CI neutral"));
+    }
+
+    #[test]
+    fn test_non_merge_ready_payload_has_no_release_message() {
+        let payload = serde_json::json!({
+            "kind": "approved",
+            "pr_number": 9,
+        });
+
+        assert!(merge_ready_release_message(&payload).is_none());
     }
 
     #[test]
@@ -1753,6 +1896,45 @@ mod tests {
             PendingAction::WasmEvent {
                 event_type: "pr_review",
                 ..
+            }
+        )));
+    }
+
+    #[test]
+    fn test_changes_requested_at_max_rounds_fires_stuck() {
+        let branch = BranchName::from("main.feat-gemini");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let reviews = vec![test_review(
+            "Still needs work",
+            ReviewState::ChangesRequested,
+        )];
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &reviews,
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, _| "Still needs work".to_string(),
+            1,
+        );
+
+        assert!(state.stuck);
+        assert_eq!(state.rounds, 1);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload,
+            } if payload["kind"] == "stuck" && payload["rounds"] == 1
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WriteRegistryStuck {
+                pr_number: 1,
+                rounds: 1,
             }
         )));
     }

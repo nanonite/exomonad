@@ -133,7 +133,7 @@ commitsPushed n ci =
 -- | PR stuck after max review rounds — signals TL human intervention needed.
 --
 -- >>> stuck 42 7
--- "[STUCK: 42, rounds=7] Review did not converge after 7 rounds. Human intervention required."
+-- "[STUCK: 42, rounds=7] Review did not converge after 7 rounds. Dev leaf remains alive. Ask the human for clarification before continuing."
 stuck :: Int -> Int -> Text
 stuck n rounds_ =
   "[STUCK: "
@@ -142,4 +142,4 @@ stuck n rounds_ =
     <> T.pack (show rounds_)
     <> "] Review did not converge after "
     <> T.pack (show rounds_)
-    <> " rounds. Human intervention required."
+    <> " rounds. Dev leaf remains alive. Ask the human for clarification before continuing."

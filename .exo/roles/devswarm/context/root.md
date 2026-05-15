@@ -29,9 +29,10 @@ Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is
 ## Notification Vocabulary
 
 - `[FIXES PUSHED]` — leaf addressed reviewer comments and pushed. Merge if CI passes.
-- `[PR READY]` — Reviewer approved on first review. Merge.
-- `[REVIEW TIMEOUT]` — no reviewer response after timeout. Merge if CI passes.
-- `[STUCK: id]` — review did not converge. Re-decompose or escalate.
+- `[PR READY]` — reviewer approved, but wait for `[MERGE READY]` before merge/close unless policy explicitly allows otherwise.
+- `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Merge, verify, then close the Chainlink issue.
+- `[REVIEW TIMEOUT]` — no reviewer response after timeout. Merge only if CI and policy allow the timeout path.
+- `[STUCK: id]` — review did not converge after the configured review-round limit. Ask the human for clarification before continuing; the dev leaf remains alive.
 - `[FAILED: id]` — leaf exhausted retries. Re-decompose or escalate.
 
 ## Chainlink Coordination
@@ -43,7 +44,8 @@ You own issue decomposition, timer lifecycle, PR merge decisions, and final issu
 - Use same-worktree workers only for narrow subissues where direct commits to the parent worktree are acceptable.
 - Use `chainlink_timer_start` when assigning/spawning coordinator-owned work and `chainlink_timer_stop` after review, CI, and merge are complete.
 - Use `chainlink_session_status` to observe whether child agents have started, attached to an issue, or ended with handoff notes.
-- Use `chainlink_issue_close` only as coordinator authority after the implementing agent ended its session and the PR/review/merge conditions are satisfied.
+- Use `chainlink_issue_close` only as coordinator authority after merge-ready, merge, verification, and the implementing agent's session end are complete.
+- Treat stuck PR review loops as a human-clarification point. Do not automatically close, respawn, or replace the dev leaf that owns the PR worktree.
 
 Do not use Chainlink agent, sync, or lock commands. Do not ask workers or dev leaves to close their own assigned issue.
 

@@ -39,6 +39,7 @@ data DevEvent
   | ReviewApprovedEv PRNumber
   | FixesPushedEv PRNumber Text
   | CommitsPushedEv PRNumber Text
+  | MergeReadyEv PRNumber Text Text
   deriving (Show, Eq)
 
 instance StateMachine DevPhase DevEvent where
@@ -47,8 +48,12 @@ instance StateMachine DevPhase DevEvent where
   transition phase event = case event of
     PRCreated prNum url _branch ->
       Transitioned (DevPRFiled prNum url)
-    NotifyParentSuccess _ ->
-      Transitioned DevDone
+    NotifyParentSuccess _ -> case phase of
+      DevPRFiled _ _ -> Transitioned phase
+      DevUnderReview _ _ -> Transitioned phase
+      DevChangesRequested _ _ -> Transitioned phase
+      DevApproved _ -> Transitioned phase
+      _ -> Transitioned DevDone
     NotifyParentFailure msg ->
       Transitioned (DevFailed msg)
     ReviewReceivedEv prNum comments ->
@@ -65,13 +70,17 @@ instance StateMachine DevPhase DevEvent where
             DevUnderReview _ r -> r + 1
             _ -> 1
        in Transitioned (DevUnderReview prNum round)
+    MergeReadyEv _prNum _ci _branch ->
+      Transitioned DevDone
 
   canExit (DevChangesRequested pr _) =
     MustBlock $ "PR #" <> T.pack (show pr) <> " has changes requested. Address review comments before stopping."
   canExit (DevPRFiled pr _) =
-    ShouldNudge $ "PR #" <> T.pack (show pr) <> " awaiting review. System will auto-notify parent."
+    MustBlock $ "PR #" <> T.pack (show pr) <> " awaiting review. Stay alive until merge-ready."
   canExit (DevUnderReview pr _) =
-    ShouldNudge $ "PR #" <> T.pack (show pr) <> " under review. System will auto-notify parent."
+    MustBlock $ "PR #" <> T.pack (show pr) <> " under review. Stay alive until merge-ready."
+  canExit (DevApproved pr) =
+    MustBlock $ "PR #" <> T.pack (show pr) <> " approved, waiting for CI merge-ready signal."
   canExit _ = Clean
 
 instance ToJSON DevPhase where
