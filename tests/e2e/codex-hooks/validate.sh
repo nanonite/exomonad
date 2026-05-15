@@ -156,9 +156,6 @@ validate_codex_config() {
     local role="$3"
     local agent_name="$4"
     local instruction_marker="$5"
-    local hooks_file
-
-    hooks_file="$(dirname "$config")/hooks.json"
 
     contains "$config" 'approval_policy = "never"' \
         || record_failure "$label config missing approval_policy"
@@ -171,25 +168,38 @@ validate_codex_config() {
     contains "$config" "$instruction_marker" \
         || record_failure "$label config missing instruction marker"
 
-    contains "$hooks_file" 'exomonad hook pre-tool-use --runtime codex' \
-        || record_failure "$label hooks missing PreToolUse command"
-    contains "$hooks_file" 'exomonad hook post-tool-use --runtime codex' \
-        || record_failure "$label hooks missing PostToolUse command"
-    contains "$hooks_file" 'exomonad hook stop --runtime codex' \
-        || record_failure "$label hooks missing Stop command"
-    contains "$hooks_file" '"timeout": 600' \
-        || record_failure "$label hooks missing explicit timeout for trust hash stability"
-    contains "$hooks_file" '"async": false' \
-        || record_failure "$label hooks missing explicit async=false for trust hash stability"
-    contains "$config" ':pre_tool_use:0:0"]' \
-        || record_failure "$label config missing trusted PreToolUse hook state"
-    contains "$config" ':post_tool_use:0:0"]' \
-        || record_failure "$label config missing trusted PostToolUse hook state"
-    contains "$config" ':stop:0:0"]' \
-        || record_failure "$label config missing trusted Stop hook state"
+    [[ ! -f "$(dirname "$config")/hooks.json" ]] \
+        || record_failure "$label should not have per-agent hooks.json"
+}
+
+validate_shared_codex_hooks() {
+    local config="${CODEX_HOME:?CODEX_HOME required}/config.toml"
+
+    contains "$config" '# BEGIN EXOMONAD CODEX HOOKS' \
+        || record_failure "shared Codex config missing ExoMonad hooks block"
+    contains "$config" 'exomonad hook pre-tool-use --runtime codex' \
+        || record_failure "shared Codex hooks missing PreToolUse command"
+    contains "$config" 'exomonad hook post-tool-use --runtime codex' \
+        || record_failure "shared Codex hooks missing PostToolUse command"
+    contains "$config" 'exomonad hook stop --runtime codex' \
+        || record_failure "shared Codex hooks missing Stop command"
+    contains "$config" 'timeout = 600' \
+        || record_failure "shared Codex hooks missing explicit timeout for trust hash stability"
+    contains "$config" 'async = false' \
+        || record_failure "shared Codex hooks missing explicit async=false for trust hash stability"
+    contains "$config" "$config:pre_tool_use:0:0" \
+        || record_failure "shared Codex hooks missing trusted PreToolUse state"
+    contains "$config" "$config:post_tool_use:0:0" \
+        || record_failure "shared Codex hooks missing trusted PostToolUse state"
+    contains "$config" "$config:stop:0:0" \
+        || record_failure "shared Codex hooks missing trusted Stop state"
 }
 
 main() {
+    log "waiting for shared Codex hook config"
+    wait_for "shared Codex hook config exists" "[[ -f '${CODEX_HOME:?CODEX_HOME required}/config.toml' ]] && grep -q 'BEGIN EXOMONAD CODEX HOOKS' '${CODEX_HOME:?CODEX_HOME required}/config.toml'"
+    validate_shared_codex_hooks
+
     log "waiting for root Codex config"
     wait_for "root Codex config exists" "[[ -f '$REPO_DIR/.codex/config.toml' ]]"
     validate_codex_config "root" "$REPO_DIR/.codex/config.toml" "root" "root" "ExoMonad Root TL Protocol"

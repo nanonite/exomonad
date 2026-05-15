@@ -1,7 +1,10 @@
 use serde_json::Value;
 use sha2::Digest;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const EXOMONAD_CODEX_HOOKS_BEGIN: &str = "# BEGIN EXOMONAD CODEX HOOKS";
+const EXOMONAD_CODEX_HOOKS_END: &str = "# END EXOMONAD CODEX HOOKS";
 
 pub const CODEX_HOOKS_JSON: &str = r#"{
   "hooks": {
@@ -54,7 +57,6 @@ developer_instructions = """
 [features]
 hooks = true
 
-{hook_state}
 {mcp_servers}
 "#;
 
@@ -64,7 +66,6 @@ pub fn render_codex_config(
     instructions: &str,
     model: Option<&str>,
     extra_mcp_servers: &HashMap<String, Value>,
-    hooks_json_path: &Path,
 ) -> String {
     let mut mcp_servers = toml::map::Map::new();
     mcp_servers.insert(
@@ -92,11 +93,80 @@ pub fn render_codex_config(
             "{instructions}",
             &escape_multiline_basic_string(instructions),
         )
-        .replace(
-            "{hook_state}",
-            &codex_generated_hook_state_toml(hooks_json_path),
-        )
         .replace("{mcp_servers}", &mcp_servers_to_toml(&mcp_servers))
+}
+
+pub fn codex_user_config_path() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|home| home.join("config.toml"))
+}
+
+pub fn install_codex_user_hooks(config_path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let existing = std::fs::read_to_string(config_path).unwrap_or_default();
+    let stripped = strip_exomonad_codex_hooks_block(&existing);
+    let block = codex_user_hooks_block(config_path);
+    let mut next = stripped.trim_end().to_string();
+    if !next.is_empty() {
+        next.push_str("\n\n");
+    }
+    next.push_str(&block);
+    next.push('\n');
+
+    std::fs::write(config_path, next)
+}
+
+fn strip_exomonad_codex_hooks_block(input: &str) -> String {
+    let mut output = Vec::new();
+    let mut in_block = false;
+    for line in input.lines() {
+        if line.trim() == EXOMONAD_CODEX_HOOKS_BEGIN {
+            in_block = true;
+            continue;
+        }
+        if line.trim() == EXOMONAD_CODEX_HOOKS_END {
+            in_block = false;
+            continue;
+        }
+        if !in_block {
+            output.push(line);
+        }
+    }
+    output.join("\n")
+}
+
+fn codex_user_hooks_block(config_path: &Path) -> String {
+    format!(
+        "{EXOMONAD_CODEX_HOOKS_BEGIN}\n\
+[[hooks.PreToolUse]]\n\
+matcher = \"*\"\n\n\
+[[hooks.PreToolUse.hooks]]\n\
+type = \"command\"\n\
+command = \"exomonad hook pre-tool-use --runtime codex\"\n\
+timeout = 600\n\
+async = false\n\n\
+[[hooks.PostToolUse]]\n\
+matcher = \"*\"\n\n\
+[[hooks.PostToolUse.hooks]]\n\
+type = \"command\"\n\
+command = \"exomonad hook post-tool-use --runtime codex\"\n\
+timeout = 600\n\
+async = false\n\n\
+[[hooks.Stop]]\n\n\
+[[hooks.Stop.hooks]]\n\
+type = \"command\"\n\
+command = \"exomonad hook stop --runtime codex\"\n\
+timeout = 600\n\
+async = false\n\n\
+{}\
+{EXOMONAD_CODEX_HOOKS_END}",
+        codex_generated_hook_state_toml(config_path)
+    )
 }
 
 fn codex_generated_hook_state_toml(hooks_json_path: &Path) -> String {
@@ -298,7 +368,6 @@ mod tests {
             "Use ExoMonad tools.",
             None,
             &HashMap::new(),
-            Path::new("/tmp/repo/.codex/hooks.json"),
         );
 
         assert!(config.contains("approval_policy = \"never\""));
@@ -337,14 +406,7 @@ mod tests {
             }),
         );
 
-        let config = render_codex_config(
-            "agent",
-            "tl",
-            "Plan.",
-            None,
-            &extra,
-            Path::new("/tmp/repo/.codex/hooks.json"),
-        );
+        let config = render_codex_config("agent", "tl", "Plan.", None, &extra);
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
         let docs = &parsed["mcp_servers"]["docs"];
@@ -368,7 +430,6 @@ mod tests {
             "Use ExoMonad tools.",
             Some("gpt-5.2"),
             &HashMap::new(),
-            Path::new("/tmp/repo/.codex/hooks.json"),
         );
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
@@ -384,7 +445,6 @@ mod tests {
             "Use ExoMonad tools.",
             None,
             &HashMap::new(),
-            Path::new("/tmp/repo/.codex/hooks.json"),
         );
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
@@ -392,28 +452,34 @@ mod tests {
     }
 
     #[test]
-    fn renders_trusted_state_for_generated_hooks() {
-        let config = render_codex_config(
-            "worker-1-codex",
-            "dev",
-            "Use ExoMonad tools.",
-            None,
-            &HashMap::new(),
-            Path::new("/tmp/repo/.codex/hooks.json"),
-        );
-
-        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+    fn renders_shared_user_hooks_block_with_trusted_state() {
+        let config = codex_user_hooks_block(Path::new("/tmp/codex-home/config.toml"));
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex hooks TOML");
         let state = parsed["hooks"]["state"]
             .as_table()
             .expect("hook state table");
         for key in [
-            "/tmp/repo/.codex/hooks.json:pre_tool_use:0:0",
-            "/tmp/repo/.codex/hooks.json:post_tool_use:0:0",
-            "/tmp/repo/.codex/hooks.json:stop:0:0",
+            "/tmp/codex-home/config.toml:pre_tool_use:0:0",
+            "/tmp/codex-home/config.toml:post_tool_use:0:0",
+            "/tmp/codex-home/config.toml:stop:0:0",
         ] {
             let trusted_hash = state[key]["trusted_hash"].as_str().expect("trusted hash");
             assert!(trusted_hash.starts_with("sha256:"));
         }
+        assert_eq!(
+            parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str(),
+            Some("exomonad hook pre-tool-use --runtime codex")
+        );
+    }
+
+    #[test]
+    fn strips_existing_exomonad_codex_hooks_block() {
+        let input = "model = \"gpt-5.5\"\n\n# BEGIN EXOMONAD CODEX HOOKS\n[[hooks.Stop]]\n# END EXOMONAD CODEX HOOKS\n\napproval_policy = \"never\"\n";
+        let stripped = strip_exomonad_codex_hooks_block(input);
+        assert_eq!(
+            stripped,
+            "model = \"gpt-5.5\"\n\n\napproval_policy = \"never\""
+        );
     }
 
     #[test]

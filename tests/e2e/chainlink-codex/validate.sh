@@ -117,9 +117,6 @@ validate_codex_config() {
     local role="$3"
     local agent_name="$4"
     local instruction_marker="$5"
-    local hooks_file
-
-    hooks_file="$(dirname "$config")/hooks.json"
 
     grep -Fq 'approval_policy = "never"' "$config" \
         || record_failure "$label config missing approval_policy"
@@ -132,15 +129,29 @@ validate_codex_config() {
     grep -Fq "$instruction_marker" "$config" \
         || record_failure "$label config missing instruction marker"
 
-    grep -Fq 'exomonad hook pre-tool-use --runtime codex' "$hooks_file" \
-        || record_failure "$label hooks missing PreToolUse command"
-    grep -Fq 'exomonad hook post-tool-use --runtime codex' "$hooks_file" \
-        || record_failure "$label hooks missing PostToolUse command"
-    grep -Fq 'exomonad hook stop --runtime codex' "$hooks_file" \
-        || record_failure "$label hooks missing Stop command"
+    [[ ! -f "$(dirname "$config")/hooks.json" ]] \
+        || record_failure "$label should not have per-agent hooks.json"
+}
+
+validate_shared_codex_hooks() {
+    local config="${CODEX_HOME:?CODEX_HOME required}/config.toml"
+
+    grep -Fq '# BEGIN EXOMONAD CODEX HOOKS' "$config" \
+        || record_failure "shared Codex config missing ExoMonad hooks block"
+    grep -Fq 'exomonad hook pre-tool-use --runtime codex' "$config" \
+        || record_failure "shared Codex hooks missing PreToolUse command"
+    grep -Fq 'exomonad hook post-tool-use --runtime codex' "$config" \
+        || record_failure "shared Codex hooks missing PostToolUse command"
+    grep -Fq 'exomonad hook stop --runtime codex' "$config" \
+        || record_failure "shared Codex hooks missing Stop command"
+    grep -Fq "$config:pre_tool_use:0:0" "$config" \
+        || record_failure "shared Codex hooks missing trusted PreToolUse state"
 }
 
 main() {
+    wait_for "shared Codex hook config exists" "[[ -f '${CODEX_HOME:?CODEX_HOME required}/config.toml' ]] && grep -q 'BEGIN EXOMONAD CODEX HOOKS' '${CODEX_HOME:?CODEX_HOME required}/config.toml'"
+    validate_shared_codex_hooks
+
     wait_for "root Codex config exists" "[[ -f '$REPO_DIR/.codex/config.toml' ]]"
     validate_codex_config "root" "$REPO_DIR/.codex/config.toml" "root" "root" "ExoMonad Root TL Protocol"
 

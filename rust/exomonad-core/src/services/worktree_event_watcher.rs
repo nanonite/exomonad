@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
+use url::Url;
 
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
 const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -238,12 +239,20 @@ where
     }
 
     pub fn with_knot_url(mut self, url: String) -> Self {
-        self.knot_url = Some(url);
+        let normalized = normalize_tangled_event_ws_url(&url);
+        if normalized != url {
+            info!(configured_url = %url, subscriber_url = %normalized, "Normalized Tangled knot event stream URL");
+        }
+        self.knot_url = Some(normalized);
         self
     }
 
     pub fn with_spindle_url(mut self, url: String) -> Self {
-        self.spindle_url = Some(url);
+        let normalized = normalize_tangled_event_ws_url(&url);
+        if normalized != url {
+            info!(configured_url = %url, subscriber_url = %normalized, "Normalized Tangled spindle event stream URL");
+        }
+        self.spindle_url = Some(normalized);
         self
     }
 
@@ -1530,6 +1539,38 @@ async fn lookup_pipeline_context(worktrees_dir: &Path, branch_name: BranchName) 
     }
 }
 
+fn normalize_tangled_event_ws_url(input: &str) -> String {
+    let trimmed = input.trim();
+    match Url::parse(trimmed) {
+        Ok(mut url) => {
+            match url.scheme() {
+                "http" => {
+                    let _ = url.set_scheme("ws");
+                }
+                "https" => {
+                    let _ = url.set_scheme("wss");
+                }
+                _ => {}
+            }
+            let path = url.path().trim_end_matches('/');
+            if path.is_empty() {
+                url.set_path("/events");
+            } else if !path.ends_with("/events") {
+                url.set_path(&format!("{path}/events"));
+            }
+            url.to_string()
+        }
+        Err(_) => {
+            let trimmed = trimmed.trim_end_matches('/');
+            if trimmed.ends_with("/events") {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/events")
+            }
+        }
+    }
+}
+
 /// Extracts the branch name from a `sh.tangled.pipeline` event payload.
 /// Returns `None` if the trigger is not a push or has no ref field.
 fn extract_pipeline_branch(event: &serde_json::Value) -> Option<BranchName> {
@@ -1844,6 +1885,42 @@ mod tests {
         });
 
         assert!(merge_ready_release_message(&payload).is_none());
+    }
+
+    #[test]
+    fn test_tangled_event_url_normalizes_base_websocket_url() {
+        assert_eq!(
+            normalize_tangled_event_ws_url("ws://localhost:5555"),
+            "ws://localhost:5555/events"
+        );
+        assert_eq!(
+            normalize_tangled_event_ws_url("ws://localhost:6555/"),
+            "ws://localhost:6555/events"
+        );
+    }
+
+    #[test]
+    fn test_tangled_event_url_preserves_explicit_events_path() {
+        assert_eq!(
+            normalize_tangled_event_ws_url("ws://localhost:5555/events"),
+            "ws://localhost:5555/events"
+        );
+        assert_eq!(
+            normalize_tangled_event_ws_url("ws://localhost:5555/events?cursor=12"),
+            "ws://localhost:5555/events?cursor=12"
+        );
+    }
+
+    #[test]
+    fn test_tangled_event_url_converts_http_scheme_for_websocket_subscription() {
+        assert_eq!(
+            normalize_tangled_event_ws_url("http://localhost:5555"),
+            "ws://localhost:5555/events"
+        );
+        assert_eq!(
+            normalize_tangled_event_ws_url("https://example.test"),
+            "wss://example.test/events"
+        );
     }
 
     #[test]

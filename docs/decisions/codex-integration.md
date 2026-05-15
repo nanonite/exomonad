@@ -10,17 +10,16 @@ Chainlink: #148
 
 Codex is supported as an ExoMonad-spawned agent runtime. It shares the same Rust host, Haskell WASM tool definitions, and hook dispatch path as Claude Code, Gemini, and OpenCode, but its local configuration model is different.
 
-Codex reads runtime configuration from `.codex/config.toml` and hook commands from `.codex/hooks.json`. It does not need an OpenCode-style TypeScript plugin bridge.
+Codex reads runtime configuration from `.codex/config.toml`. ExoMonad installs hook commands once into the active Codex user config (`$CODEX_HOME/config.toml` or `~/.codex/config.toml`) so every Codex worktree uses the same trusted hook source. It does not need an OpenCode-style TypeScript plugin bridge.
 
 ## Decision
 
-ExoMonad writes native Codex config files into each Codex agent worktree:
+ExoMonad writes native Codex identity config files into each Codex agent worktree:
 
 ```
 <worktree>/
 `-- .codex/
     |-- config.toml
-    |-- hooks.json
     `-- exomonad_role.md
 ```
 
@@ -33,11 +32,13 @@ ExoMonad writes native Codex config files into each Codex agent worktree:
 - `[mcp_servers.exomonad]` with `command = "exomonad"` and args `["mcp-stdio", "--role", <role>, "--name", <agent>]`
 - any configured `[extra_mcp_servers]` from `.exo/config.toml`
 
-`hooks.json` contains shell hook commands:
+ExoMonad also maintains a sentinel-managed block in the Codex user config:
 
 - `exomonad hook pre-tool-use --runtime codex`
 - `exomonad hook post-tool-use --runtime codex`
 - `exomonad hook stop --runtime codex`
+
+Codex only honors hook trust state from user/session config layers, not project-local `.codex/config.toml` files. Keeping the hook definitions and `[hooks.state]` trust entries in the user config gives all future worktree agents a stable hook source path and avoids repeated hook approval prompts for unknown agent IDs.
 
 These shell hooks forward Codex events to the existing ExoMonad server over the Unix-domain socket. The server normalizes Codex hook stdin into ExoMonad's internal `HookInput`, calls the Haskell WASM hook handler, then formats the result back into Codex hook stdout semantics.
 
@@ -45,7 +46,7 @@ These shell hooks forward Codex events to the existing ExoMonad server over the 
 
 Codex hooks are shell-native. The hook system executes configured commands with JSON on stdin and consumes stdout/exit status. A Bun or TypeScript bridge would duplicate what Codex already provides.
 
-OpenCode needs a TypeScript plugin because OpenCode exposes lifecycle hooks through its plugin API. Codex does not; `hooks.json` can call `exomonad hook` directly.
+OpenCode needs a TypeScript plugin because OpenCode exposes lifecycle hooks through its plugin API. Codex does not; native command hooks can call `exomonad hook` directly.
 
 ## MCP Configuration
 

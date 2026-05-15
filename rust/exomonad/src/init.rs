@@ -62,13 +62,23 @@ fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
         exomonad_core::services::agent_control::CODEX_TL_INSTRUCTIONS,
         config.model.as_deref(),
         &extra_mcp_servers,
-        &codex_dir.join("hooks.json"),
     );
+    if let Some(config_path) = exomonad_core::codex_config::codex_user_config_path() {
+        exomonad_core::codex_config::install_codex_user_hooks(&config_path).with_context(|| {
+            format!(
+                "Failed to install ExoMonad Codex hooks in {}",
+                config_path.display()
+            )
+        })?;
+        info!(path = %config_path.display(), "Installed shared ExoMonad Codex hooks in user config");
+    } else {
+        warn!("Could not determine Codex home; Codex hook trust may require manual approval");
+    }
     std::fs::write(codex_dir.join("config.toml"), codex_config)?;
-    std::fs::write(
-        codex_dir.join("hooks.json"),
-        exomonad_core::codex_config::CODEX_HOOKS_JSON,
-    )?;
+    let legacy_hooks_path = codex_dir.join("hooks.json");
+    if legacy_hooks_path.exists() {
+        std::fs::remove_file(legacy_hooks_path)?;
+    }
     info!("Codex configuration written to .codex/");
     Ok(())
 }

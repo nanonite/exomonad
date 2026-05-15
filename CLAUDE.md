@@ -310,7 +310,7 @@ Spawn heterogeneous agent teams as a recursive tree:
 - **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
 - **`spawn_codex`** — Spawn a Codex leaf agent in its own worktree+branch. Files PR when done.
 
-**Agent Types:** `Claude` (🤖), `Gemini` (💎), `OpenCode` (💻), `Codex` (🤖), `Shoal` (🌊). Codex agents use `.codex/config.toml` for MCP/instructions and `.codex/hooks.json` for shell-native hooks. Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
+**Agent Types:** `Claude` (🤖), `Gemini` (💎), `OpenCode` (💻), `Codex` (🤖), `Shoal` (🌊). Codex agents use per-agent `.codex/config.toml` for MCP/instructions and a shared ExoMonad-managed hook block in the Codex user config for shell-native hooks. Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
 
 **Multi-WASM:** The server loads multiple WASM modules from `.exo/wasm/`. Convention: if `wasm-guest-{role}.wasm` exists, it's used for that role; otherwise falls back to `wasm-guest-{wasm_name}.wasm` (default). Drop a WASM file, it's available.
 
@@ -361,7 +361,7 @@ Teams inbox registration and delivery are Claude Code-only. OpenCode, Codex, Gem
 | **Tempo observability** | **Built.** Grafana Tempo for lightweight trace storage (~100-200MB RAM). Agents query traces via `curl` + TraceQL against Tempo's HTTP API (port 3200). Optional Grafana UI at `http://localhost:3000`. |
 | **NotebookLM MCP** (optional) | **Vendored.** `vendor/notebooklm-mcp/` — stdio MCP server that automates Google NotebookLM via browser automation. Source-grounded, citation-backed answers from uploaded documentation. Opt-in via `extra_mcp_servers` in `config.toml`. |
 | **OpenCode hooks** (TypeScript plugin bridge) | **Built.** OpenCode agents get `tool.execute.before` / `tool.execute.after` / `event` hooks via a Bun TypeScript plugin written to `.exo/opencode-plugin/` at spawn time. The plugin shells out to `exomonad hook <event> --runtime opencode`, routing to the same WASM dispatch path as Claude Code and Gemini hooks. Enables role-based tool filtering and MCP call context steering (e.g. enforcing `file_pr` body format, `notify_parent` vocabulary). See `docs/decisions/opencode-hooks.md`. |
-| **Codex hooks and config** | **Built.** Codex agents get `.codex/config.toml` with the ExoMonad MCP server, developer instructions, optional model, and extra MCP servers, plus `.codex/hooks.json` shell commands for `PreToolUse`, `PostToolUse`, and `Stop`. Hook commands call `exomonad hook <event> --runtime codex` and use the same WASM dispatch path as the other runtimes. See `docs/decisions/codex-integration.md` and `docs/decisions/codex-hook-wire-format.md`. |
+| **Codex hooks and config** | **Built.** Codex agents get `.codex/config.toml` with the ExoMonad MCP server, developer instructions, optional model, and extra MCP servers. ExoMonad installs shared Codex hook commands for `PreToolUse`, `PostToolUse`, and `Stop` into the active Codex user config so spawned worktrees do not create new hook trust prompts. Hook commands call `exomonad hook <event> --runtime codex` and use the same WASM dispatch path as the other runtimes. See `docs/decisions/codex-integration.md` and `docs/decisions/codex-hook-wire-format.md`. |
 
 ### Tempo Observability
 

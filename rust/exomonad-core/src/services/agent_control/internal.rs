@@ -620,7 +620,7 @@ impl<
     /// Write MCP config for the agent directory.
     ///
     /// Claude agents get `.mcp.json`. Gemini agents get `.gemini/settings.json`.
-    /// Codex agents get `.codex/config.toml` and `.codex/hooks.json`.
+    /// Codex agents get `.codex/config.toml`; shared hooks live in Codex user config.
     /// Uses stdio transport via `exomonad mcp-stdio`.
     pub(crate) async fn write_agent_mcp_config(
         &self,
@@ -701,16 +701,25 @@ impl<
             instructions,
             model,
             extra_mcp_servers,
-            &codex_dir.join("hooks.json"),
         );
 
+        if let Some(config_path) = crate::codex_config::codex_user_config_path() {
+            crate::codex_config::install_codex_user_hooks(&config_path).with_context(|| {
+                format!(
+                    "Failed to install ExoMonad Codex hooks in {}",
+                    config_path.display()
+                )
+            })?;
+            info!(path = %config_path.display(), "Installed shared ExoMonad Codex hooks in user config");
+        } else {
+            warn!("Could not determine Codex home; Codex hook trust may require manual approval");
+        }
         fs::write(codex_dir.join("config.toml"), config).await?;
-        fs::write(
-            codex_dir.join("hooks.json"),
-            crate::codex_config::CODEX_HOOKS_JSON,
-        )
-        .await?;
-        info!(agent_dir = %dir.display(), role = %role.as_str(), "Wrote .codex/config.toml and .codex/hooks.json for Codex agent");
+        let legacy_hooks_path = codex_dir.join("hooks.json");
+        if legacy_hooks_path.exists() {
+            fs::remove_file(&legacy_hooks_path).await?;
+        }
+        info!(agent_dir = %dir.display(), role = %role.as_str(), "Wrote .codex/config.toml for Codex agent");
         Ok(())
     }
 
@@ -1178,9 +1187,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_codex_reviewer_config_uses_reviewer_instructions() {
         let temp_dir = tempfile::tempdir().unwrap();
         let project_dir = temp_dir.path().to_path_buf();
+        let codex_home = project_dir.join("codex-home");
+        std::env::set_var("CODEX_HOME", &codex_home);
         let services = test_services(project_dir.clone());
         let service = AgentControlService::new(services);
         let agent_dir = project_dir.join("reviewer-agent");
@@ -1209,12 +1221,18 @@ mod tests {
         assert!(instructions.contains("request_changes"));
         assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
+        assert!(codex_home.join("config.toml").exists());
+        assert!(!agent_dir.join(".codex/hooks.json").exists());
+        std::env::remove_var("CODEX_HOME");
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_codex_worker_config_uses_worker_instructions() {
         let temp_dir = tempfile::tempdir().unwrap();
         let project_dir = temp_dir.path().to_path_buf();
+        let codex_home = project_dir.join("codex-home");
+        std::env::set_var("CODEX_HOME", &codex_home);
         let services = test_services(project_dir.clone());
         let service = AgentControlService::new(services);
         let agent_dir = project_dir.join("worker-agent");
@@ -1244,6 +1262,9 @@ mod tests {
         assert!(!instructions.contains("chainlink_issue_close"));
         assert!(!instructions.contains("chainlink_agent_init"));
         assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
+        assert!(codex_home.join("config.toml").exists());
+        assert!(!agent_dir.join(".codex/hooks.json").exists());
+        std::env::remove_var("CODEX_HOME");
     }
 
     #[tokio::test]
