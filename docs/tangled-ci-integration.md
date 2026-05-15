@@ -280,7 +280,7 @@ setup-dev.sh (manual equivalent of AT Protocol membership flow)
 ### Prerequisites
 
 - Docker running (`tangled-knot-knot-1` container up)
-- Spindle binary: `tangled-core/cmd/spindle/spindle`
+- Spindle binary installed by `just install-all-dev` or `just spindle-dev`
 - SSH key registered in container's `authorized_keys`
 
 ### What setup-dev.sh does

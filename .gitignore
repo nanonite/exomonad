@@ -28,6 +28,8 @@ cabal.project.wasm.dev
 # Local exomonad state (symlinks, sockets, logs, per-crate config)
 .exomonad/wasm
 .exo/wasm
+.exomonad/bin/
+.exo/bin/
 .exomonad/agents/
 .exo/agents/
 .exomonad/kv/

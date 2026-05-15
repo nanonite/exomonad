@@ -10,7 +10,7 @@ just check-e2e-tangled-pr-codex
 just e2e-tangled-pr-codex
 ```
 
-`just e2e-tangled-pr-codex` launches `exomonad init --verbose --reviewer codex` in an isolated fixture repo. It requires `codex`, `tmux`, `docker`, `sqlite3`, `curl`, the local Tangled knot container, built WASM plugins, and the Spindle binary at `tangled-core/cmd/spindle/spindle`.
+`just e2e-tangled-pr-codex` launches `exomonad init --verbose --reviewer codex` in an isolated fixture repo. It requires `codex`, `tmux`, `docker`, `sqlite3`, `curl`, the local Tangled knot container, built WASM plugins, and the Spindle binary. `just install-all-dev` builds the Spindle binary and installs it to the ExoMonad dev install path.
 
 ## Expected Coverage
 

@@ -87,6 +87,22 @@ wasm-all:
     @echo ">>> Installed to .exo/wasm/:"
     @ls -lh .exo/wasm/wasm-guest-*.wasm
 
+# Build Tangled Spindle and install it for consuming repos.
+spindle-dev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -d tangled-core/cmd/spindle ]; then
+        echo "ERROR: tangled-core/cmd/spindle not found."
+        exit 1
+    fi
+    echo ">>> Building Tangled spindle..."
+    mkdir -p .exo/bin ~/.exo/bin
+    nix develop --command bash -c 'cd tangled-core && go build -o ../.exo/bin/spindle ./cmd/spindle'
+    cp .exo/bin/spindle ~/.exo/bin/spindle
+    chmod 755 .exo/bin/spindle ~/.exo/bin/spindle
+    echo ">>> Installed spindle:"
+    ls -lh .exo/bin/spindle ~/.exo/bin/spindle
+
 # One-time WASM build environment setup (populates cabal package index)
 wasm-setup:
     @echo ">>> Setting up WASM build environment (one-time)..."
@@ -108,13 +124,16 @@ _install profile:
         LABEL="debug"
     fi
 
-    echo ">>> [1/3] Building Haskell WASM plugins (cabal cached if unchanged)..."
+    echo ">>> [1/4] Building Haskell WASM plugins (cabal cached if unchanged)..."
     just wasm-all
 
-    echo ">>> [2/3] Building Rust binary (${LABEL})..."
+    echo ">>> [2/4] Building Rust binary (${LABEL})..."
     nix develop --command cargo build ${CARGO_FLAGS} -p exomonad
 
-    echo ">>> [3/3] Installing binaries..."
+    echo ">>> [3/4] Building and installing Tangled spindle..."
+    just spindle-dev
+
+    echo ">>> [4/4] Installing binaries..."
     mkdir -p ~/.cargo/bin
     mkdir -p ~/.exo/wasm
     # Atomic rename so install works even when the binary is in use (e.g. mcp-stdio running)
@@ -138,6 +157,7 @@ _install profile:
     echo "Installed:"
     ls -lh ~/.cargo/bin/exomonad
     ls -lh .exo/wasm/wasm-guest-devswarm.wasm
+    ls -lh ~/.exo/bin/spindle
 
 # Build Rust binary only (no WASM, no install) — fast iteration
 build:
