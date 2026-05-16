@@ -30,8 +30,10 @@ import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Data.Vector qualified as V
+import Effects.Agent qualified as ProtoAgent
 import Effects.Events qualified as ProtoEvents
 import Effects.Log qualified as Log
+import ExoMonad.Effects.Agent qualified as AgentEffects
 import ExoMonad.Effects.Events qualified as Events
 import ExoMonad.Effects.Log (LogEmitEvent, LogError, LogInfo)
 import ExoMonad.Guest.Continuations (retrieveContinuation)
@@ -263,31 +265,40 @@ hookHandler config = do
 
 handleWorkerExit :: HookInput -> IO Value
 handleWorkerExit hookInput = do
-  logInfo_ "WorkerExit hook firing" `andThenLogValue` do
-    res_ <- runHookEff $ do
-      let maybeAgentId = hiAgentId hookInput
-      case maybeAgentId of
-        Just agentId -> do
-          let actualStatus = fromMaybe "success" (hiExitStatus hookInput)
-          let (status, statusMsg) = case actualStatus of
-                "success" -> ("success", agentId <> " is idle")
-                other -> ("failure", "Worker " <> agentId <> " exited with status: " <> other)
-          res <-
-            suspendEffect @Events.EventsNotifyParent
-              ( ProtoEvents.NotifyParentRequest
-                  { ProtoEvents.notifyParentRequestAgentId = TL.fromStrict agentId,
-                    ProtoEvents.notifyParentRequestStatus = TL.fromStrict status,
-                    ProtoEvents.notifyParentRequestMessage = TL.fromStrict statusMsg,
-                    ProtoEvents.notifyParentRequestOverrideRecipient = Nothing
-                  }
-              )
-          case res of
-            Left err -> void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("Failed to notify parent: " <> T.pack (show err)), Log.errorRequestFields = ""})
-            Right _ -> void $ suspendEffect_ @LogInfo (Log.InfoRequest {Log.infoRequestMessage = TL.fromStrict ("Exit notified for " <> agentId <> " (" <> status <> ")"), Log.infoRequestFields = ""})
-        Nothing -> do
-          void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = "agent_id missing from hook input", Log.errorRequestFields = ""})
-      pure (allowResponse Nothing)
-    pure (Aeson.toJSON res_)
+  res_ <- runHookEff $ do
+    void $ suspendEffect_ @LogInfo (Log.InfoRequest {Log.infoRequestMessage = "WorkerExit hook firing", Log.infoRequestFields = ""})
+    let maybeAgentId = hiAgentId hookInput
+    case maybeAgentId of
+      Just agentId -> do
+        let actualStatus = fromMaybe "success" (hiExitStatus hookInput)
+        let (status, statusMsg) = case actualStatus of
+              "success" -> ("success", agentId <> " is idle")
+              other -> ("failure", "Worker " <> agentId <> " exited with status: " <> other)
+        res <-
+          suspendEffect @Events.EventsNotifyParent
+            ( ProtoEvents.NotifyParentRequest
+                { ProtoEvents.notifyParentRequestAgentId = TL.fromStrict agentId,
+                  ProtoEvents.notifyParentRequestStatus = TL.fromStrict status,
+                  ProtoEvents.notifyParentRequestMessage = TL.fromStrict statusMsg,
+                  ProtoEvents.notifyParentRequestOverrideRecipient = Nothing
+                }
+            )
+        case res of
+          Left err -> void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("Failed to notify parent: " <> T.pack (show err)), Log.errorRequestFields = ""})
+          Right _ -> void $ suspendEffect_ @LogInfo (Log.InfoRequest {Log.infoRequestMessage = TL.fromStrict ("Exit notified for " <> agentId <> " (" <> status <> ")"), Log.infoRequestFields = ""})
+        closeRes <-
+          suspendEffect @AgentEffects.AgentCloseSelf
+            ( ProtoAgent.CloseSelfRequest
+                { ProtoAgent.closeSelfRequestReason = TL.fromStrict statusMsg
+                }
+            )
+        case closeRes of
+          Left err -> void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("Failed to close worker pane: " <> T.pack (show err)), Log.errorRequestFields = ""})
+          Right _ -> void $ suspendEffect_ @LogInfo (Log.InfoRequest {Log.infoRequestMessage = TL.fromStrict ("Close requested for " <> agentId), Log.infoRequestFields = ""})
+      Nothing -> do
+        void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = "agent_id missing from hook input", Log.errorRequestFields = ""})
+    pure (allowResponse Nothing)
+  pure (Aeson.toJSON res_)
 
 -- | Wrap a handler with exception handling.
 wrapHandler :: IO CInt -> IO CInt

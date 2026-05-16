@@ -18,6 +18,10 @@ use prost::Message;
 use serde_json::{json, Value};
 use serial_test::serial;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static MOCK_AGENT_CLOSE_SELF_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MOCK_EVENTS_NOTIFY_PARENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 // ============================================================================
 // Test Infrastructure
@@ -256,6 +260,7 @@ impl EffectHandler for MockAgentHandler {
                     pr_number: 0,
                     pr_url: String::new(),
                     topology: 1,
+                    pane_id: String::new(),
                 };
                 Ok(SpawnSubtreeResponse { agent: Some(agent) }.encode_to_vec())
             }
@@ -275,6 +280,7 @@ impl EffectHandler for MockAgentHandler {
                     pr_number: 0,
                     pr_url: String::new(),
                     topology: 1,
+                    pane_id: String::new(),
                 };
                 Ok(SpawnLeafSubtreeResponse { agent: Some(agent) }.encode_to_vec())
             }
@@ -294,8 +300,17 @@ impl EffectHandler for MockAgentHandler {
                     pr_number: 0,
                     pr_url: String::new(),
                     topology: 2,
+                    pane_id: "%42".into(),
                 };
                 Ok(SpawnWorkerResponse { agent: Some(agent) }.encode_to_vec())
+            }
+            "agent.close_self" => {
+                MOCK_AGENT_CLOSE_SELF_CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(CloseSelfResponse {
+                    success: true,
+                    error: String::new(),
+                }
+                .encode_to_vec())
             }
             "agent.cleanup_merged" => Ok(CleanupMergedResponse {
                 cleaned: vec![],
@@ -417,7 +432,10 @@ impl EffectHandler for MockEventsHandler {
         use exomonad_proto::effects::events::*;
 
         match effect_type {
-            "events.notify_parent" => Ok(NotifyParentResponse { ack: true }.encode_to_vec()),
+            "events.notify_parent" => {
+                MOCK_EVENTS_NOTIFY_PARENT_CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(NotifyParentResponse { ack: true }.encode_to_vec())
+            }
             "events.notify_event" => Ok(NotifyEventResponse { success: true }.encode_to_vec()),
             _ => Err(EffectError::not_found(format!("mock_events/{effect_type}"))),
         }
@@ -1212,6 +1230,40 @@ async fn wasm_hook_session_start() {
     assert!(
         output.is_object(),
         "SessionStart should return an object: {output:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_worker_exit_notifies_parent_and_closes_self() {
+    MOCK_AGENT_CLOSE_SELF_CALLS.store(0, Ordering::SeqCst);
+    MOCK_EVENTS_NOTIFY_PARENT_CALLS.store(0, Ordering::SeqCst);
+
+    let runtime = build_test_runtime().await;
+
+    let hook_input = json!({
+        "role": "worker",
+        "session_id": "test-session",
+        "hook_event_name": "WorkerExit",
+        "agent_id": "test-worker-gemini",
+        "exit_status": "success"
+    });
+
+    let _output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &hook_input)
+        .await
+        .expect("WorkerExit hook failed");
+
+    assert_eq!(
+        MOCK_EVENTS_NOTIFY_PARENT_CALLS.load(Ordering::SeqCst),
+        1,
+        "WorkerExit should notify the parent once"
+    );
+    assert_eq!(
+        MOCK_AGENT_CLOSE_SELF_CALLS.load(Ordering::SeqCst),
+        1,
+        "WorkerExit should reuse agent.close_self once"
     );
 }
 
