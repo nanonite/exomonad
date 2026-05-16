@@ -216,6 +216,7 @@ tangled_owner_did = "did:plc:yourkey"        # optional — when set, exomonad i
 tangled_spindle_db = "spindle.db"            # optional — spindle SQLite path (default: spindle.db in project root)
 tangled_knot_container = "tangled-knot-knot-1"  # optional — knot container name for docker-based repo registration
 
+# Exomonad discovers the knot's canonical runtime hostname from tangled_knot_container during init.
 # Extra MCP servers (HTTP or stdio). Included in .mcp.json for all agents.
 [extra_mcp_servers.metacog]
 type = "http"

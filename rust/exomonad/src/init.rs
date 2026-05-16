@@ -1308,13 +1308,32 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
         }
     };
 
-    let knot_hostname = config
+    let configured_knot_url = config
         .tangled_knot_url
         .as_deref()
-        .unwrap_or("localhost:5555")
-        .trim_start_matches("ws://")
-        .trim_start_matches("wss://")
-        .to_string();
+        .unwrap_or("localhost:5555");
+    let knot_hostname = match discover_knot_container_hostname(container) {
+        Ok(hostname) => {
+            info!(
+                container,
+                configured_knot_url,
+                knot = %hostname,
+                "Discovered canonical Tangled knot hostname from container"
+            );
+            hostname
+        }
+        Err(error) => {
+            let fallback = normalize_knot_hostname(configured_knot_url);
+            warn!(
+                container,
+                configured_knot_url,
+                fallback = %fallback,
+                error = %error,
+                "Could not discover canonical Tangled knot hostname; falling back to normalized configured URL"
+            );
+            fallback
+        }
+    };
 
     let repo_name = tangled_repo_name(cwd);
 
@@ -1516,6 +1535,33 @@ fn infer_knot_db_host_path(container: &str) -> Option<String> {
     }
 }
 
+fn discover_knot_container_hostname(container: &str) -> std::result::Result<String, String> {
+    let output = std::process::Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "sh",
+            "-c",
+            "printf '%s' \"${KNOT_SERVER_HOSTNAME:-}\"",
+        ])
+        .output()
+        .map_err(|error| format!("docker exec failed: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "docker exec returned non-zero: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let hostname = normalize_knot_hostname(&String::from_utf8_lossy(&output.stdout));
+    if hostname.is_empty() {
+        Err("KNOT_SERVER_HOSTNAME is empty".to_string())
+    } else {
+        Ok(hostname)
+    }
+}
+
 fn seed_spindle_knot_cursor(spindle_db: &str, knot_db: &str, knot_hostname: &str) {
     let max_created = match std::process::Command::new("sqlite3")
         .args([knot_db, "SELECT COALESCE(MAX(created), 0) FROM events;"])
@@ -1677,14 +1723,24 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+pub(crate) fn normalize_knot_hostname(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let without_scheme = trimmed
+        .find("://")
+        .map(|index| &trimmed[index + 3..])
+        .unwrap_or(trimmed);
+    let host = without_scheme
+        .trim_start_matches('/')
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+
+    host.to_ascii_lowercase()
+}
+
 fn tangled_dev_repo_did(knot_hostname: &str, repo_name: &str) -> String {
-    let host = knot_hostname
-        .trim_start_matches("ws://")
-        .trim_start_matches("wss://")
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_end_matches('/')
-        .replace(':', "%3A");
+    let host = normalize_knot_hostname(knot_hostname).replace(':', "%3A");
     let repo = repo_name
         .chars()
         .map(|c| {
@@ -2107,6 +2163,34 @@ mod tests {
     #[test]
     fn shell_single_quote_escapes_embedded_quotes() {
         assert_eq!(shell_single_quote("owner's repo"), "'owner'\"'\"'s repo'");
+    }
+
+    #[test]
+    fn normalize_knot_hostname_accepts_supported_url_forms() {
+        for (raw, expected) in [
+            ("localhost", "localhost"),
+            ("localhost:5555", "localhost:5555"),
+            ("ws://localhost", "localhost"),
+            ("ws://localhost:5555", "localhost:5555"),
+            ("ws://localhost:5555/", "localhost:5555"),
+            ("ws://localhost:5555/events", "localhost:5555"),
+            ("wss://localhost:5555", "localhost:5555"),
+            ("http://localhost:5555", "localhost:5555"),
+            ("https://localhost:5555", "localhost:5555"),
+            ("HTTPS://LOCALHOST:5555/events?cursor=1", "localhost:5555"),
+            ("  http://LocalHost:5555/  ", "localhost:5555"),
+            ("http://knot.example.com", "knot.example.com"),
+        ] {
+            assert_eq!(normalize_knot_hostname(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn tangled_dev_repo_did_uses_normalized_knot_hostname() {
+        assert_eq!(
+            tangled_dev_repo_did("http://LocalHost:5555/events", "repo name"),
+            "did:web:localhost%3A5555:repo:repo-name"
+        );
     }
 
     #[test]
