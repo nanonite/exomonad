@@ -31,6 +31,8 @@ Use exomonad MCP tools for orchestration. Git and GitHub operations use `git` an
 - **Dev (Leaf)**: Gemini. Implements a focused spec, files PR. No spawning.
 - **Worker**: Gemini. Ephemeral pane, no branch. Research or in-place edits.
 
+TL/root roles structurally deny `Edit`, `Write`, `MultiEdit`, and `NotebookEdit` in PreToolUse. That deny is the redispatch nudge, not a transient error: use `send_message` for an existing worker, let the dev leaf address reviewer feedback, or re-decompose with `spawn_leaf` / `spawn_worker`.
+
 ## The TL Protocol: Scaffold-Fork-Converge
 
 Every TL at every level of the tree follows this protocol:

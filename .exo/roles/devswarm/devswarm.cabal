@@ -66,3 +66,31 @@ executable wasm-guest-devswarm
         exomonad-proto,
         proto3-runtime,
         vector
+
+test-suite role-hook-tests
+    import: shared
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test . ../../lib
+    main-is: Main.hs
+    other-modules:
+        RootRole
+        TLRole
+        DevRole
+        WorkerRole
+        ReviewerRole
+        TestrunnerRole
+        DevPhase
+        TLPhase
+        TLStopCheck
+        WorkerStopCheck
+        WorkerPhase
+        HttpDevHooks
+        HookPolicy
+        PRReviewHandler
+    build-depends:
+        base,
+        wasm-guest:wasm-guest-internal,
+        exomonad-pdk,
+        exomonad-proto,
+        proto3-runtime,
+        vector

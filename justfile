@@ -4,9 +4,15 @@
 default:
     @just --list
 
-# Format all code (Haskell + Rust)
-fmt:
+# Format all code
+fmt: haskell-fmt rust-fmt
+
+# Format Haskell code
+haskell-fmt:
     nix develop --command bash -c 'cd haskell && ormolu --mode inplace --ghc-opt -XImportQualifiedPost $(find . -name "*.hs" -not -path "./vendor/*")'
+
+# Format Rust code
+rust-fmt:
     nix develop --command cargo fmt --all
 
 # Check formatting (fails if unformatted — run `just fmt` to fix)
@@ -18,13 +24,23 @@ check-fmt:
 lint:
     nix develop --command hlint haskell
 
-# Run fast tests only (Rust unit tests)
-test-fast:
+# Run fast Rust tests only
+rust-test:
     nix develop --command cargo test --workspace --lib
 
+# Run native Haskell tests
+haskell-test:
+    nix develop --command cabal test all
+
+# Run fast tests only (Rust unit tests)
+test-fast: rust-test
+
 # Run every Rust test target through the dev shell
-test-cargo-all:
+rust-test-all:
     nix develop --command cargo test --workspace
+
+# Run every Rust test target through the dev shell
+test-cargo-all: rust-test-all
 
 # Build WASM, then run the Rust host ↔ Haskell WASM integration tests
 test-wasm-integration:
@@ -36,7 +52,7 @@ test:
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/4] Rust unit tests..."
-    nix develop --command cargo test --workspace --lib
+    just rust-test
     echo ">>> [2/4] Rust check (all targets)..."
     nix develop --command cargo check --workspace --all-targets
     echo ">>> [3/4] WASM build..."

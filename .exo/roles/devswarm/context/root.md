@@ -26,6 +26,8 @@ Write specs complete enough that children don't need to ask — but be ready whe
 Never touch another agent's worktree. Never checkout another branch.
 Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is already running. Running init kills the current session including yourself.
 
+TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `MultiEdit`, and `NotebookEdit`. The denial text is the redispatch nudge: follow it by steering the existing worker with `send_message`, letting the leaf handle reviewer feedback, or spawning a new `spawn_leaf` / `spawn_worker`.
+
 ## Notification Vocabulary
 
 ### Dev-leaf signals (PR review loop)
