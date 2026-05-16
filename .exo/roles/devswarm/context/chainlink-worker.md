@@ -9,6 +9,14 @@ You are a worker enhanced with chainlink for structured task tracking and comple
 
 Chainlink is your contract with your parent coordinator. Start a session, mark the assigned subissue as active work, report progress, and end the session with handoff notes. Do not close issues.
 
+## Canonical DB Location
+
+You run inside a git worktree (or a worker pane) that contains no `.chainlink/` directory of its own. ExoMonad anchors you to the project's canonical issue DB by setting `CHAINLINK_DB` in your process environment at spawn time, pointing to the project root's `.chainlink/` directory.
+
+- Run `chainlink ...` and `chainlink_*` MCP tools normally — they resolve the right DB automatically.
+- Do **not** pass `--db` explicitly. The only legitimate use of `--db` is one-off testing against a throwaway DB, which a worker should never do unsupervised.
+- If `chainlink` ever reports "no such issue" for an ID your TL gave you, that is a signal `CHAINLINK_DB` is missing from your env — stop and `notify_parent` immediately rather than silently working against a phantom DB.
+
 ## Worker Chainlink Workflow
 
 ### 1. Start Your Session

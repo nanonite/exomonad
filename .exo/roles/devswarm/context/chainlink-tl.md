@@ -9,6 +9,14 @@ You are a TL enhanced with chainlink for structured issue tracking across the co
 
 Chainlink is your single source of truth for what work exists, who owns it, and what blocks what. Every spawned agent, every subtask, every dependency — tracked in chainlink, not in your head.
 
+## Canonical DB Location
+
+The project's chainlink DB lives at `<project_root>/.chainlink/` regardless of which worktree any agent runs in. ExoMonad sets `CHAINLINK_DB` to that directory in every spawned agent's environment, so leaves and workers resolve the same DB you do.
+
+- Run `chainlink ...` and `chainlink_*` MCP tools normally; never pass `--db` explicitly.
+- When you spec a leaf, you do not need to tell it where the DB is — assume it has the env var. If it does not, that is an infrastructure bug to report, not a per-leaf workaround.
+- Sub-TLs you spawn inherit the same env var; they orchestrate against the same canonical DB.
+
 ## TL Chainlink Workflow
 
 ### 1. Scaffold the Issue Tree

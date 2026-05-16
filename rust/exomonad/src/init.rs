@@ -698,8 +698,11 @@ pub async fn run(
         );
     }
 
-    // Anchor chainlink to the root workspace DB so worktree windows don't create their own
-    let chainlink_db = cwd.join(".chainlink/issues.db");
+    // Anchor chainlink to the root workspace DB so worktree windows don't create their own.
+    // Use the directory form (no /issues.db suffix) to match every spawn-site propagation —
+    // build_spawn_env in services/agent_control/internal.rs is the canonical form, this is the
+    // tmux-level fallback for any process that does not go through build_spawn_env.
+    let chainlink_db = cwd.join(".chainlink");
     let _ = std::process::Command::new("tmux")
         .args([
             "set-environment",

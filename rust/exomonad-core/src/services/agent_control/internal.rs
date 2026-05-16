@@ -128,7 +128,20 @@ impl<
             env_vars.insert("EXOMONAD_TMUX_SESSION".to_string(), session.clone());
         }
 
-        // Path to project root chainlink DB for worktree-aware issue tracking
+        // CHAINLINK_DB anchors every spawned agent to the project-root chainlink DB so a
+        // dev-leaf inside its git worktree (which contains no `.chainlink/`) still resolves
+        // issues against the canonical tracker. The directory form is canonical (chainlink
+        // CLI accepts either, but the directory is the resource and `issues.db` is an
+        // artifact inside it). init.rs uses the same directory form when seeding the tmux
+        // session env as a fallback for processes that bypass this HashMap.
+        //
+        // Propagation contract: this HashMap flows into `build_agent_command` which renders
+        // entries as `KEY=value` shell-prefix tokens (see line ~343) ahead of the agent
+        // command. tmux executes that string, the agent process inherits the env, and every
+        // subsequent subprocess — MCP servers, hook scripts, direct `chainlink` calls —
+        // inherits it transitively. The same path covers windows (TLs, dev-leaves, sub-TLs)
+        // and panes (workers), so adding an entry here reaches all five agent runtimes
+        // (Claude, Codex, Gemini, OpenCode, worker) uniformly.
         env_vars.insert(
             "CHAINLINK_DB".to_string(),
             self.ctx
@@ -339,7 +352,13 @@ impl<
             },
         };
 
-        // Prepend env vars
+        // Shell-prefix every entry in env_vars (`KEY=value KEY2=value2 ...`) ahead of the
+        // agent command. This is the single propagation point that delivers everything
+        // common_spawn_env adds — EXOMONAD_*, CHAINLINK_DB, TRACEPARENT, model API keys — to
+        // the spawned agent process and every subprocess it forks. Both new_tmux_window_inner
+        // and new_tmux_pane (worker panes) call build_agent_command, so this covers all five
+        // agent runtimes uniformly. If a future agent type needs out-of-band propagation
+        // (e.g., a per-process config file), wire it next to this prefix, not instead of it.
         let env_prefix = env_vars
             .iter()
             .map(|(k, v)| format!("{}={}", k, shell_escape::escape(v.into())))
@@ -1353,6 +1372,36 @@ mod tests {
         assert!(
             env.get("EXOMONAD_TMUX_SESSION").is_none(),
             "No tmux session should be set when not configured"
+        );
+    }
+
+    #[test]
+    fn test_common_spawn_env_chainlink_db_directory_form() {
+        let project_dir = PathBuf::from("/tmp/exo-test-project");
+        let services = test_services(project_dir.clone());
+        let service =
+            AgentControlService::new(services).with_birth_branch(BirthBranch::from("main"));
+
+        let agent = AgentName::from("leaf-1");
+        let session_id = BranchName::from("main.leaf-1");
+        let role = crate::domain::Role::dev();
+
+        let env = service.common_spawn_env(&agent, &session_id, &role);
+
+        let chainlink_db = env
+            .get("CHAINLINK_DB")
+            .expect("CHAINLINK_DB must be set so spawned agents resolve the canonical issues DB");
+
+        assert_eq!(
+            chainlink_db,
+            &project_dir.join(".chainlink").display().to_string(),
+            "CHAINLINK_DB must point at the project-root .chainlink directory"
+        );
+        assert!(
+            !chainlink_db.ends_with("/issues.db"),
+            "CHAINLINK_DB must use the directory form, not the file form — both are valid for the \
+             chainlink CLI but the directory is the canonical resource and the project's single \
+             source of truth across all spawn sites (init.rs uses the same form)"
         );
     }
 
