@@ -99,6 +99,23 @@ logs_contain() {
     grep -R "$pattern" "$REPO_DIR/.exo/logs" 2>/dev/null | grep -q .
 }
 
+tmux_contains_hook_review_prompt() {
+    tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
+        | grep "^$SESSION:" \
+        | while IFS= read -r pane; do
+            tmux capture-pane -p -t "$pane" -S -3000 2>/dev/null || true
+        done \
+        | grep -Eiq 'hooks need review|need review before they can run|run /hooks to review|review hooks before'
+}
+
+assert_no_hook_review_prompt() {
+    if tmux_contains_hook_review_prompt; then
+        record_failure "Codex displayed an interactive hook review prompt"
+    else
+        log "OK: no Codex hook review prompt observed"
+    fi
+}
+
 codex_gh_command_is_blocked() {
     local payload
     local output
@@ -175,35 +192,70 @@ validate_codex_config() {
 validate_shared_codex_hooks() {
     local config="${CODEX_HOME:?CODEX_HOME required}/config.toml"
 
+    [[ ! -f "$config" ]] && record_failure "shared Codex config missing"
     contains "$config" '# BEGIN EXOMONAD CODEX HOOKS' \
-        || record_failure "shared Codex config missing ExoMonad hooks block"
+        && record_failure "shared Codex config still contains legacy ExoMonad hooks block"
     contains "$config" 'exomonad hook pre-tool-use --runtime codex' \
-        || record_failure "shared Codex hooks missing PreToolUse command"
+        && record_failure "shared Codex config should not define PreToolUse command hooks"
     contains "$config" 'exomonad hook post-tool-use --runtime codex' \
-        || record_failure "shared Codex hooks missing PostToolUse command"
+        && record_failure "shared Codex config should not define PostToolUse command hooks"
     contains "$config" 'exomonad hook stop --runtime codex' \
-        || record_failure "shared Codex hooks missing Stop command"
-    contains "$config" 'timeout = 600' \
-        || record_failure "shared Codex hooks missing explicit timeout for trust hash stability"
-    contains "$config" 'async = false' \
-        || record_failure "shared Codex hooks missing explicit async=false for trust hash stability"
-    contains "$config" "$config:pre_tool_use:0:0" \
-        || record_failure "shared Codex hooks missing trusted PreToolUse state"
-    contains "$config" "$config:post_tool_use:0:0" \
-        || record_failure "shared Codex hooks missing trusted PostToolUse state"
-    contains "$config" "$config:stop:0:0" \
-        || record_failure "shared Codex hooks missing trusted Stop state"
+        && record_failure "shared Codex config should not define Stop command hooks"
+
+    return 0
+}
+
+validate_hook_trust_for_config() {
+    local label="$1"
+    local codex_config="$2"
+    local user_config="${CODEX_HOME:?CODEX_HOME required}/config.toml"
+
+    contains "$codex_config" 'hook pre-tool-use --runtime codex' \
+        || record_failure "$label config missing PreToolUse command hook"
+    contains "$codex_config" 'hook post-tool-use --runtime codex' \
+        || record_failure "$label config missing PostToolUse command hook"
+    contains "$codex_config" 'hook stop --runtime codex' \
+        || record_failure "$label config missing Stop command hook"
+    contains "$codex_config" 'timeout = 600' \
+        || record_failure "$label config missing explicit timeout for trust hash stability"
+    contains "$codex_config" 'async = false' \
+        || record_failure "$label config missing explicit async=false for trust hash stability"
+
+    if ! python3 - "$user_config" "$codex_config" <<'PY'; then
+import sys
+import tomllib
+
+user_config_path, codex_config_path = sys.argv[1:3]
+with open(user_config_path, "rb") as user_config_file:
+    user_config = tomllib.load(user_config_file)
+
+state = user_config.get("hooks", {}).get("state", {})
+missing = []
+for event in ("pre_tool_use", "post_tool_use", "stop"):
+    key = f"{codex_config_path}:{event}:0:0"
+    trusted_hash = state.get(key, {}).get("trusted_hash")
+    if not isinstance(trusted_hash, str) or not trusted_hash.startswith("sha256:") or len(trusted_hash) != 71:
+        missing.append(key)
+
+if missing:
+    print("\n".join(missing))
+    raise SystemExit(1)
+PY
+        record_failure "$label config missing trusted hook state entries"
+    fi
 }
 
 main() {
-    log "waiting for shared Codex hook config"
-    wait_for "shared Codex hook config exists" "[[ -f '${CODEX_HOME:?CODEX_HOME required}/config.toml' ]] && grep -q 'BEGIN EXOMONAD CODEX HOOKS' '${CODEX_HOME:?CODEX_HOME required}/config.toml'"
+    log "waiting for shared Codex config"
+    wait_for "shared Codex config exists" "[[ -f '${CODEX_HOME:?CODEX_HOME required}/config.toml' ]]"
     validate_shared_codex_hooks
 
     log "waiting for root Codex config"
     wait_for "root Codex config exists" "[[ -f '$REPO_DIR/.codex/config.toml' ]]"
     validate_codex_config "root" "$REPO_DIR/.codex/config.toml" "root" "root" "ExoMonad Root TL Protocol"
+    validate_hook_trust_for_config "root" "$REPO_DIR/.codex/config.toml"
     wait_for_gh_command_blocked
+    assert_no_hook_review_prompt
 
     wait_for_config_role "Codex TL worktree config exists" "tl"
     tl_config="$(find_config_by_role tl || true)"
@@ -212,7 +264,9 @@ main() {
     else
         tl_agent="$(basename "$(dirname "$(dirname "$tl_config")")")"
         validate_codex_config "tl" "$tl_config" "tl" "$tl_agent" "ExoMonad Root TL Protocol"
+        validate_hook_trust_for_config "tl" "$tl_config"
     fi
+    assert_no_hook_review_prompt
 
     wait_for_config_role "Codex dev worktree config exists" "dev"
     dev_config="$(find_config_by_role dev || true)"
@@ -221,6 +275,7 @@ main() {
     else
         dev_agent="$(basename "$(dirname "$(dirname "$dev_config")")")"
         validate_codex_config "dev" "$dev_config" "dev" "$dev_agent" "ExoMonad Dev Agent Protocol"
+        validate_hook_trust_for_config "dev" "$dev_config"
     fi
 
     wait_for "dev output file exists" "find '$REPO_DIR/.exo/worktrees' -name codex-hooks-dev-output.txt -print 2>/dev/null | grep -q ."
@@ -243,10 +298,12 @@ main() {
     else
         reviewer_agent="$(basename "$(dirname "$(dirname "$reviewer_config")")")"
         validate_codex_config "reviewer" "$reviewer_config" "reviewer" "$reviewer_agent" "ExoMonad Reviewer Agent Protocol"
+        validate_hook_trust_for_config "reviewer" "$reviewer_config"
     fi
 
     wait_for "reviewer approval recorded" "[[ -f '$REPO_DIR/.exo/reviews/pr_1.json' ]] && grep -q 'approved' '$REPO_DIR/.exo/reviews/pr_1.json'"
     wait_for "reviewer notify_parent tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'review-pr-1-codex' | grep 'main.codex-hooks-tl-codex' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
+    assert_no_hook_review_prompt
 
     {
         printf 'Codex hooks E2E validation completed at %s\n' "$(date -Iseconds)"

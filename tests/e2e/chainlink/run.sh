@@ -15,10 +15,11 @@ PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 echo ">>> [Phase 0] Checking preconditions..."
 
 EXOMONAD_BIN=""
-if command -v exomonad &>/dev/null; then
-    EXOMONAD_BIN="$(command -v exomonad)"
-elif [[ -x "$PROJECT_ROOT/target/debug/exomonad" ]]; then
+if [[ -x "$PROJECT_ROOT/target/debug/exomonad" ]]; then
     EXOMONAD_BIN="$PROJECT_ROOT/target/debug/exomonad"
+    export PATH="$PROJECT_ROOT/target/debug:$PATH"
+elif command -v exomonad &>/dev/null; then
+    EXOMONAD_BIN="$(command -v exomonad)"
 else
     echo "ERROR: exomonad binary not found. Run 'just install-all-dev' or 'cargo build -p exomonad'."
     exit 1
