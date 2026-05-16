@@ -704,15 +704,12 @@ impl<
         );
 
         if let Some(config_path) = crate::codex_config::codex_user_config_path() {
-            crate::codex_config::install_codex_user_hooks(&config_path).with_context(|| {
-                format!(
-                    "Failed to install ExoMonad Codex hooks in {}",
-                    config_path.display()
-                )
+            crate::codex_config::trust_codex_project(&config_path, dir).with_context(|| {
+                format!("Failed to trust Codex project in {}", config_path.display())
             })?;
-            info!(path = %config_path.display(), "Installed shared ExoMonad Codex hooks in user config");
+            info!(path = %config_path.display(), "Marked Codex agent worktree as trusted");
         } else {
-            warn!("Could not determine Codex home; Codex hook trust may require manual approval");
+            warn!("Could not determine Codex home; worktree may not be trusted automatically");
         }
         fs::write(codex_dir.join("config.toml"), config).await?;
         let legacy_hooks_path = codex_dir.join("hooks.json");

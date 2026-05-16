@@ -1,53 +1,9 @@
 use serde_json::Value;
-use sha2::Digest;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const EXOMONAD_CODEX_HOOKS_BEGIN: &str = "# BEGIN EXOMONAD CODEX HOOKS";
 const EXOMONAD_CODEX_HOOKS_END: &str = "# END EXOMONAD CODEX HOOKS";
-
-pub const CODEX_HOOKS_JSON: &str = r#"{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "exomonad hook pre-tool-use --runtime codex",
-            "timeout": 600,
-            "async": false
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "exomonad hook post-tool-use --runtime codex",
-            "timeout": 600,
-            "async": false
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "exomonad hook stop --runtime codex",
-            "timeout": 600,
-            "async": false
-          }
-        ]
-      }
-    ]
-  }
-}"#;
 
 pub const CODEX_CONFIG_TEMPLATE: &str = r#"{model_config}approval_policy = "never"
 developer_instructions = """
@@ -56,6 +12,32 @@ developer_instructions = """
 
 [features]
 hooks = true
+
+[[hooks.PreToolUse]]
+matcher = "*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "exomonad hook pre-tool-use --runtime codex"
+timeout = 600
+async = false
+
+[[hooks.PostToolUse]]
+matcher = "*"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "exomonad hook post-tool-use --runtime codex"
+timeout = 600
+async = false
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "exomonad hook stop --runtime codex"
+timeout = 600
+async = false
 
 {mcp_servers}
 "#;
@@ -103,21 +85,32 @@ pub fn codex_user_config_path() -> Option<PathBuf> {
         .map(|home| home.join("config.toml"))
 }
 
-pub fn install_codex_user_hooks(config_path: &Path) -> std::io::Result<()> {
+/// Mark `project_path` as trusted in the Codex user config so Codex loads the
+/// project-local `.codex/config.toml` (hooks + MCP) without prompting.
+/// Also strips any legacy global exomonad hook block to prevent duplicate hook execution.
+pub fn trust_codex_project(config_path: &Path, project_path: &Path) -> std::io::Result<()> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
     let existing = std::fs::read_to_string(config_path).unwrap_or_default();
-    let stripped = strip_exomonad_codex_hooks_block(&existing);
-    let block = codex_user_hooks_block(config_path);
-    let mut next = stripped.trim_end().to_string();
-    if !next.is_empty() {
-        next.push_str("\n\n");
-    }
-    next.push_str(&block);
-    next.push('\n');
+    let cleaned = strip_exomonad_codex_hooks_block(&existing);
 
+    let project_str = project_path.display().to_string();
+    let header = format!("[projects.\"{}\"]", escape_toml_quoted_key(&project_str));
+    let already_trusted = cleaned.lines().any(|l| l.trim() == header);
+
+    let mut next = cleaned.trim_end().to_string();
+    if already_trusted {
+        if next == existing.trim_end() {
+            return Ok(());
+        }
+    } else {
+        if !next.is_empty() {
+            next.push_str("\n\n");
+        }
+        next.push_str(&format!("{header}\ntrust_level = \"trusted\"\n"));
+    }
+    next.push('\n');
     std::fs::write(config_path, next)
 }
 
@@ -138,123 +131,6 @@ fn strip_exomonad_codex_hooks_block(input: &str) -> String {
         }
     }
     output.join("\n")
-}
-
-fn codex_user_hooks_block(config_path: &Path) -> String {
-    format!(
-        "{EXOMONAD_CODEX_HOOKS_BEGIN}\n\
-[[hooks.PreToolUse]]\n\
-matcher = \"*\"\n\n\
-[[hooks.PreToolUse.hooks]]\n\
-type = \"command\"\n\
-command = \"exomonad hook pre-tool-use --runtime codex\"\n\
-timeout = 600\n\
-async = false\n\n\
-[[hooks.PostToolUse]]\n\
-matcher = \"*\"\n\n\
-[[hooks.PostToolUse.hooks]]\n\
-type = \"command\"\n\
-command = \"exomonad hook post-tool-use --runtime codex\"\n\
-timeout = 600\n\
-async = false\n\n\
-[[hooks.Stop]]\n\n\
-[[hooks.Stop.hooks]]\n\
-type = \"command\"\n\
-command = \"exomonad hook stop --runtime codex\"\n\
-timeout = 600\n\
-async = false\n\n\
-{}\
-{EXOMONAD_CODEX_HOOKS_END}",
-        codex_generated_hook_state_toml(config_path)
-    )
-}
-
-fn codex_generated_hook_state_toml(hooks_json_path: &Path) -> String {
-    let source = hooks_json_path.display().to_string();
-    let hooks = [
-        (
-            "pre_tool_use",
-            Some("*"),
-            "exomonad hook pre-tool-use --runtime codex",
-        ),
-        (
-            "post_tool_use",
-            Some("*"),
-            "exomonad hook post-tool-use --runtime codex",
-        ),
-        ("stop", None, "exomonad hook stop --runtime codex"),
-    ];
-
-    let mut state = String::new();
-    for (index, (event_key, matcher, command)) in hooks.into_iter().enumerate() {
-        let key = format!("{source}:{event_key}:0:0");
-        let hash = generated_command_hook_hash(event_key, matcher, command);
-        if index > 0 {
-            state.push('\n');
-        }
-        state.push_str(&format!(
-            "[hooks.state.\"{}\"]\ntrusted_hash = \"{}\"\n",
-            escape_toml_quoted_key(&key),
-            hash
-        ));
-    }
-    state.push('\n');
-    state
-}
-
-fn generated_command_hook_hash(event_name: &str, matcher: Option<&str>, command: &str) -> String {
-    let mut handler = serde_json::Map::new();
-    handler.insert("type".to_string(), Value::String("command".to_string()));
-    handler.insert("command".to_string(), Value::String(command.to_string()));
-    handler.insert("timeout".to_string(), Value::Number(600.into()));
-    handler.insert("async".to_string(), Value::Bool(false));
-
-    let mut group = serde_json::Map::new();
-    if let Some(matcher) = matcher {
-        group.insert("matcher".to_string(), Value::String(matcher.to_string()));
-    }
-    group.insert(
-        "hooks".to_string(),
-        Value::Array(vec![Value::Object(handler)]),
-    );
-
-    let mut identity = serde_json::Map::new();
-    identity.insert(
-        "event_name".to_string(),
-        Value::String(event_name.to_string()),
-    );
-    identity.insert("group".to_string(), Value::Object(group));
-
-    version_for_json(&Value::Object(identity))
-}
-
-fn version_for_json(value: &Value) -> String {
-    let canonical = canonical_json(value);
-    let serialized = serde_json::to_vec(&canonical).expect("canonical JSON should serialize");
-    let hash = sha2::Sha256::digest(serialized);
-    let hex = hash
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("sha256:{hex}")
-}
-
-fn canonical_json(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut sorted = serde_json::Map::new();
-            let mut keys = map.keys().collect::<Vec<_>>();
-            keys.sort();
-            for key in keys {
-                if let Some(value) = map.get(key) {
-                    sorted.insert(key.clone(), canonical_json(value));
-                }
-            }
-            Value::Object(sorted)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
-        other => other.clone(),
-    }
 }
 
 fn escape_toml_quoted_key(value: &str) -> String {
@@ -361,7 +237,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn renders_codex_config_with_exomonad_mcp_and_instructions() {
+    fn renders_codex_config_with_hooks_and_mcp() {
         let config = render_codex_config(
             "worker-1-codex",
             "dev",
@@ -380,16 +256,12 @@ mod tests {
             Some("exomonad")
         );
         assert_eq!(
-            parsed["mcp_servers"]["exomonad"]["args"]
-                .as_array()
-                .unwrap(),
-            &[
-                toml::Value::String("mcp-stdio".to_string()),
-                toml::Value::String("--role".to_string()),
-                toml::Value::String("dev".to_string()),
-                toml::Value::String("--name".to_string()),
-                toml::Value::String("worker-1-codex".to_string()),
-            ]
+            parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str(),
+            Some("exomonad hook pre-tool-use --runtime codex")
+        );
+        assert_eq!(
+            parsed["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(),
+            Some("exomonad hook stop --runtime codex")
         );
     }
 
@@ -452,73 +324,61 @@ mod tests {
     }
 
     #[test]
-    fn renders_shared_user_hooks_block_with_trusted_state() {
-        let config = codex_user_hooks_block(Path::new("/tmp/codex-home/config.toml"));
-        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex hooks TOML");
-        let state = parsed["hooks"]["state"]
-            .as_table()
-            .expect("hook state table");
-        for key in [
-            "/tmp/codex-home/config.toml:pre_tool_use:0:0",
-            "/tmp/codex-home/config.toml:post_tool_use:0:0",
-            "/tmp/codex-home/config.toml:stop:0:0",
-        ] {
-            let trusted_hash = state[key]["trusted_hash"].as_str().expect("trusted hash");
-            assert!(trusted_hash.starts_with("sha256:"));
-        }
+    fn trust_codex_project_appends_trust_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let project_path = Path::new("/tmp/my-project");
+
+        std::fs::write(&config_path, "model = \"gpt-5.5\"\n").unwrap();
+        trust_codex_project(&config_path, project_path).unwrap();
+
+        let result = std::fs::read_to_string(&config_path).unwrap();
+        assert!(result.contains("[projects.\"/tmp/my-project\"]"));
+        assert!(result.contains("trust_level = \"trusted\""));
+        let parsed: toml::Value = toml::from_str(&result).expect("valid TOML after trust");
         assert_eq!(
-            parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str(),
-            Some("exomonad hook pre-tool-use --runtime codex")
+            parsed["projects"]["/tmp/my-project"]["trust_level"].as_str(),
+            Some("trusted")
         );
     }
 
     #[test]
-    fn strips_existing_exomonad_codex_hooks_block() {
-        let input = "model = \"gpt-5.5\"\n\n# BEGIN EXOMONAD CODEX HOOKS\n[[hooks.Stop]]\n# END EXOMONAD CODEX HOOKS\n\napproval_policy = \"never\"\n";
-        let stripped = strip_exomonad_codex_hooks_block(input);
+    fn trust_codex_project_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let project_path = Path::new("/tmp/my-project");
+
+        trust_codex_project(&config_path, project_path).unwrap();
+        let after_first = std::fs::read_to_string(&config_path).unwrap();
+        trust_codex_project(&config_path, project_path).unwrap();
+        let after_second = std::fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(after_first, after_second);
         assert_eq!(
-            stripped,
-            "model = \"gpt-5.5\"\n\n\napproval_policy = \"never\""
+            after_first
+                .lines()
+                .filter(|l| l.contains("trust_level"))
+                .count(),
+            1
         );
     }
 
     #[test]
-    fn trusted_hook_hashes_match_generated_hooks_json() {
-        let hooks: Value = serde_json::from_str(CODEX_HOOKS_JSON).expect("valid hooks json");
-        let hooks = hooks["hooks"].as_object().expect("hooks object");
+    fn trust_codex_project_strips_legacy_global_hook_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let legacy = "model = \"gpt-5.5\"\n\n\
+            # BEGIN EXOMONAD CODEX HOOKS\n\
+            [[hooks.Stop]]\n\
+            # END EXOMONAD CODEX HOOKS\n\
+            \napproval_policy = \"never\"\n";
+        std::fs::write(&config_path, legacy).unwrap();
 
-        for (codex_name, event_key) in [
-            ("PreToolUse", "pre_tool_use"),
-            ("PostToolUse", "post_tool_use"),
-            ("Stop", "stop"),
-        ] {
-            let group = hooks[codex_name][0].clone();
-            let mut identity = serde_json::Map::new();
-            identity.insert(
-                "event_name".to_string(),
-                Value::String(event_key.to_string()),
-            );
-            identity.insert("group".to_string(), group);
+        trust_codex_project(&config_path, Path::new("/tmp/p")).unwrap();
 
-            let actual = version_for_json(&Value::Object(identity));
-            let expected = match event_key {
-                "pre_tool_use" => generated_command_hook_hash(
-                    "pre_tool_use",
-                    Some("*"),
-                    "exomonad hook pre-tool-use --runtime codex",
-                ),
-                "post_tool_use" => generated_command_hook_hash(
-                    "post_tool_use",
-                    Some("*"),
-                    "exomonad hook post-tool-use --runtime codex",
-                ),
-                "stop" => {
-                    generated_command_hook_hash("stop", None, "exomonad hook stop --runtime codex")
-                }
-                _ => unreachable!(),
-            };
-
-            assert_eq!(actual, expected, "hash mismatch for {codex_name}");
-        }
+        let result = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!result.contains("BEGIN EXOMONAD CODEX HOOKS"));
+        assert!(result.contains("trust_level = \"trusted\""));
+        toml::from_str::<toml::Value>(&result).expect("valid TOML after cleanup");
     }
 }
