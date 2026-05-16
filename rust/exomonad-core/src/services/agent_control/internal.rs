@@ -701,17 +701,23 @@ impl<
             instructions,
             model,
             extra_mcp_servers,
+            &crate::util::find_exomonad_binary(),
         );
+        let codex_config_path = codex_dir.join("config.toml");
+        fs::write(&codex_config_path, config).await?;
 
         if let Some(config_path) = crate::codex_config::codex_user_config_path() {
             crate::codex_config::trust_codex_project(&config_path, dir).with_context(|| {
                 format!("Failed to trust Codex project in {}", config_path.display())
             })?;
+            crate::codex_config::install_codex_hook_trust(&config_path, &codex_config_path)
+                .with_context(|| {
+                    format!("Failed to trust Codex hooks in {}", config_path.display())
+                })?;
             info!(path = %config_path.display(), "Marked Codex agent worktree as trusted");
         } else {
             warn!("Could not determine Codex home; worktree may not be trusted automatically");
         }
-        fs::write(codex_dir.join("config.toml"), config).await?;
         let legacy_hooks_path = codex_dir.join("hooks.json");
         if legacy_hooks_path.exists() {
             fs::remove_file(&legacy_hooks_path).await?;

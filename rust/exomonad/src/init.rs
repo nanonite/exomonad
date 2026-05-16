@@ -62,16 +62,20 @@ fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
         exomonad_core::services::agent_control::CODEX_TL_INSTRUCTIONS,
         config.model.as_deref(),
         &extra_mcp_servers,
+        &exomonad_core::find_exomonad_binary(),
     );
+    let codex_config_path = codex_dir.join("config.toml");
+    std::fs::write(&codex_config_path, codex_config)?;
     if let Some(config_path) = exomonad_core::codex_config::codex_user_config_path() {
         exomonad_core::codex_config::trust_codex_project(&config_path, cwd).with_context(|| {
             format!("Failed to trust Codex project in {}", config_path.display())
         })?;
+        exomonad_core::codex_config::install_codex_hook_trust(&config_path, &codex_config_path)
+            .with_context(|| format!("Failed to trust Codex hooks in {}", config_path.display()))?;
         info!(path = %config_path.display(), "Marked project as trusted in Codex user config");
     } else {
         warn!("Could not determine Codex home; project may not be trusted automatically");
     }
-    std::fs::write(codex_dir.join("config.toml"), codex_config)?;
     let legacy_hooks_path = codex_dir.join("hooks.json");
     if legacy_hooks_path.exists() {
         std::fs::remove_file(legacy_hooks_path)?;

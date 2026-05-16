@@ -228,6 +228,10 @@ check-e2e-codex-hooks:
     bash -n tests/e2e/codex-hooks/run.sh
     bash -n tests/e2e/codex-hooks/validate.sh
 
+# Compare ExoMonad's trusted hook hash with the installed Codex CLI hash
+e2e-codex-hook-parity:
+    nix develop --command cargo test -p exomonad-core --lib codex_hook_hash_matches_installed_codex_cli -- --ignored --nocapture
+
 # Run E2E Codex messaging test (send_message + notify_parent tmux delivery)
 e2e-codex-messaging:
     ./tests/e2e/codex-messaging/run.sh

@@ -10,7 +10,7 @@ Chainlink: #148
 
 Codex is supported as an ExoMonad-spawned agent runtime. It shares the same Rust host, Haskell WASM tool definitions, and hook dispatch path as Claude Code, Gemini, and OpenCode, but its local configuration model is different.
 
-Codex reads runtime configuration from `.codex/config.toml`. ExoMonad installs hook commands once into the active Codex user config (`$CODEX_HOME/config.toml` or `~/.codex/config.toml`) so every Codex worktree uses the same trusted hook source. It does not need an OpenCode-style TypeScript plugin bridge.
+Codex reads runtime configuration from `.codex/config.toml`. ExoMonad writes hook commands into each Codex agent's project config and seeds matching hook trust state in the active Codex user config (`$CODEX_HOME/config.toml` or `~/.codex/config.toml`). It does not need an OpenCode-style TypeScript plugin bridge.
 
 ## Decision
 
@@ -29,16 +29,24 @@ ExoMonad writes native Codex identity config files into each Codex agent worktre
 - `approval_policy = "never"`
 - `developer_instructions = """..."""`
 - `[features] hooks = true`
+- command hooks for `PreToolUse`, `PostToolUse`, and `Stop`
 - `[mcp_servers.exomonad]` with `command = "exomonad"` and args `["mcp-stdio", "--role", <role>, "--name", <agent>]`
 - any configured `[extra_mcp_servers]` from `.exo/config.toml`
 
-ExoMonad also maintains a sentinel-managed block in the Codex user config:
+ExoMonad renders hook commands with the absolute `exomonad` binary path:
 
-- `exomonad hook pre-tool-use --runtime codex`
-- `exomonad hook post-tool-use --runtime codex`
-- `exomonad hook stop --runtime codex`
+- `<exomonad> hook pre-tool-use --runtime codex`
+- `<exomonad> hook post-tool-use --runtime codex`
+- `<exomonad> hook stop --runtime codex`
 
-Codex only honors hook trust state from user/session config layers, not project-local `.codex/config.toml` files. Keeping the hook definitions and `[hooks.state]` trust entries in the user config gives all future worktree agents a stable hook source path and avoids repeated hook approval prompts for unknown agent IDs.
+Codex only honors hook trust state from user/session config layers, not project-local `.codex/config.toml` files. For every project config it writes, ExoMonad computes Codex-compatible `trusted_hash` values from the rendered hook definitions and stores them under `[hooks.state]` in the user config. The state keys use the absolute project config path plus Codex's event labels, for example:
+
+```toml
+[hooks.state."<worktree>/.codex/config.toml:pre_tool_use:0:0"]
+trusted_hash = "sha256:..."
+```
+
+The user config update is protected by a sidecar flock in `CODEX_HOME` and written atomically, so parallel Codex spawns do not lose trust entries. Legacy ExoMonad global hook blocks are stripped from the user config to avoid duplicate hook execution.
 
 These shell hooks forward Codex events to the existing ExoMonad server over the Unix-domain socket. The server normalizes Codex hook stdin into ExoMonad's internal `HookInput`, calls the Haskell WASM hook handler, then formats the result back into Codex hook stdout semantics.
 
@@ -114,5 +122,7 @@ ExoMonad does not inject an auth token or provider-specific environment variable
 
 - `rust/exomonad-core/src/codex_config.rs`
 - `rust/exomonad-core/src/services/agent_control/internal.rs`
+- `rust/exomonad/src/init.rs`
+- `tests/e2e/codex-hooks/validate.sh`
 - `haskell/wasm-guest/src/ExoMonad/Guest/Tools/SpawnCodex.hs`
 - `docs/decisions/codex-hook-wire-format.md`
