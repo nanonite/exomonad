@@ -280,9 +280,14 @@ where
             let ci_map = self.ci_status_map.clone();
             let knot_url = self.knot_url.clone();
             let spindle_url = self.spindle_url.clone();
-            let worktrees_dir = self.ctx.project_dir().join(".exo/worktrees");
+            let project_dir = self.ctx.project_dir();
+            let worktrees_dir = project_dir.join(".exo/worktrees");
+            let repo_name = project_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string());
             tokio::spawn(async move {
-                run_ci_subscriber(knot_url, spindle_url, ci_map, worktrees_dir).await;
+                run_ci_subscriber(knot_url, spindle_url, ci_map, worktrees_dir, repo_name).await;
             });
         }
 
@@ -1282,6 +1287,7 @@ async fn run_ci_subscriber(
     spindle_url: Option<String>,
     ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
     worktrees_dir: std::path::PathBuf,
+    repo_name: Option<String>,
 ) {
     // pipeline rkey → branch name, populated from the knot's Pipeline events
     let pipeline_map: Arc<RwLock<HashMap<String, PipelineContext>>> =
@@ -1300,8 +1306,9 @@ async fn run_ci_subscriber(
         let pm = pipeline_map.clone();
         let wd = worktrees_dir.clone();
         let ready = ready_tx.clone();
+        let repo = repo_name.clone();
         handles.push(tokio::spawn(async move {
-            run_knot_subscriber(url, pm, wd, ready).await;
+            run_knot_subscriber(url, pm, wd, ready, repo).await;
         }));
     }
 
@@ -1378,6 +1385,7 @@ async fn run_knot_subscriber(
     pipeline_map: Arc<RwLock<HashMap<String, PipelineContext>>>,
     worktrees_dir: std::path::PathBuf,
     ready_tx: mpsc::Sender<CiSubscriberKind>,
+    repo_name: Option<String>,
 ) {
     let mut reported_ready = false;
     loop {
@@ -1393,6 +1401,9 @@ async fn run_knot_subscriber(
                         Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                             if let Ok(ev) = serde_json::from_str::<TangledStreamEvent>(&text) {
                                 if ev.nsid == "sh.tangled.pipeline" {
+                                    if !pipeline_matches_repo(&ev.event, repo_name.as_deref()) {
+                                        continue;
+                                    }
                                     if let Some(branch_name) = extract_pipeline_branch(&ev.event) {
                                         let context =
                                             lookup_pipeline_context(&worktrees_dir, branch_name)
@@ -1428,6 +1439,19 @@ async fn run_knot_subscriber(
         }
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
+}
+
+fn pipeline_matches_repo(event: &serde_json::Value, expected_repo: Option<&str>) -> bool {
+    let Some(expected_repo) = expected_repo else {
+        return true;
+    };
+    event
+        .get("triggerMetadata")
+        .and_then(|tm| tm.get("repo"))
+        .and_then(|repo| repo.get("repo"))
+        .and_then(|repo| repo.as_str())
+        .map(|repo| repo == expected_repo)
+        .unwrap_or(false)
 }
 
 /// Subscribes to the spindle's `/events` WebSocket and updates `ci_status_map`
@@ -1921,6 +1945,34 @@ mod tests {
             normalize_tangled_event_ws_url("https://example.test"),
             "wss://example.test/events"
         );
+    }
+
+    #[test]
+    fn test_pipeline_repo_filter_matches_current_project() {
+        let event = serde_json::json!({
+            "triggerMetadata": {
+                "repo": {
+                    "did": "did:plc:localdev",
+                    "knot": "localhost:5555",
+                    "repo": "backrooms-workspace"
+                }
+            }
+        });
+
+        assert!(pipeline_matches_repo(&event, Some("backrooms-workspace")));
+        assert!(!pipeline_matches_repo(&event, Some("ci-test")));
+        assert!(pipeline_matches_repo(&event, None));
+    }
+
+    #[test]
+    fn test_pipeline_repo_filter_rejects_missing_repo() {
+        let event = serde_json::json!({
+            "triggerMetadata": {
+                "push": {"ref": "refs/heads/main"}
+            }
+        });
+
+        assert!(!pipeline_matches_repo(&event, Some("backrooms-workspace")));
     }
 
     #[test]

@@ -398,23 +398,28 @@ steps:
 
 ## Known Limitations & Follow-ups
 
-### Real git push → CI (not yet wired)
+### Local dev repo registration
 
-The current setup injects events directly because the test repo lives at `owner/ci-test.git` (legacy path). The knot's `triggerPipeline` needs the repo registered in `repo_keys`, but the knot's `resolveAtIdentifier` can't resolve the literal string `"owner"` as a DID.
+`exomonad init` now uses a local-dev equivalent of Knot's authenticated create-repo side effects when `tangled_knot_container`, `tangled_owner_did`, and `tangled_spindle_db` are configured:
 
-**To wire real git push → CI**, the repo needs to be created through the knot's XRPC:
+- creates a deterministic local `did:web:<knot>:repo:<name>` bare repo in the Knot container
+- inserts the `repo_keys` row for owner/repo → repo DID lookup
+- inserts push-owner ACL rows
+- installs the Knot post-receive hook
+- seeds Spindle's `repos` table
+- points the local `tangled` remote at `git@local-tangled:repositories/<repoDid>`
+
+The public XRPC path remains the production shape:
+
+```text
+POST /xrpc/sh.tangled.repo.create  { "name": "ci-test" }
 ```
-POST /xrpc/sh.tangled.knot.createRepo  { "name": "ci-test" }
-  → creates repo_keys entry
-  → creates repo on disk at did:<repodid>/
-  → installs post-receive hook
-  → sets RBAC push permission
-```
-This requires authenticated XRPC (service auth or dev mode equivalent).
+
+That endpoint requires service auth. The local init path intentionally stays shellable for the dev knot container while preserving the repo-DID/hook semantics that Knot's pipeline trigger needs.
 
 ### WAL isolation
 
-The knotserver.db is held open by the live container. Writes from the host `sqlite3` process go to the WAL but aren't immediately visible to the container's Go connection. This is why `setup-dev.sh` uses the direct event injection approach rather than trying to seed `repo_keys` via the host.
+The knotserver.db is held open by the live container. Writes from the host `sqlite3` process go to the WAL but aren't immediately visible to the container's Go connection. ExoMonad seeds Knot repo metadata inside the container and still seeds Spindle from the host-side configured `tangled_spindle_db`.
 
 ### exomonad serve integration
 

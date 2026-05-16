@@ -64,15 +64,12 @@ fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
         &extra_mcp_servers,
     );
     if let Some(config_path) = exomonad_core::codex_config::codex_user_config_path() {
-        exomonad_core::codex_config::install_codex_user_hooks(&config_path).with_context(|| {
-            format!(
-                "Failed to install ExoMonad Codex hooks in {}",
-                config_path.display()
-            )
+        exomonad_core::codex_config::trust_codex_project(&config_path, cwd).with_context(|| {
+            format!("Failed to trust Codex project in {}", config_path.display())
         })?;
-        info!(path = %config_path.display(), "Installed shared ExoMonad Codex hooks in user config");
+        info!(path = %config_path.display(), "Marked project as trusted in Codex user config");
     } else {
-        warn!("Could not determine Codex home; Codex hook trust may require manual approval");
+        warn!("Could not determine Codex home; project may not be trusted automatically");
     }
     std::fs::write(codex_dir.join("config.toml"), codex_config)?;
     let legacy_hooks_path = codex_dir.join("hooks.json");
@@ -362,13 +359,25 @@ pub async fn run(
         }
     }
 
-    // Copy spindle binary from global install when Tangled is configured
+    // Copy spindle binary from global install when Tangled is configured.
+    // Always refreshes if the global is newer (same pattern as WASM refresh).
     if config.tangled_owner_did.is_some() {
         let spindle_local = cwd.join(".exo/bin/spindle");
-        if !spindle_local.exists() {
-            if let Ok(home) = std::env::var("HOME") {
-                let spindle_global = PathBuf::from(home).join(".exo/bin/spindle");
-                if spindle_global.exists() {
+        if let Ok(home) = std::env::var("HOME") {
+            let spindle_global = PathBuf::from(home).join(".exo/bin/spindle");
+            if spindle_global.exists() {
+                let should_copy = if spindle_local.exists() {
+                    let local_mtime = std::fs::metadata(&spindle_local)
+                        .and_then(|m| m.modified())
+                        .ok();
+                    let global_mtime = std::fs::metadata(&spindle_global)
+                        .and_then(|m| m.modified())
+                        .ok();
+                    matches!((local_mtime, global_mtime), (Some(l), Some(g)) if g > l)
+                } else {
+                    true
+                };
+                if should_copy {
                     std::fs::create_dir_all(spindle_local.parent().unwrap())?;
                     std::fs::copy(&spindle_global, &spindle_local)?;
                     #[cfg(unix)]
@@ -381,14 +390,14 @@ pub async fn run(
                     info!(
                         src = %spindle_global.display(),
                         dst = %spindle_local.display(),
-                        "Copied spindle binary from global install"
-                    );
-                } else {
-                    warn!(
-                        "Tangled configured but spindle not found at ~/.exo/bin/spindle. \
-                        Build it: cd tangled-core && go build -o ~/.exo/bin/spindle ./cmd/spindle"
+                        "Refreshed spindle binary from global install"
                     );
                 }
+            } else {
+                warn!(
+                    "Tangled configured but spindle not found at ~/.exo/bin/spindle. \
+                    Build it: just spindle-dev"
+                );
             }
         }
     }
@@ -1303,52 +1312,30 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
         .trim_start_matches("wss://")
         .to_string();
 
-    // Derive repo name from git remote origin URL, fall back to directory name.
-    let repo_name = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .and_then(|url| {
-            url.trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .map(|s| s.trim_end_matches(".git").to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            cwd.file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "repo".to_string());
+    let repo_name = tangled_repo_name(cwd);
 
     info!(
         container,
         owner_did, repo_name, "Registering repo with local Tangled knot"
     );
 
-    // Step 1: create bare repo in knot container.
-    let create_cmd = format!(
-        "mkdir -p /home/git/repositories/owner/{name}.git && \
-         git init --bare /home/git/repositories/owner/{name}.git 2>/dev/null || true && \
-         chown -R git:git /home/git/repositories/owner/{name}.git",
-        name = repo_name
-    );
+    let repo_did = tangled_dev_repo_did(&knot_hostname, &repo_name);
+
+    // Step 1: create a repo-DID bare repo in the knot container and install the same
+    // post-receive hook shape that Knot's authenticated create-repo XRPC path installs.
+    let create_cmd = build_tangled_dev_repo_script(owner_did, &repo_name, &repo_did);
     let out = std::process::Command::new("docker")
         .args(["exec", container, "sh", "-c", &create_cmd])
         .output();
     match out {
         Ok(o) if o.status.success() => {
-            info!(repo_name, "Knot: bare repo created/confirmed");
+            info!(repo_name, repo_did, "Knot: repo-DID repo created/confirmed");
         }
         Ok(o) => {
             warn!(
                 repo_name,
                 stderr = %String::from_utf8_lossy(&o.stderr),
-                "Knot: docker exec for bare repo returned non-zero (may already exist)"
+                "Knot: docker exec for repo-DID setup returned non-zero"
             );
         }
         Err(e) => {
@@ -1357,28 +1344,18 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
         }
     }
 
-    // Step 2: create DID-based symlink for HTTP clone routing.
-    let symlink_cmd = format!(
-        "mkdir -p '/home/git/repositories/{did}' && \
-         ln -sfn '../owner/{name}.git' '/home/git/repositories/{did}/{name}'",
-        did = owner_did,
-        name = repo_name
-    );
-    let out = std::process::Command::new("docker")
-        .args(["exec", container, "sh", "-c", &symlink_cmd])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            info!(owner_did, repo_name, "Knot: DID symlink created/confirmed");
+    // Step 2: seed Knot's repo registry and push ACL through the host-visible DB bind mount.
+    match infer_knot_db_host_path(container) {
+        Some(knot_db) => {
+            seed_tangled_knot_repo_db(&knot_db, owner_did, &repo_name, &repo_did);
+            verify_tangled_knot_repo_db(&knot_db, owner_did, &repo_name, &repo_did);
+            seed_spindle_knot_cursor(spindle_db, &knot_db, &knot_hostname);
         }
-        Ok(o) => {
+        None => {
             warn!(
-                stderr = %String::from_utf8_lossy(&o.stderr),
-                "Knot: DID symlink docker exec returned non-zero"
+                container,
+                "Knot: could not infer host knotserver.db path from docker mounts; repo-DID DB registration skipped"
             );
-        }
-        Err(e) => {
-            warn!(error = %e, "Knot: docker exec for DID symlink failed");
         }
     }
 
@@ -1455,8 +1432,8 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
         }
     }
 
-    // Step 5: set git remote 'tangled' (idempotent).
-    let ssh_url = format!("git@local-tangled:repositories/owner/{}.git", repo_name);
+    // Step 5: set git remote 'tangled' to the repo-DID path (idempotent).
+    let ssh_url = tangled_dev_remote_url(&repo_did);
     // Remove stale remote first (ignore errors), then add fresh.
     let _ = std::process::Command::new("git")
         .args(["remote", "remove", "tangled"])
@@ -1484,6 +1461,296 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
 
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn tangled_repo_name(cwd: &Path) -> String {
+    let directory_name = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let remote_name = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .and_then(|url| {
+            url.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .map(|s| s.trim_end_matches(".git").to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .filter(|name| !name.starts_with('.'));
+
+    remote_name
+        .or(directory_name)
+        .unwrap_or_else(|| "repo".to_string())
+}
+
+fn infer_knot_db_host_path(container: &str) -> Option<String> {
+    let output = std::process::Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{range .Mounts}}{{if eq .Destination \"/app\"}}{{.Source}}{{end}}{{end}}",
+            container,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let app_mount = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if app_mount.is_empty() {
+        None
+    } else {
+        Some(format!("{}/knotserver.db", app_mount.trim_end_matches('/')))
+    }
+}
+
+fn seed_spindle_knot_cursor(spindle_db: &str, knot_db: &str, knot_hostname: &str) {
+    let max_created = match std::process::Command::new("sqlite3")
+        .args([knot_db, "SELECT COALESCE(MAX(created), 0) FROM events;"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => {
+            warn!(
+                knot_db,
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Knot: could not read event cursor for Spindle seed"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(knot_db, error = %e, "Knot: sqlite3 failed while reading event cursor");
+            return;
+        }
+    };
+
+    let Ok(max_created) = max_created.parse::<i64>() else {
+        warn!(
+            knot_db,
+            value = %max_created,
+            "Knot: invalid event cursor value for Spindle seed"
+        );
+        return;
+    };
+    if max_created <= 0 {
+        return;
+    }
+
+    let knot = escape_sql_string(knot_hostname);
+    let sql = format!(
+        "INSERT INTO cursors (knot, cursor) VALUES ('{knot}', '{cursor}') \
+         ON CONFLICT(knot) DO UPDATE SET cursor = CASE \
+           WHEN CAST(cursor AS INTEGER) < {cursor} THEN '{cursor}' ELSE cursor END;",
+        knot = knot,
+        cursor = max_created
+    );
+    match std::process::Command::new("sqlite3")
+        .args([spindle_db, &sql])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            info!(
+                spindle_db,
+                knot = %knot_hostname,
+                cursor = max_created,
+                "Spindle: knot cursor seeded to current event head"
+            );
+        }
+        Ok(o) => {
+            warn!(
+                spindle_db,
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Spindle: sqlite3 returned non-zero while seeding knot cursor"
+            );
+        }
+        Err(e) => {
+            warn!(spindle_db, error = %e, "Spindle: sqlite3 failed while seeding knot cursor");
+        }
+    }
+}
+
+fn seed_tangled_knot_repo_db(knot_db: &str, owner_did: &str, repo_name: &str, repo_did: &str) {
+    let owner = escape_sql_string(owner_did);
+    let repo = escape_sql_string(repo_name);
+    let repo_did_sql = escape_sql_string(repo_did);
+    let at_uri = escape_sql_string(&format!("at://{owner_did}/sh.tangled.repo/{repo_name}"));
+    let sql = format!(
+        "INSERT OR IGNORE INTO repo_keys \
+         (repo_did, signing_key, owner_did, repo_name, at_uri, key_type) \
+         VALUES ('{repo_did}', NULL, '{owner}', '{repo}', '{at_uri}', 'web');\
+         INSERT OR IGNORE INTO acl (p_type, v0, v1, v2, v3) VALUES \
+         ('p', '{owner}', 'thisserver', '{repo_did}', 'repo:settings'),\
+         ('p', '{owner}', 'thisserver', '{repo_did}', 'repo:push'),\
+         ('p', '{owner}', 'thisserver', '{repo_did}', 'repo:owner'),\
+         ('p', '{owner}', 'thisserver', '{repo_did}', 'repo:invite'),\
+         ('p', '{owner}', 'thisserver', '{repo_did}', 'repo:delete'),\
+         ('p', 'server:owner', 'thisserver', '{repo_did}', 'repo:delete');",
+        owner = owner,
+        repo = repo,
+        repo_did = repo_did_sql,
+        at_uri = at_uri
+    );
+
+    match std::process::Command::new("sqlite3")
+        .args([knot_db, &sql])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            info!(
+                knot_db,
+                repo_name, repo_did, "Knot: repo registry and ACL seeded"
+            );
+        }
+        Ok(o) => {
+            warn!(
+                knot_db,
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Knot: sqlite3 returned non-zero while seeding repo registry"
+            );
+        }
+        Err(e) => {
+            warn!(knot_db, error = %e, "Knot: sqlite3 failed while seeding repo registry");
+        }
+    }
+}
+
+fn verify_tangled_knot_repo_db(knot_db: &str, owner_did: &str, repo_name: &str, repo_did: &str) {
+    let owner = escape_sql_string(owner_did);
+    let repo = escape_sql_string(repo_name);
+    let repo_did_sql = escape_sql_string(repo_did);
+    let sql = format!(
+        "SELECT \
+         (SELECT COUNT(*) FROM repo_keys WHERE owner_did = '{owner}' AND repo_name = '{repo}' AND repo_did = '{repo_did}'),\
+         (SELECT COUNT(*) FROM acl WHERE p_type = 'p' AND v0 = '{owner}' AND v1 = 'thisserver' AND v2 = '{repo_did}' AND v3 = 'repo:push');",
+        owner = owner,
+        repo = repo,
+        repo_did = repo_did_sql
+    );
+
+    match std::process::Command::new("sqlite3")
+        .args([knot_db, &sql])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let counts = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if counts == "1|1" {
+                info!(
+                    knot_db,
+                    repo_name, repo_did, "Knot: repo registration verified"
+                );
+            } else {
+                warn!(
+                    knot_db,
+                    repo_name,
+                    repo_did,
+                    counts = %counts,
+                    "Knot: repo registration verification failed"
+                );
+            }
+        }
+        Ok(o) => {
+            warn!(
+                knot_db,
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Knot: sqlite3 returned non-zero while verifying repo registration"
+            );
+        }
+        Err(e) => {
+            warn!(knot_db, error = %e, "Knot: sqlite3 failed while verifying repo registration");
+        }
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn tangled_dev_repo_did(knot_hostname: &str, repo_name: &str) -> String {
+    let host = knot_hostname
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .replace(':', "%3A");
+    let repo = repo_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("did:web:{host}:repo:{repo}")
+}
+
+fn tangled_dev_remote_url(repo_did: &str) -> String {
+    format!("git@local-tangled:repositories/{repo_did}")
+}
+
+fn build_tangled_dev_repo_script(owner_did: &str, repo_name: &str, repo_did: &str) -> String {
+    let owner = shell_single_quote(owner_did);
+    let repo = shell_single_quote(repo_name);
+    let repo_did = shell_single_quote(repo_did);
+    let at_uri = shell_single_quote(&format!(
+        "at://{}/{}/{}",
+        owner_did, "sh.tangled.repo", repo_name
+    ));
+    format!(
+        r#"set -eu
+owner_did={owner}
+repo_name={repo}
+repo_did={repo_did}
+at_uri={at_uri}
+scan_path="${{KNOT_REPO_SCAN_PATH:-/home/git/repositories}}"
+db_path="${{KNOT_SERVER_DB_PATH:-/app/knotserver.db}}"
+internal_api="${{KNOT_SERVER_INTERNAL_LISTEN_ADDR:-localhost:5444}}"
+repo_path="$scan_path/$repo_did"
+mkdir -p "$repo_path"
+git init --bare --initial-branch=main "$repo_path" >/dev/null 2>&1 || git init --bare "$repo_path" >/dev/null 2>&1 || true
+git --git-dir "$repo_path" symbolic-ref HEAD refs/heads/main >/dev/null 2>&1 || true
+mkdir -p "$repo_path/hooks/post-receive.d"
+cat > "$repo_path/hooks/post-receive.d/40-notify.sh" <<'HOOK'
+#!/usr/bin/env bash
+# AUTO GENERATED BY EXOMONAD FOR LOCAL TANGLED DEV
+push_options=()
+for ((i=0; i<GIT_PUSH_OPTION_COUNT; i++)); do
+    option_var="GIT_PUSH_OPTION_$i"
+    push_options+=(-push-option "${{!option_var}}")
+done
+/usr/bin/knot hook -git-dir "$GIT_DIR" -user-did "$GIT_USER_DID" -user-handle "$GIT_USER_HANDLE" -internal-api "__INTERNAL_API__" "${{push_options[@]}}" post-receive
+HOOK
+sed -i "s#__INTERNAL_API__#$internal_api#g" "$repo_path/hooks/post-receive.d/40-notify.sh"
+cat > "$repo_path/hooks/post-receive" <<'HOOK'
+#!/usr/bin/env bash
+# AUTO GENERATED BY EXOMONAD FOR LOCAL TANGLED DEV
+data=$(cat)
+exitcodes=""
+hookname=$(basename "$0")
+GIT_DIR="$PWD"
+for hook in "${{GIT_DIR}}/hooks/${{hookname}}.d/"*; do
+  test -x "${{hook}}" && test -f "${{hook}}" || continue
+  echo "${{data}}" | "${{hook}}"
+  exitcodes="${{exitcodes}} $?"
+done
+for i in $exitcodes; do
+  [ "$i" -eq 0 ] || exit "$i"
+done
+HOOK
+chmod 755 "$repo_path/hooks/post-receive" "$repo_path/hooks/post-receive.d/40-notify.sh"
+chown -R git:git "$repo_path"
+"#
+    )
 }
 
 pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
@@ -1831,6 +2098,65 @@ mod tests {
     #[test]
     fn sql_string_escape_doubles_quotes() {
         assert_eq!(escape_sql_string("owner's repo"), "owner''s repo");
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        assert_eq!(shell_single_quote("owner's repo"), "'owner'\"'\"'s repo'");
+    }
+
+    #[test]
+    fn tangled_repo_name_ignores_hidden_local_origin_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("backrooms-workspace");
+        std::fs::create_dir(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "/tmp/backrooms-workspace/.git-remote",
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+
+        assert_eq!(tangled_repo_name(&repo), "backrooms-workspace");
+    }
+
+    #[test]
+    fn tangled_dev_repo_did_uses_did_web_repo_path() {
+        assert_eq!(
+            tangled_dev_repo_did("ws://localhost:5555", "backrooms workspace"),
+            "did:web:localhost%3A5555:repo:backrooms-workspace"
+        );
+    }
+
+    #[test]
+    fn tangled_dev_remote_uses_repo_did_path() {
+        assert_eq!(
+            tangled_dev_remote_url("did:web:localhost%3A5555:repo:backrooms"),
+            "git@local-tangled:repositories/did:web:localhost%3A5555:repo:backrooms"
+        );
+    }
+
+    #[test]
+    fn tangled_dev_repo_script_sets_repo_keys_acl_and_hooks() {
+        let script = build_tangled_dev_repo_script(
+            "did:plc:localdev",
+            "backrooms",
+            "did:web:localhost%3A5555:repo:backrooms",
+        );
+
+        assert!(script.contains("hooks/post-receive.d/40-notify.sh"));
+        assert!(script.contains("/usr/bin/knot hook"));
+        assert!(script.contains("-internal-api \"__INTERNAL_API__\""));
+        assert!(script.contains("sed -i \"s#__INTERNAL_API__#$internal_api#g\""));
     }
 
     #[test]
