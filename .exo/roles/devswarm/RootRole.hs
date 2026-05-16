@@ -15,9 +15,10 @@ import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.Tools.MergePR (mergePRCore, mergePRDescription, mergePRSchema, mergePRRender, MergePRArgs (..), MergePROutput (..), extractAgentName)
 import ExoMonad.Guest.Tools.Spawn
   ( forkWaveCore, forkWaveDescription, forkWaveSchema, forkWaveRender, ForkWaveArgs (..), ForkWaveResult (..),
-    spawnLeafCore, spawnLeafDescription, spawnLeafSchema, spawnLeafRender, SpawnLeafArgs (..),
-    spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
-    SpawnLeafSubtreeArgs
+      spawnLeafCore, spawnLeafDescription, spawnLeafSchema, spawnLeafRender, SpawnLeafArgs (..),
+      spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
+      closeWorkerPaneCore, closeWorkerPaneDescription, closeWorkerPaneSchema, CloseWorkerPaneArgs,
+      SpawnLeafSubtreeArgs
   )
 import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription, spawnCodexSchema, SpawnCodex)
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
@@ -68,6 +69,14 @@ instance MCPTool RootSpawnWorker where
   toolSchema = spawnWorkerToolSchema
   toolHandlerEff args = spawnWorkerToolCore args
 
+data RootCloseWorkerPane
+instance MCPTool RootCloseWorkerPane where
+  type ToolArgs RootCloseWorkerPane = CloseWorkerPaneArgs
+  toolName = "close_worker_pane"
+  toolDescription = closeWorkerPaneDescription
+  toolSchema = closeWorkerPaneSchema
+  toolHandlerEff args = closeWorkerPaneCore args
+
 data RootSpawnCodex
 instance MCPTool RootSpawnCodex where
   type ToolArgs RootSpawnCodex = SpawnLeafSubtreeArgs
@@ -105,9 +114,10 @@ instance MCPTool RootMergePR where
 
 data Tools mode = Tools
   { forkWave    :: mode :- RootForkWave,
-    spawnLeaf   :: mode :- RootSpawnLeaf,
-    spawnWorker :: mode :- RootSpawnWorker,
-    spawnCodex  :: mode :- RootSpawnCodex,
+      spawnLeaf   :: mode :- RootSpawnLeaf,
+      spawnWorker :: mode :- RootSpawnWorker,
+      closeWorkerPane :: mode :- RootCloseWorkerPane,
+      spawnCodex  :: mode :- RootSpawnCodex,
     mergePr     :: mode :- RootMergePR,
     sendMessage :: mode :- SendMessage
   }
@@ -119,9 +129,10 @@ config =
     { roleName = "root",
       tools = Tools
         { forkWave    = mkHandler @RootForkWave,
-          spawnLeaf   = mkHandler @RootSpawnLeaf,
-          spawnWorker = mkHandler @RootSpawnWorker,
-          spawnCodex  = mkHandler @RootSpawnCodex,
+            spawnLeaf   = mkHandler @RootSpawnLeaf,
+            spawnWorker = mkHandler @RootSpawnWorker,
+            closeWorkerPane = mkHandler @RootCloseWorkerPane,
+            spawnCodex  = mkHandler @RootSpawnCodex,
           mergePr     = mkHandler @RootMergePR,
           sendMessage = mkHandler @SendMessage
         },

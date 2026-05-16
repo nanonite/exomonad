@@ -19,6 +19,7 @@ module ExoMonad.Effects.Agent
     AgentCleanupMerged,
     AgentList,
     AgentCloseSelf,
+    AgentCloseWorkerPane,
 
     -- * Re-exported proto types
     module Effects.Agent,
@@ -116,3 +117,10 @@ instance Effect AgentCloseSelf where
   type Input AgentCloseSelf = CloseSelfRequest
   type Output AgentCloseSelf = CloseSelfResponse
   effectId = "agent.close_self"
+
+data AgentCloseWorkerPane
+
+instance Effect AgentCloseWorkerPane where
+  type Input AgentCloseWorkerPane = CloseWorkerPaneRequest
+  type Output AgentCloseWorkerPane = CloseWorkerPaneResponse
+  effectId = "agent.close_worker_pane"

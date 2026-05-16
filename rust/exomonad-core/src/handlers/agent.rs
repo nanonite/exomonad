@@ -697,6 +697,7 @@ impl<
             pr_number: 0,
             pr_url: String::new(),
             topology: exomonad_proto::effects::agent::WorkspaceTopology::SharedDir as i32,
+            pane_id: String::new(),
         };
 
         tracing::info!(
@@ -910,6 +911,30 @@ impl<
             error: String::new(),
         })
     }
+
+    async fn close_worker_pane(
+        &self,
+        req: CloseWorkerPaneRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<CloseWorkerPaneResponse> {
+        if req.pane_id.is_empty() {
+            return Ok(CloseWorkerPaneResponse {
+                success: false,
+                error: "pane_id is required".to_string(),
+            });
+        }
+
+        match crate::services::tmux_events::close_worker_pane(&req.pane_id).await {
+            Ok(()) => Ok(CloseWorkerPaneResponse {
+                success: true,
+                error: String::new(),
+            }),
+            Err(e) => Ok(CloseWorkerPaneResponse {
+                success: false,
+                error: e.to_string(),
+            }),
+        }
+    }
 }
 
 fn spawn_result_to_proto(
@@ -931,6 +956,7 @@ fn spawn_result_to_proto(
         pr_number: 0,
         pr_url: String::new(),
         topology: Topology::WorktreePerAgent.to_proto(),
+        pane_id: String::new(),
     }
 }
 
@@ -953,6 +979,7 @@ fn teammate_result_to_proto(
         pr_number: 0,
         pr_url: String::new(),
         topology: Topology::WorktreePerAgent.to_proto(),
+        pane_id: result.pane_id.clone().unwrap_or_default(),
     }
 }
 
@@ -975,6 +1002,7 @@ fn worker_result_to_proto(
         pr_number: 0,
         pr_url: String::new(),
         topology: Topology::SharedDir.to_proto(),
+        pane_id: result.pane_id.clone().unwrap_or_default(),
     }
 }
 
@@ -997,6 +1025,7 @@ fn subtree_result_to_proto(
         pr_number: 0,
         pr_url: String::new(),
         topology: Topology::WorktreePerAgent.to_proto(),
+        pane_id: result.pane_id.clone().unwrap_or_default(),
     }
 }
 
@@ -1019,6 +1048,7 @@ fn leaf_subtree_result_to_proto(
         pr_number: 0,
         pr_url: String::new(),
         topology: Topology::WorktreePerAgent.to_proto(),
+        pane_id: result.pane_id.clone().unwrap_or_default(),
     }
 }
 
@@ -1061,6 +1091,7 @@ fn service_info_to_proto(info: &AgentInfo) -> exomonad_proto::effects::agent::Ag
         pr_number: info.pr.as_ref().map(|p| p.number as i32).unwrap_or(0),
         pr_url: info.pr.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
         topology: info.topology.to_proto(),
+        pane_id: String::new(),
     }
 }
 

@@ -20,6 +20,7 @@ module ExoMonad.Guest.Effects.AgentControl
     spawnLeafSubtree,
     spawnWorker,
     spawnAcp,
+    closeWorkerPane,
 
     -- * Interpreters
     runAgentControlSuspend,
@@ -40,7 +41,7 @@ module ExoMonad.Guest.Effects.AgentControl
 where
 
 import Control.Monad.Freer (Eff, Member, interpret, send)
-import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, withText, (.:), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, withText, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -94,7 +95,8 @@ data SpawnResult = SpawnResult
     branchName :: Text,
     tabName :: Text,
     issueTitle :: Text,
-    agentTypeResult :: Text
+    agentTypeResult :: Text,
+    paneId :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -106,15 +108,17 @@ instance FromJSON SpawnResult where
       <*> v .: "tab_name"
       <*> v .: "issue_title"
       <*> v .: "agent_type"
+      <*> v .:? "pane_id"
 
 instance ToJSON SpawnResult where
-  toJSON (SpawnResult w b t i a) =
+  toJSON (SpawnResult w b t i a p) =
     object
       [ "worktree_path" .= w,
         "branch_name" .= b,
         "tab_name" .= t,
         "issue_title" .= i,
-        "agent_type" .= a
+        "agent_type" .= a,
+        "pane_id" .= p
       ]
 
 -- ============================================================================
@@ -183,6 +187,7 @@ data AgentControl a where
   SpawnLeafSubtreeC :: SpawnLeafSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnWorkerC :: SpawnWorkerConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnAcpC :: SpawnAcpConfig -> AgentControl (Either EffectError SpawnResult)
+  CloseWorkerPaneC :: Text -> AgentControl (Either EffectError PA.CloseWorkerPaneResponse)
 
 -- Smart constructors (manually written - makeSem doesn't work with WASM cross-compilation)
 spawnSubtree :: (Member AgentControl r) => SpawnSubtreeConfig -> Eff r (Either EffectError SpawnResult)
@@ -196,6 +201,9 @@ spawnWorker cfg = send (SpawnWorkerC cfg)
 
 spawnAcp :: (Member AgentControl r) => SpawnAcpConfig -> Eff r (Either EffectError SpawnResult)
 spawnAcp cfg = send (SpawnAcpC cfg)
+
+closeWorkerPane :: (Member AgentControl r) => Text -> Eff r (Either EffectError PA.CloseWorkerPaneResponse)
+closeWorkerPane pane = send (CloseWorkerPaneC pane)
 
 -- ============================================================================
 -- Interpreter (uses yield_effect via Effect typeclass)
@@ -278,6 +286,12 @@ runAgentControlSuspend = interpret $ \case
       Right resp -> case PA.spawnAcpResponseAgent resp of
         Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnAcp succeeded but no agent info returned"))))
         Just info -> Right (protoAgentInfoToSpawnResult info)
+  CloseWorkerPaneC pane -> do
+    let req =
+          PA.CloseWorkerPaneRequest
+            { PA.closeWorkerPaneRequestPaneId = fromText pane
+            }
+    suspendEffect @Agent.AgentCloseWorkerPane req
 
 -- ============================================================================
 -- Conversion helpers
@@ -317,5 +331,8 @@ protoAgentInfoToSpawnResult info =
         Enumerated (Right PA.AgentTypeAGENT_TYPE_SHOAL) -> "shoal"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_OPENCODE) -> "opencode"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_CODEX) -> "codex"
-        _ -> "unknown"
+        _ -> "unknown",
+      paneId =
+        let value = toText (PA.agentInfoPaneId info)
+         in if T.null value then Nothing else Just value
     }

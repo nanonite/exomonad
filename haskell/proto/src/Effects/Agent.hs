@@ -186,7 +186,8 @@ data AgentInfo
     agentInfoError :: Hs.Text,
     agentInfoPrNumber :: Hs.Int32,
     agentInfoPrUrl :: Hs.Text,
-    agentInfoTopology :: (HsProtobuf.Enumerated Effects.Agent.WorkspaceTopology)
+    agentInfoTopology :: (HsProtobuf.Enumerated Effects.Agent.WorkspaceTopology),
+    agentInfoPaneId :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -212,7 +213,8 @@ instance (HsProtobuf.Message AgentInfo) where
         agentInfoError,
         agentInfoPrNumber,
         agentInfoPrUrl,
-        agentInfoTopology
+        agentInfoTopology,
+        agentInfoPaneId
       } =
       Hs.mappend
         ( Hs.mappend
@@ -225,77 +227,85 @@ instance (HsProtobuf.Message AgentInfo) where
                                     ( Hs.mappend
                                         ( Hs.mappend
                                             ( Hs.mappend
-                                                ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 1)
-                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                        agentInfoId
+                                                ( Hs.mappend
+                                                    ( HsProtobuf.encodeMessageField
+                                                        (HsProtobuf.FieldNumber 1)
+                                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                            agentInfoId
+                                                        )
+                                                    )
+                                                    ( HsProtobuf.encodeMessageField
+                                                        (HsProtobuf.FieldNumber 2)
+                                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                            agentInfoIssue
+                                                        )
                                                     )
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 2)
+                                                    (HsProtobuf.FieldNumber 3)
                                                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                        agentInfoIssue
+                                                        agentInfoWorktreePath
                                                     )
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 3)
+                                                (HsProtobuf.FieldNumber 4)
                                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                    agentInfoWorktreePath
+                                                    agentInfoBranchName
                                                 )
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 4)
-                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                agentInfoBranchName
-                                            )
+                                            (HsProtobuf.FieldNumber 5)
+                                            agentInfoAgentType
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 5)
-                                        agentInfoAgentType
+                                        (HsProtobuf.FieldNumber 6)
+                                        agentInfoRole
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 6)
-                                    agentInfoRole
+                                    (HsProtobuf.FieldNumber 7)
+                                    agentInfoAlive
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 7)
-                                agentInfoAlive
+                                (HsProtobuf.FieldNumber 8)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    agentInfoMuxWindow
+                                )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 8)
+                            (HsProtobuf.FieldNumber 9)
                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                agentInfoMuxWindow
+                                agentInfoError
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 9)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            agentInfoError
-                        )
+                        (HsProtobuf.FieldNumber 10)
+                        agentInfoPrNumber
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 10)
-                    agentInfoPrNumber
+                    (HsProtobuf.FieldNumber 11)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        agentInfoPrUrl
+                    )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 11)
-                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    agentInfoPrUrl
-                )
+                (HsProtobuf.FieldNumber 12)
+                agentInfoTopology
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 12)
-            agentInfoTopology
+            (HsProtobuf.FieldNumber 13)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                agentInfoPaneId
+            )
         )
   decodeMessage _ =
     Hs.pure AgentInfo
@@ -356,6 +366,12 @@ instance (HsProtobuf.Message AgentInfo) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 12)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 13)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -438,11 +454,17 @@ instance (HsProtobuf.Message AgentInfo) where
         )
         (HsProtobufAST.Single "topology")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 13)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "pane_id")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB AgentInfo) where
-  toJSONPB (AgentInfo f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12) =
+  toJSONPB (AgentInfo f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13) =
     HsJSONPB.object
       [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "issue" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -459,9 +481,11 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
         "pr_number" .= f10,
         "pr_url"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11),
-        "topology" .= f12
+        "topology" .= f12,
+        "pane_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13)
       ]
-  toEncodingPB (AgentInfo f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12) =
+  toEncodingPB (AgentInfo f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13) =
     HsJSONPB.pairs
       [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "issue" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -478,7 +502,9 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
         "pr_number" .= f10,
         "pr_url"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11),
-        "topology" .= f12
+        "topology" .= f12,
+        "pane_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13)
       ]
 
 instance (HsJSONPB.FromJSONPB AgentInfo) where
@@ -513,6 +539,9 @@ instance (HsJSONPB.FromJSONPB AgentInfo) where
                     (obj .: "pr_url")
                 )
             <*> obj .: "topology"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "pane_id")
+                )
       )
 
 instance (HsJSONPB.ToJSON AgentInfo) where
@@ -4565,4 +4594,161 @@ instance (HsJSONPB.ToJSON CloseSelfResponse) where
   toEncoding = HsJSONPB.toAesonEncoding
 
 instance (HsJSONPB.FromJSON CloseSelfResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+newtype CloseWorkerPaneRequest
+  = CloseWorkerPaneRequest {closeWorkerPaneRequestPaneId :: Hs.Text}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData CloseWorkerPaneRequest)
+
+instance (HsProtobuf.Named CloseWorkerPaneRequest) where
+  nameOf _ = Hs.fromString "CloseWorkerPaneRequest"
+
+instance (HsProtobuf.HasDefault CloseWorkerPaneRequest)
+
+instance (HsProtobuf.Message CloseWorkerPaneRequest) where
+  encodeMessage
+    _
+    CloseWorkerPaneRequest {closeWorkerPaneRequestPaneId} =
+      ( HsProtobuf.encodeMessageField
+          (HsProtobuf.FieldNumber 1)
+          ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+              closeWorkerPaneRequestPaneId
+          )
+      )
+  decodeMessage _ =
+    Hs.pure CloseWorkerPaneRequest
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "pane_id")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB CloseWorkerPaneRequest) where
+  toJSONPB (CloseWorkerPaneRequest f1) =
+    HsJSONPB.object
+      [ "pane_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+      ]
+  toEncodingPB (CloseWorkerPaneRequest f1) =
+    HsJSONPB.pairs
+      [ "pane_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+      ]
+
+instance (HsJSONPB.FromJSONPB CloseWorkerPaneRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "CloseWorkerPaneRequest"
+      ( \obj ->
+          Hs.pure CloseWorkerPaneRequest
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "pane_id")
+                )
+      )
+
+instance (HsJSONPB.ToJSON CloseWorkerPaneRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON CloseWorkerPaneRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data CloseWorkerPaneResponse
+  = CloseWorkerPaneResponse
+  { closeWorkerPaneResponseSuccess :: Hs.Bool,
+    closeWorkerPaneResponseError :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData CloseWorkerPaneResponse)
+
+instance (HsProtobuf.Named CloseWorkerPaneResponse) where
+  nameOf _ = Hs.fromString "CloseWorkerPaneResponse"
+
+instance (HsProtobuf.HasDefault CloseWorkerPaneResponse)
+
+instance (HsProtobuf.Message CloseWorkerPaneResponse) where
+  encodeMessage
+    _
+    CloseWorkerPaneResponse
+      { closeWorkerPaneResponseSuccess,
+        closeWorkerPaneResponseError
+      } =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            closeWorkerPaneResponseSuccess
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                closeWorkerPaneResponseError
+            )
+        )
+  decodeMessage _ =
+    Hs.pure CloseWorkerPaneResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB CloseWorkerPaneResponse) where
+  toJSONPB (CloseWorkerPaneResponse f1 f2) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+  toEncodingPB (CloseWorkerPaneResponse f1 f2) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+
+instance (HsJSONPB.FromJSONPB CloseWorkerPaneResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "CloseWorkerPaneResponse"
+      ( \obj ->
+          Hs.pure CloseWorkerPaneResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+      )
+
+instance (HsJSONPB.ToJSON CloseWorkerPaneResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON CloseWorkerPaneResponse) where
   parseJSON = HsJSONPB.parseJSONPB

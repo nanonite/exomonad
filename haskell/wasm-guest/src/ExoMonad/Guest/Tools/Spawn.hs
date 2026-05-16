@@ -9,6 +9,7 @@ module ExoMonad.Guest.Tools.Spawn
     SpawnWorkers,
     SpawnLeaf,
     SpawnWorkerTool,
+    CloseWorkerPaneTool,
     SpawnAcp,
 
     -- * Args types
@@ -18,6 +19,7 @@ module ExoMonad.Guest.Tools.Spawn
     SpawnWorkersArgs (..),
     SpawnLeafArgs (..),
     SpawnWorkerToolArgs (..),
+    CloseWorkerPaneArgs (..),
     WorkerSpec (..),
     WorkerType (..),
     SpawnAcpArgs (..),
@@ -28,6 +30,7 @@ module ExoMonad.Guest.Tools.Spawn
     spawnWorkersCore,
     spawnLeafCore,
     spawnWorkerToolCore,
+    closeWorkerPaneCore,
     spawnAcpCore,
 
     -- * Result types
@@ -48,6 +51,8 @@ module ExoMonad.Guest.Tools.Spawn
     spawnLeafSchema,
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
+    closeWorkerPaneDescription,
+    closeWorkerPaneSchema,
 
     -- * Helpers (re-exported for role code)
     spawnErrorMessage,
@@ -602,6 +607,32 @@ spawnWorkerToolCore args = do
             wsDisallowedTools = Nothing
           }
   spawnWorkersCore (SpawnWorkersArgs [spec])
+
+data CloseWorkerPaneTool
+
+data CloseWorkerPaneArgs = CloseWorkerPaneArgs
+  { cwpPaneId :: Text
+  }
+  deriving (Show, Eq, Generic)
+
+instance FromJSON CloseWorkerPaneArgs where
+  parseJSON = withObject "CloseWorkerPaneArgs" $ \v ->
+    CloseWorkerPaneArgs <$> v .: "pane_id"
+
+closeWorkerPaneDescription :: Text
+closeWorkerPaneDescription = "Close an ephemeral worker tmux pane by pane_id. Use the pane_id returned by spawn_worker after you have received the worker's final result or no longer need the worker pane."
+
+closeWorkerPaneSchema :: Aeson.Object
+closeWorkerPaneSchema =
+  genericToolSchemaWith @CloseWorkerPaneArgs
+    [("pane_id", "Stable tmux pane id returned by spawn_worker, such as '%42'")]
+
+closeWorkerPaneCore :: CloseWorkerPaneArgs -> Eff Effects MCPCallOutput
+closeWorkerPaneCore args = do
+  result <- AC.closeWorkerPane (cwpPaneId args)
+  pure $ case result of
+    Left err -> errorResult (spawnErrorMessage err)
+    Right resp -> successResult (Aeson.toJSON resp)
 
 -- ============================================================================
 -- SpawnAcp (single ACP agent)

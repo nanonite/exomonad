@@ -342,6 +342,7 @@ impl<
                 agent_name,
                 issue_title: issue.title,
                 agent_type: options.agent_type,
+                pane_id: None,
             })
         })
         .await
@@ -431,6 +432,7 @@ impl<
                     agent_name,
                     issue_title: options.name.to_string(),
                     agent_type: options.agent_type,
+                    pane_id: None,
                 });
             }
 
@@ -516,6 +518,7 @@ impl<
                 agent_name,
                 issue_title: options.name.to_string(),
                 agent_type: options.agent_type,
+                pane_id: None,
             })
         })
         .await
@@ -691,20 +694,23 @@ impl<
             let settings_path = agent_config_dir.join("settings.json");
             if settings_path.exists() {
                 // Check tmux pane liveness — settings.json can outlive the pane
-                let pane_alive = match RoutingInfo::read_from_dir(&agent_config_dir).await {
+                let existing_pane_id = match RoutingInfo::read_from_dir(&agent_config_dir).await {
                     Ok(routing) => match routing.pane_id {
-                        Some(ref pane_id) => self.tmux()?.pane_exists(pane_id).await.unwrap_or(false),
-                        None => false,
+                        Some(ref pane_id) if self.tmux()?.pane_exists(pane_id).await.unwrap_or(false) => {
+                            Some(pane_id.as_str().to_string())
+                        }
+                        _ => None,
                     },
-                    Err(_) => false,
+                    Err(_) => None,
                 };
-                if pane_alive {
+                if let Some(pane_id) = existing_pane_id {
                     info!(name = %options.name, "Worker pane still alive, returning existing");
                     return Ok(SpawnResult {
                         agent_dir: PathBuf::new(),
                         agent_name,
                         issue_title: options.name.to_string(),
                         agent_type,
+                        pane_id: Some(pane_id),
                     });
                 }
                 // Stale: pane is dead but config dir remains. Clean up and respawn.
@@ -791,11 +797,12 @@ impl<
                 env_vars,
                 Some(&caller_tab),
                 Some(&options.claude_flags),
-            )
-            .await?;
+              )
+              .await?;
+              let pane_id_string = pane_id.as_str().to_string();
 
-            // Store pane_id for message delivery and cleanup
-            let routing = RoutingInfo::pane(pane_id, &caller_tab);
+              // Store pane_id for message delivery and cleanup
+              let routing = RoutingInfo::pane(pane_id, &caller_tab);
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
@@ -817,6 +824,7 @@ impl<
                 agent_name,
                 issue_title: options.name.to_string(),
                 agent_type,
+                pane_id: Some(pane_id_string),
             })
         })
         .await
@@ -865,10 +873,11 @@ impl<
                 info!(slug = %identity.slug(), "Subtree already running, returning existing");
                 return Ok(SpawnResult {
                     agent_dir: self.worktree_base.join(agent_name.as_str()),
-                    agent_name,
-                    issue_title: options.branch_name.clone(),
-                    agent_type,
-                });
+                      agent_name,
+                      issue_title: options.branch_name.clone(),
+                      agent_type,
+                      pane_id: None,
+                  });
             }
 
             // Parent branch derived from typed birth-branch.
@@ -1144,10 +1153,11 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: worktree_path.clone(),
-                agent_name,
-                issue_title: options.branch_name.clone(),
-                agent_type,
-            })
+                  agent_name,
+                  issue_title: options.branch_name.clone(),
+                  agent_type,
+                  pane_id: None,
+              })
         })
         .await
         .map_err(|_| {
@@ -1192,10 +1202,11 @@ impl<
                 info!(slug = %identity.slug(), "Leaf subtree already running, returning existing");
                 return Ok(SpawnResult {
                     agent_dir: self.worktree_base.join(agent_name.as_str()),
-                    agent_name,
-                    issue_title: options.branch_name.clone(),
-                    agent_type,
-                });
+                      agent_name,
+                      issue_title: options.branch_name.clone(),
+                      agent_type,
+                      pane_id: None,
+                  });
             }
 
             // Ensure a remote exists for local-only workflows
@@ -1295,10 +1306,11 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: worktree_path.clone(),
-                agent_name,
-                issue_title: options.branch_name.clone(),
-                agent_type,
-            })
+                  agent_name,
+                  issue_title: options.branch_name.clone(),
+                  agent_type,
+                  pane_id: None,
+              })
         })
         .await
         .map_err(|_| {

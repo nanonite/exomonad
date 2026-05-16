@@ -491,6 +491,8 @@ pub struct SpawnResult {
     pub issue_title: String,
     /// Agent type
     pub agent_type: AgentType,
+    /// Stable tmux pane id for ephemeral worker panes.
+    pub pane_id: Option<String>,
 }
 
 impl FFIBoundary for SpawnResult {}

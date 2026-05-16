@@ -42,10 +42,11 @@ import ExoMonad.Guest.Tools.Events
 import ExoMonad.Guest.Tools.MergePR (mergePRCore, mergePRDescription, mergePRSchema, mergePRRender, MergePRArgs (..), MergePROutput (..), extractAgentName)
 import ExoMonad.Guest.Tools.Spawn
   ( forkWaveCore, forkWaveDescription, forkWaveSchema, forkWaveRender, ForkWaveArgs (..), ForkWaveResult (..),
-    spawnLeafCore, spawnLeafDescription, spawnLeafSchema, SpawnLeafArgs, SpawnLeafSubtreeArgs,
-    spawnLeafRender,
-    spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
-    spawnAcpCore, SpawnAcpArgs
+      spawnLeafCore, spawnLeafDescription, spawnLeafSchema, SpawnLeafArgs, SpawnLeafSubtreeArgs,
+      spawnLeafRender,
+      spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
+      closeWorkerPaneCore, closeWorkerPaneDescription, closeWorkerPaneSchema, CloseWorkerPaneArgs,
+      spawnAcpCore, SpawnAcpArgs
   )
 import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription, spawnCodexSchema, SpawnCodex)
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
@@ -150,6 +151,15 @@ instance MCPTool TLSpawnWorker where
   toolSchema = spawnWorkerToolSchema
   toolHandlerEff args = spawnWorkerToolCore args
 
+data TLCloseWorkerPane
+
+instance MCPTool TLCloseWorkerPane where
+  type ToolArgs TLCloseWorkerPane = CloseWorkerPaneArgs
+  toolName = "close_worker_pane"
+  toolDescription = closeWorkerPaneDescription
+  toolSchema = closeWorkerPaneSchema
+  toolHandlerEff args = closeWorkerPaneCore args
+
 data TLSpawnCodex
 
 instance MCPTool TLSpawnCodex where
@@ -187,9 +197,10 @@ instance MCPTool TLNotifyParent where
 
 data Tools mode = Tools
   { forkWave :: mode :- TLForkWave,
-    spawnLeaf :: mode :- TLSpawnLeaf,
-    spawnWorker :: mode :- TLSpawnWorker,
-    spawnCodex :: mode :- TLSpawnCodex,
+      spawnLeaf :: mode :- TLSpawnLeaf,
+      spawnWorker :: mode :- TLSpawnWorker,
+      closeWorkerPane :: mode :- TLCloseWorkerPane,
+      spawnCodex :: mode :- TLSpawnCodex,
     pr :: mode :- TLFilePR,
     mergePr :: mode :- TLMergePR,
     notifyParent :: mode :- TLNotifyParent,
@@ -223,9 +234,10 @@ config =
         tools =
           Tools
             { forkWave = mkHandler @TLForkWave,
-              spawnLeaf = mkHandler @TLSpawnLeaf,
-              spawnWorker = mkHandler @TLSpawnWorker,
-              spawnCodex = mkHandler @TLSpawnCodex,
+                spawnLeaf = mkHandler @TLSpawnLeaf,
+                spawnWorker = mkHandler @TLSpawnWorker,
+                closeWorkerPane = mkHandler @TLCloseWorkerPane,
+                spawnCodex = mkHandler @TLSpawnCodex,
               pr = mkHandler @TLFilePR,
               mergePr = mkHandler @TLMergePR,
               notifyParent = mkHandler @TLNotifyParent,

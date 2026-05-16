@@ -52,6 +52,8 @@ message AgentInfo {
   string pr_url = 11;
   // Workspace topology.
   WorkspaceTopology topology = 12;
+  // Stable tmux pane id for ephemeral worker panes (e.g. "%42").
+  string pane_id = 13;
 }
 
 // ============================================================================
@@ -351,6 +353,20 @@ message CloseSelfResponse {
 }
 
 // ============================================================================
+// CloseWorkerPane - Close an explicit worker pane from the supervising TL/root
+// ============================================================================
+
+message CloseWorkerPaneRequest {
+  // Stable tmux pane id returned by spawn_worker (e.g. "%42").
+  string pane_id = 1;
+}
+
+message CloseWorkerPaneResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// ============================================================================
 // Service definition
 // ============================================================================
 
@@ -367,4 +383,5 @@ service AgentEffects {
   rpc CleanupMerged(CleanupMergedRequest) returns (CleanupMergedResponse);
   rpc List(ListRequest) returns (ListResponse);
   rpc CloseSelf(CloseSelfRequest) returns (CloseSelfResponse);
+  rpc CloseWorkerPane(CloseWorkerPaneRequest) returns (CloseWorkerPaneResponse);
 }

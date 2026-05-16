@@ -107,6 +107,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Option A: add pane_id to SpawnResult + CloseWorkerPane effect for worker feedback loop (#215)
 - Build and verify pane-pinning fix: delivery.rs .0 suffix for window-name targets (#216)
 - Worker pane lifecycle: verify send_message routing to Codex worker panes via routing.json (#214)
 - Codex: E2E test — messaging (#147)
