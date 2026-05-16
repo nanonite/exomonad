@@ -15,6 +15,22 @@ pub enum DeliveryResult {
     Failed,
 }
 
+fn pinned_tmux_target(target: &str) -> String {
+    if target.starts_with('%') {
+        target.to_string()
+    } else {
+        format!("{}.0", target)
+    }
+}
+
+fn routing_tmux_target(routing: &serde_json::Value) -> Option<String> {
+    routing["pane_id"]
+        .as_str()
+        .or_else(|| routing["window_id"].as_str())
+        .or_else(|| routing["parent_tab"].as_str())
+        .map(|s| s.to_string())
+}
+
 /// Notification status for parent-facing messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifyStatus {
@@ -473,11 +489,7 @@ async fn deliver_via_tmux(
         let path = agents_dir.join(&dir_name).join("routing.json");
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
             if let Ok(routing) = serde_json::from_str::<serde_json::Value>(&content) {
-                let target = routing["pane_id"]
-                    .as_str()
-                    .or_else(|| routing["window_id"].as_str())
-                    .or_else(|| routing["parent_tab"].as_str())
-                    .map(|s| s.to_string());
+                let target = routing_tmux_target(&routing);
 
                 if let Some(t) = target {
                     routing_target = Some(t);
@@ -510,10 +522,14 @@ async fn deliver_via_tmux(
             crate::services::resolve_working_dir(agent_key)
         };
         let effective_pd = project_dir.join(worktree);
-        let outcome = match tmux_events::inject_input(&target, message, &effective_pd).await {
+        // Pin to pane 0 when target is a window name/ID (not a %N pane ID) so
+        // injection reaches the TL's main pane rather than an active worker pane.
+        let pinned_target = pinned_tmux_target(&target);
+        let outcome = match tmux_events::inject_input(&pinned_target, message, &effective_pd).await
+        {
             Ok(()) => "success",
             Err(e) => {
-                warn!(target = %target, error = %e, "tmux inject_input failed (routing.json)");
+                warn!(target = %pinned_target, error = %e, "tmux inject_input failed (routing.json)");
                 "failed"
             }
         };
@@ -542,10 +558,14 @@ async fn deliver_via_tmux(
         crate::services::resolve_worktree_from_tab(tmux_target)
     };
     let effective_pd = project_dir.join(worktree);
-    let outcome = match tmux_events::inject_input(tmux_target, message, &effective_pd).await {
+    // When the target is a window name (not a %N pane ID), append ".0" to pin
+    // injection to the first pane. Without this, tmux sends to the active pane,
+    // which may be a worker pane rather than the TL's main pane.
+    let pinned_target = pinned_tmux_target(tmux_target);
+    let outcome = match tmux_events::inject_input(&pinned_target, message, &effective_pd).await {
         Ok(()) => "success",
         Err(e) => {
-            warn!(target = %tmux_target, error = %e, "tmux inject_input failed (fallback)");
+            warn!(target = %pinned_target, error = %e, "tmux inject_input failed (fallback)");
             "failed"
         }
     };
@@ -852,6 +872,37 @@ mod tests {
         assert_ne!(DeliveryResult::Teams, DeliveryResult::Tmux);
         assert_ne!(DeliveryResult::Teams, DeliveryResult::Failed);
         assert_ne!(DeliveryResult::Tmux, DeliveryResult::Failed);
+    }
+
+    #[test]
+    fn test_routing_tmux_target_prefers_worker_pane_id() {
+        let routing = serde_json::json!({
+            "pane_id": "%42",
+            "window_id": "@7",
+            "parent_tab": "TL"
+        });
+
+        assert_eq!(routing_tmux_target(&routing), Some("%42".to_string()));
+    }
+
+    #[test]
+    fn test_routing_tmux_target_falls_back_to_window() {
+        let routing = serde_json::json!({
+            "window_id": "@7",
+            "parent_tab": "TL"
+        });
+
+        assert_eq!(routing_tmux_target(&routing), Some("@7".to_string()));
+    }
+
+    #[test]
+    fn test_pinned_tmux_target_leaves_pane_id_unmodified() {
+        assert_eq!(pinned_tmux_target("%42"), "%42");
+    }
+
+    #[test]
+    fn test_pinned_tmux_target_pins_window_name_to_first_pane() {
+        assert_eq!(pinned_tmux_target("TL"), "TL.0");
     }
 
     #[tokio::test]

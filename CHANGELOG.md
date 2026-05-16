@@ -105,6 +105,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Worker pane lifecycle: verify send_message routing to Codex worker panes via routing.json (#214)
 - Codex: E2E test — messaging (#147)
 - Codex: documentation pass (#148)
 - Codex: Haskell WASM spawn_codex tool + hook handler (#145)
