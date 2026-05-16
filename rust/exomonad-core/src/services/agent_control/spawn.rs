@@ -1381,6 +1381,9 @@ impl<
             .context("Failed to create reviewer worktree")?;
         }
 
+        let reviewer_internal_name = identity.internal_name().to_string();
+        let reviewer_birth_branch = branch_name.clone();
+
         let options = SpawnSubtreeOptions {
             task,
             branch_name,
@@ -1405,7 +1408,45 @@ impl<
             model: self.reviewer_model.clone(),
         };
 
-        self.spawn_subtree(&options, caller_bb).await
+        let result = self.spawn_subtree(&options, caller_bb).await?;
+
+        // Persist the reviewer→PR mapping so the worktree event watcher can fan out
+        // PR review events to the reviewer's plugin manager. Without this, handlers
+        // in .exo/roles/devswarm/ReviewerRole.hs (FixesPushed, ReviewerApproved, etc.)
+        // are unreachable and the leaf+reviewer convergence loop stalls indefinitely.
+        let prs_path = self.project_dir().join(".exo/prs.json");
+        match crate::services::file_pr_local::read_pr_registry(&prs_path).await {
+            Ok(mut registry) => {
+                if let Some(entry) = registry.prs.get_mut(&pr_entry.number) {
+                    entry.reviewer_agent = Some(reviewer_internal_name);
+                    entry.reviewer_birth_branch = Some(reviewer_birth_branch);
+                    if let Err(err) =
+                        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry)
+                            .await
+                    {
+                        tracing::warn!(
+                            pr_number = pr_entry.number,
+                            error = %err,
+                            "Failed to persist reviewer registration to PR registry — \
+                             watcher will not fan out PR review events to this reviewer"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        pr_number = pr_entry.number,
+                        "PR entry missing from registry at reviewer-spawn time — \
+                         skipping reviewer registration"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                pr_number = pr_entry.number,
+                error = %err,
+                "Failed to read PR registry to persist reviewer assignment"
+            ),
+        }
+
+        Ok(result)
     }
 }
 

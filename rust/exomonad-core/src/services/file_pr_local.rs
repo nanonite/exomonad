@@ -93,6 +93,13 @@ pub struct PrEntry {
     pub last_head_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewer_agent: Option<String>,
+    /// Birth branch of the reviewer agent assigned to this PR (e.g., `review-pr-12`).
+    /// Set when a reviewer is spawned for this PR; used by the worktree event watcher
+    /// to dispatch PR review events (FixesPushed, ReviewerApproved, etc.) to the
+    /// reviewer's plugin manager in addition to the leaf's. None means no reviewer
+    /// has been spawned yet (or the PR predates reviewer-registry tracking).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reviewer_birth_branch: Option<String>,
     #[serde(default)]
     pub rounds: u32,
     #[serde(default)]
@@ -129,6 +136,32 @@ impl PrRegistry {
     pub fn find_by_branch(&self, head_branch: &BranchName) -> Option<&PrEntry> {
         let branch_str = head_branch.as_str();
         self.prs.values().find(|pr| pr.head_branch == branch_str)
+    }
+
+    /// Look up the reviewer agent assigned to a PR.
+    ///
+    /// Returns the reviewer's birth branch and agent type if a reviewer has been
+    /// spawned for this PR. The worktree event watcher calls this to fan out PR
+    /// review events (FixesPushed, ReviewerApproved, ReviewerRequestedChanges,
+    /// ReviewTimeout, Stuck, MergeReady) to the reviewer's plugin manager in
+    /// addition to the leaf's — without this lookup the reviewer's handlers in
+    /// `.exo/roles/devswarm/ReviewerRole.hs` are unreachable from the watcher.
+    ///
+    /// Returns None when:
+    /// - The PR number is unknown to this registry
+    /// - No reviewer has been spawned yet for this PR (`reviewer_birth_branch`
+    ///   is unset)
+    /// - `reviewer_agent` is unset or has no parseable type suffix (callers
+    ///   should treat this as a misconfigured PR record and log it)
+    pub fn reviewer_for_pr(
+        &self,
+        pr_number: u64,
+    ) -> Option<(BranchName, crate::services::agent_control::AgentType)> {
+        let entry = self.prs.get(&pr_number)?;
+        let birth_branch = entry.reviewer_birth_branch.as_ref()?;
+        let agent_name = entry.reviewer_agent.as_ref()?;
+        let agent_type = crate::services::agent_control::AgentType::from_dir_name(agent_name);
+        Some((BranchName::from(birth_branch.as_str()), agent_type))
     }
 }
 
@@ -280,6 +313,7 @@ pub async fn file_pr_local(
         last_review_at: None,
         last_head_sha: None,
         reviewer_agent: None,
+        reviewer_birth_branch: None,
         rounds: 0,
         stuck: false,
         needs_human_review: false,
@@ -413,6 +447,7 @@ mod tests {
                 last_review_at: None,
                 last_head_sha: None,
                 reviewer_agent: None,
+                reviewer_birth_branch: None,
                 rounds: 0,
                 stuck: false,
                 needs_human_review: false,
@@ -426,6 +461,116 @@ mod tests {
 
         let not_found = reg.find_by_branch(&BranchName::from("nonexistent"));
         assert!(not_found.is_none());
+    }
+
+    fn pr_entry_with_reviewer(
+        pr_number: u64,
+        reviewer_agent: Option<&str>,
+        reviewer_birth_branch: Option<&str>,
+    ) -> PrEntry {
+        PrEntry {
+            number: pr_number,
+            head_branch: format!("main.feat-{pr_number}-gemini"),
+            base_branch: "main".into(),
+            title: "Test PR".into(),
+            body: "body".into(),
+            author_agent: format!("feat-{pr_number}-gemini"),
+            author_role: "dev".into(),
+            created_at: Utc::now(),
+            state: PrState::Open,
+            review_state: LocalReviewState::PendingReview,
+            last_review_at: None,
+            last_head_sha: None,
+            reviewer_agent: reviewer_agent.map(String::from),
+            reviewer_birth_branch: reviewer_birth_branch.map(String::from),
+            rounds: 0,
+            stuck: false,
+            needs_human_review: false,
+            merge_blocked_on_ci: false,
+        }
+    }
+
+    #[test]
+    fn test_reviewer_for_pr_returns_birth_branch_and_agent_type() {
+        let mut reg = PrRegistry::default();
+        reg.prs.insert(
+            7,
+            pr_entry_with_reviewer(7, Some("review-pr-7-codex"), Some("review-pr-7")),
+        );
+
+        let (branch, agent_type) = reg.reviewer_for_pr(7).expect("reviewer is present");
+        assert_eq!(branch.as_str(), "review-pr-7");
+        assert_eq!(
+            agent_type,
+            crate::services::agent_control::AgentType::Codex,
+            "agent type is inferred from the reviewer_agent suffix"
+        );
+    }
+
+    #[test]
+    fn test_reviewer_for_pr_detects_each_agent_type_from_suffix() {
+        use crate::services::agent_control::AgentType;
+        let cases = [
+            ("review-pr-1-claude", AgentType::Claude),
+            ("review-pr-2-codex", AgentType::Codex),
+            ("review-pr-3-opencode", AgentType::OpenCode),
+        ];
+        for (agent_name, expected_type) in cases {
+            let mut reg = PrRegistry::default();
+            let pr_number = match expected_type {
+                AgentType::Claude => 1,
+                AgentType::Codex => 2,
+                AgentType::OpenCode => 3,
+                _ => unreachable!(),
+            };
+            reg.prs.insert(
+                pr_number,
+                pr_entry_with_reviewer(
+                    pr_number,
+                    Some(agent_name),
+                    Some(&format!("review-pr-{pr_number}")),
+                ),
+            );
+            let (_, agent_type) = reg.reviewer_for_pr(pr_number).expect("reviewer is present");
+            assert_eq!(
+                agent_type, expected_type,
+                "agent type for {agent_name} must be {expected_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reviewer_for_pr_returns_none_when_unknown_pr() {
+        let reg = PrRegistry::default();
+        assert!(reg.reviewer_for_pr(42).is_none());
+    }
+
+    #[test]
+    fn test_reviewer_for_pr_returns_none_when_no_reviewer_assigned() {
+        let mut reg = PrRegistry::default();
+        reg.prs.insert(1, pr_entry_with_reviewer(1, None, None));
+        assert!(reg.reviewer_for_pr(1).is_none());
+    }
+
+    #[test]
+    fn test_reviewer_for_pr_returns_none_when_only_one_reviewer_field_set() {
+        let mut reg = PrRegistry::default();
+        reg.prs.insert(
+            1,
+            pr_entry_with_reviewer(1, Some("review-pr-1-codex"), None),
+        );
+        assert!(
+            reg.reviewer_for_pr(1).is_none(),
+            "missing birth_branch must not return a partial reviewer record"
+        );
+
+        let mut reg2 = PrRegistry::default();
+        reg2.prs
+            .insert(2, pr_entry_with_reviewer(2, None, Some("review-pr-2")));
+        assert!(
+            reg2.reviewer_for_pr(2).is_none(),
+            "missing reviewer_agent must not return a partial reviewer record"
+        );
     }
 
     #[test]
@@ -462,6 +607,7 @@ mod tests {
                 last_review_at: None,
                 last_head_sha: None,
                 reviewer_agent: None,
+                reviewer_birth_branch: None,
                 rounds: 0,
                 stuck: false,
                 needs_human_review: false,
@@ -499,6 +645,7 @@ mod tests {
                 last_review_at: None,
                 last_head_sha: None,
                 reviewer_agent: None,
+                reviewer_birth_branch: None,
                 rounds: 0,
                 stuck: false,
                 needs_human_review: false,

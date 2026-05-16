@@ -371,6 +371,7 @@ mod tests {
             last_review_at: None,
             last_head_sha: None,
             reviewer_agent: None,
+            reviewer_birth_branch: None,
             rounds: 0,
             stuck: false,
             needs_human_review: false,
