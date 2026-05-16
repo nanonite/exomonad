@@ -129,5 +129,6 @@ spindle.db-wal
 .exo/prs.json
 
 # Working notes (not committed)
+archive/
 notes-knot-atproto-push.md
 opencode-*.md
