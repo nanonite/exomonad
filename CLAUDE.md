@@ -58,6 +58,10 @@ Always prefer failure to an undocumented heuristic or fallback.
 
 Never maintain two code paths that do the same thing. Redundant paths cause bug risk — fixes applied to one path get missed on the other. If there's a "debug mode" or "legacy mode" that duplicates a primary path, cut it.
 
+### Chainlink Timers
+
+Chainlink timers are TL-owned and explicit per issue. Start timers with the assigned issue id, and stop timers with that same issue id. Do not rely on a global active timer: Chainlink supports concurrent timers across issues while enforcing one active timer per issue.
+
 ### All Tools and Hooks in Haskell WASM
 
 **Never add direct Rust MCP tools.** All MCP tools and hooks are defined in Haskell WASM — tool schemas, argument parsing, dispatch logic, everything. Rust is the I/O runtime: it executes effects that the Haskell DSL yields. If a new tool needs new I/O capabilities, add a new effect handler in Rust and a corresponding effect type in Haskell. The tool itself lives in `haskell/wasm-guest/src/ExoMonad/Guest/Tools/`.

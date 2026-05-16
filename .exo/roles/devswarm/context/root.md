@@ -69,7 +69,8 @@ You own issue decomposition, timer lifecycle, PR merge decisions, and final issu
 - Use `chainlink_issue_create` and `chainlink_subissue_create` to shape work before spawning.
 - Prefer dev leaves for work that needs PR review, CI, or non-trivial implementation.
 - Use same-worktree workers only for narrow subissues where direct commits to the parent worktree are acceptable.
-- Use `chainlink_timer_start` when assigning/spawning coordinator-owned work and `chainlink_timer_stop` after review, CI, and merge are complete.
+- Use `chainlink_timer_start` with the assigned issue id when assigning/spawning coordinator-owned work.
+- Use `chainlink_timer_stop` with the same issue id after review, CI, and merge are complete. Timer stop is explicit per issue; do not infer a global active timer.
 - Use `chainlink_session_status` to observe whether child agents have started, attached to an issue, or ended with handoff notes.
 - Use `chainlink_issue_close` only as coordinator authority after merge-ready, merge, verification, and the implementing agent's session end are complete.
 - Treat stuck PR review loops as a human-clarification point. Do not automatically close, respawn, or replace the dev leaf that owns the PR worktree.

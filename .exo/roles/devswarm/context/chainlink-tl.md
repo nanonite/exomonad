@@ -76,8 +76,8 @@ When a child sends `notify_parent` with success:
 | `chainlink_subissue_create` | Create a child issue under a parent |
 | `chainlink_session_status` | Read session progress for active work |
 | `chainlink_timer_start` | Start coordinator-owned lifecycle timing |
-| `chainlink_timer_stop` | Stop coordinator-owned lifecycle timing |
-| `chainlink_timer_status` | Check active timer state |
+| `chainlink_timer_stop` | Stop coordinator-owned lifecycle timing for a specific issue |
+| `chainlink_timer_status` | Check active timer state for one issue or all active timers |
 | `chainlink_block` | Set a blocking dependency between issues |
 | `chainlink_cascade` | Show falsification cascade for an issue |
 | `chainlink_milestone_create` | Create a milestone for grouping issues |
@@ -93,7 +93,7 @@ Chainlink operations are cheap. Use them liberally. Prefer chainlink for coordin
 - Always create the chainlink issue BEFORE spawning a child for it
 - Include the chainlink issue ID in every spawn_worker/spawn_leaf task description
 - Use `chainlink_session_status` for supervision — never send a probing message
-- Start timers when assigning work and stop them after review, CI, and merge complete
+- Start timers when assigning work and stop them with the same issue id after review, CI, and merge complete
 - Close the issue when the work is merged, not when the PR is filed
 - Never ask a worker or dev leaf to close its own assigned issue
 - Never use Chainlink agent, sync, or lock commands
