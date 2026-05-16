@@ -28,12 +28,37 @@ Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is
 
 ## Notification Vocabulary
 
+### Dev-leaf signals (PR review loop)
 - `[FIXES PUSHED]` — leaf addressed reviewer comments and pushed. Merge if CI passes.
 - `[PR READY]` — reviewer approved, but wait for `[MERGE READY]` before merge/close unless policy explicitly allows otherwise.
 - `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Merge, verify, then close the Chainlink issue.
 - `[REVIEW TIMEOUT]` — no reviewer response after timeout. Merge only if CI and policy allow the timeout path.
 - `[STUCK: id]` — review did not converge after the configured review-round limit. Ask the human for clarification before continuing; the dev leaf remains alive.
 - `[FAILED: id]` — leaf exhausted retries. Re-decompose or escalate.
+
+### Worker signals (ephemeral pane, no PR)
+- `[from: worker-name]` with success content — worker completed. Acknowledge, no merge needed.
+- `[from: worker-name]` with blocker/partial content — worker hit an issue. See Worker Correction Loop below.
+
+## Worker Correction Loop
+
+Workers are ephemeral pane agents with no PR. When a worker reports a blocker via `notify_parent`:
+
+1. **Assess**: Can you resolve the blocker with a clarification or a narrower spec? If yes:
+   - Use `send_message` with `to: worker-name` to inject the correction directly into the worker's pane.
+   - The worker is still running and will receive the message.
+   - Wait for the worker's follow-up `notify_parent`.
+
+2. **Escalate to human**: If you cannot resolve the blocker alone (missing domain knowledge, ambiguous requirement, external dependency):
+   - Surface the issue clearly in your response so the human operator can see it.
+   - Tell the human: what the worker tried, what failed, and what clarification is needed.
+   - Once the human provides clarification, relay it to the worker via `send_message`.
+
+3. **Re-spec**: If the original task was fundamentally mis-scoped:
+   - Close the stuck worker (it will idle until the session ends).
+   - Spawn a new worker with a corrected spec.
+
+**Never wait silently** for a stuck worker. Either steer it, escalate to the human, or re-spec.
 
 ## Chainlink Coordination
 

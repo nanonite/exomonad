@@ -14,7 +14,7 @@ Use exomonad MCP tools for orchestration. Git and GitHub operations use `git` an
 
 | Tool | Role | What it does |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel Claude agents (own worktrees, context inherited by default via `fork_session`) |
+| `fork_wave` | root, tl | Fork N parallel agents — Claude, Codex, or OpenCode (own worktrees, agent type from config or explicit `agent_type`). Claude inherits context via `--fork-session`; Codex/OpenCode require context injected in the task spec. |
 | `spawn_leaf` | root, tl | Spawn Gemini agent in own worktree+branch (files PR). Structured spec fields: steps, verify, boundary, context, read_first |
 | `spawn_worker` | root, tl | Spawn ephemeral Gemini worker in tmux pane (no branch, no PR). Just name + task |
 | `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) |
@@ -50,7 +50,7 @@ Commit and push. Children fork from this commit.
 
 Spawn children for wave N. Zero dependencies between siblings in the same wave.
 
-- **Sub-TLs**: `fork_wave` (Claude). They inherit full conversation context — they already know the plan and the scaffolding.
+- **Sub-TLs**: `fork_wave` (Claude, Codex, or OpenCode — agent type from config or explicit `agent_type`). Claude inherits context via `--fork-session`. Codex and OpenCode have no team messaging — context must be explicitly injected in the task spec.
 - **Devs**: `spawn_leaf` (Gemini, worktree). They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
 - **Workers**: `spawn_worker` (Gemini, ephemeral pane). Research, boilerplate, or non-conflicting edits.
 

@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix Tangled CI event scoping during init (#208)
 - Fix Codex worktree hook trust prompts (#204)
 - Fix Tangled Spindle auto-start configuration feedback (#205)
 - Fix reviewer spawning in the project root instead of an isolated worktree (#127)
@@ -24,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Improve Tangled repo registration during init (#207)
 - Add TL-only Chainlink timer MCP lifecycle tracking (#196)
 - Block direct sqlite3 access to .chainlink/ in dev role permissionCascade (#162)
 - Add chainlink_issue_show and chainlink_issue_close to dev role (#161)

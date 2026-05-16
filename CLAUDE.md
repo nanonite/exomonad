@@ -305,7 +305,7 @@ What you can do with exomonad right now, end-to-end.
 
 Spawn heterogeneous agent teams as a recursive tree:
 
-- **`fork_wave`** — Fork N parallel Claude agents, each in its own worktree. Context inherited by default (`fork_session` defaults to `true`); set `false` for fresh-start children. Requires clean git state (committed and pushed).
+- **`fork_wave`** — Fork N parallel agents (Claude, Codex, or OpenCode), each in its own worktree. Agent type defaults to server config; set `agent_type` explicitly to override. Claude agents inherit context via `--fork-session`; Codex and OpenCode agents require context injected via the task spec (no team messaging support). Requires clean git state (committed and pushed).
 - **`spawn_leaf`** — Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields (steps, verify, boundary, context, read_first).
 - **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
 - **`spawn_codex`** — Spawn a Codex leaf agent in its own worktree+branch. Files PR when done.
@@ -662,7 +662,7 @@ The recursive execution pattern. Every TL at every level follows this protocol:
    - Commit and push. Children fork from this commit.
 
 2. **Fork** — Spawn wave N children. Zero deps between siblings in the same wave.
-   - Sub-TLs: `fork_wave` (Claude, context inherited by default) — they already know the plan
+   - Sub-TLs: `fork_wave` (Claude, Codex, or OpenCode — agent type from config or explicit `agent_type`). Claude agents inherit context via `--fork-session`; Codex and OpenCode require context injected in the task spec.
    - Devs: `spawn_leaf` (worktree+PR, agent type from config) — they get CLAUDE.md from scaffolding
    - Workers: `spawn_worker` (ephemeral pane) — research or non-conflicting edits
 
