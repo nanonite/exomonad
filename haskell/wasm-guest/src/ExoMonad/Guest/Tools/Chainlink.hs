@@ -719,6 +719,20 @@ instance FromJSON ChainlinkTimerStartArgs where
 instance ToJSON ChainlinkTimerStartArgs where
   toJSON args = object ["issue_id" .= ctsIssueId args]
 
+instance FromJSON ChainlinkTimerStopArgs where
+  parseJSON = withObject "ChainlinkTimerStopArgs" $ \v ->
+    ChainlinkTimerStopArgs <$> v .: "issue_id"
+
+instance ToJSON ChainlinkTimerStopArgs where
+  toJSON args = object ["issue_id" .= ctstopIssueId args]
+
+instance FromJSON ChainlinkTimerStatusArgs where
+  parseJSON = withObject "ChainlinkTimerStatusArgs" $ \v ->
+    ChainlinkTimerStatusArgs <$> v .:? "issue_id"
+
+instance ToJSON ChainlinkTimerStatusArgs where
+  toJSON args = object ["issue_id" .= ctstatusIssueId args]
+
 chainlinkTimerStartDescription :: Text
 chainlinkTimerStartDescription =
   "TL/SubTL-only timer start. Starts Chainlink timing for a coordinator-owned task lifecycle."
@@ -730,17 +744,21 @@ chainlinkTimerStartSchema =
 
 chainlinkTimerStopDescription :: Text
 chainlinkTimerStopDescription =
-  "TL/SubTL-only timer stop. Stops the active Chainlink timer after coordinator validation and merge."
+  "TL/SubTL-only timer stop. Stops the Chainlink timer for a specific coordinator-owned issue after validation and merge."
 
 chainlinkTimerStopSchema :: Aeson.Object
-chainlinkTimerStopSchema = mempty
+chainlinkTimerStopSchema =
+  genericToolSchemaWith @ChainlinkTimerStopArgs
+    [("issue_id", "The numeric issue ID whose active timer should stop")]
 
 chainlinkTimerStatusDescription :: Text
 chainlinkTimerStatusDescription =
-  "TL/SubTL-only timer status. Shows the active Chainlink timer for scope/time monitoring."
+  "TL/SubTL-only timer status. Shows active Chainlink timers, or one issue's timer when issue_id is provided."
 
 chainlinkTimerStatusSchema :: Aeson.Object
-chainlinkTimerStatusSchema = mempty
+chainlinkTimerStatusSchema =
+  genericToolSchemaWith @ChainlinkTimerStatusArgs
+    [("issue_id", "Optional numeric issue ID whose active timer should be shown")]
 
 runChainlinkText :: Text -> [String] -> Eff Effects (Either Text Text)
 runChainlinkText label args = do
@@ -761,11 +779,11 @@ runChainlinkText label args = do
 chainlinkTimerStartCore :: ChainlinkTimerStartArgs -> Eff Effects (Either Text Text)
 chainlinkTimerStartCore args = runChainlinkText "chainlink timer start" (buildTimerStartArgs args)
 
-chainlinkTimerStopCore :: Eff Effects (Either Text Text)
-chainlinkTimerStopCore = runChainlinkText "chainlink timer stop" buildTimerStopArgs
+chainlinkTimerStopCore :: ChainlinkTimerStopArgs -> Eff Effects (Either Text Text)
+chainlinkTimerStopCore args = runChainlinkText "chainlink timer stop" (buildTimerStopArgs args)
 
-chainlinkTimerStatusCore :: Eff Effects (Either Text Text)
-chainlinkTimerStatusCore = runChainlinkText "chainlink timer status" buildTimerStatusArgs
+chainlinkTimerStatusCore :: ChainlinkTimerStatusArgs -> Eff Effects (Either Text Text)
+chainlinkTimerStatusCore args = runChainlinkText "chainlink timer status" (buildTimerStatusArgs args)
 
 data ChainlinkTimerStart
 
@@ -783,12 +801,12 @@ instance MCPTool ChainlinkTimerStart where
 data ChainlinkTimerStop
 
 instance MCPTool ChainlinkTimerStop where
-  type ToolArgs ChainlinkTimerStop = ()
+  type ToolArgs ChainlinkTimerStop = ChainlinkTimerStopArgs
   toolName = "chainlink_timer_stop"
   toolDescription = chainlinkTimerStopDescription
   toolSchema = chainlinkTimerStopSchema
-  toolHandlerEff _ = do
-    result <- chainlinkTimerStopCore
+  toolHandlerEff args = do
+    result <- chainlinkTimerStopCore args
     case result of
       Left err -> pure $ errorResult err
       Right output -> pure $ successResult (object ["output" .= output])
@@ -796,12 +814,12 @@ instance MCPTool ChainlinkTimerStop where
 data ChainlinkTimerStatus
 
 instance MCPTool ChainlinkTimerStatus where
-  type ToolArgs ChainlinkTimerStatus = ()
+  type ToolArgs ChainlinkTimerStatus = ChainlinkTimerStatusArgs
   toolName = "chainlink_timer_status"
   toolDescription = chainlinkTimerStatusDescription
   toolSchema = chainlinkTimerStatusSchema
-  toolHandlerEff _ = do
-    result <- chainlinkTimerStatusCore
+  toolHandlerEff args = do
+    result <- chainlinkTimerStatusCore args
     case result of
       Left err -> pure $ errorResult err
       Right output -> pure $ successResult (object ["output" .= output])

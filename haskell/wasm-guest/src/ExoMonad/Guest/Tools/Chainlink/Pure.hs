@@ -36,6 +36,8 @@ module ExoMonad.Guest.Tools.Chainlink.Pure
 
     -- * Timer
     ChainlinkTimerStartArgs (..),
+    ChainlinkTimerStopArgs (..),
+    ChainlinkTimerStatusArgs (..),
     buildTimerStartArgs,
     buildTimerStopArgs,
     buildTimerStatusArgs,
@@ -162,6 +164,16 @@ data ChainlinkIssueCloseArgs = ChainlinkIssueCloseArgs
 
 data ChainlinkTimerStartArgs = ChainlinkTimerStartArgs
   { ctsIssueId :: Int
+  }
+  deriving (Generic, Show)
+
+data ChainlinkTimerStopArgs = ChainlinkTimerStopArgs
+  { ctstopIssueId :: Int
+  }
+  deriving (Generic, Show)
+
+data ChainlinkTimerStatusArgs = ChainlinkTimerStatusArgs
+  { ctstatusIssueId :: Maybe Int
   }
   deriving (Generic, Show)
 
@@ -417,11 +429,15 @@ buildCloseArgs args = ["close", show (cisIssueId args), "-q"]
 buildTimerStartArgs :: ChainlinkTimerStartArgs -> [String]
 buildTimerStartArgs args = ["timer", "start", show (ctsIssueId args)]
 
-buildTimerStopArgs :: [String]
-buildTimerStopArgs = ["timer", "stop"]
+buildTimerStopArgs :: ChainlinkTimerStopArgs -> [String]
+buildTimerStopArgs args = ["timer", "stop", show (ctstopIssueId args)]
 
-buildTimerStatusArgs :: [String]
-buildTimerStatusArgs = ["timer", "show"]
+buildTimerStatusArgs :: ChainlinkTimerStatusArgs -> [String]
+buildTimerStatusArgs args =
+  ["timer", "show"]
+    ++ case ctstatusIssueId args of
+      Just issueId -> [show issueId]
+      Nothing -> []
 
 buildListArgs :: ChainlinkIssueListArgs -> [String]
 buildListArgs args =

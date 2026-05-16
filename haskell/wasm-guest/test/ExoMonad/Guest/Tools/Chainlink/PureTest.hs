@@ -83,9 +83,14 @@ pureTests =
         buildTimerStartArgs (ChainlinkTimerStartArgs 42)
           @=? ["timer", "start", "42"],
       testCase "buildTimerStopArgs: basic" $
-        buildTimerStopArgs @=? ["timer", "stop"],
-      testCase "buildTimerStatusArgs: basic" $
-        buildTimerStatusArgs @=? ["timer", "show"],
+        buildTimerStopArgs (ChainlinkTimerStopArgs 42)
+          @=? ["timer", "stop", "42"],
+      testCase "buildTimerStatusArgs: all active timers" $
+        buildTimerStatusArgs (ChainlinkTimerStatusArgs Nothing)
+          @=? ["timer", "show"],
+      testCase "buildTimerStatusArgs: specific issue" $
+        buildTimerStatusArgs (ChainlinkTimerStatusArgs (Just 42))
+          @=? ["timer", "show", "42"],
       -- ChainlinkIssueShowOutput JSON roundtrip
       testCase "ChainlinkIssueShowOutput JSON roundtrip: all fields" $ do
         let output =
