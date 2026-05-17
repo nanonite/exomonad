@@ -270,6 +270,15 @@ check-e2e-chainlink-codex:
     bash -n tests/e2e/chainlink-codex/run.sh
     bash -n tests/e2e/chainlink-codex/validate.sh
 
+# Run E2E reviewer convergence loop test (fixes_pushed fan-out to reviewer per chainlink #247)
+e2e-reviewer-convergence:
+    ./tests/e2e/reviewer-convergence-loop/run.sh
+
+# Check E2E reviewer convergence harness scripts without launching Codex/tmux
+check-e2e-reviewer-convergence:
+    bash -n tests/e2e/reviewer-convergence-loop/run.sh
+    bash -n tests/e2e/reviewer-convergence-loop/validate.sh
+
 # Run E2E Chainlink sqlite direct DB access block test
 e2e-chainlink-sqlite-block:
     ./tests/e2e/chainlink-sqlite-block/run.sh
