@@ -8,32 +8,41 @@
 --   Tool restrictions enforced at the WASM hook layer.
 module ReviewerRole (config, Tools) where
 
-import Data.Aeson (object, (.=))
-import Data.Aeson qualified as Aeson
-import Data.Text.Encoding qualified as TE
-import Data.Text.Lazy.Encoding qualified as TLE
-import ExoMonad
-import ExoMonad.Guest.Effects.FileSystem qualified as FS
-import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
-import ExoMonad.Guest.Tools.Events
-  ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs
-  )
-import ExoMonad.Guest.Types (allowResponse, allowStopResponse, postToolUseResponse, BeforeModelOutput (..), AfterModelOutput (..))
-import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
-import HookPolicy (preToolUseWithGhBlock)
-import ExoMonad.Guest.Events
-  ( PRReviewEvent (..), CIStatusEvent (..), SiblingMergedEvent (..),
-    EventHandlerConfig (..), EventAction (..), defaultEventHandlers
-  )
-import Data.Text (Text)
-import Data.Text qualified as T
-import Data.ByteString.Lazy qualified as BSL
 import Control.Monad (void)
 import Control.Monad.Freer (Eff)
-import ExoMonad.Guest.Types (Effects)
-import ExoMonad.Effects.Log qualified as Log
+import Data.Aeson (object, (.=))
+import Data.Aeson qualified as Aeson
+import Data.ByteString.Lazy qualified as BSL
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Text.Lazy qualified as TL
+import Data.Text.Lazy.Encoding qualified as TLE
+import ExoMonad
+import ExoMonad.Effects.Log qualified as Log
+import ExoMonad.Guest.Effects.FileSystem qualified as FS
+import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
+import ExoMonad.Guest.Events
+  ( CIStatusEvent (..),
+    EventAction (..),
+    EventHandlerConfig (..),
+    PRReviewEvent (..),
+    SiblingMergedEvent (..),
+    defaultEventHandlers,
+  )
+import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
+import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
+import ExoMonad.Guest.Tools.Events
+  ( NotifyParentArgs,
+    notifyParentCore,
+    notifyParentDescription,
+    notifyParentSchema,
+  )
+import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, postToolUseResponse)
+import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
+import HookPolicy (preToolUseWithGhBlock)
+import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
 
 -- | Reviewer notify_parent: thin wrapper, no phase transitions.
 data ReviewerNotifyParent
@@ -267,8 +276,8 @@ config =
         HookConfig
           { preToolUse = preToolUseWithGhBlock (\_ -> pure (allowResponse Nothing)),
             postToolUse = \_ -> pure (postToolUseResponse Nothing),
-            onStop = \_ -> pure allowStopResponse,
-            onSubagentStop = \_ -> pure allowStopResponse,
+            onStop = \_ -> reviewerStopCheck,
+            onSubagentStop = \_ -> reviewerStopCheck,
             onSessionStart = defaultSessionStartHook,
             beforeModel = \_ -> pure (BeforeModelAllow Nothing),
             afterModel = \_ -> pure (AfterModelAllow Nothing)
@@ -289,42 +298,51 @@ reviewerEventHandlers =
 reviewerPRReviewHandler :: PRReviewEvent -> Eff Effects EventAction
 reviewerPRReviewHandler (ReviewReceived n comments_) = do
   logHandler $ "Review received on PR #" <> T.pack (show n)
+  branch <- getCurrentBranch
+  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv n comments_)
   pure (InjectMessage $ "[REVIEW] PR #" <> T.pack (show n) <> " received comments:\n" <> comments_)
-
 reviewerPRReviewHandler (ReviewApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved"
+  branch <- getCurrentBranch
+  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv n)
   pure (NotifyParentAction ("[REVIEWER APPROVED] PR #" <> T.pack (show n) <> " approved by reviewer") n)
-
 reviewerPRReviewHandler (ReviewTimeout n mins) = do
   logHandler $ "PR #" <> T.pack (show n) <> " timed out after " <> T.pack (show mins) <> " minutes"
+  branch <- getCurrentBranch
+  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerTimedOutEv n mins)
   pure NoAction
-
 reviewerPRReviewHandler (FixesPushed n ci) = do
   logHandler $ "Fixes pushed on PR #" <> T.pack (show n) <> ", CI: " <> ci
+  branch <- getCurrentBranch
+  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerFixesPushedEv n ci)
   pure (InjectMessage $ "[FIXES PUSHED] PR #" <> T.pack (show n) <> " CI: " <> ci)
-
 reviewerPRReviewHandler (CommitsPushed n ci) = do
   logHandler $ "New commits pushed on PR #" <> T.pack (show n) <> ", CI: " <> ci
+  branch <- getCurrentBranch
+  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerCommitsPushedEv n ci)
   pure NoAction
-
 reviewerPRReviewHandler (ReviewerApproved n) = do
   logHandler $ "Reviewer approved PR #" <> T.pack (show n)
+  branch <- getCurrentBranch
+  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv n)
   pure (NotifyParentAction ("[REVIEWER APPROVED] PR #" <> T.pack (show n) <> " approved by reviewer agent") n)
-
 reviewerPRReviewHandler (ReviewerRequestedChanges n comments_) = do
   logHandler $ "Reviewer requested changes on PR #" <> T.pack (show n)
+  branch <- getCurrentBranch
+  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv n comments_)
   pure (InjectMessage $ "[CHANGES REQUESTED] PR #" <> T.pack (show n) <> ":\n" <> comments_)
-
 reviewerPRReviewHandler (RateLimited remaining secs) = do
   logHandler $ "Rate limited: " <> T.pack (show remaining) <> " retries, " <> T.pack (show secs) <> "s"
   pure NoAction
-
 reviewerPRReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
+  branch <- getCurrentBranch
+  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerStuckEv n rounds_)
   pure (NotifyParentAction ("[STUCK: " <> T.pack (show n) <> ", rounds=" <> T.pack (show rounds_) <> "] Review did not converge. Dev leaf remains alive; ask the human for clarification.") n)
-
 reviewerPRReviewHandler (MergeReady n ci branch_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
+  branch <- getCurrentBranch
+  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerMergeReadyEv n ci branch_)
   pure (NotifyParentAction ("[MERGE READY] PR #" <> T.pack (show n) <> " on branch " <> branch_ <> " has CI status " <> ci) n)
 
 reviewerSiblingMergedHandler :: SiblingMergedEvent -> Eff Effects EventAction
@@ -334,7 +352,21 @@ reviewerSiblingMergedHandler ev = do
 
 logHandler :: Text -> Eff Effects ()
 logHandler msg =
-  void $ suspendEffect_ @Log.LogInfo $ Log.InfoRequest
-    { Log.infoRequestMessage = TL.fromStrict $ "[ReviewerRole] " <> msg
-    , Log.infoRequestFields = ""
-    }
+  void $
+    suspendEffect_ @Log.LogInfo $
+      Log.InfoRequest
+        { Log.infoRequestMessage = TL.fromStrict $ "[ReviewerRole] " <> msg,
+          Log.infoRequestFields = ""
+        }
+
+reviewerStopCheck :: Eff Effects StopHookOutput
+reviewerStopCheck = do
+  branch <- getCurrentBranch
+  if branch `elem` ["main", "master"]
+    then pure allowStopResponse
+    else do
+      result <- checkExit @ReviewerPhase @ReviewerEvent branch ReviewerSpawned
+      case result of
+        MustBlock msg -> pure $ blockStopResponse msg
+        ShouldNudge msg -> pure $ StopHookOutput Allow (Just msg)
+        Clean -> pure allowStopResponse

@@ -51,6 +51,7 @@ executable wasm-guest-devswarm
         ReviewerRole
         TestrunnerRole
         DevPhase
+        ReviewerPhase
         TLPhase
         TLStopCheck
         WorkerStopCheck
@@ -80,6 +81,7 @@ test-suite role-hook-tests
         ReviewerRole
         TestrunnerRole
         DevPhase
+        ReviewerPhase
         TLPhase
         TLStopCheck
         WorkerStopCheck

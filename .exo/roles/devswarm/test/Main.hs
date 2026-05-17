@@ -12,8 +12,10 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
+import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..))
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (HookConfig (..), RoleConfig (..))
+import ReviewerPhase (ReviewerPhase (..))
 import ReviewerRole qualified
 import RootRole qualified
 import TLRole qualified
@@ -31,6 +33,7 @@ main = do
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
   assertReviewerPostToolUseEventName
+  assertReviewerCanExitDecisions
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -95,6 +98,27 @@ assertReviewerPostToolUseEventName = do
   case hookSpecificOutput output of
     Just PostToolUseOutput {} -> pure ()
     other -> fail $ "reviewer PostToolUse should emit PostToolUseOutput, got " <> show other
+
+assertReviewerCanExitDecisions :: IO ()
+assertReviewerCanExitDecisions = do
+  assertBlocks "approved awaiting CI" (canExit (ReviewerApprovedAwaitingCI 7))
+  assertBlocks "requested changes" (canExit (ReviewerChangesRequested 7 "fix it"))
+  assertBlocks "reviewing" (canExit (ReviewerReviewing 7 1))
+  assertClean "done exits cleanly" (canExit ReviewerDone)
+  assertClean "spawned exits cleanly" (canExit ReviewerSpawned)
+
+assertBlocks :: String -> StopCheckResult -> IO ()
+assertBlocks _ (MustBlock _) = pure ()
+assertBlocks label_ other = fail $ label_ <> ": expected MustBlock, got " <> showStopCheck other
+
+assertClean :: String -> StopCheckResult -> IO ()
+assertClean _ Clean = pure ()
+assertClean label_ other = fail $ label_ <> ": expected Clean, got " <> showStopCheck other
+
+showStopCheck :: StopCheckResult -> String
+showStopCheck (MustBlock msg) = "MustBlock " <> T.unpack msg
+showStopCheck (ShouldNudge msg) = "ShouldNudge " <> T.unpack msg
+showStopCheck Clean = "Clean"
 
 permissionDecisionOf :: HookOutput -> Maybe Text
 permissionDecisionOf output =
