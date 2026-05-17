@@ -219,6 +219,23 @@ test-mcp *args:
 test-e2e:
     ./tests/e2e/run.sh
 
+# ============================================================================
+# E2E test recipes
+#
+# Naming convention across this section:
+#   e2e-<name>        — runs the test interactively (sets up temp repo, launches
+#                       tmux, attaches you so you can observe codex/claude
+#                       sessions). This is the one you want when you actually
+#                       want to run the test.
+#   check-e2e-<name>  — `bash -n` static syntax check of the harness scripts.
+#                       Silent on success — produces no useful output for the
+#                       operator. Used by CI/pre-commit to ensure the scripts
+#                       parse, NOT to verify the test passes.
+#
+# If you ran a `check-e2e-*` and got "two bash scripts" echoed at you, you
+# wanted the matching `e2e-<name>` recipe.
+# ============================================================================
+
 # Run E2E messaging test (Teams inbox delivery, no spawn/merge)
 e2e-messaging:
     ./tests/e2e/messaging/run.sh
