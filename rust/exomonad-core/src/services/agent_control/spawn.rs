@@ -183,6 +183,36 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 - Prefer 3-5 high-impact comments over exhaustive style feedback.
 ";
 
+/// Render the reviewer's `Read first:` context section for the spawn task prompt.
+///
+/// Relative paths in `reviewer_context` are resolved against `project_dir` so they
+/// remain readable from the reviewer's detached worktree (where cwd is the worktree,
+/// not the project root, and the context files live outside the worktree's tracked
+/// tree). Absolute paths pass through unchanged. Empty `reviewer_context` returns
+/// "" — no "Read first:" header emitted in that case (production default).
+pub(crate) fn render_reviewer_context_section(
+    reviewer_context: &[String],
+    project_dir: &std::path::Path,
+) -> String {
+    if reviewer_context.is_empty() {
+        return String::new();
+    }
+    let lines = reviewer_context
+        .iter()
+        .map(|p| {
+            let path = std::path::Path::new(p);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                project_dir.join(path)
+            };
+            format!("- {}", resolved.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n\nRead first:\n{lines}")
+}
+
 impl<
         C: super::super::HasGitHubClient
             + super::super::HasAcpRegistry
@@ -1336,18 +1366,8 @@ impl<
         pr_entry: &crate::services::file_pr_local::PrEntry,
         caller_bb: &BirthBranch,
     ) -> Result<SpawnResult> {
-        let context_section = if self.reviewer_context.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\nRead first:\n{}",
-                self.reviewer_context
-                    .iter()
-                    .map(|p| format!("- {p}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        };
+        let context_section =
+            render_reviewer_context_section(&self.reviewer_context, self.project_dir());
         let task = format!(
             "Review PR #{}: {}\n\nBranch: {}\nBase: {}\nAuthor: {}{}",
             pr_entry.number,
@@ -1486,6 +1506,53 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_render_reviewer_context_section_resolves_relative_paths_against_project_dir() {
+        let project_dir = std::path::PathBuf::from("/tmp/exo-project");
+        let ctx = vec![
+            ".exo/context/reviewer-checklist.md".to_string(),
+            "AGENTS.md".to_string(),
+        ];
+        let section = render_reviewer_context_section(&ctx, &project_dir);
+        assert!(
+            section.contains("/tmp/exo-project/.exo/context/reviewer-checklist.md"),
+            "relative paths must be joined with project_dir; got: {section}"
+        );
+        assert!(
+            section.contains("/tmp/exo-project/AGENTS.md"),
+            "second relative path must also be resolved; got: {section}"
+        );
+        assert!(
+            section.starts_with("\n\nRead first:\n"),
+            "header line must precede the bullet list; got: {section}"
+        );
+    }
+
+    #[test]
+    fn test_render_reviewer_context_section_passes_absolute_paths_through() {
+        let project_dir = std::path::PathBuf::from("/tmp/exo-project");
+        let ctx = vec!["/etc/some/absolute.md".to_string()];
+        let section = render_reviewer_context_section(&ctx, &project_dir);
+        assert!(
+            section.contains("/etc/some/absolute.md"),
+            "absolute paths must pass through; got: {section}"
+        );
+        assert!(
+            !section.contains("/tmp/exo-project/etc"),
+            "absolute paths must NOT be joined with project_dir; got: {section}"
+        );
+    }
+
+    #[test]
+    fn test_render_reviewer_context_section_empty_emits_nothing() {
+        let project_dir = std::path::PathBuf::from("/tmp/exo-project");
+        let section = render_reviewer_context_section(&[], &project_dir);
+        assert!(
+            section.is_empty(),
+            "empty ctx must emit no header; got: {section}"
+        );
+    }
 
     #[tokio::test]
     async fn test_copy_allowed_dirs_validation() {
