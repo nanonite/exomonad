@@ -33,9 +33,15 @@ This signals that `spawn_reviewer_for_pr` ran and the PR registry was updated (s
 
 The watcher polls every `poll_interval` seconds (5s in this fixture). To deterministically trigger the FixesPushed path, the watcher needs to see `review_state=ChangesRequested` BEFORE the head SHA changes.
 
-Use the local PR registry mutation path:
+**Race note:** in a real run the auto-spawned reviewer may complete its review (approve or request-changes) before this phase runs. If the reviewer already approved (read `.exo/reviews/pr_N.json` first to check), the convergence test is moot — the reviewer made a different decision than the test is set up to exercise. Report this as a skipped result rather than a failure:
+```
+notify_parent status=failure message="convergence-loop SKIPPED: reviewer already approved before ChangesRequested could be injected; race window too tight to exercise the fan-out path"
+```
+…and write the failure marker accordingly.
+
+Otherwise, mutate the local PR registry:
 1. Read `.exo/prs.json` via `jq`.
-2. For the target PR, set `review_state` to `"ChangesRequested"` and `last_head_sha` to the current value (so the next poll observes a change).
+2. For the target PR, set `review_state` to `"ChangesRequested"`. Do NOT touch `last_head_sha` — that field is dead in the local-PR path (see chainlink #254).
 3. Atomic write: write to a temp file, then rename to `.exo/prs.json`.
 
 Wait 8 seconds (≥ one poll cycle) so the watcher latches the ChangesRequested state.
@@ -50,7 +56,17 @@ send_message recipient=<author_agent> summary="push a trivial fix" content="Appe
 
 ### Phase 5 — Wait for SHA change
 
-Poll the PR's `last_head_sha` field (the watcher will update it on the next cycle after the leaf pushes). Timeout 5 minutes.
+The watcher tracks SHA changes in its in-memory `WatchState`, but per chainlink #254 the `last_head_sha` field on the persisted PrEntry is dead (never written). Do NOT poll it.
+
+Instead, poll the **leaf's worktree git log** directly:
+
+1. Resolve the leaf's worktree path: `${REPO_DIR}/.exo/worktrees/${AUTHOR_AGENT}` (the leaf's `author_agent` from Phase 1).
+2. Record the current head SHA via `git -C <worktree> rev-parse HEAD` — that's the baseline.
+3. Poll the same command every 5s. When the SHA differs from the baseline, the leaf pushed a fix. Capture the new SHA.
+
+Timeout 5 minutes.
+
+If the leaf never pushes within 5 minutes: report failure and stop. Likely root cause is that the codex leaf doesn't loop after stop-hook block and never processed your `send_message` — see chainlink #247 discussion thread.
 
 ### Phase 6 — Assert the fan-out fired
 

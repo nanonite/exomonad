@@ -150,12 +150,14 @@ shell_command = "bash"
 tmux_session = "$SESSION"
 root_agent_type = "codex"
 spawn_agent_type = "codex"
-reviewer_agent_type = "codex"
 yolo = true
 poll_interval = 5
 initial_prompt = """
 $ROOT_PROMPT
 """
+
+[reviewer]
+agent_type = "codex"
 
 [[companions]]
 name = "convergence-testrunner"
