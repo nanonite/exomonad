@@ -1420,10 +1420,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_common_spawn_env_codex_home_propagated() {
         // Sibling to the CHAINLINK_DB test — confirms CODEX_HOME flows through the
         // shell-prefix env path so spawned codex agents see install_codex_hook_trust's
         // seeded [hooks.state] entries instead of falling back to ~/.codex.
+        // #[serial] required because this test mutates CODEX_HOME, which other env-mutating
+        // tests in this module also touch (test_codex_*_config_uses_*_instructions).
         let project_dir = PathBuf::from("/tmp/exo-test-project");
         let services = test_services(project_dir.clone());
         let service =

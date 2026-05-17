@@ -14,25 +14,37 @@ use tracing::Instrument;
 /// Reads JSON-RPC from stdin, translates to REST calls against the server,
 /// writes JSON-RPC responses to stdout.
 pub async fn run(role: &str, name: &str) -> Result<()> {
-    // Retry socket discovery — server may still be starting (race with exomonad init)
-    let socket = {
+    // Retry socket discovery AND connect — server may still be starting
+    // (race with exomonad init) and the socket file may exist as a symlink
+    // before the listener is accepting connections. Without this, a leaf
+    // agent that spawns at the same moment as the server (or where the
+    // socket symlink is dangling for a beat) sees "Failed to connect to
+    // <path>" and bails permanently. See chainlink #260.
+    let client = {
         let mut attempts = 0;
         loop {
-            match uds_client::find_server_socket() {
-                Ok(s) => break s,
-                Err(_) => {
-                    attempts += 1;
-                    if attempts >= 30 {
-                        anyhow::bail!(
-                            "Server socket not found after 15s. Is exomonad serve running?"
-                        );
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let candidate = match uds_client::find_server_socket() {
+                Ok(s) => Some(s),
+                Err(_) => None,
+            };
+
+            if let Some(socket) = candidate {
+                let trial = ServerClient::new(socket.clone());
+                if trial.is_healthy().await {
+                    break trial;
                 }
             }
+
+            attempts += 1;
+            if attempts >= 30 {
+                anyhow::bail!(
+                    "Server socket not reachable after 15s (discovery or connect failed). \
+                     Is exomonad serve running?"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     };
-    let client = ServerClient::new(socket);
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
