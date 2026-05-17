@@ -2,7 +2,7 @@ use crate::domain::{AgentName, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::file_pr_local::{
-    read_pr_registry, write_pr_registry, LocalReviewState, PrRegistry, PrState,
+    LocalReviewState, PrRegistry, PrState, read_pr_registry, write_pr_registry,
 };
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
@@ -10,7 +10,7 @@ use crate::services::{
     ReviewerSpawner,
 };
 use anyhow::Result;
-use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
+use exomonad_proto::effects::events::{AgentMessage, Event, event::EventType};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
@@ -486,6 +486,7 @@ where
         let mut removed_prs = Vec::new();
         let mut pending_actions: Vec<(u64, Vec<PendingAction>, BranchName, AgentType, String)> =
             Vec::new();
+        let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
 
         {
             let mut state_guard = self.state.lock().await;
@@ -500,6 +501,9 @@ where
                 let agent_type = AgentType::from_dir_name(agent_name);
                 let branch = BranchName::from(pr.head_branch.as_str());
                 let (local_reviews, _local_review_state) = obs_to_review_parts(obs);
+                if pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str()) {
+                    head_sha_updates.push((*pr_number, obs.head_sha.clone()));
+                }
 
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
                     compute_pr_actions(
@@ -578,6 +582,10 @@ where
             for num in &removed_prs {
                 state_guard.remove(num);
             }
+        }
+
+        if !head_sha_updates.is_empty() {
+            self.persist_last_head_shas(&head_sha_updates).await?;
         }
 
         for (pr_number, actions, branch, agent_type, agent_name) in pending_actions {
@@ -694,6 +702,26 @@ where
         }
 
         Ok(removed_prs)
+    }
+
+    async fn persist_last_head_shas(&self, updates: &[(u64, String)]) -> Result<()> {
+        let mut registry = read_pr_registry(&self.prs_path).await?;
+        let mut changed = false;
+
+        for (pr_number, head_sha) in updates {
+            if let Some(pr) = registry.prs.get_mut(pr_number) {
+                if pr.last_head_sha.as_deref() != Some(head_sha.as_str()) {
+                    pr.last_head_sha = Some(head_sha.clone());
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            write_pr_registry(&self.prs_path, &registry).await?;
+        }
+
+        Ok(())
     }
 
     async fn detect_merged(
@@ -1792,10 +1820,12 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "commits_pushed")));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "commits_pushed"))
+        );
         assert_eq!(state.last_sha, "def456");
     }
 
@@ -1818,10 +1848,12 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "fixes_pushed")));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "fixes_pushed"))
+        );
         assert!(state.addressed_changes);
         assert_eq!(state.last_review_state, ReviewState::None);
     }
@@ -1840,8 +1872,7 @@ mod tests {
 
     #[test]
     fn test_reviewer_fanout_decision_dispatches_when_reviewer_registered() {
-        let registry =
-            test_registry(pr_with_reviewer(7, "review-pr-7-codex", "review-pr-7"));
+        let registry = test_registry(pr_with_reviewer(7, "review-pr-7-codex", "review-pr-7"));
         let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 7 });
 
         let decision = reviewer_fanout_decision("pr_review", &payload, 7, &registry);
@@ -1869,8 +1900,7 @@ mod tests {
 
     #[test]
     fn test_reviewer_fanout_decision_skips_non_pr_review_events() {
-        let registry =
-            test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
+        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
         let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 1 });
 
         assert_eq!(
@@ -1887,8 +1917,7 @@ mod tests {
         // corresponding handler in ReviewerRole.hs, so all of them fan out. The
         // Haskell handler decides what to do per kind (some kinds the reviewer
         // caused itself; the handler may return NoAction).
-        let registry =
-            test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
+        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
         for kind in [
             "fixes_pushed",
             "commits_pushed",
@@ -1929,10 +1958,12 @@ mod tests {
             &|_, _| "review message".to_string(),
             5,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "review_received")));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "review_received"))
+        );
         assert_eq!(state.last_comment_count, 1);
     }
 
@@ -1953,10 +1984,12 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "approved")));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "approved"))
+        );
         assert!(state.notified_parent_approved);
     }
 
@@ -2301,10 +2334,12 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "timeout")));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "timeout"))
+        );
         assert!(state.notified_parent_timeout);
     }
 
@@ -2401,10 +2436,12 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "approved")));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "approved"))
+        );
     }
 
     #[test]
@@ -2425,10 +2462,12 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "timeout" && payload["minutes_elapsed"] == 5)));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "timeout" && payload["minutes_elapsed"] == 5))
+        );
     }
 
     #[test]
@@ -2491,9 +2530,11 @@ mod tests {
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ReviewState::ChangesRequested);
-        assert!(reviews
-            .iter()
-            .any(|r| r.state == ReviewState::ChangesRequested));
+        assert!(
+            reviews
+                .iter()
+                .any(|r| r.state == ReviewState::ChangesRequested)
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -2649,6 +2690,37 @@ mod tests {
             comments: vec![],
             ci_status: CIStatus::Unknown,
         }
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_persists_last_head_sha() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let pr = test_pr_entry();
+        let registry = test_registry(pr);
+        write_pr_registry(&watcher.prs_path, &registry)
+            .await
+            .unwrap();
+
+        let mut observations = HashMap::new();
+        observations.insert(1u64, test_observation("def456"));
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        let persisted = read_pr_registry(&watcher.prs_path).await.unwrap();
+        assert_eq!(
+            persisted
+                .prs
+                .get(&1)
+                .and_then(|pr| pr.last_head_sha.as_deref()),
+            Some("def456")
+        );
     }
 
     #[tokio::test]
