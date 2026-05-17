@@ -151,6 +151,20 @@ impl<
                 .to_string(),
         );
 
+        // Propagate CODEX_HOME to every spawned codex pane. install_codex_hook_trust
+        // seeds [hooks.state] entries in `$CODEX_HOME/config.toml`; without this
+        // pass-through, spawned codex agents fall back to ~/.codex and see the hooks
+        // as untrusted, firing "3 hooks need review" (chainlink #259). The init.rs
+        // tmux set-environment for CODEX_HOME covers the root TL pane but does not
+        // reliably reach panes created later by spawn_leaf — this shell-prefix entry
+        // closes that gap explicitly on the production code path. Harmless for non-
+        // codex agents (they ignore an unfamiliar env var).
+        if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+            if !codex_home.is_empty() {
+                env_vars.insert("CODEX_HOME".to_string(), codex_home);
+            }
+        }
+
         // Propagate swarm run_id and parent agent identity for OTel resource attributes
         if let Ok(v) = std::env::var("EXOMONAD_SWARM_RUN_ID") {
             env_vars.insert("EXOMONAD_SWARM_RUN_ID".to_string(), v);
@@ -1402,6 +1416,39 @@ mod tests {
             "CHAINLINK_DB must use the directory form, not the file form — both are valid for the \
              chainlink CLI but the directory is the canonical resource and the project's single \
              source of truth across all spawn sites (init.rs uses the same form)"
+        );
+    }
+
+    #[test]
+    fn test_common_spawn_env_codex_home_propagated() {
+        // Sibling to the CHAINLINK_DB test — confirms CODEX_HOME flows through the
+        // shell-prefix env path so spawned codex agents see install_codex_hook_trust's
+        // seeded [hooks.state] entries instead of falling back to ~/.codex.
+        let project_dir = PathBuf::from("/tmp/exo-test-project");
+        let services = test_services(project_dir.clone());
+        let service =
+            AgentControlService::new(services).with_birth_branch(BirthBranch::from("main"));
+
+        let agent = AgentName::from("leaf-1");
+        let session_id = BranchName::from("main.leaf-1");
+        let role = crate::domain::Role::dev();
+
+        std::env::set_var("CODEX_HOME", "/tmp/exo-test-codex-home");
+        let env_set = service.common_spawn_env(&agent, &session_id, &role);
+        std::env::remove_var("CODEX_HOME");
+        let env_unset = service.common_spawn_env(&agent, &session_id, &role);
+
+        assert_eq!(
+            env_set.get("CODEX_HOME").map(String::as_str),
+            Some("/tmp/exo-test-codex-home"),
+            "CODEX_HOME must be propagated into the spawn env so spawned codex panes \
+             see the same hook-trust DB that install_codex_hook_trust seeded \
+             (chainlink #259)"
+        );
+        assert!(
+            env_unset.get("CODEX_HOME").is_none(),
+            "CODEX_HOME must NOT be present in the spawn env when unset in the parent \
+             process — propagation is opt-in, not synthetic"
         );
     }
 
