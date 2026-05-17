@@ -2,7 +2,7 @@ use crate::domain::{AgentName, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::file_pr_local::{
-    LocalReviewState, PrRegistry, PrState, read_pr_registry, write_pr_registry,
+    read_pr_registry, write_pr_registry, LocalReviewState, PrRegistry, PrState,
 };
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
@@ -10,7 +10,7 @@ use crate::services::{
     ReviewerSpawner,
 };
 use anyhow::Result;
-use exomonad_proto::effects::events::{AgentMessage, Event, event::EventType};
+use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 use url::Url;
 
@@ -1820,12 +1820,10 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "commits_pushed"))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "commits_pushed")));
         assert_eq!(state.last_sha, "def456");
     }
 
@@ -1848,12 +1846,10 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "fixes_pushed"))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "fixes_pushed")));
         assert!(state.addressed_changes);
         assert_eq!(state.last_review_state, ReviewState::None);
     }
@@ -1958,12 +1954,10 @@ mod tests {
             &|_, _| "review message".to_string(),
             5,
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "review_received"))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "review_received")));
         assert_eq!(state.last_comment_count, 1);
     }
 
@@ -1984,12 +1978,10 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "approved"))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "approved")));
         assert!(state.notified_parent_approved);
     }
 
@@ -2334,12 +2326,10 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "timeout"))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "timeout")));
         assert!(state.notified_parent_timeout);
     }
 
@@ -2436,12 +2426,10 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "approved"))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "approved")));
     }
 
     #[test]
@@ -2462,12 +2450,10 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "timeout" && payload["minutes_elapsed"] == 5))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "timeout" && payload["minutes_elapsed"] == 5)));
     }
 
     #[test]
@@ -2530,11 +2516,9 @@ mod tests {
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ReviewState::ChangesRequested);
-        assert!(
-            reviews
-                .iter()
-                .any(|r| r.state == ReviewState::ChangesRequested)
-        );
+        assert!(reviews
+            .iter()
+            .any(|r| r.state == ReviewState::ChangesRequested));
     }
 
     // ---------------------------------------------------------------------------
