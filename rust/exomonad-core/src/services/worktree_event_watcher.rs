@@ -69,6 +69,15 @@ enum PendingAction {
     },
 }
 
+struct PendingPrActions {
+    pr_number: u64,
+    actions: Vec<PendingAction>,
+    branch: BranchName,
+    agent_type: AgentType,
+    agent_name: String,
+    agent_role: String,
+}
+
 /// Whether a PR review event should fan out to the reviewer in addition to the leaf,
 /// and the reviewer's identity when so.
 ///
@@ -84,7 +93,7 @@ enum ReviewerFanOut {
     /// convergence loop will stall. Caller logs an error.
     NoReviewer,
     /// Event requires fan-out and the reviewer is registered.
-    DispatchTo(BranchName, AgentType),
+    DispatchTo(BranchName, AgentType, &'static str),
 }
 
 /// Decide whether to fan a PR review event out to the reviewer.
@@ -108,8 +117,16 @@ fn reviewer_fanout_decision(
         return ReviewerFanOut::NotApplicable;
     }
     match registry.reviewer_for_pr(pr_number) {
-        Some((branch, agent_type)) => ReviewerFanOut::DispatchTo(branch, agent_type),
+        Some((branch, agent_type)) => ReviewerFanOut::DispatchTo(branch, agent_type, "reviewer"),
         None => ReviewerFanOut::NoReviewer,
+    }
+}
+
+fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
+    match agent_type {
+        AgentType::Claude => "tl",
+        AgentType::Gemini | AgentType::Shoal | AgentType::OpenCode | AgentType::Codex => "dev",
+        AgentType::Process => "process",
     }
 }
 
@@ -484,8 +501,7 @@ where
         observations: &HashMap<u64, Observation>,
     ) -> Result<Vec<u64>> {
         let mut removed_prs = Vec::new();
-        let mut pending_actions: Vec<(u64, Vec<PendingAction>, BranchName, AgentType, String)> =
-            Vec::new();
+        let mut pending_actions: Vec<PendingPrActions> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
 
         {
@@ -499,6 +515,7 @@ where
 
                 let agent_name = &pr.author_agent;
                 let agent_type = AgentType::from_dir_name(agent_name);
+                let agent_role = pr.author_role.clone();
                 let branch = BranchName::from(pr.head_branch.as_str());
                 let (local_reviews, _local_review_state) = obs_to_review_parts(obs);
                 if pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str()) {
@@ -564,13 +581,14 @@ where
                 };
 
                 if !actions.is_empty() {
-                    pending_actions.push((
-                        *pr_number,
+                    pending_actions.push(PendingPrActions {
+                        pr_number: *pr_number,
                         actions,
                         branch,
                         agent_type,
-                        agent_name.clone(),
-                    ));
+                        agent_name: agent_name.clone(),
+                        agent_role,
+                    });
                 }
             }
 
@@ -588,8 +606,8 @@ where
             self.persist_last_head_shas(&head_sha_updates).await?;
         }
 
-        for (pr_number, actions, branch, agent_type, agent_name) in pending_actions {
-            for action in actions {
+        for pending in pending_actions {
+            for action in pending.actions {
                 match action {
                     PendingAction::WasmEvent {
                         event_type,
@@ -598,9 +616,9 @@ where
                         let release_message = merge_ready_release_message(&payload);
                         if event_type == "ci_status" {
                             info!(
-                                pr_number,
-                                agent_name = %agent_name,
-                                branch = %branch,
+                                pr_number = pending.pr_number,
+                                agent_name = %pending.agent_name,
+                                branch = %pending.branch,
                                 status = payload.get("status").and_then(|value| value.as_str()).unwrap_or("unknown"),
                                 "Local PR CI status event dispatching"
                             );
@@ -610,44 +628,68 @@ where
                         // .exo/roles/devswarm/ReviewerRole.hs. Dispatch to the reviewer in
                         // addition to the leaf so the convergence loop progresses without
                         // TL intervention. See reviewer_fanout_decision for the rationale.
-                        let fan_out_decision =
-                            reviewer_fanout_decision(event_type, &payload, pr_number, registry);
+                        let fan_out_decision = reviewer_fanout_decision(
+                            event_type,
+                            &payload,
+                            pending.pr_number,
+                            registry,
+                        );
                         let payload_kind = payload
                             .get("kind")
                             .and_then(|v| v.as_str())
                             .unwrap_or("<unknown>")
                             .to_string();
                         let reviewer_payload = match &fan_out_decision {
-                            ReviewerFanOut::DispatchTo(_, _) => Some(payload.clone()),
+                            ReviewerFanOut::DispatchTo(_, _, _) => Some(payload.clone()),
                             _ => None,
                         };
 
                         if let Ok(Some(response)) = self
-                            .call_handle_event(branch.as_str(), agent_type, event_type, payload)
+                            .call_handle_event_for_role(
+                                pending.branch.as_str(),
+                                pending.agent_type,
+                                &pending.agent_role,
+                                event_type,
+                                payload,
+                            )
                             .await
                         {
-                            self.handle_event_action(response, branch.as_str(), agent_type)
-                                .await;
+                            self.handle_event_action(
+                                response,
+                                pending.branch.as_str(),
+                                pending.agent_type,
+                            )
+                            .await;
                             if let Some(message) = release_message {
-                                self.deliver_release_message(branch.as_str(), agent_type, &message)
-                                    .await;
+                                self.deliver_release_message(
+                                    pending.branch.as_str(),
+                                    pending.agent_type,
+                                    &message,
+                                )
+                                .await;
                             }
                         }
 
                         match fan_out_decision {
-                            ReviewerFanOut::DispatchTo(reviewer_branch, reviewer_agent_type) => {
+                            ReviewerFanOut::DispatchTo(
+                                reviewer_branch,
+                                reviewer_agent_type,
+                                reviewer_role,
+                            ) => {
                                 if let Some(payload) = reviewer_payload {
                                     info!(
-                                        pr_number,
+                                        pr_number = pending.pr_number,
                                         reviewer_branch = %reviewer_branch,
                                         ?reviewer_agent_type,
+                                        reviewer_role,
                                         kind = %payload_kind,
                                         "Fanning out pr_review event to reviewer agent"
                                     );
                                     if let Ok(Some(response)) = self
-                                        .call_handle_event(
+                                        .call_handle_event_for_role(
                                             reviewer_branch.as_str(),
                                             reviewer_agent_type,
+                                            &reviewer_role,
                                             event_type,
                                             payload,
                                         )
@@ -664,8 +706,8 @@ where
                             }
                             ReviewerFanOut::NoReviewer => {
                                 tracing::error!(
-                                    pr_number,
-                                    leaf_branch = %branch,
+                                    pr_number = pending.pr_number,
+                                    leaf_branch = %pending.branch,
                                     kind = %payload_kind,
                                     "pr_review event fired but no reviewer is registered for \
                                      this PR — the leaf+reviewer convergence loop will \
@@ -683,10 +725,10 @@ where
                         reviews,
                     } => {
                         self.emit_event(
-                            branch.as_str(),
+                            pending.branch.as_str(),
                             &status,
                             &message,
-                            agent_type,
+                            pending.agent_type,
                             comments,
                             reviews,
                         )
@@ -814,20 +856,29 @@ where
         event_type: &str,
         payload: serde_json::Value,
     ) -> Result<Option<EventActionResponse>> {
+        let role = legacy_event_role_for_agent_type(agent_type);
+        self.call_handle_event_for_role(branch, agent_type, role, event_type, payload)
+            .await
+    }
+
+    #[instrument(skip_all, fields(branch = %branch, role = %role, event_type = %event_type))]
+    async fn call_handle_event_for_role(
+        &self,
+        branch: &str,
+        agent_type: AgentType,
+        role: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<EventActionResponse>> {
         let plugins = match &self.plugins {
             Some(p) => p,
             None => return Ok(None),
         };
 
         let agent_name = self.resolve_event_agent_name(branch, agent_type).await;
-        let role = match agent_type {
-            AgentType::Claude => "tl",
-            AgentType::Gemini => "dev",
-            AgentType::Shoal => "dev",
-            AgentType::OpenCode => "dev",
-            AgentType::Codex => "dev",
-            AgentType::Process => return Ok(None),
-        };
+        if role == "process" {
+            return Ok(None);
+        }
 
         let event_input = serde_json::json!({
             "role": role,
@@ -843,6 +894,7 @@ where
                     branch,
                     lookup_key = %agent_name,
                     ?agent_type,
+                    role,
                     event_type,
                     "No plugin found for event target; skipping event dispatch"
                 );
@@ -852,8 +904,8 @@ where
         drop(plugins_guard);
 
         info!(
-            "[EventDispatch] Calling handle_event for agent '{}': event_type={}, pr_payload={}",
-            agent_name, event_type, payload
+            "[EventDispatch] Calling handle_event for agent '{}': role={}, event_type={}, pr_payload={}",
+            agent_name, role, event_type, payload
         );
 
         match plugin
@@ -871,6 +923,7 @@ where
                 tracing::info!(
                     otel.name = "event.dispatched",
                     agent_id = %agent_name,
+                    role = %role,
                     event_type = %event_type,
                     action = %action_str,
                     "[event] event.dispatched"
@@ -880,6 +933,7 @@ where
                         "event.dispatched",
                         agent_name.as_str(),
                         &serde_json::json!({
+                            "role": role,
                             "event_type": event_type,
                             "action": action_str,
                         }),
@@ -897,6 +951,7 @@ where
                 tracing::info!(
                     otel.name = "event.dispatch_failed",
                     agent_id = %agent_name,
+                    role = %role,
                     event_type = %event_type,
                     error = %e,
                     "[event] event.dispatch_failed"
@@ -906,6 +961,7 @@ where
                         "event.dispatch_failed",
                         agent_name.as_str(),
                         &serde_json::json!({
+                            "role": role,
                             "event_type": event_type,
                             "error": e.to_string(),
                         }),
@@ -1896,9 +1952,10 @@ mod tests {
 
         let decision = reviewer_fanout_decision("pr_review", &payload, 7, &registry);
         match decision {
-            ReviewerFanOut::DispatchTo(branch, agent_type) => {
+            ReviewerFanOut::DispatchTo(branch, agent_type, role) => {
                 assert_eq!(branch.as_str(), "review-pr-7");
                 assert_eq!(agent_type, AgentType::Codex);
+                assert_eq!(role, "reviewer");
             }
             other => panic!("expected DispatchTo, got {other:?}"),
         }
@@ -1951,12 +2008,35 @@ mod tests {
         ] {
             let payload = serde_json::json!({ "kind": kind, "pr_number": 1 });
             match reviewer_fanout_decision("pr_review", &payload, 1, &registry) {
-                ReviewerFanOut::DispatchTo(branch, agent_type) => {
+                ReviewerFanOut::DispatchTo(branch, agent_type, role) => {
                     assert_eq!(branch.as_str(), "review-pr-1");
                     assert_eq!(agent_type, AgentType::Codex, "kind {kind}");
+                    assert_eq!(role, "reviewer", "kind {kind}");
                 }
                 other => panic!("kind {kind} expected DispatchTo, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn test_reviewer_fanout_uses_reviewer_role_not_runtime_role() {
+        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
+        let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 1 });
+
+        match reviewer_fanout_decision("pr_review", &payload, 1, &registry) {
+            ReviewerFanOut::DispatchTo(_, agent_type, role) => {
+                assert_eq!(agent_type, AgentType::Codex);
+                assert_eq!(
+                    legacy_event_role_for_agent_type(agent_type),
+                    "dev",
+                    "runtime-derived role would route this reviewer through DevRole"
+                );
+                assert_eq!(
+                    role, "reviewer",
+                    "reviewer fan-out must select ReviewerRole handlers explicitly"
+                );
+            }
+            other => panic!("expected DispatchTo, got {other:?}"),
         }
     }
 
