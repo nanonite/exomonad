@@ -1402,7 +1402,14 @@ impl<
         }
 
         let reviewer_internal_name = identity.internal_name().to_string();
-        let reviewer_birth_branch = branch_name.clone();
+        // spawn_subtree (called below) computes its own birth_branch as
+        // `caller_bb.child(internal_name)` and registers THAT with AgentResolver —
+        // not the bare `branch_name` we pass in. To keep the watcher's reviewer
+        // fan-out lookup working (resolve_event_agent_name finds the record by
+        // birth_branch + agent_type), persist the same dotted form into the PR
+        // registry so reviewer_for_pr returns what AgentResolver actually has.
+        // See chainlink #256.
+        let reviewer_birth_branch = caller_bb.child(&reviewer_internal_name).to_string();
 
         let options = SpawnSubtreeOptions {
             task,
