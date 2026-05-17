@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- last_head_sha on PrEntry is never persisted by the watcher — registry field is dead (#254)
+- Claude hooks: PostToolUse response payload has hookEventName=PreToolUse — every Claude PostToolUse hook errors (#252)
 - Fix Tangled CI event scoping during init (#208)
 - Fix Codex worktree hook trust prompts (#204)
 - Fix Tangled Spindle auto-start configuration feedback (#205)
@@ -107,6 +109,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Reviewer should not exit on approval — must wait for merge_ready CI signal (#255)
 - Option A: add pane_id to SpawnResult + CloseWorkerPane effect for worker feedback loop (#215)
 - Build and verify pane-pinning fix: delivery.rs .0 suffix for window-name targets (#216)
 - Worker pane lifecycle: verify send_message routing to Codex worker panes via routing.json (#214)
