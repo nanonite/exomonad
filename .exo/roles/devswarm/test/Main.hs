@@ -14,6 +14,7 @@ import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (HookConfig (..), RoleConfig (..))
+import ReviewerRole qualified
 import RootRole qualified
 import TLRole qualified
 
@@ -29,6 +30,7 @@ main = do
   assertRoleDeny "root" RootRole.config
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
+  assertReviewerPostToolUseEventName
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -55,11 +57,21 @@ runPreToolUse cfg toolName = do
     C.Done output -> pure output
     C.Continue {} -> fail "PreToolUse hook unexpectedly suspended"
 
+runPostToolUse :: RoleConfig tools -> IO HookOutput
+runPostToolUse cfg = do
+  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (postToolUse (hooks cfg) (hookInputFor PostToolUse "Bash"))
+  case status of
+    C.Done output -> pure output
+    C.Continue {} -> fail "PostToolUse hook unexpectedly suspended"
+
 hookInput :: Text -> HookInput
-hookInput toolName =
+hookInput = hookInputFor PreToolUse
+
+hookInputFor :: HookEventType -> Text -> HookInput
+hookInputFor eventName toolName =
   HookInput
     { hiSessionId = "test-session",
-      hiHookEventName = PreToolUse,
+      hiHookEventName = eventName,
       hiToolName = Just toolName,
       hiToolInput = Just Aeson.Null,
       hiStopHookActive = Nothing,
@@ -76,6 +88,13 @@ hookInput toolName =
       hiLlmRequest = Nothing,
       hiLlmResponse = Nothing
     }
+
+assertReviewerPostToolUseEventName :: IO ()
+assertReviewerPostToolUseEventName = do
+  output <- runPostToolUse ReviewerRole.config
+  case hookSpecificOutput output of
+    Just PostToolUseOutput {} -> pure ()
+    other -> fail $ "reviewer PostToolUse should emit PostToolUseOutput, got " <> show other
 
 permissionDecisionOf :: HookOutput -> Maybe Text
 permissionDecisionOf output =

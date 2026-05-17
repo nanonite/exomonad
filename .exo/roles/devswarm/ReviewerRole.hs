@@ -18,7 +18,7 @@ import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tools.Events
   ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs
   )
-import ExoMonad.Guest.Types (allowResponse, allowStopResponse, BeforeModelOutput (..), AfterModelOutput (..))
+import ExoMonad.Guest.Types (allowResponse, allowStopResponse, postToolUseResponse, BeforeModelOutput (..), AfterModelOutput (..))
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
 import HookPolicy (preToolUseWithGhBlock)
 import ExoMonad.Guest.Events
@@ -266,7 +266,7 @@ config =
       hooks =
         HookConfig
           { preToolUse = preToolUseWithGhBlock (\_ -> pure (allowResponse Nothing)),
-            postToolUse = \_ -> pure (allowResponse Nothing),
+            postToolUse = \_ -> pure (postToolUseResponse Nothing),
             onStop = \_ -> pure allowStopResponse,
             onSubagentStop = \_ -> pure allowStopResponse,
             onSessionStart = defaultSessionStartHook,
