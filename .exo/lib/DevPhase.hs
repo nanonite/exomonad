@@ -25,6 +25,7 @@ data DevPhase
   | DevPRFiled PRNumber URL
   | DevUnderReview PRNumber Int
   | DevChangesRequested PRNumber [Text]
+  | DevNeedsHumanDirection PRNumber Text
   | DevApproved PRNumber
   | DevDone
   | DevFailed Text
@@ -52,12 +53,17 @@ instance StateMachine DevPhase DevEvent where
       DevPRFiled _ _ -> Transitioned phase
       DevUnderReview _ _ -> Transitioned phase
       DevChangesRequested _ _ -> Transitioned phase
+      DevNeedsHumanDirection _ _ -> Transitioned phase
       DevApproved _ -> Transitioned phase
       _ -> Transitioned DevDone
     NotifyParentFailure msg ->
       Transitioned (DevFailed msg)
-    ReviewReceivedEv prNum comments ->
-      Transitioned (DevChangesRequested prNum [comments])
+    ReviewReceivedEv prNum comments -> case phase of
+      DevUnderReview _ round_
+        | round_ >= 1 ->
+            Transitioned (DevNeedsHumanDirection prNum "reviewer still requesting changes after first fix round")
+      _ ->
+        Transitioned (DevChangesRequested prNum [comments])
     ReviewApprovedEv prNum ->
       Transitioned (DevApproved prNum)
     FixesPushedEv prNum _ci ->
@@ -79,6 +85,8 @@ instance StateMachine DevPhase DevEvent where
     MustBlock $ "PR #" <> T.pack (show pr) <> " awaiting review. Stay alive until merge-ready."
   canExit (DevUnderReview pr _) =
     MustBlock $ "PR #" <> T.pack (show pr) <> " under review. Stay alive until merge-ready."
+  canExit (DevNeedsHumanDirection pr _) =
+    MustBlock $ "PR #" <> T.pack (show pr) <> " has unresolved review feedback after first fix round; awaiting human direction."
   canExit (DevApproved pr) =
     MustBlock $ "PR #" <> T.pack (show pr) <> " approved, waiting for CI merge-ready signal."
   canExit _ = Clean
@@ -89,6 +97,7 @@ instance ToJSON DevPhase where
   toJSON (DevPRFiled n url) = object ["phase" .= ("dev_pr_filed" :: Text), "pr_number" .= n, "url" .= url]
   toJSON (DevUnderReview n r) = object ["phase" .= ("dev_under_review" :: Text), "pr_number" .= n, "review_round" .= r]
   toJSON (DevChangesRequested n cs) = object ["phase" .= ("dev_changes_requested" :: Text), "pr_number" .= n, "comments" .= cs]
+  toJSON (DevNeedsHumanDirection n reason) = object ["phase" .= ("dev_needs_human_direction" :: Text), "pr_number" .= n, "reason" .= reason]
   toJSON (DevApproved n) = object ["phase" .= ("dev_approved" :: Text), "pr_number" .= n]
   toJSON DevDone = object ["phase" .= ("dev_done" :: Text)]
   toJSON (DevFailed msg) = object ["phase" .= ("dev_failed" :: Text), "message" .= msg]
@@ -111,6 +120,10 @@ instance FromJSON DevPhase where
         n <- v .: "pr_number"
         cs <- v .: "comments"
         pure (DevChangesRequested n cs)
+      "dev_needs_human_direction" -> do
+        n <- v .: "pr_number"
+        reason <- v .: "reason"
+        pure (DevNeedsHumanDirection n reason)
       "dev_approved" -> do
         n <- v .: "pr_number"
         pure (DevApproved n)

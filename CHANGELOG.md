@@ -110,6 +110,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E2E reviewer convergence: bias reviewer via injected context + enforce bounded 1-fix loop with [STUCK→HUMAN] escalation (#258)
 - Reviewer should not exit on approval — must wait for merge_ready CI signal (#255)
 - Option A: add pane_id to SpawnResult + CloseWorkerPane effect for worker feedback loop (#215)
 - Build and verify pane-pinning fix: delivery.rs .0 suffix for window-name targets (#216)

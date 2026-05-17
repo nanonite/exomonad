@@ -10,9 +10,10 @@ import Control.Monad.Freer.Coroutine qualified as C
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import Data.Text qualified as T
+import DevPhase (DevEvent (..), DevPhase (..))
 import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
-import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..))
+import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (HookConfig (..), RoleConfig (..))
 import ReviewerPhase (ReviewerPhase (..))
@@ -34,6 +35,7 @@ main = do
   assertRoleAllow "root" RootRole.config
   assertReviewerPostToolUseEventName
   assertReviewerCanExitDecisions
+  assertDevNeedsHumanDirectionAfterOneFixRound
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -106,6 +108,17 @@ assertReviewerCanExitDecisions = do
   assertBlocks "reviewing" (canExit (ReviewerReviewing 7 1))
   assertClean "done exits cleanly" (canExit ReviewerDone)
   assertClean "spawned exits cleanly" (canExit ReviewerSpawned)
+
+assertDevNeedsHumanDirectionAfterOneFixRound :: IO ()
+assertDevNeedsHumanDirectionAfterOneFixRound = do
+  case transition (DevUnderReview 9 1) (ReviewReceivedEv 9 "still wrong") of
+    Transitioned (DevNeedsHumanDirection 9 _) -> pure ()
+    other -> fail $ "expected DevNeedsHumanDirection after first fix round, got " <> showDevTransition other
+  assertBlocks "needs human direction" (canExit (DevNeedsHumanDirection 9 "still wrong"))
+
+showDevTransition :: TransitionResult DevPhase -> String
+showDevTransition (Transitioned phase) = "Transitioned " <> show phase
+showDevTransition (InvalidTransition reason) = "InvalidTransition " <> T.unpack reason
 
 assertBlocks :: String -> StopCheckResult -> IO ()
 assertBlocks _ (MustBlock _) = pure ()

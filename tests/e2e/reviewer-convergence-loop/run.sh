@@ -14,18 +14,16 @@ set -euo pipefail
 #   2. Leaf opens a PR via file_pr (local PR registry, no GitHub).
 #   3. Watcher auto-spawns a reviewer for the PR; PrEntry gets reviewer_*
 #      fields populated (subissue #248).
-#   4. Testrunner (Claude companion) mutates .exo/prs.json to inject a
-#      LocalReviewState::ChangesRequested for the PR. On the next poll
-#      cycle the watcher sees the state.
-#   5. Testrunner instructs the leaf (via send_message) to push a trivial
-#      fix commit, bumping the head SHA.
-#   6. Watcher detects SHA change after ChangesRequested → fires
+#   4. Reviewer reads fixture-local context and naturally writes a
+#      ChangesRequested verdict for a missing CONTRIBUTING.md header.
+#   5. Watcher injects reviewer feedback into the leaf pane; the leaf pushes
+#      a fix commit, bumping the head SHA.
+#   6. Watcher detects SHA change after ChangesRequested -> fires
 #      fixes_pushed → reviewer_fanout_decision returns DispatchTo →
 #      call_handle_event is invoked for the reviewer.
 #   7. Testrunner inspects the exomonad server log for the canonical
 #      "Fanning out pr_review event to reviewer agent" info line
-#      AND the reviewer's tmux pane for evidence of the FixesPushed
-#      handler firing. Both must be present.
+#      AND the reviewer's handle_event return line. Both must be present.
 #   8. Testrunner notify_parent with status=success / status=failure.
 #   9. validate.sh records the testrunner verdict into RESULT_FILE.
 
@@ -130,6 +128,8 @@ if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
     rm -rf .exo/roles
     cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
 fi
+mkdir -p .exo/context
+cp "$SCRIPT_DIR/reviewer-checklist.md" .exo/context/reviewer-checklist.md
 
 ROOT_PROMPT="$(python3 - "$SCRIPT_DIR/e2e-test.md" <<'PY'
 import pathlib, sys
@@ -158,6 +158,7 @@ $ROOT_PROMPT
 
 [reviewer]
 agent_type = "codex"
+context = [".exo/context/reviewer-checklist.md"]
 
 [[companions]]
 name = "convergence-testrunner"
@@ -216,11 +217,11 @@ echo "  Chain under test:"
 echo "    Codex root TL -> spawn_leaf(codex)"
 echo "    Codex leaf    -> file_pr (local registry)"
 echo "    watcher       -> spawn_reviewer_for_pr (Codex)"
-echo "    testrunner    -> inject ChangesRequested into .exo/prs.json"
-echo "    leaf          -> push fix commit (SHA bump)"
+echo "    reviewer      -> request a fixture-specified change"
+echo "    leaf          -> push fix commit from injected review feedback"
 echo "    watcher       -> fixes_pushed -> reviewer_fanout_decision"
 echo "                  -> call_handle_event(reviewer_branch, ...)"
-echo "    testrunner    -> assert server log + reviewer pane evidence"
+echo "    testrunner    -> assert server log fan-out + reviewer dispatch"
 echo "============================================"
 echo ""
 

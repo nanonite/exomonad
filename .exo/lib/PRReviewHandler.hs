@@ -11,12 +11,12 @@ import Control.Monad.Freer (Eff)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
+import DevPhase (DevEvent (..), DevPhase (..))
 import ExoMonad.Effects.Log qualified as Log
+import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), PRReviewEvent (..), SiblingMergedEvent (..), defaultEventHandlers)
 import ExoMonad.Guest.Events.Templates qualified as Tpl
 import ExoMonad.Guest.StateMachine (applyEvent)
-import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
-import DevPhase (DevPhase(..), DevEvent(..))
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
 import ExoMonad.Guest.Types (Effects)
 
@@ -34,54 +34,46 @@ prReviewHandler :: PRReviewEvent -> Eff Effects EventAction
 prReviewHandler (ReviewReceived n comments_) = do
   logHandler $ "Review received on PR #" <> T.pack (show n)
   branch <- getCurrentBranch
-  void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
-  pure (InjectMessage (Tpl.copilotReviewReceived n comments_))
-
+  phase <- applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
+  pure $ reviewRequestAction n comments_ phase
 prReviewHandler (ReviewApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved (reviewer agent)"
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewApprovedEv n)
   pure (NotifyParentAction (Tpl.prReady n) n)
-
 prReviewHandler (ReviewerApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved by reviewer agent"
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewApprovedEv n)
   pure (NotifyParentAction (Tpl.prReady n) n)
-
 prReviewHandler (ReviewTimeout n mins) = do
   logHandler $ "PR #" <> T.pack (show n) <> " timed out after " <> T.pack (show mins) <> " minutes"
   pure (NotifyParentAction (Tpl.reviewTimeout n mins) n)
-
 prReviewHandler (FixesPushed n ci) = do
   logHandler $ "Fixes pushed on PR #" <> T.pack (show n) <> ", CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (FixesPushedEv n ci)
   pure (NotifyParentAction (Tpl.fixesPushed n ci) n)
-
 prReviewHandler (CommitsPushed n ci) = do
   logHandler $ "New commits pushed on PR #" <> T.pack (show n) <> ", CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CommitsPushedEv n ci)
   pure (NotifyParentAction (Tpl.commitsPushed n ci) n)
-
 prReviewHandler (ReviewerRequestedChanges n comments_) = do
   logHandler $ "Reviewer requested changes on PR #" <> T.pack (show n)
   branch <- getCurrentBranch
-  void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
-  pure (InjectMessage (Tpl.copilotReviewReceived n comments_))
-
+  phase <- applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
+  pure $ reviewRequestAction n comments_ phase
 prReviewHandler (RateLimited remaining secs) = do
   logHandler $ "Rate limited: " <> T.pack (show remaining) <> " retries, " <> T.pack (show secs) <> "s until reset"
   pure NoAction
-
 prReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
   branch <- getCurrentBranch
-  void $ applyEvent @DevPhase @DevEvent branch DevSpawned $
-    ReviewReceivedEv n ("Review loop exceeded " <> T.pack (show rounds_) <> " rounds. Stay alive and wait for TL clarification.")
+  void $
+    applyEvent @DevPhase @DevEvent branch DevSpawned $
+      ReviewReceivedEv n ("Review loop exceeded " <> T.pack (show rounds_) <> " rounds. Stay alive and wait for TL clarification.")
   pure (NotifyParentAction (Tpl.stuck n rounds_) n)
-
 prReviewHandler (MergeReady n ci branch_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
   branch <- getCurrentBranch
@@ -105,10 +97,25 @@ ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerAppro
       pure (NotifyParentAction (Tpl.mergeReady n status_ branch_) n)
     else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
 
+reviewRequestAction :: Int -> Text -> Maybe DevPhase -> EventAction
+reviewRequestAction n _comments (Just (DevNeedsHumanDirection _ reason)) =
+  NotifyParentAction
+    ( "[STUCK: "
+        <> T.pack (show n)
+        <> ", rounds=1] "
+        <> reason
+        <> "; need human direction."
+    )
+    n
+reviewRequestAction n comments_ _ =
+  InjectMessage (Tpl.copilotReviewReceived n comments_)
+
 -- | Helper to log handler entry.
 logHandler :: Text -> Eff Effects ()
 logHandler msg =
-  void $ suspendEffect_ @Log.LogInfo $ Log.InfoRequest
-    { Log.infoRequestMessage = TL.fromStrict $ "[PRReviewHandler] " <> msg
-    , Log.infoRequestFields = ""
-    }
+  void $
+    suspendEffect_ @Log.LogInfo $
+      Log.InfoRequest
+        { Log.infoRequestMessage = TL.fromStrict $ "[PRReviewHandler] " <> msg,
+          Log.infoRequestFields = ""
+        }

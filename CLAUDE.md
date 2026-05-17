@@ -622,6 +622,7 @@ The TL's workflow is: **decompose → spec → spawn → move on**. The TL does 
 - **Leaf sends status updates** → `notify_parent` delivers `[from: leaf-id] message` to TL → informational, TL reads but does not auto-merge
 - **Leaf fails** → `notify_parent` with `failure` status → delivers `[FAILED: leaf-id] message` to TL → TL re-decomposes
 - **Review is stuck** → after max rounds without convergence, watcher fires `handle_event(PRReview::Stuck)` → handler sends `[STUCK: leaf-id]` to TL → human intervention required
+- **Reviewer requests changes after one fix round** → dev state enters `DevNeedsHumanDirection` → handler sends `[STUCK: leaf-id]` to TL → human intervention required
 
 **Escalation, not iteration.** If a leaf fails after reaching `reviewer_max_rounds` (see `.exo/review-policy.toml`), the watcher fires the `Stuck` event. The TL then decides: re-decompose, try a different approach, or flag for human intervention. The TL never manually fixes a leaf's code.
 
@@ -693,7 +694,7 @@ The TL is idle between spawning and receiving notifications. It wakes up for:
 - **`[FIXES PUSHED]`** (event handler) — leaf addressed reviewer comments and pushed fixes. TL merges if CI passes.
 - **`[PR READY]`** (event handler) — reviewer approved a leaf's PR. TL merges and verifies the result builds cleanly. Multiple leaves landing in parallel may interact.
 - **`[REVIEW TIMEOUT]`** (event handler) — no reviewer response after timeout (configured in `.exo/review-policy.toml`). TL merges if CI passes.
-- **`[STUCK: agent-id]`** — review did not converge within `reviewer_max_rounds`. Human intervention required — the PR cannot be auto-merged.
+- **`[STUCK: agent-id]`** — review did not converge within `reviewer_max_rounds`, or the reviewer still requests changes after the single allowed fix round. Human intervention required — the PR cannot be auto-merged.
 - **`[from: agent-id]`** (agent message) — informational update from a leaf. Do not auto-merge; read the message.
 - **`[FAILED: agent-id]`** — leaf exhausted retries. TL re-decomposes or escalates.
 - Worktree event watcher notifications (CI status, PR merge conflicts).
