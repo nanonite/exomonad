@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Watcher fan-out: 'No plugin found for agent <branch>' — reviewer plugin lookup keys on birth_branch but registry is keyed by internal_name (#256)
 - last_head_sha on PrEntry is never persisted by the watcher — registry field is dead (#254)
 - Claude hooks: PostToolUse response payload has hookEventName=PreToolUse — every Claude PostToolUse hook errors (#252)
 - Fix Tangled CI event scoping during init (#208)

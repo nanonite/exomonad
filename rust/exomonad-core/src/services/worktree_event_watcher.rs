@@ -1,4 +1,4 @@
-use crate::domain::{AgentName, BranchName, CIStatus, PRNumber};
+use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::file_pr_local::{
@@ -819,7 +819,7 @@ where
             None => return Ok(None),
         };
 
-        let agent_name = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
+        let agent_name = self.resolve_event_agent_name(branch, agent_type).await;
         let role = match agent_type {
             AgentType::Claude => "tl",
             AgentType::Gemini => "dev",
@@ -836,12 +836,15 @@ where
         });
 
         let plugins_guard = plugins.read().await;
-        let plugin = match plugins_guard.get(&AgentName::from(agent_name)) {
+        let plugin = match plugins_guard.get(&agent_name) {
             Some(p) => p.clone(),
             None => {
-                info!(
-                    "No plugin found for agent '{}', skipping event dispatch",
-                    agent_name
+                tracing::error!(
+                    branch,
+                    lookup_key = %agent_name,
+                    ?agent_type,
+                    event_type,
+                    "No plugin found for event target; skipping event dispatch"
                 );
                 return Ok(None);
             }
@@ -875,7 +878,7 @@ where
                 if let Some(log) = self.ctx.event_log() {
                     let _ = log.append(
                         "event.dispatched",
-                        agent_name,
+                        agent_name.as_str(),
                         &serde_json::json!({
                             "event_type": event_type,
                             "action": action_str,
@@ -901,7 +904,7 @@ where
                 if let Some(log) = self.ctx.event_log() {
                     let _ = log.append(
                         "event.dispatch_failed",
-                        agent_name,
+                        agent_name.as_str(),
                         &serde_json::json!({
                             "event_type": event_type,
                             "error": e.to_string(),
@@ -912,6 +915,26 @@ where
                 Ok(None)
             }
         }
+    }
+
+    async fn resolve_event_agent_name(&self, branch: &str, agent_type: AgentType) -> AgentName {
+        let branch_tail = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
+        let branch_name = BirthBranch::from(branch);
+        let records = self.ctx.agent_resolver().records_ref().read().await;
+
+        if let Some(record) = records
+            .values()
+            .find(|record| record.birth_branch == branch_name && record.agent_type == agent_type)
+        {
+            return record.agent_name.clone();
+        }
+
+        let exact = AgentName::from(branch);
+        if records.contains_key(&exact) {
+            return exact;
+        }
+
+        AgentName::from(branch_tail)
     }
 
     async fn handle_event_action(
@@ -2674,6 +2697,35 @@ mod tests {
             comments: vec![],
             ci_status: CIStatus::Unknown,
         }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_event_agent_name_uses_reviewer_birth_branch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let resolver = crate::services::AgentResolver::load(temp_dir.path().to_path_buf()).await;
+        resolver
+            .register(crate::services::AgentIdentityRecord {
+                agent_name: AgentName::from("review-pr-1-codex"),
+                slug: crate::domain::Slug::from("review-pr-1"),
+                agent_type: AgentType::Codex,
+                birth_branch: BirthBranch::from("review-pr-1"),
+                parent_branch: BirthBranch::from("main"),
+                working_dir: std::path::PathBuf::from(".exo/worktrees/review-pr-1-codex"),
+                display_name: "review-pr-1-codex".to_string(),
+                topology: crate::services::agent_control::Topology::WorktreePerAgent,
+            })
+            .await
+            .unwrap();
+
+        let mut services = crate::services::Services::test();
+        services.agent_resolver = Arc::new(resolver);
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+
+        let agent_name = watcher
+            .resolve_event_agent_name("review-pr-1", AgentType::Codex)
+            .await;
+
+        assert_eq!(agent_name.as_str(), "review-pr-1-codex");
     }
 
     #[tokio::test]
