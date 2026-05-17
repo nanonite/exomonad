@@ -69,6 +69,46 @@ enum PendingAction {
     },
 }
 
+/// Whether a PR review event should fan out to the reviewer in addition to the leaf,
+/// and the reviewer's identity when so.
+///
+/// The reviewer-side handlers in `.exo/roles/devswarm/ReviewerRole.hs` are only reachable
+/// when the watcher explicitly dispatches the event to the reviewer's plugin manager.
+/// This decision is computed by [`reviewer_fanout_decision`] and consumed by the
+/// dispatch loop in [`AgentControlService::process_observations`].
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewerFanOut {
+    /// Event doesn't require reviewer fan-out (most events).
+    NotApplicable,
+    /// Event requires fan-out, but the PR has no registered reviewer — the
+    /// convergence loop will stall. Caller logs an error.
+    NoReviewer,
+    /// Event requires fan-out and the reviewer is registered.
+    DispatchTo(BranchName, AgentType),
+}
+
+/// Decide whether to fan a PR review event out to the reviewer.
+///
+/// Scoped (per issue #249) to the `fixes_pushed` event kind. Sibling kinds
+/// (`reviewer_approved`, `reviewer_requested_changes`, `review_timeout`, `stuck`,
+/// `merge_ready`) are extended in issue #250 by widening the kind match below.
+fn reviewer_fanout_decision(
+    event_type: &str,
+    payload: &serde_json::Value,
+    pr_number: u64,
+    registry: &PrRegistry,
+) -> ReviewerFanOut {
+    let kind = payload.get("kind").and_then(|v| v.as_str());
+    let is_fanout_event = event_type == "pr_review" && kind == Some("fixes_pushed");
+    if !is_fanout_event {
+        return ReviewerFanOut::NotApplicable;
+    }
+    match registry.reviewer_for_pr(pr_number) {
+        Some((branch, agent_type)) => ReviewerFanOut::DispatchTo(branch, agent_type),
+        None => ReviewerFanOut::NoReviewer,
+    }
+}
+
 /// Per-PR state tracked across poll cycles.
 #[derive(Debug, Clone)]
 struct WatchState {
@@ -553,6 +593,19 @@ where
                                 "Local PR CI status event dispatching"
                             );
                         }
+
+                        // Fan-out: certain PR review events have reviewer-side handlers in
+                        // .exo/roles/devswarm/ReviewerRole.hs. Dispatch to the reviewer in
+                        // addition to the leaf so the convergence loop progresses without
+                        // TL intervention. This issue scopes the fan-out to fixes_pushed;
+                        // sibling events are extended in #250.
+                        let fan_out_decision =
+                            reviewer_fanout_decision(event_type, &payload, pr_number, registry);
+                        let reviewer_payload = match &fan_out_decision {
+                            ReviewerFanOut::DispatchTo(_, _) => Some(payload.clone()),
+                            _ => None,
+                        };
+
                         if let Ok(Some(response)) = self
                             .call_handle_event(branch.as_str(), agent_type, event_type, payload)
                             .await
@@ -563,6 +616,46 @@ where
                                 self.deliver_release_message(branch.as_str(), agent_type, &message)
                                     .await;
                             }
+                        }
+
+                        match fan_out_decision {
+                            ReviewerFanOut::DispatchTo(reviewer_branch, reviewer_agent_type) => {
+                                if let Some(payload) = reviewer_payload {
+                                    info!(
+                                        pr_number,
+                                        reviewer_branch = %reviewer_branch,
+                                        ?reviewer_agent_type,
+                                        "Fanning out fixes_pushed event to reviewer agent"
+                                    );
+                                    if let Ok(Some(response)) = self
+                                        .call_handle_event(
+                                            reviewer_branch.as_str(),
+                                            reviewer_agent_type,
+                                            event_type,
+                                            payload,
+                                        )
+                                        .await
+                                    {
+                                        self.handle_event_action(
+                                            response,
+                                            reviewer_branch.as_str(),
+                                            reviewer_agent_type,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            ReviewerFanOut::NoReviewer => {
+                                tracing::error!(
+                                    pr_number,
+                                    leaf_branch = %branch,
+                                    "fixes_pushed fired but no reviewer is registered for \
+                                     this PR — the leaf+reviewer convergence loop will \
+                                     stall. Check that spawn_reviewer_for_pr ran for this \
+                                     PR and that the PR registry was updated."
+                                );
+                            }
+                            ReviewerFanOut::NotApplicable => {}
                         }
                     }
                     PendingAction::EmitEvent {
@@ -1721,6 +1814,83 @@ mod tests {
             if payload["kind"] == "fixes_pushed")));
         assert!(state.addressed_changes);
         assert_eq!(state.last_review_state, ReviewState::None);
+    }
+
+    fn pr_with_reviewer(
+        pr_number: u64,
+        agent_name: &str,
+        birth_branch: &str,
+    ) -> crate::services::file_pr_local::PrEntry {
+        let mut pr = test_pr_entry();
+        pr.number = pr_number;
+        pr.reviewer_agent = Some(agent_name.to_string());
+        pr.reviewer_birth_branch = Some(birth_branch.to_string());
+        pr
+    }
+
+    #[test]
+    fn test_reviewer_fanout_decision_dispatches_when_reviewer_registered() {
+        let registry =
+            test_registry(pr_with_reviewer(7, "review-pr-7-codex", "review-pr-7"));
+        let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 7 });
+
+        let decision = reviewer_fanout_decision("pr_review", &payload, 7, &registry);
+        match decision {
+            ReviewerFanOut::DispatchTo(branch, agent_type) => {
+                assert_eq!(branch.as_str(), "review-pr-7");
+                assert_eq!(agent_type, AgentType::Codex);
+            }
+            other => panic!("expected DispatchTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reviewer_fanout_decision_reports_missing_reviewer() {
+        let registry = test_registry(test_pr_entry()); // reviewer fields are None
+        let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 1 });
+
+        assert_eq!(
+            reviewer_fanout_decision("pr_review", &payload, 1, &registry),
+            ReviewerFanOut::NoReviewer,
+            "fixes_pushed with no registered reviewer must surface NoReviewer so the \
+             caller logs the stall condition"
+        );
+    }
+
+    #[test]
+    fn test_reviewer_fanout_decision_skips_non_pr_review_events() {
+        let registry =
+            test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
+        let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 1 });
+
+        assert_eq!(
+            reviewer_fanout_decision("ci_status", &payload, 1, &registry),
+            ReviewerFanOut::NotApplicable,
+            "non pr_review event types must never fan out, even if the kind happens \
+             to match"
+        );
+    }
+
+    #[test]
+    fn test_reviewer_fanout_decision_skips_sibling_pr_review_kinds_for_now() {
+        // #249 scopes fan-out to fixes_pushed only; #250 extends to siblings.
+        let registry =
+            test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
+        for kind in [
+            "reviewer_approved",
+            "reviewer_requested_changes",
+            "review_timeout",
+            "stuck",
+            "merge_ready",
+            "commits_pushed",
+        ] {
+            let payload = serde_json::json!({ "kind": kind, "pr_number": 1 });
+            assert_eq!(
+                reviewer_fanout_decision("pr_review", &payload, 1, &registry),
+                ReviewerFanOut::NotApplicable,
+                "sibling kind {kind} must not fan out in #249's scope"
+            );
+        }
     }
 
     #[test]
