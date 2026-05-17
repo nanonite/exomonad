@@ -713,6 +713,22 @@ pub async fn run(
         ])
         .status();
 
+    // Propagate CODEX_HOME into the tmux session env so Codex panes see the
+    // same hook-trust DB that init's install_codex_hook_trust just seeded.
+    // Without this, when tmux server is already running from another session
+    // (e.g., a parallel workspace), the new session attaches to that server
+    // and inherits the server's captured env — NOT the env exported by the
+    // shell that ran `exomonad init`. Codex then falls back to ~/.codex and
+    // sees the hooks as untrusted, firing "3 hooks need review". The e2e
+    // tests/e2e/reviewer-convergence-loop hit this reliably (chainlink #253).
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        if !codex_home.is_empty() {
+            let _ = std::process::Command::new("tmux")
+                .args(["set-environment", "-t", &session, "CODEX_HOME", &codex_home])
+                .status();
+        }
+    }
+
     // Set EXOMONAD_ROLE=root so hook CLI passes &role=root to server
     let role_output = std::process::Command::new("tmux")
         .args(["set-environment", "-t", &session, "EXOMONAD_ROLE", "root"])

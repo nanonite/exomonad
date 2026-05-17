@@ -728,6 +728,107 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the installed codex CLI"]
+    fn codex_hook_hash_matches_codex_cli_for_root_role() {
+        // Mirrors what rust/exomonad/src/init.rs:write_codex_root_config does
+        // when the user spawns a codex root TL. The dev-role test covers leaves;
+        // this one covers the path the operator's first-run experience hits.
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("repo");
+        let codex_home = dir.path().join("codex-home");
+        let user_config_path = codex_home.join("config.toml");
+        let worktree_config_path = repo_path.join(".codex/config.toml");
+        std::fs::create_dir_all(worktree_config_path.parent().unwrap()).unwrap();
+
+        trust_codex_project(&user_config_path, &repo_path).unwrap();
+        let config = render_codex_config(
+            "root",
+            "root",
+            "Codex root TL placeholder instructions.",
+            None,
+            &HashMap::new(),
+            test_exomonad_binary(),
+        );
+        std::fs::write(&worktree_config_path, config).unwrap();
+        install_codex_hook_trust(&user_config_path, &worktree_config_path).unwrap();
+
+        for event in ["pre_tool_use", "post_tool_use", "stop"] {
+            let key = format!("{}:{event}:0:0", worktree_config_path.display());
+            let trusted_hash = read_trusted_hook_hash(&user_config_path, &key);
+            let codex_hook = read_codex_hook_metadata(&codex_home, &repo_path, &key);
+            assert_eq!(
+                codex_hook["currentHash"].as_str(),
+                Some(trusted_hash.as_str()),
+                "hash mismatch for {event} on root role — codex sees a different hash than \
+                 install_codex_hook_trust wrote, which fires the 'hooks need review' prompt"
+            );
+            assert_eq!(
+                codex_hook["trustStatus"].as_str(),
+                Some("trusted"),
+                "trustStatus is not 'trusted' for {event} — even with matching hash codex thinks \
+                 the hook is untrusted, likely a key-format or path-canonicalization mismatch"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the installed codex CLI"]
+    fn codex_hook_trust_survives_pre_seeded_projects_table() {
+        // Mirrors what tests/e2e/reviewer-convergence-loop/run.sh does:
+        // run.sh manually writes a [projects."$REPO_DIR"] trust_level = "trusted"
+        // entry into $CODEX_HOME/config.toml *before* exomonad init runs. Then
+        // init's trust_codex_project + install_codex_hook_trust must coexist
+        // with that pre-seeded entry without losing the hook state. This case
+        // is what fires "3 hooks need review" in the live e2e but is NOT
+        // covered by codex_hook_hash_matches_codex_cli_for_root_role (which
+        // starts from an empty $CODEX_HOME).
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("repo");
+        let codex_home = dir.path().join("codex-home");
+        let user_config_path = codex_home.join("config.toml");
+        let worktree_config_path = repo_path.join(".codex/config.toml");
+        std::fs::create_dir_all(worktree_config_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        // Pre-seed exactly as run.sh does, before any exomonad call.
+        let pre_seeded = format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            repo_path.display()
+        );
+        std::fs::write(&user_config_path, pre_seeded).unwrap();
+
+        // What exomonad init does for a codex root TL, in order:
+        trust_codex_project(&user_config_path, &repo_path).unwrap();
+        let config = render_codex_config(
+            "root",
+            "root",
+            "Codex root TL placeholder instructions.",
+            None,
+            &HashMap::new(),
+            test_exomonad_binary(),
+        );
+        std::fs::write(&worktree_config_path, config).unwrap();
+        install_codex_hook_trust(&user_config_path, &worktree_config_path).unwrap();
+
+        for event in ["pre_tool_use", "post_tool_use", "stop"] {
+            let key = format!("{}:{event}:0:0", worktree_config_path.display());
+            let trusted_hash = read_trusted_hook_hash(&user_config_path, &key);
+            let codex_hook = read_codex_hook_metadata(&codex_home, &repo_path, &key);
+            assert_eq!(
+                codex_hook["currentHash"].as_str(),
+                Some(trusted_hash.as_str()),
+                "hash mismatch for {event} when [projects] table was pre-seeded"
+            );
+            assert_eq!(
+                codex_hook["trustStatus"].as_str(),
+                Some("trusted"),
+                "trustStatus is not 'trusted' for {event} after pre-seeded [projects] table — \
+                 this is the bug fired by tests/e2e/reviewer-convergence-loop"
+            );
+        }
+    }
+
+    #[test]
     fn install_codex_hook_trust_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let user_config_path = dir.path().join("codex-home/config.toml");
