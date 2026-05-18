@@ -160,7 +160,7 @@ pub async fn resolve_plugin(
     wasm_path: &StdPath,
     agent_resolver: Option<&exomonad_core::services::AgentResolver>,
 ) -> anyhow::Result<Arc<PluginManager>> {
-    let agent_name = AgentName::from(name);
+    let agent_name = AgentName::try_from_str(name).context("agent name must not be empty")?;
 
     // Root's birth branch is written to .exo/agents/root/.birth_branch by init.
     // Re-resolve on every request to detect branch changes between sessions.
@@ -271,7 +271,8 @@ async fn resolve_agent_birth_branch(
             let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !branch.is_empty() {
                 tracing::debug!(agent = %agent_name, branch = %branch, "Resolved agent birth branch from worktree");
-                return Ok(BirthBranch::from(branch.as_str()));
+                return BirthBranch::try_from_str(branch.as_str())
+                    .context("resolved git branch must not be empty");
             }
         }
         _ => {}
@@ -286,7 +287,8 @@ async fn resolve_agent_birth_branch(
         if let Ok(contents) = tokio::fs::read_to_string(&bb_file).await {
             let branch = contents.trim().to_string();
             tracing::debug!(agent = %agent_name, branch = %branch, "Resolved agent birth branch from .birth_branch file");
-            return Ok(BirthBranch::from(branch.as_str()));
+            return BirthBranch::try_from_str(branch.as_str())
+                .context(".birth_branch must not be empty");
         }
     }
 
@@ -466,12 +468,14 @@ pub async fn handle_hook_inner(
 
     // Resolve agent identity: try resolver first for authoritative identity,
     // fall back to query params (which may be inaccurate for hooks fired before first tool call).
-    let agent_name_for_hook = AgentName::from(params.agent_id.as_deref().unwrap_or("root"));
+    let agent_name_for_hook = AgentName::try_from_str(params.agent_id.as_deref().unwrap_or("root"))
+        .context("hook agent_id must not be empty")?;
     let birth_branch_for_hook =
         if let Some(record) = state.agent_resolver.get(&agent_name_for_hook).await {
             record.birth_branch
         } else {
-            BirthBranch::from(params.session_id.as_deref().unwrap_or("main"))
+            BirthBranch::try_from_str(params.session_id.as_deref().unwrap_or("main"))
+                .context("hook session_id must not be empty")?
         };
 
     // Always inject identity into WASM input (hooks need it even when env vars aren't set)
@@ -660,7 +664,8 @@ pub async fn handle_hook_inner(
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     // We need to resolve the root plugin for health
     let cache = state.plugins.read().await;
-    let plugin = cache.get(&AgentName::from("root")).cloned();
+    let root = AgentName::try_from_str("root").expect("literal agent name is non-empty");
+    let plugin = cache.get(&root).cloned();
 
     let wasm_hash = if let Some(p) = plugin {
         p.content_hash()
@@ -1030,10 +1035,10 @@ Run `exomonad recompile` first to build it.",
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     // Pre-populate with the root agent's plugin
-    plugins
-        .write()
-        .await
-        .insert(AgentName::from("root"), root_plugin.clone());
+    plugins.write().await.insert(
+        AgentName::try_from_str("root").expect("literal agent name is non-empty"),
+        root_plugin.clone(),
+    );
 
     // Check for existing server BEFORE writing our own PID
     let socket_path = project_dir.join(".exo/server.sock");
