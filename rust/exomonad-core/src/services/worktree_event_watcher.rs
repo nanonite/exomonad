@@ -137,7 +137,7 @@ fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
 /// Per-PR state tracked across poll cycles.
 #[derive(Debug, Clone)]
 struct WatchState {
-    last_comment_count: usize,
+    pr_review_cycle_count: usize,
     last_ci_status: CIStatus,
     branch_name: BranchName,
     agent_type: AgentType,
@@ -164,7 +164,7 @@ impl WatchState {
         comment_count: usize,
     ) -> Self {
         Self {
-            last_comment_count: comment_count,
+            pr_review_cycle_count: comment_count,
             last_ci_status: ci_status,
             branch_name: branch.clone(),
             agent_type,
@@ -1327,8 +1327,8 @@ fn compute_pr_actions(
         }
     }
 
-    if comment_count != old_state.last_comment_count {
-        old_state.last_comment_count = comment_count;
+    if comment_count != old_state.pr_review_cycle_count {
+        old_state.pr_review_cycle_count = comment_count;
     }
 
     let approved = reviews
@@ -2166,7 +2166,7 @@ mod tests {
             .iter()
             .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "review_received")));
-        assert_eq!(state.last_comment_count, 1);
+        assert_eq!(state.pr_review_cycle_count, 1);
     }
 
     #[test]
@@ -2202,7 +2202,7 @@ mod tests {
 
         assert_eq!(review_received_count, 1);
         assert_eq!(emit_event_count, 1);
-        assert_eq!(state.last_comment_count, 2);
+        assert_eq!(state.pr_review_cycle_count, 2);
         assert_eq!(state.last_review_state, ReviewState::ChangesRequested);
     }
 
