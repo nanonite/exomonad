@@ -8,14 +8,18 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// Walk up from CWD to find `.exo/server.sock`. Follows symlinks.
+/// Walk up from CWD to find `.exo/server.sock`. Returns the canonical
+/// (symlink-resolved) path so `connect()` sees the real socket location
+/// rather than a worktree symlink that may exceed `sun_path`'s 108-byte limit.
 pub fn find_server_socket() -> Result<PathBuf> {
     let start = std::env::current_dir()?;
     let mut current = start.as_path();
     loop {
         let sock = current.join(".exo/server.sock");
         if sock.exists() {
-            return Ok(sock);
+            return sock.canonicalize().with_context(|| {
+                format!("Failed to canonicalize server socket path {}", sock.display())
+            });
         }
         match current.parent() {
             Some(parent) => current = parent,
