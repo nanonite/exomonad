@@ -58,8 +58,8 @@ echo "  tmux, git: OK"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-mkdir -p "$PROJECT_ROOT/.e2e-work"
-WORK_DIR="$(mktemp -d "$PROJECT_ROOT/.e2e-work/exomonad-e2e-close.XXXXXXXX")"
+mkdir -p "$HOME/.cache/exomonad-e2e"
+WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/close.XXXXXXXX")"
 echo "  Work dir: $WORK_DIR"
 
 cleanup() {

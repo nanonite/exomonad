@@ -128,9 +128,6 @@ spindle.db-wal
 # Local exo runtime state
 .exo/prs.json
 
-# E2E test work directories (each run.sh mktemps into here)
-.e2e-work/
-
 # Working notes (not committed)
 archive/
 notes-knot-atproto-push.md

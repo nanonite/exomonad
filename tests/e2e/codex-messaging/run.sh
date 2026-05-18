@@ -44,8 +44,8 @@ echo "  tmux, git, python3: OK"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-mkdir -p "$PROJECT_ROOT/.e2e-work"
-WORK_DIR="$(mktemp -d "$PROJECT_ROOT/.e2e-work/exomonad-e2e-codex-messaging.XXXXXXXX")"
+mkdir -p "$HOME/.cache/exomonad-e2e"
+WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/codex-messaging.XXXXXXXX")"
 SESSION="e2e-codex-messaging"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REMOTE_DIR="$WORK_DIR/remote.git"

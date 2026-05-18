@@ -52,8 +52,8 @@ done
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-mkdir -p "$PROJECT_ROOT/.e2e-work"
-WORK_DIR="$(mktemp -d "$PROJECT_ROOT/.e2e-work/exomonad-e2e-chainlink-codex.XXXXXXXX")"
+mkdir -p "$HOME/.cache/exomonad-e2e"
+WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/chainlink-codex.XXXXXXXX")"
 SESSION="e2e-chainlink-codex"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REMOTE_DIR="$WORK_DIR/remote.git"

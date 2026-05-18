@@ -65,8 +65,8 @@ echo "  knot DB: accessible"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-mkdir -p "$PROJECT_ROOT/.e2e-work"
-WORK_DIR="$(mktemp -d "$PROJECT_ROOT/.e2e-work/exomonad-e2e-tangled-pr-codex.XXXXXXXX")"
+mkdir -p "$HOME/.cache/exomonad-e2e"
+WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/tangled-pr-codex.XXXXXXXX")"
 SESSION="e2e-tangled-pr-codex"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REPO_NAME="tangled-pr-codex-$(date +%s)-$$"
