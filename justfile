@@ -47,17 +47,24 @@ test-wasm-integration:
     just wasm-all
     nix develop --command cargo test -p exomonad-core --test wasm_integration
 
+# Build and run the devswarm role-hook-tests WASM test suite
+role-hook-tests:
+    @nix develop .#wasm --command bash -c 'export PATH=$PWD/.gemini/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build role-hook-tests'
+    @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name role-hook-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
+
 # Run tests: Rust unit tests, cargo check, WASM build, proto freshness
 test:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> [1/4] Rust unit tests..."
+    echo ">>> [1/5] Rust unit tests..."
     just rust-test
-    echo ">>> [2/4] Rust check (all targets)..."
+    echo ">>> [2/5] Rust check (all targets)..."
     nix develop --command cargo check --workspace --all-targets
-    echo ">>> [3/4] WASM build..."
+    echo ">>> [3/5] WASM build..."
     just wasm-all
-    echo ">>> [4/4] Proto freshness check..."
+    echo ">>> [4/5] Role hook tests..."
+    just role-hook-tests
+    echo ">>> [5/5] Proto freshness check..."
     just proto-check
     echo ">>> All checks passed."
 

@@ -74,6 +74,7 @@ test-suite role-hook-tests
     hs-source-dirs: test . ../../lib
     main-is: Main.hs
     other-modules:
+        AllRoles
         RootRole
         TLRole
         DevRole

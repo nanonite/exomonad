@@ -122,6 +122,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Add 'just role-hook-tests' recipe to actually execute the devswarm WASM test suite (#289)
 - Remove convergence-testrunner from reviewer-convergence E2E (and audit other testrunner companions) (#287)
 - Define Tangled equivalents of github.get_pull_request / get_pull_request_for_branch via knot+spindle (#284)
 - exomonad new: scaffold .tangled/workflows/ci.yml with language-aware framing (#232)

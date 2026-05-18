@@ -106,6 +106,7 @@ Haskell WASM is a typed configuration DSL — tool schemas, dispatch logic, hook
 ```bash
 just install-all-dev    # Full build (WASM + Rust + install)
 just wasm-all           # Rebuild WASM only (after Haskell changes)
+just role-hook-tests    # Run devswarm role hook/state-machine tests in WASM
 just proto-gen          # Regenerate proto types (Rust + Haskell)
 cargo test --workspace  # Rust tests
 just fmt                # Format all code
