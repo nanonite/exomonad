@@ -10,10 +10,12 @@ import Control.Monad.Freer.Coroutine qualified as C
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import Data.Text qualified as T
+import AllRoles (lookupRole, roleListTools)
 import DevPhase (DevEvent (..), DevPhase (..))
 import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
+import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (HookConfig (..), RoleConfig (..))
 import ReviewerPhase (ReviewerPhase (..))
@@ -33,6 +35,7 @@ main = do
   assertRoleDeny "root" RootRole.config
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
+  assertReviewerToolList
   assertReviewerPostToolUseEventName
   assertReviewerCanExitDecisions
   assertDevNeedsHumanDirectionAfterOneFixRound
@@ -101,13 +104,25 @@ assertReviewerPostToolUseEventName = do
     Just PostToolUseOutput {} -> pure ()
     other -> fail $ "reviewer PostToolUse should emit PostToolUseOutput, got " <> show other
 
+assertReviewerToolList :: IO ()
+assertReviewerToolList =
+  case lookupRole "reviewer" of
+    Nothing -> fail "reviewer role missing from registry"
+    Just roleCfg -> do
+      let names = map tdName (roleListTools roleCfg)
+      assertEqual
+        "reviewer tools"
+        ["approve_pr", "request_changes", "post_review_comment"]
+        names
+      assertBool "reviewer must not expose send_message" ("send_message" `notElem` names)
+      assertBool "reviewer must not expose notify_parent" ("notify_parent" `notElem` names)
+
 assertReviewerCanExitDecisions :: IO ()
 assertReviewerCanExitDecisions = do
-  assertBlocks "approved awaiting CI" (canExit (ReviewerApprovedAwaitingCI 7))
-  assertBlocks "requested changes" (canExit (ReviewerChangesRequested 7 "fix it"))
-  assertBlocks "reviewing" (canExit (ReviewerReviewing 7 1))
+  assertBlocks "reviewing" (canExit (ReviewerReviewing 7))
   assertClean "done exits cleanly" (canExit ReviewerDone)
   assertClean "spawned exits cleanly" (canExit ReviewerSpawned)
+  assertClean "posted exits cleanly" (canExit (ReviewerPosted 7))
 
 assertDevNeedsHumanDirectionAfterOneFixRound :: IO ()
 assertDevNeedsHumanDirectionAfterOneFixRound = do

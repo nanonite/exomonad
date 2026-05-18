@@ -240,8 +240,7 @@ instance MCPTool ReviewerPostReviewComment where
 data Tools mode = Tools
   { approvePr :: mode :- ReviewerApprovePR,
     requestChanges :: mode :- ReviewerRequestChanges,
-    postReviewComment :: mode :- ReviewerPostReviewComment,
-    sendMessage :: mode :- SendMessage
+    postReviewComment :: mode :- ReviewerPostReviewComment
   }
   deriving (Generic)
 
@@ -253,8 +252,7 @@ config =
           Tools
             { approvePr = mkHandler @ReviewerApprovePR,
               requestChanges = mkHandler @ReviewerRequestChanges,
-            postReviewComment = mkHandler @ReviewerPostReviewComment,
-            sendMessage = mkHandler @SendMessage
+              postReviewComment = mkHandler @ReviewerPostReviewComment
           },
       hooks =
         HookConfig
