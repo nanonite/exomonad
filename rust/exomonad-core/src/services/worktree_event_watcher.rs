@@ -1328,24 +1328,6 @@ fn compute_pr_actions(
     }
 
     if comment_count != old_state.last_comment_count {
-        if comment_count > old_state.last_comment_count {
-            let message = format_message(comments, reviews);
-            pending_actions.push(PendingAction::EmitEvent {
-                status: "copilot_review".to_string(),
-                message: message.clone(),
-                comments: Some(comments.to_vec()),
-                reviews: Some(reviews.to_vec()),
-            });
-
-            pending_actions.push(PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload: serde_json::json!({
-                    "kind": "review_received",
-                    "pr_number": pr_number.as_u64(),
-                    "comments": message,
-                }),
-            });
-        }
         old_state.last_comment_count = comment_count;
     }
 
@@ -1402,12 +1384,19 @@ fn compute_pr_actions(
                 rounds: old_state.rounds,
             });
         } else {
+            let message = format_message(comments, reviews);
+            pending_actions.push(PendingAction::EmitEvent {
+                status: "copilot_review".to_string(),
+                message: message.clone(),
+                comments: Some(comments.to_vec()),
+                reviews: Some(reviews.to_vec()),
+            });
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
                 payload: serde_json::json!({
                     "kind": "review_received",
                     "pr_number": pr_number.as_u64(),
-                    "comments": format_message(comments, reviews),
+                    "comments": message,
                 }),
             });
         }
@@ -2156,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_comments_fire_review_received() {
+    fn test_new_comments_update_comment_count_without_review_received() {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
@@ -2173,11 +2162,48 @@ mod tests {
             &|_, _| "review message".to_string(),
             5,
         );
-        assert!(actions
+        assert!(!actions
             .iter()
             .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "review_received")));
         assert_eq!(state.last_comment_count, 1);
+    }
+
+    #[test]
+    fn test_changes_requested_fires_single_review_received() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let comments = vec![test_comment("Fix this")];
+        let reviews = vec![test_review("Please address comments", ReviewState::ChangesRequested)];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &comments,
+            &reviews,
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, _| "review message".to_string(),
+            5,
+        );
+
+        let review_received_count = actions
+            .iter()
+            .filter(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "review_received"))
+            .count();
+        let emit_event_count = actions
+            .iter()
+            .filter(|a| matches!(a, PendingAction::EmitEvent { .. }))
+            .count();
+
+        assert_eq!(review_received_count, 1);
+        assert_eq!(emit_event_count, 1);
+        assert_eq!(state.last_comment_count, 2);
+        assert_eq!(state.last_review_state, ReviewState::ChangesRequested);
     }
 
     #[test]
