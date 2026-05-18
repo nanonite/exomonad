@@ -108,7 +108,7 @@ reviewRequestAction n _comments (Just (DevNeedsHumanDirection _ reason)) =
     )
     n
 reviewRequestAction n comments_ _ =
-  InjectMessage (Tpl.copilotReviewReceived n comments_)
+  InjectMessage (Tpl.reviewReceived n comments_)
 
 -- | Helper to log handler entry.
 logHandler :: Text -> Eff Effects ()

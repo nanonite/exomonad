@@ -14,7 +14,7 @@ module ExoMonad.Guest.Events.Templates
     reviewTimeout,
     fixesPushed,
     commitsPushed,
-    copilotReviewReceived,
+    reviewReceived,
     siblingMerged,
     ciStatus,
     mergeReady,
@@ -62,13 +62,13 @@ fixesPushed n ci =
       "pending" -> " CI running \x2014 merge when green."
       _ -> " CI status: " <> ci <> "."
 
--- | Copilot posted review comments — injected into the agent's pane.
+-- | Reviewer posted review comments — injected into the agent's pane.
 --
--- >>> copilotReviewReceived 42 "Fix the typo on line 3."
--- "## Copilot Review on PR #42\n\nFix the typo on line 3.\n\nAddress these comments and push fixes."
-copilotReviewReceived :: Int -> Text -> Text
-copilotReviewReceived n comments =
-  "## Copilot Review on PR #"
+-- >>> reviewReceived 42 "Fix the typo on line 3."
+-- "## Review on PR #42\n\nFix the typo on line 3.\n\nAddress these comments and push fixes."
+reviewReceived :: Int -> Text -> Text
+reviewReceived n comments =
+  "## Review on PR #"
     <> T.pack (show n)
     <> "\n\n"
     <> comments
