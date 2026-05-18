@@ -15,9 +15,8 @@ type PRNumber = Int
 
 data ReviewerPhase
   = ReviewerSpawned
-  | ReviewerReviewing PRNumber Int
-  | ReviewerApprovedAwaitingCI PRNumber
-  | ReviewerChangesRequested PRNumber Text
+  | ReviewerReviewing PRNumber
+  | ReviewerPosted PRNumber
   | ReviewerDone
   | ReviewerFailed Text
   deriving (Show, Eq)
@@ -35,15 +34,15 @@ data ReviewerEvent
 instance StateMachine ReviewerPhase ReviewerEvent where
   machineName = "reviewer"
 
-  transition phase event = case event of
+  transition _phase event = case event of
     ReviewerApprovedEv prNum ->
-      Transitioned (ReviewerApprovedAwaitingCI prNum)
-    ReviewerRequestedChangesEv prNum comments ->
-      Transitioned (ReviewerChangesRequested prNum comments)
+      Transitioned (ReviewerPosted prNum)
+    ReviewerRequestedChangesEv prNum _comments ->
+      Transitioned (ReviewerPosted prNum)
     ReviewerFixesPushedEv prNum _ci ->
-      Transitioned (ReviewerReviewing prNum (nextRound phase))
+      Transitioned (ReviewerReviewing prNum)
     ReviewerCommitsPushedEv prNum _ci ->
-      Transitioned (ReviewerReviewing prNum (nextRound phase))
+      Transitioned (ReviewerReviewing prNum)
     ReviewerMergeReadyEv _prNum _ci _branch ->
       Transitioned ReviewerDone
     ReviewerTimedOutEv _prNum _mins ->
@@ -51,23 +50,14 @@ instance StateMachine ReviewerPhase ReviewerEvent where
     ReviewerStuckEv _prNum _rounds ->
       Transitioned ReviewerDone
 
-  canExit (ReviewerReviewing pr _) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " is under review. Stay alive until merge-ready."
-  canExit (ReviewerApprovedAwaitingCI pr) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " approved, waiting for CI merge-ready signal."
-  canExit (ReviewerChangesRequested pr _) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " has requested changes. Stay alive for fixes."
+  canExit (ReviewerReviewing pr) =
+    MustBlock $ "PR #" <> T.pack (show pr) <> " is under review. Post an approval or requested-changes verdict before exiting."
   canExit _ = Clean
-
-nextRound :: ReviewerPhase -> Int
-nextRound (ReviewerReviewing _ round_) = round_ + 1
-nextRound _ = 1
 
 instance ToJSON ReviewerPhase where
   toJSON ReviewerSpawned = object ["phase" .= ("reviewer_spawned" :: Text)]
-  toJSON (ReviewerReviewing n r) = object ["phase" .= ("reviewer_reviewing" :: Text), "pr_number" .= n, "review_round" .= r]
-  toJSON (ReviewerApprovedAwaitingCI n) = object ["phase" .= ("reviewer_approved_awaiting_ci" :: Text), "pr_number" .= n]
-  toJSON (ReviewerChangesRequested n comments) = object ["phase" .= ("reviewer_requested_changes" :: Text), "pr_number" .= n, "comments" .= comments]
+  toJSON (ReviewerReviewing n) = object ["phase" .= ("reviewer_reviewing" :: Text), "pr_number" .= n]
+  toJSON (ReviewerPosted n) = object ["phase" .= ("reviewer_posted" :: Text), "pr_number" .= n]
   toJSON ReviewerDone = object ["phase" .= ("reviewer_done" :: Text)]
   toJSON (ReviewerFailed msg) = object ["phase" .= ("reviewer_failed" :: Text), "message" .= msg]
 
@@ -76,9 +66,8 @@ instance FromJSON ReviewerPhase where
     phase <- v .: "phase"
     case (phase :: Text) of
       "reviewer_spawned" -> pure ReviewerSpawned
-      "reviewer_reviewing" -> ReviewerReviewing <$> v .: "pr_number" <*> v .: "review_round"
-      "reviewer_approved_awaiting_ci" -> ReviewerApprovedAwaitingCI <$> v .: "pr_number"
-      "reviewer_requested_changes" -> ReviewerChangesRequested <$> v .: "pr_number" <*> v .: "comments"
+      "reviewer_reviewing" -> ReviewerReviewing <$> v .: "pr_number"
+      "reviewer_posted" -> ReviewerPosted <$> v .: "pr_number"
       "reviewer_done" -> pure ReviewerDone
       "reviewer_failed" -> ReviewerFailed <$> v .: "message"
       other -> fail $ "Unknown ReviewerPhase: " <> T.unpack other

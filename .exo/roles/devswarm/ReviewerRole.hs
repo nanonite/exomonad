@@ -33,30 +33,10 @@ import ExoMonad.Guest.Events
 import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
-import ExoMonad.Guest.Tools.Events
-  ( NotifyParentArgs,
-    notifyParentCore,
-    notifyParentDescription,
-    notifyParentSchema,
-  )
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, postToolUseResponse)
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
 import HookPolicy (preToolUseWithGhBlock)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
-
--- | Reviewer notify_parent: thin wrapper, no phase transitions.
-data ReviewerNotifyParent
-
-instance MCPTool ReviewerNotifyParent where
-  type ToolArgs ReviewerNotifyParent = NotifyParentArgs
-  toolName = "notify_parent"
-  toolDescription = notifyParentDescription
-  toolSchema = notifyParentSchema
-  toolHandlerEff args = do
-    result <- notifyParentCore args
-    case result of
-      Left err -> pure $ errorResult err
-      Right _ -> pure $ successResult $ object ["success" .= True]
 
 data ApprovePRArgs = ApprovePRArgs
   { apPrNumber :: Int,
@@ -192,7 +172,10 @@ instance MCPTool ReviewerApprovePR where
     result <- writeReviewFile (apPrNumber args) (ReviewFile "approved" [])
     case result of
       Left err -> pure $ errorResult err
-      Right path -> pure $ successResult $ object ["success" .= True, "path" .= path]
+      Right path -> do
+        branch <- getCurrentBranch
+        void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv (apPrNumber args))
+        pure $ successResult $ object ["success" .= True, "path" .= path]
 
 data ReviewerRequestChanges
 
@@ -219,7 +202,10 @@ instance MCPTool ReviewerRequestChanges where
     result <- writeReviewFile (rcPrNumber args) (ReviewFile "changes_requested" [comment])
     case result of
       Left err -> pure $ errorResult err
-      Right path -> pure $ successResult $ object ["success" .= True, "path" .= path]
+      Right path -> do
+        branch <- getCurrentBranch
+        void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv (rcPrNumber args) (rcBody args))
+        pure $ successResult $ object ["success" .= True, "path" .= path]
 
 data ReviewerPostReviewComment
 
@@ -252,8 +238,7 @@ instance MCPTool ReviewerPostReviewComment where
       Right path -> pure $ successResult $ object ["success" .= True, "path" .= path]
 
 data Tools mode = Tools
-  { notifyParent :: mode :- ReviewerNotifyParent,
-    approvePr :: mode :- ReviewerApprovePR,
+  { approvePr :: mode :- ReviewerApprovePR,
     requestChanges :: mode :- ReviewerRequestChanges,
     postReviewComment :: mode :- ReviewerPostReviewComment,
     sendMessage :: mode :- SendMessage
@@ -265,10 +250,9 @@ config =
   RoleConfig
     { roleName = "reviewer",
       tools =
-        Tools
-          { notifyParent = mkHandler @ReviewerNotifyParent,
-            approvePr = mkHandler @ReviewerApprovePR,
-            requestChanges = mkHandler @ReviewerRequestChanges,
+          Tools
+            { approvePr = mkHandler @ReviewerApprovePR,
+              requestChanges = mkHandler @ReviewerRequestChanges,
             postReviewComment = mkHandler @ReviewerPostReviewComment,
             sendMessage = mkHandler @SendMessage
           },
@@ -305,7 +289,7 @@ reviewerPRReviewHandler (ReviewApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved"
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv n)
-  pure (NotifyParentAction ("[REVIEWER APPROVED] PR #" <> T.pack (show n) <> " approved by reviewer") n)
+  pure NoAction
 reviewerPRReviewHandler (ReviewTimeout n mins) = do
   logHandler $ "PR #" <> T.pack (show n) <> " timed out after " <> T.pack (show mins) <> " minutes"
   branch <- getCurrentBranch
@@ -325,7 +309,7 @@ reviewerPRReviewHandler (ReviewerApproved n) = do
   logHandler $ "Reviewer approved PR #" <> T.pack (show n)
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv n)
-  pure (NotifyParentAction ("[REVIEWER APPROVED] PR #" <> T.pack (show n) <> " approved by reviewer agent") n)
+  pure NoAction
 reviewerPRReviewHandler (ReviewerRequestedChanges n comments_) = do
   logHandler $ "Reviewer requested changes on PR #" <> T.pack (show n)
   branch <- getCurrentBranch
@@ -338,12 +322,12 @@ reviewerPRReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerStuckEv n rounds_)
-  pure (NotifyParentAction ("[STUCK: " <> T.pack (show n) <> ", rounds=" <> T.pack (show rounds_) <> "] Review did not converge. Dev leaf remains alive; ask the human for clarification.") n)
+  pure NoAction
 reviewerPRReviewHandler (MergeReady n ci branch_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerMergeReadyEv n ci branch_)
-  pure (NotifyParentAction ("[MERGE READY] PR #" <> T.pack (show n) <> " on branch " <> branch_ <> " has CI status " <> ci) n)
+  pure NoAction
 
 reviewerSiblingMergedHandler :: SiblingMergedEvent -> Eff Effects EventAction
 reviewerSiblingMergedHandler ev = do
