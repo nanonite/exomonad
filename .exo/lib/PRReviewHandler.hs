@@ -73,7 +73,13 @@ prReviewHandler (Stuck n rounds_) = do
   void $
     applyEvent @DevPhase @DevEvent branch DevSpawned $
       ReviewReceivedEv n ("Review loop exceeded " <> T.pack (show rounds_) <> " rounds. Stay alive and wait for TL clarification.")
-  pure (NotifyParentAction (Tpl.stuck n rounds_) n)
+  pure $
+    InjectMessage $
+      "Review loop stopped for PR #"
+        <> T.pack (show n)
+        <> " after "
+        <> T.pack (show rounds_)
+        <> " rounds. Stay alive and wait for TL clarification."
 prReviewHandler (MergeReady n ci branch_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
   branch <- getCurrentBranch
@@ -99,14 +105,13 @@ ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerAppro
 
 reviewRequestAction :: Int -> Text -> Maybe DevPhase -> EventAction
 reviewRequestAction n _comments (Just (DevNeedsHumanDirection _ reason)) =
-  NotifyParentAction
-    ( "[STUCK: "
+  InjectMessage
+    ( "Review loop needs human direction for PR #"
         <> T.pack (show n)
-        <> ", rounds=1] "
+        <> ": "
         <> reason
-        <> "; need human direction."
+        <> ". Stay alive and wait for TL clarification."
     )
-    n
 reviewRequestAction n comments_ _ =
   InjectMessage (Tpl.reviewReceived n comments_)
 

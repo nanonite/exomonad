@@ -67,6 +67,10 @@ enum PendingAction {
         pr_number: u64,
         rounds: u32,
     },
+    NotifyWatcherStuck {
+        pr_number: u64,
+        rounds: u32,
+    },
 }
 
 struct PendingPrActions {
@@ -760,6 +764,14 @@ where
                             warn!(pr_number, rounds, error = %e, "Failed to set stuck flag on PR");
                         }
                     }
+                    PendingAction::NotifyWatcherStuck { pr_number, rounds } => {
+                        self.deliver_watcher_stuck_message(
+                            pending.branch.as_str(),
+                            pr_number,
+                            rounds,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -1080,6 +1092,34 @@ where
         }
     }
 
+    async fn deliver_watcher_stuck_message(&self, branch: &str, pr_number: u64, rounds: u32) {
+        let parent_session_id = branch
+            .rsplit_once('.')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_else(|| "root".to_string());
+        let parent_name = AgentName::try_from_str(parent_session_id.as_str())
+            .expect("validated string input is non-empty");
+        let parent_tab = crate::services::delivery::resolve_tab_name_for_agent(
+            &parent_name,
+            Some(self.ctx.agent_resolver()),
+        );
+        let watcher_name =
+            AgentName::try_from_str("watcher").expect("literal validated string is non-empty");
+        let message = stuck_message(pr_number, rounds);
+
+        crate::services::delivery::notify_parent_delivery(
+            &*self.ctx,
+            &watcher_name,
+            &parent_session_id,
+            &parent_tab,
+            crate::services::delivery::NotifyStatus::Success,
+            &message,
+            None,
+            "worktree_event_watcher",
+        )
+        .await;
+    }
+
     async fn deliver_release_message(&self, branch: &str, agent_type: AgentType, message: &str) {
         let agent_name =
             AgentName::try_from_str(branch).expect("validated string input is non-empty");
@@ -1383,6 +1423,10 @@ fn compute_pr_actions(
                 pr_number: pr_number.as_u64(),
                 rounds: old_state.rounds,
             });
+            pending_actions.push(PendingAction::NotifyWatcherStuck {
+                pr_number: pr_number.as_u64(),
+                rounds: old_state.rounds,
+            });
         } else {
             let message = format_message(comments, reviews);
             pending_actions.push(PendingAction::EmitEvent {
@@ -1533,6 +1577,13 @@ fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
         "[MERGE READY] PR #{} on {} has reviewer approval and CI {}. You may stop; the parent TL owns merge.",
         pr_number, branch, status
     ))
+}
+
+fn stuck_message(pr_number: u64, rounds: u32) -> String {
+    format!(
+        "[STUCK: {}, rounds={}] Review did not converge after {} rounds. Dev leaf remains alive. Ask the human for clarification before continuing.",
+        pr_number, rounds, rounds
+    )
 }
 
 fn format_review_message(comments: &[LocalReviewComment], reviews: &[LocalReview]) -> String {
@@ -2533,6 +2584,13 @@ mod tests {
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WriteRegistryStuck {
+                pr_number: 1,
+                rounds: 1,
+            }
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::NotifyWatcherStuck {
                 pr_number: 1,
                 rounds: 1,
             }
