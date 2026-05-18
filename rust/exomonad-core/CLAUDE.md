@@ -116,6 +116,8 @@ All messages are prefixed with `[from: id]` (or `[FAILED: id]` for failures). Ev
 
 ## GitHub Poller State Machine (`services/github_poller.rs`)
 
+`GitHubPoller<C>` is currently hibernated: it has zero active call sites while the local Tangled path uses `services/worktree_event_watcher.rs`. Keep its review-loop semantics in parity with `worktree_event_watcher` so future GitHub Actions integration can re-enable it as a thin transport shim.
+
 `GitHubPoller<C>` is generic over capability traits. Single-phase init: `GitHubPoller::new(ctx)` — no `with_services()`. Background tokio task polling GitHub every 60s. Tracks per-PR state in `HashMap<PRNumber, PRState>`.
 
 ### PR Lifecycle States

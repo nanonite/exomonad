@@ -29,9 +29,9 @@ Two independent code paths already exist — route them to different targets:
 | Source | Code path | Current target | New target |
 |--------|-----------|----------------|------------|
 | Agent calls `notify_parent` tool | `EventHandler::notify_parent()` | TL inbox | **TL inbox** (unchanged) |
-| GitHub poller `NotifyParent` action | `GitHubPoller::handle_event_action()` | TL inbox | **Reviewer inbox** (if registered) |
+| Future GitHub Actions poller `NotifyParent` action | `GitHubPoller::handle_event_action()` | TL inbox | **Reviewer inbox** (if registered) |
 
-The split is natural: these are separate call sites. Poller `NotifyParent` actions are always PR-related (they come from PR review event handlers). Agent `notify_parent` calls are status/completion messages.
+The split is natural: these are separate call sites. The current active implementation is the local Tangled watcher; `github_poller.rs` is hibernated and should mirror watcher semantics until GitHub Actions integration is re-enabled. Poller `NotifyParent` actions are always PR-related (they come from PR review event handlers). Agent `notify_parent` calls are status/completion messages.
 
 ### Sub-Agent Identity
 
@@ -102,7 +102,7 @@ Takes `{ reviewer_name: String }`, calls `SessionRegisterMergeReviewer` effect. 
 
 ### 4. Route poller `NotifyParent` to reviewer
 
-**File**: `rust/exomonad-core/src/services/github_poller.rs` (~line 464)
+**File**: `rust/exomonad-core/src/services/github_poller.rs` (future GitHub Actions path; currently hibernated)
 
 In `handle_event_action` for `NotifyParent`: check `team_info.merge_reviewer_inbox`. If set, write to reviewer's inbox. If not, existing behavior.
 

@@ -1,3 +1,10 @@
+//! Hibernated GitHub Actions poller.
+//!
+//! This module currently has zero active call sites; the local Tangled path uses
+//! `worktree_event_watcher` instead. Keep this implementation in design parity
+//! with `worktree_event_watcher` so future GitHub Actions integration can wire it
+//! back in as a thin transport shim instead of a second review-loop design.
+
 use crate::domain::{BranchName, CIStatus, CommitSha, GithubOwner, GithubRepo, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
@@ -74,7 +81,7 @@ enum PendingAction {
 
 #[derive(Debug, Clone)]
 struct PRState {
-    last_copilot_comment_count: usize,
+    pr_review_cycle_count: usize,
     last_ci_status: CIStatus,
     branch_name: BranchName,
     agent_type: AgentType,
@@ -95,7 +102,7 @@ impl PRState {
         copilot_count: usize,
     ) -> Self {
         Self {
-            last_copilot_comment_count: copilot_count,
+            pr_review_cycle_count: copilot_count,
             last_ci_status: ci_status,
             branch_name: branch.clone(),
             agent_type,
@@ -164,30 +171,9 @@ fn compute_pr_actions(
         }
     }
 
-    // Check Copilot changes
-    if copilot_count != old_state.last_copilot_comment_count {
-        if copilot_count > old_state.last_copilot_comment_count {
-            // New activity!
-            let message = format_message(copilot_comments, copilot_reviews);
-            pending_actions.push(PendingAction::EmitEvent {
-                status: "copilot_review".to_string(),
-                message: message.clone(),
-                comments: Some(copilot_comments.to_vec()),
-                reviews: Some(copilot_reviews.to_vec()),
-            });
-
-            // Fire WASM event handler
-            pending_actions.push(PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload: serde_json::json!({
-                    "kind": "review_received",
-                    "pr_number": pr_number.as_u64(),
-                    "comments": message,
-                }),
-            });
-        }
+    if copilot_count != old_state.pr_review_cycle_count {
         // Update state even if count decreased (to sync with reality)
-        old_state.last_copilot_comment_count = copilot_count;
+        old_state.pr_review_cycle_count = copilot_count;
     }
 
     // Check for Copilot approval
@@ -212,12 +198,19 @@ fn compute_pr_actions(
         .any(|r| r.state == ReviewState::ChangesRequested);
     if changes_requested && old_state.last_review_state != ReviewState::ChangesRequested {
         old_state.last_review_state = ReviewState::ChangesRequested;
+        let message = format_message(copilot_comments, copilot_reviews);
+        pending_actions.push(PendingAction::EmitEvent {
+            status: "copilot_review".to_string(),
+            message: message.clone(),
+            comments: Some(copilot_comments.to_vec()),
+            reviews: Some(copilot_reviews.to_vec()),
+        });
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
             payload: serde_json::json!({
                 "kind": "review_received",
                 "pr_number": pr_number.as_u64(),
-                "comments": format_message(copilot_comments, copilot_reviews),
+                "comments": message,
             }),
         });
     }
