@@ -969,8 +969,8 @@ mod tests {
             .await;
 
         let repo = Repo {
-            owner: "owner".into(),
-            name: "repo".into(),
+            owner: GithubOwner::try_from_str("owner").expect("literal GitHub owner is non-empty"),
+            name: GithubRepo::try_from_str("repo").expect("literal GitHub repo is non-empty"),
         };
 
         let issues = service.list_issues(&repo, None).await.unwrap();
@@ -1013,8 +1013,8 @@ mod tests {
             .await;
 
         let repo = Repo {
-            owner: "owner".into(),
-            name: "repo".into(),
+            owner: GithubOwner::try_from_str("owner").expect("literal GitHub owner is non-empty"),
+            name: GithubRepo::try_from_str("repo").expect("literal GitHub repo is non-empty"),
         };
 
         let issue = service
@@ -1061,8 +1061,8 @@ mod tests {
             .await;
 
         let repo = Repo {
-            owner: "owner".into(),
-            name: "repo".into(),
+            owner: GithubOwner::try_from_str("owner").expect("literal GitHub owner is non-empty"),
+            name: GithubRepo::try_from_str("repo").expect("literal GitHub repo is non-empty"),
         };
 
         let spec = CreatePRSpec {
@@ -1116,8 +1116,8 @@ mod tests {
             .await;
 
         let repo = Repo {
-            owner: "owner".into(),
-            name: "repo".into(),
+            owner: GithubOwner::try_from_str("owner").expect("literal GitHub owner is non-empty"),
+            name: GithubRepo::try_from_str("repo").expect("literal GitHub repo is non-empty"),
         };
 
         let prs = service.list_prs(&repo, None).await.unwrap();

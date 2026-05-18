@@ -849,8 +849,10 @@ mod tests {
                 .unwrap();
 
         let req = ServiceRequest::GitHubGetIssue {
-            owner: "owner".into(),
-            repo: "repo".into(),
+            owner: crate::domain::GithubOwner::try_from_str("owner")
+                .expect("literal GitHub owner is non-empty"),
+            repo: crate::domain::GithubRepo::try_from_str("repo")
+                .expect("literal GitHub repo is non-empty"),
             number: 1,
             include_comments: false,
         };
@@ -884,8 +886,10 @@ mod tests {
                 .unwrap();
 
         let req = ServiceRequest::GitHubGetIssue {
-            owner: "owner".into(),
-            repo: "repo".into(),
+            owner: crate::domain::GithubOwner::try_from_str("owner")
+                .expect("literal GitHub owner is non-empty"),
+            repo: crate::domain::GithubRepo::try_from_str("repo")
+                .expect("literal GitHub repo is non-empty"),
             number: 999,
             include_comments: false,
         };
@@ -916,8 +920,10 @@ mod tests {
                 .unwrap();
 
         let req = ServiceRequest::GitHubGetIssue {
-            owner: "owner".into(),
-            repo: "repo".into(),
+            owner: crate::domain::GithubOwner::try_from_str("owner")
+                .expect("literal GitHub owner is non-empty"),
+            repo: crate::domain::GithubRepo::try_from_str("repo")
+                .expect("literal GitHub repo is non-empty"),
             number: 1,
             include_comments: false,
         };
@@ -941,8 +947,10 @@ mod tests {
                 .unwrap();
 
         let req = ServiceRequest::GitHubListIssues {
-            owner: "owner".into(),
-            repo: "repo".into(),
+            owner: crate::domain::GithubOwner::try_from_str("owner")
+                .expect("literal GitHub owner is non-empty"),
+            repo: crate::domain::GithubRepo::try_from_str("repo")
+                .expect("literal GitHub repo is non-empty"),
             state: None,
             labels: vec![],
         };
@@ -961,8 +969,10 @@ mod tests {
         let service = GitHubService::new("token".into()).unwrap();
 
         let req = ServiceRequest::GitHubListPullRequests {
-            owner: "owner".into(),
-            repo: "repo".into(),
+            owner: crate::domain::GithubOwner::try_from_str("owner")
+                .expect("literal GitHub owner is non-empty"),
+            repo: crate::domain::GithubRepo::try_from_str("repo")
+                .expect("literal GitHub repo is non-empty"),
             state: Some("invalid_state".into()),
             limit: None,
             head: None,
@@ -984,8 +994,10 @@ mod tests {
         let service = GitHubService::new("token".into()).unwrap();
 
         let req = ServiceRequest::GitHubUpdateIssue {
-            owner: "owner".into(),
-            repo: "repo".into(),
+            owner: crate::domain::GithubOwner::try_from_str("owner")
+                .expect("literal GitHub owner is non-empty"),
+            repo: crate::domain::GithubRepo::try_from_str("repo")
+                .expect("literal GitHub repo is non-empty"),
             number: 1,
             title: None,
             body: None,

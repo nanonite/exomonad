@@ -319,8 +319,9 @@ mod tests {
     #[test]
     fn test_github_get_issue_request_roundtrip() {
         let req = ServiceRequest::GitHubGetIssue {
-            owner: "octocat".into(),
-            repo: "hello-world".into(),
+            owner: GithubOwner::try_from_str("octocat").expect("literal GitHub owner is non-empty"),
+            repo: GithubRepo::try_from_str("hello-world")
+                .expect("literal GitHub repo is non-empty"),
             number: 42,
             include_comments: true,
         };
@@ -412,8 +413,9 @@ mod tests {
     #[test]
     fn test_github_get_pr_request_roundtrip() {
         let req = ServiceRequest::GitHubGetPR {
-            owner: "octocat".into(),
-            repo: "hello-world".into(),
+            owner: GithubOwner::try_from_str("octocat").expect("literal GitHub owner is non-empty"),
+            repo: GithubRepo::try_from_str("hello-world")
+                .expect("literal GitHub repo is non-empty"),
             number: 99,
             include_details: true,
         };
@@ -533,8 +535,9 @@ mod tests {
     #[test]
     fn test_github_create_issue_request_roundtrip() {
         let req = ServiceRequest::GitHubCreateIssue {
-            owner: "octocat".into(),
-            repo: "hello-world".into(),
+            owner: GithubOwner::try_from_str("octocat").expect("literal GitHub owner is non-empty"),
+            repo: GithubRepo::try_from_str("hello-world")
+                .expect("literal GitHub repo is non-empty"),
             title: "New bug".into(),
             body: "Details here".into(),
             labels: vec!["bug".into()],
@@ -559,8 +562,9 @@ mod tests {
     #[test]
     fn test_github_list_issues_request_roundtrip() {
         let req = ServiceRequest::GitHubListIssues {
-            owner: "octocat".into(),
-            repo: "hello-world".into(),
+            owner: GithubOwner::try_from_str("octocat").expect("literal GitHub owner is non-empty"),
+            repo: GithubRepo::try_from_str("hello-world")
+                .expect("literal GitHub repo is non-empty"),
             state: Some(IssueState::Open),
             labels: vec!["bug".into()],
         };
