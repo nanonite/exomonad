@@ -111,13 +111,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Add diagnostic logging to mcp_stdio startup + exomonad serve listen() to debug connect-race (#276)
+- Late approval after STUCK declaration — race or stale message? (#275)
+- Single source of STUCK: watcher-only emission (#274)
+- Reviewer state machine: STRIP notify_parent tool from reviewer role (not just simplify state) (#268)
 - Document github_poller as hibernated; keep for future github-actions integration (#272)
-- TL cleanup on MERGE READY: merge + close issue + tear down agents (#271)
 - Rename copilotReviewReceived -> reviewReceived in templates (#270)
 - Audit: poller-internal reviewer spawn (no TL-driven spawn) (#269)
-- Reviewer state machine: split from dev-leaf, make ephemeral (#268)
 - Rename last_comment_count to pr_review_cycle_count in watcher (#267)
 - Dedup review_received in worktree_event_watcher (#266)
+- TL cleanup on MERGE READY: merge + close issue + tear down agents (#271)
 - E2E reviewer convergence: bias reviewer via injected context + enforce bounded 1-fix loop with [STUCK→HUMAN] escalation (#258)
 - Reviewer should not exit on approval — must wait for merge_ready CI signal (#255)
 - Option A: add pane_id to SpawnResult + CloseWorkerPane effect for worker feedback loop (#215)
