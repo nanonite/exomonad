@@ -54,7 +54,22 @@ impl ServerClient {
 
     /// Check if the server is alive and responding.
     pub async fn is_healthy(&self) -> bool {
-        self.get("/health").await.is_ok()
+        self.health_check().await.is_ok()
+    }
+
+    /// Check if the server is alive and return the transport/HTTP error when it is not.
+    pub async fn health_check(&self) -> Result<()> {
+        match self.get("/health").await {
+            Ok(()) => {
+                tracing::debug!(socket = %self.socket.display(), "UDS health check succeeded via GET /health");
+                Ok(())
+            }
+            Err(err) => {
+                tracing::debug!(socket = %self.socket.display(), error = %err, "UDS health check failed via GET /health");
+                Err(err)
+                    .with_context(|| format!("GET /health failed via {}", self.socket.display()))
+            }
+        }
     }
 
     /// List available tools for an agent.

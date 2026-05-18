@@ -4,7 +4,7 @@ use exomonad::config::Config;
 use exomonad_core::services::AgentType;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 /// Read chainlink-tl.md from the project directory, strip YAML frontmatter,
@@ -26,6 +26,13 @@ fn read_chainlink_tl_protocol(cwd: &Path) -> Option<String> {
     } else {
         Some(stripped)
     }
+}
+
+fn current_time_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn extra_mcp_server_to_json(server: &crate::config::McpServerConfig) -> Result<Value> {
@@ -1163,6 +1170,7 @@ pub async fn run(
             info!(
                 source = %socket_source.display(),
                 target = %socket_target.display(),
+                created_at_ms = current_time_millis(),
                 "Symlinked server socket into companion worktree"
             );
 

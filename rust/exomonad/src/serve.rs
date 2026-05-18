@@ -24,7 +24,7 @@ use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, info, instrument, warn, Instrument};
+use tracing::{debug, error, info, instrument, warn, Instrument};
 
 // ============================================================================
 // Config Helpers
@@ -1024,7 +1024,13 @@ Run `exomonad recompile` first to build it.",
         services.clone(),
         Some(event_session_id),
     ));
+    let plugin_build_started_at = std::time::Instant::now();
     let rt = builder.build().await.context("Failed to build runtime")?;
+    info!(
+        wasm_path = %wasm_path.display(),
+        elapsed_ms = plugin_build_started_at.elapsed().as_millis(),
+        "WASM plugins ready for root role"
+    );
 
     // Extract the shared registry for creating per-agent plugins
     let rt_registry = rt.registry.clone();
@@ -1038,6 +1044,10 @@ Run `exomonad recompile` first to build it.",
     plugins.write().await.insert(
         AgentName::try_from_str("root").expect("literal agent name is non-empty"),
         root_plugin.clone(),
+    );
+    info!(
+        plugin_count = plugins.read().await.len(),
+        "Plugin cache initialized; server can dispatch root-role requests after listen"
     );
 
     // Check for existing server BEFORE writing our own PID
@@ -1163,6 +1173,7 @@ Run `exomonad recompile` first to build it.",
         std::fs::create_dir_all(parent)?;
     }
 
+    info!(socket = %socket_path.display(), "Binding MCP Unix domain socket");
     let listener = tokio::net::UnixListener::bind(&socket_path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to bind Unix socket {}: {}",
@@ -1179,13 +1190,18 @@ Run `exomonad recompile` first to build it.",
     }
 
     info!(socket = %socket_path.display(), "MCP server listening on Unix domain socket");
+    info!(
+        socket = %socket_path.display(),
+        plugin_count = plugins.read().await.len(),
+        "Plugins ready, accepting connections"
+    );
 
     let socket_path_for_cleanup = socket_path.clone();
     let server_pid_for_cleanup = server_pid_path.clone();
 
     // Run with graceful shutdown on SIGINT, SIGTERM, or /shutdown endpoint
     let shutdown_signal_for_server = shutdown_signal.clone();
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let ctrl_c = tokio::signal::ctrl_c();
             #[cfg(unix)]
@@ -1204,7 +1220,12 @@ Run `exomonad recompile` first to build it.",
                 _ = shutdown_signal_for_server.notified() => info!("Received /shutdown request, initiating graceful shutdown"),
             }
         })
-        .await?;
+        .await;
+    if let Err(err) = serve_result {
+        error!(error = %err, "MCP server exited with error");
+        return Err(err.into());
+    }
+    info!("MCP server exited gracefully");
 
     // Clean up socket and pid on shutdown
     if socket_path_for_cleanup.exists() {

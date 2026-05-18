@@ -7,7 +7,7 @@ use crate::uds_client::{self, ServerClient, ToolCallRequest};
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::Instrument;
+use tracing::{debug, error, info, Instrument};
 
 /// Run the stdio MCP translation layer.
 ///
@@ -21,25 +21,78 @@ pub async fn run(role: &str, name: &str) -> Result<()> {
     // socket symlink is dangling for a beat) sees "Failed to connect to
     // <path>" and bails permanently. See chainlink #260.
     let client = {
+        let started_at = std::time::Instant::now();
         let mut attempts = 0;
+        let mut last_error = String::from("socket discovery has not run");
+        info!(
+            role,
+            name, "mcp-stdio startup: beginning server socket discovery"
+        );
         loop {
             let candidate = match uds_client::find_server_socket() {
-                Ok(s) => Some(s),
-                Err(_) => None,
+                Ok(s) => {
+                    debug!(role, name, socket = %s.display(), "mcp-stdio startup: discovered server socket candidate");
+                    Some(s)
+                }
+                Err(err) => {
+                    last_error = err.to_string();
+                    debug!(role, name, error = %err, "mcp-stdio startup: server socket discovery failed");
+                    None
+                }
             };
 
             if let Some(socket) = candidate {
                 let trial = ServerClient::new(socket.clone());
-                if trial.is_healthy().await {
-                    break trial;
+                match trial.health_check().await {
+                    Ok(()) => {
+                        info!(
+                            role,
+                            name,
+                            socket = %socket.display(),
+                            attempts = attempts + 1,
+                            elapsed_ms = started_at.elapsed().as_millis(),
+                            "mcp-stdio startup: server health check succeeded"
+                        );
+                        break trial;
+                    }
+                    Err(err) => {
+                        last_error = err.to_string();
+                        debug!(
+                            role,
+                            name,
+                            socket = %socket.display(),
+                            attempt = attempts + 1,
+                            max_attempts = 30,
+                            error = %err,
+                            "mcp-stdio startup: server health check failed"
+                        );
+                    }
                 }
+            } else {
+                debug!(
+                    role,
+                    name,
+                    attempt = attempts + 1,
+                    max_attempts = 30,
+                    error = %last_error,
+                    "mcp-stdio startup: no server socket candidate"
+                );
             }
 
             attempts += 1;
             if attempts >= 30 {
+                error!(
+                    role,
+                    name,
+                    attempts,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    last_error = %last_error,
+                    "mcp-stdio startup: server socket unreachable"
+                );
                 anyhow::bail!(
-                    "Server socket not reachable after 15s (discovery or connect failed). \
-                     Is exomonad serve running?"
+                    "Server socket not reachable after 15s (discovery or health check failed). \
+                     Is exomonad serve running? Last error: {}",
+                    last_error
                 );
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
