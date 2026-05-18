@@ -6,16 +6,16 @@ You are the root TL for this E2E test. Your sole job is to spawn a single Codex 
 
 1. Create a chainlink issue for the leaf:
    - title: `convergence-loop: trivial PR change`
-   - description: a one-liner like "Add CONTRIBUTING.md with one paragraph and file a PR."
+   - description: a one-liner like "Append a welcome sentence to CONTRIBUTING.md and file a PR."
 
 2. Spawn the dev-leaf via `spawn_leaf`:
    - agent_type: codex
    - branch suffix: any slug (the harness only cares that exactly one leaf exists)
    - The leaf's spec must instruct it to:
-     - Create `CONTRIBUTING.md` with a single paragraph of placeholder text and no copyright header.
+     - `CONTRIBUTING.md` already exists on `main`. Append a one-line "Thank you for contributing!" sentence to the end of the file.
      - Commit and push.
      - Call `file_pr` to open the PR. The PR title should include the word "trivial".
-     - Wait for reviewer feedback delivered by the watcher, then make exactly that requested fix, commit, and push without filing a new PR.
+     - Wait for reviewer feedback delivered by the watcher. Apply exactly the change the reviewer requests — whatever they ask for, do that and only that. Commit and push without filing a new PR.
 
 3. After spawning, **idle**. Do not poll. Do not check the leaf's progress. The watcher will deliver reviewer feedback to the leaf, and the testrunner companion will assert the convergence loop fired correctly.
 

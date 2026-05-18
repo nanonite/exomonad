@@ -45,7 +45,8 @@ echo "  git, python3: OK"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-WORK_DIR="$(mktemp -d /tmp/exomonad-e2e-chainlink-sqlite-block.XXXXXXXX)"
+mkdir -p "$PROJECT_ROOT/.e2e-work"
+WORK_DIR="$(mktemp -d "$PROJECT_ROOT/.e2e-work/exomonad-e2e-chainlink-sqlite-block.XXXXXXXX")"
 REPO_DIR="$WORK_DIR/repo"
 SERVER_LOG="$WORK_DIR/server.log"
 SQLITE_MARKER="$WORK_DIR/sqlite3-executed"

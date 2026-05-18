@@ -42,7 +42,8 @@ echo "  tmux, python3, git: OK"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-WORK_DIR="$(mktemp -d /tmp/exomonad-e2e.XXXXXXXX)"
+mkdir -p "$PROJECT_ROOT/.e2e-work"
+WORK_DIR="$(mktemp -d "$PROJECT_ROOT/.e2e-work/exomonad-e2e.XXXXXXXX")"
 echo "  Work dir: $WORK_DIR"
 
 # Pick ephemeral port + define mock paths (needed before config writing)

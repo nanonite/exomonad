@@ -61,7 +61,8 @@ echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-WORK_DIR="$(mktemp -d /tmp/exomonad-e2e-reviewer-convergence.XXXXXXXX)"
+mkdir -p "$PROJECT_ROOT/.e2e-work"
+WORK_DIR="$(mktemp -d "$PROJECT_ROOT/.e2e-work/exomonad-e2e-reviewer-convergence.XXXXXXXX")"
 SESSION="e2e-reviewer-convergence"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REMOTE_DIR="$WORK_DIR/remote.git"
@@ -106,7 +107,10 @@ cat > README.md <<'EOF'
 
 Repository created by tests/e2e/reviewer-convergence-loop/run.sh.
 EOF
-git add README.md
+cat > CONTRIBUTING.md <<'EOF'
+Contributions are welcome. Please open a pull request describing the change.
+EOF
+git add README.md CONTRIBUTING.md
 git commit -m "initial commit" -q
 git push -u origin main -q
 
