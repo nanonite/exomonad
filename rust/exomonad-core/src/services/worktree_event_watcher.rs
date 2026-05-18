@@ -1446,7 +1446,8 @@ fn compute_pr_actions(
         let kind = if merge_ready_now {
             "merge_ready"
         } else {
-            "approved"
+            review_event_kind_for_state(&ReviewState::Approved)
+                .expect("approved review state has an event kind")
         };
         if merge_ready_now {
             old_state.merge_ready_notified = true;
@@ -1509,7 +1510,8 @@ fn compute_pr_actions(
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
                 payload: serde_json::json!({
-                    "kind": "review_received",
+                    "kind": review_event_kind_for_state(&ReviewState::ChangesRequested)
+                        .expect("changes_requested review state has an event kind"),
                     "pr_number": pr_number.as_u64(),
                     "comments": message,
                 }),
@@ -1630,6 +1632,14 @@ fn review_state_from_str(state: &str) -> ReviewState {
         "approved" => ReviewState::Approved,
         "changes_requested" => ReviewState::ChangesRequested,
         _ => ReviewState::None,
+    }
+}
+
+fn review_event_kind_for_state(state: &ReviewState) -> Option<&'static str> {
+    match state {
+        ReviewState::Approved => Some("approved"),
+        ReviewState::ChangesRequested => Some("review_received"),
+        ReviewState::None => None,
     }
 }
 
@@ -3277,6 +3287,65 @@ mod tests {
         assert!(reviews
             .iter()
             .any(|review| review.state == ReviewState::Approved && review.body == "LGTM"));
+    }
+
+    #[test]
+    fn test_review_state_dispatch_kind_mapping() {
+        assert_eq!(
+            review_event_kind_for_state(&ReviewState::ChangesRequested),
+            Some("review_received")
+        );
+        assert_eq!(
+            review_event_kind_for_state(&ReviewState::Approved),
+            Some("approved")
+        );
+        assert_eq!(review_event_kind_for_state(&ReviewState::None), None);
+    }
+
+    #[test]
+    fn test_review_file_state_drives_expected_pr_review_kind() {
+        let branch = BranchName::try_from_str("main.feat-codex")
+            .expect("literal validated string is non-empty");
+
+        for (state, expected_kind) in [
+            ("changes_requested", Some("review_received")),
+            ("approved", Some("approved")),
+            ("none", None),
+        ] {
+            let json = format!(r#"{{"state": "{state}", "comments": []}}"#);
+            let rf: ReviewFile = serde_json::from_str(&json).unwrap();
+            let (review_state, comments, reviews) = review_file_parts(rf);
+            let obs = Observation {
+                head_sha: "abc123".to_string(),
+                review_state,
+                comments,
+                reviews,
+                ci_status: CIStatus::Unknown,
+            };
+            let (reviews, _) = obs_to_review_parts(&obs);
+            let mut watcher_state = test_state(&branch, AgentType::Codex, "abc123");
+            let actions = compute_pr_actions(
+                &mut watcher_state,
+                PRNumber::new(1),
+                "abc123",
+                &obs.comments,
+                &reviews,
+                CIStatus::Unknown,
+                false,
+                branch.as_str(),
+                &|_, _| "review message".to_string(),
+                2,
+            );
+            let observed_kind = actions.iter().find_map(|action| match action {
+                PendingAction::WasmEvent {
+                    event_type: "pr_review",
+                    payload,
+                } => payload.get("kind").and_then(|kind| kind.as_str()),
+                _ => None,
+            });
+
+            assert_eq!(observed_kind, expected_kind, "state {state}");
+        }
     }
 
     // ---------------------------------------------------------------------------
