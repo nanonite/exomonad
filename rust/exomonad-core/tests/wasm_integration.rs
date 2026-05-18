@@ -684,18 +684,17 @@ async fn wasm_reviewer_tools_include_review_commands() {
 
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    for expected in [
-        "approve_pr",
-        "request_changes",
-        "post_review_comment",
-        "notify_parent",
-    ] {
+    for expected in ["approve_pr", "request_changes", "post_review_comment"] {
         assert!(
             names.contains(&expected),
             "Reviewer role missing tool '{expected}'. Got: {names:?}"
         );
     }
 
+    assert!(
+        !names.contains(&"notify_parent"),
+        "Reviewer should not have notify_parent (#268: ephemeral reviewer, no parent messaging)"
+    );
     assert!(
         !names.contains(&"fork_wave"),
         "Reviewer should not have fork_wave"
