@@ -311,7 +311,7 @@ reviewerPRReviewHandler (ReviewTimeout n mins) = do
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerTimedOutEv n mins)
   pure NoAction
-reviewerPRReviewHandler (FixesPushed n ci) = do
+reviewerPRReviewHandler (FixesPushed n ci _headSha) = do
   logHandler $ "Fixes pushed on PR #" <> T.pack (show n) <> ", CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerFixesPushedEv n ci)

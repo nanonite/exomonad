@@ -49,7 +49,7 @@ prReviewHandler (ReviewerApproved n) = do
 prReviewHandler (ReviewTimeout n mins) = do
   logHandler $ "PR #" <> T.pack (show n) <> " timed out after " <> T.pack (show mins) <> " minutes"
   pure (NotifyParentAction (Tpl.reviewTimeout n mins) n)
-prReviewHandler (FixesPushed n ci) = do
+prReviewHandler (FixesPushed n ci _headSha) = do
   logHandler $ "Fixes pushed on PR #" <> T.pack (show n) <> ", CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (FixesPushedEv n ci)

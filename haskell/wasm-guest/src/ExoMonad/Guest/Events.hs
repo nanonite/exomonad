@@ -35,7 +35,8 @@ data PRReviewEvent
       }
   | FixesPushed
       { prNumber :: Int,
-        fpCiStatus :: Text
+        fpCiStatus :: Text,
+        fpHeadSha :: Text
       }
   | CommitsPushed
       { prNumber :: Int,
@@ -70,7 +71,7 @@ instance FromJSON PRReviewEvent where
       "review_received" -> ReviewReceived <$> v .: "pr_number" <*> v .: "comments"
       "approved" -> ReviewApproved <$> v .: "pr_number"
       "timeout" -> ReviewTimeout <$> v .: "pr_number" <*> v .: "minutes_elapsed"
-      "fixes_pushed" -> FixesPushed <$> v .: "pr_number" <*> v .: "ci_status"
+      "fixes_pushed" -> FixesPushed <$> v .: "pr_number" <*> v .: "ci_status" <*> v .: "head_sha"
       "commits_pushed" -> CommitsPushed <$> v .: "pr_number" <*> v .: "ci_status"
       "reviewer_approved" -> ReviewerApproved <$> v .: "pr_number"
       "reviewer_requested_changes" -> ReviewerRequestedChanges <$> v .: "pr_number" <*> v .: "comments"
@@ -83,7 +84,7 @@ instance ToJSON PRReviewEvent where
   toJSON (ReviewReceived n c) = object ["kind" .= ("review_received" :: Text), "pr_number" .= n, "comments" .= c]
   toJSON (ReviewApproved n) = object ["kind" .= ("approved" :: Text), "pr_number" .= n]
   toJSON (ReviewTimeout n m) = object ["kind" .= ("timeout" :: Text), "pr_number" .= n, "minutes_elapsed" .= m]
-  toJSON (FixesPushed n ci) = object ["kind" .= ("fixes_pushed" :: Text), "pr_number" .= n, "ci_status" .= ci]
+  toJSON (FixesPushed n ci sha) = object ["kind" .= ("fixes_pushed" :: Text), "pr_number" .= n, "ci_status" .= ci, "head_sha" .= sha]
   toJSON (CommitsPushed n ci) = object ["kind" .= ("commits_pushed" :: Text), "pr_number" .= n, "ci_status" .= ci]
   toJSON (ReviewerApproved n) = object ["kind" .= ("reviewer_approved" :: Text), "pr_number" .= n]
   toJSON (ReviewerRequestedChanges n c) = object ["kind" .= ("reviewer_requested_changes" :: Text), "pr_number" .= n, "comments" .= c]

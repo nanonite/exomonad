@@ -9,12 +9,12 @@ use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasProjectDir, HasTeamRegistry,
     ReviewerSpawner,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -94,6 +94,10 @@ enum ReviewerFanOut {
     NoReviewer,
     /// Event requires fan-out and the reviewer is registered.
     DispatchTo(BranchName, AgentType, &'static str),
+}
+
+fn reviewer_worktree_path(project_dir: &Path, reviewer_agent: &str) -> PathBuf {
+    project_dir.join(".exo/worktrees").join(reviewer_agent)
 }
 
 /// Decide whether to fan a PR review event out to the reviewer.
@@ -679,6 +683,21 @@ where
                                 reviewer_role,
                             ) => {
                                 if let Some(payload) = reviewer_payload {
+                                    if let Err(err) = self
+                                        .advance_reviewer_worktree_for_fixes(
+                                            registry,
+                                            pending.pr_number,
+                                            &payload,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            pr_number = pending.pr_number,
+                                            reviewer_branch = %reviewer_branch,
+                                            error = %err,
+                                            "Failed to advance reviewer worktree before pr_review fan-out"
+                                        );
+                                    }
                                     info!(
                                         pr_number = pending.pr_number,
                                         reviewer_branch = %reviewer_branch,
@@ -1162,6 +1181,84 @@ where
             Err(_) => None,
         }
     }
+
+    async fn advance_reviewer_worktree_for_fixes(
+        &self,
+        registry: &PrRegistry,
+        pr_number: u64,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        if payload.get("kind").and_then(|value| value.as_str()) != Some("fixes_pushed") {
+            return Ok(());
+        }
+
+        let head_sha = payload
+            .get("head_sha")
+            .and_then(|value| value.as_str())
+            .filter(|sha| !sha.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("fixes_pushed event missing head_sha"))?;
+        let pr = registry
+            .prs
+            .get(&pr_number)
+            .ok_or_else(|| anyhow::anyhow!("PR #{} not found in registry", pr_number))?;
+        let reviewer_agent = pr
+            .reviewer_agent
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("PR #{} has no reviewer agent", pr_number))?;
+        let reviewer_dir = reviewer_worktree_path(self.ctx.project_dir(), reviewer_agent);
+
+        let fetch = Command::new("git")
+            .arg("-C")
+            .arg(&reviewer_dir)
+            .args(["fetch", "origin", pr.head_branch.as_str()])
+            .output()
+            .await;
+        match fetch {
+            Ok(output) if !output.status.success() => {
+                warn!(
+                    pr_number,
+                    reviewer_agent,
+                    path = %reviewer_dir.display(),
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "Reviewer worktree fetch failed before fixes_pushed checkout"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    pr_number,
+                    reviewer_agent,
+                    path = %reviewer_dir.display(),
+                    error = %err,
+                    "Failed to fetch reviewer worktree before fixes_pushed checkout"
+                );
+            }
+            _ => {}
+        }
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&reviewer_dir)
+            .args(["checkout", "--detach", head_sha])
+            .output()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to checkout reviewer worktree {} at {}",
+                    reviewer_dir.display(),
+                    head_sha
+                )
+            })?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to checkout reviewer worktree {} at {}: {}",
+                reviewer_dir.display(),
+                head_sha,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        Ok(())
+    }
 }
 
 /// Pure state machine: given old state + new observations, compute pending actions.
@@ -1215,6 +1312,7 @@ fn compute_pr_actions(
                     "kind": "fixes_pushed",
                     "pr_number": pr_number.as_u64(),
                     "ci_status": ci_status.as_str(),
+                    "head_sha": pr_sha,
                 }),
             });
         } else {
@@ -1936,10 +2034,16 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions
+        let fixes_payload = actions
             .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "fixes_pushed")));
+            .find_map(|a| match a {
+                PendingAction::WasmEvent { payload, .. } if payload["kind"] == "fixes_pushed" => {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .expect("fixes_pushed event should be emitted");
+        assert_eq!(fixes_payload["head_sha"], "def456");
         assert!(state.addressed_changes);
         assert_eq!(state.last_review_state, ReviewState::None);
     }
