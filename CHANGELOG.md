@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- merge_pr and dev stop-hook crash in local-PR flows: github handler unregistered, no fallback to .exo/prs.json (#283)
 - Reviewer-as-ephemeral redesign + dedup review_received in worktree_event_watcher (#265)
 - FixesPushed event never reaches reviewer — watcher only dispatches to the leaf's plugin manager (#247)
 - Fix watcher panic when reviewer worktree is detached (get_branch returns empty -> BranchName::from panics) (#262)

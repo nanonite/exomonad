@@ -340,3 +340,377 @@ instance (HsJSONPB.ToJSON FilePrResponse) where
 
 instance (HsJSONPB.FromJSON FilePrResponse) where
   parseJSON = HsJSONPB.parseJSONPB
+
+newtype LocalPrGetRequest
+  = LocalPrGetRequest {localPrGetRequestPrNumber :: Hs.Int64}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData LocalPrGetRequest)
+
+instance (HsProtobuf.Named LocalPrGetRequest) where
+  nameOf _ = Hs.fromString "LocalPrGetRequest"
+
+instance (HsProtobuf.HasDefault LocalPrGetRequest)
+
+instance (HsProtobuf.Message LocalPrGetRequest) where
+  encodeMessage _ LocalPrGetRequest {localPrGetRequestPrNumber} =
+    ( HsProtobuf.encodeMessageField
+        (HsProtobuf.FieldNumber 1)
+        localPrGetRequestPrNumber
+    )
+  decodeMessage _ =
+    Hs.pure LocalPrGetRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Int64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB LocalPrGetRequest) where
+  toJSONPB (LocalPrGetRequest f1) =
+    HsJSONPB.object ["pr_number" .= f1]
+  toEncodingPB (LocalPrGetRequest f1) =
+    HsJSONPB.pairs ["pr_number" .= f1]
+
+instance (HsJSONPB.FromJSONPB LocalPrGetRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "LocalPrGetRequest"
+      (\obj -> Hs.pure LocalPrGetRequest <*> obj .: "pr_number")
+
+instance (HsJSONPB.ToJSON LocalPrGetRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON LocalPrGetRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+newtype LocalPrGetForBranchRequest
+  = LocalPrGetForBranchRequest {localPrGetForBranchRequestBranch :: Hs.Text}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData LocalPrGetForBranchRequest)
+
+instance (HsProtobuf.Named LocalPrGetForBranchRequest) where
+  nameOf _ = Hs.fromString "LocalPrGetForBranchRequest"
+
+instance (HsProtobuf.HasDefault LocalPrGetForBranchRequest)
+
+instance (HsProtobuf.Message LocalPrGetForBranchRequest) where
+  encodeMessage
+    _
+    LocalPrGetForBranchRequest {localPrGetForBranchRequestBranch} =
+      ( HsProtobuf.encodeMessageField
+          (HsProtobuf.FieldNumber 1)
+          ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+              localPrGetForBranchRequestBranch
+          )
+      )
+  decodeMessage _ =
+    Hs.pure LocalPrGetForBranchRequest
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "branch")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB LocalPrGetForBranchRequest) where
+  toJSONPB (LocalPrGetForBranchRequest f1) =
+    HsJSONPB.object
+      [ "branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+      ]
+  toEncodingPB (LocalPrGetForBranchRequest f1) =
+    HsJSONPB.pairs
+      [ "branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+      ]
+
+instance (HsJSONPB.FromJSONPB LocalPrGetForBranchRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "LocalPrGetForBranchRequest"
+      ( \obj ->
+          Hs.pure LocalPrGetForBranchRequest
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "branch")
+                )
+      )
+
+instance (HsJSONPB.ToJSON LocalPrGetForBranchRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON LocalPrGetForBranchRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data LocalPrResponse
+  = LocalPrResponse
+  { localPrResponseFound :: Hs.Bool,
+    localPrResponsePrNumber :: Hs.Int64,
+    localPrResponseHeadBranch :: Hs.Text,
+    localPrResponseBaseBranch :: Hs.Text,
+    localPrResponseAuthorAgent :: Hs.Text,
+    localPrResponseReviewState :: Hs.Text,
+    localPrResponseLastHeadSha :: Hs.Text,
+    localPrResponseReviewerAgent :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData LocalPrResponse)
+
+instance (HsProtobuf.Named LocalPrResponse) where
+  nameOf _ = Hs.fromString "LocalPrResponse"
+
+instance (HsProtobuf.HasDefault LocalPrResponse)
+
+instance (HsProtobuf.Message LocalPrResponse) where
+  encodeMessage
+    _
+    LocalPrResponse
+      { localPrResponseFound,
+        localPrResponsePrNumber,
+        localPrResponseHeadBranch,
+        localPrResponseBaseBranch,
+        localPrResponseAuthorAgent,
+        localPrResponseReviewState,
+        localPrResponseLastHeadSha,
+        localPrResponseReviewerAgent
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 1)
+                                    localPrResponseFound
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 2)
+                                    localPrResponsePrNumber
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 3)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    localPrResponseHeadBranch
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 4)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                localPrResponseBaseBranch
+                            )
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 5)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            localPrResponseAuthorAgent
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 6)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        localPrResponseReviewState
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 7)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    localPrResponseLastHeadSha
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 8)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                localPrResponseReviewerAgent
+            )
+        )
+  decodeMessage _ =
+    Hs.pure LocalPrResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 2)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 6)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "found")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.Int64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "head_branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "base_branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "author_agent")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "review_state")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "last_head_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "reviewer_agent")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB LocalPrResponse) where
+  toJSONPB (LocalPrResponse f1 f2 f3 f4 f5 f6 f7 f8) =
+    HsJSONPB.object
+      [ "found" .= f1,
+        "pr_number" .= f2,
+        "head_branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "base_branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "author_agent"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "review_state"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "last_head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "reviewer_agent"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+      ]
+  toEncodingPB (LocalPrResponse f1 f2 f3 f4 f5 f6 f7 f8) =
+    HsJSONPB.pairs
+      [ "found" .= f1,
+        "pr_number" .= f2,
+        "head_branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "base_branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "author_agent"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "review_state"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "last_head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "reviewer_agent"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+      ]
+
+instance (HsJSONPB.FromJSONPB LocalPrResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "LocalPrResponse"
+      ( \obj ->
+          Hs.pure LocalPrResponse
+            <*> obj .: "found"
+            <*> obj .: "pr_number"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "head_branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "base_branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "author_agent")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "review_state")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "last_head_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "reviewer_agent")
+                )
+      )
+
+instance (HsJSONPB.ToJSON LocalPrResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON LocalPrResponse) where
+  parseJSON = HsJSONPB.parseJSONPB

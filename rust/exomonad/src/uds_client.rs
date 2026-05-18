@@ -18,7 +18,10 @@ pub fn find_server_socket() -> Result<PathBuf> {
         let sock = current.join(".exo/server.sock");
         if sock.exists() {
             return sock.canonicalize().with_context(|| {
-                format!("Failed to canonicalize server socket path {}", sock.display())
+                format!(
+                    "Failed to canonicalize server socket path {}",
+                    sock.display()
+                )
             });
         }
         match current.parent() {

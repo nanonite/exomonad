@@ -31,12 +31,15 @@ import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Effects.Agent qualified as Agent
+import Effects.EffectError (EffectError)
+import Effects.FilePr qualified as FPR
 import Effects.Git qualified as Git
 import Effects.Github qualified as GH
 import Effects.Log qualified as Log
 import Effects.MergePr qualified as MP
 import Effects.Process qualified as Proc
 import ExoMonad.Effects.Agent (AgentCleanup)
+import ExoMonad.Effects.FilePR (FilePRLocalPrGet)
 import ExoMonad.Effects.Git (GitGetBranch, GitGetRepoInfo)
 import ExoMonad.Effects.GitHub (GitHubGetPullRequest)
 import ExoMonad.Effects.Log (LogEmitEvent, LogError, LogInfo)
@@ -123,35 +126,15 @@ mergePRCore args = do
           pure $ Left ("Cannot merge PR #" <> T.pack (show prNum) <> " from a detached HEAD worktree.")
         else do
           -- Self-merge guard: agents cannot merge their own PRs
-          prResult <-
-            suspendEffect @GitHubGetPullRequest
-              GH.GetPullRequestRequest
-                { GH.getPullRequestRequestOwner = TL.fromStrict owner,
-                  GH.getPullRequestRequestRepo = TL.fromStrict repo,
-                  GH.getPullRequestRequestNumber = fromIntegral prNum,
-                  GH.getPullRequestRequestIncludeReviews = not force
+          localPrResult <-
+            suspendEffect @FilePRLocalPrGet
+              FPR.LocalPrGetRequest
+                { FPR.localPrGetRequestPrNumber = fromIntegral prNum
                 }
-          case prResult of
-            Left err -> do
-              void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("MergePR: failed to fetch PR: " <> T.pack (show err)), Log.errorRequestFields = ""})
-              pure $ Left ("Failed to fetch PR #" <> T.pack (show prNum) <> " for self-merge check. Cannot proceed.")
-            Right resp -> do
-              let mPr = GH.getPullRequestResponsePullRequest resp
-                  isSelfMerge = case mPr of
-                    Just pr -> TL.toStrict (GH.pullRequestHeadRef pr) == currentBranch
-                    Nothing -> False
-              if isSelfMerge
-                then pure $ Left $ "Cannot merge your own PR #" <> T.pack (show prNum) <> ". Your parent agent will merge this PR after reviewing. Call notify_parent instead."
-                else
-                  if force
-                    then doMerge args
-                    else do
-                      let readiness = checkCopilotReadinessFromPR prNum resp
-                      case readiness of
-                        Ready -> doMerge args
-                        NotReady reason -> do
-                          void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("MergePR: blocked: " <> reason), Log.errorRequestFields = ""})
-                          pure $ Left reason
+          case localPrResult of
+            Right localPr
+              | FPR.localPrResponseFound localPr -> mergeFromLocalPr args prNum force currentBranch localPr
+            _ -> mergeFromGitHub args prNum force owner repo currentBranch localPrResult
     _ -> do
       void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = "MergePR: failed to get repo info or branch for self-merge check", Log.errorRequestFields = ""})
       pure $ Left ("Failed to determine repo/branch info. Cannot verify self-merge guard for PR #" <> T.pack (show prNum) <> ".")
@@ -174,7 +157,77 @@ mergePRRender output =
 -- | Copilot review readiness.
 data Readiness = Ready | NotReady Text
 
--- | Check Copilot readiness from an already-fetched PR response.
+mergeFromLocalPr :: MergePRArgs -> Int -> Bool -> Text -> FPR.LocalPrResponse -> Eff Effects (Either Text MergePROutput)
+mergeFromLocalPr args prNum force currentBranch localPr = do
+  let headBranch = TL.toStrict (FPR.localPrResponseHeadBranch localPr)
+      reviewState = TL.toStrict (FPR.localPrResponseReviewState localPr)
+  if headBranch == currentBranch
+    then pure $ Left $ "Cannot merge your own PR #" <> T.pack (show prNum) <> ". Your parent agent will merge this PR after reviewing. Call notify_parent instead."
+    else
+      if force || reviewState == "approved"
+        then doMerge args
+        else do
+          let reason =
+                "Local PR #"
+                  <> T.pack (show prNum)
+                  <> " is not approved yet (review_state="
+                  <> reviewState
+                  <> "). Wait for [PR READY] or use force=true after [REVIEW TIMEOUT]."
+          void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("MergePR: blocked: " <> reason), Log.errorRequestFields = ""})
+          pure $ Left reason
+
+mergeFromGitHub ::
+  MergePRArgs ->
+  Int ->
+  Bool ->
+  Text ->
+  Text ->
+  Text ->
+  Either EffectError FPR.LocalPrResponse ->
+  Eff Effects (Either Text MergePROutput)
+mergeFromGitHub args prNum force owner repo currentBranch localPrResult = do
+  prResult <-
+    suspendEffect @GitHubGetPullRequest
+      GH.GetPullRequestRequest
+        { GH.getPullRequestRequestOwner = TL.fromStrict owner,
+          GH.getPullRequestRequestRepo = TL.fromStrict repo,
+          GH.getPullRequestRequestNumber = fromIntegral prNum,
+          GH.getPullRequestRequestIncludeReviews = not force
+        }
+  case prResult of
+    Left err -> do
+      let localDetail = case localPrResult of
+            Left localErr -> "local registry lookup failed: " <> T.pack (show localErr)
+            Right _ -> "local registry has no PR #" <> T.pack (show prNum)
+          message =
+            "Failed to fetch PR #"
+              <> T.pack (show prNum)
+              <> " for self-merge check from local registry or GitHub. "
+              <> localDetail
+              <> "; GitHub lookup failed: "
+              <> T.pack (show err)
+              <> ". If this is a hosted GitHub flow, set GITHUB_TOKEN."
+      void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("MergePR: " <> message), Log.errorRequestFields = ""})
+      pure $ Left message
+    Right resp -> do
+      let mPr = GH.getPullRequestResponsePullRequest resp
+          isSelfMerge = case mPr of
+            Just pr -> TL.toStrict (GH.pullRequestHeadRef pr) == currentBranch
+            Nothing -> False
+      if isSelfMerge
+        then pure $ Left $ "Cannot merge your own PR #" <> T.pack (show prNum) <> ". Your parent agent will merge this PR after reviewing. Call notify_parent instead."
+        else
+          if force
+            then doMerge args
+            else do
+              let readiness = checkCopilotReadinessFromPR prNum resp
+              case readiness of
+                Ready -> doMerge args
+                NotReady reason -> do
+                  void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("MergePR: blocked: " <> reason), Log.errorRequestFields = ""})
+                  pure $ Left reason
+
+-- \| Check Copilot readiness from an already-fetched PR response.
 checkCopilotReadinessFromPR :: Int -> GH.GetPullRequestResponse -> Readiness
 checkCopilotReadinessFromPR prNum resp =
   let reviews = V.toList (GH.getPullRequestResponseReviews resp)

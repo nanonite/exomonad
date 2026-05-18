@@ -144,13 +144,84 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
             created: output.created,
         })
     }
+
+    #[instrument(skip_all, fields(agent_name = %ctx.agent_name, pr_number = req.pr_number))]
+    async fn local_pr_get(
+        &self,
+        req: LocalPrGetRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<LocalPrResponse> {
+        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
+        let registry = match file_pr_local::read_pr_registry(&prs_path).await {
+            Ok(registry) => registry,
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    path = %prs_path.display(),
+                    "[FilePR] local PR registry unavailable"
+                );
+                return Ok(LocalPrResponse::default());
+            }
+        };
+
+        Ok(registry
+            .prs
+            .get(&(req.pr_number as u64))
+            .map(local_pr_response)
+            .unwrap_or_default())
+    }
+
+    #[instrument(skip_all, fields(agent_name = %ctx.agent_name, branch = %req.branch))]
+    async fn local_pr_get_for_branch(
+        &self,
+        req: LocalPrGetForBranchRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<LocalPrResponse> {
+        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
+        let registry = match file_pr_local::read_pr_registry(&prs_path).await {
+            Ok(registry) => registry,
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    path = %prs_path.display(),
+                    "[FilePR] local PR registry unavailable"
+                );
+                return Ok(LocalPrResponse::default());
+            }
+        };
+
+        Ok(registry
+            .prs
+            .values()
+            .find(|entry| entry.head_branch == req.branch)
+            .map(local_pr_response)
+            .unwrap_or_default())
+    }
+}
+
+fn local_pr_response(entry: &file_pr_local::PrEntry) -> LocalPrResponse {
+    LocalPrResponse {
+        found: true,
+        pr_number: entry.number as i64,
+        head_branch: entry.head_branch.clone(),
+        base_branch: entry.base_branch.clone(),
+        author_agent: entry.author_agent.clone(),
+        review_state: match entry.review_state {
+            file_pr_local::LocalReviewState::PendingReview => "pending_review",
+            file_pr_local::LocalReviewState::ChangesRequested => "changes_requested",
+            file_pr_local::LocalReviewState::Approved => "approved",
+        }
+        .to_string(),
+        last_head_sha: entry.last_head_sha.clone().unwrap_or_default(),
+        reviewer_agent: entry.reviewer_agent.clone().unwrap_or_default(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch};
-    use crate::effects::EffectContext;
+    use crate::effects::{EffectContext, FilePrEffects};
     use crate::services::Services;
     use std::path::PathBuf;
 
@@ -223,5 +294,96 @@ mod tests {
         assert_eq!(response.head_branch, "main.fix-auth-gemini");
         assert_eq!(response.base_branch, "main");
         assert!(response.created);
+    }
+
+    #[tokio::test]
+    async fn local_pr_get_reads_registry_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_registry(tmp.path());
+        let mut services = Services::test();
+        services.project_dir = tmp.path().to_path_buf();
+        let handler = FilePRHandler::new(Arc::new(services));
+
+        let response = handler
+            .local_pr_get(LocalPrGetRequest { pr_number: 7 }, &test_ctx("main"))
+            .await
+            .unwrap();
+
+        assert!(response.found);
+        assert_eq!(response.pr_number, 7);
+        assert_eq!(response.head_branch, "main.fix-local-pr-codex");
+        assert_eq!(response.author_agent, "fix-local-pr-codex");
+        assert_eq!(response.review_state, "approved");
+        assert_eq!(response.last_head_sha, "abc123");
+        assert_eq!(response.reviewer_agent, "review-pr-7-codex");
+    }
+
+    #[tokio::test]
+    async fn local_pr_get_for_branch_reads_registry_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_registry(tmp.path());
+        let mut services = Services::test();
+        services.project_dir = tmp.path().to_path_buf();
+        let handler = FilePRHandler::new(Arc::new(services));
+
+        let response = handler
+            .local_pr_get_for_branch(
+                LocalPrGetForBranchRequest {
+                    branch: "main.fix-local-pr-codex".to_string(),
+                },
+                &test_ctx("main.fix-local-pr-codex"),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.found);
+        assert_eq!(response.pr_number, 7);
+    }
+
+    #[tokio::test]
+    async fn local_pr_get_missing_returns_not_found_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_registry(tmp.path());
+        let mut services = Services::test();
+        services.project_dir = tmp.path().to_path_buf();
+        let handler = FilePRHandler::new(Arc::new(services));
+
+        let response = handler
+            .local_pr_get(LocalPrGetRequest { pr_number: 404 }, &test_ctx("main"))
+            .await
+            .unwrap();
+
+        assert!(!response.found);
+        assert_eq!(response.pr_number, 0);
+        assert!(response.head_branch.is_empty());
+    }
+
+    fn write_test_registry(project_dir: &std::path::Path) {
+        let exo_dir = project_dir.join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        std::fs::write(
+            exo_dir.join("prs.json"),
+            r#"{
+  "prs": {
+    "7": {
+      "number": 7,
+      "head_branch": "main.fix-local-pr-codex",
+      "base_branch": "main",
+      "title": "Fix local PR",
+      "body": "Body",
+      "author_agent": "fix-local-pr-codex",
+      "author_role": "dev",
+      "created_at": "2026-05-18T00:00:00Z",
+      "state": "open",
+      "review_state": "approved",
+      "last_head_sha": "abc123",
+      "reviewer_agent": "review-pr-7-codex"
+    }
+  },
+  "next_number": 8
+}
+"#,
+        )
+        .unwrap();
     }
 }

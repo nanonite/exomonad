@@ -12,8 +12,10 @@ import Control.Monad.Freer (Eff)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
+import Effects.FilePr qualified as FPR
 import Effects.Git qualified as Git
 import Effects.Github qualified as GH
+import ExoMonad.Effects.FilePR (FilePRLocalPrGetForBranch)
 import ExoMonad.Effects.Git (GitGetBranch, GitGetRepoInfo, GitGetStatus, GitHasUnpushedCommits)
 import ExoMonad.Effects.GitHub (GitHubGetPullRequestForBranch)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
@@ -47,6 +49,20 @@ checkUncommittedWork branch = do
 -- filing a PR for their work.
 checkPRNotFiled :: Text -> Eff Effects (Maybe Text)
 checkPRNotFiled branch = do
+  localPrResult <-
+    suspendEffect @FilePRLocalPrGetForBranch
+      ( FPR.LocalPrGetForBranchRequest
+          { FPR.localPrGetForBranchRequestBranch = TL.fromStrict branch
+          }
+      )
+  case localPrResult of
+    Right resp
+      | FPR.localPrResponseFound resp ->
+          pure Nothing
+    _ -> checkPRNotFiledViaGitHub branch
+
+checkPRNotFiledViaGitHub :: Text -> Eff Effects (Maybe Text)
+checkPRNotFiledViaGitHub branch = do
   repoResult <- suspendEffect @GitGetRepoInfo (Git.GetRepoInfoRequest {Git.getRepoInfoRequestWorkingDir = "."})
   case repoResult of
     Left _ -> pure Nothing -- can't determine repo, don't block
