@@ -203,7 +203,7 @@ cargo build -p exomonad
 
 ### Configuration
 
-**Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults) and `.gitignore` entries if missing. Works in any project directory. All fields are optional — auto-detection handles the common case. **Claude rules:** `exomonad new` copies `.exo/rules/exomonad.md` → `.claude/rules/exomonad.md` (if the template exists and the destination doesn't). Template resolution: project-local `.exo/rules/` → global `~/.exo/rules/`. This gives fresh Claude instances automatic knowledge of exomonad MCP tools.
+**Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults), `.gitignore` entries, and `.tangled/workflows/ci.yml` if missing. Works in any project directory. All fields are optional — auto-detection handles the common case. The Tangled workflow scaffold provides universal `nixery`, trigger, and clone framing with language-flavored bootstrap dependencies, but leaves substantive build/test commands as TODOs because those are workspace-specific. **Claude rules:** `exomonad new` copies `.exo/rules/exomonad.md` → `.claude/rules/exomonad.md` (if the template exists and the destination doesn't). Template resolution: project-local `.exo/rules/` → global `~/.exo/rules/`. This gives fresh Claude instances automatic knowledge of exomonad MCP tools.
 
 ```toml
 # All fields below are optional — shown with their auto-detected defaults

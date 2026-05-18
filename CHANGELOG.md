@@ -115,6 +115,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- exomonad new: scaffold .tangled/workflows/ci.yml with language-aware framing (#232)
 - Add diagnostic logging to mcp_stdio startup + exomonad serve listen() to debug connect-race (#276)
 - Late approval after STUCK declaration — race or stale message? (#275)
 - Single source of STUCK: watcher-only emission (#274)

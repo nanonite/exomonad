@@ -1,7 +1,28 @@
 use anyhow::{Context, Result};
 use exomonad::config::Config;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+
+const TANGLED_WORKFLOW_FRAMING: &str = r#"engine: nixery
+when:
+  - event: [push, manual]
+    branch: ["*"]
+  - event: [pull_request]
+    branch: [main]
+clone:
+  depth: 1
+  submodules: false
+"#;
+
+#[derive(Clone, Copy)]
+enum ProjectLanguage {
+    Rust,
+    Haskell,
+    Python,
+    Node,
+    Generic,
+}
 
 /// Initialize a new exomonad project in the current directory.
 /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
@@ -58,6 +79,13 @@ complexity_line_threshold = 500
 ",
         )?;
         info!("Created .exo/review-policy.toml (default review policy)");
+    }
+
+    if let Err(error) = scaffold_tangled_workflow(&cwd) {
+        warn!(
+            error = %error,
+            "Failed to scaffold .tangled/workflows/ci.yml; continuing"
+        );
     }
 
     // Add gitignore entries
@@ -140,4 +168,182 @@ complexity_line_threshold = 500
 
     info!("Project initialized. Run `exomonad init` to start a session.");
     Ok(())
+}
+
+pub(crate) fn scaffold_tangled_workflow(project_dir: &Path) -> std::io::Result<()> {
+    let workflow_path = project_dir.join(".tangled/workflows/ci.yml");
+    if workflow_path.exists() {
+        info!(
+            path = %workflow_path.display(),
+            "tangled workflow already present, leaving untouched"
+        );
+        return Ok(());
+    }
+
+    let parent = workflow_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Path has no parent: {}", workflow_path.display()),
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let content = tangled_workflow_content(detect_language(project_dir)?);
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    temp.write_all(content.as_bytes())?;
+    temp.flush()?;
+    temp.persist(&workflow_path)
+        .map(|_| ())
+        .map_err(|e| e.error)?;
+    info!(
+        path = %workflow_path.display(),
+        "Created Tangled CI workflow scaffold"
+    );
+    Ok(())
+}
+
+fn detect_language(project_dir: &Path) -> std::io::Result<ProjectLanguage> {
+    if project_dir.join("Cargo.toml").exists() {
+        return Ok(ProjectLanguage::Rust);
+    }
+    if project_dir.join("cabal.project").exists() || has_root_cabal_file(project_dir)? {
+        return Ok(ProjectLanguage::Haskell);
+    }
+    if project_dir.join("pyproject.toml").exists() || project_dir.join("setup.py").exists() {
+        return Ok(ProjectLanguage::Python);
+    }
+    if project_dir.join("package.json").exists() {
+        return Ok(ProjectLanguage::Node);
+    }
+    Ok(ProjectLanguage::Generic)
+}
+
+fn has_root_cabal_file(project_dir: &Path) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(project_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "cabal")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn tangled_workflow_content(language: ProjectLanguage) -> String {
+    let dependency_block = match language {
+        ProjectLanguage::Rust => "dependencies:\n  nixpkgs:\n    - rustup\n    - pkg-config\n",
+        ProjectLanguage::Haskell => {
+            "dependencies:\n  nixpkgs:\n    - ghc\n    - cabal-install\n    - pkg-config\n"
+        }
+        ProjectLanguage::Python => "dependencies:\n  nixpkgs:\n    - python3\n",
+        ProjectLanguage::Node => "dependencies:\n  nixpkgs:\n    - nodejs\n",
+        ProjectLanguage::Generic => {
+            "dependencies:\n  nixpkgs: [] # TODO: Add the nixpkgs needed by this workspace.\n"
+        }
+    };
+
+    format!(
+        "{TANGLED_WORKFLOW_FRAMING}{dependency_block}steps:\n  - name: customize-ci\n    command: |\n      # TODO: Replace this placeholder with workspace-specific build and test commands.\n      # See CLAUDE.md Configuration and docs/decisions for Tangled CI notes.\n"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REQUIRED_FRAMING: &str = "engine: nixery\nwhen:\n  - event: [push, manual]\n    branch: [\"*\"]\n  - event: [pull_request]\n    branch: [main]\nclone:\n  depth: 1\n  submodules: false\n";
+
+    #[test]
+    fn scaffolds_rust_tangled_workflow() {
+        assert_language_scaffold(&[("Cargo.toml", "[package]\n")], &["rustup", "pkg-config"]);
+    }
+
+    #[test]
+    fn scaffolds_haskell_tangled_workflow_from_cabal_project() {
+        assert_language_scaffold(
+            &[("cabal.project", "packages: .\n")],
+            &["ghc", "cabal-install", "pkg-config"],
+        );
+    }
+
+    #[test]
+    fn scaffolds_haskell_tangled_workflow_from_root_cabal_file() {
+        assert_language_scaffold(
+            &[("example.cabal", "cabal-version: 3.0\n")],
+            &["ghc", "cabal-install", "pkg-config"],
+        );
+    }
+
+    #[test]
+    fn scaffolds_python_tangled_workflow() {
+        assert_language_scaffold(&[("pyproject.toml", "[project]\n")], &["python3"]);
+    }
+
+    #[test]
+    fn scaffolds_node_tangled_workflow() {
+        assert_language_scaffold(&[("package.json", "{}\n")], &["nodejs"]);
+    }
+
+    #[test]
+    fn scaffolds_generic_tangled_workflow() {
+        let content = assert_language_scaffold(&[], &["TODO: Add the nixpkgs"]);
+        assert!(content.contains("nixpkgs: [] # TODO"));
+    }
+
+    #[test]
+    fn scaffold_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_tangled_workflow(dir.path()).unwrap();
+        let workflow_path = dir.path().join(".tangled/workflows/ci.yml");
+        std::fs::write(&workflow_path, "custom: true\n").unwrap();
+
+        scaffold_tangled_workflow(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(workflow_path).unwrap(),
+            "custom: true\n"
+        );
+    }
+
+    #[test]
+    fn ignores_language_markers_below_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        std::fs::write(dir.path().join("vendor/Cargo.toml"), "[package]\n").unwrap();
+
+        scaffold_tangled_workflow(dir.path()).unwrap();
+
+        let content = read_workflow(dir.path());
+        assert!(content.contains("TODO: Add the nixpkgs"));
+        assert!(!content.contains("rustup"));
+    }
+
+    fn assert_language_scaffold(markers: &[(&str, &str)], expected: &[&str]) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, content) in markers {
+            std::fs::write(dir.path().join(path), content).unwrap();
+        }
+
+        scaffold_tangled_workflow(dir.path()).unwrap();
+
+        let content = read_workflow(dir.path());
+        assert!(content.contains(REQUIRED_FRAMING));
+        assert!(content.contains("steps:\n  - name: customize-ci\n"));
+        assert!(content.contains("# TODO: Replace this placeholder"));
+        serde_yaml::from_str::<serde_yaml::Value>(&content).unwrap();
+        for needle in expected {
+            assert!(content.contains(needle), "missing {needle} in:\n{content}");
+        }
+        content
+    }
+
+    fn read_workflow(project_dir: &Path) -> String {
+        let path = project_dir.join(".tangled/workflows/ci.yml");
+        assert!(path.exists());
+        std::fs::read_to_string(path).unwrap()
+    }
 }
