@@ -79,9 +79,10 @@ pub async fn merge_pr_async(
     }
 
     let branch_name = if branch_name_str.is_empty() {
-        BranchName::from("unknown")
+        BranchName::try_from_str("unknown").expect("literal validated string is non-empty")
     } else {
-        BranchName::from(branch_name_str.as_str())
+        BranchName::try_from_str(branch_name_str.as_str())
+            .expect("validated string input is non-empty")
     };
 
     // Step 1: merge PR

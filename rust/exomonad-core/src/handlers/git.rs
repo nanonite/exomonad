@@ -257,8 +257,10 @@ mod tests {
 
     fn test_ctx(branch: &str) -> EffectContext {
         EffectContext {
-            agent_name: AgentName::from("test"),
-            birth_branch: BirthBranch::from(branch),
+            agent_name: AgentName::try_from_str("test")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str(branch)
+                .expect("validated string input is non-empty"),
             working_dir: crate::services::agent_control::resolve_working_dir(branch),
         }
     }

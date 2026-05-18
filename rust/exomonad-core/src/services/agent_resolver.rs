@@ -216,7 +216,8 @@ impl AgentResolver {
         worktree_base: &std::path::Path,
         agent_name: &str,
     ) -> anyhow::Result<(BirthBranch, PathBuf)> {
-        let name = AgentName::from(agent_name);
+        let name =
+            AgentName::try_from_str(agent_name).expect("validated string input is non-empty");
 
         // 1. Try in-memory record (canonical, fastest)
         if let Some(record) = self.get(&name).await {
@@ -261,7 +262,8 @@ impl AgentResolver {
                 let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !branch.is_empty() {
                     debug!(agent = %agent_name, branch = %branch, "Resolved from git worktree branch");
-                    let bb = BirthBranch::from(branch.as_str());
+                    let bb = BirthBranch::try_from_str(branch.as_str())
+                        .expect("validated string input is non-empty");
                     let wd = crate::services::agent_control::resolve_working_dir(bb.as_str());
                     return Ok((bb, wd));
                 }
@@ -277,7 +279,8 @@ impl AgentResolver {
             if let Ok(contents) = tokio::fs::read_to_string(&bb_file).await {
                 let branch = contents.trim().to_string();
                 debug!(agent = %agent_name, branch = %branch, "Resolved from .birth_branch file");
-                let bb = BirthBranch::from(branch.as_str());
+                let bb = BirthBranch::try_from_str(branch.as_str())
+                    .expect("validated string input is non-empty");
                 let wd = crate::services::agent_control::resolve_working_dir(bb.as_str());
                 return Ok((bb, wd));
             }
@@ -316,11 +319,13 @@ mod tests {
 
     fn test_record(name: &str, slug: &str, branch: &str) -> AgentIdentityRecord {
         AgentIdentityRecord {
-            agent_name: AgentName::from(name),
-            slug: Slug::from(slug),
+            agent_name: AgentName::try_from_str(name).expect("validated string input is non-empty"),
+            slug: Slug::try_from_str(slug).expect("validated string input is non-empty"),
             agent_type: AgentType::Claude,
-            birth_branch: BirthBranch::from(branch),
-            parent_branch: BirthBranch::from("main"),
+            birth_branch: BirthBranch::try_from_str(branch)
+                .expect("validated string input is non-empty"),
+            parent_branch: BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty"),
             working_dir: PathBuf::from(format!(".exo/worktrees/{}/", name)),
             display_name: format!("🤖 {}", name),
             topology: Topology::WorktreePerAgent,
@@ -329,11 +334,13 @@ mod tests {
 
     fn worker_record(name: &str, slug: &str, parent_branch: &str) -> AgentIdentityRecord {
         AgentIdentityRecord {
-            agent_name: AgentName::from(name),
-            slug: Slug::from(slug),
+            agent_name: AgentName::try_from_str(name).expect("validated string input is non-empty"),
+            slug: Slug::try_from_str(slug).expect("validated string input is non-empty"),
             agent_type: AgentType::Gemini,
-            birth_branch: BirthBranch::from(parent_branch),
-            parent_branch: BirthBranch::from(parent_branch),
+            birth_branch: BirthBranch::try_from_str(parent_branch)
+                .expect("validated string input is non-empty"),
+            parent_branch: BirthBranch::try_from_str(parent_branch)
+                .expect("validated string input is non-empty"),
             working_dir: PathBuf::from("."),
             display_name: format!("💎 {}", name),
             topology: Topology::SharedDir,
@@ -348,7 +355,12 @@ mod tests {
         let record = test_record("feature-a-claude", "feature-a", "main.feature-a-claude");
         resolver.register(record.clone()).await.unwrap();
 
-        let got = resolver.get(&AgentName::from("feature-a-claude")).await;
+        let got = resolver
+            .get(
+                &AgentName::try_from_str("feature-a-claude")
+                    .expect("literal validated string is non-empty"),
+            )
+            .await;
         assert_eq!(got, Some(record));
     }
 
@@ -357,7 +369,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let resolver = AgentResolver::load(tmp.path().to_path_buf()).await;
 
-        let got = resolver.get(&AgentName::from("nonexistent")).await;
+        let got = resolver
+            .get(
+                &AgentName::try_from_str("nonexistent")
+                    .expect("literal validated string is non-empty"),
+            )
+            .await;
         assert_eq!(got, None);
     }
 
@@ -369,7 +386,8 @@ mod tests {
         let record = test_record("feature-a-claude", "feature-a", "main.feature-a-claude");
         resolver.register(record).await.unwrap();
 
-        let name = AgentName::from("feature-a-claude");
+        let name = AgentName::try_from_str("feature-a-claude")
+            .expect("literal validated string is non-empty");
         resolver.deregister(&name).await.unwrap();
 
         assert_eq!(resolver.get(&name).await, None);
@@ -396,7 +414,12 @@ mod tests {
 
         // Load resolver — should find the record
         let resolver = AgentResolver::load(tmp.path().to_path_buf()).await;
-        let got = resolver.get(&AgentName::from("feature-a-claude")).await;
+        let got = resolver
+            .get(
+                &AgentName::try_from_str("feature-a-claude")
+                    .expect("literal validated string is non-empty"),
+            )
+            .await;
         assert_eq!(got, Some(record));
     }
 
@@ -445,8 +468,11 @@ mod tests {
         // check_slug_collision should find the existing agent
         let collision = resolver
             .check_slug_collision(
-                &Slug::from("feature-a"),
-                Some(&AgentName::from("new-agent-claude")),
+                &Slug::try_from_str("feature-a").expect("literal validated string is non-empty"),
+                Some(
+                    &AgentName::try_from_str("new-agent-claude")
+                        .expect("literal validated string is non-empty"),
+                ),
             )
             .await;
         assert!(collision.is_some());
@@ -463,8 +489,11 @@ mod tests {
         // SharedDir agents don't count as slug collisions
         let collision = resolver
             .check_slug_collision(
-                &Slug::from("worker-a"),
-                Some(&AgentName::from("other-agent")),
+                &Slug::try_from_str("worker-a").expect("literal validated string is non-empty"),
+                Some(
+                    &AgentName::try_from_str("other-agent")
+                        .expect("literal validated string is non-empty"),
+                ),
             )
             .await;
         assert!(collision.is_none());
@@ -482,7 +511,12 @@ mod tests {
         let record2 = test_record("feature-a-claude", "feature-a", "dev.feature-a-claude");
         resolver.register(record2.clone()).await.unwrap();
 
-        let got = resolver.get(&AgentName::from("feature-a-claude")).await;
+        let got = resolver
+            .get(
+                &AgentName::try_from_str("feature-a-claude")
+                    .expect("literal validated string is non-empty"),
+            )
+            .await;
         assert_eq!(got.unwrap().birth_branch, record2.birth_branch);
     }
 
@@ -534,8 +568,11 @@ mod tests {
         // Checking against own name should not report collision
         let collision = resolver
             .check_slug_collision(
-                &Slug::from("feature-a"),
-                Some(&AgentName::from("feature-a-claude")),
+                &Slug::try_from_str("feature-a").expect("literal validated string is non-empty"),
+                Some(
+                    &AgentName::try_from_str("feature-a-claude")
+                        .expect("literal validated string is non-empty"),
+                ),
             )
             .await;
         assert!(collision.is_none());
@@ -548,7 +585,10 @@ mod tests {
 
         // Should not error
         resolver
-            .deregister(&AgentName::from("nonexistent"))
+            .deregister(
+                &AgentName::try_from_str("nonexistent")
+                    .expect("literal validated string is non-empty"),
+            )
             .await
             .unwrap();
     }

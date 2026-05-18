@@ -133,7 +133,7 @@ fn compute_pr_actions(
 
     // Reset review tracking if new commits pushed
     if pr_sha != old_state.last_sha.as_str() {
-        old_state.last_sha = CommitSha::from(pr_sha);
+        old_state.last_sha = CommitSha::try_from_str(pr_sha).expect("validated string input is non-empty");
         if old_state.last_review_state == ReviewState::ChangesRequested {
             old_state.last_review_state = ReviewState::None;
             old_state.notified_parent_timeout = false;
@@ -397,7 +397,7 @@ impl<
         });
 
         let plugins_guard = plugins.read().await;
-        let plugin = match plugins_guard.get(&crate::AgentName::from(agent_name)) {
+        let plugin = match plugins_guard.get(&crate::AgentName::try_from_str(agent_name).expect("validated string input is non-empty")) {
             Some(p) => p.clone(),
             None => {
                 info!(
@@ -485,7 +485,7 @@ impl<
     ) {
         match action {
             EventActionResponse::InjectMessage { message } => {
-                let agent_name = crate::domain::AgentName::from(branch);
+                let agent_name = crate::domain::AgentName::try_from_str(branch).expect("validated string input is non-empty");
                 let tab_name =
                     if let Ok(records) = self.ctx.agent_resolver().records_ref().try_read() {
                         records.get(&agent_name).map(|r| r.display_name.clone())
@@ -500,7 +500,7 @@ impl<
                     &*self.ctx,
                     branch,
                     &tab_name,
-                    &crate::domain::AgentName::from("event-handler"),
+                    &crate::domain::AgentName::try_from_str("event-handler").expect("literal validated string is non-empty"),
                     &message,
                     &format!("Event handler action for PR #{}", pr_number),
                 )
@@ -515,14 +515,14 @@ impl<
                     .rsplit_once('.')
                     .map(|(parent, _)| parent.to_string())
                     .unwrap_or_else(|| "root".to_string());
-                let parent_name = crate::domain::AgentName::from(parent_session_id.as_str());
+                let parent_name = crate::domain::AgentName::try_from_str(parent_session_id.as_str()).expect("validated string input is non-empty");
                 let parent_tab = crate::services::delivery::resolve_tab_name_for_agent(
                     &parent_name,
                     Some(self.ctx.agent_resolver()),
                 );
 
                 let summary = format!("Auto-notify: PR #{}", pr_num);
-                let agent_name = crate::domain::AgentName::from(agent_slug);
+                let agent_name = crate::domain::AgentName::try_from_str(agent_slug).expect("validated string input is non-empty");
                 crate::services::delivery::notify_parent_delivery(
                     &*self.ctx,
                     &agent_name,
@@ -607,8 +607,8 @@ impl<
                 continue;
             }
 
-            let ref_name = BranchName::from(pr.head.ref_field.as_str());
-            let sha = CommitSha::from(pr.head.sha.as_str());
+            let ref_name = BranchName::try_from_str(pr.head.ref_field.as_str()).expect("validated string input is non-empty");
+            let sha = CommitSha::try_from_str(pr.head.sha.as_str()).expect("validated string input is non-empty");
             let pr_number = PRNumber::new(pr.number);
             pr_map.insert(ref_name, (pr_number, sha));
         }
@@ -720,8 +720,8 @@ impl<
         match repo::get_repo_info(self.ctx.project_dir()).await {
             Ok(info) => {
                 let result = (
-                    GithubOwner::from(info.owner.as_str()),
-                    GithubRepo::from(info.repo.as_str()),
+                    GithubOwner::try_from_str(info.owner.as_str()).expect("validated string input is non-empty"),
+                    GithubRepo::try_from_str(info.repo.as_str()).expect("validated string input is non-empty"),
                 );
                 *info_guard = Some(result.clone());
                 Ok(Some(result))
@@ -762,7 +762,7 @@ impl<
                 let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !branch.is_empty() {
                     branches.push(WorktreeBranch {
-                        branch: BranchName::from(branch.as_str()),
+                        branch: BranchName::try_from_str(branch.as_str()).expect("validated string input is non-empty"),
                         agent_type,
                     });
                 }
@@ -1184,9 +1184,9 @@ mod tests {
 
     fn make_pr_state(branch: &str, sha: &str) -> PRState {
         PRState::new(
-            &BranchName::from(branch),
+            &BranchName::try_from_str(branch).expect("validated string input is non-empty"),
             AgentType::Gemini,
-            &CommitSha::from(sha),
+            &CommitSha::try_from_str(sha).expect("validated string input is non-empty"),
             CIStatus::Pending,
             0,
         )

@@ -117,7 +117,8 @@ pub enum DeliveryOutcome {
 
 impl DeliveryOutcome {
     fn from_result(result: DeliveryResult, recipient: &str) -> Self {
-        let agent = crate::domain::AgentName::from(recipient);
+        let agent = crate::domain::AgentName::try_from_str(recipient)
+            .expect("validated string input is non-empty");
         match result {
             DeliveryResult::Failed => DeliveryOutcome::Failed {
                 original: recipient.to_string(),
@@ -236,7 +237,8 @@ async fn resolve_and_deliver_to_lead(
         "Resolved team lead for delivery"
     );
 
-    let lead_agent = crate::domain::AgentName::from(lead_key.as_str());
+    let lead_agent = crate::domain::AgentName::try_from_str(lead_key.as_str())
+        .expect("validated string input is non-empty");
     let tab_name = resolve_tab_name_for_agent(&lead_agent, Some(ctx.agent_resolver()));
     let result = deliver_to_agent(ctx, &lead_key, &tab_name, from, content, summary).await;
 
@@ -248,7 +250,8 @@ async fn resolve_and_deliver_to_lead(
         _ => DeliveryOutcome::FallbackToLead {
             method: delivery_method_from_result(result),
             original,
-            lead: crate::domain::AgentName::from(lead_key.as_str()),
+            lead: crate::domain::AgentName::try_from_str(lead_key.as_str())
+                .expect("validated string input is non-empty"),
         },
     }
 }
@@ -834,35 +837,40 @@ mod tests {
 
     #[test]
     fn test_format_parent_notification_success() {
-        let id = crate::domain::AgentName::from("agent-1");
+        let id = crate::domain::AgentName::try_from_str("agent-1")
+            .expect("literal validated string is non-empty");
         let msg = format_parent_notification(&id, NotifyStatus::Success, "All done");
         assert_eq!(msg, "[from: agent-1] All done");
     }
 
     #[test]
     fn test_format_parent_notification_success_empty() {
-        let id = crate::domain::AgentName::from("agent-1");
+        let id = crate::domain::AgentName::try_from_str("agent-1")
+            .expect("literal validated string is non-empty");
         let msg = format_parent_notification(&id, NotifyStatus::Success, "");
         assert_eq!(msg, "[from: agent-1] Status update.");
     }
 
     #[test]
     fn test_format_parent_notification_failure() {
-        let id = crate::domain::AgentName::from("agent-2");
+        let id = crate::domain::AgentName::try_from_str("agent-2")
+            .expect("literal validated string is non-empty");
         let msg = format_parent_notification(&id, NotifyStatus::Failure, "Something went wrong");
         assert_eq!(msg, "[FAILED: agent-2] Something went wrong");
     }
 
     #[test]
     fn test_format_parent_notification_failure_empty() {
-        let id = crate::domain::AgentName::from("agent-2");
+        let id = crate::domain::AgentName::try_from_str("agent-2")
+            .expect("literal validated string is non-empty");
         let msg = format_parent_notification(&id, NotifyStatus::Failure, "");
         assert_eq!(msg, "[FAILED: agent-2] Task failed.");
     }
 
     #[test]
     fn test_format_parent_notification_other_status() {
-        let id = crate::domain::AgentName::from("agent-3");
+        let id = crate::domain::AgentName::try_from_str("agent-3")
+            .expect("literal validated string is non-empty");
         let msg = format_parent_notification(&id, NotifyStatus::parse("running"), "Working...");
         assert_eq!(msg, "[from: agent-3] Working...");
     }
@@ -912,7 +920,7 @@ mod tests {
             &services,
             "agent-1",
             "tab-1",
-            &AgentName::from("test"),
+            &AgentName::try_from_str("test").expect("literal validated string is non-empty"),
             "hello",
             "summary",
         )

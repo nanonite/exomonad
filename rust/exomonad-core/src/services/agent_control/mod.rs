@@ -164,7 +164,8 @@ impl AgentIdentity {
     pub fn internal_name(&self) -> AgentName {
         // Safe: slug is non-empty (validated at construction) and suffix is non-empty,
         // so the formatted string is always non-empty.
-        AgentName::from(format!("{}-{}", self.slug, self.agent_type.suffix()).as_str())
+        AgentName::try_from_str(format!("{}-{}", self.slug, self.agent_type.suffix()).as_str())
+            .expect("validated string input is non-empty")
     }
 
     /// tmux window display name (e.g., `"🤖 feature-a-claude"`).
@@ -639,7 +640,8 @@ impl<
             worktree_base,
             tmux_session: None,
             tmux_ipc: None,
-            birth_branch: BirthBranch::from("unset"),
+            birth_branch: BirthBranch::try_from_str("unset")
+                .expect("literal validated string is non-empty"),
             yolo: false,
             spawn_agent_type: AgentType::Gemini,
             spawn_agent_model: None,

@@ -61,7 +61,9 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<FilePrResponse> {
         tracing::info!(title = %req.title, "[FilePR] file_pr starting");
-        let base_branch = non_empty(req.base_branch).map(|s| BranchName::from(s.as_str()));
+        let base_branch = non_empty(req.base_branch).map(|s| {
+            BranchName::try_from_str(s.as_str()).expect("validated string input is non-empty")
+        });
 
         let working_dir = ctx.working_dir.clone();
 
@@ -154,8 +156,10 @@ mod tests {
 
     fn test_ctx(branch: &str) -> EffectContext {
         EffectContext {
-            agent_name: AgentName::from("test"),
-            birth_branch: BirthBranch::from(branch),
+            agent_name: AgentName::try_from_str("test")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str(branch)
+                .expect("validated string input is non-empty"),
             working_dir: crate::services::agent_control::resolve_working_dir(branch),
         }
     }
@@ -183,7 +187,9 @@ mod tests {
 
     #[test]
     fn test_base_branch_conversion_empty_is_none() {
-        let base_branch = non_empty("".to_string()).map(|s| BranchName::from(s.as_str()));
+        let base_branch = non_empty("".to_string()).map(|s| {
+            BranchName::try_from_str(s.as_str()).expect("validated string input is non-empty")
+        });
         assert!(
             base_branch.is_none(),
             "Empty string should become None (auto-detect)"
@@ -192,15 +198,18 @@ mod tests {
 
     #[test]
     fn test_base_branch_conversion_explicit() {
-        let base_branch = non_empty("develop".to_string()).map(|s| BranchName::from(s.as_str()));
+        let base_branch = non_empty("develop".to_string()).map(|s| {
+            BranchName::try_from_str(s.as_str()).expect("validated string input is non-empty")
+        });
         assert_eq!(base_branch.unwrap().to_string(), "develop");
     }
 
     #[test]
     fn test_response_field_conversion() {
         let pr_number = crate::domain::PRNumber::new(42);
-        let head = BranchName::from("main.fix-auth-gemini");
-        let base = BranchName::from("main");
+        let head = BranchName::try_from_str("main.fix-auth-gemini")
+            .expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str("main").expect("literal validated string is non-empty");
 
         let response = FilePrResponse {
             pr_url: "https://github.com/owner/repo/pull/42".to_string(),

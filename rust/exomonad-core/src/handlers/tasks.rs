@@ -249,8 +249,10 @@ mod tests {
 
     fn test_ctx() -> EffectContext {
         EffectContext {
-            agent_name: AgentName::from("test-agent"),
-            birth_branch: BirthBranch::from("main"),
+            agent_name: AgentName::try_from_str("test-agent")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty"),
             working_dir: std::path::PathBuf::from("."),
         }
     }

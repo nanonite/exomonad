@@ -472,7 +472,8 @@ where
             };
 
             let ci_status = {
-                let branch = BranchName::from(pr.head_branch.as_str());
+                let branch = BranchName::try_from_str(pr.head_branch.as_str())
+                    .expect("validated string input is non-empty");
                 self.ci_status_map
                     .read()
                     .await
@@ -516,7 +517,8 @@ where
                 let agent_name = &pr.author_agent;
                 let agent_type = AgentType::from_dir_name(agent_name);
                 let agent_role = pr.author_role.clone();
-                let branch = BranchName::from(pr.head_branch.as_str());
+                let branch = BranchName::try_from_str(pr.head_branch.as_str())
+                    .expect("validated string input is non-empty");
                 let (local_reviews, _local_review_state) = obs_to_review_parts(obs);
                 if pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str()) {
                     head_sha_updates.push((*pr_number, obs.head_sha.clone()));
@@ -975,7 +977,8 @@ where
 
     async fn resolve_event_agent_name(&self, branch: &str, agent_type: AgentType) -> AgentName {
         let branch_tail = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
-        let branch_name = BirthBranch::from(branch);
+        let branch_name =
+            BirthBranch::try_from_str(branch).expect("validated string input is non-empty");
         let records = self.ctx.agent_resolver().records_ref().read().await;
 
         if let Some(record) = records
@@ -985,12 +988,12 @@ where
             return record.agent_name.clone();
         }
 
-        let exact = AgentName::from(branch);
+        let exact = AgentName::try_from_str(branch).expect("validated string input is non-empty");
         if records.contains_key(&exact) {
             return exact;
         }
 
-        AgentName::from(branch_tail)
+        AgentName::try_from_str(branch_tail).expect("validated string input is non-empty")
     }
 
     async fn handle_event_action(
@@ -1001,7 +1004,8 @@ where
     ) {
         match action {
             EventActionResponse::InjectMessage { message } => {
-                let agent_name = AgentName::from(branch);
+                let agent_name =
+                    AgentName::try_from_str(branch).expect("validated string input is non-empty");
                 let tab_name =
                     if let Ok(records) = self.ctx.agent_resolver().records_ref().try_read() {
                         records.get(&agent_name).map(|r| r.display_name.clone())
@@ -1016,7 +1020,8 @@ where
                     &*self.ctx,
                     branch,
                     &tab_name,
-                    &AgentName::from("event-handler"),
+                    &AgentName::try_from_str("event-handler")
+                        .expect("literal validated string is non-empty"),
                     &message,
                     "Event handler action",
                 )
@@ -1031,13 +1036,15 @@ where
                     .rsplit_once('.')
                     .map(|(parent, _)| parent.to_string())
                     .unwrap_or_else(|| "root".to_string());
-                let parent_name = AgentName::from(parent_session_id.as_str());
+                let parent_name = AgentName::try_from_str(parent_session_id.as_str())
+                    .expect("validated string input is non-empty");
                 let parent_tab = crate::services::delivery::resolve_tab_name_for_agent(
                     &parent_name,
                     Some(self.ctx.agent_resolver()),
                 );
 
-                let agent_name = AgentName::from(agent_slug);
+                let agent_name = AgentName::try_from_str(agent_slug)
+                    .expect("validated string input is non-empty");
                 crate::services::delivery::notify_parent_delivery(
                     &*self.ctx,
                     &agent_name,
@@ -1055,7 +1062,8 @@ where
     }
 
     async fn deliver_release_message(&self, branch: &str, agent_type: AgentType, message: &str) {
-        let agent_name = AgentName::from(branch);
+        let agent_name =
+            AgentName::try_from_str(branch).expect("validated string input is non-empty");
         let tab_name = if let Ok(records) = self.ctx.agent_resolver().records_ref().try_read() {
             records.get(&agent_name).map(|r| r.display_name.clone())
         } else {
@@ -1070,7 +1078,8 @@ where
             &*self.ctx,
             branch,
             &tab_name,
-            &AgentName::from("event-handler"),
+            &AgentName::try_from_str("event-handler")
+                .expect("literal validated string is non-empty"),
             message,
             "Merge-ready release",
         )
@@ -1818,7 +1827,7 @@ fn extract_pipeline_branch(event: &serde_json::Value) -> Option<BranchName> {
     if branch.is_empty() {
         None
     } else {
-        Some(BranchName::from(branch))
+        Some(BranchName::try_from_str(branch).expect("validated string input is non-empty"))
     }
 }
 
@@ -1885,7 +1894,8 @@ mod tests {
 
     #[test]
     fn test_new_sha_fires_commits_pushed() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let actions = compute_pr_actions(
             &mut state,
@@ -1908,7 +1918,8 @@ mod tests {
 
     #[test]
     fn test_sha_change_after_changes_requested_fires_fixes_pushed() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.last_review_state = ReviewState::ChangesRequested;
         state.addressed_changes = false;
@@ -2042,7 +2053,8 @@ mod tests {
 
     #[test]
     fn test_new_comments_fire_review_received() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let comments = vec![test_comment("Fix this")];
         let actions = compute_pr_actions(
@@ -2066,7 +2078,8 @@ mod tests {
 
     #[test]
     fn test_approval_fires_approved() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
         let actions = compute_pr_actions(
@@ -2090,7 +2103,8 @@ mod tests {
 
     #[test]
     fn test_approval_after_green_ci_fires_merge_ready() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.last_ci_status = CIStatus::Success;
         state.ci_mergeable_at = Some(Instant::now() - Duration::from_secs(60));
@@ -2121,7 +2135,8 @@ mod tests {
 
     #[test]
     fn test_initial_approved_green_ci_observation_fires_merge_ready() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
 
@@ -2157,7 +2172,8 @@ mod tests {
 
     #[test]
     fn test_green_ci_after_approval_fires_merge_ready_ci_event() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
         state.last_review_state = ReviewState::Approved;
@@ -2294,7 +2310,8 @@ mod tests {
 
     #[test]
     fn test_green_ci_after_stale_approval_does_not_fire_merge_ready() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
         state.last_review_state = ReviewState::Approved;
@@ -2321,7 +2338,8 @@ mod tests {
 
     #[test]
     fn test_changes_requested_fires_review_received() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let reviews = vec![test_review("Needs work", ReviewState::ChangesRequested)];
         let actions = compute_pr_actions(
@@ -2348,7 +2366,8 @@ mod tests {
 
     #[test]
     fn test_changes_requested_at_max_rounds_fires_stuck() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let reviews = vec![test_review(
             "Still needs work",
@@ -2387,7 +2406,8 @@ mod tests {
 
     #[test]
     fn test_ci_change_fires_event() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.last_ci_status = CIStatus::Pending;
         let actions = compute_pr_actions(
@@ -2414,7 +2434,8 @@ mod tests {
 
     #[test]
     fn test_timeout_after_15_minutes() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.first_seen = Instant::now() - Duration::from_secs(16 * 60);
         let actions = compute_pr_actions(
@@ -2438,7 +2459,8 @@ mod tests {
 
     #[test]
     fn test_stale_guard_suppresses_after_approval() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
         state.last_ci_status = CIStatus::Pending;
@@ -2459,7 +2481,8 @@ mod tests {
 
     #[test]
     fn test_ci_success_after_merge_block_bypasses_stale_guard() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
         state.last_ci_status = CIStatus::Pending;
@@ -2489,7 +2512,8 @@ mod tests {
 
     #[test]
     fn test_no_duplicate_approval() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.last_review_state = ReviewState::Approved;
         state.notified_parent_approved = true;
@@ -2511,7 +2535,8 @@ mod tests {
 
     #[test]
     fn test_approval_detected_from_body_text() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let reviews = vec![LocalReview {
             body: "I have reviewed this and it is APPROVED".to_string(),
@@ -2537,7 +2562,8 @@ mod tests {
 
     #[test]
     fn test_timeout_shorter_after_addressed_changes() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.addressed_changes = true;
         state.first_seen = Instant::now() - Duration::from_secs(6 * 60);
@@ -2561,7 +2587,8 @@ mod tests {
 
     #[test]
     fn test_no_ci_event_when_status_unchanged() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.last_ci_status = CIStatus::Success;
         let actions = compute_pr_actions(
@@ -2674,7 +2701,8 @@ mod tests {
 
     #[test]
     fn test_watch_state_new_sets_defaults() {
-        let branch = BranchName::from("main.feat-gemini");
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
         let state = WatchState::new(&branch, AgentType::Gemini, "abc123", CIStatus::Unknown, 0);
         assert_eq!(state.branch_name.as_str(), "main.feat-gemini");
         assert_eq!(state.last_sha, "abc123");
@@ -2785,11 +2813,15 @@ mod tests {
         let resolver = crate::services::AgentResolver::load(temp_dir.path().to_path_buf()).await;
         resolver
             .register(crate::services::AgentIdentityRecord {
-                agent_name: AgentName::from("review-pr-1-codex"),
-                slug: crate::domain::Slug::from("review-pr-1"),
+                agent_name: AgentName::try_from_str("review-pr-1-codex")
+                    .expect("literal validated string is non-empty"),
+                slug: crate::domain::Slug::try_from_str("review-pr-1")
+                    .expect("literal validated string is non-empty"),
                 agent_type: AgentType::Codex,
-                birth_branch: BirthBranch::from("review-pr-1"),
-                parent_branch: BirthBranch::from("main"),
+                birth_branch: BirthBranch::try_from_str("review-pr-1")
+                    .expect("literal validated string is non-empty"),
+                parent_branch: BirthBranch::try_from_str("main")
+                    .expect("literal validated string is non-empty"),
                 working_dir: std::path::PathBuf::from(".exo/worktrees/review-pr-1-codex"),
                 display_name: "review-pr-1-codex".to_string(),
                 topology: crate::services::agent_control::Topology::WorktreePerAgent,

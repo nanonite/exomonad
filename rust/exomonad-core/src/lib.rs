@@ -255,7 +255,8 @@ impl RuntimeBuilder {
         let root_working_dir =
             crate::services::agent_control::resolve_working_dir(root_birth_branch.as_str());
         let root_ctx = EffectContext {
-            agent_name: AgentName::from("root"),
+            agent_name: AgentName::try_from_str("root")
+                .expect("literal validated string is non-empty"),
             birth_branch: root_birth_branch,
             working_dir: root_working_dir,
         };

@@ -463,8 +463,10 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("worktree-1");
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -479,8 +481,10 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("worktree-1");
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -494,7 +498,8 @@ mod tests {
     #[test]
     fn test_create_bookmark_delete_bookmark_roundtrip() {
         let (temp, service) = init_test_repo();
-        let branch = BranchName::from("test-branch");
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
 
         service.create_bookmark(temp.path(), &branch, None).unwrap();
 
@@ -520,8 +525,10 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("worktree-1");
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -535,8 +542,10 @@ mod tests {
     fn test_create_workspace_duplicate_branch() {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&temp.path().join("wt1"), &branch, &base)
@@ -554,8 +563,10 @@ mod tests {
     fn test_create_workspace_non_existent_base() {
         let (temp, service) = init_test_repo();
         let worktree_path = temp.path().join("worktree-1");
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from("nonexistent-base-xyz");
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str("nonexistent-base-xyz")
+            .expect("literal validated string is non-empty");
 
         let result = service.create_workspace(&worktree_path, &branch, &base);
 
@@ -578,7 +589,8 @@ mod tests {
     #[test]
     fn test_push_bookmark_without_remote() {
         let (temp, service) = init_test_repo();
-        let branch = BranchName::from("test-branch");
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
         service.create_bookmark(temp.path(), &branch, None).unwrap();
 
         let result = service.push_bookmark(temp.path(), &branch);
@@ -589,7 +601,8 @@ mod tests {
     #[test]
     fn test_push_to_remote_without_remote() {
         let (temp, service) = init_test_repo();
-        let branch = BranchName::from("test-branch");
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
         service.create_bookmark(temp.path(), &branch, None).unwrap();
 
         let result = service.push_to_remote(temp.path(), &branch, "origin");
@@ -632,7 +645,8 @@ mod tests {
 
         let service = GitWorktreeService::new(work_dir.to_path_buf());
         let default_branch = get_default_branch(work_dir);
-        let branch = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let result = service.push_to_remote(work_dir, &branch, "tangled");
         assert!(result.is_ok(), "push_to_remote failed: {:?}", result);
@@ -654,8 +668,10 @@ mod tests {
 
         // Simulate exomonad's dot-separated branch naming (suffixed agent names)
         let birth_branch = format!("{}.remove-option-mcp-gemini", default_branch);
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         // Step 1: resolve_working_dir (same logic as EffectContext construction)
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
@@ -690,8 +706,10 @@ mod tests {
             "{}.tui-port-2-claude.pdv-snapshot-enums-gemini",
             default_branch
         );
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
@@ -715,8 +733,10 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("wt-verify");
-        let branch = BranchName::from("test-verify-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str("test-verify-branch")
+            .expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -733,8 +753,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("wt-dotted");
         let branch_name = format!("{}.feat-a-gemini", default_branch);
-        let branch = BranchName::from(branch_name.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(branch_name.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -751,8 +773,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("wt-deep");
         let branch_name = format!("{}.tl.sub.leaf-gemini", default_branch);
-        let branch = BranchName::from(branch_name.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(branch_name.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -769,8 +793,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
 
         let birth_branch = format!("{}.fix-auth-gemini", default_branch);
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
@@ -795,8 +821,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
 
         let birth_branch = format!("{}.tl-auth-claude", default_branch);
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         let worktree_path = temp.path().join(&relative_dir);
@@ -816,8 +844,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
 
         let birth_branch = format!("{}.tl.sub.leaf.worker-gemini", default_branch);
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
@@ -870,7 +900,8 @@ mod tests {
     fn test_file_pr_resolution_chain_sibling_isolation() {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
-        let base = BranchName::from(default_branch.as_str());
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let branch_a = format!("{}.feature-a-claude", default_branch);
         let branch_b = format!("{}.feature-b-claude", default_branch);
@@ -888,10 +919,20 @@ mod tests {
 
         std::fs::create_dir_all(dir_a.parent().unwrap()).unwrap();
         service
-            .create_workspace(&dir_a, &BranchName::from(branch_a.as_str()), &base)
+            .create_workspace(
+                &dir_a,
+                &BranchName::try_from_str(branch_a.as_str())
+                    .expect("validated string input is non-empty"),
+                &base,
+            )
             .unwrap();
         service
-            .create_workspace(&dir_b, &BranchName::from(branch_b.as_str()), &base)
+            .create_workspace(
+                &dir_b,
+                &BranchName::try_from_str(branch_b.as_str())
+                    .expect("validated string input is non-empty"),
+                &base,
+            )
             .unwrap();
 
         let resolved_a = service.get_workspace_bookmark(&dir_a).unwrap();

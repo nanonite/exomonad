@@ -210,7 +210,8 @@ impl<C: HasClaudeSessionRegistry + HasTeamRegistry + HasSupervisorRegistry + 'st
         // deregistering from TeamRegistry. This prevents ghost members
         // from blocking CC's TeamDelete (which checks config.json).
         if let Some(team_info) = self.ctx.team_registry().get(&key).await {
-            let team_name = crate::domain::TeamName::from(team_info.team_name.as_str());
+            let team_name = crate::domain::TeamName::try_from_str(team_info.team_name.as_str())
+                .expect("validated string input is non-empty");
             match crate::services::synthetic_members::remove_all_synthetic_members(&team_name) {
                 Ok(removed) => {
                     info!(team = %team_name, removed, "Cleaned synthetic members before team deregister");
@@ -247,8 +248,10 @@ mod tests {
 
     fn test_ctx() -> EffectContext {
         EffectContext {
-            agent_name: AgentName::from("test"),
-            birth_branch: BirthBranch::from("main"),
+            agent_name: AgentName::try_from_str("test")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty"),
             working_dir: std::path::PathBuf::from("."),
         }
     }
@@ -338,8 +341,10 @@ mod tests {
         let handler = SessionHandler::new(services.clone());
 
         let ctx = EffectContext {
-            agent_name: AgentName::from("foo-claude"),
-            birth_branch: BirthBranch::from("main"),
+            agent_name: AgentName::try_from_str("foo-claude")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty"),
             working_dir: std::path::PathBuf::from("."),
         };
 
@@ -360,8 +365,10 @@ mod tests {
         let handler = SessionHandler::new(services.clone());
 
         let ctx = EffectContext {
-            agent_name: AgentName::from("foo-claude"),
-            birth_branch: BirthBranch::from("main"),
+            agent_name: AgentName::try_from_str("foo-claude")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty"),
             working_dir: std::path::PathBuf::from("."),
         };
 

@@ -211,7 +211,8 @@ pub async fn merge_pr_local(
 
     // Resolve CI status for Gate 7: when spindle is configured, missing status blocks the merge.
     let ci_status = if spindle_url.is_some() {
-        let branch = BranchName::from(head_branch.as_str());
+        let branch = BranchName::try_from_str(head_branch.as_str())
+            .expect("validated string input is non-empty");
         let status = ci_status_map
             .read()
             .await
@@ -235,7 +236,8 @@ pub async fn merge_pr_local(
             success: false,
             message: e.to_string(),
             git_fetched: false,
-            branch_name: BranchName::from(head_branch.as_str()),
+            branch_name: BranchName::try_from_str(head_branch.as_str())
+                .expect("validated string input is non-empty"),
         });
     }
     if pr.merge_blocked_on_ci {
@@ -271,7 +273,8 @@ pub async fn merge_pr_local(
     }
 
     // Step 4: Push base branch to tangled remote if configured, otherwise origin.
-    let base = BranchName::from(base_branch.as_str());
+    let base = BranchName::try_from_str(base_branch.as_str())
+        .expect("validated string input is non-empty");
     let dir = PathBuf::from(project_dir);
     let remote = resolve_push_remote(&dir).to_string();
     info!(remote = %remote, base = %base_branch, "Pushing merged base branch");
@@ -327,7 +330,8 @@ pub async fn merge_pr_local(
         success: true,
         message: format!("PR #{} merged via {}", pr_number, strategy),
         git_fetched: true,
-        branch_name: BranchName::from(head_branch.as_str()),
+        branch_name: BranchName::try_from_str(head_branch.as_str())
+            .expect("validated string input is non-empty"),
     })
 }
 
@@ -380,11 +384,11 @@ mod tests {
     }
 
     fn reviewer_agent() -> AgentName {
-        AgentName::from("reviewer-gemini")
+        AgentName::try_from_str("reviewer-gemini").expect("literal validated string is non-empty")
     }
 
     fn author_agent() -> AgentName {
-        AgentName::from("feat-gemini")
+        AgentName::try_from_str("feat-gemini").expect("literal validated string is non-empty")
     }
 
     fn standard_policy() -> ReviewPolicy {
@@ -567,7 +571,8 @@ mod tests {
         pr.reviewer_agent = Some("third-agent-gemini".into());
 
         // Third agent merges (not author, not reviewer) — OK
-        let merger = AgentName::from("tl-claude");
+        let merger =
+            AgentName::try_from_str("tl-claude").expect("literal validated string is non-empty");
         let result = check_merge_gates(&pr, &merger, &standard_policy(), None, None);
         assert!(result.is_ok());
     }
@@ -917,7 +922,11 @@ mod tests {
 
         let git_wt = Arc::new(GitWorktreeService::new(tmp.path().to_path_buf()));
         let mut map = HashMap::new();
-        map.insert(BranchName::from("main.feat-gemini"), CIStatus::Success);
+        map.insert(
+            BranchName::try_from_str("main.feat-gemini")
+                .expect("literal validated string is non-empty"),
+            CIStatus::Success,
+        );
         let ci_map = Arc::new(RwLock::new(map));
 
         // merge will fail at the git step (no real repo), but gate 7 must pass

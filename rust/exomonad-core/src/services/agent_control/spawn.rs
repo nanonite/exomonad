@@ -276,18 +276,18 @@ impl<
                 .map(|b| b.as_str().to_string())
                 .unwrap_or(default_base);
             let agent_suffix = options.agent_type.suffix();
-            let branch_name = BranchName::from(
-                if self.birth_branch.depth() == 0 {
-                    format!("gh-{}/{}-{}", issue_id, slug, agent_suffix)
-                } else {
-                    format!("{}/{}-{}", base, slug, agent_suffix)
-                }
-                .as_str(),
-            );
+            let branch_name_raw = if self.birth_branch.depth() == 0 {
+                format!("gh-{}/{}-{}", issue_id, slug, agent_suffix)
+            } else {
+                format!("{}/{}-{}", base, slug, agent_suffix)
+            };
+            let branch_name = BranchName::try_from_str(&branch_name_raw)
+                .context("generated spawn branch name was empty")?;
 
             // Create worktree
             let worktree_path = self.worktree_base.join(agent_name.as_str());
-            let base_branch = BranchName::from(base.as_str());
+            let base_branch = BranchName::try_from_str(base.as_str())
+                .expect("validated string input is non-empty");
 
             self.create_worktree_checked(&worktree_path, &branch_name, &base_branch)
                 .await?;
@@ -335,7 +335,8 @@ impl<
             let display_name = options.agent_type.display_name(&issue_id, &slug);
 
             let parent_bb = self.effective_birth_branch(Some(caller_bb));
-            let session_branch = BranchName::from(parent_bb.as_str());
+            let session_branch = BranchName::try_from_str(parent_bb.as_str())
+                .expect("validated string input is non-empty");
             let env_vars = self.common_spawn_env(&agent_name, &session_branch, &role);
 
             // Open tmux window with cwd = worktree_path
@@ -354,9 +355,11 @@ impl<
             let effective_birth = self.effective_birth_branch(Some(caller_bb));
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
                 agent_type: options.agent_type,
-                birth_branch: BirthBranch::from(branch_name.as_str()),
+                birth_branch: BirthBranch::try_from_str(branch_name.as_str())
+                    .expect("validated string input is non-empty"),
                 parent_branch: effective_birth,
                 working_dir: agent_dir.clone(),
                 display_name: display_name.clone(),
@@ -468,7 +471,7 @@ impl<
 
             // Determine base branch
             let base_branch = if let Some(ref b) = options.base_branch {
-                BranchName::from(b.as_str())
+                BranchName::try_from_str(b.as_str()).expect("validated string input is non-empty")
             } else {
                 // Default to current branch
                 let current_branch_output = Command::new("git")
@@ -480,13 +483,16 @@ impl<
                 let branch_str = String::from_utf8_lossy(&current_branch_output.stdout)
                     .trim()
                     .to_string();
-                BranchName::from(branch_str.as_str())
+                BranchName::try_from_str(branch_str.as_str())
+                    .expect("validated string input is non-empty")
             };
 
             // Use '.' separator to avoid directory/file conflicts in git refs
             // and avoid ambiguity with '-' word separators in slugs.
             // Branch includes type suffix so rsplit_once('.') yields the AgentName directly.
-            let branch_name = BranchName::from(format!("{}.{}", base_branch, agent_name).as_str());
+            let branch_name =
+                BranchName::try_from_str(format!("{}.{}", base_branch, agent_name).as_str())
+                    .expect("validated string input is non-empty");
             let worktree_path = self.worktree_base.join(agent_name.as_str());
 
             self.create_worktree_checked(&worktree_path, &branch_name, &base_branch)
@@ -530,7 +536,8 @@ impl<
             let child_birth = effective_birth.child(agent_name.as_str());
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
                 agent_type: options.agent_type,
                 birth_branch: child_birth,
                 parent_branch: effective_birth,
@@ -752,7 +759,7 @@ impl<
 
             let role = crate::domain::Role::worker();
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
-            let session_branch = BranchName::from(parent_bb.as_str());
+            let session_branch = BranchName::try_from_str(parent_bb.as_str()).expect("validated string input is non-empty");
             let mut env_vars = self.common_spawn_env(&agent_name, &session_branch, &role);
 
             fs::create_dir_all(&agent_config_dir).await?;
@@ -836,7 +843,8 @@ impl<
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
                 agent_type,
                 birth_branch: parent_bb.clone(),
                 parent_branch: parent_bb,
@@ -911,7 +919,8 @@ impl<
             }
 
             // Parent branch derived from typed birth-branch.
-            let current_branch = BranchName::from(effective_birth.as_parent_branch());
+            let current_branch = BranchName::try_from_str(effective_birth.as_parent_branch())
+                .context("effective birth branch was empty")?;
 
             // Ensure a remote exists for local-only workflows
             ensure_remote_exists(effective_project_dir).await;
@@ -938,7 +947,7 @@ impl<
                     self.copy_allowed_dirs(&worktree_path, &options.allowed_dirs).await?;
                 }
             } else if !is_custom_dir {
-                let branch = BranchName::from(branch_name.as_str());
+                let branch = BranchName::try_from_str(branch_name.as_str()).expect("validated string input is non-empty");
                 self.create_worktree_checked(&worktree_path, &branch, &current_branch).await?;
             }
 
@@ -997,7 +1006,7 @@ impl<
                 }
             }
 
-            let session_branch = BranchName::from(branch_name.as_str());
+            let session_branch = BranchName::try_from_str(branch_name.as_str()).expect("validated string input is non-empty");
             let mut env_vars = self.common_spawn_env(&agent_name, &session_branch, role);
 
             // Write agent MCP config
@@ -1170,7 +1179,8 @@ impl<
             };
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
                 agent_type,
                 birth_branch: child_birth,
                 parent_branch: effective_birth,
@@ -1218,7 +1228,8 @@ impl<
             let effective_project_dir = self.project_dir();
 
             // Parent branch derived from typed birth-branch.
-            let current_branch = BranchName::from(effective_birth.as_parent_branch());
+            let current_branch = BranchName::try_from_str(effective_birth.as_parent_branch())
+                .context("effective birth branch was empty")?;
 
             // Sanitize branch name and construct typed identity
             let agent_type = options.agent_type;
@@ -1246,7 +1257,7 @@ impl<
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
             let child_birth = effective_birth.child(agent_name.as_str());
-            let branch_name = BranchName::from(child_birth.to_string().as_str());
+            let branch_name = BranchName::try_from_str(child_birth.to_string().as_str()).expect("validated string input is non-empty");
 
             let worktree_path = self.worktree_base.join(agent_name.as_str());
             let mut remove_worktree_on_spawn_failure = false;
@@ -1323,7 +1334,8 @@ impl<
             let routing = RoutingInfo::window(window_id);
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
                 agent_type,
                 birth_branch: child_birth,
                 parent_branch: effective_birth,
@@ -1504,7 +1516,8 @@ impl<
             );
             return Ok(());
         }
-        let caller_bb = BirthBranch::from(pr.base_branch.as_str());
+        let caller_bb = BirthBranch::try_from_str(pr.base_branch.as_str())
+            .expect("validated string input is non-empty");
         self.spawn_reviewer_subtree(pr, &caller_bb).await?;
         Ok(())
     }

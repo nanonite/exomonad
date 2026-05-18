@@ -21,7 +21,7 @@ pub fn get_current_branch() -> Result<BranchName> {
         anyhow::bail!("Not on a branch (detached HEAD?)");
     }
 
-    Ok(BranchName::from(branch))
+    BranchName::try_from_str(branch).context("current git branch name was empty")
 }
 
 /// Extract agent ID from a branch name following gh-{number}/{slug} convention.
@@ -134,7 +134,7 @@ impl GitService {
     #[tracing::instrument(skip(self))]
     pub async fn get_branch(&self, dir: &str) -> Result<BranchName> {
         let output = self.exec_git(dir, &["branch", "--show-current"]).await?;
-        Ok(BranchName::from(output.trim()))
+        BranchName::try_from_str(output.trim()).context("current git branch name was empty")
     }
 
     #[tracing::instrument(skip(self))]
@@ -225,8 +225,8 @@ impl GitService {
 
         Ok(RepoInfo {
             branch,
-            owner: owner.as_ref().map(|s| GithubOwner::from(s.as_str())),
-            name: name.as_ref().map(|s| GithubRepo::from(s.as_str())),
+            owner,
+            name,
         })
     }
 }

@@ -701,7 +701,8 @@ impl<
                 self.write_codex_config_files(
                     agent_dir,
                     role,
-                    &AgentName::from(agent_name),
+                    &AgentName::try_from_str(agent_name)
+                        .expect("validated string input is non-empty"),
                     self.spawn_agent_model(),
                     &self.extra_mcp_servers,
                 )
@@ -1237,7 +1238,8 @@ mod tests {
             .write_codex_config_files(
                 &agent_dir,
                 &crate::domain::Role::reviewer(),
-                &AgentName::from("reviewer-agent"),
+                &AgentName::try_from_str("reviewer-agent")
+                    .expect("literal validated string is non-empty"),
                 Some("gpt-5.2"),
                 &HashMap::new(),
             )
@@ -1277,7 +1279,8 @@ mod tests {
             .write_codex_config_files(
                 &agent_dir,
                 &crate::domain::Role::worker(),
-                &AgentName::from("worker-agent"),
+                &AgentName::try_from_str("worker-agent")
+                    .expect("literal validated string is non-empty"),
                 None,
                 &HashMap::new(),
             )
@@ -1330,11 +1333,15 @@ mod tests {
     #[test]
     fn test_common_spawn_env_core_vars() {
         let services = test_services(PathBuf::from("."));
-        let service =
-            AgentControlService::new(services).with_birth_branch(BirthBranch::from("main.tl-auth"));
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main.tl-auth")
+                .expect("literal validated string is non-empty"),
+        );
 
-        let agent = AgentName::from("fix-oauth-gemini");
-        let session_id = BranchName::from("main.tl-auth.fix-oauth-gemini");
+        let agent = AgentName::try_from_str("fix-oauth-gemini")
+            .expect("literal validated string is non-empty");
+        let session_id = BranchName::try_from_str("main.tl-auth.fix-oauth-gemini")
+            .expect("literal validated string is non-empty");
         let role = crate::domain::Role::dev();
 
         let env = service.common_spawn_env(&agent, &session_id, &role);
@@ -1356,11 +1363,15 @@ mod tests {
     fn test_common_spawn_env_tmux_session() {
         let services = test_services(PathBuf::from("."));
         let service = AgentControlService::new(services)
-            .with_birth_branch(BirthBranch::from("main"))
+            .with_birth_branch(
+                BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+            )
             .with_tmux_session("exo-test-session".to_string());
 
-        let agent = AgentName::from("worker-1");
-        let session_id = BranchName::from("main");
+        let agent =
+            AgentName::try_from_str("worker-1").expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("main").expect("literal validated string is non-empty");
         let role = crate::domain::Role::worker();
 
         let env = service.common_spawn_env(&agent, &session_id, &role);
@@ -1374,11 +1385,14 @@ mod tests {
     #[test]
     fn test_common_spawn_env_no_tmux_session() {
         let services = test_services(PathBuf::from("."));
-        let service =
-            AgentControlService::new(services).with_birth_branch(BirthBranch::from("main"));
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+        );
 
-        let agent = AgentName::from("worker-1");
-        let session_id = BranchName::from("main");
+        let agent =
+            AgentName::try_from_str("worker-1").expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("main").expect("literal validated string is non-empty");
         let role = crate::domain::Role::worker();
 
         let env = service.common_spawn_env(&agent, &session_id, &role);
@@ -1393,11 +1407,14 @@ mod tests {
     fn test_common_spawn_env_chainlink_db_directory_form() {
         let project_dir = PathBuf::from("/tmp/exo-test-project");
         let services = test_services(project_dir.clone());
-        let service =
-            AgentControlService::new(services).with_birth_branch(BirthBranch::from("main"));
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+        );
 
-        let agent = AgentName::from("leaf-1");
-        let session_id = BranchName::from("main.leaf-1");
+        let agent =
+            AgentName::try_from_str("leaf-1").expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("main.leaf-1").expect("literal validated string is non-empty");
         let role = crate::domain::Role::dev();
 
         let env = service.common_spawn_env(&agent, &session_id, &role);
@@ -1429,11 +1446,14 @@ mod tests {
         // tests in this module also touch (test_codex_*_config_uses_*_instructions).
         let project_dir = PathBuf::from("/tmp/exo-test-project");
         let services = test_services(project_dir.clone());
-        let service =
-            AgentControlService::new(services).with_birth_branch(BirthBranch::from("main"));
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+        );
 
-        let agent = AgentName::from("leaf-1");
-        let session_id = BranchName::from("main.leaf-1");
+        let agent =
+            AgentName::try_from_str("leaf-1").expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("main.leaf-1").expect("literal validated string is non-empty");
         let role = crate::domain::Role::dev();
 
         std::env::set_var("CODEX_HOME", "/tmp/exo-test-codex-home");

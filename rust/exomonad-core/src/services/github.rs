@@ -459,8 +459,8 @@ impl FFIBoundary for GithubGetPRReviewCommentsInput {}
 /// let github = GitHubService::new(client);
 ///
 /// let repo = Repo {
-///     owner: GithubOwner::from("anthropics"),
-///     name: GithubRepo::from("exomonad"),
+///     owner: GithubOwner::try_from_str("anthropics").expect("literal validated string is non-empty"),
+///     name: GithubRepo::try_from_str("exomonad").expect("literal validated string is non-empty"),
 /// };
 ///
 /// let issues = github.list_issues(&repo, None).await?;
@@ -784,9 +784,11 @@ impl GitHubService {
                         state,
                         body: v["body"].as_str().unwrap_or("").to_string(),
                         commit_id: if commit_str.is_empty() {
-                            CommitSha::from("unknown")
+                            CommitSha::try_from_str("unknown")
+                                .expect("literal validated string is non-empty")
                         } else {
-                            CommitSha::from(commit_str)
+                            CommitSha::try_from_str(commit_str)
+                                .expect("validated string input is non-empty")
                         },
                     }
                 })
@@ -1066,8 +1068,9 @@ mod tests {
         let spec = CreatePRSpec {
             title: "New PR".to_string(),
             body: "PR Body".to_string(),
-            head: BranchName::from("feature"),
-            base: BranchName::from("main"),
+            head: BranchName::try_from_str("feature")
+                .expect("literal validated string is non-empty"),
+            base: BranchName::try_from_str("main").expect("literal validated string is non-empty"),
         };
 
         let pr = service.create_pr(&repo, spec).await.unwrap();

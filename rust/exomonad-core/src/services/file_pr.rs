@@ -71,10 +71,13 @@ pub(crate) fn resolve_base_branch(head: &BranchName, explicit: Option<&BranchNam
     if let Some(base) = explicit {
         return base.clone();
     }
-    BirthBranch::from(head.as_str())
+    BirthBranch::try_from_str(head.as_str())
+        .expect("validated string input is non-empty")
         .parent()
-        .map(|p| BranchName::from(p.as_str()))
-        .unwrap_or_else(|| BranchName::from("main"))
+        .map(|p| BranchName::try_from_str(p.as_str()).expect("validated string input is non-empty"))
+        .unwrap_or_else(|| {
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        })
 }
 
 // ============================================================================
@@ -103,7 +106,8 @@ async fn find_existing_pr(
     let pr = page.into_iter().next().map(|p| GhPr {
         number: p.number,
         url: p.html_url.map(|u| u.to_string()).unwrap_or_default(),
-        head_ref_name: BranchName::from(p.head.ref_field.as_str()),
+        head_ref_name: BranchName::try_from_str(p.head.ref_field.as_str())
+            .expect("validated string input is non-empty"),
     });
     Ok(pr)
 }
@@ -148,7 +152,8 @@ async fn create_pr(
     Ok(GhPr {
         number: pr.number,
         url: pr.html_url.map(|u| u.to_string()).unwrap_or_default(),
-        head_ref_name: BranchName::from(pr.head.ref_field.as_str()),
+        head_ref_name: BranchName::try_from_str(pr.head.ref_field.as_str())
+            .expect("validated string input is non-empty"),
     })
 }
 
@@ -180,7 +185,8 @@ pub async fn file_pr_async(
             .context("spawn_blocking failed")?
             .context("Failed to get workspace bookmark")?
             .ok_or_else(|| anyhow::anyhow!("No bookmark found for workspace at {}", dir))?;
-    let head = BranchName::from(head_str.as_str());
+    let head =
+        BranchName::try_from_str(head_str.as_str()).expect("validated string input is non-empty");
 
     let base = resolve_base_branch(&head, input.base_branch.as_ref());
 
@@ -279,70 +285,98 @@ mod tests {
 
     #[test]
     fn test_resolve_base_branch_explicit_override() {
-        let head = BranchName::from("main.feat");
-        let explicit = BranchName::from("develop");
+        let head =
+            BranchName::try_from_str("main.feat").expect("literal validated string is non-empty");
+        let explicit =
+            BranchName::try_from_str("develop").expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, Some(&explicit)),
-            BranchName::from("develop")
+            BranchName::try_from_str("develop").expect("literal validated string is non-empty")
         );
     }
 
     #[test]
     fn test_resolve_base_branch_root_no_dots() {
-        let head = BranchName::from("my-branch");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head =
+            BranchName::try_from_str("my-branch").expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
     fn test_resolve_base_branch_single_dot() {
-        let head = BranchName::from("main.my-feature");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head = BranchName::try_from_str("main.my-feature")
+            .expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
     fn test_resolve_base_branch_double_dot() {
-        let head = BranchName::from("main.auth-service.middleware");
+        let head = BranchName::try_from_str("main.auth-service.middleware")
+            .expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, None),
-            BranchName::from("main.auth-service")
+            BranchName::try_from_str("main.auth-service")
+                .expect("literal validated string is non-empty")
         );
     }
 
     #[test]
     fn test_resolve_base_branch_deep_nesting() {
-        let head = BranchName::from("main.a.b.c.d.e");
+        let head = BranchName::try_from_str("main.a.b.c.d.e")
+            .expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, None),
-            BranchName::from("main.a.b.c.d")
+            BranchName::try_from_str("main.a.b.c.d")
+                .expect("literal validated string is non-empty")
         );
     }
 
     #[test]
     fn test_resolve_base_branch_agent_suffixed() {
-        let head = BranchName::from("main.fix-auth-gemini");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head = BranchName::try_from_str("main.fix-auth-gemini")
+            .expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
     fn test_resolve_base_branch_agent_suffixed_nested() {
-        let head = BranchName::from("main.tl-auth-claude.fix-oauth-gemini");
+        let head = BranchName::try_from_str("main.tl-auth-claude.fix-oauth-gemini")
+            .expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, None),
-            BranchName::from("main.tl-auth-claude")
+            BranchName::try_from_str("main.tl-auth-claude")
+                .expect("literal validated string is non-empty")
         );
     }
 
     #[test]
     fn test_resolve_base_branch_no_slash_convention() {
         // Slash convention is dead — no dots means fallback to "main"
-        let head = BranchName::from("feature/my-work");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head = BranchName::try_from_str("feature/my-work")
+            .expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
     fn test_resolve_base_branch_none_explicit() {
-        let head = BranchName::from("main.feat");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head =
+            BranchName::try_from_str("main.feat").expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
@@ -357,11 +391,18 @@ mod tests {
             "main.tl-auth-claude.fix-oauth-gemini",
         ];
         for case in &cases {
-            let head = BranchName::from(*case);
-            let expected = BirthBranch::from(*case)
+            let head =
+                BranchName::try_from_str(*case).expect("validated string input is non-empty");
+            let expected = BirthBranch::try_from_str(*case)
+                .expect("validated string input is non-empty")
                 .parent()
-                .map(|p| BranchName::from(p.as_str()))
-                .unwrap_or_else(|| BranchName::from("main"));
+                .map(|p| {
+                    BranchName::try_from_str(p.as_str())
+                        .expect("validated string input is non-empty")
+                })
+                .unwrap_or_else(|| {
+                    BranchName::try_from_str("main").expect("literal validated string is non-empty")
+                });
             assert_eq!(
                 resolve_base_branch(&head, None),
                 expected,
@@ -375,10 +416,12 @@ mod tests {
     fn test_resolve_base_branch_depth_4() {
         assert_eq!(
             resolve_base_branch(
-                &BranchName::from("main.core-eval.optimize.inline.inline-coalg"),
+                &BranchName::try_from_str("main.core-eval.optimize.inline.inline-coalg")
+                    .expect("literal validated string is non-empty"),
                 None
             ),
-            BranchName::from("main.core-eval.optimize.inline")
+            BranchName::try_from_str("main.core-eval.optimize.inline")
+                .expect("literal validated string is non-empty")
         );
     }
 
@@ -511,9 +554,13 @@ mod tests {
         assert_eq!(bookmark, Some("main.feat-a-gemini".to_string()));
 
         // Verify base detection via resolve_base_branch
-        let head = BranchName::from("main.feat-a-gemini");
+        let head = BranchName::try_from_str("main.feat-a-gemini")
+            .expect("literal validated string is non-empty");
         let base = resolve_base_branch(&head, None);
-        assert_eq!(base, BranchName::from("main"));
+        assert_eq!(
+            base,
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
 
         Ok(())
     }

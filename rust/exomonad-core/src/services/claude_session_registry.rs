@@ -54,7 +54,8 @@ mod tests {
     #[tokio::test]
     async fn test_register_then_get() {
         let reg = ClaudeSessionRegistry::new();
-        let uuid = ClaudeSessionUuid::from("uuid-123");
+        let uuid = ClaudeSessionUuid::try_from_str("uuid-123")
+            .expect("literal validated string is non-empty");
         reg.register("root", uuid.clone()).await;
         let result = reg.get("root").await;
         assert_eq!(result, Some(uuid));
@@ -63,12 +64,26 @@ mod tests {
     #[tokio::test]
     async fn test_register_overwrites() {
         let reg = ClaudeSessionRegistry::new();
-        reg.register("root", ClaudeSessionUuid::from("uuid-1"))
-            .await;
-        reg.register("root", ClaudeSessionUuid::from("uuid-2"))
-            .await;
+        reg.register(
+            "root",
+            ClaudeSessionUuid::try_from_str("uuid-1")
+                .expect("literal validated string is non-empty"),
+        )
+        .await;
+        reg.register(
+            "root",
+            ClaudeSessionUuid::try_from_str("uuid-2")
+                .expect("literal validated string is non-empty"),
+        )
+        .await;
         let result = reg.get("root").await;
-        assert_eq!(result, Some(ClaudeSessionUuid::from("uuid-2")));
+        assert_eq!(
+            result,
+            Some(
+                ClaudeSessionUuid::try_from_str("uuid-2")
+                    .expect("literal validated string is non-empty")
+            )
+        );
     }
 
     #[tokio::test]

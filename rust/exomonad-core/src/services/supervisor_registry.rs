@@ -70,8 +70,9 @@ mod tests {
 
     fn test_info() -> SupervisorInfo {
         SupervisorInfo {
-            supervisor: AgentName::from("tl-1"),
-            team: TeamName::from("my-team"),
+            supervisor: AgentName::try_from_str("tl-1")
+                .expect("literal validated string is non-empty"),
+            team: TeamName::try_from_str("my-team").expect("literal validated string is non-empty"),
         }
     }
 
@@ -112,8 +113,10 @@ mod tests {
         reg.register(&["child".into()], test_info()).await;
 
         let new_info = SupervisorInfo {
-            supervisor: AgentName::from("tl-2"),
-            team: TeamName::from("other-team"),
+            supervisor: AgentName::try_from_str("tl-2")
+                .expect("literal validated string is non-empty"),
+            team: TeamName::try_from_str("other-team")
+                .expect("literal validated string is non-empty"),
         };
         reg.register(&["child".into()], new_info).await;
 

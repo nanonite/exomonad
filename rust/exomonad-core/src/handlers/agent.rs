@@ -65,11 +65,15 @@ impl<
         let team_reg = self.ctx.team_registry();
         let agent_key = ctx.agent_name.to_string();
         let team_name = if let Some(info) = team_reg.get(&agent_key).await {
-            TeamName::from(info.team_name.as_str())
+            TeamName::try_from_str(info.team_name.as_str())
+                .expect("validated string input is non-empty")
         } else if let Some(info) = team_reg.get(ctx.birth_branch.as_ref()).await {
-            TeamName::from(info.team_name.as_str())
+            TeamName::try_from_str(info.team_name.as_str())
+                .expect("validated string input is non-empty")
         } else {
-            let fallback = TeamName::from(format!("exo-{}", ctx.birth_branch.as_ref()).as_str());
+            let fallback =
+                TeamName::try_from_str(format!("exo-{}", ctx.birth_branch.as_ref()).as_str())
+                    .expect("validated string input is non-empty");
             info!(
                 agent = %agent_key,
                 child = %child_key,
@@ -104,9 +108,11 @@ impl<
         let team_reg = self.ctx.team_registry();
         let agent_key = ctx.agent_name.to_string();
         let team_name = if let Some(info) = team_reg.get(&agent_key).await {
-            TeamName::from(info.team_name.as_str())
+            TeamName::try_from_str(info.team_name.as_str())
+                .expect("validated string input is non-empty")
         } else if let Some(info) = team_reg.get(ctx.birth_branch.as_ref()).await {
-            TeamName::from(info.team_name.as_str())
+            TeamName::try_from_str(info.team_name.as_str())
+                .expect("validated string input is non-empty")
         } else {
             warn!(
                 member = %member_name,
@@ -300,7 +306,9 @@ impl<
             repo: parse_repo(&req.repo)?,
             agent_type: convert_agent_type(req.agent_type())?,
             subrepo: non_empty(req.subrepo).map(PathBuf::from),
-            base_branch: non_empty(req.base_branch).map(|s| BirthBranch::from(s.as_str())),
+            base_branch: non_empty(req.base_branch).map(|s| {
+                BirthBranch::try_from_str(s.as_str()).expect("validated string input is non-empty")
+            }),
         };
 
         let result = self
@@ -358,11 +366,14 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnGeminiTeammateResponse> {
         let options = SpawnGeminiTeammateOptions {
-            name: AgentName::from(req.name.as_str()),
+            name: AgentName::try_from_str(req.name.as_str())
+                .expect("validated string input is non-empty"),
             prompt: req.prompt.clone(),
             agent_type: convert_agent_type(req.agent_type())?,
             subrepo: non_empty(req.subrepo).map(PathBuf::from),
-            base_branch: non_empty(req.base_branch).map(|s| BirthBranch::from(s.as_str())),
+            base_branch: non_empty(req.base_branch).map(|s| {
+                BirthBranch::try_from_str(s.as_str()).expect("validated string input is non-empty")
+            }),
         };
 
         let result = self
@@ -383,7 +394,8 @@ impl<
     ) -> EffectResult<SpawnWorkerResponse> {
         let default_type = self.service.default_spawn_agent_type();
         let options = SpawnWorkerOptions {
-            name: AgentName::from(req.name.as_str()),
+            name: AgentName::try_from_str(req.name.as_str())
+                .expect("validated string input is non-empty"),
             prompt: req.prompt.clone(),
             agent_type: convert_agent_type(req.agent_type()).unwrap_or(default_type),
             claude_flags: claude_spawn_flags(
@@ -455,7 +467,8 @@ impl<
         // session IDs causing "No conversation found" errors.
         let parent_session_id = if req.fork_session {
             let key = if ctx.agent_name.as_str().is_empty() {
-                crate::domain::AgentName::from("root")
+                crate::domain::AgentName::try_from_str("root")
+                    .expect("literal validated string is non-empty")
             } else {
                 ctx.agent_name.clone()
             };
@@ -471,7 +484,10 @@ impl<
                     "No Claude session UUID registered — child will start without --fork-session context. Ensure SessionStart hook is configured."
                 );
             }
-            claude_uuid.map(|s| ClaudeSessionUuid::from(s.as_str()))
+            claude_uuid.map(|s| {
+                ClaudeSessionUuid::try_from_str(s.as_str())
+                    .expect("validated string input is non-empty")
+            })
         } else {
             info!("fork_session=false, child starts fresh");
             None
@@ -871,7 +887,9 @@ impl<
                 let team_reg = self.ctx.team_registry();
                 let member_name = {
                     let resolver = self.ctx.agent_resolver();
-                    let name = crate::domain::AgentName::from(resolved_internal_name.as_str());
+                    let name =
+                        crate::domain::AgentName::try_from_str(resolved_internal_name.as_str())
+                            .expect("validated string input is non-empty");
                     if let Ok(records) = resolver.records_ref().try_read() {
                         records.get(&name).map(|r| r.agent_name.clone())
                     } else {
@@ -890,7 +908,8 @@ impl<
                         None
                     };
                     if let Some(info) = team_info {
-                        let team_name = TeamName::from(info.team_name.as_str());
+                        let team_name = TeamName::try_from_str(info.team_name.as_str())
+                            .expect("validated string input is non-empty");
                         if let Err(e) = crate::services::synthetic_members::remove_synthetic_member(
                             &team_name,
                             &member_name,

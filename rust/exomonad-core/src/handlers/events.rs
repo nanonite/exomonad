@@ -186,7 +186,8 @@ impl<
             (agent_name.clone(), "ctx")
         } else {
             (
-                crate::domain::AgentName::from(req.agent_id.as_str()),
+                crate::domain::AgentName::try_from_str(req.agent_id.as_str())
+                    .expect("validated string input is non-empty"),
                 "request",
             )
         };
@@ -227,7 +228,8 @@ impl<
                 Address::Team { team, member: None } => {
                     let lead = self.ctx.team_registry().resolve_lead(team.as_str()).await;
                     let id = lead.unwrap_or_else(|| "root".to_string());
-                    let lead_name = crate::domain::AgentName::from(id.as_str());
+                    let lead_name = crate::domain::AgentName::try_from_str(id.as_str())
+                        .expect("validated string input is non-empty");
                     let tab = crate::services::delivery::resolve_tab_name_for_agent(
                         &lead_name,
                         resolver_ref,
@@ -260,7 +262,8 @@ impl<
                 "notify_parent: resolved supervisor from registry"
             );
             let parent_session_id = info.supervisor.as_str();
-            let supervisor_name = crate::domain::AgentName::from(parent_session_id);
+            let supervisor_name = crate::domain::AgentName::try_from_str(parent_session_id)
+                .expect("validated string input is non-empty");
             let tab_name = crate::services::delivery::resolve_tab_name_for_agent(
                 &supervisor_name,
                 Some(self.ctx.agent_resolver()),
@@ -294,7 +297,8 @@ impl<
             "notify_parent: routing via structural identity"
         );
 
-        let parent_agent = crate::domain::AgentName::from(parent_session_id.as_str());
+        let parent_agent = crate::domain::AgentName::try_from_str(parent_session_id.as_str())
+            .expect("validated string input is non-empty");
         let tab_name = crate::services::delivery::resolve_tab_name_for_agent(
             &parent_agent,
             Some(self.ctx.agent_resolver()),
@@ -387,14 +391,18 @@ mod tests {
 
     #[test]
     fn shared_dir_worker_notifies_recorded_parent_branch() {
-        let agent_name = AgentName::from("chainlink-codex-worker-codex");
-        let birth_branch = BirthBranch::from("main.chainlink-codex-tl-codex");
+        let agent_name = AgentName::try_from_str("chainlink-codex-worker-codex")
+            .expect("literal validated string is non-empty");
+        let birth_branch = BirthBranch::try_from_str("main.chainlink-codex-tl-codex")
+            .expect("literal validated string is non-empty");
         let identity = AgentIdentityRecord {
             agent_name: agent_name.clone(),
-            slug: Slug::from("chainlink-codex-worker"),
+            slug: Slug::try_from_str("chainlink-codex-worker")
+                .expect("literal validated string is non-empty"),
             agent_type: AgentType::Codex,
             birth_branch: birth_branch.clone(),
-            parent_branch: BirthBranch::from("main.chainlink-codex-tl-codex"),
+            parent_branch: BirthBranch::try_from_str("main.chainlink-codex-tl-codex")
+                .expect("literal validated string is non-empty"),
             working_dir: PathBuf::from(".exo/worktrees/chainlink-codex-tl-codex"),
             display_name: "🤖 chainlink-codex-worker-codex".to_string(),
             topology: Topology::SharedDir,
@@ -408,8 +416,10 @@ mod tests {
 
     #[test]
     fn worktree_agent_notifies_birth_branch_parent() {
-        let agent_name = AgentName::from("codex-leaf-codex");
-        let birth_branch = BirthBranch::from("main.codex-tl-codex.codex-leaf-codex");
+        let agent_name = AgentName::try_from_str("codex-leaf-codex")
+            .expect("literal validated string is non-empty");
+        let birth_branch = BirthBranch::try_from_str("main.codex-tl-codex.codex-leaf-codex")
+            .expect("literal validated string is non-empty");
 
         assert_eq!(
             structural_parent_session_id(&agent_name, &birth_branch, None),

@@ -161,7 +161,11 @@ impl PrRegistry {
         let birth_branch = entry.reviewer_birth_branch.as_ref()?;
         let agent_name = entry.reviewer_agent.as_ref()?;
         let agent_type = crate::services::agent_control::AgentType::from_dir_name(agent_name);
-        Some((BranchName::from(birth_branch.as_str()), agent_type))
+        Some((
+            BranchName::try_from_str(birth_branch.as_str())
+                .expect("validated string input is non-empty"),
+            agent_type,
+        ))
     }
 }
 
@@ -245,7 +249,8 @@ pub async fn file_pr_local(
             .context("spawn_blocking failed")?
             .context("Failed to get workspace bookmark")?
             .ok_or_else(|| anyhow::anyhow!("No bookmark found for workspace at {}", dir))?;
-    let head = BranchName::from(head_str.as_str());
+    let head =
+        BranchName::try_from_str(head_str.as_str()).expect("validated string input is non-empty");
     let base = resolve_base_branch(&head, input.base_branch.as_ref());
 
     info!("[FilePRLocal] head={} base={} dir={}", head, base, dir);
@@ -369,7 +374,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_agent() -> AgentName {
-        AgentName::from("test-agent-gemini")
+        AgentName::try_from_str("test-agent-gemini").expect("literal validated string is non-empty")
     }
 
     fn test_role() -> Role {
@@ -455,11 +460,17 @@ mod tests {
             },
         );
 
-        let found = reg.find_by_branch(&BranchName::from("main.feat-gemini"));
+        let found = reg.find_by_branch(
+            &BranchName::try_from_str("main.feat-gemini")
+                .expect("literal validated string is non-empty"),
+        );
         assert!(found.is_some());
         assert_eq!(found.unwrap().number, 1);
 
-        let not_found = reg.find_by_branch(&BranchName::from("nonexistent"));
+        let not_found = reg.find_by_branch(
+            &BranchName::try_from_str("nonexistent")
+                .expect("literal validated string is non-empty"),
+        );
         assert!(not_found.is_none());
     }
 
@@ -578,9 +589,10 @@ mod tests {
         let body = "This is a test PR body.";
         let result = append_authoring_footer(
             body,
-            &AgentName::from("feat-gemini"),
+            &AgentName::try_from_str("feat-gemini").expect("literal validated string is non-empty"),
             &Role::dev(),
-            &BranchName::from("main.feat-gemini"),
+            &BranchName::try_from_str("main.feat-gemini")
+                .expect("literal validated string is non-empty"),
         );
         assert!(result.contains("Authoring-Agent: feat-gemini"));
         assert!(result.contains("Authoring-Role:  dev"));

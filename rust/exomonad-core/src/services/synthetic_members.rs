@@ -224,7 +224,8 @@ mod tests {
     #[test]
     fn test_synthetic_member_lifecycle() -> Result<()> {
         let dir = tempdir()?;
-        let team_name = TeamName::from("test-team");
+        let team_name =
+            TeamName::try_from_str("test-team").expect("literal validated string is non-empty");
         let config_path = dir.path().join("config.json");
 
         let initial_config = serde_json::json!({
@@ -267,7 +268,8 @@ mod tests {
     #[test]
     fn test_remove_all_synthetic_members() -> Result<()> {
         let dir = tempdir()?;
-        let team_name = TeamName::from("test-team");
+        let team_name =
+            TeamName::try_from_str("test-team").expect("literal validated string is non-empty");
         let config_path = dir.path().join("config.json");
 
         let initial_config = serde_json::json!({
@@ -317,7 +319,8 @@ mod tests {
 
     #[test]
     fn test_remove_all_synthetic_members_missing_config() -> Result<()> {
-        let team_name = TeamName::from("nonexistent-team");
+        let team_name = TeamName::try_from_str("nonexistent-team")
+            .expect("literal validated string is non-empty");
         let config_path = PathBuf::from("/tmp/nonexistent-config.json");
         let removed = remove_all_synthetic_members_at_path(&config_path, &team_name)?;
         assert_eq!(removed, 0);

@@ -40,8 +40,8 @@ pub enum DomainError {
 
 /// Generate a validated non-empty string newtype with standard impls.
 ///
-/// Provides: TryFrom<String>, From<&str> (panics on empty), From<T> for String,
-/// Display, as_str(), AsRef<str>, Borrow<str>, and serde support via try_from/into.
+/// Provides: TryFrom<String>, TryFrom<&str>, From<T> for String, Display,
+/// as_str(), AsRef<str>, Borrow<str>, and serde support via try_from/into.
 macro_rules! validated_string {
     ($(#[doc = $doc:expr])* $name:ident, $field:expr) => {
         $(#[doc = $doc])*
@@ -66,15 +66,20 @@ macro_rules! validated_string {
             }
         }
 
-        impl From<&str> for $name {
-            /// Panics on empty input. Use `TryFrom<String>` for fallible conversion.
-            fn from(s: &str) -> Self {
-                assert!(!s.is_empty(), concat!($field, " must not be empty"));
-                Self(s.to_string())
+        impl TryFrom<&str> for $name {
+            type Error = DomainError;
+
+            fn try_from(s: &str) -> Result<Self, Self::Error> {
+                Self::try_from(s.to_string())
             }
         }
 
         impl $name {
+            /// Construct from a string slice with validation.
+            pub fn try_from_str(s: &str) -> Result<Self, DomainError> {
+                Self::try_from(s)
+            }
+
             /// Get the value as a string slice.
             pub fn as_str(&self) -> &str {
                 &self.0
@@ -909,19 +914,24 @@ impl Address {
     pub fn from_proto(addr: Option<exomonad_proto::effects::events::Address>) -> Self {
         use exomonad_proto::effects::events::address::Kind;
         match addr.as_ref().and_then(|a| a.kind.as_ref()) {
-            Some(Kind::Agent(name)) if !name.is_empty() => {
-                Address::Agent(AgentName::from(name.as_str()))
-            }
+            Some(Kind::Agent(name)) if !name.is_empty() => Address::Agent(
+                AgentName::try_from_str(name.as_str())
+                    .expect("validated string input is non-empty"),
+            ),
             Some(Kind::Team(team_addr)) => {
                 let team = if team_addr.team.is_empty() {
                     return Address::Supervisor;
                 } else {
-                    TeamName::from(team_addr.team.as_str())
+                    TeamName::try_from_str(team_addr.team.as_str())
+                        .expect("validated string input is non-empty")
                 };
                 let member = if team_addr.member.is_empty() {
                     None
                 } else {
-                    Some(AgentName::from(team_addr.member.as_str()))
+                    Some(
+                        AgentName::try_from_str(team_addr.member.as_str())
+                            .expect("validated string input is non-empty"),
+                    )
                 };
                 Address::Team { team, member }
             }
@@ -1152,29 +1162,67 @@ mod tests {
 
     #[test]
     fn test_birth_branch_depth() {
-        assert_eq!(BirthBranch::from("main").depth(), 0);
-        assert_eq!(BirthBranch::from("master").depth(), 0);
-        assert_eq!(BirthBranch::from("main.feature-a").depth(), 1);
-        assert_eq!(BirthBranch::from("main.feature-a.sub-task").depth(), 2);
+        assert_eq!(
+            BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty")
+                .depth(),
+            0
+        );
+        assert_eq!(
+            BirthBranch::try_from_str("master")
+                .expect("literal validated string is non-empty")
+                .depth(),
+            0
+        );
+        assert_eq!(
+            BirthBranch::try_from_str("main.feature-a")
+                .expect("literal validated string is non-empty")
+                .depth(),
+            1
+        );
+        assert_eq!(
+            BirthBranch::try_from_str("main.feature-a.sub-task")
+                .expect("literal validated string is non-empty")
+                .depth(),
+            2
+        );
     }
 
     #[test]
     fn test_birth_branch_parent() {
-        assert_eq!(BirthBranch::from("main").parent(), None);
-        assert_eq!(BirthBranch::from("master").parent(), None);
         assert_eq!(
-            BirthBranch::from("main.feature-a").parent(),
-            Some(BirthBranch::from("main"))
+            BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty")
+                .parent(),
+            None
         );
         assert_eq!(
-            BirthBranch::from("main.feature-a.sub-task").parent(),
-            Some(BirthBranch::from("main.feature-a"))
+            BirthBranch::try_from_str("master")
+                .expect("literal validated string is non-empty")
+                .parent(),
+            None
+        );
+        assert_eq!(
+            BirthBranch::try_from_str("main.feature-a")
+                .expect("literal validated string is non-empty")
+                .parent(),
+            Some(BirthBranch::try_from_str("main").expect("literal validated string is non-empty"))
+        );
+        assert_eq!(
+            BirthBranch::try_from_str("main.feature-a.sub-task")
+                .expect("literal validated string is non-empty")
+                .parent(),
+            Some(
+                BirthBranch::try_from_str("main.feature-a")
+                    .expect("literal validated string is non-empty")
+            )
         );
     }
 
     #[test]
     fn test_birth_branch_child() {
-        let root = BirthBranch::from("main");
+        let root =
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty");
         let child = root.child("feature-a");
         assert_eq!(child.as_str(), "main.feature-a");
         assert_eq!(child.depth(), 1);
@@ -1184,29 +1232,46 @@ mod tests {
         assert_eq!(grandchild.depth(), 2);
 
         // Works with any root branch name
-        let master_root = BirthBranch::from("master");
+        let master_root =
+            BirthBranch::try_from_str("master").expect("literal validated string is non-empty");
         let master_child = master_root.child("feature-a");
         assert_eq!(master_child.as_str(), "master.feature-a");
-        assert_eq!(master_child.parent(), Some(BirthBranch::from("master")));
+        assert_eq!(
+            master_child.parent(),
+            Some(
+                BirthBranch::try_from_str("master").expect("literal validated string is non-empty")
+            )
+        );
     }
 
     #[test]
     fn test_birth_branch_parent_deep() {
         assert_eq!(
-            BirthBranch::from("main.a.b.c.d").parent(),
-            Some(BirthBranch::from("main.a.b.c"))
+            BirthBranch::try_from_str("main.a.b.c.d")
+                .expect("literal validated string is non-empty")
+                .parent(),
+            Some(
+                BirthBranch::try_from_str("main.a.b.c")
+                    .expect("literal validated string is non-empty")
+            )
         );
     }
 
     #[test]
     fn test_birth_branch_depth_deep() {
-        assert_eq!(BirthBranch::from("main.a.b.c").depth(), 3);
+        assert_eq!(
+            BirthBranch::try_from_str("main.a.b.c")
+                .expect("literal validated string is non-empty")
+                .depth(),
+            3
+        );
     }
 
     #[test]
     fn test_birth_branch_child_roundtrip() {
         // parent → child → parent roundtrip reconstructs the original parent
-        let parent = BirthBranch::from("main");
+        let parent =
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty");
         let child = parent.child("feat-claude");
         assert_eq!(child.as_str(), "main.feat-claude");
         assert_eq!(child.parent(), Some(parent));
@@ -1214,7 +1279,8 @@ mod tests {
 
     #[test]
     fn test_birth_branch_nested_child_roundtrip() {
-        let parent = BirthBranch::from("main.feat");
+        let parent =
+            BirthBranch::try_from_str("main.feat").expect("literal validated string is non-empty");
         let child = parent.child("sub-gemini");
         assert_eq!(child.as_str(), "main.feat.sub-gemini");
         assert_eq!(child.parent(), Some(parent));
@@ -1226,7 +1292,12 @@ mod tests {
         let addr = Address::from_proto(Some(ProtoAddr {
             kind: Some(Kind::Agent("worker-1".into())),
         }));
-        assert_eq!(addr, Address::Agent(AgentName::from("worker-1")));
+        assert_eq!(
+            addr,
+            Address::Agent(
+                AgentName::try_from_str("worker-1").expect("literal validated string is non-empty")
+            )
+        );
         assert_eq!(addr.to_string(), "agent:worker-1");
     }
 
@@ -1242,8 +1313,12 @@ mod tests {
         assert_eq!(
             addr,
             Address::Team {
-                team: TeamName::from("my-team"),
-                member: Some(AgentName::from("worker-1"))
+                team: TeamName::try_from_str("my-team")
+                    .expect("literal validated string is non-empty"),
+                member: Some(
+                    AgentName::try_from_str("worker-1")
+                        .expect("literal validated string is non-empty")
+                )
             }
         );
         assert_eq!(addr.to_string(), "team:my-team:worker-1");
@@ -1261,7 +1336,8 @@ mod tests {
         assert_eq!(
             addr,
             Address::Team {
-                team: TeamName::from("my-team"),
+                team: TeamName::try_from_str("my-team")
+                    .expect("literal validated string is non-empty"),
                 member: None
             }
         );
@@ -1289,8 +1365,12 @@ mod tests {
 
     #[test]
     fn test_agent_name_is_gemini_worker() {
-        assert!(AgentName::from("impl-gemini").is_gemini_worker());
-        assert!(!AgentName::from("impl-claude").is_gemini_worker());
+        assert!(AgentName::try_from_str("impl-gemini")
+            .expect("literal validated string is non-empty")
+            .is_gemini_worker());
+        assert!(!AgentName::try_from_str("impl-claude")
+            .expect("literal validated string is non-empty")
+            .is_gemini_worker());
     }
 
     #[test]
@@ -1631,7 +1711,7 @@ mod proptest_tests {
 
         #[test]
         fn test_birth_branch_hierarchy(slugs in prop::collection::vec("[a-z0-9-]+", 1..5)) {
-            let mut current = BirthBranch::from("main");
+            let mut current = BirthBranch::try_from_str("main").expect("literal validated string is non-empty");
 
             for (i, slug) in slugs.into_iter().enumerate() {
                 let child = current.child(&slug);
