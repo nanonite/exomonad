@@ -27,6 +27,7 @@ pub mod review_policy;
 pub mod secrets;
 pub mod supervisor_registry;
 pub mod synthetic_members;
+pub mod tangled_pr;
 pub mod tmux_events;
 pub mod tmux_ipc;
 pub mod worktree_event_watcher;
@@ -98,6 +99,9 @@ pub trait HasCiStatusMap: Send + Sync {
     >;
     fn spindle_url(&self) -> Option<&str>;
 }
+pub trait HasTangledPrClient: Send + Sync {
+    fn tangled_pr_client(&self) -> Option<&Arc<tangled_pr::TangledPrClient>>;
+}
 
 /// Spawns a reviewer agent for a local PR. Implemented by `AgentControlService`.
 ///
@@ -145,6 +149,9 @@ pub struct Services {
     >,
     /// Tangled spindle URL (`ws://...`). Present when spindle CI is configured.
     pub spindle_url: Option<String>,
+    /// Optional Tangled appview reader used as a fallback when `.exo/prs.json`
+    /// does not have a PR entry.
+    pub tangled_pr_client: Option<Arc<tangled_pr::TangledPrClient>>,
 }
 
 impl Services {
@@ -223,6 +230,11 @@ impl HasCiStatusMap for Services {
         self.spindle_url.as_deref()
     }
 }
+impl HasTangledPrClient for Services {
+    fn tangled_pr_client(&self) -> Option<&Arc<tangled_pr::TangledPrClient>> {
+        self.tangled_pr_client.as_ref()
+    }
+}
 
 #[cfg(test)]
 impl Services {
@@ -243,6 +255,7 @@ impl Services {
             opencode_worker_model: None,
             ci_status_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             spindle_url: None,
+            tangled_pr_client: None,
         }
     }
 }

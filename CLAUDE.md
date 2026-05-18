@@ -216,6 +216,7 @@ model = "sonnet"             # optional — passed as --model flag to root TL ag
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
 tangled_spindle_url = "ws://localhost:6555"  # optional — spindle WebSocket for CI status events
 tangled_knot_url = "http://localhost:5555"   # optional — knot HTTP URL (used to derive spindle jetstream endpoint)
+tangled_appview_url = "http://localhost:3000" # optional — appview HTTP URL for PR read-through fallback
 tangled_owner_did = "did:plc:yourkey"        # optional — when set, exomonad init auto-starts spindle as a process companion
 tangled_spindle_db = "spindle.db"            # optional — spindle SQLite path (default: spindle.db in project root)
 tangled_knot_container = "tangled-knot-knot-1"  # optional — knot container name for docker-based repo registration

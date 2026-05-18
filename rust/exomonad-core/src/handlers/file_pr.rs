@@ -14,7 +14,9 @@ use exomonad_proto::effects::file_pr::*;
 use std::sync::Arc;
 use tracing::instrument;
 
-use crate::services::{HasEventLog, HasGitHubClient, HasGitWorktreeService, HasProjectDir};
+use crate::services::{
+    HasEventLog, HasGitHubClient, HasGitWorktreeService, HasProjectDir, HasTangledPrClient,
+};
 
 /// File PR effect handler.
 ///
@@ -24,8 +26,14 @@ pub struct FilePRHandler<C> {
     ctx: Arc<C>,
 }
 
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 'static>
-    FilePRHandler<C>
+impl<
+        C: HasGitHubClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasTangledPrClient
+            + 'static,
+    > FilePRHandler<C>
 {
     pub fn new(ctx: Arc<C>) -> Self {
         Self { ctx }
@@ -33,8 +41,14 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 'static>
-    EffectHandler for FilePRHandler<C>
+impl<
+        C: HasGitHubClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasTangledPrClient
+            + 'static,
+    > EffectHandler for FilePRHandler<C>
 {
     fn namespace(&self) -> &str {
         "file_pr"
@@ -51,8 +65,14 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 'static>
-    FilePrEffects for FilePRHandler<C>
+impl<
+        C: HasGitHubClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasTangledPrClient
+            + 'static,
+    > FilePrEffects for FilePRHandler<C>
 {
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, pr_title = %req.title))]
     async fn file_pr(
@@ -160,15 +180,19 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
                     path = %prs_path.display(),
                     "[FilePR] local PR registry unavailable"
                 );
-                return Ok(LocalPrResponse::default());
+                return self.tangled_pr_get(req.pr_number).await;
             }
         };
 
-        Ok(registry
+        if let Some(response) = registry
             .prs
             .get(&(req.pr_number as u64))
             .map(local_pr_response)
-            .unwrap_or_default())
+        {
+            return Ok(response);
+        }
+
+        self.tangled_pr_get(req.pr_number).await
     }
 
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, branch = %req.branch))]
@@ -186,16 +210,68 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 
                     path = %prs_path.display(),
                     "[FilePR] local PR registry unavailable"
                 );
-                return Ok(LocalPrResponse::default());
+                return self.tangled_pr_get_for_branch(&req.branch).await;
             }
         };
 
-        Ok(registry
+        if let Some(response) = registry
             .prs
             .values()
             .find(|entry| entry.head_branch == req.branch)
             .map(local_pr_response)
-            .unwrap_or_default())
+        {
+            return Ok(response);
+        }
+
+        self.tangled_pr_get_for_branch(&req.branch).await
+    }
+}
+
+impl<
+        C: HasGitHubClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasTangledPrClient
+            + 'static,
+    > FilePRHandler<C>
+{
+    async fn tangled_pr_get(&self, pr_number: i64) -> EffectResult<LocalPrResponse> {
+        let Some(client) = self.ctx.tangled_pr_client() else {
+            return Ok(LocalPrResponse::default());
+        };
+
+        match client.get_pull(pr_number).await {
+            Ok(Some(response)) => Ok(response),
+            Ok(None) => Ok(LocalPrResponse::default()),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    pr_number,
+                    "[FilePR] Tangled appview PR lookup failed"
+                );
+                Ok(LocalPrResponse::default())
+            }
+        }
+    }
+
+    async fn tangled_pr_get_for_branch(&self, branch: &str) -> EffectResult<LocalPrResponse> {
+        let Some(client) = self.ctx.tangled_pr_client() else {
+            return Ok(LocalPrResponse::default());
+        };
+
+        match client.get_pull_for_branch(branch).await {
+            Ok(Some(response)) => Ok(response),
+            Ok(None) => Ok(LocalPrResponse::default()),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    branch,
+                    "[FilePR] Tangled appview branch PR lookup failed"
+                );
+                Ok(LocalPrResponse::default())
+            }
+        }
     }
 }
 
@@ -222,8 +298,10 @@ mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch};
     use crate::effects::{EffectContext, FilePrEffects};
-    use crate::services::Services;
+    use crate::services::{tangled_pr::TangledPrClient, Services};
     use std::path::PathBuf;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_ctx(branch: &str) -> EffectContext {
         EffectContext {
@@ -356,6 +434,88 @@ mod tests {
         assert!(!response.found);
         assert_eq!(response.pr_number, 0);
         assert!(response.head_branch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_pr_get_falls_through_to_tangled_appview_on_cache_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_registry(tmp.path());
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/sh.tangled.repo.getPull"))
+            .and(query_param("repo", "did:plc:owner"))
+            .and(query_param("pull", "12"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "prNumber": 12,
+                "headBranch": "main.fix-appview-codex",
+                "baseBranch": "main",
+                "ownerDid": "did:plc:owner",
+                "state": "open",
+                "latestSha": "def456"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut services = Services::test();
+        services.project_dir = tmp.path().to_path_buf();
+        services.tangled_pr_client = Some(Arc::new(
+            TangledPrClient::new(&server.uri(), "did:plc:owner").unwrap(),
+        ));
+        let handler = FilePRHandler::new(Arc::new(services));
+
+        let response = handler
+            .local_pr_get(LocalPrGetRequest { pr_number: 12 }, &test_ctx("main"))
+            .await
+            .unwrap();
+
+        assert!(response.found);
+        assert_eq!(response.pr_number, 12);
+        assert_eq!(response.head_branch, "main.fix-appview-codex");
+        assert_eq!(response.base_branch, "main");
+        assert_eq!(response.last_head_sha, "def456");
+    }
+
+    #[tokio::test]
+    async fn local_pr_get_for_branch_falls_through_to_tangled_appview_on_cache_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_test_registry(tmp.path());
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/sh.tangled.repo.getPullForBranch"))
+            .and(query_param("repo", "did:plc:owner"))
+            .and(query_param("branch", "main.fix-appview-codex"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pullId": 12,
+                "sourceBranch": "main.fix-appview-codex",
+                "targetBranch": "main",
+                "ownerDid": "did:plc:owner",
+                "reviewState": "approved",
+                "sourceRev": "def456"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut services = Services::test();
+        services.project_dir = tmp.path().to_path_buf();
+        services.tangled_pr_client = Some(Arc::new(
+            TangledPrClient::new(&server.uri(), "did:plc:owner").unwrap(),
+        ));
+        let handler = FilePRHandler::new(Arc::new(services));
+
+        let response = handler
+            .local_pr_get_for_branch(
+                LocalPrGetForBranchRequest {
+                    branch: "main.fix-appview-codex".to_string(),
+                },
+                &test_ctx("main.fix-appview-codex"),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.found);
+        assert_eq!(response.pr_number, 12);
+        assert_eq!(response.review_state, "approved");
+        assert_eq!(response.last_head_sha, "def456");
     }
 
     fn write_test_registry(project_dir: &std::path::Path) {
