@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Reviewer-as-ephemeral redesign + dedup review_received in worktree_event_watcher (#265)
+- FixesPushed event never reaches reviewer — watcher only dispatches to the leaf's plugin manager (#247)
+- Fix watcher panic when reviewer worktree is detached (get_branch returns empty -> BranchName::from panics) (#262)
 - reviewer-convergence testrunner reports invented failure modes (#280)
 - e2e reviewer-convergence: agents bypass MCP via UDS curl side-channel (#279)
 - mcp-stdio child processes do not write to .exo/logs/sidecar.log (#278)
@@ -33,6 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Advance reviewer detached-HEAD worktree to new PR tip on fixes_pushed event (#264)
 - Improve Tangled repo registration during init (#207)
 - Add TL-only Chainlink timer MCP lifecycle tracking (#196)
 - Block direct sqlite3 access to .chainlink/ in dev role permissionCascade (#162)
@@ -116,6 +120,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - exomonad new: scaffold .tangled/workflows/ci.yml with language-aware framing (#232)
+- Verify and document CHAINLINK_DB propagation to spawned dev-leafs/workers across all agent types (#245)
+- Remove panicking From<&str> impl from validated_string! macro (#263)
 - Add diagnostic logging to mcp_stdio startup + exomonad serve listen() to debug connect-race (#276)
 - Late approval after STUCK declaration — race or stale message? (#275)
 - Single source of STUCK: watcher-only emission (#274)
