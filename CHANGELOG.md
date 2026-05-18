@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Watcher's stuck-detection counts approvals as rounds — successful convergence trips STUCK (#288)
 - Fix reviewer tool contract to exclude parent notification (#286)
 - merge_pr and dev stop-hook crash in local-PR flows: github handler unregistered, no fallback to .exo/prs.json (#283)
 - Reviewer-as-ephemeral redesign + dedup review_received in worktree_event_watcher (#265)
@@ -121,6 +122,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Remove convergence-testrunner from reviewer-convergence E2E (and audit other testrunner companions) (#287)
 - Define Tangled equivalents of github.get_pull_request / get_pull_request_for_branch via knot+spindle (#284)
 - exomonad new: scaffold .tangled/workflows/ci.yml with language-aware framing (#232)
 - Verify and document CHAINLINK_DB propagation to spawned dev-leafs/workers across all agent types (#245)

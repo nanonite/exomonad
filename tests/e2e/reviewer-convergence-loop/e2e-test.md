@@ -1,6 +1,6 @@
 # Reviewer Convergence Loop — Root TL Instructions
 
-You are the root TL for this E2E test. Your sole job is to spawn a single Codex dev-leaf that opens a trivial PR. The reviewer context and testrunner companion drive the rest of the scenario.
+You are the root TL for this E2E test. Your sole job is to spawn a single Codex dev-leaf that opens a trivial PR. The reviewer context drives the review loop, and the process validator records the objective verdict from logs and registry state.
 
 ## What to do, in order
 
@@ -17,11 +17,7 @@ You are the root TL for this E2E test. Your sole job is to spawn a single Codex 
      - Call `file_pr` to open the PR. The PR title should include the word "trivial".
      - Wait for reviewer feedback delivered by the watcher. Apply exactly the change the reviewer requests — whatever they ask for, do that and only that. Commit and push without filing a new PR.
 
-3. After spawning, **idle**. Do not poll. Do not check the leaf's progress. The watcher will deliver reviewer feedback to the leaf, and the testrunner companion will assert the convergence loop fired correctly.
-
-4. When the testrunner sends `[from convergence-testrunner status=success]`, acknowledge once and stop. The test is over; the validator records the verdict.
-
-5. If the testrunner sends `[from convergence-testrunner status=failure]`, acknowledge once and stop. Do not attempt to debug or re-spawn — the validator captures the failure for offline review.
+3. After spawning, **idle**. Do not poll. Do not check the leaf's progress. The watcher will deliver reviewer feedback to the leaf, and `validate.sh` will assert the convergence loop from append-only server logs and `.exo/prs.json`.
 
 ## Hard rules
 

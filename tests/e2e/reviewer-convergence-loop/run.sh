@@ -21,11 +21,10 @@ set -euo pipefail
 #   6. Watcher detects SHA change after ChangesRequested -> fires
 #      fixes_pushed → reviewer_fanout_decision returns DispatchTo →
 #      call_handle_event is invoked for the reviewer.
-#   7. Testrunner inspects the exomonad server log for the canonical
-#      "Fanning out pr_review event to reviewer agent" info line
+#   7. validate.sh inspects the append-only exomonad server log for the
+#      canonical "Fanning out pr_review event to reviewer agent" info line
 #      AND the reviewer's handle_event return line. Both must be present.
-#   8. Testrunner notify_parent with status=success / status=failure.
-#   9. validate.sh records the testrunner verdict into RESULT_FILE.
+#   8. validate.sh writes the objective verdict into RESULT_FILE.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -141,12 +140,6 @@ print(pathlib.Path(sys.argv[1]).read_text().replace('"""', '\\"\\"\\"'))
 PY
 )"
 
-TESTRUNNER_TASK="$(python3 - "$SCRIPT_DIR/testrunner.md" <<'PY'
-import pathlib, sys
-print(pathlib.Path(sys.argv[1]).read_text().replace('"""', '\\"\\"\\"'))
-PY
-)"
-
 cat > .exo/config.toml <<EOF
 default_role = "devswarm"
 wasm_name = "devswarm"
@@ -163,16 +156,6 @@ $ROOT_PROMPT
 [reviewer]
 agent_type = "codex"
 context = [".exo/context/reviewer-checklist.md"]
-
-[[companions]]
-name = "convergence-testrunner"
-agent_type = "claude"
-role = "testrunner"
-command = "claude --dangerously-skip-permissions"
-task = """
-$TESTRUNNER_TASK
-"""
-model = "haiku"
 
 [[companions]]
 name = "convergence-validator"
@@ -203,8 +186,8 @@ unset GITHUB_TOKEN
 unset GITHUB_API_URL
 export CODEX_HOME="$CODEX_HOME_DIR"
 export EXOMONAD_LOG_FORMAT=""
-# Route exomonad server stderr to a known file so the testrunner + validator
-# can grep it for the canonical fan-out info line.
+# Route exomonad server stderr to a known file so validate.sh can grep it for
+# the canonical fan-out info line.
 export EXOMONAD_SERVER_LOG_FILE="$SERVER_LOG"
 echo "  GitHub auth unset"
 echo "  Codex config isolated to $CODEX_HOME"
@@ -225,7 +208,7 @@ echo "    reviewer      -> request a fixture-specified change"
 echo "    leaf          -> push fix commit from injected review feedback"
 echo "    watcher       -> fixes_pushed -> reviewer_fanout_decision"
 echo "                  -> call_handle_event(reviewer_branch, ...)"
-echo "    testrunner    -> assert server log fan-out + reviewer dispatch"
+echo "    validate.sh   -> assert server log fan-out + reviewer dispatch"
 echo "============================================"
 echo ""
 

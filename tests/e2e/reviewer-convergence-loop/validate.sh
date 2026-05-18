@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Process companion for the reviewer-convergence-loop E2E test.
 #
-# Watches for the testrunner's verdict signal, then independently validates
-# objective convergence and MCP transport evidence before writing RESULT_FILE.
+# Watches objective convergence and MCP transport evidence, then writes RESULT_FILE.
 # The harness's run.sh inspects RESULT_FILE for "Failures: 0" to set its exit
 # code.
 #
@@ -13,7 +12,7 @@
 #   $4  SERVER_LOG   — exomonad server log path (also dumped on failure)
 #
 # Lifecycle: runs from `exomonad init` as a process companion. Polls
-# until either the marker file is present or the configured timeout
+# until either the required evidence is present or the configured timeout
 # elapses. Writes RESULT_FILE then exits 0 regardless of verdict — the
 # verdict is communicated through RESULT_FILE, not through this
 # script's exit code.
@@ -25,16 +24,11 @@ SESSION="${2:?SESSION required}"
 RESULT_FILE="${3:?RESULT_FILE required}"
 SERVER_LOG="${4:-}"
 
-MARKER_DIR="$REPO_DIR/.exo/e2e-reviewer-convergence"
-SUCCESS_MARKER="$MARKER_DIR/success"
-FAILURE_MARKER="$MARKER_DIR/failure"
 TIMEOUT_SECS="${E2E_REVIEWER_TIMEOUT:-1500}"  # 25 min default
 POLL_SECS=5
 START=$(date +%s)
 FAILURES=()
 EVIDENCE=()
-
-mkdir -p "$MARKER_DIR"
 
 log() {
     printf '[validate.sh] %s\n' "$*"
@@ -62,6 +56,40 @@ grep_fixed_tree() {
     local needle="$2"
 
     [[ -d "$root" ]] && grep -R -F "$needle" "$root" 2>/dev/null
+}
+
+server_log_sources() {
+    if [[ -n "$SERVER_LOG" && -f "$SERVER_LOG" ]]; then
+        printf '%s\n' "$SERVER_LOG"
+    fi
+
+    find "$REPO_DIR/.exo/logs" -maxdepth 1 -type f \
+        \( -name 'sidecar.log*' -o -name '*.jsonl' -o -name '*.log' \) \
+        -print 2>/dev/null
+}
+
+server_logs_available() {
+    [[ -n "$(server_log_sources)" ]]
+}
+
+grep_fixed_server_logs() {
+    local needle="$1"
+    local file
+
+    while IFS= read -r file; do
+        grep -F "$needle" "$file" 2>/dev/null || true
+    done < <(server_log_sources)
+}
+
+contains_fixed_server_log() {
+    local needle="$1"
+    local file
+
+    while IFS= read -r file; do
+        contains_fixed "$file" "$needle" && return 0
+    done < <(server_log_sources)
+
+    return 1
 }
 
 capture_session_panes() {
@@ -201,32 +229,47 @@ validate_convergence_evidence() {
     fi
 
     review_file="$REPO_DIR/.exo/reviews/pr_${pr}.json"
-    if contains_fixed "$review_file" "changes_requested"; then
-        record_evidence "review file has changes_requested: $review_file"
-    else
-        record_failure "review file missing changes_requested evidence: $review_file"
-    fi
+    contains_fixed "$review_file" "approved" \
+        && record_evidence "review file has final approved state: $review_file" \
+        || record_failure "review file missing final approved state: $review_file"
 
-    if [[ -n "$SERVER_LOG" && -f "$SERVER_LOG" ]]; then
-        grep -F "Fanning out pr_review event to reviewer agent" "$SERVER_LOG" 2>/dev/null \
+    [[ "$(pr_field review_state)" == "approved" ]] \
+        && record_evidence ".exo/prs.json propagated review_state=approved" \
+        || record_failure ".exo/prs.json did not propagate review_state=approved"
+
+    [[ "$(pr_field stuck)" != "True" && "$(pr_field stuck)" != "true" ]] \
+        && record_evidence ".exo/prs.json did not mark the happy path stuck" \
+        || record_failure ".exo/prs.json marked the happy path stuck"
+
+    if server_logs_available; then
+        grep_fixed_server_logs "Fanning out pr_review event to reviewer agent" \
             | grep -F "kind=fixes_pushed" >/dev/null 2>&1 \
             && record_evidence "server log has fixes_pushed reviewer fan-out" \
             || record_failure "server log missing fixes_pushed reviewer fan-out"
 
-        grep -F "[EventDispatch] Calling handle_event for agent 'review-pr-${pr}" "$SERVER_LOG" >/dev/null 2>&1 \
+        contains_fixed_server_log "[EventDispatch] Calling handle_event for agent 'review-pr-${pr}" \
             && record_evidence "server log has reviewer handle_event call for review-pr-${pr}" \
             || record_failure "server log missing reviewer handle_event call for review-pr-${pr}"
 
-        grep -F "[EventDispatch] handle_event returned" "$SERVER_LOG" >/dev/null 2>&1 \
+        contains_fixed_server_log "[EventDispatch] handle_event returned" \
             && record_evidence "server log has handle_event returned" \
             || record_failure "server log missing handle_event returned"
 
-        grep -F "No plugin found for event target" "$SERVER_LOG" 2>/dev/null | grep -F "review-pr-${pr}" >/dev/null 2>&1 \
+        if contains_fixed_server_log '"kind":"merge_ready"' \
+            || contains_fixed_server_log 'kind=merge_ready' \
+            || contains_fixed_server_log '[PR READY]'
+        then
+            record_evidence "server log has merge-ready or PR-ready event"
+        else
+            record_failure "server log missing merge-ready or PR-ready event"
+        fi
+
+        grep_fixed_server_logs "No plugin found for event target" | grep -F "review-pr-${pr}" >/dev/null 2>&1 \
             && record_failure "server log contains No plugin found for event target review-pr-${pr}"
-        grep -F "pr_review event fired but no reviewer is registered" "$SERVER_LOG" 2>/dev/null | grep -F "PR #${pr}" >/dev/null 2>&1 \
+        grep_fixed_server_logs "pr_review event fired but no reviewer is registered" | grep -F "PR #${pr}" >/dev/null 2>&1 \
             && record_failure "server log says pr_review event fired without reviewer for PR #${pr}"
     else
-        record_failure "server log missing at $SERVER_LOG"
+        record_failure "server log missing at $SERVER_LOG and .exo/logs"
     fi
 }
 
@@ -251,6 +294,8 @@ detect_uds_side_channel() {
 }
 
 run_success_assertions() {
+    FAILURES=()
+    EVIDENCE=()
     validate_convergence_evidence
     validate_mcp_stdio_evidence
     detect_uds_side_channel
@@ -281,42 +326,29 @@ write_result() {
                 printf '  - %s\n' "$failure"
             done
         fi
-        if [[ -f "$SUCCESS_MARKER" ]]; then
-            echo "Success marker content:"
-            sed 's/^/  /' "$SUCCESS_MARKER"
-        fi
-        if [[ -f "$FAILURE_MARKER" ]]; then
-            echo "Failure marker content:"
-            sed 's/^/  /' "$FAILURE_MARKER"
-        fi
-        if [[ "$effective_verdict" != "success" && -n "$SERVER_LOG" && -f "$SERVER_LOG" ]]; then
-            echo "Last 100 server log lines:"
-            tail -n 100 "$SERVER_LOG" | sed 's/^/  /'
+        if [[ "$effective_verdict" != "success" ]]; then
+            while IFS= read -r log_file; do
+                echo "Last 100 lines from $log_file:"
+                tail -n 100 "$log_file" | sed 's/^/  /'
+            done < <(server_log_sources)
         fi
     } > "$RESULT_FILE"
 }
 
-log "watching $MARKER_DIR (timeout ${TIMEOUT_SECS}s, poll ${POLL_SECS}s)"
+log "watching objective convergence evidence (timeout ${TIMEOUT_SECS}s, poll ${POLL_SECS}s)"
 
 while true; do
-    if [[ -f "$SUCCESS_MARKER" ]]; then
-        log "success marker observed; running objective validator assertions"
-        run_success_assertions
-        write_result success "testrunner reported success; validate.sh checked convergence, MCP stdio evidence, and UDS side-channel absence"
-        exit 0
-    fi
-    if [[ -f "$FAILURE_MARKER" ]]; then
-        log "failure marker observed"
-        detect_uds_side_channel
-        write_result failure "testrunner reported convergence-loop FAILED — see marker content + server log"
+    run_success_assertions
+    if (( ${#FAILURES[@]} == 0 )); then
+        log "objective convergence evidence complete"
+        write_result success "validate.sh checked convergence, MCP stdio evidence, and UDS side-channel absence"
         exit 0
     fi
 
     NOW=$(date +%s)
     if (( NOW - START >= TIMEOUT_SECS )); then
         log "timed out after ${TIMEOUT_SECS}s"
-        detect_uds_side_channel
-        write_result failure "validator timed out after ${TIMEOUT_SECS}s — testrunner never wrote success/failure marker"
+        write_result failure "validator timed out after ${TIMEOUT_SECS}s waiting for objective convergence evidence"
         exit 0
     fi
 

@@ -512,6 +512,7 @@ where
         let mut removed_prs = Vec::new();
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
+        let mut review_state_updates: Vec<(u64, LocalReviewState)> = Vec::new();
 
         {
             let mut state_guard = self.state.lock().await;
@@ -530,6 +531,9 @@ where
                 let (local_reviews, _local_review_state) = obs_to_review_parts(obs);
                 if pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str()) {
                     head_sha_updates.push((*pr_number, obs.head_sha.clone()));
+                }
+                if pr.review_state != obs.review_state {
+                    review_state_updates.push((*pr_number, obs.review_state.clone()));
                 }
 
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
@@ -614,6 +618,9 @@ where
 
         if !head_sha_updates.is_empty() {
             self.persist_last_head_shas(&head_sha_updates).await?;
+        }
+        if !review_state_updates.is_empty() {
+            self.persist_review_states(&review_state_updates).await?;
         }
 
         for pending in pending_actions {
@@ -787,6 +794,30 @@ where
             if let Some(pr) = registry.prs.get_mut(pr_number) {
                 if pr.last_head_sha.as_deref() != Some(head_sha.as_str()) {
                     pr.last_head_sha = Some(head_sha.clone());
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            write_pr_registry(&self.prs_path, &registry).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn persist_review_states(&self, updates: &[(u64, LocalReviewState)]) -> Result<()> {
+        let mut registry = read_pr_registry(&self.prs_path).await?;
+        let mut changed = false;
+
+        for (pr_number, review_state) in updates {
+            if let Some(pr) = registry.prs.get_mut(pr_number) {
+                if pr.review_state != *review_state {
+                    pr.review_state = review_state.clone();
+                    if matches!(review_state, LocalReviewState::Approved) {
+                        pr.stuck = false;
+                        pr.needs_human_review = false;
+                    }
                     changed = true;
                 }
             }
@@ -1405,11 +1436,14 @@ fn compute_pr_actions(
     let changes_requested = reviews
         .iter()
         .any(|r| r.state == ReviewState::ChangesRequested);
-    if changes_requested && old_state.last_review_state != ReviewState::ChangesRequested {
+    if !approved
+        && changes_requested
+        && old_state.last_review_state != ReviewState::ChangesRequested
+    {
         old_state.last_review_state = ReviewState::ChangesRequested;
         old_state.rounds += 1;
 
-        if old_state.rounds >= max_rounds {
+        if old_state.rounds > max_rounds {
             old_state.stuck = true;
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
@@ -2555,6 +2589,7 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.rounds = 1;
         let reviews = vec![test_review(
             "Still needs work",
             ReviewState::ChangesRequested,
@@ -2573,27 +2608,108 @@ mod tests {
         );
 
         assert!(state.stuck);
-        assert_eq!(state.rounds, 1);
+        assert_eq!(state.rounds, 2);
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WasmEvent {
                 event_type: "pr_review",
                 payload,
-            } if payload["kind"] == "stuck" && payload["rounds"] == 1
+            } if payload["kind"] == "stuck" && payload["rounds"] == 2
         )));
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WriteRegistryStuck {
                 pr_number: 1,
-                rounds: 1,
+                rounds: 2,
             }
         )));
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::NotifyWatcherStuck {
                 pr_number: 1,
-                rounds: 1,
+                rounds: 2,
             }
+        )));
+    }
+
+    #[test]
+    fn test_request_changes_then_approve_does_not_trip_stuck() {
+        let branch = BranchName::try_from_str("main.feat-codex")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
+        let request_changes = vec![test_review(
+            "Add required header",
+            ReviewState::ChangesRequested,
+        )];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &request_changes,
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, _| "Add required header".to_string(),
+            2,
+        );
+
+        assert_eq!(state.rounds, 1);
+        assert!(!state.stuck);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "review_received"
+        )));
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "def456",
+            &[],
+            &[],
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            2,
+        );
+
+        assert_eq!(state.rounds, 1);
+        assert!(!state.stuck);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "fixes_pushed"
+        )));
+
+        let approved = vec![
+            test_review("Add required header", ReviewState::ChangesRequested),
+            test_review("Approved", ReviewState::Approved),
+        ];
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "def456",
+            &[],
+            &approved,
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            2,
+        );
+
+        assert_eq!(state.rounds, 1);
+        assert!(!state.stuck);
+        assert_eq!(state.last_review_state, ReviewState::Approved);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "approved" || payload["kind"] == "merge_ready"
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "stuck"
         )));
     }
 
@@ -3091,6 +3207,48 @@ mod tests {
                 .and_then(|pr| pr.last_head_sha.as_deref()),
             Some("def456")
         );
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_persists_approved_review_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let mut pr = test_pr_entry();
+        pr.review_state = crate::services::file_pr_local::LocalReviewState::PendingReview;
+        pr.stuck = true;
+        pr.needs_human_review = true;
+        let registry = test_registry(pr);
+        write_pr_registry(&watcher.prs_path, &registry)
+            .await
+            .unwrap();
+
+        let mut observations = HashMap::new();
+        observations.insert(
+            1u64,
+            Observation {
+                head_sha: "abc123".to_string(),
+                review_state: crate::services::file_pr_local::LocalReviewState::Approved,
+                comments: vec![],
+                ci_status: CIStatus::Unknown,
+            },
+        );
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        let persisted = read_pr_registry(&watcher.prs_path).await.unwrap();
+        let pr = persisted.prs.get(&1).unwrap();
+        assert_eq!(
+            pr.review_state,
+            crate::services::file_pr_local::LocalReviewState::Approved
+        );
+        assert!(!pr.stuck);
+        assert!(!pr.needs_human_review);
     }
 
     #[tokio::test]
