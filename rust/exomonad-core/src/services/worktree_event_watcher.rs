@@ -2673,6 +2673,34 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_guard_suppresses_after_stuck() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.stuck = true;
+        state.rounds = 2;
+        let reviews = vec![test_review("Late approval", ReviewState::Approved)];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "def456",
+            &[],
+            &reviews,
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            2,
+        );
+
+        assert!(actions.is_empty());
+        assert!(state.stuck);
+        assert!(!state.notified_parent_approved);
+        assert_eq!(state.last_sha, "abc123");
+    }
+
+    #[test]
     fn test_ci_success_after_merge_block_bypasses_stale_guard() {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
