@@ -112,6 +112,104 @@ pub fn init(otlp_endpoint: Option<&str>, service_name: &str) -> LoggingGuard {
     }
 }
 
+pub fn init_mcp_stdio(
+    otlp_endpoint: Option<&str>,
+    service_name: &str,
+    role: &str,
+    name: &str,
+) -> LoggingGuard {
+    let use_json = std::env::var("EXOMONAD_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    let log_dir = PathBuf::from(".exo/logs");
+    let file_ok = std::fs::create_dir_all(&log_dir).is_ok();
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+
+    let mut file_guard = None;
+    let (file_plain, file_json) = if file_ok {
+        let file_name = mcp_stdio_log_file_name(role, name);
+        let appender = tracing_appender::rolling::never(&log_dir, file_name);
+        let (nb, g) = tracing_appender::non_blocking(appender);
+        file_guard = Some(g);
+
+        if use_json {
+            (
+                None,
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(nb)
+                        .with_ansi(false),
+                ),
+            )
+        } else {
+            (
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(nb)
+                        .with_ansi(false),
+                ),
+                None,
+            )
+        }
+    } else {
+        (None, None)
+    };
+
+    let (otel_layer, tracer_provider) = match otlp_endpoint {
+        Some(endpoint) => match build_otel_provider(endpoint, service_name) {
+            Ok(provider) => {
+                use opentelemetry::trace::TracerProvider as _;
+                let tracer = provider.tracer("exomonad");
+                let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+                (Some(layer), Some(provider))
+            }
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    let subscriber = Registry::default()
+        .with(env_filter)
+        .with(file_plain)
+        .with(file_json)
+        .with(otel_layer);
+    set_global(subscriber);
+
+    LoggingGuard {
+        _file_guard: file_guard,
+        tracer_provider,
+    }
+}
+
+fn mcp_stdio_log_file_name(role: &str, name: &str) -> String {
+    let role = sanitize_file_name_segment(role);
+    let name = sanitize_file_name_segment(name);
+    let pid = std::process::id();
+    format!("mcp-stdio-{role}-{name}-{pid}.log")
+}
+
+fn sanitize_file_name_segment(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn set_global(subscriber: impl Subscriber + Send + Sync + 'static) {
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set global tracing subscriber");

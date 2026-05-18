@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- reviewer-convergence testrunner reports invented failure modes (#280)
+- e2e reviewer-convergence: agents bypass MCP via UDS curl side-channel (#279)
+- mcp-stdio child processes do not write to .exo/logs/sidecar.log (#278)
+- Codex dev-leaf MCP initialize handshake fails after spawn (#277)
 - Fix AgentInfo wire compatibility test fixtures (#273)
 - Watcher fan-out: 'No plugin found for agent <branch>' — reviewer plugin lookup keys on birth_branch but registry is keyed by internal_name (#256)
 - last_head_sha on PrEntry is never persisted by the watcher — registry field is dead (#254)
