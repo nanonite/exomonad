@@ -291,6 +291,9 @@ pub async fn merge_pr_local(
         entry.state = PrState::Merged;
     }
     write_pr_registry(&prs_path, &registry).await?;
+    if let Some(issue_id) = pr.chainlink_issue_id {
+        close_chainlink_issue(project_dir, issue_id, pr_number.as_u64()).await;
+    }
 
     info!(
         pr_number = pr_number.as_u64(),
@@ -333,6 +336,38 @@ pub async fn merge_pr_local(
         branch_name: BranchName::try_from_str(head_branch.as_str())
             .expect("validated string input is non-empty"),
     })
+}
+
+async fn close_chainlink_issue(project_dir: &Path, issue_id: u64, pr_number: u64) {
+    let project_dir = project_dir.to_path_buf();
+    let issue_id_arg = issue_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("chainlink")
+            .args(["issue", "close", &issue_id_arg])
+            .current_dir(project_dir)
+            .output()
+    })
+    .await;
+
+    match result {
+        Ok(Ok(output)) if output.status.success() => {
+            info!(issue_id, pr_number, "Closed Chainlink issue for merged PR");
+        }
+        Ok(Ok(output)) => {
+            warn!(
+                issue_id,
+                pr_number,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "Failed to close Chainlink issue for merged PR"
+            );
+        }
+        Ok(Err(err)) => {
+            warn!(issue_id, pr_number, error = %err, "Failed to run chainlink close");
+        }
+        Err(err) => {
+            warn!(issue_id, pr_number, error = %err, "chainlink close task failed");
+        }
+    }
 }
 
 async fn set_merge_blocked_on_ci(prs_path: &Path, pr_number: u64, blocked: bool) -> Result<()> {
@@ -380,6 +415,7 @@ mod tests {
             stuck: false,
             needs_human_review: false,
             merge_blocked_on_ci: false,
+            chainlink_issue_id: None,
         }
     }
 

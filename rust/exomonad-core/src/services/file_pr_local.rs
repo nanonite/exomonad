@@ -9,6 +9,7 @@ use crate::services::git_worktree::GitWorktreeService;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -108,6 +109,8 @@ pub struct PrEntry {
     pub needs_human_review: bool,
     #[serde(default)]
     pub merge_blocked_on_ci: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub chainlink_issue_id: Option<u64>,
 }
 
 /// Local PR registry stored at `.exo/prs.json`.
@@ -217,6 +220,28 @@ fn append_authoring_footer(
     )
 }
 
+async fn active_chainlink_issue_id(working_dir: &std::path::Path) -> Option<u64> {
+    let working_dir = working_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("chainlink")
+            .args(["--json", "session", "status"])
+            .current_dir(working_dir)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value: Value = serde_json::from_slice(&output.stdout).ok()?;
+        value
+            .get("active_issue")
+            .and_then(|issue| issue.get("id"))
+            .and_then(Value::as_u64)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 // ============================================================================
 // Git Helpers (shared with file_pr.rs)
 // ============================================================================
@@ -240,6 +265,7 @@ pub async fn file_pr_local(
 ) -> Result<FilePROutput> {
     let dir = input.working_dir.as_deref().unwrap_or(".");
     let dir_path = std::path::PathBuf::from(dir);
+    let chainlink_issue_id = active_chainlink_issue_id(&dir_path).await;
 
     // Get branch from the agent's working directory
     let git_wt_clone = git_wt.clone();
@@ -286,6 +312,9 @@ pub async fn file_pr_local(
             entry.title = input.title.clone();
             entry.body = append_authoring_footer(&input.body, agent_name, agent_role, &head);
             entry.base_branch = base.to_string();
+            if entry.chainlink_issue_id.is_none() {
+                entry.chainlink_issue_id = chainlink_issue_id;
+            }
         }
 
         write_pr_registry(&prs_path, &registry).await?;
@@ -323,6 +352,7 @@ pub async fn file_pr_local(
         stuck: false,
         needs_human_review: false,
         merge_blocked_on_ci: false,
+        chainlink_issue_id,
     };
 
     let pr_number = PRNumber::new(number);
@@ -457,6 +487,7 @@ mod tests {
                 stuck: false,
                 needs_human_review: false,
                 merge_blocked_on_ci: false,
+                chainlink_issue_id: None,
             },
         );
 
@@ -498,6 +529,7 @@ mod tests {
             stuck: false,
             needs_human_review: false,
             merge_blocked_on_ci: false,
+            chainlink_issue_id: None,
         }
     }
 
@@ -624,6 +656,7 @@ mod tests {
                 stuck: false,
                 needs_human_review: false,
                 merge_blocked_on_ci: false,
+                chainlink_issue_id: None,
             },
         );
         reg.next_number = 2;
@@ -662,6 +695,7 @@ mod tests {
                 stuck: false,
                 needs_human_review: false,
                 merge_blocked_on_ci: false,
+                chainlink_issue_id: None,
             },
         );
 

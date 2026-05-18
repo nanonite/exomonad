@@ -2175,7 +2175,10 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let comments = vec![test_comment("Fix this")];
-        let reviews = vec![test_review("Please address comments", ReviewState::ChangesRequested)];
+        let reviews = vec![test_review(
+            "Please address comments",
+            ReviewState::ChangesRequested,
+        )];
 
         let actions = compute_pr_actions(
             &mut state,
@@ -2192,8 +2195,10 @@ mod tests {
 
         let review_received_count = actions
             .iter()
-            .filter(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-                if payload["kind"] == "review_received"))
+            .filter(|a| {
+                matches!(a, PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "review_received")
+            })
             .count();
         let emit_event_count = actions
             .iter()
@@ -2914,6 +2919,7 @@ mod tests {
             stuck: false,
             needs_human_review: false,
             merge_blocked_on_ci: false,
+            chainlink_issue_id: None,
         }
     }
 
