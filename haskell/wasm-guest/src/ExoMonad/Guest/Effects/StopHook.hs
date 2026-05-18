@@ -89,5 +89,7 @@ getCurrentBranch :: Eff Effects Text
 getCurrentBranch = do
   result <- suspendEffect @GitGetBranch (Git.GetBranchRequest {Git.getBranchRequestWorkingDir = "."})
   case result of
-    Right resp -> pure $ TL.toStrict (Git.getBranchResponseBranch resp)
+    Right resp
+      | Git.getBranchResponseDetached resp -> pure "unknown"
+      | otherwise -> pure $ TL.toStrict (Git.getBranchResponseBranch resp)
     Left _ -> pure "unknown"

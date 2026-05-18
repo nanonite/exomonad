@@ -117,36 +117,41 @@ mergePRCore args = do
           repo = TL.toStrict (Git.getRepoInfoResponseName repoInfo)
           currentBranch = TL.toStrict (Git.getBranchResponseBranch branchResp)
 
-      -- Self-merge guard: agents cannot merge their own PRs
-      prResult <-
-        suspendEffect @GitHubGetPullRequest
-          GH.GetPullRequestRequest
-            { GH.getPullRequestRequestOwner = TL.fromStrict owner,
-              GH.getPullRequestRequestRepo = TL.fromStrict repo,
-              GH.getPullRequestRequestNumber = fromIntegral prNum,
-              GH.getPullRequestRequestIncludeReviews = not force
-            }
-      case prResult of
-        Left err -> do
-          void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("MergePR: failed to fetch PR: " <> T.pack (show err)), Log.errorRequestFields = ""})
-          pure $ Left ("Failed to fetch PR #" <> T.pack (show prNum) <> " for self-merge check. Cannot proceed.")
-        Right resp -> do
-          let mPr = GH.getPullRequestResponsePullRequest resp
-              isSelfMerge = case mPr of
-                Just pr -> TL.toStrict (GH.pullRequestHeadRef pr) == currentBranch
-                Nothing -> False
-          if isSelfMerge
-            then pure $ Left $ "Cannot merge your own PR #" <> T.pack (show prNum) <> ". Your parent agent will merge this PR after reviewing. Call notify_parent instead."
-            else
-              if force
-                then doMerge args
-                else do
-                  let readiness = checkCopilotReadinessFromPR prNum resp
-                  case readiness of
-                    Ready -> doMerge args
-                    NotReady reason -> do
-                      void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("MergePR: blocked: " <> reason), Log.errorRequestFields = ""})
-                      pure $ Left reason
+      if Git.getBranchResponseDetached branchResp
+        then do
+          void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = "MergePR: current worktree is detached; cannot verify self-merge guard", Log.errorRequestFields = ""})
+          pure $ Left ("Cannot merge PR #" <> T.pack (show prNum) <> " from a detached HEAD worktree.")
+        else do
+          -- Self-merge guard: agents cannot merge their own PRs
+          prResult <-
+            suspendEffect @GitHubGetPullRequest
+              GH.GetPullRequestRequest
+                { GH.getPullRequestRequestOwner = TL.fromStrict owner,
+                  GH.getPullRequestRequestRepo = TL.fromStrict repo,
+                  GH.getPullRequestRequestNumber = fromIntegral prNum,
+                  GH.getPullRequestRequestIncludeReviews = not force
+                }
+          case prResult of
+            Left err -> do
+              void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("MergePR: failed to fetch PR: " <> T.pack (show err)), Log.errorRequestFields = ""})
+              pure $ Left ("Failed to fetch PR #" <> T.pack (show prNum) <> " for self-merge check. Cannot proceed.")
+            Right resp -> do
+              let mPr = GH.getPullRequestResponsePullRequest resp
+                  isSelfMerge = case mPr of
+                    Just pr -> TL.toStrict (GH.pullRequestHeadRef pr) == currentBranch
+                    Nothing -> False
+              if isSelfMerge
+                then pure $ Left $ "Cannot merge your own PR #" <> T.pack (show prNum) <> ". Your parent agent will merge this PR after reviewing. Call notify_parent instead."
+                else
+                  if force
+                    then doMerge args
+                    else do
+                      let readiness = checkCopilotReadinessFromPR prNum resp
+                      case readiness of
+                        Ready -> doMerge args
+                        NotReady reason -> do
+                          void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict ("MergePR: blocked: " <> reason), Log.errorRequestFields = ""})
+                          pure $ Left reason
     _ -> do
       void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = "MergePR: failed to get repo info or branch for self-merge check", Log.errorRequestFields = ""})
       pure $ Left ("Failed to determine repo/branch info. Cannot verify self-merge guard for PR #" <> T.pack (show prNum) <> ".")

@@ -52,10 +52,11 @@ impl GitEffects for GitHandler {
             .await
             .effect_err("git")?;
 
-        info!(branch = %branch, "[Git] get_branch complete");
+        info!(branch = ?branch, "[Git] get_branch complete");
+        let detached = branch.is_none();
         Ok(GetBranchResponse {
-            branch: branch.to_string(),
-            detached: false,
+            branch: branch.map(|branch| branch.to_string()).unwrap_or_default(),
+            detached,
         })
     }
 
@@ -224,10 +225,13 @@ impl GitEffects for GitHandler {
             .await
             .effect_err("git")?;
 
-        info!(path = %info.path, branch = %info.branch, "[Git] get_worktree complete");
+        info!(path = %info.path, branch = ?info.branch, "[Git] get_worktree complete");
         Ok(GetWorktreeResponse {
             path: info.path,
-            branch: info.branch.to_string(),
+            branch: info
+                .branch
+                .map(|branch| branch.to_string())
+                .unwrap_or_default(),
             head_commit: String::new(),
             is_linked: false,
         })
