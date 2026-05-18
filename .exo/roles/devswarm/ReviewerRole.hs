@@ -112,9 +112,32 @@ instance Aeson.FromJSON ReviewComment where
       <*> v Aeson..:? "thread_id"
       <*> v Aeson..:? "resolved" Aeson..!= False
 
+data ReviewVerdict = ReviewVerdict
+  { verdictState :: Text,
+    verdictBody :: Text,
+    verdictComments :: [ReviewComment]
+  }
+  deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON ReviewVerdict where
+  toJSON v =
+    object
+      [ "state" .= verdictState v,
+        "body" .= verdictBody v,
+        "comments" .= verdictComments v
+      ]
+
+instance Aeson.FromJSON ReviewVerdict where
+  parseJSON = Aeson.withObject "ReviewVerdict" $ \v ->
+    ReviewVerdict
+      <$> v Aeson..:? "state" Aeson..!= "none"
+      <*> v Aeson..:? "body" Aeson..!= ""
+      <*> v Aeson..:? "comments" Aeson..!= []
+
 data ReviewFile = ReviewFile
   { reviewState :: Text,
-    reviewComments :: [ReviewComment]
+    reviewComments :: [ReviewComment],
+    reviewVerdicts :: [ReviewVerdict]
   }
   deriving (Show, Eq, Generic)
 
@@ -122,7 +145,8 @@ instance Aeson.ToJSON ReviewFile where
   toJSON r =
     object
       [ "state" .= reviewState r,
-        "comments" .= reviewComments r
+        "comments" .= reviewComments r,
+        "verdicts" .= reviewVerdicts r
       ]
 
 instance Aeson.FromJSON ReviewFile where
@@ -130,6 +154,7 @@ instance Aeson.FromJSON ReviewFile where
     ReviewFile
       <$> v Aeson..:? "state" Aeson..!= "none"
       <*> v Aeson..:? "comments" Aeson..!= []
+      <*> v Aeson..:? "verdicts" Aeson..!= []
 
 reviewFilePath :: Int -> Text
 reviewFilePath prNumber = ".exo/reviews/pr_" <> T.pack (show prNumber) <> ".json"
@@ -147,8 +172,26 @@ readExistingReviewFile prNumber = do
   result <- FS.readFile (reviewFilePath prNumber) 0
   pure $ case result of
     Right output ->
-      maybe (ReviewFile "none" []) id (decodeReviewFile (FS.rfoContent output))
-    Left _ -> ReviewFile "none" []
+      maybe emptyReviewFile id (decodeReviewFile (FS.rfoContent output))
+    Left _ -> emptyReviewFile
+
+emptyReviewFile :: ReviewFile
+emptyReviewFile = ReviewFile "none" [] []
+
+appendVerdict :: Text -> Text -> [ReviewComment] -> ReviewFile -> ReviewFile
+appendVerdict state body comments existing =
+  ReviewFile
+    { reviewState = state,
+      reviewComments = comments,
+      reviewVerdicts =
+        reviewVerdicts existing
+          <> [ ReviewVerdict
+                 { verdictState = state,
+                   verdictBody = body,
+                   verdictComments = comments
+                 }
+             ]
+    }
 
 writeReviewFile :: Int -> ReviewFile -> Eff Effects (Either Text Text)
 writeReviewFile prNumber reviewFile = do
@@ -169,7 +212,9 @@ instance MCPTool ReviewerApprovePR where
         ("body", "Concise approval summary")
       ]
   toolHandlerEff args = do
-    result <- writeReviewFile (apPrNumber args) (ReviewFile "approved" [])
+    existing <- readExistingReviewFile (apPrNumber args)
+    let next = appendVerdict "approved" (apBody args) [] existing
+    result <- writeReviewFile (apPrNumber args) next
     case result of
       Left err -> pure $ errorResult err
       Right path -> do
@@ -199,7 +244,9 @@ instance MCPTool ReviewerRequestChanges where
               commentThreadId = Nothing,
               commentResolved = False
             }
-    result <- writeReviewFile (rcPrNumber args) (ReviewFile "changes_requested" [comment])
+    existing <- readExistingReviewFile (rcPrNumber args)
+    let next = appendVerdict "changes_requested" (rcBody args) [comment] existing
+    result <- writeReviewFile (rcPrNumber args) next
     case result of
       Left err -> pure $ errorResult err
       Right path -> do

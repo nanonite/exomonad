@@ -18,7 +18,7 @@ import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), Tra
 import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (HookConfig (..), RoleConfig (..))
-import ReviewerPhase (ReviewerPhase (..))
+import ReviewerPhase (ReviewerEvent, ReviewerPhase (..))
 import ReviewerRole qualified
 import RootRole qualified
 import TLRole qualified
@@ -39,6 +39,11 @@ main = do
   assertReviewerPostToolUseEventName
   assertReviewerCanExitDecisions
   assertDevNeedsHumanDirectionAfterOneFixRound
+  assertReviewApprovedAfterFixRoundTransitionsToApproved
+  assertReviewApprovedFromUnderReviewRoundZero
+  assertFixesPushedFromChangesRequestedYieldsRoundOne
+  assertFixesPushedIncrementsUnderReviewRound
+  assertApprovedMergeReadyTransitionsToDoneAndExits
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -119,17 +124,62 @@ assertReviewerToolList =
 
 assertReviewerCanExitDecisions :: IO ()
 assertReviewerCanExitDecisions = do
-  assertBlocks "reviewing" (canExit (ReviewerReviewing 7))
-  assertClean "done exits cleanly" (canExit ReviewerDone)
-  assertClean "spawned exits cleanly" (canExit ReviewerSpawned)
-  assertClean "posted exits cleanly" (canExit (ReviewerPosted 7))
+  assertBlocks "reviewing" (canExit @ReviewerPhase @ReviewerEvent (ReviewerReviewing 7))
+  assertClean "done exits cleanly" (canExit @ReviewerPhase @ReviewerEvent ReviewerDone)
+  assertClean "spawned exits cleanly" (canExit @ReviewerPhase @ReviewerEvent ReviewerSpawned)
+  assertClean "posted exits cleanly" (canExit @ReviewerPhase @ReviewerEvent (ReviewerPosted 7))
 
 assertDevNeedsHumanDirectionAfterOneFixRound :: IO ()
 assertDevNeedsHumanDirectionAfterOneFixRound = do
   case transition (DevUnderReview 9 1) (ReviewReceivedEv 9 "still wrong") of
     Transitioned (DevNeedsHumanDirection 9 _) -> pure ()
     other -> fail $ "expected DevNeedsHumanDirection after first fix round, got " <> showDevTransition other
-  assertBlocks "needs human direction" (canExit (DevNeedsHumanDirection 9 "still wrong"))
+  assertBlocks "needs human direction" (canExit @DevPhase @DevEvent (DevNeedsHumanDirection 9 "still wrong"))
+
+-- Intended semantics: after the dev has pushed a fix (round_ >= 1), an
+-- *approval* must transition to DevApproved, NOT DevNeedsHumanDirection.
+-- The watcher is responsible for firing ReviewApprovedEv (not
+-- ReviewReceivedEv) when the reviewer's verdict is "approved".
+assertReviewApprovedAfterFixRoundTransitionsToApproved :: IO ()
+assertReviewApprovedAfterFixRoundTransitionsToApproved = do
+  case transition (DevUnderReview 9 1) (ReviewApprovedEv 9) of
+    Transitioned (DevApproved 9) -> pure ()
+    other -> fail $ "expected DevApproved after fix round + approval, got " <> showDevTransition other
+
+-- Approvals on the initial review pass (round 0) should also transition to
+-- DevApproved — the round counter must not gate the approval path.
+assertReviewApprovedFromUnderReviewRoundZero :: IO ()
+assertReviewApprovedFromUnderReviewRoundZero = do
+  case transition (DevUnderReview 9 0) (ReviewApprovedEv 9) of
+    Transitioned (DevApproved 9) -> pure ()
+    other -> fail $ "expected DevApproved from initial review, got " <> showDevTransition other
+
+-- A fix push from DevChangesRequested initializes the round counter to 1,
+-- not 0 — round 0 is the pre-fix initial-review window.
+assertFixesPushedFromChangesRequestedYieldsRoundOne :: IO ()
+assertFixesPushedFromChangesRequestedYieldsRoundOne = do
+  case transition (DevChangesRequested 9 ["needs header"]) (FixesPushedEv 9 "ci") of
+    Transitioned (DevUnderReview 9 1) -> pure ()
+    other -> fail $ "expected DevUnderReview 9 1 after first fix push, got " <> showDevTransition other
+
+-- Subsequent fix pushes increment the round counter monotonically.
+assertFixesPushedIncrementsUnderReviewRound :: IO ()
+assertFixesPushedIncrementsUnderReviewRound = do
+  case transition (DevUnderReview 9 1) (FixesPushedEv 9 "ci") of
+    Transitioned (DevUnderReview 9 2) -> pure ()
+    other -> fail $ "expected DevUnderReview 9 2 after second fix push, got " <> showDevTransition other
+
+-- DevApproved blocks exit until MergeReadyEv arrives; once it arrives, the
+-- dev transitions to DevDone and may exit cleanly. The intermediate
+-- DevApproved -> DevDone transition is the merge-ready signal the TL has
+-- already merged the PR.
+assertApprovedMergeReadyTransitionsToDoneAndExits :: IO ()
+assertApprovedMergeReadyTransitionsToDoneAndExits = do
+  case transition (DevApproved 9) (MergeReadyEv 9 "success" "main.feature") of
+    Transitioned DevDone -> pure ()
+    other -> fail $ "expected DevDone after MergeReadyEv from approved, got " <> showDevTransition other
+  assertBlocks "approved waiting for CI" (canExit @DevPhase @DevEvent (DevApproved 9))
+  assertClean "done exits cleanly" (canExit @DevPhase @DevEvent DevDone)
 
 showDevTransition :: TransitionResult DevPhase -> String
 showDevTransition (Transitioned phase) = "Transitioned " <> show phase

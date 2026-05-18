@@ -67,6 +67,10 @@ enum PendingAction {
         pr_number: u64,
         rounds: u32,
     },
+    WriteRegistryRounds {
+        pr_number: u64,
+        rounds: u32,
+    },
     NotifyWatcherStuck {
         pr_number: u64,
         rounds: u32,
@@ -210,6 +214,18 @@ struct ReviewFile {
     state: String,
     #[serde(default)]
     comments: Vec<ReviewCommentEntry>,
+    #[serde(default)]
+    verdicts: Vec<ReviewVerdictEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReviewVerdictEntry {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    comments: Vec<ReviewCommentEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,6 +247,7 @@ struct Observation {
     head_sha: String,
     review_state: LocalReviewState,
     comments: Vec<LocalReviewComment>,
+    reviews: Vec<LocalReview>,
     ci_status: CIStatus,
 }
 
@@ -418,6 +435,18 @@ where
         Ok(())
     }
 
+    async fn set_pr_rounds(&self, pr_number: u64, rounds: u32) -> anyhow::Result<()> {
+        let mut registry: PrRegistry = read_pr_registry(&self.prs_path).await?;
+        if let Some(pr) = registry.prs.get_mut(&pr_number) {
+            if pr.rounds != rounds {
+                pr.rounds = rounds;
+                write_pr_registry(&self.prs_path, &registry).await?;
+                info!(pr_number, rounds, "Persisted PR review rounds");
+            }
+        }
+        Ok(())
+    }
+
     #[instrument(skip_all, name = "worktree_event_watcher.poll_cycle")]
     async fn poll_cycle(&self) -> Result<()> {
         let registry = match read_pr_registry(&self.prs_path).await {
@@ -453,29 +482,11 @@ where
             let head_sha = git_head_sha(&worktree_path).await.unwrap_or_default();
 
             let review_file = Self::read_review_file(&project_dir, *number).await;
-            let (review_state, comments) = match review_file {
-                Some(rf) => {
-                    let state = match rf.state.as_str() {
-                        "approved" => LocalReviewState::Approved,
-                        "changes_requested" => LocalReviewState::ChangesRequested,
-                        _ => LocalReviewState::PendingReview,
-                    };
-                    let lrc: Vec<LocalReviewComment> = rf
-                        .comments
-                        .into_iter()
-                        .map(|c| LocalReviewComment {
-                            body: c.body,
-                            path: c.path,
-                            diff_hunk: c.diff_hunk,
-                            thread_id: c.thread_id,
-                            resolved: c.resolved,
-                        })
-                        .collect();
-                    (state, lrc)
-                }
+            let (review_state, comments, reviews) = match review_file {
+                Some(rf) => review_file_parts(rf),
                 None => {
                     let state = pr.review_state.clone();
-                    (state, vec![])
+                    (state, vec![], vec![])
                 }
             };
 
@@ -496,6 +507,7 @@ where
                     head_sha,
                     review_state,
                     comments,
+                    reviews,
                     ci_status,
                 },
             );
@@ -769,6 +781,11 @@ where
                     PendingAction::WriteRegistryStuck { pr_number, rounds } => {
                         if let Err(e) = self.set_pr_stuck(pr_number, rounds).await {
                             warn!(pr_number, rounds, error = %e, "Failed to set stuck flag on PR");
+                        }
+                    }
+                    PendingAction::WriteRegistryRounds { pr_number, rounds } => {
+                        if let Err(e) = self.set_pr_rounds(pr_number, rounds).await {
+                            warn!(pr_number, rounds, error = %e, "Failed to persist PR review rounds");
                         }
                     }
                     PendingAction::NotifyWatcherStuck { pr_number, rounds } => {
@@ -1402,10 +1419,22 @@ fn compute_pr_actions(
         old_state.pr_review_cycle_count = comment_count;
     }
 
+    let observed_request_change_rounds = reviews
+        .iter()
+        .filter(|r| r.state == ReviewState::ChangesRequested)
+        .count() as u32;
+
     let approved = reviews
         .iter()
         .any(|r| r.state == ReviewState::Approved || r.body.to_lowercase().contains("approved"));
     if approved && old_state.last_review_state != ReviewState::Approved {
+        if observed_request_change_rounds > old_state.rounds {
+            old_state.rounds = observed_request_change_rounds;
+            pending_actions.push(PendingAction::WriteRegistryRounds {
+                pr_number: pr_number.as_u64(),
+                rounds: old_state.rounds,
+            });
+        }
         old_state.last_review_state = ReviewState::Approved;
         old_state.notified_parent_approved = true;
         old_state.review_approved_at = Some(now);
@@ -1441,7 +1470,11 @@ fn compute_pr_actions(
         && old_state.last_review_state != ReviewState::ChangesRequested
     {
         old_state.last_review_state = ReviewState::ChangesRequested;
-        old_state.rounds += 1;
+        old_state.rounds = if observed_request_change_rounds > old_state.rounds {
+            observed_request_change_rounds
+        } else {
+            old_state.rounds + 1
+        };
 
         if old_state.rounds > max_rounds {
             old_state.stuck = true;
@@ -1462,6 +1495,10 @@ fn compute_pr_actions(
                 rounds: old_state.rounds,
             });
         } else {
+            pending_actions.push(PendingAction::WriteRegistryRounds {
+                pr_number: pr_number.as_u64(),
+                rounds: old_state.rounds,
+            });
             let message = format_message(comments, reviews);
             pending_actions.push(PendingAction::EmitEvent {
                 status: "copilot_review".to_string(),
@@ -1531,12 +1568,98 @@ fn compute_pr_actions(
     pending_actions
 }
 
+fn review_file_parts(
+    rf: ReviewFile,
+) -> (LocalReviewState, Vec<LocalReviewComment>, Vec<LocalReview>) {
+    let state = local_review_state_from_str(&rf.state);
+    let comments: Vec<LocalReviewComment> = rf
+        .comments
+        .into_iter()
+        .map(review_comment_entry_to_local)
+        .collect();
+    let reviews = if rf.verdicts.is_empty() {
+        legacy_reviews_from_state(&state, &comments)
+    } else {
+        rf.verdicts
+            .into_iter()
+            .map(|verdict| {
+                let body = if verdict.body.is_empty() {
+                    format_review_message(
+                        &verdict
+                            .comments
+                            .iter()
+                            .cloned()
+                            .map(review_comment_entry_to_local)
+                            .collect::<Vec<_>>(),
+                        &[],
+                    )
+                } else {
+                    verdict.body
+                };
+                LocalReview {
+                    body,
+                    state: review_state_from_str(&verdict.state),
+                }
+            })
+            .collect()
+    };
+
+    (state, comments, reviews)
+}
+
+fn review_comment_entry_to_local(c: ReviewCommentEntry) -> LocalReviewComment {
+    LocalReviewComment {
+        body: c.body,
+        path: c.path,
+        diff_hunk: c.diff_hunk,
+        thread_id: c.thread_id,
+        resolved: c.resolved,
+    }
+}
+
+fn local_review_state_from_str(state: &str) -> LocalReviewState {
+    match state {
+        "approved" => LocalReviewState::Approved,
+        "changes_requested" => LocalReviewState::ChangesRequested,
+        _ => LocalReviewState::PendingReview,
+    }
+}
+
+fn review_state_from_str(state: &str) -> ReviewState {
+    match state {
+        "approved" => ReviewState::Approved,
+        "changes_requested" => ReviewState::ChangesRequested,
+        _ => ReviewState::None,
+    }
+}
+
+fn legacy_reviews_from_state(
+    state: &LocalReviewState,
+    comments: &[LocalReviewComment],
+) -> Vec<LocalReview> {
+    comments
+        .iter()
+        .map(|comment| LocalReview {
+            body: comment.body.clone(),
+            state: match state {
+                LocalReviewState::Approved => ReviewState::Approved,
+                LocalReviewState::ChangesRequested => ReviewState::ChangesRequested,
+                LocalReviewState::PendingReview => ReviewState::None,
+            },
+        })
+        .collect()
+}
+
 fn obs_to_review_parts(obs: &Observation) -> (Vec<LocalReview>, ReviewState) {
     let state = match obs.review_state {
         LocalReviewState::Approved => ReviewState::Approved,
         LocalReviewState::ChangesRequested => ReviewState::ChangesRequested,
         LocalReviewState::PendingReview => ReviewState::None,
     };
+
+    if !obs.reviews.is_empty() {
+        return (obs.reviews.clone(), state);
+    }
 
     let mut reviews: Vec<LocalReview> = obs
         .comments
@@ -2714,6 +2837,46 @@ mod tests {
     }
 
     #[test]
+    fn test_request_changes_history_preserves_round_when_poll_sees_only_approval() {
+        let branch = BranchName::try_from_str("main.feat-codex")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Codex, "def456");
+        let reviews = vec![
+            test_review("Add required header", ReviewState::ChangesRequested),
+            test_review("Approved", ReviewState::Approved),
+        ];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "def456",
+            &[],
+            &reviews,
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            2,
+        );
+
+        assert_eq!(state.rounds, 1);
+        assert!(!state.stuck);
+        assert_eq!(state.last_review_state, ReviewState::Approved);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WriteRegistryRounds {
+                pr_number: 1,
+                rounds: 1,
+            }
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "approved" || payload["kind"] == "merge_ready"
+        )));
+    }
+
+    #[test]
     fn test_ci_change_fires_event() {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
@@ -2953,6 +3116,7 @@ mod tests {
             head_sha: "abc".into(),
             review_state: LocalReviewState::PendingReview,
             comments: vec![],
+            reviews: vec![],
             ci_status: CIStatus::Unknown,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
@@ -2966,6 +3130,7 @@ mod tests {
             head_sha: "abc".into(),
             review_state: LocalReviewState::Approved,
             comments: vec![],
+            reviews: vec![],
             ci_status: CIStatus::Unknown,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
@@ -2979,6 +3144,7 @@ mod tests {
             head_sha: "abc".into(),
             review_state: LocalReviewState::ChangesRequested,
             comments: vec![],
+            reviews: vec![],
             ci_status: CIStatus::Unknown,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
@@ -3082,6 +3248,37 @@ mod tests {
         assert_eq!(rf.comments[0].body, "Needs more tests");
     }
 
+    #[test]
+    fn test_review_file_with_verdict_history_counts_request_changes() {
+        let json = r#"{
+            "state": "approved",
+            "comments": [],
+            "verdicts": [
+                {
+                    "state": "changes_requested",
+                    "body": "Needs tests",
+                    "comments": [{"body": "Add coverage", "path": "src/lib.rs"}]
+                },
+                {"state": "approved", "body": "LGTM", "comments": []}
+            ]
+        }"#;
+        let rf: ReviewFile = serde_json::from_str(json).unwrap();
+        let (state, comments, reviews) = review_file_parts(rf);
+
+        assert_eq!(state, LocalReviewState::Approved);
+        assert!(comments.is_empty());
+        assert_eq!(
+            reviews
+                .iter()
+                .filter(|review| review.state == ReviewState::ChangesRequested)
+                .count(),
+            1
+        );
+        assert!(reviews
+            .iter()
+            .any(|review| review.state == ReviewState::Approved && review.body == "LGTM"));
+    }
+
     // ---------------------------------------------------------------------------
     // Reviewer spawner tests
     // ---------------------------------------------------------------------------
@@ -3141,6 +3338,7 @@ mod tests {
             head_sha: sha.to_string(),
             review_state: crate::services::file_pr_local::LocalReviewState::PendingReview,
             comments: vec![],
+            reviews: vec![],
             ci_status: CIStatus::Unknown,
         }
     }
@@ -3232,6 +3430,7 @@ mod tests {
                 head_sha: "abc123".to_string(),
                 review_state: crate::services::file_pr_local::LocalReviewState::Approved,
                 comments: vec![],
+                reviews: vec![],
                 ci_status: CIStatus::Unknown,
             },
         );
