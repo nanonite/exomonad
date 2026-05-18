@@ -101,6 +101,10 @@ pub trait HasCiStatusMap: Send + Sync {
 
 /// Spawns a reviewer agent for a local PR. Implemented by `AgentControlService`.
 ///
+/// Reviewer creation is owned by the local PR watcher. TL/root roles spawn
+/// dev leaves and workers, but they must not spawn reviewer agents directly.
+/// This keeps review rounds driven by observable PR state instead of TL prompts.
+///
 /// Decouples `WorktreeEventWatcher` from the concrete `AgentControlService` type.
 #[async_trait::async_trait]
 pub trait ReviewerSpawner: Send + Sync {
