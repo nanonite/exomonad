@@ -92,6 +92,8 @@ pub struct PrEntry {
     pub last_review_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_head_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approved_at_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewer_agent: Option<String>,
     /// Birth branch of the reviewer agent assigned to this PR (e.g., `review-pr-12`).
@@ -346,6 +348,7 @@ pub async fn file_pr_local(
         review_state: LocalReviewState::PendingReview,
         last_review_at: None,
         last_head_sha: None,
+        approved_at_sha: None,
         reviewer_agent: None,
         reviewer_birth_branch: None,
         rounds: 0,
@@ -464,6 +467,25 @@ mod tests {
     }
 
     #[test]
+    fn test_pr_entry_deserializes_missing_approved_at_sha() {
+        let json = serde_json::json!({
+            "number": 1,
+            "head_branch": "main.feat-gemini",
+            "base_branch": "main",
+            "title": "Test PR",
+            "body": "Test body",
+            "author_agent": "feat-gemini",
+            "author_role": "dev",
+            "created_at": Utc::now(),
+            "state": "open",
+            "review_state": "approved",
+            "last_head_sha": "abc123"
+        });
+        let pr: PrEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(pr.approved_at_sha, None);
+    }
+
+    #[test]
     fn test_find_by_branch() {
         let mut reg = PrRegistry::default();
         reg.prs.insert(
@@ -481,6 +503,7 @@ mod tests {
                 review_state: LocalReviewState::PendingReview,
                 last_review_at: None,
                 last_head_sha: None,
+                approved_at_sha: None,
                 reviewer_agent: None,
                 reviewer_birth_branch: None,
                 rounds: 0,
@@ -523,6 +546,7 @@ mod tests {
             review_state: LocalReviewState::PendingReview,
             last_review_at: None,
             last_head_sha: None,
+            approved_at_sha: None,
             reviewer_agent: reviewer_agent.map(String::from),
             reviewer_birth_branch: reviewer_birth_branch.map(String::from),
             rounds: 0,
@@ -650,6 +674,7 @@ mod tests {
                 review_state: LocalReviewState::PendingReview,
                 last_review_at: None,
                 last_head_sha: None,
+                approved_at_sha: None,
                 reviewer_agent: None,
                 reviewer_birth_branch: None,
                 rounds: 0,
@@ -689,6 +714,7 @@ mod tests {
                 review_state: LocalReviewState::PendingReview,
                 last_review_at: None,
                 last_head_sha: None,
+                approved_at_sha: None,
                 reviewer_agent: None,
                 reviewer_birth_branch: None,
                 rounds: 0,

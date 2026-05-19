@@ -87,17 +87,14 @@ pub trait HasMutexRegistry: Send + Sync {
 pub trait HasGitHubClient: Send + Sync {
     fn github_client(&self) -> Option<&Arc<GitHubClient>>;
 }
+pub type CiStatusKey = (crate::domain::BranchName, String);
+pub type CiStatusMap = std::collections::HashMap<CiStatusKey, crate::domain::CIStatus>;
+
 pub trait HasGitWorktreeService: Send + Sync {
     fn git_worktree_service(&self) -> &Arc<GitWorktreeService>;
 }
 pub trait HasCiStatusMap: Send + Sync {
-    fn ci_status_map(
-        &self,
-    ) -> &Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>,
-        >,
-    >;
+    fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<CiStatusMap>>;
     fn spindle_url(&self) -> Option<&str>;
 }
 pub trait HasTangledPrClient: Send + Sync {
@@ -141,13 +138,9 @@ pub struct Services {
     /// `None` means let opencode pick.
     pub opencode_worker_model: Option<String>,
     /// Shared CI status map updated by the spindle WebSocket subscriber.
-    /// Keyed by branch name; `None` values mean no status received yet.
+    /// Keyed by `(branch, sha)` so stale CI from an older push cannot satisfy a newer PR head.
     /// Shared with `WorktreeEventWatcher` so both the watcher and merge gate read from the same map.
-    pub ci_status_map: Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>,
-        >,
-    >,
+    pub ci_status_map: Arc<tokio::sync::RwLock<CiStatusMap>>,
     /// Tangled spindle URL (`ws://...`). Present when spindle CI is configured.
     pub spindle_url: Option<String>,
     /// Optional Tangled appview reader used as a fallback when `.exo/prs.json`
@@ -218,13 +211,7 @@ impl HasGitWorktreeService for Services {
     }
 }
 impl HasCiStatusMap for Services {
-    fn ci_status_map(
-        &self,
-    ) -> &Arc<
-        tokio::sync::RwLock<
-            std::collections::HashMap<crate::domain::BranchName, crate::domain::CIStatus>,
-        >,
-    > {
+    fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<CiStatusMap>> {
         &self.ci_status_map
     }
     fn spindle_url(&self) -> Option<&str> {

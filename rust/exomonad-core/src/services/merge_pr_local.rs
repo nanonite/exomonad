@@ -12,8 +12,8 @@ use crate::services::file_pr_local::{
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::merge_pr::MergePROutput;
 pub use crate::services::review_policy::ReviewPolicy;
+use crate::services::CiStatusMap;
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -255,7 +255,7 @@ pub async fn merge_pr_local(
     merger_agent: &AgentName,
     policy: &ReviewPolicy,
     spindle_url: Option<&str>,
-    ci_status_map: &Arc<RwLock<HashMap<BranchName, CIStatus>>>,
+    ci_status_map: &Arc<RwLock<CiStatusMap>>,
 ) -> Result<MergePROutput> {
     let prs_path = project_dir.join(".exo/prs.json");
 
@@ -278,17 +278,30 @@ pub async fn merge_pr_local(
         "Merging local PR"
     );
 
-    // Resolve CI status for Gate 7: when spindle is configured, missing status blocks the merge.
+    // Resolve CI status for Gate 7: when spindle is configured, the approved SHA must pass.
     let ci_status = if spindle_url.is_some() {
         let branch = BranchName::try_from_str(head_branch.as_str())
             .expect("validated string input is non-empty");
-        let status = ci_status_map
-            .read()
-            .await
-            .get(&branch)
-            .copied()
-            .unwrap_or(CIStatus::Unknown);
-        info!(branch = %head_branch, status = ?status, "CI gate check (spindle configured)");
+        let approved_sha = pr
+            .approved_at_sha
+            .as_deref()
+            .or(pr.last_head_sha.as_deref());
+        let status = if let Some(sha) = approved_sha {
+            ci_status_map
+                .read()
+                .await
+                .get(&(branch.clone(), sha.to_string()))
+                .copied()
+                .unwrap_or(CIStatus::Unknown)
+        } else {
+            CIStatus::Unknown
+        };
+        info!(
+            branch = %head_branch,
+            approved_sha = approved_sha.unwrap_or("<missing>"),
+            status = ?status,
+            "CI gate check for reviewer-approved SHA (spindle configured)"
+        );
         Some(status)
     } else {
         None
@@ -485,6 +498,7 @@ mod tests {
     use crate::domain::AgentName;
     use crate::services::file_pr_local::{LocalReviewState, PrEntry, PrState};
     use chrono::Utc;
+    use std::collections::HashMap;
     use std::process::Command;
 
     fn test_entry(number: u64, head: &str, base: &str) -> PrEntry {
@@ -501,6 +515,7 @@ mod tests {
             review_state: LocalReviewState::PendingReview,
             last_review_at: None,
             last_head_sha: None,
+            approved_at_sha: None,
             reviewer_agent: None,
             reviewer_birth_branch: None,
             rounds: 0,
@@ -1009,8 +1024,7 @@ mod tests {
         let project_dir = repo.work.path();
         write_approved_pr_registry(project_dir).await;
         let git_wt = Arc::new(GitWorktreeService::new(project_dir.to_path_buf()));
-        let ci_map: Arc<RwLock<HashMap<BranchName, CIStatus>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let ci_map: Arc<RwLock<CiStatusMap>> = Arc::new(RwLock::new(HashMap::new()));
 
         let output = merge_pr_local(
             PRNumber::new(1),
@@ -1138,14 +1152,15 @@ mod tests {
         let mut pr = test_entry(1, "main.feat-gemini", "main");
         pr.review_state = LocalReviewState::Approved;
         pr.rounds = 1;
+        pr.last_head_sha = Some("abc123".into());
+        pr.approved_at_sha = Some("abc123".into());
         registry.prs.insert(1, pr);
         crate::services::file_pr_local::write_pr_registry(&prs_path, &registry)
             .await
             .unwrap();
 
         let git_wt = Arc::new(GitWorktreeService::new(tmp.path().to_path_buf()));
-        let ci_map: Arc<RwLock<HashMap<BranchName, CIStatus>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let ci_map: Arc<RwLock<CiStatusMap>> = Arc::new(RwLock::new(HashMap::new()));
 
         let result = merge_pr_local(
             PRNumber::new(1),
@@ -1180,6 +1195,8 @@ mod tests {
         let mut pr = test_entry(1, "main.feat-gemini", "main");
         pr.review_state = LocalReviewState::Approved;
         pr.rounds = 1;
+        pr.last_head_sha = Some("abc123".into());
+        pr.approved_at_sha = Some("abc123".into());
         registry.prs.insert(1, pr);
         crate::services::file_pr_local::write_pr_registry(&prs_path, &registry)
             .await
@@ -1188,8 +1205,11 @@ mod tests {
         let git_wt = Arc::new(GitWorktreeService::new(tmp.path().to_path_buf()));
         let mut map = HashMap::new();
         map.insert(
-            BranchName::try_from_str("main.feat-gemini")
-                .expect("literal validated string is non-empty"),
+            (
+                BranchName::try_from_str("main.feat-gemini")
+                    .expect("literal validated string is non-empty"),
+                "abc123".to_string(),
+            ),
             CIStatus::Success,
         );
         let ci_map = Arc::new(RwLock::new(map));
@@ -1216,6 +1236,51 @@ mod tests {
             ),
             Err(_) => {} // git ops fail without a real repo — that's expected
         }
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_local_ci_gate_rejects_stale_sha_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prs_path = tmp.path().join(".exo/prs.json");
+        std::fs::create_dir_all(tmp.path().join(".exo")).unwrap();
+        let mut registry = crate::services::file_pr_local::PrRegistry::default();
+        let mut pr = test_entry(1, "main.feat-gemini", "main");
+        pr.review_state = LocalReviewState::Approved;
+        pr.rounds = 1;
+        pr.last_head_sha = Some("new456".into());
+        pr.approved_at_sha = Some("new456".into());
+        registry.prs.insert(1, pr);
+        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry)
+            .await
+            .unwrap();
+
+        let git_wt = Arc::new(GitWorktreeService::new(tmp.path().to_path_buf()));
+        let mut map = HashMap::new();
+        map.insert(
+            (
+                BranchName::try_from_str("main.feat-gemini")
+                    .expect("literal validated string is non-empty"),
+                "old123".to_string(),
+            ),
+            CIStatus::Success,
+        );
+        let ci_map = Arc::new(RwLock::new(map));
+
+        let result = merge_pr_local(
+            PRNumber::new(1),
+            &MergeStrategy::Squash,
+            tmp.path(),
+            git_wt,
+            &reviewer_agent(),
+            &standard_policy(),
+            Some("ws://localhost:6555"),
+            &ci_map,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.success);
+        assert!(result.message.contains("CI"));
     }
 
     // ── Registry integration test (no git) ─────────────────────

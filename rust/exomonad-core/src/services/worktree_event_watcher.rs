@@ -6,8 +6,8 @@ use crate::services::file_pr_local::{
 };
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
-    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasProjectDir, HasTeamRegistry,
-    ReviewerSpawner,
+    CiStatusKey, CiStatusMap, HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue,
+    HasProjectDir, HasTeamRegistry, ReviewerSpawner,
 };
 use anyhow::{Context, Result};
 use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
@@ -324,6 +324,7 @@ struct Observation {
 #[derive(Debug, Clone)]
 struct PipelineContext {
     branch_name: BranchName,
+    head_sha: String,
     pr_number: Option<u64>,
     agent_name: Option<String>,
 }
@@ -344,7 +345,7 @@ pub struct WorktreeEventWatcher<C> {
     plugins: Option<PluginMap>,
     policy: ReviewPolicy,
     /// Shared CI status map updated by the spindle subscriber (branch → CIStatus).
-    ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
+    ci_status_map: Arc<RwLock<CiStatusMap>>,
     /// WebSocket URL of the Tangled knot (for pipeline→branch mapping).
     knot_url: Option<String>,
     /// WebSocket URL of the Tangled spindle (for PipelineStatus events).
@@ -420,7 +421,7 @@ where
     /// Use a shared CI status map (e.g. from `Services`) instead of the internal one.
     ///
     /// Call this so the merge handler and the watcher read from the same map.
-    pub fn with_ci_status_map(mut self, map: Arc<RwLock<HashMap<BranchName, CIStatus>>>) -> Self {
+    pub fn with_ci_status_map(mut self, map: Arc<RwLock<CiStatusMap>>) -> Self {
         self.ci_status_map = map;
         self
     }
@@ -429,7 +430,7 @@ where
         self.spindle_url.is_some()
     }
 
-    async fn observed_ci_status(&self, branch: &BranchName) -> CIStatus {
+    async fn observed_ci_status(&self, branch: &BranchName, head_sha: &str) -> CIStatus {
         if !self.policy.ci.gate.enabled(self.ci_source_configured()) {
             return CIStatus::Neutral;
         }
@@ -437,7 +438,7 @@ where
         self.ci_status_map
             .read()
             .await
-            .get(branch)
+            .get(&ci_status_key(branch, head_sha))
             .copied()
             .unwrap_or(CIStatus::Unknown)
     }
@@ -587,7 +588,7 @@ where
 
             let branch = BranchName::try_from_str(pr.head_branch.as_str())
                 .expect("validated string input is non-empty");
-            let ci_status = self.observed_ci_status(&branch).await;
+            let ci_status = self.observed_ci_status(&branch, &head_sha).await;
 
             observations.insert(
                 *number,
@@ -614,7 +615,7 @@ where
         let mut removed_prs = Vec::new();
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
-        let mut review_state_updates: Vec<(u64, LocalReviewState)> = Vec::new();
+        let mut review_state_updates: Vec<(u64, LocalReviewState, String)> = Vec::new();
 
         {
             let mut state_guard = self.state.lock().await;
@@ -635,7 +636,11 @@ where
                     head_sha_updates.push((*pr_number, obs.head_sha.clone()));
                 }
                 if pr.review_state != obs.review_state {
-                    review_state_updates.push((*pr_number, obs.review_state.clone()));
+                    review_state_updates.push((
+                        *pr_number,
+                        obs.review_state.clone(),
+                        obs.head_sha.clone(),
+                    ));
                 }
 
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
@@ -925,6 +930,7 @@ where
             if let Some(pr) = registry.prs.get_mut(pr_number) {
                 if pr.last_head_sha.as_deref() != Some(head_sha.as_str()) {
                     pr.last_head_sha = Some(head_sha.clone());
+                    pr.approved_at_sha = None;
                     changed = true;
                 }
             }
@@ -937,17 +943,23 @@ where
         Ok(())
     }
 
-    async fn persist_review_states(&self, updates: &[(u64, LocalReviewState)]) -> Result<()> {
+    async fn persist_review_states(
+        &self,
+        updates: &[(u64, LocalReviewState, String)],
+    ) -> Result<()> {
         let mut registry = read_pr_registry(&self.prs_path).await?;
         let mut changed = false;
 
-        for (pr_number, review_state) in updates {
+        for (pr_number, review_state, head_sha) in updates {
             if let Some(pr) = registry.prs.get_mut(pr_number) {
                 if pr.review_state != *review_state {
                     pr.review_state = review_state.clone();
                     if matches!(review_state, LocalReviewState::Approved) {
+                        pr.approved_at_sha = Some(head_sha.clone());
                         pr.stuck = false;
                         pr.needs_human_review = false;
+                    } else {
+                        pr.approved_at_sha = None;
                     }
                     changed = true;
                 }
@@ -2063,7 +2075,7 @@ struct TangledStreamEvent {
 async fn run_ci_subscriber(
     knot_url: Option<String>,
     spindle_url: Option<String>,
-    ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
+    ci_status_map: Arc<RwLock<CiStatusMap>>,
     worktrees_dir: std::path::PathBuf,
     repo_name: Option<String>,
 ) {
@@ -2182,10 +2194,15 @@ async fn run_knot_subscriber(
                                     if !pipeline_matches_repo(&ev.event, repo_name.as_deref()) {
                                         continue;
                                     }
-                                    if let Some(branch_name) = extract_pipeline_branch(&ev.event) {
-                                        let context =
-                                            lookup_pipeline_context(&worktrees_dir, branch_name)
-                                                .await;
+                                    if let Some((branch_name, head_sha)) =
+                                        extract_pipeline_branch_and_sha(&ev.event)
+                                    {
+                                        let context = lookup_pipeline_context(
+                                            &worktrees_dir,
+                                            branch_name,
+                                            head_sha,
+                                        )
+                                        .await;
                                         let worktree =
                                             worktrees_dir.join(context.branch_name.as_str());
                                         info!(
@@ -2193,6 +2210,7 @@ async fn run_knot_subscriber(
                                             branch = %context.branch_name,
                                             pr_number = context.pr_number,
                                             agent_name = context.agent_name.as_deref().unwrap_or("unknown"),
+                                            head_sha = %context.head_sha,
                                             worktree = %worktree.display(),
                                             "Spindle: CI initiated for worktree"
                                         );
@@ -2237,7 +2255,7 @@ fn pipeline_matches_repo(event: &serde_json::Value, expected_repo: Option<&str>)
 async fn run_spindle_subscriber(
     spindle_url: String,
     pipeline_map: Arc<RwLock<HashMap<String, PipelineContext>>>,
-    ci_status_map: Arc<RwLock<HashMap<BranchName, CIStatus>>>,
+    ci_status_map: Arc<RwLock<CiStatusMap>>,
     worktrees_dir: std::path::PathBuf,
     ready_tx: mpsc::Sender<CiSubscriberKind>,
 ) {
@@ -2271,10 +2289,13 @@ async fn run_spindle_subscriber(
                                                 worktree = %worktree.display(),
                                                 "Spindle: CI status updated"
                                             );
-                                            ci_status_map
-                                                .write()
-                                                .await
-                                                .insert(context.branch_name, ci);
+                                            ci_status_map.write().await.insert(
+                                                ci_status_key(
+                                                    &context.branch_name,
+                                                    &context.head_sha,
+                                                ),
+                                                ci,
+                                            );
                                         } else {
                                             info!(rkey = %rkey, status = %status, "Spindle: CI event received but no branch mapping for rkey yet (pipeline may not have registered)");
                                         }
@@ -2300,13 +2321,18 @@ async fn run_spindle_subscriber(
     }
 }
 
-async fn lookup_pipeline_context(worktrees_dir: &Path, branch_name: BranchName) -> PipelineContext {
+async fn lookup_pipeline_context(
+    worktrees_dir: &Path,
+    branch_name: BranchName,
+    head_sha: String,
+) -> PipelineContext {
     let Some(prs_path) = worktrees_dir
         .parent()
         .map(|exo_dir| exo_dir.join("prs.json"))
     else {
         return PipelineContext {
             branch_name,
+            head_sha,
             pr_number: None,
             agent_name: None,
         };
@@ -2317,11 +2343,13 @@ async fn lookup_pipeline_context(worktrees_dir: &Path, branch_name: BranchName) 
             .find_by_branch(&branch_name)
             .map(|pr| PipelineContext {
                 branch_name: branch_name.clone(),
+                head_sha: head_sha.clone(),
                 pr_number: Some(pr.number),
                 agent_name: Some(pr.author_agent.clone()),
             })
             .unwrap_or(PipelineContext {
                 branch_name,
+                head_sha,
                 pr_number: None,
                 agent_name: None,
             }),
@@ -2334,6 +2362,7 @@ async fn lookup_pipeline_context(worktrees_dir: &Path, branch_name: BranchName) 
             );
             PipelineContext {
                 branch_name,
+                head_sha,
                 pr_number: None,
                 agent_name: None,
             }
@@ -2373,20 +2402,25 @@ fn normalize_tangled_event_ws_url(input: &str) -> String {
     }
 }
 
-/// Extracts the branch name from a `sh.tangled.pipeline` event payload.
-/// Returns `None` if the trigger is not a push or has no ref field.
-fn extract_pipeline_branch(event: &serde_json::Value) -> Option<BranchName> {
-    let ref_str = event
-        .get("triggerMetadata")
-        .and_then(|tm| tm.get("push"))
-        .and_then(|push| push.get("ref"))
-        .and_then(|r| r.as_str())?;
+fn ci_status_key(branch: &BranchName, head_sha: &str) -> CiStatusKey {
+    (branch.clone(), head_sha.to_string())
+}
+
+/// Extracts the branch name and head SHA from a `sh.tangled.pipeline` event payload.
+/// Returns `None` if the trigger is not a push or is missing the ref/SHA fields.
+fn extract_pipeline_branch_and_sha(event: &serde_json::Value) -> Option<(BranchName, String)> {
+    let push = event.get("triggerMetadata").and_then(|tm| tm.get("push"))?;
+    let ref_str = push.get("ref").and_then(|r| r.as_str())?;
+    let head_sha = push.get("newSha").and_then(|sha| sha.as_str())?;
 
     let branch = ref_str.strip_prefix("refs/heads/").unwrap_or(ref_str);
-    if branch.is_empty() {
+    if branch.is_empty() || head_sha.is_empty() {
         None
     } else {
-        Some(BranchName::try_from_str(branch).expect("validated string input is non-empty"))
+        Some((
+            BranchName::try_from_str(branch).expect("validated string input is non-empty"),
+            head_sha.to_string(),
+        ))
     }
 }
 
@@ -2880,7 +2914,10 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
 
-        assert_eq!(watcher.observed_ci_status(&branch).await, CIStatus::Neutral);
+        assert_eq!(
+            watcher.observed_ci_status(&branch, "abc123").await,
+            CIStatus::Neutral
+        );
     }
 
     #[tokio::test]
@@ -2893,7 +2930,10 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
 
-        assert_eq!(watcher.observed_ci_status(&branch).await, CIStatus::Unknown);
+        assert_eq!(
+            watcher.observed_ci_status(&branch, "abc123").await,
+            CIStatus::Unknown
+        );
     }
 
     #[test]
@@ -3798,6 +3838,7 @@ mod tests {
             review_state: crate::services::file_pr_local::LocalReviewState::PendingReview,
             last_review_at: None,
             last_head_sha: None,
+            approved_at_sha: None,
             reviewer_agent: None,
             reviewer_birth_branch: None,
             rounds: 0,
@@ -3936,8 +3977,76 @@ mod tests {
             pr.review_state,
             crate::services::file_pr_local::LocalReviewState::Approved
         );
+        assert_eq!(pr.approved_at_sha.as_deref(), Some("abc123"));
         assert!(!pr.stuck);
         assert!(!pr.needs_human_review);
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_clears_approved_sha_on_new_head() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let mut pr = test_pr_entry();
+        pr.review_state = crate::services::file_pr_local::LocalReviewState::Approved;
+        pr.last_head_sha = Some("abc123".to_string());
+        pr.approved_at_sha = Some("abc123".to_string());
+        let registry = test_registry(pr);
+        write_pr_registry(&watcher.prs_path, &registry)
+            .await
+            .unwrap();
+
+        let mut observations = HashMap::new();
+        observations.insert(
+            1u64,
+            Observation {
+                head_sha: "def456".to_string(),
+                review_state: crate::services::file_pr_local::LocalReviewState::Approved,
+                comments: vec![],
+                reviews: vec![],
+                ci_status: CIStatus::Unknown,
+                review_file_seen: false,
+                review_file_mtime: None,
+            },
+        );
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        let persisted = read_pr_registry(&watcher.prs_path).await.unwrap();
+        let pr = persisted.prs.get(&1).unwrap();
+        assert_eq!(pr.last_head_sha.as_deref(), Some("def456"));
+        assert_eq!(pr.approved_at_sha, None);
+    }
+
+    #[tokio::test]
+    async fn test_observed_ci_status_is_sha_keyed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let ci_status_map = services.ci_status_map.clone();
+        ci_status_map
+            .write()
+            .await
+            .insert((branch.clone(), "abc123".to_string()), CIStatus::Success);
+        let watcher = WorktreeEventWatcher::new(Arc::new(services))
+            .with_ci_status_map(ci_status_map)
+            .with_spindle_url("ws://localhost:6555".to_string());
+
+        assert_eq!(
+            watcher.observed_ci_status(&branch, "abc123").await,
+            CIStatus::Success
+        );
+        assert_eq!(
+            watcher.observed_ci_status(&branch, "def456").await,
+            CIStatus::Unknown
+        );
     }
 
     #[tokio::test]
