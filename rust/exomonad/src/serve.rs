@@ -949,11 +949,11 @@ Run `exomonad recompile` first to build it.",
         Arc::new(exomonad_core::services::claude_session_registry::ClaudeSessionRegistry::new());
 
     // Shared CI status map — updated by WorktreeEventWatcher's spindle subscriber,
-    // read by MergePRHandler gate 7. Both components hold an Arc to the same map.
-    let ci_status_map = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::<
-        exomonad_core::domain::BranchName,
-        exomonad_core::domain::CIStatus,
-    >::new()));
+    // read by MergePRHandler gate 7. Keyed by (branch, SHA) so stale CI from
+    // an older push cannot satisfy the reviewer-approved commit gate.
+    let ci_status_map = Arc::new(tokio::sync::RwLock::new(
+        exomonad_core::services::CiStatusMap::new(),
+    ));
 
     let tangled_pr_client = match (
         config.tangled_appview_url.as_deref(),
