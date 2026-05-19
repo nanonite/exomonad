@@ -35,7 +35,7 @@ import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, HookInput (..), HookOutput, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, denyResponse, postToolUseResponse)
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
-import HookPolicy (preToolUseWithGhBlock)
+import HookPolicy (preToolUseWithGitAuthorBlock)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
 
 reviewerImplementerTools :: [Text]
@@ -327,7 +327,7 @@ config =
           },
       hooks =
         HookConfig
-          { preToolUse = preToolUseWithGhBlock reviewerImplementationDenyHook,
+          { preToolUse = preToolUseWithGitAuthorBlock reviewerImplementationDenyHook,
             postToolUse = \_ -> pure (postToolUseResponse Nothing),
             onStop = \_ -> reviewerStopCheck,
             onSubagentStop = \_ -> reviewerStopCheck,

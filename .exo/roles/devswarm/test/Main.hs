@@ -34,6 +34,7 @@ main = do
   assertRoleDeny "tl" TLRole.config
   assertRoleDeny "root" RootRole.config
   assertReviewerDenyImplementationTools
+  assertReviewerGitAuthorMutationPolicy
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
   assertReviewerToolList
@@ -73,9 +74,39 @@ assertReviewerDenyImplementationTools =
     assertBool (label "reviewer" toolName "message names reviewer policy") (messageContains "Reviewers do not edit code" output)
     assertBool (label "reviewer" toolName "message relays to worker") (messageContains "request_changes" output)
 
+assertReviewerGitAuthorMutationPolicy :: IO ()
+assertReviewerGitAuthorMutationPolicy = do
+  let deniedCommands =
+        [ "git commit -m x",
+          "git commit --amend --no-edit",
+          "git rebase main",
+          "git cherry-pick abc123",
+          "git merge feature",
+          "git status && git commit -m sneak"
+        ]
+  forM_ deniedCommands $ \command -> do
+    output <- runPreToolUseInput ReviewerRole.config (bashHookInput command)
+    assertBool ("reviewer denies " <> T.unpack command) (not (continue_ output))
+    assertEqual ("reviewer git deny decision " <> T.unpack command) (Just "deny") (permissionDecisionOf output)
+    assertBool ("reviewer git deny message " <> T.unpack command) (messageContains "Reviewer cannot author or rewrite commits" output)
+
+  let allowedCommands =
+        [ "git status",
+          "git rev-parse HEAD",
+          "git log --oneline",
+          "gitk"
+        ]
+  forM_ allowedCommands $ \command -> do
+    output <- runPreToolUseInput ReviewerRole.config (bashHookInput command)
+    assertBool ("reviewer allows " <> T.unpack command) (continue_ output)
+    assertEqual ("reviewer git allow decision " <> T.unpack command) (Just "allow") (permissionDecisionOf output)
+
 runPreToolUse :: RoleConfig tools -> Text -> IO HookOutput
-runPreToolUse cfg toolName = do
-  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (preToolUse (hooks cfg) (hookInput toolName))
+runPreToolUse cfg toolName = runPreToolUseInput cfg (hookInput toolName)
+
+runPreToolUseInput :: RoleConfig tools -> HookInput -> IO HookOutput
+runPreToolUseInput cfg input = do
+  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (preToolUse (hooks cfg) input)
   case status of
     C.Done output -> pure output
     C.Continue {} -> fail "PreToolUse hook unexpectedly suspended"
@@ -89,6 +120,12 @@ runPostToolUse cfg = do
 
 hookInput :: Text -> HookInput
 hookInput = hookInputFor PreToolUse
+
+bashHookInput :: Text -> HookInput
+bashHookInput command =
+  (hookInput "Bash")
+    { hiToolInput = Just (Aeson.object ["command" Aeson..= command])
+    }
 
 hookInputFor :: HookEventType -> Text -> HookInput
 hookInputFor eventName toolName =
