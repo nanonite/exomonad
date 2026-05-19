@@ -13,6 +13,7 @@ const EXOMONAD_CODEX_HOOKS_END: &str = "# END EXOMONAD CODEX HOOKS";
 const CODEX_HOOK_TIMEOUT_SEC: u64 = 600;
 
 pub const CODEX_CONFIG_TEMPLATE: &str = r#"{model_config}approval_policy = "never"
+default_permissions = "{default_permissions}"
 developer_instructions = """
 {instructions}
 """
@@ -47,6 +48,8 @@ timeout = {hook_timeout}
 async = false
 
 {mcp_servers}
+
+{permissions_profiles}
 "#;
 
 pub fn render_codex_config(
@@ -86,6 +89,7 @@ pub fn render_codex_config(
             "{instructions}",
             &escape_multiline_basic_string(instructions),
         )
+        .replace("{default_permissions}", permissions_profile_for_role(role))
         .replace(
             "exomonad hook pre-tool-use --runtime codex",
             &format!("{hook_command_prefix} hook pre-tool-use --runtime codex"),
@@ -100,6 +104,7 @@ pub fn render_codex_config(
         )
         .replace("{hook_timeout}", &CODEX_HOOK_TIMEOUT_SEC.to_string())
         .replace("{mcp_servers}", &mcp_servers_to_toml(&mcp_servers))
+        .replace("{permissions_profiles}", &permissions_profiles_toml())
 }
 
 pub fn codex_user_config_path() -> Option<PathBuf> {
@@ -410,6 +415,81 @@ fn to_io_invalid_data(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
 }
 
+fn permissions_profile_for_role(role: &str) -> &'static str {
+    match role {
+        "root" => "root",
+        "tl" => "tl",
+        "reviewer" => "reviewer",
+        "worker" => "worker",
+        _ => "dev",
+    }
+}
+
+fn permissions_profiles_toml() -> String {
+    let mut root = toml::map::Map::new();
+    let mut permissions = toml::map::Map::new();
+
+    permissions.insert(
+        "root".to_string(),
+        toml::Value::Table(read_mostly_profile(&[".exo", ".git"])),
+    );
+    permissions.insert(
+        "tl".to_string(),
+        toml::Value::Table(read_mostly_profile(&[".exo", ".git"])),
+    );
+    permissions.insert(
+        "reviewer".to_string(),
+        toml::Value::Table(read_mostly_profile(&[
+            ".exo/reviews",
+            ".exo/events",
+            ".exo/tmp",
+            "target",
+            "rust/target",
+            "dist-newstyle",
+            "haskell/dist-newstyle",
+            ".stack-work",
+            ".cache",
+        ])),
+    );
+    permissions.insert(
+        "dev".to_string(),
+        toml::Value::Table(workspace_write_profile()),
+    );
+    permissions.insert(
+        "worker".to_string(),
+        toml::Value::Table(workspace_write_profile()),
+    );
+
+    root.insert("permissions".to_string(), toml::Value::Table(permissions));
+    toml::to_string_pretty(&toml::Value::Table(root))
+        .expect("Codex permissions profiles should serialize")
+        .trim()
+        .to_string()
+}
+
+fn read_mostly_profile(writable_roots: &[&str]) -> toml::map::Map<String, toml::Value> {
+    let mut profile = toml::map::Map::new();
+    profile.insert(
+        "sandbox_mode".to_string(),
+        toml::Value::String("workspace-write".to_string()),
+    );
+    profile.insert("network_access".to_string(), toml::Value::Boolean(false));
+    profile.insert(
+        "writable_roots".to_string(),
+        toml::Value::Array(
+            writable_roots
+                .iter()
+                .map(|root| toml::Value::String((*root).to_string()))
+                .collect(),
+        ),
+    );
+    profile
+}
+
+fn workspace_write_profile() -> toml::map::Map<String, toml::Value> {
+    read_mostly_profile(&["."])
+}
+
 fn model_config_toml(model: Option<&str>) -> String {
     match model.filter(|value| !value.is_empty()) {
         Some(model) => {
@@ -525,6 +605,7 @@ mod tests {
         );
 
         assert!(config.contains("approval_policy = \"never\""));
+        assert!(config.contains("default_permissions = \"dev\""));
         assert!(config.contains("developer_instructions = \"\"\"\nUse ExoMonad tools.\n\"\"\""));
         assert!(config.contains("[features]\nhooks = true"));
 
@@ -540,6 +621,26 @@ mod tests {
         assert_eq!(
             parsed["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(),
             Some("/usr/local/bin/exomonad hook stop --runtime codex")
+        );
+        assert_eq!(parsed["default_permissions"].as_str(), Some("dev"));
+        assert_eq!(
+            parsed["permissions"]["dev"]["writable_roots"]
+                .as_array()
+                .unwrap(),
+            &[toml::Value::String(".".to_string())]
+        );
+        assert_eq!(
+            parsed["permissions"]["tl"]["writable_roots"]
+                .as_array()
+                .unwrap(),
+            &[
+                toml::Value::String(".exo".to_string()),
+                toml::Value::String(".git".to_string())
+            ]
+        );
+        assert_eq!(
+            parsed["permissions"]["reviewer"]["network_access"].as_bool(),
+            Some(false)
         );
     }
 
@@ -602,6 +703,33 @@ mod tests {
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
         assert!(parsed.get("model").is_none());
+    }
+
+    #[test]
+    fn maps_roles_to_default_permission_profiles() {
+        for (role, expected) in [
+            ("root", "root"),
+            ("tl", "tl"),
+            ("reviewer", "reviewer"),
+            ("worker", "worker"),
+            ("dev", "dev"),
+            ("custom-dev-role", "dev"),
+        ] {
+            let config = render_codex_config(
+                "agent",
+                role,
+                "Use ExoMonad tools.",
+                None,
+                &HashMap::new(),
+                test_exomonad_binary(),
+            );
+            let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+            assert_eq!(
+                parsed["default_permissions"].as_str(),
+                Some(expected),
+                "role {role} should select profile {expected}"
+            );
+        }
     }
 
     #[test]

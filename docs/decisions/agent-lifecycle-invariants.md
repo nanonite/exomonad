@@ -85,6 +85,8 @@ When a dev-leaf ends its session (blocker, handoff), the issue remains open and 
 - [reviewer-authorship-invariant](../../CLAUDE.md) — chainlink #298–#301, reviewer must never author commits. Invariant 3 here is the worker-side analogue.
 - [hylo-worktree-model.md](hylo-worktree-model.md) — the unfold/fold recursion that makes worktree cleanup a structural step rather than an ad-hoc one.
 
+- [agent-sandbox-profiles.md](agent-sandbox-profiles.md) — Codex filesystem profiles are the structural sandbox layer for the reviewer and worker invariants.
+
 ## Implementation tracking
 
 | Chainlink | Priority | Covers |

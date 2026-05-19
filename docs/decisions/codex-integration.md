@@ -126,3 +126,5 @@ ExoMonad does not inject an auth token or provider-specific environment variable
 - `tests/e2e/codex-hooks/validate.sh`
 - `haskell/wasm-guest/src/ExoMonad/Guest/Tools/SpawnCodex.hs`
 - `docs/decisions/codex-hook-wire-format.md`
+
+- `docs/decisions/agent-sandbox-profiles.md`
