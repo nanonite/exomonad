@@ -70,6 +70,7 @@ library wasm-guest-internal
         ExoMonad.Guest.Tools.Events
         ExoMonad.Guest.Tools.Tasks
         ExoMonad.Guest.Tools.Chainlink
+        ExoMonad.Guest.Tools.DisposeLeaf
         ExoMonad.Guest.Tools.TestRunner
         ExoMonad.Guest.Prompt
         ExoMonad.Guest.Events

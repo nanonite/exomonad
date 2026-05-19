@@ -59,6 +59,7 @@ Workers are ephemeral pane agents with no PR. When a worker reports a blocker vi
 3. **Re-spec**: If the original task was fundamentally mis-scoped:
    - Close the stuck worker (it will idle until the session ends).
    - Spawn a new worker with a corrected spec.
+   - If you want to end a leaf and reuse its slot, call `dispose_leaf`. If you want to keep the leaf alive and unblock it, use `send_message`.
 
 **Never wait silently** for a stuck worker. Either steer it, escalate to the human, or re-spec.
 

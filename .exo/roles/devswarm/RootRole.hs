@@ -15,6 +15,7 @@ import ExoMonad
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.StateMachine (applyEvent)
+import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
