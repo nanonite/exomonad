@@ -10,13 +10,16 @@ import Control.Monad (void)
 import Control.Monad.Freer (Eff)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Aeson qualified as Aeson
+import Data.Aeson.KeyMap qualified as KM
 import Data.Text.Lazy qualified as TL
 import DevPhase (DevEvent (..), DevPhase (..))
 import ExoMonad.Effects.Log qualified as Log
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
-import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), PRReviewEvent (..), SiblingMergedEvent (..), defaultEventHandlers)
+import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), IssueClosedEvent (..), PRReviewEvent (..), SiblingMergedEvent (..), defaultEventHandlers)
 import ExoMonad.Guest.Events.Templates qualified as Tpl
 import ExoMonad.Guest.StateMachine (applyEvent)
+import ExoMonad.Guest.Tools.Chainlink (chainlinkSessionStatusCore)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
 import ExoMonad.Guest.Types (Effects)
 
@@ -26,7 +29,8 @@ prReviewEventHandlers =
   defaultEventHandlers
     { onPRReview = prReviewHandler,
       onCIStatus = ciStatusHandler,
-      onSiblingMerged = siblingMergedHandler
+      onSiblingMerged = siblingMergedHandler,
+      onIssueClosed = issueClosedHandler
     }
 
 -- | Handle PR review events for dev/tl roles.
@@ -97,6 +101,36 @@ prReviewHandler (ReviewerNeverStarted n) = do
 prReviewHandler (ReviewDevFailed n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " dev leaf reported failure"
   pure NoAction
+
+
+-- | Handle Chainlink issue closure events for dev leaves.
+issueClosedHandler :: IssueClosedEvent -> Eff Effects EventAction
+issueClosedHandler (IssueClosedEvent issueId closedBy) = do
+  activeIssue <- currentChainlinkIssueId
+  if issueId == 0 || activeIssue == Just issueId
+    then do
+      branch <- getCurrentBranch
+      void $ applyEvent @DevPhase @DevEvent branch DevSpawned (IssueClosedEv issueId closedBy)
+      pure $
+        InjectMessage $
+          "[ISSUE CLOSED: #"
+            <> T.pack (show issueId)
+            <> " closed by "
+            <> closedBy
+            <> ". Exiting; your worktree will be cleaned up.]"
+    else pure NoAction
+
+currentChainlinkIssueId :: Eff Effects (Maybe Int)
+currentChainlinkIssueId = do
+  result <- chainlinkSessionStatusCore
+  pure $ case result of
+    Right (Aeson.Object obj) -> do
+      Aeson.Object activeIssue <- KM.lookup "active_issue" obj
+      value <- KM.lookup "id" activeIssue
+      case Aeson.fromJSON value of
+        Aeson.Success issueId -> Just issueId
+        Aeson.Error _ -> Nothing
+    _ -> Nothing
 
 -- | Handle sibling merged events.
 siblingMergedHandler :: SiblingMergedEvent -> Eff Effects EventAction

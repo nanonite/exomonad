@@ -2,6 +2,7 @@ pub mod acp_client;
 pub mod acp_registry;
 pub mod agent_control;
 pub mod agent_resolver;
+pub mod agent_resources;
 pub mod claude_session_registry;
 pub mod command;
 pub mod complexity_classifier;

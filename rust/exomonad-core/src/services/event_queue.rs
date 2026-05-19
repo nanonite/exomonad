@@ -121,6 +121,7 @@ impl EventQueue {
         match &event.event_type {
             Some(EventType::AgentMessage(_)) => types.iter().any(|t| t == "agent_message"),
             Some(EventType::Timeout(_)) => types.iter().any(|t| t == "timeout"),
+            Some(EventType::IssueClosed(_)) => types.iter().any(|t| t == "issue_closed"),
             None => false,
         }
     }

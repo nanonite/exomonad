@@ -25,6 +25,7 @@ message Event {
   oneof event_type {
     AgentMessage agent_message = 1;
     Timeout timeout = 2;
+    IssueClosed issue_closed = 4;
   }
 }
 
@@ -38,6 +39,11 @@ message AgentMessage {
 
 message Timeout {
   int32 timeout_secs = 1;
+}
+
+message IssueClosed {
+  uint64 issue_id = 1;
+  string closed_by = 2;
 }
 
 // ============================================================================

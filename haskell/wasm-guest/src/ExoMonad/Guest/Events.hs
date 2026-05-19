@@ -7,6 +7,7 @@ module ExoMonad.Guest.Events
     CIStatusEvent (..),
     TimeoutEvent (..),
     SiblingMergedEvent (..),
+    IssueClosedEvent (..),
     EventInput (..),
     defaultEventHandlers,
     dispatchEvent,
@@ -166,6 +167,20 @@ instance FromJSON SiblingMergedEvent where
 instance ToJSON SiblingMergedEvent where
   toJSON (SiblingMergedEvent mb pb n) = object ["merged_branch" .= mb, "parent_branch" .= pb, "sibling_pr_number" .= n]
 
+-- | Chainlink issue closed event.
+data IssueClosedEvent = IssueClosedEvent
+  { issueClosedIssueId :: Int,
+    issueClosedBy :: Text
+  }
+  deriving (Show, Generic)
+
+instance FromJSON IssueClosedEvent where
+  parseJSON = withObject "IssueClosedEvent" $ \v ->
+    IssueClosedEvent <$> v .: "issue_id" <*> v .: "closed_by"
+
+instance ToJSON IssueClosedEvent where
+  toJSON (IssueClosedEvent issueId closedBy) = object ["issue_id" .= issueId, "closed_by" .= closedBy]
+
 -- | Event handler return type
 data EventAction
   = InjectMessage Text
@@ -192,7 +207,8 @@ data EventHandlerConfig = EventHandlerConfig
   { onPRReview :: PRReviewEvent -> Eff Effects EventAction,
     onCIStatus :: CIStatusEvent -> Eff Effects EventAction,
     onTimeout :: TimeoutEvent -> Eff Effects EventAction,
-    onSiblingMerged :: SiblingMergedEvent -> Eff Effects EventAction
+    onSiblingMerged :: SiblingMergedEvent -> Eff Effects EventAction,
+    onIssueClosed :: IssueClosedEvent -> Eff Effects EventAction
   }
 
 -- | Default event handlers (all NoAction).
@@ -202,7 +218,8 @@ defaultEventHandlers =
     { onPRReview = \_ -> pure NoAction,
       onCIStatus = \_ -> pure NoAction,
       onTimeout = \_ -> pure NoAction,
-      onSiblingMerged = \_ -> pure NoAction
+      onSiblingMerged = \_ -> pure NoAction,
+      onIssueClosed = \_ -> pure NoAction
     }
 
 -- | Top-level event type wrapper for dispatching.
@@ -211,6 +228,7 @@ data EventInput
   | CIStatusInput CIStatusEvent
   | TimeoutInput TimeoutEvent
   | SiblingMergedInput SiblingMergedEvent
+  | IssueClosedInput IssueClosedEvent
   deriving (Show, Generic)
 
 instance FromJSON EventInput where
@@ -222,6 +240,7 @@ instance FromJSON EventInput where
       "ci_status" -> CIStatusInput <$> Aeson.parseJSON payload
       "timeout" -> TimeoutInput <$> Aeson.parseJSON payload
       "sibling_merged" -> SiblingMergedInput <$> Aeson.parseJSON payload
+      "issue_closed" -> IssueClosedInput <$> Aeson.parseJSON payload
       other -> fail $ "Unknown event_type: " <> show (other :: Text)
 
 -- | Dispatch an event to the appropriate handler.
@@ -230,3 +249,4 @@ dispatchEvent cfg (PRReviewInput ev) = onPRReview cfg ev
 dispatchEvent cfg (CIStatusInput ev) = onCIStatus cfg ev
 dispatchEvent cfg (TimeoutInput ev) = onTimeout cfg ev
 dispatchEvent cfg (SiblingMergedInput ev) = onSiblingMerged cfg ev
+dispatchEvent cfg (IssueClosedInput ev) = onIssueClosed cfg ev

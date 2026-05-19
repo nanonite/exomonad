@@ -28,6 +28,7 @@ data DevPhase
   | DevNeedsHumanDirection PRNumber Text
   | DevApproved PRNumber
   | DevDone
+  | DevDismissed Int Text
   | DevFailed Text
   deriving (Show, Eq)
 
@@ -41,6 +42,7 @@ data DevEvent
   | FixesPushedEv PRNumber Text
   | CommitsPushedEv PRNumber Text
   | MergeReadyEv PRNumber Text Text
+  | IssueClosedEv Int Text
   deriving (Show, Eq)
 
 instance StateMachine DevPhase DevEvent where
@@ -78,6 +80,8 @@ instance StateMachine DevPhase DevEvent where
        in Transitioned (DevUnderReview prNum round)
     MergeReadyEv _prNum _ci _branch ->
       Transitioned DevDone
+    IssueClosedEv issueId closedBy ->
+      Transitioned (DevDismissed issueId closedBy)
 
   canExit (DevChangesRequested pr _) =
     MustBlock $ "PR #" <> T.pack (show pr) <> " has changes requested. Address review comments before stopping."
@@ -100,6 +104,7 @@ instance ToJSON DevPhase where
   toJSON (DevNeedsHumanDirection n reason) = object ["phase" .= ("dev_needs_human_direction" :: Text), "pr_number" .= n, "reason" .= reason]
   toJSON (DevApproved n) = object ["phase" .= ("dev_approved" :: Text), "pr_number" .= n]
   toJSON DevDone = object ["phase" .= ("dev_done" :: Text)]
+  toJSON (DevDismissed issueId closedBy) = object ["phase" .= ("dev_dismissed" :: Text), "issue_id" .= issueId, "closed_by" .= closedBy]
   toJSON (DevFailed msg) = object ["phase" .= ("dev_failed" :: Text), "message" .= msg]
 
 instance FromJSON DevPhase where
@@ -128,6 +133,10 @@ instance FromJSON DevPhase where
         n <- v .: "pr_number"
         pure (DevApproved n)
       "dev_done" -> pure DevDone
+      "dev_dismissed" -> do
+        issueId <- v .: "issue_id"
+        closedBy <- v .: "closed_by"
+        pure (DevDismissed issueId closedBy)
       "dev_failed" -> do
         msg <- v .: "message"
         pure (DevFailed msg)
