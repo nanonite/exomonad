@@ -1103,13 +1103,18 @@ Run `exomonad recompile` first to build it.",
     std::fs::write(&server_pid_path, serde_json::to_string_pretty(&pid_info)?)?;
     info!(path = %server_pid_path.display(), "Wrote server.pid");
 
+    let review_policy = exomonad_core::services::review_policy::ReviewPolicy::load(&project_dir)
+        .await
+        .context("Failed to load review policy")?;
+
     // Start Worktree Event Watcher (background service — replaces GitHub poller + Copilot review)
     let mut watcher = exomonad_core::services::worktree_event_watcher::WorktreeEventWatcher::new(
         services.clone(),
     )
     .with_plugins(plugins.clone())
     .with_reviewer_spawner(agent_control.clone())
-    .with_ci_status_map(ci_status_map.clone());
+    .with_ci_status_map(ci_status_map.clone())
+    .with_policy(review_policy);
     if let Some(interval) = config.poll_interval {
         if interval == 0 {
             anyhow::bail!("Invalid configuration: `poll_interval` must be >= 1 second, got 0");

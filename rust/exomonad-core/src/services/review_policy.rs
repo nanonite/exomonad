@@ -38,6 +38,47 @@ pub struct ReviewPolicy {
 
     /// Lines changed threshold to trigger second-reviewer requirement.
     pub complexity_line_threshold: u64,
+
+    /// CI merge gate behavior.
+    pub ci: CiPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CiPolicy {
+    /// `auto` requires CI only when a CI source is configured, `on` always requires it,
+    /// and `off` treats CI as neutral.
+    pub gate: CiGate,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CiGate {
+    Auto,
+    On,
+    Off,
+}
+
+impl Default for CiPolicy {
+    fn default() -> Self {
+        Self { gate: CiGate::Auto }
+    }
+}
+
+impl Default for CiGate {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl CiGate {
+    pub fn enabled(self, ci_source_configured: bool) -> bool {
+        match self {
+            Self::Auto => ci_source_configured,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
 }
 
 impl Default for ReviewPolicy {
@@ -55,6 +96,7 @@ impl Default for ReviewPolicy {
             reviewer_max_rate_limit_retries: 2,
             require_second_reviewer_complexity: false,
             complexity_line_threshold: 500,
+            ci: CiPolicy::default(),
         }
     }
 }
@@ -112,6 +154,7 @@ mod tests {
         assert_eq!(p.external_review_threshold, 300);
         assert_eq!(p.reviewer_max_wait_seconds, 1200);
         assert_eq!(p.reviewer_max_rate_limit_retries, 2);
+        assert_eq!(p.ci.gate, CiGate::Auto);
     }
 
     #[test]
@@ -158,6 +201,9 @@ mod tests {
             reviewer_max_rate_limit_retries = 3
             require_second_reviewer_complexity = true
             complexity_line_threshold = 1000
+
+            [ci]
+            gate = "off"
         "#;
         let policy: ReviewPolicy = toml::from_str(toml_str).unwrap();
         assert_eq!(policy.min_review_rounds, 2);
@@ -169,5 +215,14 @@ mod tests {
         assert_eq!(policy.reviewer_max_rate_limit_retries, 3);
         assert!(policy.require_second_reviewer_complexity);
         assert_eq!(policy.complexity_line_threshold, 1000);
+        assert_eq!(policy.ci.gate, CiGate::Off);
+    }
+
+    #[test]
+    fn test_ci_gate_auto_requires_configured_source_only() {
+        assert!(!CiGate::Auto.enabled(false));
+        assert!(CiGate::Auto.enabled(true));
+        assert!(CiGate::On.enabled(false));
+        assert!(!CiGate::Off.enabled(true));
     }
 }

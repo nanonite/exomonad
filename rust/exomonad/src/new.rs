@@ -77,6 +77,9 @@ external_review_paths = [\"proto/**\", \"rust/exomonad-core/src/handlers/**\"]
 reviewer_max_rate_limit_retries = 2
 require_second_reviewer_complexity = false
 complexity_line_threshold = 500
+
+[ci]
+gate = \"auto\"
 ",
         )?;
         info!("Created .exo/review-policy.toml (default review policy)");

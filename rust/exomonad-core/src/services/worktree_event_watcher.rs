@@ -407,6 +407,23 @@ where
         self
     }
 
+    fn ci_source_configured(&self) -> bool {
+        self.spindle_url.is_some()
+    }
+
+    async fn observed_ci_status(&self, branch: &BranchName) -> CIStatus {
+        if !self.policy.ci.gate.enabled(self.ci_source_configured()) {
+            return CIStatus::Neutral;
+        }
+
+        self.ci_status_map
+            .read()
+            .await
+            .get(branch)
+            .copied()
+            .unwrap_or(CIStatus::Unknown)
+    }
+
     pub async fn run(&self) {
         tracing::info!(
             poll_interval_secs = self.poll_interval.as_secs(),
@@ -550,16 +567,9 @@ where
                 }
             };
 
-            let ci_status = {
-                let branch = BranchName::try_from_str(pr.head_branch.as_str())
-                    .expect("validated string input is non-empty");
-                self.ci_status_map
-                    .read()
-                    .await
-                    .get(&branch)
-                    .copied()
-                    .unwrap_or(CIStatus::Unknown)
-            };
+            let branch = BranchName::try_from_str(pr.head_branch.as_str())
+                .expect("validated string input is non-empty");
+            let ci_status = self.observed_ci_status(&branch).await;
 
             observations.insert(
                 *number,
@@ -2725,6 +2735,61 @@ mod tests {
             } if payload["status"] == "success"
         )));
         assert!(state.merge_ready_notified);
+    }
+
+    #[test]
+    fn test_initial_approved_neutral_ci_observation_fires_merge_ready() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &reviews,
+            CIStatus::Neutral,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload,
+            } if payload["kind"] == "merge_ready" && payload["ci_status"] == "neutral"
+        )));
+        assert!(state.merge_ready_notified);
+    }
+
+    #[tokio::test]
+    async fn test_default_ci_gate_is_neutral_without_ci_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+
+        assert_eq!(watcher.observed_ci_status(&branch).await, CIStatus::Neutral);
+    }
+
+    #[tokio::test]
+    async fn test_ci_gate_uses_unknown_when_source_configured_without_status() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services))
+            .with_spindle_url("ws://localhost:6555".to_string());
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+
+        assert_eq!(watcher.observed_ci_status(&branch).await, CIStatus::Unknown);
     }
 
     #[test]
