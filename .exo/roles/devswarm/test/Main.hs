@@ -34,6 +34,7 @@ main = do
   assertRoleDeny "tl" TLRole.config
   assertRoleDeny "root" RootRole.config
   assertReviewerDenyImplementationTools
+  assertRuntimeImplementationPolicy
   assertReviewerGitAuthorMutationPolicy
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
@@ -73,6 +74,45 @@ assertReviewerDenyImplementationTools =
     assertEqual (label "reviewer" toolName "decision") (Just "deny") (permissionDecisionOf output)
     assertBool (label "reviewer" toolName "message names reviewer policy") (messageContains "Reviewers do not edit code" output)
     assertBool (label "reviewer" toolName "message relays to worker") (messageContains "request_changes" output)
+
+assertRuntimeImplementationPolicy :: IO ()
+assertRuntimeImplementationPolicy = do
+  assertAllowsRuntimeTool "tl allows Claude apply_patch" TLRole.config Claude "apply_patch"
+  assertDeniesRuntimeTool "tl denies Codex apply_patch" TLRole.config Codex "apply_patch" "apply_patch"
+  assertAllowsRuntimeTool "tl allows Codex Edit passthrough" TLRole.config Codex "Edit"
+  assertDeniesRuntimeTool "root denies OpenCode edit" RootRole.config OpenCode "edit" "edit"
+  assertAllowsRuntimeTool "root allows Gemini apply_patch passthrough" RootRole.config Gemini "apply_patch"
+  assertDeniesRuntimeTool "reviewer denies Codex str_replace_editor" ReviewerRole.config Codex "str_replace_editor" "str_replace_editor"
+  assertDeniesRuntimeCommand "tl denies Codex shell redirection" TLRole.config Codex "shell" "cat > src/lib.rs" "shell"
+  assertDeniesRuntimeCommand "tl denies Codex python write_text" TLRole.config Codex "shell" "python -c 'from pathlib import Path; Path(\"x\").write_text(\"y\")'" "shell"
+  assertAllowsRuntimeCommand "tl allows Codex shell read" TLRole.config Codex "shell" "cat src/lib.rs"
+  assertAllowsRuntimeCommand "tl allows Claude Bash redirection passthrough" TLRole.config Claude "Bash" "cat > src/lib.rs"
+
+assertDeniesRuntimeTool :: String -> RoleConfig tools -> Runtime -> Text -> Text -> IO ()
+assertDeniesRuntimeTool label_ cfg runtime toolName expectedMessage = do
+  output <- runPreToolUseInput cfg (hookInputRuntime runtime toolName)
+  assertBool label_ (not (continue_ output))
+  assertEqual (label_ <> " decision") (Just "deny") (permissionDecisionOf output)
+  assertBool (label_ <> " message") (messageContains expectedMessage output)
+
+assertAllowsRuntimeTool :: String -> RoleConfig tools -> Runtime -> Text -> IO ()
+assertAllowsRuntimeTool label_ cfg runtime toolName = do
+  output <- runPreToolUseInput cfg (hookInputRuntime runtime toolName)
+  assertBool label_ (continue_ output)
+  assertEqual (label_ <> " decision") (Just "allow") (permissionDecisionOf output)
+
+assertDeniesRuntimeCommand :: String -> RoleConfig tools -> Runtime -> Text -> Text -> Text -> IO ()
+assertDeniesRuntimeCommand label_ cfg runtime toolName command expectedMessage = do
+  output <- runPreToolUseInput cfg (commandHookInputRuntime runtime toolName command)
+  assertBool label_ (not (continue_ output))
+  assertEqual (label_ <> " decision") (Just "deny") (permissionDecisionOf output)
+  assertBool (label_ <> " message") (messageContains expectedMessage output)
+
+assertAllowsRuntimeCommand :: String -> RoleConfig tools -> Runtime -> Text -> Text -> IO ()
+assertAllowsRuntimeCommand label_ cfg runtime toolName command = do
+  output <- runPreToolUseInput cfg (commandHookInputRuntime runtime toolName command)
+  assertBool label_ (continue_ output)
+  assertEqual (label_ <> " decision") (Just "allow") (permissionDecisionOf output)
 
 assertReviewerGitAuthorMutationPolicy :: IO ()
 assertReviewerGitAuthorMutationPolicy = do
@@ -122,8 +162,17 @@ hookInput :: Text -> HookInput
 hookInput = hookInputFor PreToolUse
 
 bashHookInput :: Text -> HookInput
-bashHookInput command =
-  (hookInput "Bash")
+bashHookInput command = commandHookInputRuntime Claude "Bash" command
+
+hookInputRuntime :: Runtime -> Text -> HookInput
+hookInputRuntime runtime toolName =
+  (hookInput toolName)
+    { hiRuntime = Just runtime
+    }
+
+commandHookInputRuntime :: Runtime -> Text -> Text -> HookInput
+commandHookInputRuntime runtime toolName command =
+  (hookInputRuntime runtime toolName)
     { hiToolInput = Just (Aeson.object ["command" Aeson..= command])
     }
 

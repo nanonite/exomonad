@@ -33,23 +33,16 @@ import ExoMonad.Guest.Events
 import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
-import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, HookInput (..), HookOutput, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, denyResponse, postToolUseResponse)
+import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, postToolUseResponse)
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
-import HookPolicy (preToolUseWithGitAuthorBlock)
+import HookPolicy (preToolUseWithGitAuthorAndImplementationBlock)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
 
-reviewerImplementerTools :: [Text]
-reviewerImplementerTools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
-
-reviewerRedispatchMessage :: Text
-reviewerRedispatchMessage =
-  "Reviewers do not edit code. Use `request_changes` or `post_review_comment` to relay the fix to the worker that owns the worktree. The worker's git identity is the canonical author of every commit on its branch."
-
-reviewerImplementationDenyHook :: HookInput -> Eff Effects HookOutput
-reviewerImplementationDenyHook hookInput =
-  case hiToolName hookInput of
-    Just toolName | toolName `elem` reviewerImplementerTools -> pure (denyResponse reviewerRedispatchMessage)
-    _ -> pure (allowResponse Nothing)
+reviewerRedispatchMessage :: Text -> Text
+reviewerRedispatchMessage toolName =
+  "Reviewers do not edit code. The "
+    <> toolName
+    <> " tool is unavailable in reviewer sessions. Use `request_changes` or `post_review_comment` to relay the fix to the worker that owns the worktree. The worker's git identity is the canonical author of every commit on its branch."
 
 data ApprovePRArgs = ApprovePRArgs
   { apPrNumber :: Int,
@@ -327,7 +320,7 @@ config =
           },
       hooks =
         HookConfig
-          { preToolUse = preToolUseWithGitAuthorBlock reviewerImplementationDenyHook,
+          { preToolUse = preToolUseWithGitAuthorAndImplementationBlock reviewerRedispatchMessage (\_ -> pure (allowResponse Nothing)),
             postToolUse = \_ -> pure (postToolUseResponse Nothing),
             onStop = \_ -> reviewerStopCheck,
             onSubagentStop = \_ -> reviewerStopCheck,

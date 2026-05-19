@@ -9,7 +9,6 @@
 module RootRole (config, Tools) where
 
 import Control.Monad (forM_, void, when)
-import Control.Monad.Freer (Eff)
 import Data.Text (Text)
 import ExoMonad
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
@@ -40,14 +39,11 @@ import ExoMonad.Guest.Tools.Spawn
     spawnWorkerToolSchema,
   )
 import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
-import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), HookInput (..), HookOutput, allowResponse, allowStopResponse, denyResponse)
+import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
 import ExoMonad.Types (Effects, HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
-import HookPolicy (preToolUseWithGhBlock)
+import HookPolicy (preToolUseWithImplementationBlock)
 import PRReviewHandler (prReviewEventHandlers)
 import TLPhase (ChildHandle (..), TLEvent (..), TLPhase (..))
-
-rootImplementerTools :: [Text]
-rootImplementerTools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
 
 rootRedispatchMessage :: Text -> Text
 rootRedispatchMessage toolName =
@@ -58,12 +54,6 @@ rootRedispatchMessage toolName =
     <> "If a worker is blocked, use send_message to inject a clarification into the worker's pane. See Worker Correction Loop in .exo/roles/devswarm/context/root.md.\n"
     <> "If neither path fits, re-decompose with spawn_leaf or spawn_worker.\n"
     <> "See CLAUDE.md § Tech Lead Praxis for the full protocol."
-
-rootImplementationDenyHook :: HookInput -> Eff Effects HookOutput
-rootImplementationDenyHook hookInput =
-  case hiToolName hookInput of
-    Just toolName | toolName `elem` rootImplementerTools -> pure (denyResponse (rootRedispatchMessage toolName))
-    _ -> pure (allowResponse Nothing)
 
 data RootForkWave
 
@@ -182,7 +172,7 @@ config =
           },
       hooks =
         HookConfig
-          { preToolUse = preToolUseWithGhBlock rootImplementationDenyHook,
+          { preToolUse = preToolUseWithImplementationBlock rootRedispatchMessage (\_ -> pure (allowResponse Nothing)),
             postToolUse = teamRegistrationPostToolUse,
             onStop = \_ -> pure allowStopResponse,
             onSubagentStop = \_ -> pure allowStopResponse,

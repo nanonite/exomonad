@@ -8,7 +8,6 @@
 module TLRole (config, Tools) where
 
 import Control.Monad (forM_, void, when)
-import Control.Monad.Freer (Eff)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
@@ -72,15 +71,12 @@ import ExoMonad.Guest.Tools.Spawn
     spawnWorkerToolSchema,
   )
 import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
-import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), HookInput (..), HookOutput, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, denyResponse)
+import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse)
 import ExoMonad.Types (Effects, HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
-import HookPolicy (preToolUseWithGhBlock)
+import HookPolicy (preToolUseWithImplementationBlock)
 import PRReviewHandler (prReviewEventHandlers)
 import TLPhase (ChildHandle (..), TLEvent (..), TLPhase (..))
 import TLStopCheck (tlStopCheck)
-
-tlImplementerTools :: [Text]
-tlImplementerTools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
 
 tlRedispatchMessage :: Text -> Text
 tlRedispatchMessage toolName =
@@ -91,12 +87,6 @@ tlRedispatchMessage toolName =
     <> "If a worker is blocked, use send_message to inject a clarification into the worker's pane. See Worker Correction Loop in .exo/roles/devswarm/context/root.md.\n"
     <> "If neither path fits, re-decompose with spawn_leaf or spawn_worker.\n"
     <> "See CLAUDE.md § Tech Lead Praxis for the full protocol."
-
-tlImplementationDenyHook :: HookInput -> Eff Effects HookOutput
-tlImplementationDenyHook hookInput =
-  case hiToolName hookInput of
-    Just toolName | toolName `elem` tlImplementerTools -> pure (denyResponse (tlRedispatchMessage toolName))
-    _ -> pure (allowResponse Nothing)
 
 -- | TL-specific file_pr: files PR, transitions TLPhase.
 data TLFilePR
@@ -311,7 +301,7 @@ config =
           },
       hooks =
         HookConfig
-          { preToolUse = preToolUseWithGhBlock tlImplementationDenyHook,
+          { preToolUse = preToolUseWithImplementationBlock tlRedispatchMessage (\_ -> pure (allowResponse Nothing)),
             postToolUse = teamRegistrationPostToolUse,
             onStop = \_ -> tlStopCheck,
             onSubagentStop = \_ -> tlStopCheck,

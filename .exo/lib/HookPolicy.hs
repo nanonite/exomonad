@@ -5,18 +5,22 @@ module HookPolicy
   ( blockGhCommand,
     blockChainlinkSqliteCommand,
     blockGitAuthorMutation,
+    blockImplementationMutation,
+    implementerToolsFor,
     preToolUseWithGhBlock,
     preToolUseWithGitAuthorBlock,
+    preToolUseWithImplementationBlock,
+    preToolUseWithGitAuthorAndImplementationBlock,
   )
 where
 
 import Control.Monad.Freer (Eff)
-import Data.List (tails)
 import Data.Aeson (Value (..))
 import Data.Aeson.KeyMap qualified as KM
+import Data.List (tails)
 import Data.Text (Text)
 import Data.Text qualified as T
-import ExoMonad.Guest.Types (HookInput (..), HookOutput, denyResponse)
+import ExoMonad.Guest.Types (HookInput (..), HookOutput, Runtime (..), denyResponse)
 import ExoMonad.Types (Effects)
 
 blockGhCommand :: HookInput -> Maybe Text
@@ -46,6 +50,26 @@ blockGitAuthorMutation hookInput =
       then Just reviewerGitAuthorMutationMessage
       else Nothing
 
+blockImplementationMutation :: (Text -> Text) -> HookInput -> Maybe Text
+blockImplementationMutation renderMessage hookInput =
+  case hiToolName hookInput of
+    Just toolName
+      | toolName `elem` implementerToolsFor runtime ->
+          Just (renderMessage toolName)
+      | toolName `elem` shellToolsFor runtime,
+        Just cmd <- commandFromHookInput hookInput,
+        commandWritesFiles cmd ->
+          Just (renderMessage toolName)
+    _ -> Nothing
+  where
+    runtime = runtimeFromHookInput hookInput
+
+implementerToolsFor :: Runtime -> [Text]
+implementerToolsFor Claude = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+implementerToolsFor Codex = ["apply_patch", "str_replace_editor", "edit_file"]
+implementerToolsFor OpenCode = ["edit", "write", "patch"]
+implementerToolsFor Gemini = []
+
 reviewerGitAuthorMutationMessage :: Text
 reviewerGitAuthorMutationMessage =
   "Reviewer cannot author or rewrite commits -- provenance must remain with the worktree owner. Use `request_changes`/`post_review_comment` to send the fix back to the worker. Read-only git commands (status, diff, log, show, fetch, rev-parse, symbolic-ref) remain available for inspecting the PR's HEAD."
@@ -55,6 +79,10 @@ commandFromHookInput hookInput =
   case hiToolInput hookInput of
     Just (Object obj)
       | Just (String cmd) <- KM.lookup "command" obj ->
+          Just cmd
+      | Just (String cmd) <- KM.lookup "cmd" obj ->
+          Just cmd
+      | Just (String cmd) <- KM.lookup "script" obj ->
           Just cmd
     _ -> Nothing
 
@@ -78,6 +106,56 @@ preToolUseWithGitAuthorBlock next hookInput =
   case blockGitAuthorMutation hookInput of
     Just reason -> pure (denyResponse reason)
     Nothing -> preToolUseWithGhBlock next hookInput
+
+preToolUseWithImplementationBlock ::
+  (Text -> Text) ->
+  (HookInput -> Eff Effects HookOutput) ->
+  HookInput ->
+  Eff Effects HookOutput
+preToolUseWithImplementationBlock renderMessage next hookInput =
+  case blockImplementationMutation renderMessage hookInput of
+    Just reason -> pure (denyResponse reason)
+    Nothing -> preToolUseWithGhBlock next hookInput
+
+preToolUseWithGitAuthorAndImplementationBlock ::
+  (Text -> Text) ->
+  (HookInput -> Eff Effects HookOutput) ->
+  HookInput ->
+  Eff Effects HookOutput
+preToolUseWithGitAuthorAndImplementationBlock renderMessage next hookInput =
+  case blockGitAuthorMutation hookInput of
+    Just reason -> pure (denyResponse reason)
+    Nothing -> preToolUseWithImplementationBlock renderMessage next hookInput
+
+runtimeFromHookInput :: HookInput -> Runtime
+runtimeFromHookInput hookInput =
+  case hiRuntime hookInput of
+    Just runtime -> runtime
+    Nothing -> Claude
+
+shellToolsFor :: Runtime -> [Text]
+shellToolsFor Claude = []
+shellToolsFor Codex = ["shell", "Bash"]
+shellToolsFor OpenCode = ["shell", "bash", "run_command"]
+shellToolsFor Gemini = []
+
+commandWritesFiles :: Text -> Bool
+commandWritesFiles cmd =
+  let normalized = T.toCaseFold cmd
+      tokens = normalizedShellTokens cmd
+   in ">" `T.isInfixOf` normalized
+        || "tee" `elem` tokens
+        || "write_text" `T.isInfixOf` normalized
+        || "write_bytes" `T.isInfixOf` normalized
+        || ".write(" `T.isInfixOf` normalized
+        || pythonOpenWriteMode normalized
+
+pythonOpenWriteMode :: Text -> Bool
+pythonOpenWriteMode normalized =
+  "open(" `T.isInfixOf` normalized
+    && any
+      (`T.isInfixOf` normalized)
+      ["'w", "\"w", "'a", "\"a", "'x", "\"x"]
 
 containsGhToken :: Text -> Bool
 containsGhToken cmd =
