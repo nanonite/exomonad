@@ -328,6 +328,17 @@ check-e2e-tangled-pr-codex:
     bash -n tests/e2e/tangled-pr-codex/deferred-spindle.sh
     python3 -m py_compile tests/e2e/tangled-pr-codex/knot-event-relay.py
 
+
+# Run Tangled VM PR integration test against a pre-provisioned Tangled VM.
+e2e-tangled-vm-pr:
+    ./tests/e2e/tangled-vm-pr/run.sh
+
+# Check Tangled VM PR E2E scripts without launching agents or contacting the VM.
+check-e2e-tangled-vm-pr:
+    bash -n tests/e2e/tangled-vm-pr/run.sh
+    bash -n tests/e2e/tangled-vm-pr/validate.sh
+    python3 -m py_compile tests/e2e/tangled-vm-pr/pr-field.py
+
 # Run Tangled CI integration test.
 # Requires only the knot container: docker compose up -d  (in tests/e2e/tangled-ci/)
 # Manages spindle lifecycle entirely: kills any existing instance, starts fresh, cleans up on exit.
