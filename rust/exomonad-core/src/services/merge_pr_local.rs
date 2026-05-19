@@ -151,6 +151,25 @@ pub fn check_merge_gates(
 async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
     let dir = dir.to_path_buf();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || run_git_command(&dir, &args, None))
+        .await
+        .context("spawn_blocking failed")??;
+    Ok(())
+}
+
+async fn run_git_with_author(dir: &Path, args: &[&str], author: &GitAuthor) -> Result<()> {
+    let dir = dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let author = author.clone();
+    tokio::task::spawn_blocking(move || run_git_command(&dir, &args, Some(&author)))
+        .await
+        .context("spawn_blocking failed")??;
+    Ok(())
+}
+
+async fn run_git_capture(dir: &Path, args: &[&str]) -> Result<String> {
+    let dir = dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new("git")
             .args(&args)
@@ -161,11 +180,60 @@ async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("git {} failed: {}", args.join(" "), stderr.trim());
         }
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     })
     .await
-    .context("spawn_blocking failed")??;
+    .context("spawn_blocking failed")?
+}
+
+fn run_git_command(dir: &Path, args: &[String], author: Option<&GitAuthor>) -> Result<()> {
+    let mut command = std::process::Command::new("git");
+    command.args(args).current_dir(dir);
+    if let Some(author) = author {
+        command
+            .env("GIT_AUTHOR_NAME", &author.name)
+            .env("GIT_AUTHOR_EMAIL", &author.email);
+    }
+    let output = command.output().context("Failed to run git")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git {} failed: {}", args.join(" "), stderr.trim());
+    }
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitAuthor {
+    name: String,
+    email: String,
+    line: String,
+}
+
+impl GitAuthor {
+    fn from_line(author_line: &str) -> Result<Self> {
+        let line = author_line.trim();
+        if line.is_empty() {
+            bail!("head-branch author for merge attribution was empty");
+        }
+        let (name, email_with_suffix) = line
+            .rsplit_once(" <")
+            .ok_or_else(|| anyhow::anyhow!("invalid head-branch author format: {}", line))?;
+        let email = email_with_suffix
+            .strip_suffix('>')
+            .ok_or_else(|| anyhow::anyhow!("invalid head-branch author format: {}", line))?;
+        if name.trim().is_empty() || email.trim().is_empty() {
+            bail!("head-branch author for merge attribution was empty");
+        }
+        Ok(Self {
+            name: name.trim().to_string(),
+            email: email.trim().to_string(),
+            line: line.to_string(),
+        })
+    }
+
+    fn author_flag(&self) -> String {
+        format!("--author={}", self.line)
+    }
 }
 
 // ============================================================================
@@ -261,14 +329,27 @@ pub async fn merge_pr_local(
     }
 
     // Step 3: Merge head branch using the requested strategy
+    let author_line = run_git_capture(
+        project_dir,
+        &["log", "-1", "--format=%an <%ae>", &head_branch],
+    )
+    .await
+    .context("failed to read head-branch author for merge attribution")?;
+    let merge_author = GitAuthor::from_line(&author_line)?;
+    let author_flag = merge_author.author_flag();
     let commit_msg = format!("Merge PR #{} ({})", pr_number, strategy);
     match strategy {
         MergeStrategy::Squash => {
             run_git(project_dir, &["merge", "--squash", &head_branch]).await?;
-            run_git(project_dir, &["commit", "-m", &commit_msg]).await?;
+            run_git(project_dir, &["commit", &author_flag, "-m", &commit_msg]).await?;
         }
         MergeStrategy::Merge | MergeStrategy::Rebase => {
-            run_git(project_dir, &["merge", &head_branch, "-m", &commit_msg]).await?;
+            run_git_with_author(
+                project_dir,
+                &["merge", &head_branch, "-m", &commit_msg],
+                &merge_author,
+            )
+            .await?;
         }
     }
 
@@ -463,6 +544,7 @@ mod tests {
     use crate::domain::AgentName;
     use crate::services::file_pr_local::{LocalReviewState, PrEntry, PrState};
     use chrono::Utc;
+    use std::process::Command;
 
     fn test_entry(number: u64, head: &str, base: &str) -> PrEntry {
         PrEntry {
@@ -884,6 +966,143 @@ mod tests {
         };
         assert!(e.to_string().contains("alice-gemini"));
         assert!(e.to_string().contains("self-merge"));
+    }
+
+    // ── Merge authorship ───────────────────────────────────────
+
+    struct TestMergeRepo {
+        _remote: tempfile::TempDir,
+        work: tempfile::TempDir,
+    }
+
+    fn run_test_git(dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn capture_test_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn write_file(path: &std::path::Path, content: &str) {
+        std::fs::write(path, content).expect("failed to write test file");
+    }
+
+    fn set_git_identity(dir: &std::path::Path, name: &str, email: &str) {
+        run_test_git(dir, &["config", "user.name", name]);
+        run_test_git(dir, &["config", "user.email", email]);
+    }
+
+    fn init_merge_repo() -> TestMergeRepo {
+        let remote = tempfile::tempdir().expect("failed to create remote tempdir");
+        let work = tempfile::tempdir().expect("failed to create work tempdir");
+        run_test_git(remote.path(), &["init", "--bare"]);
+
+        let work_dir = work.path();
+        run_test_git(work_dir, &["init"]);
+        run_test_git(work_dir, &["branch", "-M", "main"]);
+        set_git_identity(work_dir, "TL Runner", "tl@example.com");
+        write_file(&work_dir.join("base.txt"), "base\n");
+        run_test_git(work_dir, &["add", "base.txt"]);
+        run_test_git(work_dir, &["commit", "-m", "Initial commit"]);
+        run_test_git(
+            work_dir,
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        run_test_git(work_dir, &["push", "-u", "origin", "main"]);
+
+        run_test_git(work_dir, &["checkout", "-b", "main.feat-gemini"]);
+        set_git_identity(work_dir, "Worker Agent", "worker@example.com");
+        write_file(&work_dir.join("feature.txt"), "feature\n");
+        run_test_git(work_dir, &["add", "feature.txt"]);
+        run_test_git(work_dir, &["commit", "-m", "Feature work"]);
+
+        run_test_git(work_dir, &["checkout", "main"]);
+        set_git_identity(work_dir, "TL Runner", "tl@example.com");
+        write_file(&work_dir.join("base-only.txt"), "base only\n");
+        run_test_git(work_dir, &["add", "base-only.txt"]);
+        run_test_git(work_dir, &["commit", "-m", "Base work"]);
+
+        TestMergeRepo {
+            _remote: remote,
+            work,
+        }
+    }
+
+    async fn write_approved_pr_registry(project_dir: &std::path::Path) {
+        let prs_path = project_dir.join(".exo/prs.json");
+        std::fs::create_dir_all(project_dir.join(".exo")).unwrap();
+        let mut registry = crate::services::file_pr_local::PrRegistry::default();
+        let mut pr = test_entry(1, "main.feat-gemini", "main");
+        pr.review_state = LocalReviewState::Approved;
+        pr.rounds = 1;
+        pr.reviewer_agent = Some("reviewer-gemini".into());
+        registry.prs.insert(1, pr);
+        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry)
+            .await
+            .unwrap();
+    }
+
+    async fn merge_and_read_author(strategy: MergeStrategy) -> String {
+        let repo = init_merge_repo();
+        let project_dir = repo.work.path();
+        write_approved_pr_registry(project_dir).await;
+        let git_wt = Arc::new(GitWorktreeService::new(project_dir.to_path_buf()));
+        let ci_map: Arc<RwLock<HashMap<BranchName, CIStatus>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let output = merge_pr_local(
+            PRNumber::new(1),
+            &strategy,
+            project_dir,
+            git_wt,
+            &reviewer_agent(),
+            &standard_policy(),
+            None,
+            &ci_map,
+        )
+        .await
+        .unwrap();
+        assert!(output.success, "merge failed: {}", output.message);
+        capture_test_git(project_dir, &["log", "-1", "main", "--format=%an <%ae>"])
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_local_merge_commit_uses_head_author() {
+        let author = merge_and_read_author(MergeStrategy::Merge).await;
+        assert_eq!(author, "Worker Agent <worker@example.com>");
+    }
+
+    #[tokio::test]
+    async fn test_merge_pr_local_squash_commit_uses_head_author() {
+        let author = merge_and_read_author(MergeStrategy::Squash).await;
+        assert_eq!(author, "Worker Agent <worker@example.com>");
+    }
+
+    #[test]
+    fn test_empty_head_author_is_rejected() {
+        let error = GitAuthor::from_line("  \n").unwrap_err().to_string();
+        assert!(error.contains("empty"));
     }
 
     // ── Gate 7: CI status ──────────────────────────────────────
