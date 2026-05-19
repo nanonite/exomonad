@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ExoMonad — Agent System Reference</title>
+<style>
+  :root {
+    --bg: #0f1116;
+    --panel: #161922;
+    --fg: #e6e6e6;
+    --muted: #9aa3b2;
+    --accent: #6cb6ff;
+    --border: #262a36;
+  }
+  body { background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.5; max-width: 1100px; margin: 0 auto; padding: 32px 24px 96px; }
+  h1 { border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+  h2 { color: var(--accent); margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { color: var(--fg); margin-top: 28px; }
+  code { background: var(--panel); padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+  pre { background: var(--panel); padding: 16px; border-radius: 6px; overflow-x: auto; border: 1px solid var(--border); }
+  table { border-collapse: collapse; margin: 12px 0 24px; font-size: 0.92em; }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+  th { background: var(--panel); }
+  td.c { text-align: center; }
+  .mermaid { background: var(--panel); padding: 16px; border-radius: 6px; margin: 12px 0; border: 1px solid var(--border); overflow-x: auto; }
+  .note { color: var(--muted); font-style: italic; }
+  ul li { margin: 4px 0; }
+  a { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+</style>
+</head>
+<body>
+
+<h1>ExoMonad — Agent System Reference</h1>
+<p class="note">Generated companion to <code>docs/architecture/agent-system.md</code>. Update both files together. Sources of truth live in <code>.exo/roles/devswarm/</code>, <code>.exo/lib/</code>, and <code>rust/exomonad-core/src/services/worktree_event_watcher.rs</code>.</p>
+
+<h2>1. Roles</h2>
+<table>
+<tr><th>Role</th><th>Model</th><th>Spawns</th><th>Files PR</th><th>Merges PR</th><th>Lifecycle</th></tr>
+<tr><td><code>root</code></td><td>Opus</td><td>yes</td><td>no</td><td>yes</td><td>persistent (TL window)</td></tr>
+<tr><td><code>tl</code></td><td>Opus</td><td>yes</td><td>yes</td><td>yes</td><td>per-subtree</td></tr>
+<tr><td><code>dev</code></td><td>Codex / Gemini / OpenCode</td><td>no</td><td>yes</td><td>no</td><td>per-spec, exits at merge-ready</td></tr>
+<tr><td><code>reviewer</code></td><td>Codex / Gemini</td><td>no</td><td>no</td><td>no</td><td>ephemeral per review round</td></tr>
+<tr><td><code>worker</code></td><td>Codex / Gemini</td><td>no</td><td>no</td><td>no</td><td>ephemeral, same-worktree edits</td></tr>
+</table>
+
+<h2>2. Tool Matrix</h2>
+
+<h3>ExoMonad orchestration</h3>
+<table>
+<tr><th>Tool</th><th>root</th><th>tl</th><th>dev</th><th>reviewer</th><th>worker</th></tr>
+<tr><td><code>fork_wave</code></td><td class="c">x</td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>spawn_leaf</code></td><td class="c">x</td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>spawn_codex</code></td><td class="c">x</td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>spawn_worker</code></td><td class="c">x</td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>close_worker_pane</code></td><td class="c">x</td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>file_pr</code></td><td></td><td class="c">x</td><td class="c">x</td><td></td><td></td></tr>
+<tr><td><code>merge_pr</code></td><td class="c">x</td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>notify_parent</code></td><td></td><td class="c">x</td><td class="c">x</td><td></td><td class="c">x</td></tr>
+<tr><td><code>send_message</code></td><td class="c">x</td><td class="c">x</td><td class="c">x</td><td></td><td class="c">x</td></tr>
+<tr><td><code>task_list</code> / <code>task_get</code> / <code>task_update</code></td><td></td><td></td><td class="c">x</td><td></td><td class="c">x</td></tr>
+<tr><td><code>approve_pr</code></td><td></td><td></td><td></td><td class="c">x</td><td></td></tr>
+<tr><td><code>request_changes</code></td><td></td><td></td><td></td><td class="c">x</td><td></td></tr>
+<tr><td><code>post_review_comment</code></td><td></td><td></td><td></td><td class="c">x</td><td></td></tr>
+</table>
+
+<h3>Chainlink</h3>
+<table>
+<tr><th>Tool</th><th>root</th><th>tl</th><th>dev</th><th>reviewer</th><th>worker</th></tr>
+<tr><td><code>chainlink_issue_create</code></td><td></td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>chainlink_subissue_create</code></td><td></td><td class="c">x</td><td class="c">x</td><td></td><td></td></tr>
+<tr><td><code>chainlink_subissue_close</code></td><td></td><td></td><td class="c">x</td><td></td><td></td></tr>
+<tr><td><code>chainlink_issue_list</code></td><td></td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>chainlink_issue_show</code></td><td></td><td class="c">x</td><td class="c">x</td><td></td><td class="c">x</td></tr>
+<tr><td><code>chainlink_issue_update</code></td><td></td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>chainlink_issue_comment</code></td><td></td><td class="c">x</td><td class="c">x</td><td></td><td class="c">x</td></tr>
+<tr><td><code>chainlink_issue_close</code></td><td></td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>chainlink_issue_block</code></td><td></td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>chainlink_issue_relate</code></td><td></td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>chainlink_issue_cascade</code></td><td></td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>chainlink_milestone_create</code> / <code>_list</code></td><td></td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td><code>chainlink_session_start</code></td><td></td><td class="c">x</td><td class="c">x</td><td></td><td class="c">x</td></tr>
+<tr><td><code>chainlink_session_work</code></td><td></td><td class="c">x</td><td class="c">x</td><td></td><td class="c">x</td></tr>
+<tr><td><code>chainlink_session_status</code></td><td></td><td class="c">x</td><td class="c">x</td><td></td><td></td></tr>
+<tr><td><code>chainlink_session_end</code></td><td></td><td class="c">x</td><td class="c">x</td><td></td><td class="c">x</td></tr>
+<tr><td><code>chainlink_timer_start</code> / <code>_stop</code> / <code>_status</code></td><td></td><td class="c">x</td><td></td><td></td><td></td></tr>
+</table>
+
+<p>Issue decomposition and timer ownership live at the TL/root layer. Dev/worker can read and comment but cannot create top-level issues or own timers.</p>
+
+<h2>3. Hook Rules</h2>
+
+<h3>PreToolUse deny matrix</h3>
+<table>
+<tr><th>Rule</th><th>root</th><th>tl</th><th>dev</th><th>reviewer</th><th>worker</th></tr>
+<tr><td>Deny <code>Edit</code> / <code>Write</code> / <code>MultiEdit</code> / <code>NotebookEdit</code> with redispatch nudge</td><td class="c">x</td><td class="c">x</td><td></td><td></td><td></td></tr>
+<tr><td>Deny <code>Bash(gh …)</code> — force MCP tools</td><td class="c">x</td><td class="c">x</td><td class="c">x</td><td class="c">x</td><td class="c">x</td></tr>
+<tr><td>Deny direct <code>.chainlink/issues.db</code> sqlite access</td><td class="c">x</td><td class="c">x</td><td class="c">x</td><td class="c">x</td><td class="c">x</td></tr>
+<tr><td>Dev-specific HTTP-context rewriting</td><td></td><td></td><td class="c">x</td><td></td><td></td></tr>
+</table>
+
+<h3>Other hooks</h3>
+<table>
+<tr><th>Hook</th><th>root</th><th>tl</th><th>dev</th><th>reviewer</th><th>worker</th></tr>
+<tr><td>SessionStart</td><td>default</td><td>default</td><td>default</td><td>default</td><td>default</td></tr>
+<tr><td>PostToolUse</td><td>team reg.</td><td>team reg.</td><td>http rewrite</td><td>none</td><td>none</td></tr>
+<tr><td>Stop / SubagentStop</td><td>allow</td><td><code>tlStopCheck</code></td><td><code>DevPhase.canExit</code></td><td><code>reviewerStopCheck</code></td><td><code>workerStopCheck</code></td></tr>
+<tr><td>BeforeModel / AfterModel</td><td>allow</td><td>allow</td><td>http rewriting</td><td>allow</td><td>allow</td></tr>
+<tr><td>Event handlers</td><td><code>prReviewEventHandlers</code></td><td><code>prReviewEventHandlers</code></td><td><code>prReviewEventHandlers</code></td><td><code>reviewerEventHandlers</code></td><td>default</td></tr>
+</table>
+
+<div class="mermaid">
+flowchart LR
+  call[Agent tool call] --> Pre[PreToolUse]
+  Pre -->|gh in command| DenyGh[Deny: use MCP tools]
+  Pre -->|sqlite3 .chainlink| DenyDb[Deny: use Chainlink MCP]
+  Pre -->|Edit/Write and role in tl,root| DenyImpl[Deny: redispatch via spawn_leaf/spawn_worker/send_message]
+  Pre -->|otherwise| Run[Run tool]
+  Run --> Post[PostToolUse: team registration / http rewrite]
+  Post --> Done[Result to agent]
+  Stop[Stop hook] --> SM[Check role phase canExit]
+  SM -->|MustBlock| Block[Block exit, inject reason]
+  SM -->|ShouldNudge| Nudge[Allow + nudge]
+  SM -->|Clean| Allow[Allow exit]
+</div>
+
+<h2>4. Per-role State Machines</h2>
+
+<h3>TLPhase</h3>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> TLPlanning
+  TLPlanning --> TLDispatching: (implicit on first spawn)
+  TLDispatching --> TLWaiting: ChildSpawned
+  TLWaiting --> TLWaiting: ChildSpawned (adds to map)
+  TLWaiting --> TLAllMerged: ChildCompleted (last child)
+  TLWaiting --> TLMerging: PRMerged
+  TLMerging --> TLAllMerged: PRMerged (last child)
+  TLAllMerged --> TLPRFiled: OwnPRFiled
+  TLPRFiled --> TLDone: AllChildrenDone
+  TLWaiting --> TLFailed: ChildFailed
+  TLPRFiled --> [*]
+  TLDone --> [*]
+  TLFailed --> [*]
+</div>
+
+<h3>DevPhase</h3>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> DevSpawned
+  DevSpawned --> DevWorking
+  DevWorking --> DevPRFiled: PRCreated
+  DevPRFiled --> DevChangesRequested: ReviewReceivedEv (first round)
+  DevPRFiled --> DevApproved: ReviewApprovedEv
+  DevChangesRequested --> DevUnderReview: FixesPushedEv (round=1)
+  DevUnderReview --> DevUnderReview: CommitsPushedEv (round++)
+  DevUnderReview --> DevApproved: ReviewApprovedEv
+  DevUnderReview --> DevNeedsHumanDirection: ReviewReceivedEv (round >= 1)
+  DevApproved --> DevDone: MergeReadyEv
+  DevPRFiled --> DevDone: MergeReadyEv
+  DevDone --> [*]
+  DevFailed --> [*]
+</div>
+
+<p class="note">Key rule: a second <code>ReviewReceivedEv</code> while already in <code>DevUnderReview</code> with <code>round &gt;= 1</code> transitions to <code>DevNeedsHumanDirection</code> — the dev gets one fix round; further disagreement is a human-clarification signal.</p>
+
+<h3>ReviewerPhase</h3>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> ReviewerSpawned
+  ReviewerSpawned --> ReviewerPosted: ReviewerApprovedEv
+  ReviewerSpawned --> ReviewerPosted: ReviewerRequestedChangesEv
+  ReviewerPosted --> ReviewerReviewing: ReviewerFixesPushedEv / ReviewerCommitsPushedEv
+  ReviewerReviewing --> ReviewerPosted: ReviewerApprovedEv / ReviewerRequestedChangesEv
+  ReviewerPosted --> ReviewerDone: ReviewerMergeReadyEv
+  ReviewerPosted --> ReviewerDone: ReviewerTimedOutEv
+  ReviewerPosted --> ReviewerDone: ReviewerStuckEv
+  ReviewerDone --> [*]
+  ReviewerFailed --> [*]
+</div>
+
+<h3>WorkerPhase</h3>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> WorkerSpawned
+  WorkerSpawned --> WorkerRunning: WorkerStarted
+  WorkerRunning --> WorkerDone: WorkerCompleted
+  WorkerRunning --> WorkerFailed: WorkerErrored
+  WorkerDone --> [*]
+  WorkerFailed --> [*]
+</div>
+
+<h2>5. PR Review Convergence Flow</h2>
+
+<h3>Happy path</h3>
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant TL
+  participant Dev
+  participant Watcher as Worktree Watcher
+  participant Reviewer
+  participant CI as Spindle / CI
+
+  TL->>Dev: spawn_leaf(spec)
+  Dev->>Dev: implement, commit
+  Dev->>Dev: file_pr (writes .exo/prs.json)
+  Note over Dev: DevPhase: DevPRFiled
+  Watcher->>Reviewer: spawn (ephemeral) via review-loop
+  Reviewer->>Reviewer: read diff
+  Reviewer->>Reviewer: approve_pr (writes .exo/reviews/pr_N.json)
+  Note over Reviewer: ReviewerPhase: ReviewerPosted
+  Watcher->>Dev: handle_event(ReviewApproved)
+  Note over Dev: DevPhase: DevApproved (MustBlock)
+  CI-->>Watcher: CIStatus = success
+  Watcher->>Dev: handle_event(CIStatus, mergeReady=true)
+  Watcher->>TL: deliver [from: dev] [MERGE READY] PR #N
+  Note over Dev: DevPhase: DevDone
+  TL->>TL: merge_pr
+  Watcher->>Dev: PR branch gone — dev exits cleanly
+</div>
+
+<h3>Fixes-pushed loop</h3>
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Dev
+  participant Watcher
+  participant Reviewer
+  participant TL
+
+  Reviewer->>Reviewer: request_changes
+  Watcher->>Dev: handle_event(ReviewReceived) -> InjectMessage(comments)
+  Note over Dev: DevPhase: DevChangesRequested
+  Dev->>Dev: fix, commit, push (SHA changes)
+  Watcher->>Dev: handle_event(FixesPushed)
+  Note over Dev: DevPhase: DevUnderReview round=1
+  Watcher->>Reviewer: handle_event(FixesPushed) -> re-review
+  Note over Reviewer: ReviewerPhase: ReviewerReviewing
+  Reviewer->>Reviewer: approve_pr OR request_changes again
+  alt approved
+    Watcher->>Dev: ReviewApproved -> DevApproved
+  else changes requested round 2
+    Watcher->>Dev: ReviewReceived -> DevNeedsHumanDirection
+    Watcher->>TL: [STUCK] PR #N requires human direction
+  end
+</div>
+
+<h3>Event vocabulary</h3>
+<table>
+<tr><th>Event</th><th>Watcher trigger</th><th>Dev / TL handler</th><th>Reviewer handler</th></tr>
+<tr><td><code>ReviewReceived</code></td><td>new comments in <code>.exo/reviews/pr_N.json</code></td><td>log + <code>ReviewReceivedEv</code> + inject comments</td><td>log + <code>ReviewerRequestedChangesEv</code> + inject</td></tr>
+<tr><td><code>ReviewApproved</code></td><td>review state = approved</td><td><code>ReviewApprovedEv</code> -&gt; <code>DevApproved</code></td><td><code>ReviewerApprovedEv</code> -&gt; <code>ReviewerPosted</code></td></tr>
+<tr><td><code>ReviewerApproved</code></td><td>reviewer agent set verdict approved</td><td>same as above</td><td>same as above</td></tr>
+<tr><td><code>ReviewerRequestedChanges</code></td><td>reviewer wrote requested-changes verdict</td><td><code>ReviewReceivedEv</code> (one fix round)</td><td><code>ReviewerRequestedChangesEv</code></td></tr>
+<tr><td><code>FixesPushed</code></td><td>SHA change after <code>changes_requested</code></td><td><code>FixesPushedEv</code> -&gt; round++</td><td>inject <code>[FIXES PUSHED]</code> to re-review</td></tr>
+<tr><td><code>CommitsPushed</code></td><td>SHA change outside changes-requested window</td><td><code>CommitsPushedEv</code> -&gt; round++</td><td><code>ReviewerCommitsPushedEv</code></td></tr>
+<tr><td><code>ReviewTimeout</code></td><td>no reviewer response within <code>reviewer_max_wait_seconds</code></td><td>log only</td><td><code>ReviewerTimedOutEv</code> -&gt; Done</td></tr>
+<tr><td><code>MergeReady</code></td><td>reviewer approval AND CI success/neutral both seen</td><td><code>MergeReadyEv</code> -&gt; Dev sends <code>[MERGE READY]</code> to TL</td><td><code>ReviewerMergeReadyEv</code> -&gt; Done</td></tr>
+<tr><td><code>Stuck</code></td><td>rounds exceed <code>reviewer_max_rounds</code></td><td>inject "stay alive, wait for TL"</td><td><code>ReviewerStuckEv</code> -&gt; Done</td></tr>
+<tr><td><code>RateLimited</code></td><td>rate-limit hit</td><td>log only</td><td>log only</td></tr>
+<tr><td><code>DevNotPushing</code> / <code>ReviewerNotResponding</code> / <code>ReviewerNeverStarted</code> / <code>ReviewDevFailed</code></td><td>health probes</td><td>log only (escalated by watcher to chainlink <code>review-stuck</code>)</td><td>n/a</td></tr>
+</table>
+
+<h3>CI gating</h3>
+<div class="mermaid">
+flowchart TD
+  A[Watcher tick] --> B{review approved?}
+  B -- no --> Z[no merge_ready]
+  B -- yes --> C{CI status in success or neutral?}
+  C -- no --> Z
+  C -- yes --> D{first time both true?}
+  D -- no --> Z
+  D -- yes --> E[fire MergeReady event]
+  E --> F[Dev: NotifyParentAction]
+  F --> G[TL receives 'from: dev MERGE READY']
+</div>
+
+<p class="note">Without a spindle / GitHub Actions producing a CI status, <code>ci_mergeable_at</code> stays <code>None</code> and <code>MergeReady</code> never fires — even with reviewer approval the loop deadlocks at <code>DevApproved</code>.</p>
+
+<h2>6. Watcher Escalation Outputs</h2>
+<table>
+<tr><th>Watcher signal</th><th>Outcome</th></tr>
+<tr><td><code>dev_not_pushing</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
+<tr><td><code>reviewer_not_responding</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
+<tr><td><code>reviewer_never_started</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
+<tr><td><code>dev_failed</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
+<tr><td><code>Stuck</code> (rounds exceeded)</td><td>inject "wait for TL", dev moves to <code>DevNeedsHumanDirection</code></td></tr>
+</table>
+
+<hr/>
+<p class="note">Regenerate or hand-edit this file when role behavior changes. The markdown master at <code>docs/architecture/agent-system.md</code> is the diff-friendly canonical version.</p>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    sequence: { actorMargin: 60, boxMargin: 10 }
+  });
+</script>
+</body>
+</html>

@@ -719,6 +719,8 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 ├── tests/e2e/                 ← E2E tests (see § E2E Test Pattern)
 │   ├── messaging/             ← Teams inbox delivery test
 │   └── hook-rewrite/          ← PII rewriting hooks test
+├── docs/architecture/         ← Cross-cutting architecture references
+│   └── agent-system.md        ← Role × tool matrix, hook deny rules, per-role state machines, PR review flow (+ .html view)
 └── docs/decisions/            ← Architecture decision records (living docs)
 ```
 
@@ -734,6 +736,7 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 | Work on WASM guest (MCP tools) | `haskell/wasm-guest/CLAUDE.md` |
 | Add or modify E2E tests | `CLAUDE.md` § E2E Test Pattern + `tests/e2e/messaging/` as reference |
 | Understand architectural decisions | `docs/decisions/` |
+| See role tool matrix, hook rules, state machines, PR review flow | `docs/architecture/agent-system.md` |
 
 ---
 

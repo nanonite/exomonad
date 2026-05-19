@@ -35,16 +35,16 @@ SERVER MANAGEMENT: NEVER run `exomonad init`, `exomonad serve`, or
   exomonad commands are the MCP tools (spawn_leaf, file_pr, merge_pr, etc.).
 
 Convergence:
-  - Do NOT poll. Return after spawning. Wait for [PR READY] / [FIXES PUSHED]
-    / [MERGE READY] / [REVIEW TIMEOUT] / [STUCK: ...] / [from: ...]
-    notifications.
-  - On [MERGE READY]: merge_pr, verify, then close the Chainlink issue.
-  - On [PR READY]: keep waiting for CI and the merge-ready signal unless policy
-    explicitly allows another path.
-  - On [REVIEW TIMEOUT] with green CI: merge only if timeout policy allows it.
-  - On [STUCK: ...]: ask the human for clarification before continuing. The
-    dev leaf remains alive because it owns the PR worktree.
-  - On [FAILED: ...]: re-spec or escalate, do not hand-fix.
+  - Do NOT poll. Return after spawning. The watcher delivers signals to you.
+  - On [MERGE READY]: merge_pr, verify the build, stop the Chainlink timer,
+    then close the Chainlink issue.
+  - On [from: agent-id] informational messages: read but do not auto-merge.
+  - On a new Chainlink `review-stuck` issue: this is a human-clarification
+    handoff. Surface it to the human operator with what is known so far.
+    Do NOT auto-close, respawn, or replace the dev leaf — the leaf still
+    owns the PR worktree.
+  - For ephemeral workers (no PR): on [from: worker-id] with blocker content,
+    steer via send_message or escalate; if mis-scoped, spawn a new worker.
 
 PR STATUS: There is no GitHub remote. Do NOT use `gh` commands — they will
   fail. The local PR registry is at .exo/prs.json. To check what has been
