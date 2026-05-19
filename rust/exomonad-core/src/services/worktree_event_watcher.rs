@@ -42,6 +42,7 @@ struct LocalReviewComment {
     diff_hunk: Option<String>,
     thread_id: Option<String>,
     resolved: bool,
+    author_branch: Option<String>,
 }
 
 /// A local review with typed state.
@@ -49,6 +50,7 @@ struct LocalReviewComment {
 struct LocalReview {
     body: String,
     state: ReviewState,
+    author_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +105,8 @@ enum ReviewerFanOut {
     NoReviewer,
     /// Event requires fan-out and the reviewer is registered.
     DispatchTo(BranchName, AgentType, &'static str),
+    /// Event was authored by the registered reviewer and should not be echoed back.
+    SuppressedSelfEcho,
 }
 
 fn reviewer_worktree_path(project_dir: &Path, reviewer_agent: &str) -> PathBuf {
@@ -113,25 +117,35 @@ fn reviewer_worktree_path(project_dir: &Path, reviewer_agent: &str) -> PathBuf {
 ///
 /// Every `pr_review` event kind currently emitted by the watcher has a corresponding
 /// handler in `.exo/roles/devswarm/ReviewerRole.hs` (`fixes_pushed`, `commits_pushed`,
-/// `review_received`, `approved`, `timeout`, `reviewer_approved`,
-/// `reviewer_requested_changes`, `rate_limited`, `stuck`, `merge_ready`), so the
-/// fan-out condition is the event_type alone — the Haskell handler decides whether to
-/// act on its own kind (some kinds the reviewer caused; the handler returns NoAction).
+/// `approved`, `reviewer_approved`, `reviewer_requested_changes`, `rate_limited`,
+/// `merge_ready`), so most fan-out is keyed by event_type alone. `review_received`
+/// is the exception: when the registered reviewer authored the review file, the
+/// leaf needs the feedback and the reviewer does not need its own comment echoed back.
 ///
 /// Non-`pr_review` event_types (`ci_status`, `agent.sibling_merged`, etc.) remain
 /// leaf-only because the reviewer has no handler for them.
 fn reviewer_fanout_decision(
     event_type: &str,
-    _payload: &serde_json::Value,
+    payload: &serde_json::Value,
     pr_number: u64,
     registry: &PrRegistry,
 ) -> ReviewerFanOut {
     if event_type != "pr_review" {
         return ReviewerFanOut::NotApplicable;
     }
-    match registry.reviewer_for_pr(pr_number) {
-        Some((branch, agent_type)) => ReviewerFanOut::DispatchTo(branch, agent_type, "reviewer"),
-        None => ReviewerFanOut::NoReviewer,
+    let Some((branch, agent_type)) = registry.reviewer_for_pr(pr_number) else {
+        return ReviewerFanOut::NoReviewer;
+    };
+
+    if payload.get("kind").and_then(|value| value.as_str()) == Some("review_received")
+        && payload
+            .get("author_branch")
+            .and_then(|value| value.as_str())
+            .is_some_and(|author_branch| author_branch == branch.as_str())
+    {
+        ReviewerFanOut::SuppressedSelfEcho
+    } else {
+        ReviewerFanOut::DispatchTo(branch, agent_type, "reviewer")
     }
 }
 
@@ -276,6 +290,8 @@ struct ReviewVerdictEntry {
     body: String,
     #[serde(default)]
     comments: Vec<ReviewCommentEntry>,
+    #[serde(default)]
+    author_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -290,6 +306,8 @@ struct ReviewCommentEntry {
     thread_id: Option<String>,
     #[serde(default)]
     resolved: bool,
+    #[serde(default)]
+    author_branch: Option<String>,
 }
 
 /// Observation collected from local sources for one open PR.
@@ -837,6 +855,13 @@ where
                                      this PR — the leaf+reviewer convergence loop will \
                                      stall. Check that spawn_reviewer_for_pr ran for this \
                                      PR and that the PR registry was updated."
+                                );
+                            }
+                            ReviewerFanOut::SuppressedSelfEcho => {
+                                debug!(
+                                    pr_number = pending.pr_number,
+                                    kind = %payload_kind,
+                                    "Suppressing reviewer self-echo"
                                 );
                             }
                             ReviewerFanOut::NotApplicable => {}
@@ -1687,6 +1712,7 @@ fn compute_pr_actions_with_context(
                         .expect("changes_requested review state has an event kind"),
                     "pr_number": pr_number.as_u64(),
                     "comments": message,
+                    "author_branch": review_author_branch(reviews),
                 }),
             });
         }
@@ -1779,6 +1805,7 @@ fn review_file_parts(
                 LocalReview {
                     body,
                     state: review_state_from_str(&verdict.state),
+                    author_branch: verdict.author_branch,
                 }
             })
             .collect()
@@ -1794,6 +1821,7 @@ fn review_comment_entry_to_local(c: ReviewCommentEntry) -> LocalReviewComment {
         diff_hunk: c.diff_hunk,
         thread_id: c.thread_id,
         resolved: c.resolved,
+        author_branch: c.author_branch,
     }
 }
 
@@ -1834,6 +1862,7 @@ fn legacy_reviews_from_state(
                 LocalReviewState::ChangesRequested => ReviewState::ChangesRequested,
                 LocalReviewState::PendingReview => ReviewState::None,
             },
+            author_branch: comment.author_branch.clone(),
         })
         .collect()
 }
@@ -1855,6 +1884,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<LocalReview>, ReviewState) {
         .map(|c| LocalReview {
             body: c.body.clone(),
             state: state.clone(),
+            author_branch: c.author_branch.clone(),
         })
         .collect();
 
@@ -1862,15 +1892,25 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<LocalReview>, ReviewState) {
         reviews.push(LocalReview {
             body: "Approved".to_string(),
             state: ReviewState::Approved,
+            author_branch: None,
         });
     } else if obs.review_state == LocalReviewState::ChangesRequested && reviews.is_empty() {
         reviews.push(LocalReview {
             body: "Changes requested".to_string(),
             state: ReviewState::ChangesRequested,
+            author_branch: None,
         });
     }
 
     (reviews, state)
+}
+
+fn review_author_branch(reviews: &[LocalReview]) -> Option<&str> {
+    reviews
+        .iter()
+        .rev()
+        .find(|review| review.state == ReviewState::ChangesRequested)
+        .and_then(|review| review.author_branch.as_deref())
 }
 
 fn signals_within_merge_ready_window(
@@ -2397,6 +2437,7 @@ mod tests {
             diff_hunk: None,
             thread_id: None,
             resolved: false,
+            author_branch: None,
         }
     }
 
@@ -2404,6 +2445,7 @@ mod tests {
         LocalReview {
             body: body.to_string(),
             state,
+            author_branch: None,
         }
     }
 
@@ -2524,6 +2566,36 @@ mod tests {
     }
 
     #[test]
+    fn test_reviewer_fanout_decision_suppresses_self_authored_review_received() {
+        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
+        let payload = serde_json::json!({
+            "kind": "review_received",
+            "pr_number": 1,
+            "author_branch": "review-pr-1",
+        });
+
+        assert_eq!(
+            reviewer_fanout_decision("pr_review", &payload, 1, &registry),
+            ReviewerFanOut::SuppressedSelfEcho
+        );
+    }
+
+    #[test]
+    fn test_reviewer_fanout_decision_dispatches_review_from_other_author() {
+        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
+        let payload = serde_json::json!({
+            "kind": "review_received",
+            "pr_number": 1,
+            "author_branch": "human-reviewer",
+        });
+
+        match reviewer_fanout_decision("pr_review", &payload, 1, &registry) {
+            ReviewerFanOut::DispatchTo(branch, _, _) => assert_eq!(branch.as_str(), "review-pr-1"),
+            other => panic!("expected DispatchTo, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_reviewer_fanout_decision_dispatches_for_every_pr_review_kind() {
         // Per #250: every pr_review kind currently emitted by the watcher has a
         // corresponding handler in ReviewerRole.hs, so all of them fan out. The
@@ -2641,6 +2713,38 @@ mod tests {
         assert_eq!(emit_event_count, 1);
         assert_eq!(state.pr_review_cycle_count, 2);
         assert_eq!(state.last_review_state, ReviewState::ChangesRequested);
+    }
+
+    #[test]
+    fn test_changes_requested_payload_records_review_author_branch() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let reviews = vec![LocalReview {
+            body: "Please address comments".to_string(),
+            state: ReviewState::ChangesRequested,
+            author_branch: Some("review-pr-1".to_string()),
+        }];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &reviews,
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, _| "review message".to_string(),
+            5,
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "review_received"
+                    && payload["author_branch"] == "review-pr-1"
+        )));
     }
 
     #[test]
@@ -3317,6 +3421,7 @@ mod tests {
         let reviews = vec![LocalReview {
             body: "I have reviewed this and it is APPROVED".to_string(),
             state: ReviewState::None,
+            author_branch: None,
         }];
         let actions = compute_pr_actions(
             &mut state,
@@ -3487,10 +3592,12 @@ mod tests {
             LocalReview {
                 body: "LGTM!".to_string(),
                 state: ReviewState::Approved,
+                author_branch: None,
             },
             LocalReview {
                 body: "Good work.".to_string(),
                 state: ReviewState::None,
+                author_branch: None,
             },
         ];
         let msg = format_review_message(&[], &reviews);
@@ -3507,6 +3614,7 @@ mod tests {
             diff_hunk: Some("@@ -1,3 +1,3 @@".to_string()),
             thread_id: None,
             resolved: false,
+            author_branch: None,
         }];
         let msg = format_review_message(&comments, &[]);
         assert!(msg.contains("Inline comments:"));

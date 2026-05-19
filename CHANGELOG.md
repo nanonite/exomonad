@@ -123,6 +123,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Watcher: stop fanning pr_review review_received back to the reviewer that posted it (#296)
 - Watcher: add ci.gate config knob — treat 'no CI source configured' as auto-neutral so merge_ready can fire (#295)
 - merge_pr: post-merge git pull failure mode is opaque; log the actual exit code/stderr instead of a generic recovery hint (#294)
 - Watcher: distinguish dev-stuck from reviewer-stuck timeouts; TL should only ever receive [MERGE READY] (#293)

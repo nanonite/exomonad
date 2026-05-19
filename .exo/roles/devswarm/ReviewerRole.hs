@@ -89,7 +89,8 @@ data ReviewComment = ReviewComment
     commentPath :: Maybe Text,
     commentDiffHunk :: Maybe Text,
     commentThreadId :: Maybe Text,
-    commentResolved :: Bool
+    commentResolved :: Bool,
+    commentAuthorBranch :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -100,7 +101,8 @@ instance Aeson.ToJSON ReviewComment where
         "path" .= commentPath c,
         "diff_hunk" .= commentDiffHunk c,
         "thread_id" .= commentThreadId c,
-        "resolved" .= commentResolved c
+        "resolved" .= commentResolved c,
+        "author_branch" .= commentAuthorBranch c
       ]
 
 instance Aeson.FromJSON ReviewComment where
@@ -111,11 +113,13 @@ instance Aeson.FromJSON ReviewComment where
       <*> v Aeson..:? "diff_hunk"
       <*> v Aeson..:? "thread_id"
       <*> v Aeson..:? "resolved" Aeson..!= False
+      <*> v Aeson..:? "author_branch"
 
 data ReviewVerdict = ReviewVerdict
   { verdictState :: Text,
     verdictBody :: Text,
-    verdictComments :: [ReviewComment]
+    verdictComments :: [ReviewComment],
+    verdictAuthorBranch :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -124,7 +128,8 @@ instance Aeson.ToJSON ReviewVerdict where
     object
       [ "state" .= verdictState v,
         "body" .= verdictBody v,
-        "comments" .= verdictComments v
+        "comments" .= verdictComments v,
+        "author_branch" .= verdictAuthorBranch v
       ]
 
 instance Aeson.FromJSON ReviewVerdict where
@@ -133,6 +138,7 @@ instance Aeson.FromJSON ReviewVerdict where
       <$> v Aeson..:? "state" Aeson..!= "none"
       <*> v Aeson..:? "body" Aeson..!= ""
       <*> v Aeson..:? "comments" Aeson..!= []
+      <*> v Aeson..:? "author_branch"
 
 data ReviewFile = ReviewFile
   { reviewState :: Text,
@@ -178,8 +184,8 @@ readExistingReviewFile prNumber = do
 emptyReviewFile :: ReviewFile
 emptyReviewFile = ReviewFile "none" [] []
 
-appendVerdict :: Text -> Text -> [ReviewComment] -> ReviewFile -> ReviewFile
-appendVerdict state body comments existing =
+appendVerdict :: Text -> Text -> Maybe Text -> [ReviewComment] -> ReviewFile -> ReviewFile
+appendVerdict state body authorBranch comments existing =
   ReviewFile
     { reviewState = state,
       reviewComments = comments,
@@ -188,7 +194,8 @@ appendVerdict state body comments existing =
           <> [ ReviewVerdict
                  { verdictState = state,
                    verdictBody = body,
-                   verdictComments = comments
+                   verdictComments = comments,
+                   verdictAuthorBranch = authorBranch
                  }
              ]
     }
@@ -213,12 +220,12 @@ instance MCPTool ReviewerApprovePR where
       ]
   toolHandlerEff args = do
     existing <- readExistingReviewFile (apPrNumber args)
-    let next = appendVerdict "approved" (apBody args) [] existing
+    branch <- getCurrentBranch
+    let next = appendVerdict "approved" (apBody args) (Just branch) [] existing
     result <- writeReviewFile (apPrNumber args) next
     case result of
       Left err -> pure $ errorResult err
       Right path -> do
-        branch <- getCurrentBranch
         void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv (apPrNumber args))
         pure $ successResult $ object ["success" .= True, "path" .= path]
 
@@ -236,16 +243,18 @@ instance MCPTool ReviewerRequestChanges where
         ("diff_hunk", "Optional diff hunk for the comment")
       ]
   toolHandlerEff args = do
+    branch <- getCurrentBranch
     let comment =
           ReviewComment
             { commentBody = rcBody args,
               commentPath = rcPath args,
               commentDiffHunk = rcDiffHunk args,
               commentThreadId = Nothing,
-              commentResolved = False
+              commentResolved = False,
+              commentAuthorBranch = Just branch
             }
     existing <- readExistingReviewFile (rcPrNumber args)
-    let next = appendVerdict "changes_requested" (rcBody args) [comment] existing
+    let next = appendVerdict "changes_requested" (rcBody args) (Just branch) [comment] existing
     result <- writeReviewFile (rcPrNumber args) next
     case result of
       Left err -> pure $ errorResult err
@@ -270,13 +279,15 @@ instance MCPTool ReviewerPostReviewComment where
       ]
   toolHandlerEff args = do
     existing <- readExistingReviewFile (pcPrNumber args)
+    branch <- getCurrentBranch
     let comment =
           ReviewComment
             { commentBody = pcBody args,
               commentPath = pcPath args,
               commentDiffHunk = pcDiffHunk args,
               commentThreadId = pcThreadId args,
-              commentResolved = False
+              commentResolved = False,
+              commentAuthorBranch = Just branch
             }
         next = existing {reviewComments = reviewComments existing <> [comment]}
     result <- writeReviewFile (pcPrNumber args) next
