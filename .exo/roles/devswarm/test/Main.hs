@@ -33,6 +33,7 @@ main :: IO ()
 main = do
   assertRoleDeny "tl" TLRole.config
   assertRoleDeny "root" RootRole.config
+  assertReviewerDenyImplementationTools
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
   assertReviewerToolList
@@ -62,6 +63,15 @@ assertRoleAllow role cfg =
     assertBool (label role toolName "allows") (continue_ output)
     assertEqual (label role toolName "decision") (Just "allow") (permissionDecisionOf output)
     assertBool (label role toolName "does not emit deny") (not (messageContains "TL agents cannot use" output))
+
+assertReviewerDenyImplementationTools :: IO ()
+assertReviewerDenyImplementationTools =
+  forM_ denyTools $ \toolName -> do
+    output <- runPreToolUse ReviewerRole.config toolName
+    assertBool (label "reviewer" toolName "denies") (not (continue_ output))
+    assertEqual (label "reviewer" toolName "decision") (Just "deny") (permissionDecisionOf output)
+    assertBool (label "reviewer" toolName "message names reviewer policy") (messageContains "Reviewers do not edit code" output)
+    assertBool (label "reviewer" toolName "message relays to worker") (messageContains "request_changes" output)
 
 runPreToolUse :: RoleConfig tools -> Text -> IO HookOutput
 runPreToolUse cfg toolName = do

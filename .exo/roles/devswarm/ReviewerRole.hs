@@ -33,10 +33,23 @@ import ExoMonad.Guest.Events
 import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
-import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, postToolUseResponse)
+import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, HookInput (..), HookOutput, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, denyResponse, postToolUseResponse)
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
 import HookPolicy (preToolUseWithGhBlock)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
+
+reviewerImplementerTools :: [Text]
+reviewerImplementerTools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+
+reviewerRedispatchMessage :: Text
+reviewerRedispatchMessage =
+  "Reviewers do not edit code. Use `request_changes` or `post_review_comment` to relay the fix to the worker that owns the worktree. The worker's git identity is the canonical author of every commit on its branch."
+
+reviewerImplementationDenyHook :: HookInput -> Eff Effects HookOutput
+reviewerImplementationDenyHook hookInput =
+  case hiToolName hookInput of
+    Just toolName | toolName `elem` reviewerImplementerTools -> pure (denyResponse reviewerRedispatchMessage)
+    _ -> pure (allowResponse Nothing)
 
 data ApprovePRArgs = ApprovePRArgs
   { apPrNumber :: Int,
@@ -314,7 +327,7 @@ config =
           },
       hooks =
         HookConfig
-          { preToolUse = preToolUseWithGhBlock (\_ -> pure (allowResponse Nothing)),
+          { preToolUse = preToolUseWithGhBlock reviewerImplementationDenyHook,
             postToolUse = \_ -> pure (postToolUseResponse Nothing),
             onStop = \_ -> reviewerStopCheck,
             onSubagentStop = \_ -> reviewerStopCheck,
