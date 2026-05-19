@@ -37,6 +37,7 @@ import ExoMonad.Guest.Tools.Chainlink
     ChainlinkTimerStatus (..),
     ChainlinkTimerStop (..),
   )
+import ExoMonad.Guest.Tools.DiscardWorkerOutput (DiscardWorkerOutput (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.Events
   ( NotifyParentArgs (..),

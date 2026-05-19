@@ -63,7 +63,7 @@ disposeLeafCore args =
   case inferIssueId (dlaName args) of
     Just issueId -> do
       let summary = Just ("Disposed by TL: " <> dlaReason args)
-      result <- chainlinkIssueCloseCore (ChainlinkIssueCloseArgs issueId summary)
+      result <- chainlinkIssueCloseCore (ChainlinkIssueCloseArgs issueId summary (dlaForce args))
       case result of
         Left err -> pure $ Left err
         Right _ -> pure $ Right $ object ["success" .= True, "agent" .= dlaName args, "issue_id" .= issueId, "force" .= dlaForce args]

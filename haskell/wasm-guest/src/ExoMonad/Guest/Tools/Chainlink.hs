@@ -131,7 +131,7 @@ module ExoMonad.Guest.Tools.Chainlink
 where
 
 import Control.Monad.Freer (Eff)
-import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.!=), (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Int (Int32)
 import Data.Map qualified as Map
@@ -141,7 +141,9 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Data.Word (Word64)
+import Effects.Git qualified as Git
 import Effects.Process qualified as Proc
+import ExoMonad.Effects.Git (GitGetStatus)
 import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
@@ -636,6 +638,7 @@ instance FromJSON ChainlinkIssueCloseArgs where
     ChainlinkIssueCloseArgs
       <$> v .: "issue_id"
       <*> v .:? "summary"
+      <*> v .:? "force" .!= False
 
 instance ToJSON ChainlinkIssueCloseArgs where
   toJSON args =
@@ -658,18 +661,45 @@ chainlinkIssueCloseSchema =
 
 chainlinkIssueCloseCore :: ChainlinkIssueCloseArgs -> Eff Effects (Either Text ())
 chainlinkIssueCloseCore args = do
-  result <- runChainlink (buildCloseArgs args)
-  case result of
-    Left err -> pure $ Left ("chainlink close failed: " <> err)
-    Right resp
-      | Proc.runResponseExitCode resp == 0 -> pure $ Right ()
-      | otherwise ->
-          pure $
-            Left $
-              "chainlink close failed (exit "
-                <> exitCodeToText (Proc.runResponseExitCode resp)
-                <> "): "
-                <> TL.toStrict (Proc.runResponseStderr resp)
+  clean <- if cisForce args then pure (Right ()) else ensureCleanWorktreeForClose (cisIssueId args)
+  case clean of
+    Left err -> pure (Left err)
+    Right () -> do
+      result <- runChainlink (buildCloseArgs args)
+      case result of
+        Left err -> pure $ Left ("chainlink close failed: " <> err)
+        Right resp
+          | Proc.runResponseExitCode resp == 0 -> pure $ Right ()
+          | otherwise ->
+              pure $
+                Left $
+                  "chainlink close failed (exit "
+                    <> exitCodeToText (Proc.runResponseExitCode resp)
+                    <> "): "
+                    <> TL.toStrict (Proc.runResponseStderr resp)
+
+ensureCleanWorktreeForClose :: Int -> Eff Effects (Either Text ())
+ensureCleanWorktreeForClose issueId = do
+  statusResult <- suspendEffect @GitGetStatus (Git.GetStatusRequest {Git.getStatusRequestWorkingDir = "."})
+  case statusResult of
+    Right status
+      | not (null (Git.getStatusResponseDirtyFiles status) && null (Git.getStatusResponseStagedFiles status)) ->
+          pure $ Left $ closeDirtyMessage issueId status
+    _ -> pure (Right ())
+
+closeDirtyMessage :: Int -> Git.GetStatusResponse -> Text
+closeDirtyMessage issueId status =
+  "Cannot close issue #"
+    <> T.pack (show issueId)
+    <> ": uncommitted changes in this worktree:\n"
+    <> formatGitStatus status
+    <> "\nCommit, discard, or use `discard_worker_output` first."
+
+formatGitStatus :: Git.GetStatusResponse -> Text
+formatGitStatus status =
+  T.unlines $
+    map (("staged: " <>) . TL.toStrict) (V.toList (Git.getStatusResponseStagedFiles status))
+      <> map (("dirty: " <>) . TL.toStrict) (V.toList (Git.getStatusResponseDirtyFiles status))
 
 data ChainlinkIssueClose
 

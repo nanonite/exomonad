@@ -761,6 +761,14 @@ impl<
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             let session_branch = BranchName::try_from_str(parent_bb.as_str()).expect("validated string input is non-empty");
             let mut env_vars = self.common_spawn_env(&agent_name, &session_branch, &role);
+              env_vars.insert(
+                  "GIT_AUTHOR_NAME".to_string(),
+                  format!("exomonad-{}", agent_name.as_str()),
+              );
+              env_vars.insert(
+                  "GIT_AUTHOR_EMAIL".to_string(),
+                  format!("{}@exomonad.local", agent_name.as_str()),
+              );
 
             fs::create_dir_all(&agent_config_dir).await?;
 

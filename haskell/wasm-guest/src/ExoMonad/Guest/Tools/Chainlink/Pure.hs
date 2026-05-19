@@ -158,7 +158,8 @@ data ChainlinkSessionEndArgs = ChainlinkSessionEndArgs
 
 data ChainlinkIssueCloseArgs = ChainlinkIssueCloseArgs
   { cisIssueId :: Int,
-    cisSummary :: Maybe Text
+    cisSummary :: Maybe Text,
+    cisForce :: Bool
   }
   deriving (Generic, Show)
 
