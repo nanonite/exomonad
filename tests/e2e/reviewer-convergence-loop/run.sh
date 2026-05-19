@@ -68,6 +68,7 @@ REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
 CODEX_HOME_DIR="$WORK_DIR/codex-home"
 SERVER_LOG="$WORK_DIR/server.log"
+SCENARIO="${E2E_REVIEWER_SCENARIO:-converge}"
 
 echo "  Work dir: $WORK_DIR"
 
@@ -132,9 +133,25 @@ if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
     cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
 fi
 mkdir -p .exo/context
-cp "$SCRIPT_DIR/reviewer-checklist.md" .exo/context/reviewer-checklist.md
+case "$SCENARIO" in
+    converge)
+        REVIEWER_CONTEXT="$SCRIPT_DIR/reviewer-checklist.md"
+        ROOT_TEST="$SCRIPT_DIR/e2e-test.md"
+        VALIDATOR_EXPECTATION="converge"
+        ;;
+    round-escalation)
+        REVIEWER_CONTEXT="$SCRIPT_DIR/reviewer-round-escalation-checklist.md"
+        ROOT_TEST="$SCRIPT_DIR/e2e-round-escalation-test.md"
+        VALIDATOR_EXPECTATION="round-escalation"
+        ;;
+    *)
+        echo "ERROR: unknown E2E_REVIEWER_SCENARIO '$SCENARIO'"
+        exit 1
+        ;;
+esac
+cp "$REVIEWER_CONTEXT" .exo/context/reviewer-checklist.md
 
-ROOT_PROMPT="$(python3 - "$SCRIPT_DIR/e2e-test.md" <<'PY'
+ROOT_PROMPT="$(python3 - "$ROOT_TEST" <<'PY'
 import pathlib, sys
 print(pathlib.Path(sys.argv[1]).read_text().replace('"""', '\\"\\"\\"'))
 PY
@@ -160,7 +177,7 @@ context = [".exo/context/reviewer-checklist.md"]
 [[companions]]
 name = "convergence-validator"
 agent_type = "process"
-command = "$SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE' '$SERVER_LOG'"
+command = "E2E_REVIEWER_EXPECTATION='$VALIDATOR_EXPECTATION' $SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE' '$SERVER_LOG'"
 EOF
 
 if [[ -f "$HOME/.codex/auth.json" ]]; then
@@ -192,11 +209,13 @@ export EXOMONAD_SERVER_LOG_FILE="$SERVER_LOG"
 echo "  GitHub auth unset"
 echo "  Codex config isolated to $CODEX_HOME"
 echo "  Server log: $EXOMONAD_SERVER_LOG_FILE"
+echo "  Scenario: $SCENARIO"
 
 echo ">>> [Phase 3] Launching exomonad init..."
 echo ""
 echo "============================================"
 echo "  E2E Reviewer Convergence Loop Test Ready"
+echo "  Scenario: $SCENARIO"
 echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
 echo ""

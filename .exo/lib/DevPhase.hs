@@ -63,7 +63,7 @@ instance StateMachine DevPhase DevEvent where
     ReviewReceivedEv prNum comments -> case phase of
       DevUnderReview _ round_
         | round_ >= 1 ->
-            Transitioned (DevNeedsHumanDirection prNum "reviewer still requesting changes after first fix round")
+            Transitioned (DevNeedsHumanDirection prNum "reviewer still requesting changes in round 1 after the first fix push")
       _ ->
         Transitioned (DevChangesRequested prNum [comments])
     ReviewApprovedEv prNum ->
@@ -90,7 +90,7 @@ instance StateMachine DevPhase DevEvent where
   canExit (DevUnderReview pr _) =
     MustBlock $ "PR #" <> T.pack (show pr) <> " under review. Stay alive until merge-ready."
   canExit (DevNeedsHumanDirection pr _) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " has unresolved review feedback after first fix round; awaiting human direction."
+    MustBlock $ "PR #" <> T.pack (show pr) <> " has unresolved review feedback in round 1 after the first fix push; awaiting human direction."
   canExit (DevApproved pr) =
     MustBlock $ "PR #" <> T.pack (show pr) <> " approved, waiting for CI merge-ready signal."
   canExit _ = Clean

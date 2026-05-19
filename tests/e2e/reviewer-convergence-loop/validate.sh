@@ -29,6 +29,7 @@ POLL_SECS=5
 START=$(date +%s)
 FAILURES=()
 EVIDENCE=()
+EXPECTATION="${E2E_REVIEWER_EXPECTATION:-converge}"
 
 log() {
     printf '[validate.sh] %s\n' "$*"
@@ -273,6 +274,57 @@ validate_convergence_evidence() {
     fi
 }
 
+validate_round_escalation_evidence() {
+    local pr reason
+
+    if [[ ! -f "$REPO_DIR/.exo/prs.json" ]]; then
+        record_failure "missing .exo/prs.json"
+        return
+    fi
+
+    pr="$(pr_number)"
+    reason="$(
+        python3 - "$REPO_DIR/.exo/kv" <<'PY' 2>/dev/null
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for path in sorted(root.glob("**/*.json")):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if isinstance(value, dict) and value.get("phase") == "dev_needs_human_direction":
+        print(value.get("reason", ""))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    )"
+
+    if [[ -n "$reason" ]]; then
+        record_evidence "dev phase persisted as DevNeedsHumanDirection for PR #$pr: $reason"
+    else
+        record_failure "no persisted DevNeedsHumanDirection phase found in .exo/kv"
+    fi
+
+    if server_logs_available; then
+        contains_fixed_server_log "[STUCK: PR #${pr}]" \
+            && record_evidence "server log has TL [STUCK: PR #${pr}] notification" \
+            || record_failure "server log missing TL [STUCK: PR #${pr}] notification"
+
+        contains_fixed_server_log "reviewer still requesting changes in round 1" \
+            && record_evidence "server log has round 1 escalation reason" \
+            || record_failure "server log missing round 1 escalation reason"
+
+        grep_fixed_server_logs "Created issue" | grep -F "review-stuck" >/dev/null 2>&1 \
+            && record_failure "watcher opened a chainlink review-stuck issue for in-band round escalation" \
+            || record_evidence "no chainlink review-stuck issue was opened for round escalation"
+    else
+        record_failure "server log missing at $SERVER_LOG and .exo/logs"
+    fi
+}
+
 detect_uds_side_channel() {
     local evidence
 
@@ -296,7 +348,17 @@ detect_uds_side_channel() {
 run_success_assertions() {
     FAILURES=()
     EVIDENCE=()
-    validate_convergence_evidence
+    case "$EXPECTATION" in
+        converge)
+            validate_convergence_evidence
+            ;;
+        round-escalation)
+            validate_round_escalation_evidence
+            ;;
+        *)
+            record_failure "unknown E2E_REVIEWER_EXPECTATION=$EXPECTATION"
+            ;;
+    esac
     validate_mcp_stdio_evidence
     detect_uds_side_channel
 }

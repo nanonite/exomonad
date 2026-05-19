@@ -151,13 +151,14 @@ ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerAppro
 
 reviewRequestAction :: Int -> Text -> Maybe DevPhase -> EventAction
 reviewRequestAction n _comments (Just (DevNeedsHumanDirection _ reason)) =
-  InjectMessage
-    ( "Review loop needs human direction for PR #"
+  NotifyParentAction
+    ( "[STUCK: PR #"
         <> T.pack (show n)
-        <> ": "
+        <> "] Review loop needs human direction: "
         <> reason
-        <> ". Stay alive and wait for TL clarification."
+        <> ". Dev leaf is staying alive and waiting for TL clarification."
     )
+    n
 reviewRequestAction n comments_ _ =
   InjectMessage (Tpl.reviewReceived n comments_)
 

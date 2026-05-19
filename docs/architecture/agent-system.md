@@ -148,7 +148,7 @@ stateDiagram-v2
   [*] --> DevSpawned
   DevSpawned --> DevWorking
   DevWorking --> DevPRFiled: PRCreated
-  DevPRFiled --> DevChangesRequested: ReviewReceivedEv\n(first round)
+  DevPRFiled --> DevChangesRequested: ReviewReceivedEv\n(round 0)
   DevPRFiled --> DevApproved: ReviewApprovedEv
   DevChangesRequested --> DevUnderReview: FixesPushedEv\n(round=1)
   DevUnderReview --> DevUnderReview: CommitsPushedEv\n(round++)
@@ -167,7 +167,7 @@ stateDiagram-v2
   note right of DevNeedsHumanDirection: canExit = MustBlock
 ```
 
-Key rule: a second `ReviewReceivedEv` while already in `DevUnderReview` with `round >= 1` transitions to `DevNeedsHumanDirection` — the dev gets one fix round; further disagreement is a human-clarification signal.
+Round vocabulary is zero-based and tied to reviewer verdicts. Round 0 is the first reviewer verdict after the PR is filed. If that verdict requests changes, the dev fixes and pushes; `FixesPushedEv` moves the dev to `DevUnderReview` with `review_round=1`. A second `ReviewReceivedEv` in round 1 transitions to `DevNeedsHumanDirection`, and the handler notifies the TL with `[STUCK: PR #N]`. That is an in-band human-clarification signal, not a watcher health failure and not a Chainlink `review-stuck` issue.
 
 ### ReviewerPhase
 
