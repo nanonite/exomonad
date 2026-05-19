@@ -31,12 +31,12 @@ TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `Mul
 ## Notification Vocabulary
 
 ### Dev-leaf signals (PR review loop)
-- `[FIXES PUSHED]` — leaf addressed reviewer comments and pushed. Merge if CI passes.
-- `[PR READY]` — reviewer approved, but wait for `[MERGE READY]` before merge/close unless policy explicitly allows otherwise.
 - `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Merge, verify, then close the Chainlink issue.
-- `[REVIEW TIMEOUT]` — no reviewer response after timeout. Merge only if CI and policy allow the timeout path.
-- `[STUCK: id]` — review did not converge after the configured review-round limit. Ask the human for clarification before continuing; the dev leaf remains alive.
-- `[FAILED: id]` — leaf exhausted retries. Re-decompose or escalate.
+
+The review-loop watcher routes all non-merge-ready outcomes (`dev_not_pushing`,
+`reviewer_not_responding`, `reviewer_never_started`, and `dev_failed`) to the
+human escalation surface as Chainlink `review-stuck` issues. Do not branch on
+review-loop timeout, stuck, or failed signals in this TL prompt.
 
 ### Worker signals (ephemeral pane, no PR)
 - `[from: worker-name]` with success content — worker completed. Acknowledge, no merge needed.
@@ -73,7 +73,7 @@ You own issue decomposition, timer lifecycle, PR merge decisions, and final issu
 - Use `chainlink_timer_stop` with the same issue id after review, CI, and merge are complete. Timer stop is explicit per issue; do not infer a global active timer.
 - Use `chainlink_session_status` to observe whether child agents have started, attached to an issue, or ended with handoff notes.
 - Use `chainlink_issue_close` only as coordinator authority after merge-ready, merge, verification, and the implementing agent's session end are complete.
-- Treat stuck PR review loops as a human-clarification point. Do not automatically close, respawn, or replace the dev leaf that owns the PR worktree.
+- Treat Chainlink `review-stuck` issues as human-clarification inputs. Do not automatically close, respawn, or replace the dev leaf that owns the PR worktree.
 
 Do not use Chainlink agent, sync, or lock commands. Do not ask workers or dev leaves to close their own assigned issue.
 

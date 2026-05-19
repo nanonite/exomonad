@@ -123,6 +123,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Watcher: distinguish dev-stuck from reviewer-stuck timeouts; TL should only ever receive [MERGE READY] (#293)
 - Reviewer-convergence E2E: realign fixture so reviewer feedback is scoped to the leaf's actual change (Option A) (#292)
 - Add 'just role-hook-tests' recipe to actually execute the devswarm WASM test suite (#289)
 - Remove convergence-testrunner from reviewer-convergence E2E (and audit other testrunner companions) (#287)

@@ -40,25 +40,25 @@ prReviewHandler (ReviewApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved (reviewer agent)"
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewApprovedEv n)
-  pure (NotifyParentAction (Tpl.prReady n) n)
+  pure NoAction
 prReviewHandler (ReviewerApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved by reviewer agent"
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewApprovedEv n)
-  pure (NotifyParentAction (Tpl.prReady n) n)
+  pure NoAction
 prReviewHandler (ReviewTimeout n mins) = do
   logHandler $ "PR #" <> T.pack (show n) <> " timed out after " <> T.pack (show mins) <> " minutes"
-  pure (NotifyParentAction (Tpl.reviewTimeout n mins) n)
+  pure NoAction
 prReviewHandler (FixesPushed n ci _headSha) = do
   logHandler $ "Fixes pushed on PR #" <> T.pack (show n) <> ", CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (FixesPushedEv n ci)
-  pure (NotifyParentAction (Tpl.fixesPushed n ci) n)
+  pure NoAction
 prReviewHandler (CommitsPushed n ci) = do
   logHandler $ "New commits pushed on PR #" <> T.pack (show n) <> ", CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CommitsPushedEv n ci)
-  pure (NotifyParentAction (Tpl.commitsPushed n ci) n)
+  pure NoAction
 prReviewHandler (ReviewerRequestedChanges n comments_) = do
   logHandler $ "Reviewer requested changes on PR #" <> T.pack (show n)
   branch <- getCurrentBranch
@@ -85,6 +85,18 @@ prReviewHandler (MergeReady n ci branch_) = do
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (MergeReadyEv n ci branch_)
   pure (NotifyParentAction (Tpl.mergeReady n ci branch_) n)
+prReviewHandler (DevNotPushing n) = do
+  logHandler $ "PR #" <> T.pack (show n) <> " dev leaf stopped pushing fixes"
+  pure NoAction
+prReviewHandler (ReviewerNotResponding n) = do
+  logHandler $ "PR #" <> T.pack (show n) <> " reviewer stopped responding"
+  pure NoAction
+prReviewHandler (ReviewerNeverStarted n) = do
+  logHandler $ "PR #" <> T.pack (show n) <> " reviewer never started"
+  pure NoAction
+prReviewHandler (ReviewDevFailed n) = do
+  logHandler $ "PR #" <> T.pack (show n) <> " dev leaf reported failure"
+  pure NoAction
 
 -- | Handle sibling merged events.
 siblingMergedHandler :: SiblingMergedEvent -> Eff Effects EventAction

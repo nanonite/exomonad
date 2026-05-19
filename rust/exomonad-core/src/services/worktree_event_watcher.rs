@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
@@ -71,9 +71,10 @@ enum PendingAction {
         pr_number: u64,
         rounds: u32,
     },
-    NotifyWatcherStuck {
+    FileHumanEscalation {
         pr_number: u64,
-        rounds: u32,
+        classification: ReviewStallKind,
+        diagnostic: ReviewStallDiagnostic,
     },
 }
 
@@ -163,6 +164,55 @@ struct WatchState {
     merge_ready_notified: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReviewStallKind {
+    DevNotPushing,
+    ReviewerNotResponding,
+    ReviewerNeverStarted,
+    DevFailed,
+}
+
+const REVIEW_STALL_KINDS: [ReviewStallKind; 4] = [
+    ReviewStallKind::DevNotPushing,
+    ReviewStallKind::ReviewerNotResponding,
+    ReviewStallKind::ReviewerNeverStarted,
+    ReviewStallKind::DevFailed,
+];
+
+impl ReviewStallKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReviewStallKind::DevNotPushing => "dev_not_pushing",
+            ReviewStallKind::ReviewerNotResponding => "reviewer_not_responding",
+            ReviewStallKind::ReviewerNeverStarted => "reviewer_never_started",
+            ReviewStallKind::DevFailed => "dev_failed",
+        }
+    }
+
+    fn title_fragment(self) -> &'static str {
+        match self {
+            ReviewStallKind::DevNotPushing => "dev leaf stopped pushing fixes",
+            ReviewStallKind::ReviewerNotResponding => "reviewer stopped responding",
+            ReviewStallKind::ReviewerNeverStarted => "reviewer never started",
+            ReviewStallKind::DevFailed => "dev leaf reported failure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReviewStallDiagnostic {
+    branch: String,
+    head_sha: String,
+    last_observed_sha: String,
+    rounds: u32,
+    reviewer_registered: bool,
+    review_file_seen: bool,
+    review_file_mtime: Option<String>,
+    wait_seconds: u64,
+    ci_status: String,
+}
+
 impl WatchState {
     fn new(
         branch: &BranchName,
@@ -249,6 +299,8 @@ struct Observation {
     comments: Vec<LocalReviewComment>,
     reviews: Vec<LocalReview>,
     ci_status: CIStatus,
+    review_file_seen: bool,
+    review_file_mtime: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -481,7 +533,15 @@ where
 
             let head_sha = git_head_sha(&worktree_path).await.unwrap_or_default();
 
+            let review_path = project_dir
+                .join(".exo/reviews")
+                .join(format!("pr_{}.json", number));
+            let review_file_mtime = tokio::fs::metadata(&review_path)
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok());
             let review_file = Self::read_review_file(&project_dir, *number).await;
+            let review_file_seen = review_file.is_some();
             let (review_state, comments, reviews) = match review_file {
                 Some(rf) => review_file_parts(rf),
                 None => {
@@ -509,6 +569,8 @@ where
                     comments,
                     reviews,
                     ci_status,
+                    review_file_seen,
+                    review_file_mtime,
                 },
             );
         }
@@ -549,7 +611,7 @@ where
                 }
 
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
-                    compute_pr_actions(
+                    compute_pr_actions_with_context(
                         old_state,
                         PRNumber::new(*pr_number),
                         &obs.head_sha,
@@ -557,16 +619,20 @@ where
                         &local_reviews,
                         obs.ci_status,
                         pr.merge_blocked_on_ci,
+                        pr.reviewer_agent.is_some(),
+                        obs.review_file_seen,
+                        obs.review_file_mtime,
                         branch.as_str(),
                         &|c, r| format_review_message(c, r),
                         self.policy.reviewer_max_rounds,
+                        self.policy.reviewer_max_wait_seconds,
                     )
                 } else {
                     state_guard.insert(
                         *pr_number,
                         WatchState::new(&branch, agent_type, &obs.head_sha, CIStatus::Unknown, 0),
                     );
-                    let actions = compute_pr_actions(
+                    let actions = compute_pr_actions_with_context(
                         state_guard
                             .get_mut(pr_number)
                             .expect("watch state inserted above"),
@@ -576,9 +642,13 @@ where
                         &local_reviews,
                         obs.ci_status,
                         pr.merge_blocked_on_ci,
+                        pr.reviewer_agent.is_some(),
+                        obs.review_file_seen,
+                        obs.review_file_mtime,
                         branch.as_str(),
                         &|c, r| format_review_message(c, r),
                         self.policy.reviewer_max_rounds,
+                        self.policy.reviewer_max_wait_seconds,
                     );
                     // Spawn reviewer immediately on first sighting of a new open PR
                     if let Some(spawner) = &self.reviewer_spawner {
@@ -788,13 +858,22 @@ where
                             warn!(pr_number, rounds, error = %e, "Failed to persist PR review rounds");
                         }
                     }
-                    PendingAction::NotifyWatcherStuck { pr_number, rounds } => {
-                        self.deliver_watcher_stuck_message(
-                            pending.branch.as_str(),
-                            pr_number,
-                            rounds,
-                        )
-                        .await;
+                    PendingAction::FileHumanEscalation {
+                        pr_number,
+                        classification,
+                        diagnostic,
+                    } => {
+                        if let Err(e) = self
+                            .file_review_loop_escalation(pr_number, classification, &diagnostic)
+                            .await
+                        {
+                            warn!(
+                                pr_number,
+                                classification = classification.as_str(),
+                                error = %e,
+                                "Failed to file review-loop human escalation"
+                            );
+                        }
                     }
                 }
             }
@@ -1140,32 +1219,78 @@ where
         }
     }
 
-    async fn deliver_watcher_stuck_message(&self, branch: &str, pr_number: u64, rounds: u32) {
-        let parent_session_id = branch
-            .rsplit_once('.')
-            .map(|(parent, _)| parent.to_string())
-            .unwrap_or_else(|| "root".to_string());
-        let parent_name = AgentName::try_from_str(parent_session_id.as_str())
-            .expect("validated string input is non-empty");
-        let parent_tab = crate::services::delivery::resolve_tab_name_for_agent(
-            &parent_name,
-            Some(self.ctx.agent_resolver()),
+    async fn file_review_loop_escalation(
+        &self,
+        pr_number: u64,
+        classification: ReviewStallKind,
+        diagnostic: &ReviewStallDiagnostic,
+    ) -> Result<()> {
+        debug_assert!(REVIEW_STALL_KINDS.contains(&classification));
+        let title = format!(
+            "Fix review loop escalation for PR #{}: {}",
+            pr_number,
+            classification.title_fragment()
         );
-        let watcher_name =
-            AgentName::try_from_str("watcher").expect("literal validated string is non-empty");
-        let message = stuck_message(pr_number, rounds);
+        let description = format!(
+            "Watcher classified PR #{} as `{}`.\n\n\
+             This is routed to the human review-loop escalation surface, not to the TL. \
+             The TL contract is intentionally limited to `[MERGE READY]`.\n\n\
+             Diagnostic:\n\
+             - branch: `{}`\n\
+             - head_sha: `{}`\n\
+             - last_observed_sha: `{}`\n\
+             - rounds: `{}`\n\
+             - reviewer_registered: `{}`\n\
+             - review_file_seen: `{}`\n\
+             - review_file_mtime: `{}`\n\
+             - wait_seconds: `{}`\n\
+             - ci_status: `{}`",
+            pr_number,
+            classification.as_str(),
+            diagnostic.branch,
+            diagnostic.head_sha,
+            diagnostic.last_observed_sha,
+            diagnostic.rounds,
+            diagnostic.reviewer_registered,
+            diagnostic.review_file_seen,
+            diagnostic
+                .review_file_mtime
+                .as_deref()
+                .unwrap_or("<never written>"),
+            diagnostic.wait_seconds,
+            diagnostic.ci_status
+        );
 
-        crate::services::delivery::notify_parent_delivery(
-            &*self.ctx,
-            &watcher_name,
-            &parent_session_id,
-            &parent_tab,
-            crate::services::delivery::NotifyStatus::Success,
-            &message,
-            None,
-            "worktree_event_watcher",
-        )
-        .await;
+        let output = Command::new("chainlink")
+            .current_dir(self.ctx.project_dir())
+            .args([
+                "create",
+                title.as_str(),
+                "-p",
+                "high",
+                "-l",
+                "review-stuck",
+                "-d",
+                description.as_str(),
+            ])
+            .output()
+            .await
+            .context("failed to run chainlink create for review-loop escalation")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "chainlink create failed for review-loop escalation: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        info!(
+            pr_number,
+            classification = classification.as_str(),
+            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+            "Filed review-loop human escalation issue"
+        );
+        Ok(())
     }
 
     async fn deliver_release_message(&self, branch: &str, agent_type: AgentType, message: &str) {
@@ -1351,6 +1476,7 @@ where
 
 /// Pure state machine: given old state + new observations, compute pending actions.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn compute_pr_actions(
     old_state: &mut WatchState,
     pr_number: PRNumber,
@@ -1362,6 +1488,40 @@ fn compute_pr_actions(
     branch: &str,
     format_message: &dyn Fn(&[LocalReviewComment], &[LocalReview]) -> String,
     max_rounds: u32,
+) -> Vec<PendingAction> {
+    compute_pr_actions_with_context(
+        old_state,
+        pr_number,
+        pr_sha,
+        comments,
+        reviews,
+        ci_status,
+        merge_blocked_on_ci,
+        false,
+        false,
+        None,
+        branch,
+        format_message,
+        max_rounds,
+        15 * 60,
+    )
+}
+
+fn compute_pr_actions_with_context(
+    old_state: &mut WatchState,
+    pr_number: PRNumber,
+    pr_sha: &str,
+    comments: &[LocalReviewComment],
+    reviews: &[LocalReview],
+    ci_status: CIStatus,
+    merge_blocked_on_ci: bool,
+    reviewer_registered: bool,
+    review_file_seen: bool,
+    review_file_mtime: Option<SystemTime>,
+    branch: &str,
+    format_message: &dyn Fn(&[LocalReviewComment], &[LocalReview]) -> String,
+    max_rounds: u32,
+    max_wait_seconds: u64,
 ) -> Vec<PendingAction> {
     let mut pending_actions = Vec::new();
     let comment_count = comments.len() + reviews.len();
@@ -1471,6 +1631,7 @@ fn compute_pr_actions(
         && old_state.last_review_state != ReviewState::ChangesRequested
     {
         old_state.last_review_state = ReviewState::ChangesRequested;
+        old_state.first_seen = now;
         old_state.rounds = if observed_request_change_rounds > old_state.rounds {
             observed_request_change_rounds
         } else {
@@ -1479,21 +1640,23 @@ fn compute_pr_actions(
 
         if old_state.rounds > max_rounds {
             old_state.stuck = true;
-            pending_actions.push(PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload: serde_json::json!({
-                    "kind": "stuck",
-                    "pr_number": pr_number.as_u64(),
-                    "rounds": old_state.rounds,
-                }),
-            });
             pending_actions.push(PendingAction::WriteRegistryStuck {
                 pr_number: pr_number.as_u64(),
                 rounds: old_state.rounds,
             });
-            pending_actions.push(PendingAction::NotifyWatcherStuck {
+            pending_actions.push(PendingAction::FileHumanEscalation {
                 pr_number: pr_number.as_u64(),
-                rounds: old_state.rounds,
+                classification: ReviewStallKind::DevNotPushing,
+                diagnostic: review_stall_diagnostic(
+                    old_state,
+                    pr_sha,
+                    branch,
+                    reviewer_registered,
+                    review_file_seen,
+                    review_file_mtime,
+                    max_wait_seconds,
+                    ci_status,
+                ),
             });
         } else {
             pending_actions.push(PendingAction::WriteRegistryRounds {
@@ -1549,21 +1712,26 @@ fn compute_pr_actions(
         old_state.last_ci_status = ci_status;
     }
 
-    let timeout_minutes: u64 = if old_state.addressed_changes { 5 } else { 15 };
     if !old_state.notified_parent_timeout
-        && old_state.last_review_state == ReviewState::None
         && !old_state.notified_parent_approved
-        && old_state.first_seen.elapsed() > Duration::from_secs(timeout_minutes * 60)
+        && old_state.first_seen.elapsed() > Duration::from_secs(max_wait_seconds)
     {
+        let classification =
+            classify_review_stall(old_state, reviewer_registered, review_file_seen);
         old_state.notified_parent_timeout = true;
-        pending_actions.push(PendingAction::WasmEvent {
-            event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": "timeout",
-                "pr_number": pr_number.as_u64(),
-                "minutes_elapsed": timeout_minutes,
-                "ci_status": ci_status.as_str(),
-            }),
+        pending_actions.push(PendingAction::FileHumanEscalation {
+            pr_number: pr_number.as_u64(),
+            classification,
+            diagnostic: review_stall_diagnostic(
+                old_state,
+                pr_sha,
+                branch,
+                reviewer_registered,
+                review_file_seen,
+                review_file_mtime,
+                max_wait_seconds,
+                ci_status,
+            ),
         });
     }
 
@@ -1711,6 +1879,49 @@ fn signals_within_merge_ready_window(
     }
 }
 
+fn classify_review_stall(
+    state: &WatchState,
+    reviewer_registered: bool,
+    review_file_seen: bool,
+) -> ReviewStallKind {
+    if state.last_review_state == ReviewState::ChangesRequested {
+        return ReviewStallKind::DevNotPushing;
+    }
+
+    if state.addressed_changes && review_file_seen {
+        return ReviewStallKind::ReviewerNotResponding;
+    }
+
+    if reviewer_registered && !review_file_seen {
+        return ReviewStallKind::ReviewerNeverStarted;
+    }
+
+    ReviewStallKind::ReviewerNotResponding
+}
+
+fn review_stall_diagnostic(
+    state: &WatchState,
+    head_sha: &str,
+    branch: &str,
+    reviewer_registered: bool,
+    review_file_seen: bool,
+    review_file_mtime: Option<SystemTime>,
+    wait_seconds: u64,
+    ci_status: CIStatus,
+) -> ReviewStallDiagnostic {
+    ReviewStallDiagnostic {
+        branch: branch.to_string(),
+        head_sha: head_sha.to_string(),
+        last_observed_sha: state.last_sha.clone(),
+        rounds: state.rounds,
+        reviewer_registered,
+        review_file_seen,
+        review_file_mtime: review_file_mtime.map(|mtime| format!("{mtime:?}")),
+        wait_seconds,
+        ci_status: ci_status.to_string(),
+    }
+}
+
 fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
     let kind_is_merge_ready = payload
         .get("kind")
@@ -1744,13 +1955,6 @@ fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
         "[MERGE READY] PR #{} on {} has reviewer approval and CI {}. You may stop; the parent TL owns merge.",
         pr_number, branch, status
     ))
-}
-
-fn stuck_message(pr_number: u64, rounds: u32) -> String {
-    format!(
-        "[STUCK: {}, rounds={}] Review did not converge after {} rounds. Dev leaf remains alive. Ask the human for clarification before continuing.",
-        pr_number, rounds, rounds
-    )
 }
 
 fn format_review_message(comments: &[LocalReviewComment], reviews: &[LocalReview]) -> String {
@@ -2744,13 +2948,6 @@ mod tests {
         assert_eq!(state.rounds, 2);
         assert!(actions.iter().any(|action| matches!(
             action,
-            PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload,
-            } if payload["kind"] == "stuck" && payload["rounds"] == 2
-        )));
-        assert!(actions.iter().any(|action| matches!(
-            action,
             PendingAction::WriteRegistryStuck {
                 pr_number: 1,
                 rounds: 2,
@@ -2758,10 +2955,11 @@ mod tests {
         )));
         assert!(actions.iter().any(|action| matches!(
             action,
-            PendingAction::NotifyWatcherStuck {
+            PendingAction::FileHumanEscalation {
                 pr_number: 1,
-                rounds: 2,
-            }
+                classification: ReviewStallKind::DevNotPushing,
+                ..
+            },
         )));
     }
 
@@ -2932,10 +3130,13 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "timeout")));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::FileHumanEscalation {
+                classification: ReviewStallKind::ReviewerNotResponding,
+                ..
+            }
+        )));
         assert!(state.notified_parent_timeout);
     }
 
@@ -3077,7 +3278,7 @@ mod tests {
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.addressed_changes = true;
         state.first_seen = Instant::now() - Duration::from_secs(6 * 60);
-        let actions = compute_pr_actions(
+        let actions = compute_pr_actions_with_context(
             &mut state,
             PRNumber::new(1),
             "abc123",
@@ -3085,14 +3286,49 @@ mod tests {
             &[],
             CIStatus::Unknown,
             false,
+            true,
+            true,
+            None,
             branch.as_str(),
             &|_, _| String::new(),
             5,
+            5 * 60,
         );
         assert!(actions
             .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "timeout" && payload["minutes_elapsed"] == 5)));
+            .any(|a| matches!(a, PendingAction::FileHumanEscalation {
+                  classification: ReviewStallKind::ReviewerNotResponding,
+                  diagnostic,
+                  ..
+              } if diagnostic.wait_seconds == 5 * 60)));
+    }
+
+    #[test]
+    fn test_review_stall_classification_names_stuck_actor() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+
+        state.last_review_state = ReviewState::ChangesRequested;
+        assert_eq!(
+            classify_review_stall(&state, true, true),
+            ReviewStallKind::DevNotPushing
+        );
+
+        state.last_review_state = ReviewState::None;
+        state.addressed_changes = true;
+        assert_eq!(
+            classify_review_stall(&state, true, true),
+            ReviewStallKind::ReviewerNotResponding
+        );
+
+        state.addressed_changes = false;
+        assert_eq!(
+            classify_review_stall(&state, true, false),
+            ReviewStallKind::ReviewerNeverStarted
+        );
+
+        assert_eq!(ReviewStallKind::DevFailed.as_str(), "dev_failed");
     }
 
     #[test]
@@ -3128,6 +3364,8 @@ mod tests {
             comments: vec![],
             reviews: vec![],
             ci_status: CIStatus::Unknown,
+            review_file_seen: false,
+            review_file_mtime: None,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ReviewState::None);
@@ -3142,6 +3380,8 @@ mod tests {
             comments: vec![],
             reviews: vec![],
             ci_status: CIStatus::Unknown,
+            review_file_seen: false,
+            review_file_mtime: None,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ReviewState::Approved);
@@ -3156,6 +3396,8 @@ mod tests {
             comments: vec![],
             reviews: vec![],
             ci_status: CIStatus::Unknown,
+            review_file_seen: false,
+            review_file_mtime: None,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ReviewState::ChangesRequested);
@@ -3321,6 +3563,8 @@ mod tests {
                 comments,
                 reviews,
                 ci_status: CIStatus::Unknown,
+                review_file_seen: true,
+                review_file_mtime: None,
             };
             let (reviews, _) = obs_to_review_parts(&obs);
             let mut watcher_state = test_state(&branch, AgentType::Codex, "abc123");
@@ -3409,6 +3653,8 @@ mod tests {
             comments: vec![],
             reviews: vec![],
             ci_status: CIStatus::Unknown,
+            review_file_seen: false,
+            review_file_mtime: None,
         }
     }
 
@@ -3501,6 +3747,8 @@ mod tests {
                 comments: vec![],
                 reviews: vec![],
                 ci_status: CIStatus::Unknown,
+                review_file_seen: false,
+                review_file_mtime: None,
             },
         );
 
