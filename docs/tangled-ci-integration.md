@@ -430,6 +430,8 @@ The knotserver.db is held open by the live container. Writes from the host `sqli
 
 The `tangled_spindle_url` and `tangled_knot_url` are now in `.exo/config.toml`. When `exomonad serve` starts, `WorktreeEventWatcher` launches `run_ci_subscriber` which connects to both WebSockets. The CI merge gate in `merge_pr_local.rs` checks `ci_status_map` before allowing merges.
 
+Reviewer approval is the CI trigger point. When the watcher observes an approved review for a SHA that has no mergeable CI result, it calls `POST /xrpc/sh.tangled.pipeline.trigger` on the configured knot URL with the repo name, branch, ref, SHA, and PR number, then dispatches a `ci_triggered` event to the dev leaf. If the later spindle status is `failure`, the watcher dispatches `ci_blocked`, marks the local PR stuck, and files a Chainlink human-escalation issue with classification `ci_failed`.
+
 ---
 
 ## File Map

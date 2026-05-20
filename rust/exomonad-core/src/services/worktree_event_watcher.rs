@@ -81,6 +81,11 @@ enum PendingAction {
         classification: ReviewStallKind,
         diagnostic: ReviewStallDiagnostic,
     },
+    TriggerManualCi {
+        pr_number: u64,
+        branch: String,
+        head_sha: String,
+    },
 }
 
 struct PendingPrActions {
@@ -136,6 +141,13 @@ fn reviewer_fanout_decision(
     if event_type != "pr_review" {
         return ReviewerFanOut::NotApplicable;
     }
+    if payload
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .is_some_and(|kind| matches!(kind, "ci_triggered" | "ci_blocked"))
+    {
+        return ReviewerFanOut::NotApplicable;
+    }
     let Some((branch, agent_type)) = registry.reviewer_for_pr(pr_number) else {
         return ReviewerFanOut::NoReviewer;
     };
@@ -179,6 +191,8 @@ struct WatchState {
     review_approved_at: Option<Instant>,
     ci_mergeable_at: Option<Instant>,
     merge_ready_notified: bool,
+    ci_triggered_sha: Option<String>,
+    ci_blocked_notified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -188,13 +202,15 @@ enum ReviewStallKind {
     ReviewerNotResponding,
     ReviewerNeverStarted,
     DevFailed,
+    CiFailed,
 }
 
-const REVIEW_STALL_KINDS: [ReviewStallKind; 4] = [
+const REVIEW_STALL_KINDS: [ReviewStallKind; 5] = [
     ReviewStallKind::DevNotPushing,
     ReviewStallKind::ReviewerNotResponding,
     ReviewStallKind::ReviewerNeverStarted,
     ReviewStallKind::DevFailed,
+    ReviewStallKind::CiFailed,
 ];
 
 impl ReviewStallKind {
@@ -204,6 +220,7 @@ impl ReviewStallKind {
             ReviewStallKind::ReviewerNotResponding => "reviewer_not_responding",
             ReviewStallKind::ReviewerNeverStarted => "reviewer_never_started",
             ReviewStallKind::DevFailed => "dev_failed",
+            ReviewStallKind::CiFailed => "ci_failed",
         }
     }
 
@@ -213,6 +230,7 @@ impl ReviewStallKind {
             ReviewStallKind::ReviewerNotResponding => "reviewer stopped responding",
             ReviewStallKind::ReviewerNeverStarted => "reviewer never started",
             ReviewStallKind::DevFailed => "dev leaf reported failure",
+            ReviewStallKind::CiFailed => "CI failed after reviewer approval",
         }
     }
 }
@@ -259,6 +277,8 @@ impl WatchState {
                 None
             },
             merge_ready_notified: false,
+            ci_triggered_sha: None,
+            ci_blocked_notified: false,
         }
     }
 }
@@ -448,6 +468,43 @@ where
             .get(&ci_status_key(branch, head_sha))
             .copied()
             .unwrap_or(CIStatus::Unknown)
+    }
+
+    async fn trigger_tangled_manual_ci(
+        &self,
+        pr_number: u64,
+        branch: &str,
+        head_sha: &str,
+    ) -> Result<()> {
+        let Some(knot_url) = self.knot_url.as_deref() else {
+            anyhow::bail!("tangled_knot_url is not configured");
+        };
+        let url = tangled_manual_ci_url(knot_url)?;
+        let project_dir = self.ctx.project_dir();
+        let repo_name = project_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        let payload = serde_json::json!({
+            "repo": repo_name,
+            "branch": branch,
+            "ref": format!("refs/heads/{branch}"),
+            "sha": head_sha,
+            "pr_number": pr_number,
+        });
+
+        let response = reqwest::Client::new()
+            .post(url.clone())
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("failed to POST Tangled manual CI trigger to {url}"))?;
+        if !response.status().is_success() {
+            anyhow::bail!("Tangled manual CI trigger returned {}", response.status());
+        }
+
+        info!(pr_number, branch, head_sha, url = %url, "Triggered Tangled manual CI");
+        Ok(())
     }
 
     pub async fn run(&self) {
@@ -995,6 +1052,24 @@ where
                                 classification = classification.as_str(),
                                 error = %e,
                                 "Failed to file review-loop human escalation"
+                            );
+                        }
+                    }
+                    PendingAction::TriggerManualCi {
+                        pr_number,
+                        branch,
+                        head_sha,
+                    } => {
+                        if let Err(e) = self
+                            .trigger_tangled_manual_ci(pr_number, &branch, &head_sha)
+                            .await
+                        {
+                            warn!(
+                                pr_number,
+                                branch = %branch,
+                                head_sha = %head_sha,
+                                error = %e,
+                                "Failed to trigger Tangled manual CI"
                             );
                         }
                     }
@@ -1677,6 +1752,8 @@ fn compute_pr_actions_with_context(
         old_state.notified_parent_timeout = false;
         old_state.review_approved_at = None;
         old_state.merge_ready_notified = false;
+        old_state.ci_triggered_sha = None;
+        old_state.ci_blocked_notified = false;
         old_state.first_seen = Instant::now();
         merge_ready_now = false;
         if was_changes_requested {
@@ -1703,6 +1780,42 @@ fn compute_pr_actions_with_context(
         }
     }
 
+    if ci_changed
+        && ci_status == CIStatus::Failure
+        && old_state.review_approved_at.is_some()
+        && !old_state.ci_blocked_notified
+    {
+        old_state.stuck = true;
+        old_state.ci_blocked_notified = true;
+        pending_actions.push(PendingAction::WriteRegistryStuck {
+            pr_number: pr_number.as_u64(),
+            rounds: old_state.rounds,
+        });
+        pending_actions.push(PendingAction::FileHumanEscalation {
+            pr_number: pr_number.as_u64(),
+            classification: ReviewStallKind::CiFailed,
+            diagnostic: review_stall_diagnostic(
+                old_state,
+                pr_sha,
+                branch,
+                reviewer_registered,
+                review_file_seen,
+                review_file_mtime,
+                max_wait_seconds,
+                ci_status,
+            ),
+        });
+        pending_actions.push(PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": "ci_blocked",
+                "pr_number": pr_number.as_u64(),
+                "ci_status": ci_status.as_str(),
+                "branch": branch,
+            }),
+        });
+    }
+
     if (old_state.notified_parent_approved || old_state.notified_parent_timeout || old_state.stuck)
         && !recover_after_ci_block
         && !merge_ready_now
@@ -1724,7 +1837,14 @@ fn compute_pr_actions_with_context(
         .iter()
         .any(|r| r.state == ReviewState::Approved || r.body.to_lowercase().contains("approved"));
     if approved && old_state.last_review_state != ReviewState::Approved {
-        old_state.rounds = next_review_round;
+        let approved_round = if old_state.rounds == 0 {
+            1
+        } else if observed_request_change_rounds >= old_state.rounds {
+            old_state.rounds
+        } else {
+            old_state.rounds + 1
+        };
+        old_state.rounds = approved_round;
         pending_actions.push(PendingAction::WriteRegistryRounds {
             pr_number: pr_number.as_u64(),
             rounds: old_state.rounds,
@@ -1745,6 +1865,22 @@ fn compute_pr_actions_with_context(
         };
         if merge_ready_now {
             old_state.merge_ready_notified = true;
+        } else if old_state.ci_triggered_sha.as_deref() != Some(pr_sha) {
+            old_state.ci_triggered_sha = Some(pr_sha.to_string());
+            pending_actions.push(PendingAction::TriggerManualCi {
+                pr_number: pr_number.as_u64(),
+                branch: branch.to_string(),
+                head_sha: pr_sha.to_string(),
+            });
+            pending_actions.push(PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload: serde_json::json!({
+                    "kind": "ci_triggered",
+                    "pr_number": pr_number.as_u64(),
+                    "branch": branch,
+                    "head_sha": pr_sha,
+                }),
+            });
         }
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
@@ -2185,6 +2321,21 @@ fn review_stall_diagnostic(
         wait_seconds,
         ci_status: ci_status.to_string(),
     }
+}
+
+fn tangled_manual_ci_url(knot_url: &str) -> Result<String> {
+    let mut url =
+        Url::parse(knot_url).with_context(|| format!("invalid Tangled knot URL: {knot_url}"))?;
+    match url.scheme() {
+        "ws" => url.set_scheme("http").ok(),
+        "wss" => url.set_scheme("https").ok(),
+        "http" | "https" => Some(()),
+        scheme => anyhow::bail!("unsupported Tangled knot URL scheme: {scheme}"),
+    };
+    url.set_path("/xrpc/sh.tangled.pipeline.trigger");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
 }
 
 fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
@@ -2936,6 +3087,91 @@ mod tests {
         assert_eq!(fixes_payload["head_sha"], "def456");
         assert!(state.addressed_changes);
         assert_eq!(state.last_review_state, ReviewState::None);
+    }
+
+    #[test]
+    fn test_reviewer_approval_triggers_manual_ci_when_status_unknown() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let reviews = vec![test_review("approved", ReviewState::Approved)];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &reviews,
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(matches!(
+            actions.iter().find(|action| matches!(action, PendingAction::TriggerManualCi { .. })),
+            Some(PendingAction::TriggerManualCi { pr_number: 1, branch, head_sha })
+                if branch == "main.feat-gemini" && head_sha == "abc123"
+        ));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "ci_triggered" && payload["head_sha"] == "abc123"
+        )));
+        assert_eq!(state.ci_triggered_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_ci_failure_after_approval_blocks_pr() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.last_ci_status = CIStatus::Pending;
+        state.last_review_state = ReviewState::Approved;
+        state.notified_parent_approved = true;
+        state.review_approved_at = Some(Instant::now());
+        state.rounds = 1;
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &[],
+            CIStatus::Failure,
+            true,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(state.stuck);
+        assert!(state.ci_blocked_notified);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::FileHumanEscalation {
+                classification: ReviewStallKind::CiFailed,
+                ..
+            }
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "ci_blocked" && payload["ci_status"] == "failure"
+        )));
+    }
+
+    #[test]
+    fn test_tangled_manual_ci_url_uses_xrpc_http_endpoint() {
+        assert_eq!(
+            tangled_manual_ci_url("ws://localhost:5555/events").unwrap(),
+            "http://localhost:5555/xrpc/sh.tangled.pipeline.trigger"
+        );
+        assert_eq!(
+            tangled_manual_ci_url("https://knot.example.com/events").unwrap(),
+            "https://knot.example.com/xrpc/sh.tangled.pipeline.trigger"
+        );
     }
 
     fn pr_with_reviewer(
@@ -4222,15 +4458,27 @@ mod tests {
                 &|_, _| "review message".to_string(),
                 2,
             );
-            let observed_kind = actions.iter().find_map(|action| match action {
-                PendingAction::WasmEvent {
-                    event_type: "pr_review",
-                    payload,
-                } => payload.get("kind").and_then(|kind| kind.as_str()),
-                _ => None,
-            });
+            let observed_kinds: Vec<&str> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    PendingAction::WasmEvent {
+                        event_type: "pr_review",
+                        payload,
+                    } => payload.get("kind").and_then(|kind| kind.as_str()),
+                    _ => None,
+                })
+                .collect();
 
-            assert_eq!(observed_kind, expected_kind, "state {state}");
+            match expected_kind {
+                Some(kind) => assert!(
+                    observed_kinds.contains(&kind),
+                    "state {state}: expected {kind:?} in {observed_kinds:?}"
+                ),
+                None => assert!(
+                    observed_kinds.is_empty(),
+                    "state {state}: expected no event, got {observed_kinds:?}"
+                ),
+            }
         }
     }
 
