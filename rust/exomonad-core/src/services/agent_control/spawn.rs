@@ -1,5 +1,61 @@
 use super::*;
 
+fn parse_git_status_paths(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let path = line.get(3..)?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(
+                path.rsplit_once(" -> ")
+                    .map(|(_, target)| target)
+                    .unwrap_or(path)
+                    .trim_matches('"')
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn dirty_spawn_error(files: &[String]) -> anyhow::Error {
+    let mut message = format!(
+        "BLOCKED: cannot spawn agent into a dirty TL worktree. {} file(s) have uncommitted changes:",
+        files.len()
+    );
+    for file in files {
+        message.push_str("\n  ");
+        message.push_str(file);
+    }
+    message.push_str("\nCommit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` if throwaway, then retry. Workers spawn in-place and would inherit this state; dev-leaves fork from your branch HEAD and would not see your uncommitted work.");
+    anyhow!(message)
+}
+
+async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree)
+        .output()
+        .await
+        .with_context(|| format!("failed to inspect git status in {}", worktree.display()))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to inspect git status in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let files = parse_git_status_paths(&String::from_utf8_lossy(&output.stdout));
+    if files.is_empty() {
+        Ok(())
+    } else {
+        Err(dirty_spawn_error(&files))
+    }
+}
+
 macro_rules! exomonad_tl_instructions {
     ($runtime_notes:literal) => {
         concat!(
@@ -718,6 +774,12 @@ impl<
         let result = timeout(SPAWN_TIMEOUT, async {
             self.resolve_tmux_session()?;
 
+            // Workers run in the caller's worktree and inherit any dirty state.
+            let caller_tab = resolve_own_tab_name(ctx);
+            let caller_worktree = ctx.working_dir.clone();
+            let absolute_worktree = self.project_dir().join(&caller_worktree);
+            ensure_clean_spawn_worktree(&absolute_worktree).await?;
+
             // Sanitize name and construct typed identity
             let identity = AgentIdentity::new(slugify(options.name.as_str()), agent_type);
             let agent_name = identity.internal_name();
@@ -818,11 +880,6 @@ impl<
                 }
                 _ => {}
             }
-
-            // Resolve caller's context (tab and worktree) from its context.
-            let caller_tab = resolve_own_tab_name(ctx);
-            let caller_worktree = ctx.working_dir.clone();
-            let absolute_worktree = self.project_dir().join(&caller_worktree);
 
             // Config-discovered runtimes run in their agent config dir so they
             // receive the worker role/name instead of inheriting the caller's
@@ -1234,6 +1291,7 @@ impl<
 
             let effective_birth = self.effective_birth_branch(Some(caller_bb));
             let effective_project_dir = self.project_dir();
+            ensure_clean_spawn_worktree(effective_project_dir).await?;
 
             // Parent branch derived from typed birth-branch.
             let current_branch = BranchName::try_from_str(effective_birth.as_parent_branch())
@@ -1534,6 +1592,36 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_git_status_paths_lists_status_entries() {
+        let paths = parse_git_status_paths(
+            " M src/lib.rs\nA  docs/new.md\nR  old.rs -> new.rs\n?? scratch.txt\n",
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "src/lib.rs".to_string(),
+                "docs/new.md".to_string(),
+                "new.rs".to_string(),
+                "scratch.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dirty_spawn_error_includes_count_files_and_recovery() {
+        let files = vec!["src/lib.rs".to_string(), "docs/new.md".to_string()];
+        let message = dirty_spawn_error(&files).to_string();
+        assert!(message.contains(
+            "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes:"
+        ));
+        assert!(message.contains("  src/lib.rs"));
+        assert!(message.contains("  docs/new.md"));
+        assert!(message.contains("Commit the scaffold"));
+        assert!(message.contains("discard_worker_output"));
+        assert!(message.contains("dev-leaves fork from your branch HEAD"));
+    }
 
     #[test]
     fn test_render_reviewer_context_section_resolves_relative_paths_against_project_dir() {

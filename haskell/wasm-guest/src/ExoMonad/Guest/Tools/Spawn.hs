@@ -423,7 +423,7 @@ instance FromJSON SpawnWorkersArgs where
 
 -- | Shared tool description for spawn_workers.
 spawnWorkersDescription :: Text
-spawnWorkersDescription = "Spawn multiple worker agents in one call. PREFER WORKERS OVER DOING WORK YOURSELF — worker tokens cost far less than TL tokens. Any task you can specify clearly (implementation, research, file edits, test writing) should be a worker. If it touches 2+ files or takes more than 5 tool calls, spawn a worker. Give them acceptance criteria, key file paths, and anti-patterns, not step-by-step code. Each gets a tmux pane in YOUR window, working in YOUR directory on YOUR branch (ephemeral, no isolation, no PR). Workers send messages via notify_parent. Set type to 'research' for read-only exploration workers that search, read, and report findings without modifying anything. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately — do not poll or wait."
+spawnWorkersDescription = "Spawn multiple worker agents in one call. PREFER WORKERS OVER DOING WORK YOURSELF — worker tokens cost far less than TL tokens. Any task you can specify clearly (implementation, research, file edits, test writing) should be a worker. If it touches 2+ files or takes more than 5 tool calls, spawn a worker. Give them acceptance criteria, key file paths, and anti-patterns, not step-by-step code. Each gets a tmux pane in YOUR window, working in YOUR directory on YOUR branch (ephemeral, no isolation, no PR), so the TL worktree must be clean before spawning. Commit the scaffold or discard throwaway output before retrying. Workers send messages via notify_parent. Set type to 'research' for read-only exploration workers that search, read, and report findings without modifying anything. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately — do not poll or wait."
 
 -- | Shared tool schema for spawn_workers.
 spawnWorkersSchema :: Aeson.Object
@@ -499,7 +499,7 @@ instance FromJSON SpawnLeafArgs where
       <*> v .:? "context"
 
 spawnLeafDescription :: Text
-spawnLeafDescription = "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). Agent type defaults to the server config; pass agent_type only when this leaf needs a specific supported runtime. Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. Claude Code parents should create a team using TeamCreate before spawning Claude Code leaves. After spawning, return immediately."
+spawnLeafDescription = "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). The TL worktree must be clean before spawning because dev-leaves fork from branch HEAD and cannot see uncommitted scaffold. Agent type defaults to the server config; pass agent_type only when this leaf needs a specific supported runtime. Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. Claude Code parents should create a team using TeamCreate before spawning Claude Code leaves. After spawning, return immediately."
 
 spawnLeafSchema :: Aeson.Object
 spawnLeafSchema =
@@ -574,7 +574,7 @@ instance FromJSON SpawnWorkerToolArgs where
       <*> v .:? "agent_type"
 
 spawnWorkerToolDescription :: Text
-spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately."
+spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR, so the TL worktree must be clean before spawning. Commit the scaffold or discard throwaway output before retrying. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately."
 
 spawnWorkerToolSchema :: Aeson.Object
 spawnWorkerToolSchema =
