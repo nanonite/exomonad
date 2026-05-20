@@ -1507,7 +1507,7 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn tangled_repo_name(cwd: &Path) -> String {
+pub(crate) fn tangled_repo_name(cwd: &Path) -> String {
     let directory_name = cwd
         .file_name()
         .and_then(|n| n.to_str())
@@ -1760,7 +1760,7 @@ pub(crate) fn normalize_knot_hostname(raw: &str) -> String {
     host.to_ascii_lowercase()
 }
 
-fn tangled_dev_repo_did(knot_hostname: &str, repo_name: &str) -> String {
+pub(crate) fn tangled_dev_repo_did(knot_hostname: &str, repo_name: &str) -> String {
     let host = normalize_knot_hostname(knot_hostname).replace(':', "%3A");
     let repo = repo_name
         .chars()
