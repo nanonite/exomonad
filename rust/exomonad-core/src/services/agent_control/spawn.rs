@@ -56,6 +56,31 @@ async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveWorker {
+    name: String,
+    age: String,
+}
+
+fn format_worker_age(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / (60 * 60))
+    }
+}
+
+fn active_worker_error(worker: &ActiveWorker) -> anyhow::Error {
+    anyhow!(
+        "BLOCKED: workers are sequential per CLAUDE.md and docs/decisions/agent-lifecycle-invariants.md. Active worker in this TL worktree: `{}` (spawned {} ago).\n\nOptions:\n1. Wait for the active worker's handoff before spawning the next.\n2. Use `spawn_leaf` for parallel work that warrants its own PR — dev-leaves have their own worktrees and don't share state.\n\nPer-worker attribution to allow parallel workers in one worktree is explicitly out of scope (see ADR § Out of Scope).",
+        worker.name,
+        worker.age
+    )
+}
+
 macro_rules! exomonad_tl_instructions {
     ($runtime_notes:literal) => {
         concat!(
@@ -761,6 +786,55 @@ impl<
         Ok(())
     }
 
+    async fn active_worker_for_parent_tab(
+        &self,
+        agents_dir: &Path,
+        parent_tab: &str,
+        current_agent_name: &AgentName,
+    ) -> Result<Option<ActiveWorker>> {
+        let Ok(mut entries) = fs::read_dir(agents_dir).await else {
+            return Ok(None);
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == current_agent_name.as_str() {
+                continue;
+            }
+
+            let agent_dir = entry.path();
+            let Ok(routing) = RoutingInfo::read_from_dir(&agent_dir).await else {
+                continue;
+            };
+            if routing.parent_tab.as_deref() != Some(parent_tab) {
+                continue;
+            }
+            let Some(pane_id) = routing.pane_id.as_ref() else {
+                continue;
+            };
+            if !self.tmux()?.pane_exists(pane_id).await.unwrap_or(false) {
+                continue;
+            }
+
+            let age = entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+                .map(format_worker_age)
+                .unwrap_or_else(|| "unknown time".to_string());
+            return Ok(Some(ActiveWorker { name, age }));
+        }
+
+        Ok(None)
+    }
+
     /// Spawn a worker agent in the current worktree (no branch/worktree).
     #[instrument(skip_all, fields(name = %options.name, agent_type = %options.agent_type.suffix()))]
     pub async fn spawn_worker(
@@ -784,12 +858,17 @@ impl<
             let identity = AgentIdentity::new(slugify(options.name.as_str()), agent_type);
             let agent_name = identity.internal_name();
             let display_name = identity.display_name();
+            let agents_dir = self.project_dir().join(".exo").join("agents");
+
+            if let Some(active_worker) = self
+                .active_worker_for_parent_tab(&agents_dir, &caller_tab, &agent_name)
+                .await?
+            {
+                return Err(active_worker_error(&active_worker));
+            }
 
             // Idempotency: check if agent config dir already exists (workers are panes, not tabs)
-            let agent_config_dir = self.project_dir()
-                .join(".exo")
-                .join("agents")
-                .join(agent_name.as_str());
+            let agent_config_dir = agents_dir.join(agent_name.as_str());
             let settings_path = agent_config_dir.join("settings.json");
             if settings_path.exists() {
                 // Check tmux pane liveness — settings.json can outlive the pane
@@ -1621,6 +1700,30 @@ mod tests {
         assert!(message.contains("Commit the scaffold"));
         assert!(message.contains("discard_worker_output"));
         assert!(message.contains("dev-leaves fork from your branch HEAD"));
+    }
+
+    #[test]
+    fn test_format_worker_age_uses_readable_units() {
+        assert_eq!(format_worker_age(std::time::Duration::from_secs(42)), "42s");
+        assert_eq!(format_worker_age(std::time::Duration::from_secs(125)), "2m");
+        assert_eq!(
+            format_worker_age(std::time::Duration::from_secs(7_400)),
+            "2h"
+        );
+    }
+
+    #[test]
+    fn test_active_worker_error_includes_name_options_and_scope() {
+        let worker = ActiveWorker {
+            name: "alpha-codex".to_string(),
+            age: "2m".to_string(),
+        };
+        let message = active_worker_error(&worker).to_string();
+        assert!(message.contains("Active worker in this TL worktree: `alpha-codex`"));
+        assert!(message.contains("spawned 2m ago"));
+        assert!(message.contains("Wait for the active worker's handoff"));
+        assert!(message.contains("Use `spawn_leaf` for parallel work"));
+        assert!(message.contains("Per-worker attribution"));
     }
 
     #[test]
