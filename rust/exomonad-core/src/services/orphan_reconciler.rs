@@ -1,4 +1,4 @@
-use crate::services::agent_resources::dispose_reviewers_for_pr;
+use crate::services::agent_resources::{dispose_agent_resources, dispose_reviewers_for_pr};
 use crate::services::file_pr_local::{read_pr_registry, PrState};
 use crate::services::git_worktree::GitWorktreeService;
 use anyhow::{Context, Result};
@@ -23,12 +23,15 @@ pub async fn run_orphan_reconciler(
 }
 
 pub async fn reconcile_once(project_dir: &Path, git_wt: Arc<GitWorktreeService>) -> Result<()> {
-    reconcile_issue_worktrees(project_dir).await?;
+    reconcile_issue_worktrees(project_dir, git_wt.clone()).await?;
     reconcile_reviewer_worktrees(project_dir, git_wt).await?;
     Ok(())
 }
 
-async fn reconcile_issue_worktrees(project_dir: &Path) -> Result<()> {
+async fn reconcile_issue_worktrees(
+    project_dir: &Path,
+    git_wt: Arc<GitWorktreeService>,
+) -> Result<()> {
     let worktrees_dir = project_dir.join(".exo/worktrees");
     let Ok(mut entries) = tokio::fs::read_dir(&worktrees_dir).await else {
         return Ok(());
@@ -49,6 +52,7 @@ async fn reconcile_issue_worktrees(project_dir: &Path) -> Result<()> {
         }
         if chainlink_issue_is_closed(project_dir, issue_id).await? {
             append_issue_closed_event(project_dir, issue_id, "orphan_reconciler").await?;
+            dispose_agent_resources(project_dir, git_wt.clone(), &slug).await;
             info!(issue_id, agent = %slug, "Reconciled closed Chainlink issue for live worktree");
         }
     }
