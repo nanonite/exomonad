@@ -114,6 +114,111 @@ fn assert_tools_present(role: &str, names: &BTreeSet<String>, expected: &[&str])
     }
 }
 
+fn expand_matrix_tool_cell(cell: &str) -> BTreeSet<String> {
+    let mut tools = BTreeSet::new();
+    let mut prefix = String::new();
+
+    for raw_part in cell.split('/') {
+        let tool = raw_part.trim().trim_matches('`');
+        if tool.is_empty() {
+            continue;
+        }
+
+        if let Some(suffix) = tool.strip_prefix('_') {
+            if !prefix.is_empty() {
+                tools.insert(format!("{prefix}_{suffix}"));
+            }
+            continue;
+        }
+
+        if let Some((base_prefix, _)) = tool.rsplit_once('_') {
+            prefix = base_prefix.to_string();
+        } else {
+            prefix.clear();
+        }
+        tools.insert(tool.to_string());
+    }
+
+    tools
+}
+
+fn expected_tool_matrix_from_architecture_doc(
+) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    let doc = include_str!("../../../docs/architecture/agent-system.md");
+    let mut matrix = std::collections::BTreeMap::from([
+        ("root".to_string(), BTreeSet::new()),
+        ("tl".to_string(), BTreeSet::new()),
+        ("dev".to_string(), BTreeSet::new()),
+        ("reviewer".to_string(), BTreeSet::new()),
+        ("worker".to_string(), BTreeSet::new()),
+    ]);
+    let roles = ["root", "tl", "dev", "reviewer", "worker"];
+    let mut in_tool_table = false;
+
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("| Tool |") || trimmed.starts_with("| Chainlink tool |") {
+            in_tool_table = true;
+            continue;
+        }
+        if in_tool_table && !trimmed.starts_with('|') {
+            in_tool_table = false;
+            continue;
+        }
+        if !in_tool_table
+            || trimmed.starts_with("|------")
+            || trimmed.starts_with("|---------------")
+        {
+            continue;
+        }
+
+        let cells: Vec<&str> = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        if cells.len() != 6 {
+            continue;
+        }
+
+        let expanded_tools = expand_matrix_tool_cell(cells[0]);
+        for (idx, role) in roles.iter().enumerate() {
+            if cells[idx + 1] == "x" {
+                matrix
+                    .get_mut(*role)
+                    .expect("role initialized")
+                    .extend(expanded_tools.iter().cloned());
+            }
+        }
+    }
+
+    matrix
+}
+
+fn markdown_tool_visibility_diff(
+    rows: &[(String, String, BTreeSet<String>, BTreeSet<String>)],
+) -> String {
+    let mut output = String::from(
+        "\n| Runtime | Role | Missing | Unexpected |\n|---------|------|---------|------------|\n",
+    );
+    for (runtime, role, missing, unexpected) in rows {
+        let missing = if missing.is_empty() {
+            "-".to_string()
+        } else {
+            missing.iter().cloned().collect::<Vec<_>>().join(", ")
+        };
+        let unexpected = if unexpected.is_empty() {
+            "-".to_string()
+        } else {
+            unexpected.iter().cloned().collect::<Vec<_>>().join(", ")
+        };
+        output.push_str(&format!(
+            "| {runtime} | {role} | {missing} | {unexpected} |\n"
+        ));
+    }
+    output
+}
+
 fn assert_tools_absent(role: &str, names: &BTreeSet<String>, forbidden: &[&str]) {
     for tool in forbidden {
         assert!(
@@ -580,6 +685,35 @@ impl EffectHandler for MockCopilotHandler {
 // ============================================================================
 // Tool Listing Tests (per role)
 // ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mcp_tool_visibility_matrix_matches_live_wasm_tools() {
+    let runtime = build_test_runtime().await;
+    let expected = expected_tool_matrix_from_architecture_doc();
+    let runtimes = ["claude", "codex", "opencode", "gemini"];
+    let mut failures = Vec::new();
+
+    for runtime_name in runtimes {
+        for (role, expected_tools) in &expected {
+            let actual_tools = list_tool_names(&runtime, role).await;
+            let missing: BTreeSet<String> =
+                expected_tools.difference(&actual_tools).cloned().collect();
+            let unexpected: BTreeSet<String> =
+                actual_tools.difference(expected_tools).cloned().collect();
+
+            if !missing.is_empty() || !unexpected.is_empty() {
+                failures.push((runtime_name.to_string(), role.clone(), missing, unexpected));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Live MCP tool visibility differs from docs/architecture/agent-system.md:{}",
+        markdown_tool_visibility_diff(&failures)
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]

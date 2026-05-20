@@ -316,6 +316,14 @@ check-e2e-chainlink-timer-role-scope:
     bash -n tests/e2e/chainlink-timer-role-scope/validate.sh
     bash tests/e2e/chainlink-timer-role-scope/validate.sh
 
+# Assert live MCP tool visibility matches docs/architecture/agent-system.md
+e2e-mcp-tool-visibility:
+    ./tests/e2e/mcp-tool-visibility/run.sh
+
+# Check MCP tool visibility harness without running the WASM assertion
+check-e2e-mcp-tool-visibility:
+    bash -n tests/e2e/mcp-tool-visibility/run.sh
+
 # Run Tangled PR integration test through Codex root/TL/worker/dev/reviewer roles.
 # Requires the local knot container: docker compose up -d  (in tests/e2e/tangled-ci/)
 e2e-tangled-pr-codex:
