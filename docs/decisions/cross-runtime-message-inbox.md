@@ -1,6 +1,6 @@
 # Cross-Runtime Message Inbox
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Date:** 2026-05-19
 

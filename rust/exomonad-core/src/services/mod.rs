@@ -1,6 +1,7 @@
 pub mod acp_client;
 pub mod acp_registry;
 pub mod agent_control;
+pub mod agent_inbox;
 pub mod agent_resolver;
 pub mod agent_resources;
 pub mod claude_session_registry;
@@ -32,6 +33,7 @@ pub mod synthetic_members;
 pub mod tangled_pr;
 pub mod tmux_events;
 pub mod tmux_ipc;
+pub mod tui_consumption;
 pub mod worktree_event_watcher;
 
 pub use self::acp_registry::AcpRegistry;
