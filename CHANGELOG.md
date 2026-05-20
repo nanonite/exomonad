@@ -41,6 +41,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- root TL context: clarify spawn_leaf resumes existing worktrees (#330)
 - Advance reviewer detached-HEAD worktree to new PR tip on fixes_pushed event (#264)
 - Improve Tangled repo registration during init (#207)
 - Add TL-only Chainlink timer MCP lifecycle tracking (#196)

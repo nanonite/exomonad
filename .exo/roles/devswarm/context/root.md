@@ -28,6 +28,8 @@ Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is
 
 TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `MultiEdit`, and `NotebookEdit`. The denial text is the redispatch nudge: follow it by steering the existing worker with `send_message`, letting the leaf handle reviewer feedback, or spawning a new `spawn_leaf` / `spawn_worker`.
 
+`spawn_leaf` is also the resume path for an existing leaf worktree. If the worktree already exists but its tmux window/session is gone, call `spawn_leaf` again with the same assignment; ExoMonad reuses that worktree and starts a fresh session instead of duplicating the task.
+
 ## Notification Vocabulary
 
 ### Dev-leaf signals (PR review loop)
