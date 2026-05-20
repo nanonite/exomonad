@@ -58,6 +58,16 @@ data PRReviewEvent
       { prNumber :: Int,
         stuckRounds :: Int
       }
+  | CITriggered
+      { prNumber :: Int,
+        ctBranch :: Text,
+        ctHeadSha :: Text
+      }
+  | CIBlocked
+      { prNumber :: Int,
+        cbCiStatus :: Text,
+        cbBranch :: Text
+      }
   | MergeReady
       { prNumber :: Int,
         mrCiStatus :: Text,
@@ -90,6 +100,8 @@ instance FromJSON PRReviewEvent where
       "reviewer_requested_changes" -> ReviewerRequestedChanges <$> v .: "pr_number" <*> v .: "comments"
       "rate_limited" -> RateLimited <$> v .: "retries_remaining" <*> v .: "seconds_until_reset"
       "stuck" -> Stuck <$> v .: "pr_number" <*> v .: "rounds"
+      "ci_triggered" -> CITriggered <$> v .: "pr_number" <*> v .: "branch" <*> v .: "head_sha"
+      "ci_blocked" -> CIBlocked <$> v .: "pr_number" <*> v .: "ci_status" <*> v .: "branch"
       "merge_ready" -> MergeReady <$> v .: "pr_number" <*> v .: "ci_status" <*> v .: "branch"
       "dev_not_pushing" -> DevNotPushing <$> v .: "pr_number"
       "reviewer_not_responding" -> ReviewerNotResponding <$> v .: "pr_number"
@@ -107,6 +119,8 @@ instance ToJSON PRReviewEvent where
   toJSON (ReviewerRequestedChanges n c) = object ["kind" .= ("reviewer_requested_changes" :: Text), "pr_number" .= n, "comments" .= c]
   toJSON (RateLimited r s) = object ["kind" .= ("rate_limited" :: Text), "retries_remaining" .= r, "seconds_until_reset" .= s]
   toJSON (Stuck n r) = object ["kind" .= ("stuck" :: Text), "pr_number" .= n, "rounds" .= r]
+  toJSON (CITriggered n branch sha) = object ["kind" .= ("ci_triggered" :: Text), "pr_number" .= n, "branch" .= branch, "head_sha" .= sha]
+  toJSON (CIBlocked n ci branch) = object ["kind" .= ("ci_blocked" :: Text), "pr_number" .= n, "ci_status" .= ci, "branch" .= branch]
   toJSON (MergeReady n ci branch) = object ["kind" .= ("merge_ready" :: Text), "pr_number" .= n, "ci_status" .= ci, "branch" .= branch]
   toJSON (DevNotPushing n) = object ["kind" .= ("dev_not_pushing" :: Text), "pr_number" .= n]
   toJSON (ReviewerNotResponding n) = object ["kind" .= ("reviewer_not_responding" :: Text), "pr_number" .= n]

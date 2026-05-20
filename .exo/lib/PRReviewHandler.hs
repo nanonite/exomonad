@@ -81,6 +81,16 @@ prReviewHandler (ReviewerRequestedChanges n comments_) = do
 prReviewHandler (RateLimited remaining secs) = do
   logHandler $ "Rate limited: " <> T.pack (show remaining) <> " retries, " <> T.pack (show secs) <> "s until reset"
   pure NoAction
+prReviewHandler (CITriggered n branch_ headSha) = do
+  logHandler $ "CI triggered on PR #" <> T.pack (show n) <> ", branch: " <> branch_
+  branch <- getCurrentBranch
+  void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CITriggeredEv n branch_ headSha)
+  pure (InjectMessage $ "[CI TRIGGERED] PR #" <> T.pack (show n) <> " on " <> branch_ <> ". Waiting for CI result.")
+prReviewHandler (CIBlocked n status_ branch_) = do
+  logHandler $ "CI blocked PR #" <> T.pack (show n) <> ", status: " <> status_
+  branch <- getCurrentBranch
+  void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CIBlockedEv n status_ branch_)
+  pure $ NotifyParentAction ("[CI BLOCKED: PR #" <> T.pack (show n) <> "] CI finished with status " <> status_ <> " on " <> branch_ <> ". Dev leaf is staying alive and waiting for TL direction.") n
 prReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
   branch <- getCurrentBranch
@@ -138,6 +148,12 @@ tlPrReviewHandler (ReviewerRequestedChanges n comments_) = do
 tlPrReviewHandler (RateLimited remaining secs) = do
   logHandler $ "TL observed review rate limit"
   pure (InjectMessage $ "[RATE LIMITED] Review polling has " <> T.pack (show remaining) <> " retries remaining; reset in " <> T.pack (show secs) <> " seconds.")
+tlPrReviewHandler (CITriggered n branch_ _headSha) = do
+  logHandler $ "TL observed CI triggered on PR #" <> T.pack (show n)
+  pure (InjectMessage $ "[CI TRIGGERED] PR #" <> T.pack (show n) <> " on " <> branch_ <> ".")
+tlPrReviewHandler (CIBlocked n status_ branch_) = do
+  logHandler $ "TL observed CI blocked PR #" <> T.pack (show n)
+  pure (InjectMessage $ "[CI BLOCKED] PR #" <> T.pack (show n) <> " CI status " <> status_ <> " on " <> branch_ <> ". Human direction required.")
 tlPrReviewHandler (Stuck n rounds_) = do
   logHandler $ "TL observed PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
   pure (InjectMessage (Tpl.stuck n rounds_))
@@ -201,7 +217,13 @@ ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerAppro
       branch <- getCurrentBranch
       void $ applyEvent @DevPhase @DevEvent branch DevSpawned (MergeReadyEv n status_ branch_)
       pure (InjectMessage (Tpl.mergeReady n status_ branch_))
-    else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
+    else
+      if mergeBlockedOnCI && status_ == "failure"
+        then do
+          branch <- getCurrentBranch
+          void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CIBlockedEv n status_ branch_)
+          pure $ NotifyParentAction ("[CI BLOCKED: PR #" <> T.pack (show n) <> "] CI finished with status " <> status_ <> " on " <> branch_ <> ". Dev leaf is staying alive and waiting for TL direction.") n
+        else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
 
 tlCiStatusHandler :: CIStatusEvent -> Eff Effects EventAction
 tlCiStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerApproved mergeReady_) = do

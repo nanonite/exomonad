@@ -27,6 +27,8 @@ data DevPhase
   | DevChangesRequested PRNumber [Text]
   | DevNeedsHumanDirection PRNumber Text
   | DevApproved PRNumber
+  | DevCITriggered PRNumber Text
+  | DevCIBlocked PRNumber Text
   | DevDone
   | DevDismissed Int Text
   | DevFailed Text
@@ -41,6 +43,8 @@ data DevEvent
   | ReviewApprovedEv PRNumber
   | FixesPushedEv PRNumber Text
   | CommitsPushedEv PRNumber Text
+  | CITriggeredEv PRNumber Text Text
+  | CIBlockedEv PRNumber Text Text
   | MergeReadyEv PRNumber Text Text
   | IssueClosedEv Int Text
   deriving (Show, Eq)
@@ -57,6 +61,8 @@ instance StateMachine DevPhase DevEvent where
       DevChangesRequested _ _ -> Transitioned phase
       DevNeedsHumanDirection _ _ -> Transitioned phase
       DevApproved _ -> Transitioned phase
+      DevCITriggered _ _ -> Transitioned phase
+      DevCIBlocked _ _ -> Transitioned phase
       _ -> Transitioned DevDone
     NotifyParentFailure msg ->
       Transitioned (DevFailed msg)
@@ -78,8 +84,20 @@ instance StateMachine DevPhase DevEvent where
             DevUnderReview _ r -> r + 1
             _ -> 1
        in Transitioned (DevUnderReview prNum round)
-    MergeReadyEv _prNum _ci _branch ->
-      Transitioned DevDone
+    CITriggeredEv prNum branch_ _sha -> case phase of
+      DevApproved approvedPr
+        | approvedPr == prNum -> Transitioned (DevCITriggered prNum branch_)
+      DevCITriggered triggeredPr _
+        | triggeredPr == prNum -> Transitioned phase
+      _ -> InvalidTransition "CI can only be triggered after reviewer approval"
+    CIBlockedEv prNum status_ _branch -> case phase of
+      DevCITriggered triggeredPr _
+        | triggeredPr == prNum -> Transitioned (DevCIBlocked prNum status_)
+      _ -> InvalidTransition "CI can only block a PR after CI has been triggered"
+    MergeReadyEv prNum _ci _branch -> case phase of
+      DevCITriggered triggeredPr _
+        | triggeredPr == prNum -> Transitioned DevDone
+      _ -> InvalidTransition "MergeReady requires CITriggered first"
     IssueClosedEv issueId closedBy ->
       Transitioned (DevDismissed issueId closedBy)
 
@@ -92,7 +110,11 @@ instance StateMachine DevPhase DevEvent where
   canExit (DevNeedsHumanDirection pr _) =
     MustBlock $ "PR #" <> T.pack (show pr) <> " has unresolved review feedback in round 1 after the first fix push; awaiting human direction."
   canExit (DevApproved pr) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " approved, waiting for CI merge-ready signal."
+    MustBlock $ "PR #" <> T.pack (show pr) <> " approved, waiting for CI to be triggered."
+  canExit (DevCITriggered pr _) =
+    MustBlock $ "PR #" <> T.pack (show pr) <> " CI triggered, waiting for CI merge-ready signal."
+  canExit (DevCIBlocked pr status_) =
+    MustBlock $ "PR #" <> T.pack (show pr) <> " blocked by CI status " <> status_ <> "; awaiting TL direction."
   canExit _ = Clean
 
 instance ToJSON DevPhase where
@@ -103,6 +125,8 @@ instance ToJSON DevPhase where
   toJSON (DevChangesRequested n cs) = object ["phase" .= ("dev_changes_requested" :: Text), "pr_number" .= n, "comments" .= cs]
   toJSON (DevNeedsHumanDirection n reason) = object ["phase" .= ("dev_needs_human_direction" :: Text), "pr_number" .= n, "reason" .= reason]
   toJSON (DevApproved n) = object ["phase" .= ("dev_approved" :: Text), "pr_number" .= n]
+  toJSON (DevCITriggered n branch_) = object ["phase" .= ("dev_ci_triggered" :: Text), "pr_number" .= n, "branch" .= branch_]
+  toJSON (DevCIBlocked n status_) = object ["phase" .= ("dev_ci_blocked" :: Text), "pr_number" .= n, "status" .= status_]
   toJSON DevDone = object ["phase" .= ("dev_done" :: Text)]
   toJSON (DevDismissed issueId closedBy) = object ["phase" .= ("dev_dismissed" :: Text), "issue_id" .= issueId, "closed_by" .= closedBy]
   toJSON (DevFailed msg) = object ["phase" .= ("dev_failed" :: Text), "message" .= msg]
@@ -132,6 +156,14 @@ instance FromJSON DevPhase where
       "dev_approved" -> do
         n <- v .: "pr_number"
         pure (DevApproved n)
+      "dev_ci_triggered" -> do
+        n <- v .: "pr_number"
+        branch_ <- v .: "branch"
+        pure (DevCITriggered n branch_)
+      "dev_ci_blocked" -> do
+        n <- v .: "pr_number"
+        status_ <- v .: "status"
+        pure (DevCIBlocked n status_)
       "dev_done" -> pure DevDone
       "dev_dismissed" -> do
         issueId <- v .: "issue_id"

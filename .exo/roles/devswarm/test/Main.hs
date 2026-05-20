@@ -52,7 +52,9 @@ main = do
   assertReviewApprovedFromUnderReviewRoundZero
   assertFixesPushedFromChangesRequestedYieldsRoundOne
   assertFixesPushedIncrementsUnderReviewRound
-  assertApprovedMergeReadyTransitionsToDoneAndExits
+  assertApprovedRequiresCITriggeredBeforeMergeReady
+  assertCITriggeredMergeReadyTransitionsToDoneAndExits
+  assertCIFailureBlocksAfterTrigger
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -352,17 +354,32 @@ assertFixesPushedIncrementsUnderReviewRound = do
     Transitioned (DevUnderReview 9 2) -> pure ()
     other -> fail $ "expected DevUnderReview 9 2 after second fix push, got " <> showDevTransition other
 
--- DevApproved blocks exit until MergeReadyEv arrives; once it arrives, the
--- dev transitions to DevDone and may exit cleanly. The intermediate
--- DevApproved -> DevDone transition is the merge-ready signal the TL has
--- already merged the PR.
-assertApprovedMergeReadyTransitionsToDoneAndExits :: IO ()
-assertApprovedMergeReadyTransitionsToDoneAndExits = do
+-- DevApproved is not mergeable by itself. The watcher must trigger CI first,
+-- then MergeReadyEv can finish the dev lifecycle after CI passes.
+assertApprovedRequiresCITriggeredBeforeMergeReady :: IO ()
+assertApprovedRequiresCITriggeredBeforeMergeReady = do
   case transition (DevApproved 9) (MergeReadyEv 9 "success" "main.feature") of
+    InvalidTransition _ -> pure ()
+    other -> fail $ "expected invalid MergeReadyEv before CITriggered, got " <> showDevTransition other
+  assertBlocks "approved waiting for CI trigger" (canExit @DevPhase @DevEvent (DevApproved 9))
+
+assertCITriggeredMergeReadyTransitionsToDoneAndExits :: IO ()
+assertCITriggeredMergeReadyTransitionsToDoneAndExits = do
+  case transition (DevApproved 9) (CITriggeredEv 9 "main.feature" "abc123") of
+    Transitioned (DevCITriggered 9 "main.feature") -> pure ()
+    other -> fail $ "expected DevCITriggered after approval, got " <> showDevTransition other
+  case transition (DevCITriggered 9 "main.feature") (MergeReadyEv 9 "success" "main.feature") of
     Transitioned DevDone -> pure ()
-    other -> fail $ "expected DevDone after MergeReadyEv from approved, got " <> showDevTransition other
-  assertBlocks "approved waiting for CI" (canExit @DevPhase @DevEvent (DevApproved 9))
+    other -> fail $ "expected DevDone after MergeReadyEv from CITriggered, got " <> showDevTransition other
+  assertBlocks "ci triggered waiting for result" (canExit @DevPhase @DevEvent (DevCITriggered 9 "main.feature"))
   assertClean "done exits cleanly" (canExit @DevPhase @DevEvent DevDone)
+
+assertCIFailureBlocksAfterTrigger :: IO ()
+assertCIFailureBlocksAfterTrigger = do
+  case transition (DevCITriggered 9 "main.feature") (CIBlockedEv 9 "failure" "main.feature") of
+    Transitioned (DevCIBlocked 9 "failure") -> pure ()
+    other -> fail $ "expected DevCIBlocked after failed CI, got " <> showDevTransition other
+  assertBlocks "ci blocked terminal" (canExit @DevPhase @DevEvent (DevCIBlocked 9 "failure"))
 
 showDevTransition :: TransitionResult DevPhase -> String
 showDevTransition (Transitioned phase) = "Transitioned " <> show phase
