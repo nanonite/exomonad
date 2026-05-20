@@ -44,6 +44,9 @@ main = do
   assertReviewerPostToolUseEventName
   assertReviewerCanExitDecisions
   assertReviewerVerdictsAreTerminal
+  assertAppendVerdictLocksPerHeadSha
+  assertAppendVerdictAllowsNewHeadSha
+  assertAppendVerdictRecordsAuthorAndHeadSha
   assertDevNeedsHumanDirectionAfterOneFixRound
   assertReviewApprovedAfterFixRoundTransitionsToApproved
   assertReviewApprovedFromUnderReviewRoundZero
@@ -274,6 +277,29 @@ assertReviewerVerdictsAreTerminal = do
   case transition ReviewerSpawned (ReviewerRequestedChangesEv 7 "needs fix") of
     Transitioned ReviewerDone -> pure ()
     _ -> fail "expected ReviewerDone after requested-changes verdict"
+
+
+assertAppendVerdictLocksPerHeadSha :: IO ()
+assertAppendVerdictLocksPerHeadSha = do
+  first <- either (fail . T.unpack) pure $ ReviewerRole.appendVerdict 7 "abc123" "approved" "ok" (Just "main.review-pr-7-codex") [] ReviewerRole.emptyReviewFile
+  case ReviewerRole.appendVerdict 7 "abc123" "changes_requested" "late finding" (Just "main.review-pr-7-claude") [] first of
+    Left msg -> assertBool "duplicate verdict mentions existing SHA" ("already exists" `T.isInfixOf` msg && "abc123" `T.isInfixOf` msg)
+    Right _ -> fail "expected duplicate verdict at same SHA to be refused"
+
+assertAppendVerdictAllowsNewHeadSha :: IO ()
+assertAppendVerdictAllowsNewHeadSha = do
+  first <- either (fail . T.unpack) pure $ ReviewerRole.appendVerdict 7 "abc123" "approved" "ok" (Just "main.review-pr-7-codex") [] ReviewerRole.emptyReviewFile
+  second <- either (fail . T.unpack) pure $ ReviewerRole.appendVerdict 7 "def456" "changes_requested" "new round" (Just "main.review-pr-7-codex") [] first
+  assertEqual "new SHA verdict count" 2 (length (ReviewerRole.reviewVerdicts second))
+
+assertAppendVerdictRecordsAuthorAndHeadSha :: IO ()
+assertAppendVerdictRecordsAuthorAndHeadSha = do
+  reviewFile <- either (fail . T.unpack) pure $ ReviewerRole.appendVerdict 7 "abc123" "approved" "ok" (Just "main.review-pr-7-codex") [] ReviewerRole.emptyReviewFile
+  case ReviewerRole.reviewVerdicts reviewFile of
+    [verdict] -> do
+      assertEqual "verdict author branch" (Just "main.review-pr-7-codex") (ReviewerRole.verdictAuthorBranch verdict)
+      assertEqual "verdict head sha" (Just "abc123") (ReviewerRole.verdictHeadSha verdict)
+    other -> fail $ "expected one verdict, got " <> show (length other)
 
 assertDevNeedsHumanDirectionAfterOneFixRound :: IO ()
 assertDevNeedsHumanDirectionAfterOneFixRound = do

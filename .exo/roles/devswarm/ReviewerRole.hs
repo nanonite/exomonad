@@ -6,7 +6,7 @@
 
 -- | Reviewer role: diff review only — no spawn, merge, or PR tools.
 --   Tool restrictions enforced at the WASM hook layer.
-module ReviewerRole (config, Tools) where
+module ReviewerRole (config, Tools, appendVerdict, emptyReviewFile, ReviewFile (..), ReviewVerdict (..)) where
 
 import Control.Monad (void)
 import Control.Monad.Freer (Eff)
@@ -19,6 +19,8 @@ import Data.Text.Encoding qualified as TE
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TLE
 import ExoMonad
+import Effects.FilePr qualified as FPR
+import ExoMonad.Effects.FilePR (FilePRLocalPrGet)
 import ExoMonad.Effects.Log qualified as Log
 import ExoMonad.Guest.Effects.FileSystem qualified as FS
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
@@ -32,7 +34,7 @@ import ExoMonad.Guest.Events
   )
 import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
-import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
+import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, postToolUseResponse)
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
 import HookPolicy (preToolUseWithGitAuthorAndImplementationBlock)
@@ -125,7 +127,8 @@ data ReviewVerdict = ReviewVerdict
   { verdictState :: Text,
     verdictBody :: Text,
     verdictComments :: [ReviewComment],
-    verdictAuthorBranch :: Maybe Text
+    verdictAuthorBranch :: Maybe Text,
+    verdictHeadSha :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -135,7 +138,8 @@ instance Aeson.ToJSON ReviewVerdict where
       [ "state" .= verdictState v,
         "body" .= verdictBody v,
         "comments" .= verdictComments v,
-        "author_branch" .= verdictAuthorBranch v
+        "author_branch" .= verdictAuthorBranch v,
+        "head_sha" .= verdictHeadSha v
       ]
 
 instance Aeson.FromJSON ReviewVerdict where
@@ -145,6 +149,7 @@ instance Aeson.FromJSON ReviewVerdict where
       <*> v Aeson..:? "body" Aeson..!= ""
       <*> v Aeson..:? "comments" Aeson..!= []
       <*> v Aeson..:? "author_branch"
+      <*> v Aeson..:? "head_sha"
 
 data ReviewFile = ReviewFile
   { reviewState :: Text,
@@ -190,21 +195,66 @@ readExistingReviewFile prNumber = do
 emptyReviewFile :: ReviewFile
 emptyReviewFile = ReviewFile "none" [] []
 
-appendVerdict :: Text -> Text -> Maybe Text -> [ReviewComment] -> ReviewFile -> ReviewFile
-appendVerdict state body authorBranch comments existing =
-  ReviewFile
-    { reviewState = state,
-      reviewComments = comments,
-      reviewVerdicts =
-        reviewVerdicts existing
-          <> [ ReviewVerdict
-                 { verdictState = state,
-                   verdictBody = body,
-                   verdictComments = comments,
-                   verdictAuthorBranch = authorBranch
-                 }
-             ]
-    }
+appendVerdict :: Int -> Text -> Text -> Text -> Maybe Text -> [ReviewComment] -> ReviewFile -> Either Text ReviewFile
+appendVerdict prNumber headSha state body authorBranch comments existing
+  | T.null headSha = Left $ missingHeadShaMessage prNumber
+  | any (sameHeadSha headSha) (reviewVerdicts existing) = Left $ duplicateVerdictMessage prNumber headSha
+  | otherwise =
+      Right $
+        ReviewFile
+          { reviewState = state,
+            reviewComments = comments,
+            reviewVerdicts =
+              reviewVerdicts existing
+                <> [ ReviewVerdict
+                       { verdictState = state,
+                         verdictBody = body,
+                         verdictComments = comments,
+                         verdictAuthorBranch = authorBranch,
+                         verdictHeadSha = Just headSha
+                       }
+                   ]
+          }
+
+sameHeadSha :: Text -> ReviewVerdict -> Bool
+sameHeadSha headSha verdict =
+  verdictHeadSha verdict == Just headSha
+
+duplicateVerdictMessage :: Int -> Text -> Text
+duplicateVerdictMessage prNumber headSha =
+  "Refused: verdict for PR #"
+    <> T.pack (show prNumber)
+    <> " at SHA "
+    <> headSha
+    <> " already exists. Reviewers are ephemeral per round; if you believe the PR needs re-review, the dev-leaf must push a new SHA first."
+
+missingHeadShaMessage :: Int -> Text
+missingHeadShaMessage prNumber =
+  "Refused: cannot determine head SHA for PR #"
+    <> T.pack (show prNumber)
+    <> ". Verdicts are locked per PR/SHA round, so the PR registry must include last_head_sha before review."
+
+currentHeadShaForPR :: Int -> Eff Effects (Either Text Text)
+currentHeadShaForPR prNumber = do
+  result <-
+    suspendEffect @FilePRLocalPrGet
+      FPR.LocalPrGetRequest
+        { FPR.localPrGetRequestPrNumber = fromIntegral prNumber
+        }
+  pure $ case result of
+    Right response
+      | FPR.localPrResponseFound response && not (TL.null (FPR.localPrResponseLastHeadSha response)) ->
+          Right (TL.toStrict (FPR.localPrResponseLastHeadSha response))
+    Right _ -> Left $ missingHeadShaMessage prNumber
+    Left err -> Left $ "Failed to load PR #" <> T.pack (show prNumber) <> " before writing verdict: " <> T.pack (show err)
+
+getReviewerBranch :: Eff Effects (Either Text Text)
+getReviewerBranch = do
+  branch <- getCurrentBranch
+  pure $
+    if T.null branch || branch == "unknown"
+      then Left "Refused: reviewer branch identity is unknown. Detached reviewer worktrees must report the agent birth branch before writing verdicts."
+      else Right branch
 
 writeReviewFile :: Int -> ReviewFile -> Eff Effects (Either Text Text)
 writeReviewFile prNumber reviewFile = do
@@ -226,14 +276,21 @@ instance MCPTool ReviewerApprovePR where
       ]
   toolHandlerEff args = do
     existing <- readExistingReviewFile (apPrNumber args)
-    branch <- getCurrentBranch
-    let next = appendVerdict "approved" (apBody args) (Just branch) [] existing
-    result <- writeReviewFile (apPrNumber args) next
-    case result of
-      Left err -> pure $ errorResult err
-      Right path -> do
-        void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv (apPrNumber args))
-        pure $ successResult $ object ["success" .= True, "path" .= path]
+    branchResult <- getReviewerBranch
+    headShaResult <- currentHeadShaForPR (apPrNumber args)
+    case (branchResult, headShaResult) of
+      (Left err, _) -> pure $ errorResult err
+      (_, Left err) -> pure $ errorResult err
+      (Right branch, Right headSha) ->
+        case appendVerdict (apPrNumber args) headSha "approved" (apBody args) (Just branch) [] existing of
+          Left err -> pure $ errorResult err
+          Right next -> do
+            result <- writeReviewFile (apPrNumber args) next
+            case result of
+              Left err -> pure $ errorResult err
+              Right path -> do
+                void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv (apPrNumber args))
+                pure $ successResult $ object ["success" .= True, "path" .= path]
 
 data ReviewerRequestChanges
 
@@ -249,25 +306,31 @@ instance MCPTool ReviewerRequestChanges where
         ("diff_hunk", "Optional diff hunk for the comment")
       ]
   toolHandlerEff args = do
-    branch <- getCurrentBranch
-    let comment =
-          ReviewComment
-            { commentBody = rcBody args,
-              commentPath = rcPath args,
-              commentDiffHunk = rcDiffHunk args,
-              commentThreadId = Nothing,
-              commentResolved = False,
-              commentAuthorBranch = Just branch
-            }
-    existing <- readExistingReviewFile (rcPrNumber args)
-    let next = appendVerdict "changes_requested" (rcBody args) (Just branch) [comment] existing
-    result <- writeReviewFile (rcPrNumber args) next
-    case result of
-      Left err -> pure $ errorResult err
-      Right path -> do
-        branch <- getCurrentBranch
-        void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv (rcPrNumber args) (rcBody args))
-        pure $ successResult $ object ["success" .= True, "path" .= path]
+    branchResult <- getReviewerBranch
+    headShaResult <- currentHeadShaForPR (rcPrNumber args)
+    case (branchResult, headShaResult) of
+      (Left err, _) -> pure $ errorResult err
+      (_, Left err) -> pure $ errorResult err
+      (Right branch, Right headSha) -> do
+        let comment =
+              ReviewComment
+                { commentBody = rcBody args,
+                  commentPath = rcPath args,
+                  commentDiffHunk = rcDiffHunk args,
+                  commentThreadId = Nothing,
+                  commentResolved = False,
+                  commentAuthorBranch = Just branch
+                }
+        existing <- readExistingReviewFile (rcPrNumber args)
+        case appendVerdict (rcPrNumber args) headSha "changes_requested" (rcBody args) (Just branch) [comment] existing of
+          Left err -> pure $ errorResult err
+          Right next -> do
+            result <- writeReviewFile (rcPrNumber args) next
+            case result of
+              Left err -> pure $ errorResult err
+              Right path -> do
+                void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv (rcPrNumber args) (rcBody args))
+                pure $ successResult $ object ["success" .= True, "path" .= path]
 
 data ReviewerPostReviewComment
 
@@ -285,21 +348,24 @@ instance MCPTool ReviewerPostReviewComment where
       ]
   toolHandlerEff args = do
     existing <- readExistingReviewFile (pcPrNumber args)
-    branch <- getCurrentBranch
-    let comment =
-          ReviewComment
-            { commentBody = pcBody args,
-              commentPath = pcPath args,
-              commentDiffHunk = pcDiffHunk args,
-              commentThreadId = pcThreadId args,
-              commentResolved = False,
-              commentAuthorBranch = Just branch
-            }
-        next = existing {reviewComments = reviewComments existing <> [comment]}
-    result <- writeReviewFile (pcPrNumber args) next
-    case result of
+    branchResult <- getReviewerBranch
+    case branchResult of
       Left err -> pure $ errorResult err
-      Right path -> pure $ successResult $ object ["success" .= True, "path" .= path]
+      Right branch -> do
+        let comment =
+              ReviewComment
+                { commentBody = pcBody args,
+                  commentPath = pcPath args,
+                  commentDiffHunk = pcDiffHunk args,
+                  commentThreadId = pcThreadId args,
+                  commentResolved = False,
+                  commentAuthorBranch = Just branch
+                }
+            next = existing {reviewComments = reviewComments existing <> [comment]}
+        result <- writeReviewFile (pcPrNumber args) next
+        case result of
+          Left err -> pure $ errorResult err
+          Right path -> pure $ successResult $ object ["success" .= True, "path" .= path]
 
 data Tools mode = Tools
   { approvePr :: mode :- ReviewerApprovePR,

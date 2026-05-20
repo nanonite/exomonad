@@ -100,12 +100,14 @@ checkPRNotFiledViaGitHub branch = do
 getAgentId :: IO (Maybe Text)
 getAgentId = fmap (fmap T.pack) (lookupEnv "EXOMONAD_AGENT_ID")
 
--- | Get the current git branch name, defaulting to "unknown" on error.
+-- | Get the current branch identity, defaulting to "unknown" on error.
+-- Detached reviewer worktrees receive their agent birth branch from the host
+-- git effect so verdict provenance does not collapse to "unknown".
 getCurrentBranch :: Eff Effects Text
 getCurrentBranch = do
   result <- suspendEffect @GitGetBranch (Git.GetBranchRequest {Git.getBranchRequestWorkingDir = "."})
   case result of
     Right resp
-      | Git.getBranchResponseDetached resp -> pure "unknown"
-      | otherwise -> pure $ TL.toStrict (Git.getBranchResponseBranch resp)
+      | not (TL.null (Git.getBranchResponseBranch resp)) -> pure $ TL.toStrict (Git.getBranchResponseBranch resp)
+      | otherwise -> pure "unknown"
     Left _ -> pure "unknown"

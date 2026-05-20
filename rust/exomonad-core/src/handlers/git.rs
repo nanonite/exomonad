@@ -54,8 +54,11 @@ impl GitEffects for GitHandler {
 
         info!(branch = ?branch, "[Git] get_branch complete");
         let detached = branch.is_none();
+        let branch_name = branch
+            .map(|branch| branch.to_string())
+            .unwrap_or_else(|| ctx.birth_branch.to_string());
         Ok(GetBranchResponse {
-            branch: branch.map(|branch| branch.to_string()).unwrap_or_default(),
+            branch: branch_name,
             detached,
         })
     }
@@ -258,6 +261,10 @@ fn parse_git_date(date: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch};
+    use crate::services::command::CommandExecutor;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
 
     fn test_ctx(branch: &str) -> EffectContext {
         EffectContext {
@@ -269,6 +276,29 @@ mod tests {
         }
     }
 
+    struct MockExecutor {
+        responses: Mutex<Vec<anyhow::Result<String>>>,
+    }
+
+    impl MockExecutor {
+        fn new(responses: Vec<anyhow::Result<String>>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+    }
+
+    impl CommandExecutor for MockExecutor {
+        fn exec<'a>(
+            &'a self,
+            _dir: &'a str,
+            _cmd: &'a [&'a str],
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+            let response = self.responses.lock().unwrap().remove(0);
+            Box::pin(async move { response })
+        }
+    }
+
     #[test]
     fn test_extract_email() {
         assert_eq!(
@@ -276,6 +306,25 @@ mod tests {
             Some("john@example.com".to_string())
         );
         assert_eq!(extract_email("No Email"), None);
+    }
+
+    #[tokio::test]
+    async fn test_get_branch_uses_birth_branch_when_head_is_detached() {
+        let handler = GitHandler::new(Arc::new(GitService::new(Arc::new(MockExecutor::new(
+            vec![Ok("\n".to_string())],
+        )))));
+        let response = handler
+            .get_branch(
+                GetBranchRequest {
+                    working_dir: ".".to_string(),
+                },
+                &test_ctx("main.review-pr-7-codex"),
+            )
+            .await
+            .expect("get_branch succeeds");
+
+        assert!(response.detached);
+        assert_eq!(response.branch, "main.review-pr-7-codex");
     }
 
     #[test]
