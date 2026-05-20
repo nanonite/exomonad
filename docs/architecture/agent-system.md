@@ -73,6 +73,10 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 
 Authority summary: **issue decomposition and lifecycle authority lives at the TL/root layer; dev and worker can read and comment but cannot create top-level issues, close them, or own timers.**
 
+### Messaging inboxes
+
+Message delivery is serialized per recipient. Claude Code uses its native Teams inbox and InboxPoller. Codex, Gemini tmux fallback, OpenCode, and future runtimes without a native inbox route through ExoMonad's per-agent FIFO inbox with one consumer task per agent; see [cross-runtime-message-inbox.md](../decisions/cross-runtime-message-inbox.md).
+
 ---
 
 ## 3. Hook Rules — per role

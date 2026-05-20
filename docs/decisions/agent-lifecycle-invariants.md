@@ -86,6 +86,7 @@ Bash-CLI close paths were initially carved out as operator escape hatches. Obser
 - [hylo-worktree-model.md](hylo-worktree-model.md) — the unfold/fold recursion that makes worktree cleanup a structural step rather than an ad-hoc one.
 
 - [agent-sandbox-profiles.md](agent-sandbox-profiles.md) — Codex filesystem profiles are the structural sandbox layer for the reviewer and worker invariants.
+- [cross-runtime-message-inbox.md](cross-runtime-message-inbox.md) — peer ADR for serialized message delivery in runtimes without a native inbox.
 
 ## Implementation tracking
 
