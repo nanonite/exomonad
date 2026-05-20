@@ -118,7 +118,7 @@ fn build_codex_root_command(
         .into(),
     );
 
-    format!("{command}; echo; printf '%s\\n' {restart_hint}; exec bash -l")
+    format!("{command}; echo; printf '%s\n' {restart_hint}; exec bash -l")
 }
 
 /// Reject `--tl-model` / `--worker-model` values that opencode doesn't recognise.
@@ -1855,6 +1855,12 @@ pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
         "!.exo/roles/",
         "!.exo/lib/",
         "!.exo/rules/",
+        ".codex/",
+        ".tangled/*",
+        "!.tangled/workflows/",
+        ".claude/settings.local.json",
+        ".opencode/",
+        "opencode.json",
     ]
     .into_iter()
     .filter(|line| !has_line(line))
@@ -2287,6 +2293,57 @@ mod tests {
         assert!(companion.is_some());
     }
 
+    #[test]
+    fn ensure_gitignore_writes_runtime_scaffold_paths_on_fresh_repo() {
+        let dir = tempfile::tempdir().unwrap();
+
+        ensure_gitignore(dir.path()).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+
+        for expected in [
+            ".exo/*",
+            "!.exo/config.toml",
+            "!.exo/roles/",
+            "!.exo/lib/",
+            "!.exo/rules/",
+            ".codex/",
+            ".tangled/*",
+            "!.tangled/workflows/",
+            ".claude/settings.local.json",
+            ".opencode/",
+            "opencode.json",
+        ] {
+            assert!(
+                content.lines().any(|line| line.trim() == expected),
+                "missing gitignore entry: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_gitignore_only_appends_missing_runtime_scaffold_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let gitignore = dir.path().join(".gitignore");
+        std::fs::write(&gitignore, "target/\n.exo/*\n.codex/\n").unwrap();
+
+        ensure_gitignore(dir.path()).unwrap();
+        let once = std::fs::read_to_string(&gitignore).unwrap();
+        ensure_gitignore(dir.path()).unwrap();
+        let twice = std::fs::read_to_string(&gitignore).unwrap();
+
+        assert_eq!(once, twice);
+        assert_eq!(
+            once.lines().filter(|line| line.trim() == ".exo/*").count(),
+            1
+        );
+        assert_eq!(
+            once.lines().filter(|line| line.trim() == ".codex/").count(),
+            1
+        );
+        assert!(once.lines().any(|line| line.trim() == ".opencode/"));
+        assert!(once.lines().any(|line| line.trim() == "opencode.json"));
+    }
+
     // ── validate_claude_model tests ───────────────────────────────────────
     // Aliases sourced from `claude --help`: 'sonnet' or 'opus'
     // Full IDs accepted via "claude-" prefix.
@@ -2323,7 +2380,7 @@ mod tests {
 
         assert_eq!(
             command,
-            "codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/exomonad repo' --model gpt-5.2 'Plan the next wave'; echo; printf '%s\\n' '[Codex exited - restart with: codex --dangerously-bypass-approvals-and-sandbox --cd '\\''/tmp/exomonad repo'\\'' --model gpt-5.2]'; exec bash -l"
+            "codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/exomonad repo' --model gpt-5.2 'Plan the next wave'; echo; printf '%s\n' '[Codex exited - restart with: codex --dangerously-bypass-approvals-and-sandbox --cd '\\''/tmp/exomonad repo'\\'' --model gpt-5.2]'; exec bash -l"
         );
         assert!(!command.contains("not implemented"));
         assert!(command.ends_with("exec bash -l"));
