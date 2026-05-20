@@ -188,6 +188,9 @@ pub struct RawConfig {
     /// GitHub poller interval in seconds (default: 60).
     pub poll_interval: Option<u64>,
 
+    /// Orphan reconciler interval in seconds (default: 60).
+    pub orphan_reconciler_interval_secs: Option<u64>,
+
     /// OpenRouter routing configuration.
     #[serde(default)]
     pub openrouter: Option<OpenRouterConfig>,
@@ -268,6 +271,9 @@ pub struct Config {
 
     /// GitHub poller interval in seconds (default: 60).
     pub poll_interval: Option<u64>,
+
+    /// Orphan reconciler interval in seconds (default: 60).
+    pub orphan_reconciler_interval_secs: Option<u64>,
 
     /// OpenRouter routing configuration.
     pub openrouter: OpenRouterConfig,
@@ -441,6 +447,9 @@ impl Config {
 
         // Resolve poll_interval: local > global
         let poll_interval = local_raw.poll_interval.or(global_raw.poll_interval);
+        let orphan_reconciler_interval_secs = local_raw
+            .orphan_reconciler_interval_secs
+            .or(global_raw.orphan_reconciler_interval_secs);
 
         // Resolve openrouter: local > global > default
         let openrouter = local_raw
@@ -516,6 +525,7 @@ impl Config {
             otlp_endpoint,
             model,
             poll_interval,
+            orphan_reconciler_interval_secs,
             openrouter,
             opencode,
             opencode_as_tl,
@@ -562,6 +572,7 @@ impl Default for Config {
             otlp_endpoint: None,
             model: None,
             poll_interval: None,
+            orphan_reconciler_interval_secs: None,
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
             opencode_as_tl: false,

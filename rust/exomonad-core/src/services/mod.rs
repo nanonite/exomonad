@@ -22,6 +22,7 @@ pub mod log;
 pub mod merge_pr;
 pub mod merge_pr_local;
 pub mod mutex_registry;
+pub mod orphan_reconciler;
 pub mod repo;
 pub mod resilience;
 pub mod review_policy;

@@ -4,6 +4,7 @@ tmux_session = "EXOMONAD"
 port = 7433
 yolo = true
 otlp_endpoint = "http://localhost:4317"
+orphan_reconciler_interval_secs = 60
 
 # Tangled local dev: knot at localhost:5555, spindle at localhost:6555
 tangled_knot_url = "ws://localhost:5555"

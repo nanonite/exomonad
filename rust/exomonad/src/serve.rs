@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use exomonad_core::protocol::Runtime as HookRuntime;
-use exomonad_core::services::{git, tmux_events};
+use exomonad_core::services::{git, tmux_events, HasGitWorktreeService};
 use exomonad_core::{
     AgentName, BirthBranch, ClaudePreToolUseOutput, HookEnvelope, HookEventType, HookInput,
     InternalAfterModelOutput, InternalBeforeModelOutput, InternalStopHookOutput, PluginManager,
@@ -1131,6 +1131,24 @@ Run `exomonad recompile` first to build it.",
     }
     tokio::spawn(async move {
         watcher.run().await;
+    });
+
+    let orphan_reconciler_interval =
+        Duration::from_secs(config.orphan_reconciler_interval_secs.unwrap_or(60));
+    if orphan_reconciler_interval.is_zero() {
+        anyhow::bail!(
+            "Invalid configuration: `orphan_reconciler_interval_secs` must be >= 1 second, got 0"
+        );
+    }
+    let orphan_project_dir = Arc::new(project_dir.clone());
+    let orphan_git_wt = services.git_worktree_service().clone();
+    tokio::spawn(async move {
+        exomonad_core::services::orphan_reconciler::run_orphan_reconciler(
+            orphan_project_dir,
+            orphan_git_wt,
+            orphan_reconciler_interval,
+        )
+        .await;
     });
 
     let app_state = AppState {
