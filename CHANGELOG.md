@@ -123,6 +123,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- leaf-lifecycle: merge gate rounds counter never increments on verdict write (option B: rounds = unique reviewed SHAs) (#326)
+- runtime-hook-parity: extend agent inbox with structural deduplication for convergent delivery paths (#328)
+- leaf-lifecycle: PRReview handler must branch by role — TL gets InjectMessage (backstop), leaf drops auto NotifyParent (#327)
+- ensure_gitignore must cover all runtime scaffold paths (.codex/, .tangled/state/, .claude/settings.local.json, .opencode/) (#323)
 - Watcher: stop fanning pr_review review_received back to the reviewer that posted it (#296)
 - Watcher: add ci.gate config knob — treat 'no CI source configured' as auto-neutral so merge_ready can fire (#295)
 - merge_pr: post-merge git pull failure mode is opaque; log the actual exit code/stderr instead of a generic recovery hint (#294)
