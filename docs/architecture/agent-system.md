@@ -53,23 +53,23 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 
 | Chainlink tool | root | tl | dev | reviewer | worker |
 |---------------|:----:|:--:|:---:|:--------:|:------:|
-| `chainlink_issue_create` | | x | | | |
-| `chainlink_subissue_create` | | x | x | | |
+| `chainlink_issue_create` | x | x | | | |
+| `chainlink_subissue_create` | x | x | x | | |
 | `chainlink_subissue_close` | | | x | | |
-| `chainlink_issue_list` | | x | | | |
-| `chainlink_issue_show` | | x | x | | x |
-| `chainlink_issue_update` | | x | | | |
-| `chainlink_issue_comment` | | x | x | | x |
-| `chainlink_issue_close` | | x | | | |
-| `chainlink_issue_block` | | x | | | |
-| `chainlink_issue_relate` | | x | | | |
-| `chainlink_issue_cascade` | | x | | | |
-| `chainlink_milestone_create` / `_list` | | x | | | |
-| `chainlink_session_start` | | x | x | | x |
-| `chainlink_session_work` | | x | x | | x |
-| `chainlink_session_status` | | x | x | | |
-| `chainlink_session_end` | | x | x | | x |
-| `chainlink_timer_start` / `_stop` / `_status` | | x | | | |
+| `chainlink_issue_list` | x | x | | | |
+| `chainlink_issue_show` | x | x | x | | x |
+| `chainlink_issue_update` | x | x | | | |
+| `chainlink_issue_comment` | x | x | x | | x |
+| `chainlink_issue_close` | x | x | | | |
+| `chainlink_issue_block` | x | x | | | |
+| `chainlink_issue_relate` | x | x | | | |
+| `chainlink_issue_cascade` | x | x | | | |
+| `chainlink_milestone_create` / `_list` | x | x | | | |
+| `chainlink_session_start` | x | x | x | | x |
+| `chainlink_session_work` | x | x | x | | x |
+| `chainlink_session_status` | x | x | x | | |
+| `chainlink_session_end` | x | x | x | | x |
+| `chainlink_timer_start` / `_stop` / `_status` | x | x | | | |
 
 Authority summary: **issue decomposition and lifecycle authority lives at the TL/root layer; dev and worker can read and comment but cannot create top-level issues, close them, or own timers.**
 

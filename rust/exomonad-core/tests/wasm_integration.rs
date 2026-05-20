@@ -876,33 +876,35 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
         "chainlink_worker_status",
     ];
 
+    let coordinator_chainlink_tools = [
+        "chainlink_issue_create",
+        "chainlink_session_start",
+        "chainlink_session_status",
+        "chainlink_issue_show",
+        "chainlink_issue_comment",
+        "chainlink_subissue_create",
+        "chainlink_session_work",
+        "chainlink_session_end",
+        "chainlink_issue_close",
+        "chainlink_timer_start",
+        "chainlink_timer_stop",
+        "chainlink_timer_status",
+        "chainlink_issue_list",
+        "chainlink_issue_update",
+        "chainlink_issue_block",
+        "chainlink_issue_relate",
+        "chainlink_issue_cascade",
+        "chainlink_milestone_create",
+        "chainlink_milestone_list",
+    ];
+
     let tl_tools = list_tool_names(&runtime, "tl").await;
-    assert_tools_present(
-        "tl",
-        &tl_tools,
-        &[
-            "chainlink_issue_create",
-            "chainlink_session_start",
-            "chainlink_session_status",
-            "chainlink_issue_show",
-            "chainlink_issue_comment",
-            "chainlink_subissue_create",
-            "chainlink_session_work",
-            "chainlink_session_end",
-            "chainlink_issue_close",
-            "chainlink_timer_start",
-            "chainlink_timer_stop",
-            "chainlink_timer_status",
-            "chainlink_issue_list",
-            "chainlink_issue_update",
-            "chainlink_issue_block",
-            "chainlink_issue_relate",
-            "chainlink_issue_cascade",
-            "chainlink_milestone_create",
-            "chainlink_milestone_list",
-        ],
-    );
+    assert_tools_present("tl", &tl_tools, &coordinator_chainlink_tools);
     assert_tools_absent("tl", &tl_tools, &dropped_chainlink_tools);
+
+    let root_tools = list_tool_names(&runtime, "root").await;
+    assert_tools_present("root", &root_tools, &coordinator_chainlink_tools);
+    assert_tools_absent("root", &root_tools, &dropped_chainlink_tools);
 
     let dev_tools = list_tool_names(&runtime, "dev").await;
     assert_tools_present(
@@ -974,7 +976,7 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
     );
     assert_tools_absent("worker", &worker_tools, &dropped_chainlink_tools);
 
-    for role in ["root", "reviewer", "testrunner"] {
+    for role in ["reviewer", "testrunner"] {
         let names = list_tool_names(&runtime, role).await;
         assert_tools_absent(role, &names, &all_chainlink_tools);
         assert_tools_absent(role, &names, &dropped_chainlink_tools);

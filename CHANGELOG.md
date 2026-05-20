@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- root role missing chainlink MCP tools after #310 CLI block (#329)
 - Audit watcher's pr_review event-type dispatch: approvals must fire ReviewApprovedEv, not ReviewReceivedEv (#290)
 - Watcher's stuck-detection counts approvals as rounds — successful convergence trips STUCK (#288)
 - Fix reviewer tool contract to exclude parent notification (#286)

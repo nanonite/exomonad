@@ -14,6 +14,27 @@ import ExoMonad
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.StateMachine (applyEvent)
+import ExoMonad.Guest.Tools.Chainlink
+  ( ChainlinkBlock (..),
+    ChainlinkCascade (..),
+    ChainlinkIssueClose (..),
+    ChainlinkIssueComment (..),
+    ChainlinkIssueCreate (..),
+    ChainlinkIssueList (..),
+    ChainlinkIssueShow (..),
+    ChainlinkIssueUpdate (..),
+    ChainlinkMilestoneCreate (..),
+    ChainlinkMilestoneList (..),
+    ChainlinkRelate (..),
+    ChainlinkSessionEnd (..),
+    ChainlinkSessionStart (..),
+    ChainlinkSessionStatus (..),
+    ChainlinkSessionWork (..),
+    ChainlinkSubissueCreate (..),
+    ChainlinkTimerStart (..),
+    ChainlinkTimerStatus (..),
+    ChainlinkTimerStop (..),
+  )
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.Spawn
@@ -152,7 +173,26 @@ data Tools mode = Tools
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
     mergePr :: mode :- RootMergePR,
-    sendMessage :: mode :- SendMessage
+    sendMessage :: mode :- SendMessage,
+    chainlinkIssueCreate :: mode :- ChainlinkIssueCreate,
+    chainlinkSessionStart :: mode :- ChainlinkSessionStart,
+    chainlinkSessionStatus :: mode :- ChainlinkSessionStatus,
+    chainlinkIssueShow :: mode :- ChainlinkIssueShow,
+    chainlinkIssueComment :: mode :- ChainlinkIssueComment,
+    chainlinkSubissueCreate :: mode :- ChainlinkSubissueCreate,
+    chainlinkSessionWork :: mode :- ChainlinkSessionWork,
+    chainlinkSessionEnd :: mode :- ChainlinkSessionEnd,
+    chainlinkIssueClose :: mode :- ChainlinkIssueClose,
+    chainlinkTimerStart :: mode :- ChainlinkTimerStart,
+    chainlinkTimerStop :: mode :- ChainlinkTimerStop,
+    chainlinkTimerStatus :: mode :- ChainlinkTimerStatus,
+    chainlinkIssueList :: mode :- ChainlinkIssueList,
+    chainlinkIssueUpdate :: mode :- ChainlinkIssueUpdate,
+    chainlinkIssueBlock :: mode :- ChainlinkBlock,
+    chainlinkIssueRelate :: mode :- ChainlinkRelate,
+    chainlinkIssueCascade :: mode :- ChainlinkCascade,
+    chainlinkMilestoneCreate :: mode :- ChainlinkMilestoneCreate,
+    chainlinkMilestoneList :: mode :- ChainlinkMilestoneList
   }
   deriving (Generic)
 
@@ -168,7 +208,26 @@ config =
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,
             mergePr = mkHandler @RootMergePR,
-            sendMessage = mkHandler @SendMessage
+            sendMessage = mkHandler @SendMessage,
+            chainlinkIssueCreate = mkHandler @ChainlinkIssueCreate,
+            chainlinkSessionStart = mkHandler @ChainlinkSessionStart,
+            chainlinkSessionStatus = mkHandler @ChainlinkSessionStatus,
+            chainlinkIssueShow = mkHandler @ChainlinkIssueShow,
+            chainlinkIssueComment = mkHandler @ChainlinkIssueComment,
+            chainlinkSubissueCreate = mkHandler @ChainlinkSubissueCreate,
+            chainlinkSessionWork = mkHandler @ChainlinkSessionWork,
+            chainlinkSessionEnd = mkHandler @ChainlinkSessionEnd,
+            chainlinkIssueClose = mkHandler @ChainlinkIssueClose,
+            chainlinkTimerStart = mkHandler @ChainlinkTimerStart,
+            chainlinkTimerStop = mkHandler @ChainlinkTimerStop,
+            chainlinkTimerStatus = mkHandler @ChainlinkTimerStatus,
+            chainlinkIssueList = mkHandler @ChainlinkIssueList,
+            chainlinkIssueUpdate = mkHandler @ChainlinkIssueUpdate,
+            chainlinkIssueBlock = mkHandler @ChainlinkBlock,
+            chainlinkIssueRelate = mkHandler @ChainlinkRelate,
+            chainlinkIssueCascade = mkHandler @ChainlinkCascade,
+            chainlinkMilestoneCreate = mkHandler @ChainlinkMilestoneCreate,
+            chainlinkMilestoneList = mkHandler @ChainlinkMilestoneList
           },
       hooks =
         HookConfig
