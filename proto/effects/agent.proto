@@ -366,6 +366,25 @@ message CloseWorkerPaneResponse {
   string error = 2;
 }
 
+
+// ============================================================================
+// CloseIssueAndCleanup - Close a Chainlink issue after merged PR cleanup is safe
+// ============================================================================
+
+message CloseIssueAndCleanupRequest {
+  // Chainlink issue id to close.
+  uint64 issue_id = 1;
+  // Leaf agent name / worktree slug to dispose.
+  string leaf_name = 2;
+}
+
+message CloseIssueAndCleanupResponse {
+  bool success = 1;
+  string error = 2;
+  string leaf_name = 3;
+  repeated uint64 cleaned_pr_numbers = 4;
+}
+
 // ============================================================================
 // Service definition
 // ============================================================================
@@ -384,4 +403,5 @@ service AgentEffects {
   rpc List(ListRequest) returns (ListResponse);
   rpc CloseSelf(CloseSelfRequest) returns (CloseSelfResponse);
   rpc CloseWorkerPane(CloseWorkerPaneRequest) returns (CloseWorkerPaneResponse);
+  rpc CloseIssueAndCleanup(CloseIssueAndCleanupRequest) returns (CloseIssueAndCleanupResponse);
 }

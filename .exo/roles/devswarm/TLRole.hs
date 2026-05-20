@@ -36,6 +36,7 @@ import ExoMonad.Guest.Tools.Chainlink
     ChainlinkTimerStatus (..),
     ChainlinkTimerStop (..),
   )
+import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.DiscardWorkerOutput (DiscardWorkerOutput (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.Events
@@ -251,6 +252,7 @@ data Tools mode = Tools
     chainlinkSessionWork :: mode :- ChainlinkSessionWork,
     chainlinkSessionEnd :: mode :- ChainlinkSessionEnd,
     chainlinkIssueClose :: mode :- ChainlinkIssueClose,
+    closeIssueAndCleanup :: mode :- CloseIssueAndCleanup,
     chainlinkTimerStart :: mode :- ChainlinkTimerStart,
     chainlinkTimerStop :: mode :- ChainlinkTimerStop,
     chainlinkTimerStatus :: mode :- ChainlinkTimerStatus,
@@ -288,6 +290,7 @@ config =
             chainlinkSessionWork = mkHandler @ChainlinkSessionWork,
             chainlinkSessionEnd = mkHandler @ChainlinkSessionEnd,
             chainlinkIssueClose = mkHandler @ChainlinkIssueClose,
+            closeIssueAndCleanup = mkHandler @CloseIssueAndCleanup,
             chainlinkTimerStart = mkHandler @ChainlinkTimerStart,
             chainlinkTimerStop = mkHandler @ChainlinkTimerStop,
             chainlinkTimerStatus = mkHandler @ChainlinkTimerStatus,

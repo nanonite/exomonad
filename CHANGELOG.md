@@ -43,6 +43,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- TL tool: close_issue_and_cleanup — close Chainlink issue + dispose leaf and reviewer worktrees (#335)
 - exomonad new: attempt Tangled integration by default (#334)
 - root TL context: clarify spawn_leaf resumes existing worktrees (#330)
 - Advance reviewer detached-HEAD worktree to new PR tip on fixes_pushed event (#264)

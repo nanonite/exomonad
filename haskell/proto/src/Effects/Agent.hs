@@ -4752,3 +4752,260 @@ instance (HsJSONPB.ToJSON CloseWorkerPaneResponse) where
 
 instance (HsJSONPB.FromJSON CloseWorkerPaneResponse) where
   parseJSON = HsJSONPB.parseJSONPB
+
+data CloseIssueAndCleanupRequest
+  = CloseIssueAndCleanupRequest
+  { closeIssueAndCleanupRequestIssueId :: Hs.Word64,
+    closeIssueAndCleanupRequestLeafName :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData CloseIssueAndCleanupRequest)
+
+instance (HsProtobuf.Named CloseIssueAndCleanupRequest) where
+  nameOf _ = Hs.fromString "CloseIssueAndCleanupRequest"
+
+instance (HsProtobuf.HasDefault CloseIssueAndCleanupRequest)
+
+instance (HsProtobuf.Message CloseIssueAndCleanupRequest) where
+  encodeMessage
+    _
+    CloseIssueAndCleanupRequest
+      { closeIssueAndCleanupRequestIssueId,
+        closeIssueAndCleanupRequestLeafName
+      } =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            closeIssueAndCleanupRequestIssueId
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                closeIssueAndCleanupRequestLeafName
+            )
+        )
+  decodeMessage _ =
+    Hs.pure CloseIssueAndCleanupRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "issue_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "leaf_name")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB CloseIssueAndCleanupRequest) where
+  toJSONPB (CloseIssueAndCleanupRequest f1 f2) =
+    HsJSONPB.object
+      [ "issue_id" .= f1,
+        "leaf_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+  toEncodingPB (CloseIssueAndCleanupRequest f1 f2) =
+    HsJSONPB.pairs
+      [ "issue_id" .= f1,
+        "leaf_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+
+instance (HsJSONPB.FromJSONPB CloseIssueAndCleanupRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "CloseIssueAndCleanupRequest"
+      ( \obj ->
+          Hs.pure CloseIssueAndCleanupRequest
+            <*> obj .: "issue_id"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "leaf_name")
+                )
+      )
+
+instance (HsJSONPB.ToJSON CloseIssueAndCleanupRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON CloseIssueAndCleanupRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data CloseIssueAndCleanupResponse
+  = CloseIssueAndCleanupResponse
+  { closeIssueAndCleanupResponseSuccess :: Hs.Bool,
+    closeIssueAndCleanupResponseError :: Hs.Text,
+    closeIssueAndCleanupResponseLeafName :: Hs.Text,
+    closeIssueAndCleanupResponseCleanedPrNumbers :: (Hs.Vector Hs.Word64)
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData CloseIssueAndCleanupResponse)
+
+instance (HsProtobuf.Named CloseIssueAndCleanupResponse) where
+  nameOf _ = Hs.fromString "CloseIssueAndCleanupResponse"
+
+instance (HsProtobuf.HasDefault CloseIssueAndCleanupResponse)
+
+instance (HsProtobuf.Message CloseIssueAndCleanupResponse) where
+  encodeMessage
+    _
+    CloseIssueAndCleanupResponse
+      { closeIssueAndCleanupResponseSuccess,
+        closeIssueAndCleanupResponseError,
+        closeIssueAndCleanupResponseLeafName,
+        closeIssueAndCleanupResponseCleanedPrNumbers
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 1)
+                    closeIssueAndCleanupResponseSuccess
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 2)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        closeIssueAndCleanupResponseError
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 3)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    closeIssueAndCleanupResponseLeafName
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 4)
+            ( ( Hs.coerce
+                  @(Hs.Vector Hs.Word64)
+                  @(HsProtobuf.PackedVec Hs.Word64)
+              )
+                closeIssueAndCleanupResponseCleanedPrNumbers
+            )
+        )
+  decodeMessage _ =
+    Hs.pure CloseIssueAndCleanupResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.PackedVec Hs.Word64)
+                @(Hs.Vector Hs.Word64)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "leaf_name")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Repeated HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "cleaned_pr_numbers")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB CloseIssueAndCleanupResponse) where
+  toJSONPB (CloseIssueAndCleanupResponse f1 f2 f3 f4) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "leaf_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "cleaned_pr_numbers"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Word64)
+                   @(HsProtobuf.PackedVec Hs.Word64)
+               )
+                 f4
+             )
+      ]
+  toEncodingPB (CloseIssueAndCleanupResponse f1 f2 f3 f4) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "leaf_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "cleaned_pr_numbers"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Word64)
+                   @(HsProtobuf.PackedVec Hs.Word64)
+               )
+                 f4
+             )
+      ]
+
+instance (HsJSONPB.FromJSONPB CloseIssueAndCleanupResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "CloseIssueAndCleanupResponse"
+      ( \obj ->
+          Hs.pure CloseIssueAndCleanupResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "leaf_name")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.PackedVec Hs.Word64)
+                      @(Hs.Vector Hs.Word64)
+                  )
+                    (obj .: "cleaned_pr_numbers")
+                )
+      )
+
+instance (HsJSONPB.ToJSON CloseIssueAndCleanupResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON CloseIssueAndCleanupResponse) where
+  parseJSON = HsJSONPB.parseJSONPB

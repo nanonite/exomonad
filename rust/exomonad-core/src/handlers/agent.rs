@@ -14,11 +14,13 @@ use crate::services::agent_control::{
     SpawnGeminiTeammateOptions, SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions,
     SpawnWorkerOptions,
 };
+use crate::services::agent_resources::dispose_reviewers_for_pr;
+use crate::services::file_pr_local::{read_pr_registry, PrEntry, PrRegistry, PrState};
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber};
 use async_trait::async_trait;
 use exomonad_proto::effects::agent::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -954,6 +956,143 @@ impl<
             }),
         }
     }
+
+    async fn close_issue_and_cleanup(
+        &self,
+        req: CloseIssueAndCleanupRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<CloseIssueAndCleanupResponse> {
+        if req.issue_id == 0 {
+            return Ok(close_issue_cleanup_error("issue_id is required"));
+        }
+        if req.leaf_name.trim().is_empty() {
+            return Ok(close_issue_cleanup_error("leaf_name is required"));
+        }
+
+        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
+        let registry = read_pr_registry(&prs_path).await.ok();
+        let matching_prs = registry
+            .as_ref()
+            .map(|registry| cleanup_prs_for_leaf(registry, req.issue_id, &req.leaf_name))
+            .unwrap_or_default();
+
+        let open_prs: Vec<u64> = matching_prs
+            .iter()
+            .filter(|(_, pr)| pr.state != PrState::Merged)
+            .map(|(number, _)| *number)
+            .collect();
+        if !open_prs.is_empty() {
+            return Ok(CloseIssueAndCleanupResponse {
+                success: false,
+                error: format!(
+                    "Refusing cleanup: PR(s) {} for leaf '{}' are not merged",
+                    format_pr_numbers(&open_prs),
+                    req.leaf_name
+                ),
+                leaf_name: req.leaf_name,
+                cleaned_pr_numbers: Vec::new(),
+            });
+        }
+
+        if let Err(error) =
+            close_chainlink_issue_for_cleanup(self.ctx.project_dir(), req.issue_id).await
+        {
+            return Ok(CloseIssueAndCleanupResponse {
+                success: false,
+                error,
+                leaf_name: req.leaf_name,
+                cleaned_pr_numbers: Vec::new(),
+            });
+        }
+
+        if let Err(error) = self.service.cleanup_agent(&req.leaf_name).await {
+            return Ok(CloseIssueAndCleanupResponse {
+                success: false,
+                error: error.to_string(),
+                leaf_name: req.leaf_name,
+                cleaned_pr_numbers: Vec::new(),
+            });
+        }
+
+        let cleaned_pr_numbers: Vec<u64> = matching_prs.iter().map(|(number, _)| *number).collect();
+        for pr_number in &cleaned_pr_numbers {
+            dispose_reviewers_for_pr(
+                self.ctx.project_dir(),
+                self.ctx.git_worktree_service().clone(),
+                *pr_number,
+            )
+            .await;
+        }
+
+        Ok(CloseIssueAndCleanupResponse {
+            success: true,
+            error: String::new(),
+            leaf_name: req.leaf_name,
+            cleaned_pr_numbers,
+        })
+    }
+}
+
+fn close_issue_cleanup_error(message: &str) -> CloseIssueAndCleanupResponse {
+    CloseIssueAndCleanupResponse {
+        success: false,
+        error: message.to_string(),
+        leaf_name: String::new(),
+        cleaned_pr_numbers: Vec::new(),
+    }
+}
+
+async fn close_chainlink_issue_for_cleanup(
+    project_dir: &Path,
+    issue_id: u64,
+) -> Result<(), String> {
+    let output = tokio::process::Command::new("chainlink")
+        .args(["close", &issue_id.to_string()])
+        .current_dir(project_dir)
+        .output()
+        .await
+        .map_err(|error| format!("failed to run chainlink close {issue_id}: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "chainlink close {issue_id} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn cleanup_prs_for_leaf<'a>(
+    registry: &'a PrRegistry,
+    issue_id: u64,
+    leaf_name: &str,
+) -> Vec<(u64, &'a PrEntry)> {
+    let mut prs: Vec<(u64, &PrEntry)> = registry
+        .prs
+        .iter()
+        .filter(|(_, pr)| pr_matches_cleanup_target(pr, issue_id, leaf_name))
+        .map(|(number, pr)| (*number, pr))
+        .collect();
+    prs.sort_by_key(|(number, _)| *number);
+    prs
+}
+
+fn pr_matches_cleanup_target(pr: &PrEntry, issue_id: u64, leaf_name: &str) -> bool {
+    pr.chainlink_issue_id == Some(issue_id)
+        || pr.author_agent == leaf_name
+        || pr
+            .head_branch
+            .rsplit_once('.')
+            .map(|(_, agent)| agent == leaf_name)
+            .unwrap_or(false)
+}
+
+fn format_pr_numbers(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn spawn_result_to_proto(
@@ -1145,5 +1284,74 @@ mod tests {
             ServiceAgentType::Codex
         );
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
+    }
+
+    #[test]
+    fn cleanup_prs_for_leaf_matches_issue_and_leaf_identity() {
+        let mut registry = PrRegistry::default();
+        registry.prs.insert(
+            3,
+            PrEntry {
+                number: 3,
+                head_branch: "main.feature-codex".to_string(),
+                base_branch: "main".to_string(),
+                title: String::new(),
+                body: String::new(),
+                author_agent: "feature-codex".to_string(),
+                author_role: "dev".to_string(),
+                created_at: chrono::Utc::now(),
+                state: PrState::Merged,
+                review_state: Default::default(),
+                last_review_at: None,
+                last_head_sha: None,
+                approved_at_sha: None,
+                reviewer_agent: None,
+                reviewer_birth_branch: None,
+                rounds: 0,
+                stuck: false,
+                needs_human_review: false,
+                merge_blocked_on_ci: false,
+                chainlink_issue_id: Some(335),
+            },
+        );
+
+        let prs = cleanup_prs_for_leaf(&registry, 335, "feature-codex");
+
+        assert_eq!(
+            prs.iter().map(|(number, _)| *number).collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn cleanup_prs_for_leaf_ignores_other_leaf_prs() {
+        let mut registry = PrRegistry::default();
+        registry.prs.insert(
+            4,
+            PrEntry {
+                number: 4,
+                head_branch: "main.other-codex".to_string(),
+                base_branch: "main".to_string(),
+                title: String::new(),
+                body: String::new(),
+                author_agent: "other-codex".to_string(),
+                author_role: "dev".to_string(),
+                created_at: chrono::Utc::now(),
+                state: PrState::Open,
+                review_state: Default::default(),
+                last_review_at: None,
+                last_head_sha: None,
+                approved_at_sha: None,
+                reviewer_agent: None,
+                reviewer_birth_branch: None,
+                rounds: 0,
+                stuck: false,
+                needs_human_review: false,
+                merge_blocked_on_ci: false,
+                chainlink_issue_id: Some(444),
+            },
+        );
+
+        assert!(cleanup_prs_for_leaf(&registry, 335, "feature-codex").is_empty());
     }
 }
