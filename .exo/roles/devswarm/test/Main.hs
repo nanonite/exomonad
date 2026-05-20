@@ -22,6 +22,7 @@ import ReviewerPhase (ReviewerEvent, ReviewerPhase (..))
 import ReviewerRole qualified
 import RootRole qualified
 import TLRole qualified
+import WorkerRole qualified
 
 denyTools :: [Text]
 denyTools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
@@ -35,6 +36,7 @@ main = do
   assertRoleDeny "root" RootRole.config
   assertReviewerDenyImplementationTools
   assertRuntimeImplementationPolicy
+  assertChainlinkCLIBlockPolicy
   assertReviewerGitAuthorMutationPolicy
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
@@ -113,6 +115,44 @@ assertAllowsRuntimeCommand label_ cfg runtime toolName command = do
   output <- runPreToolUseInput cfg (commandHookInputRuntime runtime toolName command)
   assertBool label_ (continue_ output)
   assertEqual (label_ <> " decision") (Just "allow") (permissionDecisionOf output)
+
+assertChainlinkCLIBlockPolicy :: IO ()
+assertChainlinkCLIBlockPolicy = do
+  let deniedCommands =
+        [ "chainlink issue close 1",
+          "chainlink issue create title",
+          "chainlink issue update 1",
+          "chainlink issue block 2 1",
+          "chainlink issue relate 2 1",
+          "chainlink issue comment 1 note",
+          "chainlink subissue create 1 child",
+          "chainlink subissue close 2",
+          "chainlink session work 310",
+          "chainlink session end",
+          "chainlink timer start 1",
+          "chainlink timer stop 1",
+          "chainlink milestone create M1",
+          "chainlink close 1",
+          "chainlink quick title"
+        ]
+  forM_ deniedCommands $ \command -> do
+    output <- runPreToolUseInput TLRole.config (bashHookInput command)
+    assertBool ("tl denies " <> T.unpack command) (not (continue_ output))
+    assertEqual ("chainlink deny decision " <> T.unpack command) (Just "deny") (permissionDecisionOf output)
+    assertBool ("chainlink deny message " <> T.unpack command) (messageContains "chainlink CLI mutating verbs" output)
+
+  let allowedCommands =
+        [ "chainlink issue show 1",
+          "chainlink issue list",
+          "chainlink issue search lifecycle",
+          "chainlink session status",
+          "chainlink timer show 1",
+          "chainlink timer list"
+        ]
+  forM_ allowedCommands $ \command -> do
+    output <- runPreToolUseInput WorkerRole.config (bashHookInput command)
+    assertBool ("worker allows " <> T.unpack command) (continue_ output)
+    assertEqual ("chainlink allow decision " <> T.unpack command) (Just "allow") (permissionDecisionOf output)
 
 assertReviewerGitAuthorMutationPolicy :: IO ()
 assertReviewerGitAuthorMutationPolicy = do

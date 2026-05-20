@@ -3,6 +3,7 @@
 -- | Shared hook policy guards for agent shell commands.
 module HookPolicy
   ( blockGhCommand,
+    blockChainlinkCLICommand,
     blockChainlinkSqliteCommand,
     blockGitAuthorMutation,
     blockImplementationMutation,
@@ -31,6 +32,17 @@ blockGhCommand hookInput =
         Just $
           "BLOCKED: Do not run gh commands from agents. "
             <> "Use ExoMonad MCP tools such as file_pr, merge_pr, and local review flow instead."
+      else Nothing
+
+blockChainlinkCLICommand :: HookInput -> Maybe Text
+blockChainlinkCLICommand hookInput =
+  commandFromHookInput hookInput >>= \cmd ->
+    if hasMutatingChainlinkCommand cmd
+      then
+        Just $
+          "BLOCKED: chainlink CLI mutating verbs are not allowed from agents -- "
+            <> "they bypass the IssueClosed event, dirty-tree precondition, and provenance trace. "
+            <> "Use the chainlink_* MCP tool equivalents instead. Read-only CLI (show/list/search/status) remains available for inspection."
       else Nothing
 
 blockChainlinkSqliteCommand :: HookInput -> Maybe Text
@@ -94,9 +106,12 @@ preToolUseWithGhBlock next hookInput =
   case blockGhCommand hookInput of
     Just reason -> pure (denyResponse reason)
     Nothing ->
-      case blockChainlinkSqliteCommand hookInput of
+      case blockChainlinkCLICommand hookInput of
         Just reason -> pure (denyResponse reason)
-        Nothing -> next hookInput
+        Nothing ->
+          case blockChainlinkSqliteCommand hookInput of
+            Just reason -> pure (denyResponse reason)
+            Nothing -> next hookInput
 
 preToolUseWithGitAuthorBlock ::
   (HookInput -> Eff Effects HookOutput) ->
@@ -160,6 +175,64 @@ pythonOpenWriteMode normalized =
 containsGhToken :: Text -> Bool
 containsGhToken cmd =
   "gh" `elem` T.words (T.map shellTokenSeparator (T.toCaseFold cmd))
+
+hasMutatingChainlinkCommand :: Text -> Bool
+hasMutatingChainlinkCommand cmd =
+  any deniesChainlinkInvocation (chainlinkInvocationTokens cmd)
+
+chainlinkInvocationTokens :: Text -> [[Text]]
+chainlinkInvocationTokens cmd =
+  [suffix | suffix@(token : _) <- tails (normalizedShellTokens cmd), token == "chainlink"]
+
+deniesChainlinkInvocation :: [Text] -> Bool
+deniesChainlinkInvocation (_chainlink : args) =
+  case firstNonFlag args of
+    Just "issue" -> deniedChainlinkIssueVerb (dropChainlinkNamespace args)
+    Just "subissue" -> deniedChainlinkSubissueVerb (dropChainlinkNamespace args)
+    Just "session" -> deniedChainlinkSessionVerb (dropChainlinkNamespace args)
+    Just "timer" -> deniedChainlinkTimerVerb (dropChainlinkNamespace args)
+    Just "milestone" -> deniedChainlinkMilestoneVerb (dropChainlinkNamespace args)
+    Just verb -> verb `elem` topLevelMutatingChainlinkVerbs
+    Nothing -> False
+deniesChainlinkInvocation _ = False
+
+dropChainlinkNamespace :: [Text] -> [Text]
+dropChainlinkNamespace [] = []
+dropChainlinkNamespace (_namespace : rest) = rest
+
+deniedChainlinkIssueVerb :: [Text] -> Bool
+deniedChainlinkIssueVerb args =
+  case firstNonFlag args of
+    Just verb -> verb `elem` ["close", "create", "update", "block", "relate", "comment"]
+    Nothing -> False
+
+deniedChainlinkSubissueVerb :: [Text] -> Bool
+deniedChainlinkSubissueVerb args =
+  case firstNonFlag args of
+    Just verb -> verb `elem` ["close", "create"]
+    Nothing -> False
+
+deniedChainlinkSessionVerb :: [Text] -> Bool
+deniedChainlinkSessionVerb args =
+  case firstNonFlag args of
+    Just verb -> verb `elem` ["work", "end"]
+    Nothing -> False
+
+deniedChainlinkTimerVerb :: [Text] -> Bool
+deniedChainlinkTimerVerb args =
+  case firstNonFlag args of
+    Just verb -> verb `elem` ["start", "stop"]
+    Nothing -> False
+
+deniedChainlinkMilestoneVerb :: [Text] -> Bool
+deniedChainlinkMilestoneVerb args =
+  case firstNonFlag args of
+    Just "create" -> True
+    _ -> False
+
+topLevelMutatingChainlinkVerbs :: [Text]
+topLevelMutatingChainlinkVerbs =
+  ["close", "create", "quick", "update", "block", "relate", "comment", "subissue"]
 
 accessesChainlinkSqlite :: Text -> Bool
 accessesChainlinkSqlite cmd =
