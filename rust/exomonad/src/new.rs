@@ -179,9 +179,11 @@ struct TangledNewIntegration {
 #[serde(rename_all = "camelCase")]
 struct RepoCreateRequest {
     rkey: String,
-    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     default_branch: String,
-    repo_did: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,12 +279,12 @@ async fn discover_tangled_integration(project_dir: &Path) -> Option<TangledNewIn
 
     let repo_name = crate::init::tangled_repo_name(project_dir);
     let repo_did = crate::init::tangled_dev_repo_did(&knot_hostname, &repo_name);
-    if let Err(error) = register_tangled_repo(&client, &knot_url, &repo_name, &repo_did).await {
+    if let Err(error) = register_tangled_repo(&client, &knot_url, &repo_name).await {
         warn!(
             repo_name,
             repo_did,
             error = %error,
-            "Tangled repo.create probe failed; exomonad init will still use local container registration"
+            "Tangled repo.create failed; exomonad init will still use local container registration"
         );
     }
 
@@ -315,31 +317,45 @@ async fn register_tangled_repo(
     client: &reqwest::Client,
     knot_url: &str,
     repo_name: &str,
-    repo_did: &str,
 ) -> Result<Option<String>> {
-    let response = client
+    let mut request = client
         .post(xrpc_url(knot_url, "sh.tangled.repo.create"))
-        .json(&repo_create_request(repo_name, repo_did))
-        .send()
-        .await
-        .context("repo.create request failed")?;
+        .json(&repo_create_request(repo_name));
+    if let Some(token) = tangled_service_auth_token() {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request.send().await.context("repo.create request failed")?;
     if !response.status().is_success() {
         return Err(anyhow!("repo.create returned {}", response.status()));
     }
 
-    response
-        .json::<RepoCreateResponse>()
+    let body = response
+        .bytes()
         .await
+        .context("failed to read repo.create response")?;
+    if body.is_empty() {
+        return Ok(None);
+    }
+
+    serde_json::from_slice::<RepoCreateResponse>(&body)
         .map(|body| body.repo_did)
         .context("failed to decode repo.create response")
 }
 
-fn repo_create_request(repo_name: &str, repo_did: &str) -> RepoCreateRequest {
+fn tangled_service_auth_token() -> Option<String> {
+    std::env::var("EXOMONAD_TANGLED_SERVICE_AUTH")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn repo_create_request(repo_name: &str) -> RepoCreateRequest {
     RepoCreateRequest {
         rkey: repo_name.to_string(),
-        name: repo_name.to_string(),
+        name: Some(repo_name.to_string()),
         default_branch: "main".to_string(),
-        repo_did: repo_did.to_string(),
+        source: None,
     }
 }
 
@@ -574,13 +590,21 @@ mod tests {
 
     #[test]
     fn repo_create_request_matches_current_tangled_lexicon() {
-        let request = repo_create_request("example", "did:web:localhost%3A5555:repo:example");
+        let request = repo_create_request("example");
         let json = serde_json::to_value(request).unwrap();
 
         assert_eq!(json["rkey"], "example");
         assert_eq!(json["name"], "example");
         assert_eq!(json["defaultBranch"], "main");
-        assert_eq!(json["repoDid"], "did:web:localhost%3A5555:repo:example");
+        assert!(json.get("repoDid").is_none());
+        assert!(json.get("source").is_none());
+    }
+
+    #[test]
+    fn service_auth_env_ignores_empty_tokens() {
+        std::env::set_var("EXOMONAD_TANGLED_SERVICE_AUTH", "  ");
+        assert!(tangled_service_auth_token().is_none());
+        std::env::remove_var("EXOMONAD_TANGLED_SERVICE_AUTH");
     }
 
     #[test]

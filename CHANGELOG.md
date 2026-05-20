@@ -129,6 +129,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Document knot HTTP API for repo registration and service auth (#339)
 - leaf-lifecycle: merge gate rounds counter never increments on verdict write (option B: rounds = unique reviewed SHAs) (#326)
 - runtime-hook-parity: extend agent inbox with structural deduplication for convergent delivery paths (#328)
 - leaf-lifecycle: PRReview handler must branch by role — TL gets InjectMessage (backstop), leaf drops auto NotifyParent (#327)

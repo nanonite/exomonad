@@ -409,13 +409,18 @@ steps:
 - seeds Spindle's `repos` table
 - points the local `tangled` remote at `git@local-tangled:repositories/<repoDid>`
 
-The public XRPC path remains the production shape:
+The public XRPC path is the production repo-initialization shape:
 
 ```text
-POST /xrpc/sh.tangled.repo.create  { "name": "ci-test" }
+POST /xrpc/sh.tangled.repo.create
+Authorization: Bearer <service-auth>
+
+{ "rkey": "<sh.tangled.repo record rkey>", "name": "ci-test", "defaultBranch": "main" }
 ```
 
-That endpoint requires service auth. The local init path intentionally stays shellable for the dev knot container while preserving the repo-DID/hook semantics that Knot's pipeline trigger needs.
+The repo-create handler is a ServiceAuth-protected mutating endpoint. The production flow is two-step: first create a `sh.tangled.repo` record on the owner PDS and keep the returned record rkey, then obtain `com.atproto.server.getServiceAuth` with audience `did:web:<knot-host>` and call `sh.tangled.repo.create` on the knot/appview API base with that rkey. `exomonad new` will attach `EXOMONAD_TANGLED_SERVICE_AUTH` as the bearer token when present; otherwise the request fails closed and `exomonad init` still uses the shellable local container fallback below.
+
+That fallback intentionally preserves the repo-DID/hook semantics that Knot's pipeline trigger needs while avoiding hardcoded PDS credentials in local dev.
 
 ### WAL isolation
 
