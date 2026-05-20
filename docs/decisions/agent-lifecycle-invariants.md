@@ -4,7 +4,7 @@
 
 **Date:** 2026-05-19
 
-**Chainlink:** #302, #303, #304, #305
+**Chainlink:** #302, #303, #304, #305, #310, #311, #312, #313
 
 ## Context
 
@@ -76,7 +76,7 @@ When a dev-leaf ends its session (blocker, handoff), the issue remains open and 
 - **Parallel workers in one TL worktree.** Workers stay sequential and one-off. Parallelization is dev-leaf turf (own worktree per leaf, own branch, own PR). If multi-worker workflows become common, the stash-and-cherrypick dance is a future bridge.
 - **Per-issue file provenance.** Tracking which files belong to which session over a session's lifespan adds complexity without a corresponding correctness gain.
 - **Forcing the TL to commit before close.** The TL never has the "did the worker mean to commit this?" knowledge problem once invariant 2 holds — by the time the TL goes to close, the worker has already self-committed or self-discarded.
-- **Bash-CLI close paths.** Closing issues from raw bash bypasses the WASM dispatch and the precondition. Leaves are never created from bash-CLI workflows, so this is acceptable: bash closes are operator escape hatches and the operator carries the responsibility.
+Bash-CLI close paths were initially carved out as operator escape hatches. Observed orphan storm 2026-05-19 (nemotron-port: TL closed issues via bash `chainlink issue close` to work around a separate bug, producing orphan leaves and reviewers because the `IssueClosed` event never fired) showed AI operators reach for whatever runs. The carve-out is closed by **#310** (block bash chainlink mutating verbs) and **#313** (background orphan reconciler). The runtime now refuses bash mutating close paths from agents and reconciles any close paths that still slip through.
 
 ## Related
 
@@ -95,3 +95,6 @@ When a dev-leaf ends its session (blocker, handoff), the issue remains open and 
 | #303 | medium (blocked by #302) | `dispose_leaf` MCP tool with `force` flag |
 | #304 | high | Worker stop hook clean-tree check, `GIT_AUTHOR_*` env injection, `chainlink_issue_close` precondition, `discard_worker_output` escape hatch |
 | #305 | low (deferred) | Composite E2E test exercising all three invariants — placeholder until E2E investment makes sense |
+| #310 | high | Hook-level block for bash `chainlink` mutating verbs so agents use MCP close paths |
+| #311 | high | Reviewer ephemerality: reviewer verdicts become terminal and reviewer worktrees are disposed after verdict or merge |
+| #313 | medium | Background orphan reconciler for missed issue-close and reviewer-close paths |
