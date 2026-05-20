@@ -196,8 +196,11 @@ runPreToolUseInput cfg input = do
     C.Continue {} -> fail "PreToolUse hook unexpectedly suspended"
 
 runPostToolUse :: RoleConfig tools -> IO HookOutput
-runPostToolUse cfg = do
-  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (postToolUse (hooks cfg) (hookInputFor PostToolUse "Bash"))
+runPostToolUse cfg = runPostToolUseFor cfg "Bash"
+
+runPostToolUseFor :: RoleConfig tools -> Text -> IO HookOutput
+runPostToolUseFor cfg toolName = do
+  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (postToolUse (hooks cfg) (hookInputFor PostToolUse toolName))
   case status of
     C.Done output -> pure output
     C.Continue {} -> fail "PostToolUse hook unexpectedly suspended"
@@ -246,8 +249,16 @@ assertReviewerPostToolUseEventName :: IO ()
 assertReviewerPostToolUseEventName = do
   output <- runPostToolUse ReviewerRole.config
   case hookSpecificOutput output of
-    Just PostToolUseOutput {} -> pure ()
-    other -> fail $ "reviewer PostToolUse should emit PostToolUseOutput, got " <> show other
+    Just (PostToolUseOutput Nothing) -> pure ()
+    other -> fail $ "reviewer Bash PostToolUse should emit empty PostToolUseOutput, got " <> show other
+
+  forM_ ["approve_pr", "request_changes"] $ \toolName -> do
+    verdictOutput <- runPostToolUseFor ReviewerRole.config toolName
+    case hookSpecificOutput verdictOutput of
+      Just (PostToolUseOutput (Just ctx)) -> do
+        assertBool (T.unpack toolName <> " nudge says exit") (T.isInfixOf "Exit now" ctx)
+        assertBool (T.unpack toolName <> " nudge forbids code edits") (T.isInfixOf "do not continue reviewing or edit code" ctx)
+      other -> fail $ "reviewer " <> T.unpack toolName <> " PostToolUse should nudge exit, got " <> show other
 
 assertReviewerToolList :: IO ()
 assertReviewerToolList =

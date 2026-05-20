@@ -35,7 +35,7 @@ import ExoMonad.Guest.Events
 import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
-import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, postToolUseResponse)
+import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, HookInput (..), HookOutput, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, postToolUseResponse)
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
 import HookPolicy (preToolUseWithGitAuthorAndImplementationBlock)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
@@ -45,6 +45,17 @@ reviewerRedispatchMessage toolName =
   "Reviewers do not edit code. The "
     <> toolName
     <> " tool is unavailable in reviewer sessions. Use `request_changes` or `post_review_comment` to relay the fix to the worker that owns the worktree. The worker's git identity is the canonical author of every commit on its branch."
+
+reviewerVerdictExitNudge :: Text
+reviewerVerdictExitNudge =
+  "Verdict written. Exit now; do not continue reviewing or edit code. The watcher will route the result."
+
+reviewerPostToolUse :: HookInput -> Eff Effects HookOutput
+reviewerPostToolUse input =
+  case hiToolName input of
+    Just "approve_pr" -> pure $ postToolUseResponse (Just reviewerVerdictExitNudge)
+    Just "request_changes" -> pure $ postToolUseResponse (Just reviewerVerdictExitNudge)
+    _ -> pure $ postToolUseResponse Nothing
 
 data ApprovePRArgs = ApprovePRArgs
   { apPrNumber :: Int,
@@ -387,7 +398,7 @@ config =
       hooks =
         HookConfig
           { preToolUse = preToolUseWithGitAuthorAndImplementationBlock reviewerRedispatchMessage (\_ -> pure (allowResponse Nothing)),
-            postToolUse = \_ -> pure (postToolUseResponse Nothing),
+            postToolUse = reviewerPostToolUse,
             onStop = \_ -> reviewerStopCheck,
             onSubagentStop = \_ -> reviewerStopCheck,
             onSessionStart = defaultSessionStartHook,
