@@ -74,7 +74,7 @@ import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodex
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse)
 import ExoMonad.Types (Effects, HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
 import HookPolicy (preToolUseWithImplementationBlock)
-import PRReviewHandler (prReviewEventHandlers)
+import PRReviewHandler (tlPRReviewEventHandlers)
 import TLPhase (ChildHandle (..), TLEvent (..), TLPhase (..))
 import TLStopCheck (tlStopCheck)
 
@@ -309,5 +309,5 @@ config =
             beforeModel = \_ -> pure (BeforeModelAllow Nothing),
             afterModel = \_ -> pure (AfterModelAllow Nothing)
           },
-      eventHandlers = prReviewEventHandlers
+      eventHandlers = tlPRReviewEventHandlers
     }

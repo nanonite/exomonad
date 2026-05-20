@@ -42,7 +42,7 @@ import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodex
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
 import ExoMonad.Types (Effects, HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
 import HookPolicy (preToolUseWithImplementationBlock)
-import PRReviewHandler (prReviewEventHandlers)
+import PRReviewHandler (tlPRReviewEventHandlers)
 import TLPhase (ChildHandle (..), TLEvent (..), TLPhase (..))
 
 rootRedispatchMessage :: Text -> Text
@@ -180,5 +180,5 @@ config =
             beforeModel = \_ -> pure (BeforeModelAllow Nothing),
             afterModel = \_ -> pure (AfterModelAllow Nothing)
           },
-      eventHandlers = prReviewEventHandlers
+      eventHandlers = tlPRReviewEventHandlers
     }

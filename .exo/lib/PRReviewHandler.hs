@@ -2,6 +2,7 @@
 
 module PRReviewHandler
   ( prReviewEventHandlers,
+    tlPRReviewEventHandlers,
     siblingMergedHandler,
   )
 where
@@ -23,7 +24,9 @@ import ExoMonad.Guest.Tools.Chainlink (chainlinkSessionStatusCore)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
 import ExoMonad.Guest.Types (Effects)
 
--- | Event handler config with PR review handling.
+-- | Dev-leaf PR review handling updates DevPhase and injects actionable review
+-- messages into the leaf pane. TL/root handling injects the same structured
+-- signals into its own pane without cascading NotifyParentAction upward.
 prReviewEventHandlers :: EventHandlerConfig
 prReviewEventHandlers =
   defaultEventHandlers
@@ -33,7 +36,14 @@ prReviewEventHandlers =
       onIssueClosed = issueClosedHandler
     }
 
--- | Handle PR review events for dev/tl roles.
+tlPRReviewEventHandlers :: EventHandlerConfig
+tlPRReviewEventHandlers =
+  defaultEventHandlers
+    { onPRReview = tlPrReviewHandler,
+      onCIStatus = tlCiStatusHandler,
+      onSiblingMerged = siblingMergedHandler
+    }
+
 prReviewHandler :: PRReviewEvent -> Eff Effects EventAction
 prReviewHandler (ReviewReceived n comments_) = do
   logHandler $ "Review received on PR #" <> T.pack (show n)
@@ -88,7 +98,7 @@ prReviewHandler (MergeReady n ci branch_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (MergeReadyEv n ci branch_)
-  pure (NotifyParentAction (Tpl.mergeReady n ci branch_) n)
+  pure (InjectMessage (Tpl.mergeReady n ci branch_))
 prReviewHandler (DevNotPushing n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " dev leaf stopped pushing fixes"
   pure NoAction
@@ -102,6 +112,50 @@ prReviewHandler (ReviewDevFailed n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " dev leaf reported failure"
   pure NoAction
 
+
+tlPrReviewHandler :: PRReviewEvent -> Eff Effects EventAction
+tlPrReviewHandler (ReviewReceived n comments_) = do
+  logHandler $ "TL observed review comments on PR #" <> T.pack (show n)
+  pure (InjectMessage (Tpl.reviewReceived n comments_))
+tlPrReviewHandler (ReviewApproved n) = do
+  logHandler $ "TL observed PR #" <> T.pack (show n) <> " approved"
+  pure (InjectMessage (Tpl.prReady n))
+tlPrReviewHandler (ReviewerApproved n) = do
+  logHandler $ "TL observed reviewer approval on PR #" <> T.pack (show n)
+  pure (InjectMessage (Tpl.prReady n))
+tlPrReviewHandler (ReviewTimeout n mins) = do
+  logHandler $ "TL observed PR #" <> T.pack (show n) <> " review timeout"
+  pure (InjectMessage (Tpl.reviewTimeout n mins))
+tlPrReviewHandler (FixesPushed n ci _headSha) = do
+  logHandler $ "TL observed fixes pushed on PR #" <> T.pack (show n)
+  pure (InjectMessage (Tpl.fixesPushed n ci))
+tlPrReviewHandler (CommitsPushed n ci) = do
+  logHandler $ "TL observed commits pushed on PR #" <> T.pack (show n)
+  pure (InjectMessage (Tpl.commitsPushed n ci))
+tlPrReviewHandler (ReviewerRequestedChanges n comments_) = do
+  logHandler $ "TL observed reviewer requested changes on PR #" <> T.pack (show n)
+  pure (InjectMessage (Tpl.reviewReceived n comments_))
+tlPrReviewHandler (RateLimited remaining secs) = do
+  logHandler $ "TL observed review rate limit"
+  pure (InjectMessage $ "[RATE LIMITED] Review polling has " <> T.pack (show remaining) <> " retries remaining; reset in " <> T.pack (show secs) <> " seconds.")
+tlPrReviewHandler (Stuck n rounds_) = do
+  logHandler $ "TL observed PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
+  pure (InjectMessage (Tpl.stuck n rounds_))
+tlPrReviewHandler (MergeReady n ci branch_) = do
+  logHandler $ "TL observed PR #" <> T.pack (show n) <> " merge ready"
+  pure (InjectMessage (Tpl.mergeReady n ci branch_))
+tlPrReviewHandler (DevNotPushing n) = do
+  logHandler $ "TL observed PR #" <> T.pack (show n) <> " dev leaf stopped pushing fixes"
+  pure (InjectMessage $ "[DEV NOT PUSHING] PR #" <> T.pack (show n) <> " needs TL attention.")
+tlPrReviewHandler (ReviewerNotResponding n) = do
+  logHandler $ "TL observed PR #" <> T.pack (show n) <> " reviewer stopped responding"
+  pure (InjectMessage $ "[REVIEWER NOT RESPONDING] PR #" <> T.pack (show n) <> " needs TL attention.")
+tlPrReviewHandler (ReviewerNeverStarted n) = do
+  logHandler $ "TL observed PR #" <> T.pack (show n) <> " reviewer never started"
+  pure (InjectMessage $ "[REVIEWER NEVER STARTED] PR #" <> T.pack (show n) <> " needs TL attention.")
+tlPrReviewHandler (ReviewDevFailed n) = do
+  logHandler $ "TL observed PR #" <> T.pack (show n) <> " dev leaf failure"
+  pure (InjectMessage $ "[DEV FAILED] PR #" <> T.pack (show n) <> " needs TL attention.")
 
 -- | Handle Chainlink issue closure events for dev leaves.
 issueClosedHandler :: IssueClosedEvent -> Eff Effects EventAction
@@ -146,7 +200,14 @@ ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerAppro
     then do
       branch <- getCurrentBranch
       void $ applyEvent @DevPhase @DevEvent branch DevSpawned (MergeReadyEv n status_ branch_)
-      pure (NotifyParentAction (Tpl.mergeReady n status_ branch_) n)
+      pure (InjectMessage (Tpl.mergeReady n status_ branch_))
+    else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
+
+tlCiStatusHandler :: CIStatusEvent -> Eff Effects EventAction
+tlCiStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerApproved mergeReady_) = do
+  logHandler $ "TL observed CI status changed on PR #" <> T.pack (show n) <> ": " <> status_
+  if (mergeBlockedOnCI || mergeReady_) && status_ `elem` ["success", "neutral"]
+    then pure (InjectMessage (Tpl.mergeReady n status_ branch_))
     else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
 
 reviewRequestAction :: Int -> Text -> Maybe DevPhase -> EventAction
