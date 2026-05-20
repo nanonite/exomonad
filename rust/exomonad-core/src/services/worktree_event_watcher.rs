@@ -293,6 +293,8 @@ struct ReviewVerdictEntry {
     comments: Vec<ReviewCommentEntry>,
     #[serde(default)]
     author_branch: Option<String>,
+    #[serde(default)]
+    head_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -581,7 +583,7 @@ where
             let review_file = Self::read_review_file(&project_dir, *number).await;
             let review_file_seen = review_file.is_some();
             let (review_state, comments, reviews) = match review_file {
-                Some(rf) => review_file_parts(rf),
+                Some(rf) => review_file_parts(rf, Some(&head_sha)),
                 None => {
                     let state = pr.review_state.clone();
                     (state, vec![], vec![])
@@ -634,7 +636,8 @@ where
                 let branch = BranchName::try_from_str(pr.head_branch.as_str())
                     .expect("validated string input is non-empty");
                 let (local_reviews, _local_review_state) = obs_to_review_parts(obs);
-                if pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str()) {
+                let head_sha_changed = pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str());
+                if head_sha_changed {
                     head_sha_updates.push((*pr_number, obs.head_sha.clone()));
                 }
                 if pr.review_state != obs.review_state {
@@ -646,6 +649,29 @@ where
                 }
 
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
+                    if head_sha_changed {
+                        old_state.reviewer_spawned = false;
+                        if let Some(spawner) = &self.reviewer_spawner {
+                            let spawner = spawner.clone();
+                            let pr_clone = pr.clone();
+                            let pr_num = *pr_number;
+                            let sha = obs.head_sha.clone();
+                            tokio::spawn(async move {
+                                info!(pr_number = pr_num, head_sha = %sha, "Spawning reviewer agent for new PR head SHA");
+                                match spawner.spawn_reviewer_for_pr(&pr_clone).await {
+                                    Ok(_) => info!(
+                                        pr_number = pr_num,
+                                        head_sha = %sha,
+                                        "Reviewer agent spawned successfully for new PR head SHA"
+                                    ),
+                                    Err(e) => {
+                                        warn!(pr_number = pr_num, head_sha = %sha, error = %e, "Failed to spawn reviewer for new PR head SHA")
+                                    }
+                                }
+                            });
+                            old_state.reviewer_spawned = true;
+                        }
+                    }
                     compute_pr_actions_with_context(
                         old_state,
                         PRNumber::new(*pr_number),
@@ -1594,26 +1620,24 @@ fn compute_pr_actions_with_context(
     if ci_changed {
         old_state.ci_mergeable_at = if ci_now_mergeable { Some(now) } else { None };
     }
-    let merge_ready_now = !old_state.merge_ready_notified
+    let mut merge_ready_now = !old_state.merge_ready_notified
         && signals_within_merge_ready_window(
             old_state.review_approved_at,
             old_state.ci_mergeable_at,
         );
     let recover_after_ci_block = merge_blocked_on_ci && ci_changed && ci_now_mergeable;
 
-    if (old_state.notified_parent_approved || old_state.notified_parent_timeout || old_state.stuck)
-        && !recover_after_ci_block
-        && !merge_ready_now
-    {
-        return pending_actions;
-    }
-
     if pr_sha != old_state.last_sha {
+        let was_changes_requested = old_state.last_review_state == ReviewState::ChangesRequested;
         old_state.last_sha = pr_sha.to_string();
-        if old_state.last_review_state == ReviewState::ChangesRequested {
-            old_state.last_review_state = ReviewState::None;
-            old_state.notified_parent_timeout = false;
-            old_state.first_seen = Instant::now();
+        old_state.last_review_state = ReviewState::None;
+        old_state.notified_parent_approved = false;
+        old_state.notified_parent_timeout = false;
+        old_state.review_approved_at = None;
+        old_state.merge_ready_notified = false;
+        old_state.first_seen = Instant::now();
+        merge_ready_now = false;
+        if was_changes_requested {
             old_state.addressed_changes = true;
 
             pending_actions.push(PendingAction::WasmEvent {
@@ -1635,6 +1659,13 @@ fn compute_pr_actions_with_context(
                 }),
             });
         }
+    }
+
+    if (old_state.notified_parent_approved || old_state.notified_parent_timeout || old_state.stuck)
+        && !recover_after_ci_block
+        && !merge_ready_now
+    {
+        return pending_actions;
     }
 
     if comment_count != old_state.pr_review_cycle_count {
@@ -1803,40 +1834,64 @@ fn compute_pr_actions_with_context(
 
 fn review_file_parts(
     rf: ReviewFile,
+    current_head_sha: Option<&str>,
 ) -> (LocalReviewState, Vec<LocalReviewComment>, Vec<LocalReview>) {
-    let state = local_review_state_from_str(&rf.state);
     let comments: Vec<LocalReviewComment> = rf
         .comments
         .into_iter()
         .map(review_comment_entry_to_local)
         .collect();
-    let reviews = if rf.verdicts.is_empty() {
-        legacy_reviews_from_state(&state, &comments)
+    if rf.verdicts.is_empty() {
+        let state = local_review_state_from_str(&rf.state);
+        let reviews = legacy_reviews_from_state(&state, &comments);
+        return (state, comments, reviews);
+    }
+
+    let has_sha_scoped_verdict = rf.verdicts.iter().any(|verdict| verdict.head_sha.is_some());
+    let verdicts: Vec<ReviewVerdictEntry> = if has_sha_scoped_verdict {
+        current_head_sha
+            .map(|sha| {
+                rf.verdicts
+                    .into_iter()
+                    .filter(|verdict| verdict.head_sha.as_deref() == Some(sha))
+                    .collect()
+            })
+            .unwrap_or_default()
     } else {
         rf.verdicts
-            .into_iter()
-            .map(|verdict| {
-                let body = if verdict.body.is_empty() {
-                    format_review_message(
-                        &verdict
-                            .comments
-                            .iter()
-                            .cloned()
-                            .map(review_comment_entry_to_local)
-                            .collect::<Vec<_>>(),
-                        &[],
-                    )
-                } else {
-                    verdict.body
-                };
-                LocalReview {
-                    body,
-                    state: review_state_from_str(&verdict.state),
-                    author_branch: verdict.author_branch,
-                }
-            })
-            .collect()
     };
+
+    if verdicts.is_empty() {
+        return (LocalReviewState::PendingReview, vec![], vec![]);
+    }
+
+    let state = verdicts
+        .last()
+        .map(|verdict| local_review_state_from_str(&verdict.state))
+        .unwrap_or(LocalReviewState::PendingReview);
+    let reviews = verdicts
+        .into_iter()
+        .map(|verdict| {
+            let body = if verdict.body.is_empty() {
+                format_review_message(
+                    &verdict
+                        .comments
+                        .iter()
+                        .cloned()
+                        .map(review_comment_entry_to_local)
+                        .collect::<Vec<_>>(),
+                    &[],
+                )
+            } else {
+                verdict.body
+            };
+            LocalReview {
+                body,
+                state: review_state_from_str(&verdict.state),
+                author_branch: verdict.author_branch,
+            }
+        })
+        .collect();
 
     (state, comments, reviews)
 }
@@ -2524,6 +2579,38 @@ mod tests {
             .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "commits_pushed")));
         assert_eq!(state.last_sha, "def456");
+    }
+
+    #[test]
+    fn test_new_sha_after_approval_reopens_review_round() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.last_review_state = ReviewState::Approved;
+        state.notified_parent_approved = true;
+        state.review_approved_at = Some(Instant::now());
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "def456",
+            &[],
+            &[],
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "commits_pushed"
+        )));
+        assert_eq!(state.last_sha, "def456");
+        assert_eq!(state.last_review_state, ReviewState::None);
+        assert!(!state.notified_parent_approved);
+        assert_eq!(state.review_approved_at, None);
     }
 
     #[test]
@@ -3374,7 +3461,7 @@ mod tests {
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
-            "def456",
+            "abc123",
             &[test_comment("late")],
             &[test_review("late review", ReviewState::Approved)],
             CIStatus::Success,
@@ -3398,7 +3485,7 @@ mod tests {
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
-            "def456",
+            "abc123",
             &[],
             &reviews,
             CIStatus::Unknown,
@@ -3743,7 +3830,7 @@ mod tests {
             ]
         }"#;
         let rf: ReviewFile = serde_json::from_str(json).unwrap();
-        let (state, comments, reviews) = review_file_parts(rf);
+        let (state, comments, reviews) = review_file_parts(rf, Some("abc123"));
 
         assert_eq!(state, LocalReviewState::Approved);
         assert!(comments.is_empty());
@@ -3757,6 +3844,42 @@ mod tests {
         assert!(reviews
             .iter()
             .any(|review| review.state == ReviewState::Approved && review.body == "LGTM"));
+    }
+
+    #[test]
+    fn test_review_file_filters_sha_scoped_verdicts_to_current_head() {
+        let json = r#"{
+            "state": "approved",
+            "comments": [],
+            "verdicts": [
+                {"state": "approved", "body": "old", "comments": [], "head_sha": "abc123"},
+                {"state": "changes_requested", "body": "current", "comments": [], "head_sha": "def456"}
+            ]
+        }"#;
+        let rf: ReviewFile = serde_json::from_str(json).unwrap();
+        let (state, comments, reviews) = review_file_parts(rf, Some("def456"));
+
+        assert_eq!(state, LocalReviewState::ChangesRequested);
+        assert!(comments.is_empty());
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].body, "current");
+    }
+
+    #[test]
+    fn test_review_file_without_current_sha_is_pending_review() {
+        let json = r#"{
+            "state": "approved",
+            "comments": [],
+            "verdicts": [
+                {"state": "approved", "body": "old", "comments": [], "head_sha": "abc123"}
+            ]
+        }"#;
+        let rf: ReviewFile = serde_json::from_str(json).unwrap();
+        let (state, comments, reviews) = review_file_parts(rf, Some("def456"));
+
+        assert_eq!(state, LocalReviewState::PendingReview);
+        assert!(comments.is_empty());
+        assert!(reviews.is_empty());
     }
 
     #[test]
@@ -3784,7 +3907,7 @@ mod tests {
         ] {
             let json = format!(r#"{{"state": "{state}", "comments": []}}"#);
             let rf: ReviewFile = serde_json::from_str(&json).unwrap();
-            let (review_state, comments, reviews) = review_file_parts(rf);
+            let (review_state, comments, reviews) = review_file_parts(rf, Some("abc123"));
             let obs = Observation {
                 head_sha: "abc123".to_string(),
                 review_state,
@@ -4105,6 +4228,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reviewer_spawner_called_for_new_head_sha() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSpawner {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for CountingSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                _pr: &crate::services::file_pr_local::PrEntry,
+            ) -> anyhow::Result<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let spawner = Arc::new(CountingSpawner {
+            count: call_count.clone(),
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
+        let branch = BranchName::try_from_str("main.feature-codex")
+            .expect("literal validated string is non-empty");
+        watcher.state.lock().await.insert(
+            1,
+            WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0),
+        );
+
+        let mut pr = test_pr_entry();
+        pr.last_head_sha = Some("abc123".to_string());
+        let registry = test_registry(pr);
+        let mut observations = HashMap::new();
+        observations.insert(1u64, test_observation("def456"));
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn test_reviewer_spawner_not_called_twice() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4147,6 +4320,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Second call — PR is already in state, no second spawn
+        let mut pr = test_pr_entry();
+        pr.last_head_sha = Some("abc123".to_string());
+        let registry = test_registry(pr);
         watcher
             .process_observations(&registry, &observations)
             .await

@@ -303,6 +303,15 @@ check-e2e-reviewer-convergence:
     bash -n tests/e2e/reviewer-convergence-loop/run.sh
     bash -n tests/e2e/reviewer-convergence-loop/validate.sh
 
+# Run E2E reviewer ephemerality regression test.
+e2e-reviewer-ephemerality:
+    ./tests/e2e/reviewer-ephemerality/run.sh
+
+# Check E2E reviewer ephemerality harness scripts without launching agents.
+check-e2e-reviewer-ephemerality:
+    bash -n tests/e2e/reviewer-ephemerality/run.sh
+    bash -n tests/e2e/reviewer-ephemerality/validate.sh
+
 # Run E2E Chainlink sqlite direct DB access block test
 e2e-chainlink-sqlite-block:
     ./tests/e2e/chainlink-sqlite-block/run.sh
