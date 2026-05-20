@@ -1676,18 +1676,17 @@ fn compute_pr_actions_with_context(
         .iter()
         .filter(|r| r.state == ReviewState::ChangesRequested)
         .count() as u32;
+    let next_review_round = observed_request_change_rounds.max(old_state.rounds + 1);
 
     let approved = reviews
         .iter()
         .any(|r| r.state == ReviewState::Approved || r.body.to_lowercase().contains("approved"));
     if approved && old_state.last_review_state != ReviewState::Approved {
-        if observed_request_change_rounds > old_state.rounds {
-            old_state.rounds = observed_request_change_rounds;
-            pending_actions.push(PendingAction::WriteRegistryRounds {
-                pr_number: pr_number.as_u64(),
-                rounds: old_state.rounds,
-            });
-        }
+        old_state.rounds = next_review_round;
+        pending_actions.push(PendingAction::WriteRegistryRounds {
+            pr_number: pr_number.as_u64(),
+            rounds: old_state.rounds,
+        });
         old_state.last_review_state = ReviewState::Approved;
         old_state.notified_parent_approved = true;
         old_state.review_approved_at = Some(now);
@@ -1725,11 +1724,7 @@ fn compute_pr_actions_with_context(
     {
         old_state.last_review_state = ReviewState::ChangesRequested;
         old_state.first_seen = now;
-        old_state.rounds = if observed_request_change_rounds > old_state.rounds {
-            observed_request_change_rounds
-        } else {
-            old_state.rounds + 1
-        };
+        old_state.rounds = next_review_round;
 
         if old_state.rounds > max_rounds {
             old_state.stuck = true;
@@ -2611,6 +2606,83 @@ mod tests {
         assert_eq!(state.last_review_state, ReviewState::None);
         assert!(!state.notified_parent_approved);
         assert_eq!(state.review_approved_at, None);
+    }
+
+    #[test]
+    fn test_first_approval_increments_review_rounds() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.ci_mergeable_at = Some(Instant::now());
+        let reviews = vec![test_review("approved", ReviewState::Approved)];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &reviews,
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert_eq!(state.rounds, 1);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WriteRegistryRounds {
+                pr_number: 1,
+                rounds: 1
+            }
+        )));
+    }
+
+    #[test]
+    fn test_approval_after_new_sha_increments_review_rounds_once() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.rounds = 1;
+        state.last_review_state = ReviewState::Approved;
+        state.notified_parent_approved = true;
+        state.review_approved_at = Some(Instant::now());
+
+        let _ = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "def456",
+            &[],
+            &[],
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+        let reviews = vec![test_review("approved", ReviewState::Approved)];
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "def456",
+            &[],
+            &reviews,
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert_eq!(state.rounds, 2);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WriteRegistryRounds {
+                pr_number: 1,
+                rounds: 2
+            }
+        )));
     }
 
     #[test]
