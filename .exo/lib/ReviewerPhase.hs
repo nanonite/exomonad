@@ -35,10 +35,10 @@ instance StateMachine ReviewerPhase ReviewerEvent where
   machineName = "reviewer"
 
   transition _phase event = case event of
-    ReviewerApprovedEv prNum ->
-      Transitioned (ReviewerPosted prNum)
-    ReviewerRequestedChangesEv prNum _comments ->
-      Transitioned (ReviewerPosted prNum)
+    ReviewerApprovedEv _prNum ->
+      Transitioned ReviewerDone
+    ReviewerRequestedChangesEv _prNum _comments ->
+      Transitioned ReviewerDone
     ReviewerFixesPushedEv prNum _ci ->
       Transitioned (ReviewerReviewing prNum)
     ReviewerCommitsPushedEv prNum _ci ->

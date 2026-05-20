@@ -18,7 +18,7 @@ import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), Tra
 import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (HookConfig (..), RoleConfig (..))
-import ReviewerPhase (ReviewerEvent, ReviewerPhase (..))
+import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
 import ReviewerRole qualified
 import RootRole qualified
 import TLRole qualified
@@ -43,6 +43,7 @@ main = do
   assertReviewerToolList
   assertReviewerPostToolUseEventName
   assertReviewerCanExitDecisions
+  assertReviewerVerdictsAreTerminal
   assertDevNeedsHumanDirectionAfterOneFixRound
   assertReviewApprovedAfterFixRoundTransitionsToApproved
   assertReviewApprovedFromUnderReviewRoundZero
@@ -264,6 +265,15 @@ assertReviewerCanExitDecisions = do
   assertClean "done exits cleanly" (canExit @ReviewerPhase @ReviewerEvent ReviewerDone)
   assertClean "spawned exits cleanly" (canExit @ReviewerPhase @ReviewerEvent ReviewerSpawned)
   assertClean "posted exits cleanly" (canExit @ReviewerPhase @ReviewerEvent (ReviewerPosted 7))
+
+assertReviewerVerdictsAreTerminal :: IO ()
+assertReviewerVerdictsAreTerminal = do
+  case transition ReviewerSpawned (ReviewerApprovedEv 7) of
+    Transitioned ReviewerDone -> pure ()
+    _ -> fail "expected ReviewerDone after approval verdict"
+  case transition ReviewerSpawned (ReviewerRequestedChangesEv 7 "needs fix") of
+    Transitioned ReviewerDone -> pure ()
+    _ -> fail "expected ReviewerDone after requested-changes verdict"
 
 assertDevNeedsHumanDirectionAfterOneFixRound :: IO ()
 assertDevNeedsHumanDirectionAfterOneFixRound = do

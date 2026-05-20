@@ -1,13 +1,14 @@
 use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
+use crate::services::agent_resources::dispose_reviewers_for_pr;
 use crate::services::file_pr_local::{
     read_pr_registry, write_pr_registry, LocalReviewState, PrRegistry, PrState,
 };
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     CiStatusKey, CiStatusMap, HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue,
-    HasProjectDir, HasTeamRegistry, ReviewerSpawner,
+    HasGitWorktreeService, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
 };
 use anyhow::{Context, Result};
 use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
@@ -361,6 +362,7 @@ where
         + HasAgentResolver
         + HasEventLog
         + HasEventQueue
+        + HasGitWorktreeService
         + HasProjectDir
         + 'static,
 {
@@ -736,6 +738,19 @@ where
         }
         if !review_state_updates.is_empty() {
             self.persist_review_states(&review_state_updates).await?;
+            for (pr_number, review_state, _) in &review_state_updates {
+                if matches!(
+                    review_state,
+                    LocalReviewState::Approved | LocalReviewState::ChangesRequested
+                ) {
+                    dispose_reviewers_for_pr(
+                        self.ctx.project_dir(),
+                        self.ctx.git_worktree_service().clone(),
+                        *pr_number,
+                    )
+                    .await;
+                }
+            }
         }
 
         for pending in pending_actions {

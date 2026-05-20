@@ -3,6 +3,48 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+pub async fn dispose_reviewers_for_pr(
+    project_dir: &Path,
+    git_wt: Arc<GitWorktreeService>,
+    pr_number: u64,
+) {
+    let slugs = reviewer_slugs_for_pr(project_dir, pr_number).await;
+    for slug in slugs {
+        info!(pr_number, reviewer = %slug, "Disposing ephemeral reviewer agent");
+        dispose_agent_resources(project_dir, git_wt.clone(), &slug).await;
+    }
+}
+
+async fn reviewer_slugs_for_pr(project_dir: &Path, pr_number: u64) -> Vec<String> {
+    let worktrees_dir = project_dir.join(".exo/worktrees");
+    let Ok(mut entries) = tokio::fs::read_dir(&worktrees_dir).await else {
+        return Vec::new();
+    };
+
+    let mut slugs = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if is_reviewer_slug_for_pr(&name, pr_number) {
+            slugs.push(name);
+        }
+    }
+    slugs.sort();
+    slugs
+}
+
+fn is_reviewer_slug_for_pr(slug: &str, pr_number: u64) -> bool {
+    let prefix = format!("review-pr-{}-", pr_number);
+    slug.starts_with(&prefix)
+}
+
 pub async fn dispose_agent_resources(
     project_dir: &Path,
     git_wt: Arc<GitWorktreeService>,
@@ -102,6 +144,14 @@ fn parent_tab_matches_slug(parent_tab: Option<&str>, parent_slug: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_reviewer_slug_for_pr_matches_exact_pr_prefix() {
+        assert!(is_reviewer_slug_for_pr("review-pr-12-codex", 12));
+        assert!(is_reviewer_slug_for_pr("review-pr-12-opencode", 12));
+        assert!(!is_reviewer_slug_for_pr("review-pr-123-codex", 12));
+        assert!(!is_reviewer_slug_for_pr("issue-12-codex", 12));
+    }
 
     #[test]
     fn test_parent_tab_matches_agent_slug() {

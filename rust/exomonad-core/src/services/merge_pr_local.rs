@@ -5,7 +5,7 @@
 // remote (or origin as fallback), and updates the registry state to Merged.
 
 use crate::domain::{AgentName, BranchName, CIStatus, MergeStrategy, PRNumber};
-use crate::services::agent_resources::dispose_agent_resources;
+use crate::services::agent_resources::{dispose_agent_resources, dispose_reviewers_for_pr};
 use crate::services::file_pr_local::{
     read_pr_registry, resolve_push_remote, write_pr_registry, PrRegistry, PrState,
 };
@@ -404,6 +404,7 @@ pub async fn merge_pr_local(
         .unwrap_or(&head_branch)
         .to_string();
     dispose_agent_resources(project_dir, git_wt.clone(), &agent_slug).await;
+    dispose_reviewers_for_pr(project_dir, git_wt.clone(), pr_number.as_u64()).await;
 
     Ok(MergePROutput {
         success: true,
