@@ -49,6 +49,11 @@ struct ToolListResponse {
     tools: Vec<ToolDefinition>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HealthResponse {
+    pub wasm_hash: String,
+}
+
 /// Client for the exomonad UDS server.
 pub struct ServerClient {
     socket: PathBuf,
@@ -66,10 +71,14 @@ impl ServerClient {
 
     /// Check if the server is alive and return the transport/HTTP error when it is not.
     pub async fn health_check(&self) -> Result<()> {
-        match self.get("/health").await {
-            Ok(()) => {
+        self.health_info().await.map(|_| ())
+    }
+
+    pub async fn health_info(&self) -> Result<HealthResponse> {
+        match self.get_json("/health").await {
+            Ok(response) => {
                 tracing::debug!(socket = %self.socket.display(), "UDS health check succeeded via GET /health");
-                Ok(())
+                Ok(response)
             }
             Err(err) => {
                 tracing::debug!(socket = %self.socket.display(), error = %err, "UDS health check failed via GET /health");
@@ -114,12 +123,6 @@ impl ServerClient {
         let resp = self.raw_get(path).await?;
         serde_json::from_slice(&resp)
             .with_context(|| format!("Failed to deserialize response from {}", path))
-    }
-
-    /// GET request, returns Ok if 2xx.
-    async fn get(&self, path: &str) -> Result<()> {
-        let _ = self.raw_get(path).await?;
-        Ok(())
     }
 
     /// Low-level GET over UDS. Returns response body bytes.

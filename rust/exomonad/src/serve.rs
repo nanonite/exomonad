@@ -662,10 +662,25 @@ pub async fn handle_hook_inner(
 // ============================================================================
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    // We need to resolve the root plugin for health
-    let cache = state.plugins.read().await;
+    let plugins: Vec<Arc<PluginManager>> = {
+        let cache = state.plugins.read().await;
+        cache.values().cloned().collect()
+    };
+
+    for plugin in &plugins {
+        if let Err(e) = plugin.reload_if_changed().await {
+            warn!(error = %e, "WASM hot-reload check failed during health probe");
+        }
+    }
+
     let root = AgentName::try_from_str("root").expect("literal agent name is non-empty");
-    let plugin = cache.get(&root).cloned();
+    let plugin = {
+        let cache = state.plugins.read().await;
+        cache
+            .get(&root)
+            .cloned()
+            .or_else(|| cache.values().next().cloned())
+    };
 
     let wasm_hash = if let Some(p) = plugin {
         p.content_hash()

@@ -6,7 +6,9 @@
 use crate::uds_client::{self, ServerClient, ToolCallRequest};
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info, Instrument};
 
 struct LazyServerClient {
@@ -27,6 +29,67 @@ impl LazyServerClient {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Server client initialization did not complete"))
     }
+}
+
+async fn write_json_line(stdout: &Arc<AsyncMutex<Stdout>>, value: &Value) -> Result<()> {
+    let mut stdout = stdout.lock().await;
+    stdout.write_all(&serde_json::to_vec(value)?).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+fn tools_list_changed_notification() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed"
+    })
+}
+
+fn start_tool_list_changed_watcher(role: String, name: String, stdout: Arc<AsyncMutex<Stdout>>) {
+    tokio::spawn(async move {
+        let mut client: Option<ServerClient> = None;
+        let mut last_hash: Option<String> = None;
+
+        loop {
+            if client.is_none() {
+                match connect_with_retry(&role, &name).await {
+                    Ok(next_client) => client = Some(next_client),
+                    Err(err) => {
+                        debug!(role = %role, name = %name, error = %err, "tools/list_changed watcher could not connect");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
+            }
+
+            let Some(active_client) = client.as_ref() else {
+                continue;
+            };
+
+            match active_client.health_info().await {
+                Ok(health) => {
+                    if let Some(previous_hash) = &last_hash {
+                        if previous_hash != &health.wasm_hash {
+                            let notification = tools_list_changed_notification();
+                            if let Err(err) = write_json_line(&stdout, &notification).await {
+                                error!(role = %role, name = %name, error = %err, "failed to send tools/list_changed notification");
+                                return;
+                            }
+                            info!(role = %role, name = %name, old_hash = %previous_hash, new_hash = %health.wasm_hash, "sent tools/list_changed notification");
+                        }
+                    }
+                    last_hash = Some(health.wasm_hash);
+                }
+                Err(err) => {
+                    debug!(role = %role, name = %name, error = %err, "tools/list_changed watcher health probe failed");
+                    client = None;
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
 }
 
 async fn connect_with_retry(role: &str, name: &str) -> Result<ServerClient> {
@@ -117,8 +180,9 @@ async fn connect_with_retry(role: &str, name: &str) -> Result<ServerClient> {
 pub async fn run(role: &str, name: &str) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
-    let mut stdout = tokio::io::stdout();
+    let stdout = Arc::new(AsyncMutex::new(tokio::io::stdout()));
     let mut lazy_client = LazyServerClient::new();
+    let mut tool_watcher_started = false;
 
     while let Some(line) = reader.next_line().await? {
         if line.trim().is_empty() {
@@ -151,11 +215,23 @@ pub async fn run(role: &str, name: &str) -> Result<()> {
             match method {
                 "initialize" => Some(Ok(json!({
                     "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": { "listChanged": false } },
+                    "capabilities": { "tools": { "listChanged": true } },
                     "serverInfo": { "name": "exomonad", "version": env!("CARGO_PKG_VERSION") }
                 }))),
 
-                "notifications/initialized" | "notifications/cancelled" => {
+                "notifications/initialized" => {
+                    if !tool_watcher_started {
+                        start_tool_list_changed_watcher(
+                            role.to_string(),
+                            name.to_string(),
+                            stdout.clone(),
+                        );
+                        tool_watcher_started = true;
+                    }
+                    None
+                }
+
+                "notifications/cancelled" => {
                     // Notifications — no response
                     None
                 }
@@ -204,11 +280,22 @@ pub async fn run(role: &str, name: &str) -> Result<()> {
                     "error": { "code": -32603, "message": e.to_string() }
                 }),
             };
-            stdout.write_all(&serde_json::to_vec(&response)?).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+            write_json_line(&stdout, &response).await?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_list_changed_notification_uses_mcp_method_name() {
+        let notification = tools_list_changed_notification();
+        assert_eq!(notification["jsonrpc"], "2.0");
+        assert_eq!(notification["method"], "notifications/tools/list_changed");
+        assert!(notification.get("id").is_none());
+    }
 }
