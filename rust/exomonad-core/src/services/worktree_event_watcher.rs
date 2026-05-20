@@ -3,15 +3,17 @@ use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::agent_resources::dispose_reviewers_for_pr;
 use crate::services::file_pr_local::{
-    read_pr_registry, write_pr_registry, LocalReviewState, PrRegistry, PrState,
+    read_pr_registry, write_pr_registry, LocalReviewState, PrEntry, PrRegistry, PrState,
 };
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     CiStatusKey, CiStatusMap, HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue,
-    HasGitWorktreeService, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
+    HasGitWorktreeService, HasProjectDir, HasTangledPrClient, HasTeamRegistry, ReviewerSpawner,
 };
 use anyhow::{Context, Result};
+use chrono::Utc;
 use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
+use exomonad_proto::effects::file_pr::LocalPrResponse;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -366,6 +368,7 @@ where
         + HasEventQueue
         + HasGitWorktreeService
         + HasProjectDir
+        + HasTangledPrClient
         + 'static,
 {
     pub fn new(ctx: Arc<C>) -> Self {
@@ -474,15 +477,6 @@ where
         let mut consecutive_failures: u32 = 0;
 
         loop {
-            let sleep_duration = if consecutive_failures == 0 {
-                base_interval
-            } else {
-                let backoff = base_interval * 2u32.saturating_pow(consecutive_failures.min(6));
-                backoff.min(max_backoff)
-            };
-
-            tokio::time::sleep(sleep_duration).await;
-
             match self.poll_cycle().await {
                 Ok(()) => {
                     if consecutive_failures > 0 {
@@ -513,7 +507,52 @@ where
                     }
                 }
             }
+
+            let sleep_duration = if consecutive_failures == 0 {
+                base_interval
+            } else {
+                let backoff = base_interval * 2u32.saturating_pow(consecutive_failures.min(6));
+                backoff.min(max_backoff)
+            };
+
+            tokio::time::sleep(sleep_duration).await;
         }
+    }
+
+    async fn bootstrap_registry_from_reviews(&self) -> Result<PrRegistry> {
+        let Some(client) = self.ctx.tangled_pr_client().cloned() else {
+            return Ok(PrRegistry::default());
+        };
+        let reviews_dir = self.ctx.project_dir().join(".exo/reviews");
+        let mut entries = match tokio::fs::read_dir(&reviews_dir).await {
+            Ok(entries) => entries,
+            Err(_) => return Ok(PrRegistry::default()),
+        };
+
+        let mut registry = PrRegistry::default();
+        while let Some(entry) = entries.next_entry().await? {
+            let Some(pr_number) = review_file_pr_number(&entry.file_name().to_string_lossy())
+            else {
+                continue;
+            };
+            let Some(pr_response) = client.get_pull(pr_number as i64).await? else {
+                continue;
+            };
+            let review_file = Self::read_review_file(self.ctx.project_dir(), pr_number).await;
+            let pr_entry = pr_entry_from_tangled_response(pr_response, review_file.as_ref());
+            registry.next_number = registry.next_number.max(pr_entry.number + 1);
+            registry.prs.insert(pr_entry.number, pr_entry);
+        }
+
+        if !registry.prs.is_empty() {
+            write_pr_registry(&self.prs_path, &registry).await?;
+            info!(
+                count = registry.prs.len(),
+                "Bootstrapped prs.json from existing review files and Tangled PR state"
+            );
+        }
+
+        Ok(registry)
     }
 
     async fn set_pr_stuck(&self, pr_number: u64, rounds: u32) -> anyhow::Result<()> {
@@ -541,13 +580,16 @@ where
 
     #[instrument(skip_all, name = "worktree_event_watcher.poll_cycle")]
     async fn poll_cycle(&self) -> Result<()> {
-        let registry = match read_pr_registry(&self.prs_path).await {
+        let mut registry = match read_pr_registry(&self.prs_path).await {
             Ok(r) => r,
             Err(_) => return Ok(()),
         };
 
         if registry.prs.is_empty() {
-            return Ok(());
+            registry = self.bootstrap_registry_from_reviews().await?;
+            if registry.prs.is_empty() {
+                return Ok(());
+            }
         }
 
         let observations = self.collect_observations(&registry).await?;
@@ -1827,6 +1869,102 @@ fn compute_pr_actions_with_context(
     pending_actions
 }
 
+fn review_file_pr_number(file_name: &str) -> Option<u64> {
+    file_name
+        .strip_prefix("pr_")?
+        .strip_suffix(".json")?
+        .parse()
+        .ok()
+}
+
+fn pr_entry_from_tangled_response(
+    response: LocalPrResponse,
+    review_file: Option<&ReviewFile>,
+) -> PrEntry {
+    let review_state = local_review_state_from_str(&response.review_state);
+    let last_head_sha = non_empty(response.last_head_sha);
+    let reviewer_agent = non_empty(response.reviewer_agent);
+    let approved_at_sha = if matches!(review_state, LocalReviewState::Approved) {
+        last_head_sha.clone()
+    } else {
+        None
+    };
+    let head_branch = response.head_branch;
+    let author_agent = author_agent_from_branch(&head_branch)
+        .or_else(|| non_empty(response.author_agent))
+        .unwrap_or_else(|| format!("pr-{}", response.pr_number));
+    let rounds = review_file.map(review_rounds_from_file).unwrap_or(0);
+
+    PrEntry {
+        number: response.pr_number as u64,
+        head_branch,
+        base_branch: response.base_branch,
+        title: format!("Recovered PR #{}", response.pr_number),
+        body: "Recovered from Tangled PR state and existing .exo/reviews verdicts.".to_string(),
+        author_agent,
+        author_role: "dev".to_string(),
+        created_at: Utc::now(),
+        state: PrState::Open,
+        review_state,
+        last_review_at: None,
+        last_head_sha,
+        approved_at_sha,
+        reviewer_agent: reviewer_agent.clone(),
+        reviewer_birth_branch: reviewer_agent
+            .as_deref()
+            .and_then(reviewer_birth_branch_from_agent),
+        rounds,
+        stuck: false,
+        needs_human_review: false,
+        merge_blocked_on_ci: false,
+        chainlink_issue_id: None,
+    }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn author_agent_from_branch(branch: &str) -> Option<String> {
+    branch
+        .rsplit_once('.')
+        .map(|(_, slug)| slug.to_string())
+        .filter(|slug| !slug.is_empty())
+}
+
+fn reviewer_birth_branch_from_agent(agent: &str) -> Option<String> {
+    let rest = agent.strip_prefix("review-pr-")?;
+    let pr_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if pr_digits.is_empty() {
+        None
+    } else {
+        Some(format!("review-pr-{pr_digits}"))
+    }
+}
+
+fn review_rounds_from_file(review_file: &ReviewFile) -> u32 {
+    let mut shas = std::collections::HashSet::new();
+    for verdict in &review_file.verdicts {
+        if let Some(sha) = verdict.head_sha.as_deref() {
+            if !sha.is_empty() {
+                shas.insert(sha);
+            }
+        }
+    }
+    if !shas.is_empty() {
+        return shas.len() as u32;
+    }
+    if review_file.state == "approved" || review_file.state == "changes_requested" {
+        1
+    } else {
+        0
+    }
+}
+
 fn review_file_parts(
     rf: ReviewFile,
     current_head_sha: Option<&str>,
@@ -2524,6 +2662,9 @@ async fn git_head_sha(worktree_path: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::{tangled_pr::TangledPrClient, Services};
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_state(branch: &BranchName, agent_type: AgentType, sha: &str) -> WatchState {
         WatchState::new(branch, agent_type, sha, CIStatus::Unknown, 0)
@@ -2546,6 +2687,84 @@ mod tests {
             state,
             author_branch: None,
         }
+    }
+
+    #[tokio::test]
+    async fn bootstraps_empty_registry_from_review_files_and_tangled_prs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let reviews_dir = temp_dir.path().join(".exo/reviews");
+        tokio::fs::create_dir_all(&reviews_dir)
+            .await
+            .expect("reviews dir created");
+        tokio::fs::write(
+            temp_dir.path().join(".exo/prs.json"),
+            "{\"prs\":{},\"next_number\":1}\n",
+        )
+        .await
+        .expect("empty registry written");
+        tokio::fs::write(
+            reviews_dir.join("pr_4.json"),
+            r#"{
+                "state":"approved",
+                "comments":[],
+                "verdicts":[{
+                    "state":"approved",
+                    "body":"LGTM",
+                    "comments":[],
+                    "author_branch":"review-pr-4",
+                    "head_sha":"abc123"
+                }]
+            }"#,
+        )
+        .await
+        .expect("review file written");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/sh.tangled.repo.getPull"))
+            .and(query_param("repo", "did:plc:owner"))
+            .and(query_param("pull", "4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "found": true,
+                "prNumber": 4,
+                "headBranch": "main.fix-codex",
+                "baseBranch": "main",
+                "ownerDid": "did:plc:owner",
+                "reviewState": "approved",
+                "latestSha": "abc123",
+                "reviewerAgent": "review-pr-4-codex"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut services = Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        services.tangled_pr_client = Some(Arc::new(
+            TangledPrClient::new(&server.uri(), "did:plc:owner").expect("client created"),
+        ));
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+
+        let registry = watcher
+            .bootstrap_registry_from_reviews()
+            .await
+            .expect("registry bootstrapped");
+
+        let pr = registry.prs.get(&4).expect("PR recovered");
+        assert_eq!(registry.next_number, 5);
+        assert_eq!(pr.head_branch, "main.fix-codex");
+        assert_eq!(pr.base_branch, "main");
+        assert_eq!(pr.author_agent, "fix-codex");
+        assert_eq!(pr.review_state, LocalReviewState::Approved);
+        assert_eq!(pr.last_head_sha.as_deref(), Some("abc123"));
+        assert_eq!(pr.approved_at_sha.as_deref(), Some("abc123"));
+        assert_eq!(pr.reviewer_agent.as_deref(), Some("review-pr-4-codex"));
+        assert_eq!(pr.reviewer_birth_branch.as_deref(), Some("review-pr-4"));
+        assert_eq!(pr.rounds, 1);
+
+        let persisted = read_pr_registry(&watcher.prs_path)
+            .await
+            .expect("registry persisted");
+        assert!(persisted.prs.contains_key(&4));
     }
 
     // ---------------------------------------------------------------------------

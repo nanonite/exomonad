@@ -608,14 +608,8 @@ pub async fn run(
         let _ = std::fs::remove_file(&pid_path);
         info!("Cleaned up server socket and pid");
 
-        // Clear stale session state: PR registry and non-root agent entries.
-        // These are per-session — the old agents are dead and their PRs will never
-        // be updated, so carrying them forward causes spurious reviewer spawns.
-        let prs_path = cwd.join(".exo/prs.json");
-        if prs_path.exists() {
-            let _ = std::fs::remove_file(&prs_path);
-            info!("Cleared stale prs.json");
-        }
+        // Clear stale non-root agent entries. Keep prs.json: local PRs and review
+        // files outlive tmux sessions, and the watcher can resume them on startup.
         let agents_dir = cwd.join(".exo/agents");
         if let Ok(entries) = std::fs::read_dir(&agents_dir) {
             for entry in entries.flatten() {

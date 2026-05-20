@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- worktree event watcher prs.json empty — not tracking PRs through review cycle (#332)
 - root role missing chainlink MCP tools after #310 CLI block (#329)
 - Audit watcher's pr_review event-type dispatch: approvals must fire ReviewApprovedEv, not ReviewReceivedEv (#290)
 - Watcher's stuck-detection counts approvals as rounds — successful convergence trips STUCK (#288)
