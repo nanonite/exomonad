@@ -1,0 +1,53 @@
+services:
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:15
+    container_name: forgejo
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+      - "2222:22"
+    volumes:
+      - forgejo-data:/data
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - FORGEJO__server__DOMAIN=localhost
+      - FORGEJO__server__HTTP_PORT=3000
+      - FORGEJO__server__SSH_DOMAIN=localhost
+      - FORGEJO__server__SSH_PORT=2222
+      - FORGEJO__actions__ENABLED=true
+      - FORGEJO__actions__DEFAULT_ACTIONS_URL=https://code.forgejo.org
+      - FORGEJO__log__LEVEL=Info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  docker-in-docker:
+    image: docker:dind
+    container_name: forgejo-dind
+    privileged: true
+    restart: unless-stopped
+    command: ["dockerd", "-H", "tcp://0.0.0.0:2375", "--tls=false"]
+
+  runner:
+    image: data.forgejo.org/forgejo/runner:12
+    container_name: forgejo-runner
+    restart: unless-stopped
+    user: "1000:1000"
+    depends_on:
+      forgejo:
+        condition: service_healthy
+      docker-in-docker:
+        condition: service_started
+    links:
+      - docker-in-docker
+    volumes:
+      - ./runner-data:/data
+    environment:
+      - DOCKER_HOST=tcp://docker-in-docker:2375
+    command: forgejo-runner daemon --config /data/runner-config.yml
+
+volumes:
+  forgejo-data:

@@ -134,6 +134,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- add Forgejo + act_runner docker-compose (#345)
 - spindle auto-discovers and watches unintended repos from jetstream (#336)
 - Document knot HTTP API for repo registration and service auth (#339)
 - leaf-lifecycle: merge gate rounds counter never increments on verdict write (option B: rounds = unique reviewed SHAs) (#326)
