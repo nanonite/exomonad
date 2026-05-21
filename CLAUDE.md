@@ -135,6 +135,12 @@ claude                        # MCP tools available immediately
 
 Use `--recreate` to tear down and rebuild the session (e.g., after binary updates).
 
+Optional local Forgejo CI stack:
+```bash
+cd forgejo
+docker compose up -d
+```
+
 **Project setup:**
 ```bash
 exomonad new                     # Bootstrap new project (.exo/config.toml, WASM, rules)
@@ -203,7 +209,7 @@ cargo build -p exomonad
 
 ### Configuration
 
-**Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults), `.gitignore` entries, and `.tangled/workflows/ci.yml` if missing. Works in any project directory. All fields are optional — auto-detection handles the common case. The Tangled workflow scaffold provides universal `nixery`, trigger, and clone framing with language-flavored bootstrap dependencies, but leaves substantive build/test commands as TODOs because those are workspace-specific. **Claude rules:** `exomonad new` copies `.exo/rules/exomonad.md` → `.claude/rules/exomonad.md` (if the template exists and the destination doesn't). Template resolution: project-local `.exo/rules/` → global `~/.exo/rules/`. This gives fresh Claude instances automatic knowledge of exomonad MCP tools.
+**Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults), `.gitignore` entries, and `.github/workflows/ci.yml` if missing. Works in any project directory. All fields are optional — auto-detection handles the common case. The CI scaffold uses GitHub Actions syntax with language-specific defaults, and leaves workspace-specific build/test customization where needed. **Claude rules:** `exomonad new` copies `.exo/rules/exomonad.md` → `.claude/rules/exomonad.md` (if the template exists and the destination doesn't). Template resolution: project-local `.exo/rules/` → global `~/.exo/rules/`. This gives fresh Claude instances automatic knowledge of exomonad MCP tools.
 
 ```toml
 # All fields below are optional — shown with their auto-detected defaults
@@ -214,17 +220,10 @@ wasm_dir = ".exo/wasm"       # project-local (default), override for shared inst
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
 model = "sonnet"             # optional — passed as --model flag to root TL agent
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
-tangled_spindle_url = "ws://localhost:6555"  # optional — spindle WebSocket for CI status events
-tangled_knot_url = "http://localhost:5555"   # optional — knot HTTP URL (used to derive spindle jetstream endpoint)
-tangled_appview_url = "http://localhost:3000" # optional — appview HTTP URL for PR read-through fallback
-tangled_owner_did = "did:plc:yourkey"        # optional — when set, exomonad init auto-starts spindle as a process companion
-tangled_spindle_db = "spindle.db"            # optional — spindle SQLite path (default: spindle.db in project root)
-tangled_knot_container = "tangled-knot-knot-1"  # optional — knot container name for docker-based repo registration
 forgejo_url = "http://localhost:3000"           # optional — Forgejo base URL
 forgejo_token = "forgejo_pat"                      # optional — Forgejo API token
 forgejo_webhook_secret = "shared-secret"           # optional — webhook signature secret
 
-# Exomonad discovers the knot's canonical runtime hostname from tangled_knot_container during init.
 # Extra MCP servers (HTTP or stdio). Included in .mcp.json for all agents.
 [extra_mcp_servers.metacog]
 type = "http"
