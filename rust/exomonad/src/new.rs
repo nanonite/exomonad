@@ -11,17 +11,6 @@ const DEFAULT_TANGLED_SPINDLE_URL: &str = "ws://localhost:6555";
 const DEFAULT_TANGLED_APPVIEW_URL: &str = "http://localhost:3000";
 const DEFAULT_TANGLED_SPINDLE_DB: &str = "spindle.db";
 
-const TANGLED_WORKFLOW_FRAMING: &str = r#"engine: nixery
-when:
-  - event: [push, manual]
-    branch: ["*"]
-  - event: [pull_request]
-    branch: [main]
-clone:
-  depth: 1
-  submodules: false
-"#;
-
 #[derive(Clone, Copy)]
 enum ProjectLanguage {
     Rust,
@@ -582,7 +571,6 @@ struct ForgejoRepoOwner {
 #[derive(Debug, Deserialize)]
 struct ForgejoRepoResponse {
     owner: ForgejoRepoOwner,
-    name: String,
 }
 
 #[derive(Debug, Deserialize)]

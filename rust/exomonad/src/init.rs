@@ -1423,7 +1423,7 @@ async fn report_orphaned_agent_windows(session: &str, cwd: &Path) {
     }
 }
 
-async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
+async fn register_tangled_repo(cwd: &Path, _config: &exomonad::config::Config) {
     let (container, owner_did, spindle_db) = match (
         None,
         None,

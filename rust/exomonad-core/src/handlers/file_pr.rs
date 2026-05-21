@@ -222,22 +222,6 @@ impl<
     }
 }
 
-impl<
-        C: HasGitHubClient
-            + HasEventLog
-            + HasGitWorktreeService
-            + HasProjectDir
-            + 'static,
-    > FilePRHandler<C>
-{
-    async fn tangled_pr_get(&self, _pr_number: i64) -> EffectResult<LocalPrResponse> {
-        Ok(LocalPrResponse::default())
-    }
-
-    async fn tangled_pr_get_for_branch(&self, _branch: &str) -> EffectResult<LocalPrResponse> {
-        Ok(LocalPrResponse::default())
-    }
-}
 
 fn local_pr_response(entry: &file_pr_local::PrEntry) -> LocalPrResponse {
     LocalPrResponse {

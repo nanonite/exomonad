@@ -1868,6 +1868,7 @@ fn compute_pr_actions_with_context(
     pending_actions
 }
 
+#[allow(dead_code)]
 fn review_file_pr_number(file_name: &str) -> Option<u64> {
     file_name
         .strip_prefix("pr_")?
@@ -1876,6 +1877,7 @@ fn review_file_pr_number(file_name: &str) -> Option<u64> {
         .ok()
 }
 
+#[allow(dead_code)]
 fn pr_entry_from_tangled_response(
     response: LocalPrResponse,
     review_file: Option<&ReviewFile>,
@@ -1920,6 +1922,7 @@ fn pr_entry_from_tangled_response(
     }
 }
 
+#[allow(dead_code)]
 fn non_empty(value: String) -> Option<String> {
     if value.is_empty() {
         None
@@ -1928,6 +1931,7 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 fn author_agent_from_branch(branch: &str) -> Option<String> {
     branch
         .rsplit_once('.')
@@ -1935,6 +1939,7 @@ fn author_agent_from_branch(branch: &str) -> Option<String> {
         .filter(|slug| !slug.is_empty())
 }
 
+#[allow(dead_code)]
 fn reviewer_birth_branch_from_agent(agent: &str) -> Option<String> {
     let rest = agent.strip_prefix("review-pr-")?;
     let pr_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -1945,6 +1950,7 @@ fn reviewer_birth_branch_from_agent(agent: &str) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 fn review_rounds_from_file(review_file: &ReviewFile) -> u32 {
     let mut shas = std::collections::HashSet::new();
     for verdict in &review_file.verdicts {
@@ -2265,6 +2271,7 @@ fn ci_status_key(branch: &BranchName, head_sha: &str) -> CiStatusKey {
 
 /// Extracts the branch name and head SHA from a `sh.tangled.pipeline` event payload.
 /// Returns `None` if the trigger is not a push or is missing the ref/SHA fields.
+#[allow(dead_code)]
 fn extract_pipeline_branch_and_sha(event: &serde_json::Value) -> Option<(BranchName, String)> {
     let push = event.get("triggerMetadata").and_then(|tm| tm.get("push"))?;
     let ref_str = push.get("ref").and_then(|r| r.as_str())?;
@@ -2283,6 +2290,7 @@ fn extract_pipeline_branch_and_sha(event: &serde_json::Value) -> Option<(BranchN
 
 /// Extracts the pipeline rkey and status string from a `sh.tangled.pipeline.status` event payload.
 /// The pipeline field is an AT-URI; the rkey is the last path segment.
+#[allow(dead_code)]
 fn extract_pipeline_status(event: &serde_json::Value) -> Option<(String, String)> {
     let pipeline_uri = event.get("pipeline").and_then(|p| p.as_str())?;
     let status = event.get("status").and_then(|s| s.as_str())?;
@@ -2316,9 +2324,6 @@ async fn git_head_sha(worktree_path: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::Services;
-    use wiremock::matchers::{method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_state(branch: &BranchName, agent_type: AgentType, sha: &str) -> WatchState {
         WatchState::new(branch, agent_type, sha, CIStatus::Unknown, 0)
@@ -2585,19 +2590,6 @@ mod tests {
                 if payload["kind"] == "ci_blocked" && payload["ci_status"] == "failure"
         )));
     }
-
-    #[test]
-    fn test_tangled_manual_ci_url_uses_xrpc_http_endpoint() {
-        assert_eq!(
-            tangled_manual_ci_url("ws://localhost:5555/events").unwrap(),
-            "http://localhost:5555/xrpc/sh.tangled.pipeline.trigger"
-        );
-        assert_eq!(
-            tangled_manual_ci_url("https://knot.example.com/events").unwrap(),
-            "https://knot.example.com/xrpc/sh.tangled.pipeline.trigger"
-        );
-    }
-
     fn pr_with_reviewer(
         pr_number: u64,
         agent_name: &str,
@@ -3061,71 +3053,6 @@ mod tests {
 
         assert!(merge_ready_release_message(&payload).is_none());
     }
-
-    #[test]
-    fn test_tangled_event_url_normalizes_base_websocket_url() {
-        assert_eq!(
-            normalize_tangled_event_ws_url("ws://localhost:5555"),
-            "ws://localhost:5555/events"
-        );
-        assert_eq!(
-            normalize_tangled_event_ws_url("ws://localhost:6555/"),
-            "ws://localhost:6555/events"
-        );
-    }
-
-    #[test]
-    fn test_tangled_event_url_preserves_explicit_events_path() {
-        assert_eq!(
-            normalize_tangled_event_ws_url("ws://localhost:5555/events"),
-            "ws://localhost:5555/events"
-        );
-        assert_eq!(
-            normalize_tangled_event_ws_url("ws://localhost:5555/events?cursor=12"),
-            "ws://localhost:5555/events?cursor=12"
-        );
-    }
-
-    #[test]
-    fn test_tangled_event_url_converts_http_scheme_for_websocket_subscription() {
-        assert_eq!(
-            normalize_tangled_event_ws_url("http://localhost:5555"),
-            "ws://localhost:5555/events"
-        );
-        assert_eq!(
-            normalize_tangled_event_ws_url("https://example.test"),
-            "wss://example.test/events"
-        );
-    }
-
-    #[test]
-    fn test_pipeline_repo_filter_matches_current_project() {
-        let event = serde_json::json!({
-            "triggerMetadata": {
-                "repo": {
-                    "did": "did:plc:localdev",
-                    "knot": "localhost:5555",
-                    "repo": "backrooms-workspace"
-                }
-            }
-        });
-
-        assert!(pipeline_matches_repo(&event, Some("backrooms-workspace")));
-        assert!(!pipeline_matches_repo(&event, Some("ci-test")));
-        assert!(pipeline_matches_repo(&event, None));
-    }
-
-    #[test]
-    fn test_pipeline_repo_filter_rejects_missing_repo() {
-        let event = serde_json::json!({
-            "triggerMetadata": {
-                "push": {"ref": "refs/heads/main"}
-            }
-        });
-
-        assert!(!pipeline_matches_repo(&event, Some("backrooms-workspace")));
-    }
-
     #[test]
     fn test_green_ci_after_stale_approval_does_not_fire_merge_ready() {
         let branch = BranchName::try_from_str("main.feat-gemini")

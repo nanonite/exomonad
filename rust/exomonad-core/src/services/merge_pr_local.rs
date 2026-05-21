@@ -1031,7 +1031,6 @@ mod tests {
             git_wt,
             &reviewer_agent(),
             &standard_policy(),
-            None,
             &ci_map,
         )
         .await
@@ -1167,7 +1166,6 @@ mod tests {
             git_wt,
             &reviewer_agent(),
             &standard_policy(),
-            Some("ws://localhost:6555"),
             &ci_map,
         )
         .await
@@ -1220,7 +1218,6 @@ mod tests {
             git_wt,
             &reviewer_agent(),
             &standard_policy(),
-            Some("ws://localhost:6555"),
             &ci_map,
         )
         .await;
@@ -1271,7 +1268,6 @@ mod tests {
             git_wt,
             &reviewer_agent(),
             &standard_policy(),
-            Some("ws://localhost:6555"),
             &ci_map,
         )
         .await
@@ -1297,7 +1293,6 @@ mod tests {
             git_wt,
             &reviewer_agent(),
             &standard_policy(),
-            None,
             &ci_map,
         )
         .await;
