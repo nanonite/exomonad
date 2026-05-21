@@ -4,7 +4,7 @@
 
 **Date:** 2026-05-19
 
-**Chainlink:** #302, #303, #304, #305, #310, #311, #312, #313
+**Chainlink:** #302, #303, #304, #305, #310, #311, #312, #313, #316, #319
 
 ## Context
 
@@ -60,6 +60,26 @@ The worker spawn path in `rust/exomonad-core/src/services/agent_control/` inject
 
 The git history audit `git log --author=exomonad-` should yield commits from every spawned agent type — workers, dev-leaves, and reviewers (reviewer commits only via merge attribution, never authored directly) — with one identity per agent.
 
+## Worker sequentiality
+
+Workers share the TL's worktree (in-place, ephemeral panes). At most **one worker per TL worktree** may be active at any time. This is not a soft guideline; it is a structural rule enforced at spawn time.
+
+**Why.** Per-worker file attribution is explicitly out of scope (see below). Without attribution, the strict #304 stop hook cannot tell whose changes are whose when multiple workers share a worktree — worker A's `session_end` sees files modified by worker B as foreign dirty state, refuses exit, escalates. Symptom observed 2026-05-19 (nemotron-port: four parallel verification workers stuck on the same inherited dirty set). Sequential workers make every dirty file at session end unambiguously attributable to the one active worker.
+
+**Mechanism.** `spawn_worker` (#319) refuses if `.exo/agents/` contains any entry whose `parent_tab` matches the calling TL's slug. The deny message names the active worker, its age, and points the TL at the two valid alternatives:
+
+1. Wait for the active worker's `notify_parent` handoff before spawning the next.
+2. Use `spawn_leaf` for work that warrants its own PR — dev-leaves have their own worktrees and parallelize freely.
+
+**Spawn preconditions in full.** Two preconditions gate `spawn_worker` (and `spawn_leaf` for the clean-tree case):
+
+| Precondition | Issue | Why |
+|--------------|-------|-----|
+| Clean TL worktree | #316 | Workers can't distinguish inherited dirty state from their own work; dev-leaves fork from branch HEAD and miss uncommitted scaffold |
+| No active sibling worker (worker spawn only) | #319 | Without attribution, parallel workers in one worktree create ambiguous dirty state at session end |
+
+**Architectural framing.** The fork-wave parallelism primitive lives at the **dev-leaf** layer, not the worker layer. Workers are *narrow, sequential, in-place* tasks — anything that needs to run in parallel either decomposes into sequential worker steps or graduates to a dev-leaf. This matches the scaffold-fork-converge pattern in [CLAUDE.md § Tech Lead Praxis](../../CLAUDE.md).
+
 ## Session vs. issue lifecycle
 
 Chainlink session lifecycle ≠ chainlink issue lifecycle.
@@ -73,8 +93,8 @@ When a dev-leaf ends its session (blocker, handoff), the issue remains open and 
 
 ## Out of scope
 
-- **Parallel workers in one TL worktree.** Workers stay sequential and one-off. Parallelization is dev-leaf turf (own worktree per leaf, own branch, own PR). If multi-worker workflows become common, the stash-and-cherrypick dance is a future bridge.
-- **Per-issue file provenance.** Tracking which files belong to which session over a session's lifespan adds complexity without a corresponding correctness gain.
+- **Per-worker file attribution.** Tracking which files were modified by which worker over a worker's lifespan — whether via pre/post snapshots, runtime tool-call interception, or file-scoped spawn manifests — adds complexity without correctness gain when sequential workers (see § Worker sequentiality) make every dirty file at session end unambiguously attributable to the one active worker. Re-confirmed 2026-05-19 by Roger after the parallel-workers pattern was considered and rejected. The structural enforcement is sequentiality; attribution would be the wrong layer to add machinery at.
+- **Per-issue file provenance.** Tracking which files belong to which session over a session's lifespan adds complexity without a corresponding correctness gain. Closely related to per-worker attribution above.
 - **Forcing the TL to commit before close.** The TL never has the "did the worker mean to commit this?" knowledge problem once invariant 2 holds — by the time the TL goes to close, the worker has already self-committed or self-discarded.
 Bash-CLI close paths were initially carved out as operator escape hatches. Observed orphan storm 2026-05-19 (nemotron-port: TL closed issues via bash `chainlink issue close` to work around a separate bug, producing orphan leaves and reviewers because the `IssueClosed` event never fired) showed AI operators reach for whatever runs. The carve-out is closed by **#310** (block bash chainlink mutating verbs) and **#313** (background orphan reconciler). The runtime now refuses bash mutating close paths from agents and reconciles any close paths that still slip through.
 
@@ -99,3 +119,5 @@ Bash-CLI close paths were initially carved out as operator escape hatches. Obser
 | #310 | high | Hook-level block for bash `chainlink` mutating verbs so agents use MCP close paths |
 | #311 | high | Reviewer ephemerality: reviewer verdicts become terminal and reviewer worktrees are disposed after verdict or merge |
 | #313 | medium | Background orphan reconciler for missed issue-close and reviewer-close paths |
+| #316 | high | Spawn precondition: `spawn_worker` and `spawn_leaf` refuse on dirty TL worktree |
+| #319 | high | Spawn precondition: `spawn_worker` refuses if another worker is active in the TL worktree (sequential workers) |

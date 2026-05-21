@@ -478,6 +478,15 @@ instance (HsProtobuf.Message Event) where
                     )
                       (Hs.Just y)
                   )
+              EventEventTypeIssueClosed y ->
+                HsProtobuf.encodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+                  ( ( Hs.coerce
+                        @(Hs.Maybe Effects.Events.IssueClosed)
+                        @(HsProtobuf.Nested Effects.Events.IssueClosed)
+                    )
+                      (Hs.Just y)
+                  )
       )
   decodeMessage _ =
     Hs.pure Event
@@ -503,6 +512,15 @@ instance (HsProtobuf.Message Event) where
                     )
                       HsProtobuf.decodeMessageField
                   )
+          ),
+          ( (HsProtobuf.FieldNumber 4),
+            Hs.pure (Hs.fmap EventEventTypeIssueClosed)
+              <*> ( ( HsProtobuf.coerceOver
+                        @(HsProtobuf.Nested Effects.Events.IssueClosed)
+                        @(Hs.Maybe Effects.Events.IssueClosed)
+                    )
+                      HsProtobuf.decodeMessageField
+                  )
           )
         ]
   dotProto _ =
@@ -515,14 +533,16 @@ instance (HsProtobuf.Message Event) where
     ]
 
 instance (HsJSONPB.ToJSONPB Event) where
-  toJSONPB (Event f3 f1_or_f2) =
+  toJSONPB (Event f3 f1_or_f2_or_f4) =
     HsJSONPB.object
       [ "event_id" .= f3,
         ( let encodeEvent_type =
-                ( case f1_or_f2 of
+                ( case f1_or_f2_or_f4 of
                     Hs.Just (EventEventTypeAgentMessage f1) ->
                       HsJSONPB.pair "agent_message" f1
                     Hs.Just (EventEventTypeTimeout f2) -> HsJSONPB.pair "timeout" f2
+                    Hs.Just (EventEventTypeIssueClosed f4) ->
+                      HsJSONPB.pair "issue_closed" f4
                     Hs.Nothing -> Hs.mempty
                 )
            in ( \options ->
@@ -535,14 +555,16 @@ instance (HsJSONPB.ToJSONPB Event) where
               )
         )
       ]
-  toEncodingPB (Event f3 f1_or_f2) =
+  toEncodingPB (Event f3 f1_or_f2_or_f4) =
     HsJSONPB.pairs
       [ "event_id" .= f3,
         ( let encodeEvent_type =
-                ( case f1_or_f2 of
+                ( case f1_or_f2_or_f4 of
                     Hs.Just (EventEventTypeAgentMessage f1) ->
                       HsJSONPB.pair "agent_message" f1
                     Hs.Just (EventEventTypeTimeout f2) -> HsJSONPB.pair "timeout" f2
+                    Hs.Just (EventEventTypeIssueClosed f4) ->
+                      HsJSONPB.pair "issue_closed" f4
                     Hs.Nothing -> Hs.mempty
                 )
            in ( \options ->
@@ -569,6 +591,8 @@ instance (HsJSONPB.FromJSONPB Event) where
                               <$> HsJSONPB.parseField parseObj "agent_message",
                             Hs.Just Hs.. EventEventTypeTimeout
                               <$> HsJSONPB.parseField parseObj "timeout",
+                            Hs.Just Hs.. EventEventTypeIssueClosed
+                              <$> HsJSONPB.parseField parseObj "issue_closed",
                             Hs.pure Hs.Nothing
                           ]
                    in ( obj .: "event_type"
@@ -588,6 +612,7 @@ instance (HsJSONPB.FromJSON Event) where
 data EventEventType
   = EventEventTypeAgentMessage Effects.Events.AgentMessage
   | EventEventTypeTimeout Effects.Events.Timeout
+  | EventEventTypeIssueClosed Effects.Events.IssueClosed
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
 instance (Hs.NFData EventEventType)
@@ -816,6 +841,94 @@ instance (HsJSONPB.ToJSON Timeout) where
   toEncoding = HsJSONPB.toAesonEncoding
 
 instance (HsJSONPB.FromJSON Timeout) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data IssueClosed
+  = IssueClosed
+  { issueClosedIssueId :: Hs.Word64,
+    issueClosedClosedBy :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData IssueClosed)
+
+instance (HsProtobuf.Named IssueClosed) where
+  nameOf _ = Hs.fromString "IssueClosed"
+
+instance (HsProtobuf.HasDefault IssueClosed)
+
+instance (HsProtobuf.Message IssueClosed) where
+  encodeMessage
+    _
+    IssueClosed {issueClosedIssueId, issueClosedClosedBy} =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            issueClosedIssueId
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                issueClosedClosedBy
+            )
+        )
+  decodeMessage _ =
+    Hs.pure IssueClosed
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "issue_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "closed_by")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB IssueClosed) where
+  toJSONPB (IssueClosed f1 f2) =
+    HsJSONPB.object
+      [ "issue_id" .= f1,
+        "closed_by"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+  toEncodingPB (IssueClosed f1 f2) =
+    HsJSONPB.pairs
+      [ "issue_id" .= f1,
+        "closed_by"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+
+instance (HsJSONPB.FromJSONPB IssueClosed) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "IssueClosed"
+      ( \obj ->
+          Hs.pure IssueClosed
+            <*> obj .: "issue_id"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "closed_by")
+                )
+      )
+
+instance (HsJSONPB.ToJSON IssueClosed) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON IssueClosed) where
   parseJSON = HsJSONPB.parseJSONPB
 
 newtype Address

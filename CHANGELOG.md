@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - reviewer pane does not exit after writing verdict (#333)
 - worktree event watcher prs.json empty — not tracking PRs through review cycle (#332)
 - root role missing chainlink MCP tools after #310 CLI block (#329)
+- Canonicalize server socket path in uds_client to fix dev-leaf/reviewer MCP path-length failures (#282)
 - Audit watcher's pr_review event-type dispatch: approvals must fire ReviewApprovedEv, not ReviewReceivedEv (#290)
 - Watcher's stuck-detection counts approvals as rounds — successful convergence trips STUCK (#288)
 - Fix reviewer tool contract to exclude parent notification (#286)
@@ -43,6 +44,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- exomonad init: surface orphaned agent windows for TL review rather than auto-killing (#342)
+- orphan reconciler: enforce max session age to stop long-running leaves and reviewers (#340)
 - Add watcher CI trigger on reviewer approval and CI failure blocking (#337)
 - DevPhase: add sequential CITriggered and CIBlocked states after reviewer approval (#338)
 - TL tool: close_issue_and_cleanup — close Chainlink issue + dispose leaf and reviewer worktrees (#335)
@@ -131,13 +134,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- spindle auto-discovers and watches unintended repos from jetstream (#336)
 - Document knot HTTP API for repo registration and service auth (#339)
 - leaf-lifecycle: merge gate rounds counter never increments on verdict write (option B: rounds = unique reviewed SHAs) (#326)
 - runtime-hook-parity: extend agent inbox with structural deduplication for convergent delivery paths (#328)
 - leaf-lifecycle: PRReview handler must branch by role — TL gets InjectMessage (backstop), leaf drops auto NotifyParent (#327)
 - ensure_gitignore must cover all runtime scaffold paths (.codex/, .tangled/state/, .claude/settings.local.json, .opencode/) (#323)
+- leaf-lifecycle: orphan_reconciler must dispose dev-leaf worktrees, not just log the event (#315)
 - Watcher: stop fanning pr_review review_received back to the reviewer that posted it (#296)
 - Watcher: add ci.gate config knob — treat 'no CI source configured' as auto-neutral so merge_ready can fire (#295)
+- Reviewer-convergence E2E degenerates into timeout-escalation path; fixture mismatch causes dev paralysis (#291)
 - merge_pr: post-merge git pull failure mode is opaque; log the actual exit code/stderr instead of a generic recovery hint (#294)
 - Watcher: distinguish dev-stuck from reviewer-stuck timeouts; TL should only ever receive [MERGE READY] (#293)
 - Reviewer-convergence E2E: realign fixture so reviewer feedback is scoped to the leaf's actual change (Option A) (#292)
