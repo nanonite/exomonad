@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use crate::services::{
-    HasEventLog, HasGitHubClient, HasGitWorktreeService, HasProjectDir, HasTangledPrClient,
+    HasEventLog, HasGitHubClient, HasGitWorktreeService, HasProjectDir,
 };
 
 /// File PR effect handler.
@@ -31,7 +31,6 @@ impl<
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
-            + HasTangledPrClient
             + 'static,
     > FilePRHandler<C>
 {
@@ -46,7 +45,6 @@ impl<
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
-            + HasTangledPrClient
             + 'static,
     > EffectHandler for FilePRHandler<C>
 {
@@ -70,7 +68,6 @@ impl<
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
-            + HasTangledPrClient
             + 'static,
     > FilePrEffects for FilePRHandler<C>
 {
@@ -180,7 +177,7 @@ impl<
                     path = %prs_path.display(),
                     "[FilePR] local PR registry unavailable"
                 );
-                return self.tangled_pr_get(req.pr_number).await;
+                return Ok(LocalPrResponse::default());
             }
         };
 
@@ -191,8 +188,7 @@ impl<
         {
             return Ok(response);
         }
-
-        self.tangled_pr_get(req.pr_number).await
+        Ok(LocalPrResponse::default())
     }
 
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, branch = %req.branch))]
@@ -210,7 +206,7 @@ impl<
                     path = %prs_path.display(),
                     "[FilePR] local PR registry unavailable"
                 );
-                return self.tangled_pr_get_for_branch(&req.branch).await;
+                return Ok(LocalPrResponse::default());
             }
         };
 
@@ -222,8 +218,7 @@ impl<
         {
             return Ok(response);
         }
-
-        self.tangled_pr_get_for_branch(&req.branch).await
+        Ok(LocalPrResponse::default())
     }
 }
 
@@ -232,46 +227,15 @@ impl<
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
-            + HasTangledPrClient
             + 'static,
     > FilePRHandler<C>
 {
-    async fn tangled_pr_get(&self, pr_number: i64) -> EffectResult<LocalPrResponse> {
-        let Some(client) = self.ctx.tangled_pr_client() else {
-            return Ok(LocalPrResponse::default());
-        };
-
-        match client.get_pull(pr_number).await {
-            Ok(Some(response)) => Ok(response),
-            Ok(None) => Ok(LocalPrResponse::default()),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    pr_number,
-                    "[FilePR] Tangled appview PR lookup failed"
-                );
-                Ok(LocalPrResponse::default())
-            }
-        }
+    async fn tangled_pr_get(&self, _pr_number: i64) -> EffectResult<LocalPrResponse> {
+        Ok(LocalPrResponse::default())
     }
 
-    async fn tangled_pr_get_for_branch(&self, branch: &str) -> EffectResult<LocalPrResponse> {
-        let Some(client) = self.ctx.tangled_pr_client() else {
-            return Ok(LocalPrResponse::default());
-        };
-
-        match client.get_pull_for_branch(branch).await {
-            Ok(Some(response)) => Ok(response),
-            Ok(None) => Ok(LocalPrResponse::default()),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    branch,
-                    "[FilePR] Tangled appview branch PR lookup failed"
-                );
-                Ok(LocalPrResponse::default())
-            }
-        }
+    async fn tangled_pr_get_for_branch(&self, _branch: &str) -> EffectResult<LocalPrResponse> {
+        Ok(LocalPrResponse::default())
     }
 }
 
@@ -298,7 +262,7 @@ mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch};
     use crate::effects::{EffectContext, FilePrEffects};
-    use crate::services::{tangled_pr::TangledPrClient, Services};
+    use crate::services::Services;
     use std::path::PathBuf;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -458,9 +422,7 @@ mod tests {
 
         let mut services = Services::test();
         services.project_dir = tmp.path().to_path_buf();
-        services.tangled_pr_client = Some(Arc::new(
-            TangledPrClient::new(&server.uri(), "did:plc:owner").unwrap(),
-        ));
+        // Tangled appview fallback removed.
         let handler = FilePRHandler::new(Arc::new(services));
 
         let response = handler
@@ -497,9 +459,7 @@ mod tests {
 
         let mut services = Services::test();
         services.project_dir = tmp.path().to_path_buf();
-        services.tangled_pr_client = Some(Arc::new(
-            TangledPrClient::new(&server.uri(), "did:plc:owner").unwrap(),
-        ));
+        // Tangled appview fallback removed.
         let handler = FilePRHandler::new(Arc::new(services));
 
         let response = handler

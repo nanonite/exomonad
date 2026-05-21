@@ -100,7 +100,6 @@ impl<
                 self.ctx.git_worktree_service().clone(),
                 &merger,
                 &policy,
-                self.ctx.spindle_url(),
                 self.ctx.ci_status_map(),
             )
             .await

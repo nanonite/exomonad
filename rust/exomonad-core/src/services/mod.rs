@@ -30,7 +30,6 @@ pub mod review_policy;
 pub mod secrets;
 pub mod supervisor_registry;
 pub mod synthetic_members;
-pub mod tangled_pr;
 pub mod tmux_events;
 pub mod tmux_ipc;
 pub mod tui_consumption;
@@ -98,12 +97,7 @@ pub trait HasGitWorktreeService: Send + Sync {
 }
 pub trait HasCiStatusMap: Send + Sync {
     fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<CiStatusMap>>;
-    fn spindle_url(&self) -> Option<&str>;
 }
-pub trait HasTangledPrClient: Send + Sync {
-    fn tangled_pr_client(&self) -> Option<&Arc<tangled_pr::TangledPrClient>>;
-}
-
 /// Spawns a reviewer agent for a local PR. Implemented by `AgentControlService`.
 ///
 /// Reviewer creation is owned by the local PR watcher. TL/root roles spawn
@@ -140,15 +134,10 @@ pub struct Services {
     /// Model for spawned OpenCode workers (passed to `opencode run --model`).
     /// `None` means let opencode pick.
     pub opencode_worker_model: Option<String>,
-    /// Shared CI status map updated by the spindle WebSocket subscriber.
+    /// Shared CI status map updated by CI integrations.
     /// Keyed by `(branch, sha)` so stale CI from an older push cannot satisfy a newer PR head.
     /// Shared with `WorktreeEventWatcher` so both the watcher and merge gate read from the same map.
     pub ci_status_map: Arc<tokio::sync::RwLock<CiStatusMap>>,
-    /// Tangled spindle URL (`ws://...`). Present when spindle CI is configured.
-    pub spindle_url: Option<String>,
-    /// Optional Tangled appview reader used as a fallback when `.exo/prs.json`
-    /// does not have a PR entry.
-    pub tangled_pr_client: Option<Arc<tangled_pr::TangledPrClient>>,
 }
 
 impl Services {
@@ -217,14 +206,6 @@ impl HasCiStatusMap for Services {
     fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<CiStatusMap>> {
         &self.ci_status_map
     }
-    fn spindle_url(&self) -> Option<&str> {
-        self.spindle_url.as_deref()
-    }
-}
-impl HasTangledPrClient for Services {
-    fn tangled_pr_client(&self) -> Option<&Arc<tangled_pr::TangledPrClient>> {
-        self.tangled_pr_client.as_ref()
-    }
 }
 
 #[cfg(test)]
@@ -245,8 +226,6 @@ impl Services {
             git_wt: Arc::new(GitWorktreeService::new(PathBuf::from("."))),
             opencode_worker_model: None,
             ci_status_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            spindle_url: None,
-            tangled_pr_client: None,
         }
     }
 }

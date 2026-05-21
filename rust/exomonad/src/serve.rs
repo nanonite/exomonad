@@ -970,22 +970,6 @@ Run `exomonad recompile` first to build it.",
         exomonad_core::services::CiStatusMap::new(),
     ));
 
-    let tangled_pr_client = match (
-        config.tangled_appview_url.as_deref(),
-        config.tangled_owner_did.as_deref(),
-    ) {
-        (Some(appview_url), Some(owner_did)) => {
-            match exomonad_core::services::tangled_pr::TangledPrClient::new(appview_url, owner_did)
-            {
-                Ok(client) => Some(Arc::new(client)),
-                Err(error) => {
-                    warn!(error = %error, "Tangled PR appview fallback disabled");
-                    None
-                }
-            }
-        }
-        _ => None,
-    };
 
     // Build Services once — all shared registries in one struct
     let services = Arc::new(exomonad_core::services::Services {
@@ -1002,8 +986,6 @@ Run `exomonad recompile` first to build it.",
         git_wt,
         opencode_worker_model: config.opencode.worker_model.clone(),
         ci_status_map: ci_status_map.clone(),
-        spindle_url: config.tangled_spindle_url.clone(),
-        tangled_pr_client,
     });
 
     let mut agent_control =
@@ -1137,14 +1119,6 @@ Run `exomonad recompile` first to build it.",
             anyhow::bail!("Invalid configuration: `poll_interval` must be >= 1 second, got 0");
         }
         watcher = watcher.with_poll_interval(Duration::from_secs(interval));
-    }
-    if let Some(url) = config.tangled_knot_url.clone() {
-        info!(url = %url, "Tangled knot CI subscriber enabled");
-        watcher = watcher.with_knot_url(url);
-    }
-    if let Some(url) = config.tangled_spindle_url.clone() {
-        info!(url = %url, "Tangled spindle CI subscriber enabled");
-        watcher = watcher.with_spindle_url(url);
     }
     tokio::spawn(async move {
         watcher.run().await;

@@ -254,7 +254,6 @@ pub async fn merge_pr_local(
     git_wt: Arc<GitWorktreeService>,
     merger_agent: &AgentName,
     policy: &ReviewPolicy,
-    spindle_url: Option<&str>,
     ci_status_map: &Arc<RwLock<CiStatusMap>>,
 ) -> Result<MergePROutput> {
     let prs_path = project_dir.join(".exo/prs.json");
@@ -279,7 +278,7 @@ pub async fn merge_pr_local(
     );
 
     // Resolve CI status for Gate 7: when spindle is configured, the approved SHA must pass.
-    let ci_status = if spindle_url.is_some() {
+    let ci_status = {
         let branch = BranchName::try_from_str(head_branch.as_str())
             .expect("validated string input is non-empty");
         let approved_sha = pr
@@ -300,11 +299,9 @@ pub async fn merge_pr_local(
             branch = %head_branch,
             approved_sha = approved_sha.unwrap_or("<missing>"),
             status = ?status,
-            "CI gate check for reviewer-approved SHA (spindle configured)"
+            "CI gate check for reviewer-approved SHA "
         );
         Some(status)
-    } else {
-        None
     };
 
     // Gate checks (fail early)

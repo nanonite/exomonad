@@ -204,28 +204,6 @@ pub struct RawConfig {
     #[serde(default)]
     pub opencode_as_tl: Option<bool>,
 
-    /// WebSocket URL of the local Tangled knot (e.g. "ws://localhost:7000").
-    /// When set, exomonad subscribes to the knot's /events for pipeline→branch mappings.
-    pub tangled_knot_url: Option<String>,
-
-    /// WebSocket URL of the local Tangled spindle (e.g. "ws://localhost:8080").
-    /// When set, exomonad subscribes to the spindle's /events for CI status updates.
-    pub tangled_spindle_url: Option<String>,
-
-    /// HTTP URL of the Tangled appview used for PR read-through fallback.
-    pub tangled_appview_url: Option<String>,
-
-    /// DID of the repo owner on the Tangled knot (e.g. "did:plc:abc123").
-    /// Required alongside tangled_knot_url for XRPC repo registration during init.
-    pub tangled_owner_did: Option<String>,
-
-    /// Docker container name for the local Tangled knot (e.g. "tangled-knot-knot-1").
-    /// When set alongside tangled_owner_did, exomonad init registers the repo via docker exec.
-    pub tangled_knot_container: Option<String>,
-
-    /// Absolute path to the spindle SQLite database (e.g. "/home/user/project/spindle.db").
-    /// Used during init to INSERT the repo into the spindle's repos table.
-    pub tangled_spindle_db: Option<String>,
 
     /// PR reviewer agent configuration.
     #[serde(default)]
@@ -284,23 +262,6 @@ pub struct Config {
     /// Use OpenCode as the root TL agent instead of Claude.
     pub opencode_as_tl: bool,
 
-    /// WebSocket URL of the local Tangled knot (e.g. "ws://localhost:7000").
-    pub tangled_knot_url: Option<String>,
-
-    /// WebSocket URL of the local Tangled spindle (e.g. "ws://localhost:8080").
-    pub tangled_spindle_url: Option<String>,
-
-    /// HTTP URL of the Tangled appview used for PR read-through fallback.
-    pub tangled_appview_url: Option<String>,
-
-    /// DID of the repo owner on the Tangled knot (e.g. "did:plc:abc123").
-    pub tangled_owner_did: Option<String>,
-
-    /// Docker container name for the local Tangled knot (e.g. "tangled-knot-knot-1").
-    pub tangled_knot_container: Option<String>,
-
-    /// Absolute path to the spindle SQLite database.
-    pub tangled_spindle_db: Option<String>,
 
     /// PR reviewer agent configuration.
     pub reviewer: ReviewerConfig,
@@ -479,22 +440,6 @@ impl Config {
             .or(global_raw.opencode_as_tl)
             .unwrap_or(false);
 
-        // Resolve tangled config: local > global
-        let tangled_knot_url = local_raw.tangled_knot_url.or(global_raw.tangled_knot_url);
-        let tangled_spindle_url = local_raw
-            .tangled_spindle_url
-            .or(global_raw.tangled_spindle_url);
-        let tangled_appview_url = local_raw
-            .tangled_appview_url
-            .or(global_raw.tangled_appview_url);
-        let tangled_owner_did = local_raw.tangled_owner_did.or(global_raw.tangled_owner_did);
-        let tangled_knot_container = local_raw
-            .tangled_knot_container
-            .or(global_raw.tangled_knot_container);
-        let tangled_spindle_db = local_raw
-            .tangled_spindle_db
-            .or(global_raw.tangled_spindle_db);
-
         // Resolve reviewer: env > local > global > default
         let mut reviewer = local_raw
             .reviewer
@@ -528,14 +473,7 @@ impl Config {
             orphan_reconciler_interval_secs,
             openrouter,
             opencode,
-            opencode_as_tl,
-            tangled_knot_url,
-            tangled_spindle_url,
-            tangled_appview_url,
-            tangled_owner_did,
-            tangled_knot_container,
-            tangled_spindle_db,
-            reviewer,
+            opencode_as_tl,            reviewer,
         })
     }
 
@@ -575,14 +513,7 @@ impl Default for Config {
             orphan_reconciler_interval_secs: None,
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
-            opencode_as_tl: false,
-            tangled_knot_url: None,
-            tangled_spindle_url: None,
-            tangled_appview_url: None,
-            tangled_owner_did: None,
-            tangled_knot_container: None,
-            tangled_spindle_db: None,
-            reviewer: ReviewerConfig::default(),
+            opencode_as_tl: false,            reviewer: ReviewerConfig::default(),
         }
     }
 }

@@ -8,22 +8,20 @@ use crate::services::file_pr_local::{
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     CiStatusKey, CiStatusMap, HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue,
-    HasGitWorktreeService, HasProjectDir, HasTangledPrClient, HasTeamRegistry, ReviewerSpawner,
+    HasGitWorktreeService, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
 use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
 use exomonad_proto::effects::file_pr::LocalPrResponse;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
-use url::Url;
 
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
 const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -346,20 +344,6 @@ struct Observation {
     review_file_mtime: Option<SystemTime>,
 }
 
-#[derive(Debug, Clone)]
-struct PipelineContext {
-    branch_name: BranchName,
-    head_sha: String,
-    pr_number: Option<u64>,
-    agent_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CiSubscriberKind {
-    Knot,
-    Spindle,
-}
-
 /// Replaces `github_poller.rs` and `copilot_review.rs` by observing the local
 /// `.exo/prs.json` registry, `.exo/reviews/` files, and git worktree state.
 pub struct WorktreeEventWatcher<C> {
@@ -371,10 +355,6 @@ pub struct WorktreeEventWatcher<C> {
     policy: ReviewPolicy,
     /// Shared CI status map updated by the spindle subscriber (branch → CIStatus).
     ci_status_map: Arc<RwLock<CiStatusMap>>,
-    /// WebSocket URL of the Tangled knot (for pipeline→branch mapping).
-    knot_url: Option<String>,
-    /// WebSocket URL of the Tangled spindle (for PipelineStatus events).
-    spindle_url: Option<String>,
     /// Spawns reviewer agents on PR creation.
     reviewer_spawner: Option<Arc<dyn ReviewerSpawner>>,
 }
@@ -388,7 +368,6 @@ where
         + HasEventQueue
         + HasGitWorktreeService
         + HasProjectDir
-        + HasTangledPrClient
         + 'static,
 {
     pub fn new(ctx: Arc<C>) -> Self {
@@ -401,8 +380,6 @@ where
             plugins: None,
             policy: ReviewPolicy::default(),
             ci_status_map: Arc::new(RwLock::new(HashMap::new())),
-            knot_url: None,
-            spindle_url: None,
             reviewer_spawner: None,
         }
     }
@@ -422,24 +399,6 @@ where
         self
     }
 
-    pub fn with_knot_url(mut self, url: String) -> Self {
-        let normalized = normalize_tangled_event_ws_url(&url);
-        if normalized != url {
-            info!(configured_url = %url, subscriber_url = %normalized, "Normalized Tangled knot event stream URL");
-        }
-        self.knot_url = Some(normalized);
-        self
-    }
-
-    pub fn with_spindle_url(mut self, url: String) -> Self {
-        let normalized = normalize_tangled_event_ws_url(&url);
-        if normalized != url {
-            info!(configured_url = %url, subscriber_url = %normalized, "Normalized Tangled spindle event stream URL");
-        }
-        self.spindle_url = Some(normalized);
-        self
-    }
-
     pub fn with_reviewer_spawner(mut self, spawner: Arc<dyn ReviewerSpawner>) -> Self {
         self.reviewer_spawner = Some(spawner);
         self
@@ -454,7 +413,7 @@ where
     }
 
     fn ci_source_configured(&self) -> bool {
-        self.spindle_url.is_some()
+        true
     }
 
     async fn observed_ci_status(&self, branch: &BranchName, head_sha: &str) -> CIStatus {
@@ -469,65 +428,12 @@ where
             .copied()
             .unwrap_or(CIStatus::Unknown)
     }
-
-    async fn trigger_tangled_manual_ci(
-        &self,
-        pr_number: u64,
-        branch: &str,
-        head_sha: &str,
-    ) -> Result<()> {
-        let Some(knot_url) = self.knot_url.as_deref() else {
-            anyhow::bail!("tangled_knot_url is not configured");
-        };
-        let url = tangled_manual_ci_url(knot_url)?;
-        let project_dir = self.ctx.project_dir();
-        let repo_name = project_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown");
-        let payload = serde_json::json!({
-            "repo": repo_name,
-            "branch": branch,
-            "ref": format!("refs/heads/{branch}"),
-            "sha": head_sha,
-            "pr_number": pr_number,
-        });
-
-        let response = reqwest::Client::new()
-            .post(url.clone())
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| format!("failed to POST Tangled manual CI trigger to {url}"))?;
-        if !response.status().is_success() {
-            anyhow::bail!("Tangled manual CI trigger returned {}", response.status());
-        }
-
-        info!(pr_number, branch, head_sha, url = %url, "Triggered Tangled manual CI");
-        Ok(())
-    }
-
     pub async fn run(&self) {
         tracing::info!(
             poll_interval_secs = self.poll_interval.as_secs(),
             "Local worktree event watcher started"
         );
 
-        // Launch CI event subscriber if either URL is configured
-        if self.knot_url.is_some() || self.spindle_url.is_some() {
-            let ci_map = self.ci_status_map.clone();
-            let knot_url = self.knot_url.clone();
-            let spindle_url = self.spindle_url.clone();
-            let project_dir = self.ctx.project_dir();
-            let worktrees_dir = project_dir.join(".exo/worktrees");
-            let repo_name = project_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.to_string());
-            tokio::spawn(async move {
-                run_ci_subscriber(knot_url, spindle_url, ci_map, worktrees_dir, repo_name).await;
-            });
-        }
 
         let base_interval = self.poll_interval;
         let max_backoff = Duration::from_secs(600);
@@ -577,39 +483,7 @@ where
     }
 
     async fn bootstrap_registry_from_reviews(&self) -> Result<PrRegistry> {
-        let Some(client) = self.ctx.tangled_pr_client().cloned() else {
-            return Ok(PrRegistry::default());
-        };
-        let reviews_dir = self.ctx.project_dir().join(".exo/reviews");
-        let mut entries = match tokio::fs::read_dir(&reviews_dir).await {
-            Ok(entries) => entries,
-            Err(_) => return Ok(PrRegistry::default()),
-        };
-
-        let mut registry = PrRegistry::default();
-        while let Some(entry) = entries.next_entry().await? {
-            let Some(pr_number) = review_file_pr_number(&entry.file_name().to_string_lossy())
-            else {
-                continue;
-            };
-            let Some(pr_response) = client.get_pull(pr_number as i64).await? else {
-                continue;
-            };
-            let review_file = Self::read_review_file(self.ctx.project_dir(), pr_number).await;
-            let pr_entry = pr_entry_from_tangled_response(pr_response, review_file.as_ref());
-            registry.next_number = registry.next_number.max(pr_entry.number + 1);
-            registry.prs.insert(pr_entry.number, pr_entry);
-        }
-
-        if !registry.prs.is_empty() {
-            write_pr_registry(&self.prs_path, &registry).await?;
-            info!(
-                count = registry.prs.len(),
-                "Bootstrapped prs.json from existing review files and Tangled PR state"
-            );
-        }
-
-        Ok(registry)
+        Ok(PrRegistry::default())
     }
 
     async fn set_pr_stuck(&self, pr_number: u64, rounds: u32) -> anyhow::Result<()> {
@@ -1060,18 +934,7 @@ where
                         branch,
                         head_sha,
                     } => {
-                        if let Err(e) = self
-                            .trigger_tangled_manual_ci(pr_number, &branch, &head_sha)
-                            .await
-                        {
-                            warn!(
-                                pr_number,
-                                branch = %branch,
-                                head_sha = %head_sha,
-                                error = %e,
-                                "Failed to trigger Tangled manual CI"
-                            );
-                        }
+                        info!(pr_number, branch = %branch, head_sha = %head_sha, "Manual CI trigger is disabled until Forgejo integration is configured");
                     }
                 }
             }
@@ -2322,22 +2185,6 @@ fn review_stall_diagnostic(
         ci_status: ci_status.to_string(),
     }
 }
-
-fn tangled_manual_ci_url(knot_url: &str) -> Result<String> {
-    let mut url =
-        Url::parse(knot_url).with_context(|| format!("invalid Tangled knot URL: {knot_url}"))?;
-    match url.scheme() {
-        "ws" => url.set_scheme("http").ok(),
-        "wss" => url.set_scheme("https").ok(),
-        "http" | "https" => Some(()),
-        scheme => anyhow::bail!("unsupported Tangled knot URL scheme: {scheme}"),
-    };
-    url.set_path("/xrpc/sh.tangled.pipeline.trigger");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string())
-}
-
 fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
     let kind_is_merge_ready = payload
         .get("kind")
@@ -2412,350 +2259,6 @@ fn format_review_message(comments: &[LocalReviewComment], reviews: &[LocalReview
     msg
 }
 
-// ============================================================================
-// Tangled CI event subscribers
-// ============================================================================
-
-/// Wire frame for events streamed by both the knot and the spindle.
-#[derive(Deserialize)]
-struct TangledStreamEvent {
-    rkey: String,
-    nsid: String,
-    event: serde_json::Value,
-}
-
-/// Launch background tasks that subscribe to the knot and spindle WebSocket
-/// streams and keep `ci_status_map` up to date.
-async fn run_ci_subscriber(
-    knot_url: Option<String>,
-    spindle_url: Option<String>,
-    ci_status_map: Arc<RwLock<CiStatusMap>>,
-    worktrees_dir: std::path::PathBuf,
-    repo_name: Option<String>,
-) {
-    // pipeline rkey → branch name, populated from the knot's Pipeline events
-    let pipeline_map: Arc<RwLock<HashMap<String, PipelineContext>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    let (ready_tx, ready_rx) = mpsc::channel(2);
-    tokio::spawn(log_ci_pipeline_readiness(
-        knot_url.clone(),
-        spindle_url.clone(),
-        worktrees_dir.clone(),
-        ready_rx,
-    ));
-
-    let mut handles = Vec::new();
-
-    if let Some(url) = knot_url {
-        let pm = pipeline_map.clone();
-        let wd = worktrees_dir.clone();
-        let ready = ready_tx.clone();
-        let repo = repo_name.clone();
-        handles.push(tokio::spawn(async move {
-            run_knot_subscriber(url, pm, wd, ready, repo).await;
-        }));
-    }
-
-    if let Some(url) = spindle_url {
-        let pm = pipeline_map.clone();
-        let cs = ci_status_map.clone();
-        let wd = worktrees_dir.clone();
-        let ready = ready_tx.clone();
-        handles.push(tokio::spawn(async move {
-            run_spindle_subscriber(url, pm, cs, wd, ready).await;
-        }));
-    }
-    drop(ready_tx);
-
-    futures::future::join_all(handles).await;
-}
-
-async fn log_ci_pipeline_readiness(
-    knot_url: Option<String>,
-    spindle_url: Option<String>,
-    worktrees_dir: std::path::PathBuf,
-    mut ready_rx: mpsc::Receiver<CiSubscriberKind>,
-) {
-    let mut knot_ready = knot_url.is_none();
-    let mut spindle_ready = spindle_url.is_none();
-    let repo = worktrees_dir
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let deadline = tokio::time::sleep(Duration::from_secs(30));
-    tokio::pin!(deadline);
-
-    loop {
-        if knot_ready && spindle_ready {
-            info!(
-                knot = knot_url.as_deref().unwrap_or("disabled"),
-                spindle = spindle_url.as_deref().unwrap_or("disabled"),
-                repo,
-                "CI pipeline ready"
-            );
-            return;
-        }
-
-        tokio::select! {
-            maybe_kind = ready_rx.recv() => {
-                match maybe_kind {
-                    Some(CiSubscriberKind::Knot) => knot_ready = true,
-                    Some(CiSubscriberKind::Spindle) => spindle_ready = true,
-                    None => return,
-                }
-            }
-            _ = &mut deadline => {
-                warn!(
-                    knot = knot_url.as_deref().unwrap_or("disabled"),
-                    spindle = spindle_url.as_deref().unwrap_or("disabled"),
-                    knot_ready,
-                    spindle_ready,
-                    repo,
-                    "CI pipeline degraded: subscriber connection not ready after 30s"
-                );
-                return;
-            }
-        }
-    }
-}
-
-/// Subscribes to the knot's `/events` WebSocket and builds a mapping from
-/// pipeline rkey → branch name by parsing `sh.tangled.pipeline` records.
-async fn run_knot_subscriber(
-    knot_url: String,
-    pipeline_map: Arc<RwLock<HashMap<String, PipelineContext>>>,
-    worktrees_dir: std::path::PathBuf,
-    ready_tx: mpsc::Sender<CiSubscriberKind>,
-    repo_name: Option<String>,
-) {
-    let mut reported_ready = false;
-    loop {
-        match tokio_tungstenite::connect_async(&knot_url).await {
-            Ok((mut ws, _)) => {
-                info!(url = %knot_url, "Knot CI subscriber connected");
-                if !reported_ready {
-                    let _ = ready_tx.send(CiSubscriberKind::Knot).await;
-                    reported_ready = true;
-                }
-                while let Some(msg) = ws.next().await {
-                    match msg {
-                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                            if let Ok(ev) = serde_json::from_str::<TangledStreamEvent>(&text) {
-                                if ev.nsid == "sh.tangled.pipeline" {
-                                    if !pipeline_matches_repo(&ev.event, repo_name.as_deref()) {
-                                        continue;
-                                    }
-                                    if let Some((branch_name, head_sha)) =
-                                        extract_pipeline_branch_and_sha(&ev.event)
-                                    {
-                                        let context = lookup_pipeline_context(
-                                            &worktrees_dir,
-                                            branch_name,
-                                            head_sha,
-                                        )
-                                        .await;
-                                        let worktree =
-                                            worktrees_dir.join(context.branch_name.as_str());
-                                        info!(
-                                            rkey = %ev.rkey,
-                                            branch = %context.branch_name,
-                                            pr_number = context.pr_number,
-                                            agent_name = context.agent_name.as_deref().unwrap_or("unknown"),
-                                            head_sha = %context.head_sha,
-                                            worktree = %worktree.display(),
-                                            "Spindle: CI initiated for worktree"
-                                        );
-                                        pipeline_map.write().await.insert(ev.rkey, context);
-                                    }
-                                }
-                            }
-                        }
-                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
-                        Err(e) => {
-                            warn!(url = %knot_url, error = %e, "Knot subscriber error");
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                warn!(url = %knot_url, "Knot CI subscriber disconnected, reconnecting in 15s");
-            }
-            Err(e) => {
-                warn!(url = %knot_url, error = %e, "Knot CI subscriber failed to connect, retrying in 15s");
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(15)).await;
-    }
-}
-
-fn pipeline_matches_repo(event: &serde_json::Value, expected_repo: Option<&str>) -> bool {
-    let Some(expected_repo) = expected_repo else {
-        return true;
-    };
-    event
-        .get("triggerMetadata")
-        .and_then(|tm| tm.get("repo"))
-        .and_then(|repo| repo.get("repo"))
-        .and_then(|repo| repo.as_str())
-        .map(|repo| repo == expected_repo)
-        .unwrap_or(false)
-}
-
-/// Subscribes to the spindle's `/events` WebSocket and updates `ci_status_map`
-/// by parsing `sh.tangled.pipeline.status` events.
-async fn run_spindle_subscriber(
-    spindle_url: String,
-    pipeline_map: Arc<RwLock<HashMap<String, PipelineContext>>>,
-    ci_status_map: Arc<RwLock<CiStatusMap>>,
-    worktrees_dir: std::path::PathBuf,
-    ready_tx: mpsc::Sender<CiSubscriberKind>,
-) {
-    let mut reported_ready = false;
-    loop {
-        match tokio_tungstenite::connect_async(&spindle_url).await {
-            Ok((mut ws, _)) => {
-                info!(url = %spindle_url, "Spindle CI subscriber connected");
-                if !reported_ready {
-                    let _ = ready_tx.send(CiSubscriberKind::Spindle).await;
-                    reported_ready = true;
-                }
-                while let Some(msg) = ws.next().await {
-                    match msg {
-                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                            if let Ok(ev) = serde_json::from_str::<TangledStreamEvent>(&text) {
-                                if ev.nsid == "sh.tangled.pipeline.status" {
-                                    if let Some((rkey, status)) = extract_pipeline_status(&ev.event)
-                                    {
-                                        let context = pipeline_map.read().await.get(&rkey).cloned();
-                                        if let Some(context) = context {
-                                            let ci = CIStatus::parse(&status);
-                                            let worktree =
-                                                worktrees_dir.join(context.branch_name.as_str());
-                                            info!(
-                                                rkey = %rkey,
-                                                branch = %context.branch_name,
-                                                pr_number = context.pr_number,
-                                                agent_name = context.agent_name.as_deref().unwrap_or("unknown"),
-                                                status = %status,
-                                                worktree = %worktree.display(),
-                                                "Spindle: CI status updated"
-                                            );
-                                            ci_status_map.write().await.insert(
-                                                ci_status_key(
-                                                    &context.branch_name,
-                                                    &context.head_sha,
-                                                ),
-                                                ci,
-                                            );
-                                        } else {
-                                            info!(rkey = %rkey, status = %status, "Spindle: CI event received but no branch mapping for rkey yet (pipeline may not have registered)");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
-                        Err(e) => {
-                            warn!(url = %spindle_url, error = %e, "Spindle subscriber error");
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                warn!(url = %spindle_url, "Spindle CI subscriber disconnected, reconnecting in 15s");
-            }
-            Err(e) => {
-                warn!(url = %spindle_url, error = %e, "Spindle CI subscriber failed to connect, retrying in 15s");
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(15)).await;
-    }
-}
-
-async fn lookup_pipeline_context(
-    worktrees_dir: &Path,
-    branch_name: BranchName,
-    head_sha: String,
-) -> PipelineContext {
-    let Some(prs_path) = worktrees_dir
-        .parent()
-        .map(|exo_dir| exo_dir.join("prs.json"))
-    else {
-        return PipelineContext {
-            branch_name,
-            head_sha,
-            pr_number: None,
-            agent_name: None,
-        };
-    };
-
-    match read_pr_registry(&prs_path).await {
-        Ok(registry) => registry
-            .find_by_branch(&branch_name)
-            .map(|pr| PipelineContext {
-                branch_name: branch_name.clone(),
-                head_sha: head_sha.clone(),
-                pr_number: Some(pr.number),
-                agent_name: Some(pr.author_agent.clone()),
-            })
-            .unwrap_or(PipelineContext {
-                branch_name,
-                head_sha,
-                pr_number: None,
-                agent_name: None,
-            }),
-        Err(error) => {
-            debug!(
-                path = %prs_path.display(),
-                branch = %branch_name,
-                error = %error,
-                "Unable to enrich CI pipeline event from local PR registry"
-            );
-            PipelineContext {
-                branch_name,
-                head_sha,
-                pr_number: None,
-                agent_name: None,
-            }
-        }
-    }
-}
-
-fn normalize_tangled_event_ws_url(input: &str) -> String {
-    let trimmed = input.trim();
-    match Url::parse(trimmed) {
-        Ok(mut url) => {
-            match url.scheme() {
-                "http" => {
-                    let _ = url.set_scheme("ws");
-                }
-                "https" => {
-                    let _ = url.set_scheme("wss");
-                }
-                _ => {}
-            }
-            let path = url.path().trim_end_matches('/');
-            if path.is_empty() {
-                url.set_path("/events");
-            } else if !path.ends_with("/events") {
-                url.set_path(&format!("{path}/events"));
-            }
-            url.to_string()
-        }
-        Err(_) => {
-            let trimmed = trimmed.trim_end_matches('/');
-            if trimmed.ends_with("/events") {
-                trimmed.to_string()
-            } else {
-                format!("{trimmed}/events")
-            }
-        }
-    }
-}
-
 fn ci_status_key(branch: &BranchName, head_sha: &str) -> CiStatusKey {
     (branch.clone(), head_sha.to_string())
 }
@@ -2813,7 +2316,7 @@ async fn git_head_sha(worktree_path: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::{tangled_pr::TangledPrClient, Services};
+    use crate::services::Services;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2839,85 +2342,6 @@ mod tests {
             author_branch: None,
         }
     }
-
-    #[tokio::test]
-    async fn bootstraps_empty_registry_from_review_files_and_tangled_prs() {
-        let temp_dir = tempfile::tempdir().expect("temp dir created");
-        let reviews_dir = temp_dir.path().join(".exo/reviews");
-        tokio::fs::create_dir_all(&reviews_dir)
-            .await
-            .expect("reviews dir created");
-        tokio::fs::write(
-            temp_dir.path().join(".exo/prs.json"),
-            "{\"prs\":{},\"next_number\":1}\n",
-        )
-        .await
-        .expect("empty registry written");
-        tokio::fs::write(
-            reviews_dir.join("pr_4.json"),
-            r#"{
-                "state":"approved",
-                "comments":[],
-                "verdicts":[{
-                    "state":"approved",
-                    "body":"LGTM",
-                    "comments":[],
-                    "author_branch":"review-pr-4",
-                    "head_sha":"abc123"
-                }]
-            }"#,
-        )
-        .await
-        .expect("review file written");
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/xrpc/sh.tangled.repo.getPull"))
-            .and(query_param("repo", "did:plc:owner"))
-            .and(query_param("pull", "4"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "found": true,
-                "prNumber": 4,
-                "headBranch": "main.fix-codex",
-                "baseBranch": "main",
-                "ownerDid": "did:plc:owner",
-                "reviewState": "approved",
-                "latestSha": "abc123",
-                "reviewerAgent": "review-pr-4-codex"
-            })))
-            .mount(&server)
-            .await;
-
-        let mut services = Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-        services.tangled_pr_client = Some(Arc::new(
-            TangledPrClient::new(&server.uri(), "did:plc:owner").expect("client created"),
-        ));
-        let watcher = WorktreeEventWatcher::new(Arc::new(services));
-
-        let registry = watcher
-            .bootstrap_registry_from_reviews()
-            .await
-            .expect("registry bootstrapped");
-
-        let pr = registry.prs.get(&4).expect("PR recovered");
-        assert_eq!(registry.next_number, 5);
-        assert_eq!(pr.head_branch, "main.fix-codex");
-        assert_eq!(pr.base_branch, "main");
-        assert_eq!(pr.author_agent, "fix-codex");
-        assert_eq!(pr.review_state, LocalReviewState::Approved);
-        assert_eq!(pr.last_head_sha.as_deref(), Some("abc123"));
-        assert_eq!(pr.approved_at_sha.as_deref(), Some("abc123"));
-        assert_eq!(pr.reviewer_agent.as_deref(), Some("review-pr-4-codex"));
-        assert_eq!(pr.reviewer_birth_branch.as_deref(), Some("review-pr-4"));
-        assert_eq!(pr.rounds, 1);
-
-        let persisted = read_pr_registry(&watcher.prs_path)
-            .await
-            .expect("registry persisted");
-        assert!(persisted.prs.contains_key(&4));
-    }
-
     // ---------------------------------------------------------------------------
     // compute_pr_actions tests
     // ---------------------------------------------------------------------------
@@ -3554,8 +2978,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
-        let watcher = WorktreeEventWatcher::new(Arc::new(services))
-            .with_spindle_url("ws://localhost:6555".to_string());
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
 
@@ -4712,9 +4135,7 @@ mod tests {
             .write()
             .await
             .insert((branch.clone(), "abc123".to_string()), CIStatus::Success);
-        let watcher = WorktreeEventWatcher::new(Arc::new(services))
-            .with_ci_status_map(ci_status_map)
-            .with_spindle_url("ws://localhost:6555".to_string());
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_ci_status_map(ci_status_map);
 
         assert_eq!(
             watcher.observed_ci_status(&branch, "abc123").await,

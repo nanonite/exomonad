@@ -372,7 +372,7 @@ pub async fn run(
 
     // Copy spindle binary from global install when Tangled is configured.
     // Always refreshes if the global is newer (same pattern as WASM refresh).
-    if config.tangled_owner_did.is_some() {
+    if false {
         let spindle_local = cwd.join(".exo/bin/spindle");
         if let Ok(home) = std::env::var("HOME") {
             let spindle_global = PathBuf::from(home).join(".exo/bin/spindle");
@@ -928,9 +928,9 @@ pub async fn run(
     // has already declared a companion named "spindle".
     let spindle_path = cwd.join(".exo/bin/spindle");
     let auto_spindle = build_spindle_companion(
-        config.tangled_owner_did.as_deref(),
-        config.tangled_knot_url.as_deref(),
-        config.tangled_spindle_db.as_deref(),
+        None,
+        None,
+        None,
         &spindle_path,
         &config.companions,
     );
@@ -1387,9 +1387,9 @@ async fn report_orphaned_agent_windows(session: &str, cwd: &Path) {
 
 async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
     let (container, owner_did, spindle_db) = match (
-        config.tangled_knot_container.as_deref(),
-        config.tangled_owner_did.as_deref(),
-        config.tangled_spindle_db.as_deref(),
+        None,
+        None,
+        None,
     ) {
         (Some(c), Some(d), Some(s)) => (c, d, s),
         _ => {
@@ -1398,10 +1398,7 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
         }
     };
 
-    let configured_knot_url = config
-        .tangled_knot_url
-        .as_deref()
-        .unwrap_or("localhost:5555");
+    let configured_knot_url = "localhost:5555";
     let knot_hostname = match discover_knot_container_hostname(container) {
         Ok(hostname) => {
             info!(
