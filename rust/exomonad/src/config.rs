@@ -205,6 +205,15 @@ pub struct RawConfig {
     pub opencode_as_tl: Option<bool>,
 
 
+    /// Forgejo base URL (e.g. "http://localhost:3000").
+    pub forgejo_url: Option<String>,
+
+    /// Forgejo token for API/webhook setup.
+    pub forgejo_token: Option<String>,
+
+    /// Shared secret used to verify Forgejo webhook signatures.
+    pub forgejo_webhook_secret: Option<String>,
+
     /// PR reviewer agent configuration.
     #[serde(default)]
     pub reviewer: Option<ReviewerConfig>,
@@ -262,6 +271,15 @@ pub struct Config {
     /// Use OpenCode as the root TL agent instead of Claude.
     pub opencode_as_tl: bool,
 
+
+    /// Forgejo base URL (e.g. "http://localhost:3000").
+    pub forgejo_url: Option<String>,
+
+    /// Forgejo token for API/webhook setup.
+    pub forgejo_token: Option<String>,
+
+    /// Shared secret used to verify Forgejo webhook signatures.
+    pub forgejo_webhook_secret: Option<String>,
 
     /// PR reviewer agent configuration.
     pub reviewer: ReviewerConfig,
@@ -440,6 +458,12 @@ impl Config {
             .or(global_raw.opencode_as_tl)
             .unwrap_or(false);
 
+        let forgejo_url = local_raw.forgejo_url.or(global_raw.forgejo_url);
+        let forgejo_token = local_raw.forgejo_token.or(global_raw.forgejo_token);
+        let forgejo_webhook_secret = local_raw
+            .forgejo_webhook_secret
+            .or(global_raw.forgejo_webhook_secret);
+
         // Resolve reviewer: env > local > global > default
         let mut reviewer = local_raw
             .reviewer
@@ -473,7 +497,11 @@ impl Config {
             orphan_reconciler_interval_secs,
             openrouter,
             opencode,
-            opencode_as_tl,            reviewer,
+            opencode_as_tl,
+            forgejo_url,
+            forgejo_token,
+            forgejo_webhook_secret,
+            reviewer,
         })
     }
 
@@ -513,7 +541,11 @@ impl Default for Config {
             orphan_reconciler_interval_secs: None,
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
-            opencode_as_tl: false,            reviewer: ReviewerConfig::default(),
+            opencode_as_tl: false,
+            forgejo_url: None,
+            forgejo_token: None,
+            forgejo_webhook_secret: None,
+            reviewer: ReviewerConfig::default(),
         }
     }
 }

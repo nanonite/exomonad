@@ -220,6 +220,9 @@ tangled_appview_url = "http://localhost:3000" # optional — appview HTTP URL fo
 tangled_owner_did = "did:plc:yourkey"        # optional — when set, exomonad init auto-starts spindle as a process companion
 tangled_spindle_db = "spindle.db"            # optional — spindle SQLite path (default: spindle.db in project root)
 tangled_knot_container = "tangled-knot-knot-1"  # optional — knot container name for docker-based repo registration
+forgejo_url = "http://localhost:3000"           # optional — Forgejo base URL
+forgejo_token = "forgejo_pat"                      # optional — Forgejo API token
+forgejo_webhook_secret = "shared-secret"           # optional — webhook signature secret
 
 # Exomonad discovers the knot's canonical runtime hostname from tangled_knot_container during init.
 # Extra MCP servers (HTTP or stdio). Included in .mcp.json for all agents.

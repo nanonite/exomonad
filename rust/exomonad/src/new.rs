@@ -227,7 +227,12 @@ fn config_content(tangled: Option<&TangledNewIntegration>) -> String {
          # tmux_session = \"my-project\"\n\
          # model = \"sonnet\"\n\
          \n\
-         {tangled_block}"
+         {tangled_block}
+         # Forgejo CI integration
+         # forgejo_url = \"http://localhost:3000\"
+         # forgejo_token = \"your_forgejo_token\"
+         # forgejo_webhook_secret = \"your_webhook_secret\"
+"
     )
 }
 
