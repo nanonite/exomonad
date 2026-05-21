@@ -608,24 +608,13 @@ pub async fn run(
         let _ = std::fs::remove_file(&pid_path);
         info!("Cleaned up server socket and pid");
 
-        // Clear stale non-root agent entries. Keep prs.json: local PRs and review
-        // files outlive tmux sessions, and the watcher can resume them on startup.
-        let agents_dir = cwd.join(".exo/agents");
-        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
-            for entry in entries.flatten() {
-                if entry.file_name() != "root" {
-                    let _ = std::fs::remove_dir_all(entry.path());
-                }
-            }
-            info!("Cleared stale agent entries (kept root)");
-        }
-
         if session_alive {
             info!(session = %session, "Deleting session (--recreate)");
             TmuxIpc::kill_session(&session).await?;
         }
     } else if session_alive {
         // Attach to running session
+        report_orphaned_agent_windows(&session, &cwd).await;
         info!(session = %session, "Attaching to session");
         return TmuxIpc::attach_session(&session).await;
     }
@@ -1316,6 +1305,86 @@ pub async fn run(
 /// All steps are idempotent — safe to call on every `exomonad init`. Failures are warnings, not
 /// errors: a missing Docker container or unreachable spindle DB must not prevent the session from
 /// starting.
+async fn report_orphaned_agent_windows(session: &str, cwd: &Path) {
+    let output = std::process::Command::new("tmux")
+        .args([
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_name}\t#{pane_current_command}",
+        ])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            warn!(
+                session,
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Could not list tmux windows for orphan report"
+            );
+            return;
+        }
+        Err(error) => {
+            warn!(session, error = %error, "tmux list-windows failed for orphan report");
+            return;
+        }
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut rows: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split('\t');
+        let window_name = match parts.next() {
+            Some(name) => name.trim(),
+            None => continue,
+        };
+        let pane_cmd = parts.next().unwrap_or("").trim();
+
+        if window_name.is_empty() || window_name == "Server" || window_name == "TL" {
+            continue;
+        }
+
+        let is_shell_prompt = matches!(pane_cmd, "bash" | "zsh" | "fish" | "sh");
+        if !is_shell_prompt {
+            continue;
+        }
+
+        let agent_dir = cwd.join(".exo/agents").join(window_name);
+        if !agent_dir.exists() {
+            continue;
+        }
+
+        let issue = std::fs::read_to_string(agent_dir.join("active_issue"))
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "(none)".to_string());
+
+        let age = std::fs::read_to_string(agent_dir.join("spawned_at"))
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|spawned| format!("{}m", now.saturating_sub(spawned) / 60))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        rows.push(format!("- {window_name}: issue={issue}, age={age}"));
+    }
+
+    if rows.is_empty() {
+        return;
+    }
+
+    warn!(session, count = rows.len(), "Orphaned agent windows detected (not auto-killed)");
+    for row in rows {
+        warn!(session, "{}", row);
+    }
+}
+
 async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
     let (container, owner_did, spindle_db) = match (
         config.tangled_knot_container.as_deref(),
