@@ -165,6 +165,14 @@ impl<
             }
         }
 
+        for var in ["GH_HOST", "GH_TOKEN", "FORGEJO_URL"] {
+            if let Ok(value) = std::env::var(var) {
+                if !value.is_empty() {
+                    env_vars.insert(var.to_string(), value);
+                }
+            }
+        }
+
         // Propagate swarm run_id and parent agent identity for OTel resource attributes
         if let Ok(v) = std::env::var("EXOMONAD_SWARM_RUN_ID") {
             env_vars.insert("EXOMONAD_SWARM_RUN_ID".to_string(), v);

@@ -28,6 +28,24 @@ fn read_chainlink_tl_protocol(cwd: &Path) -> Option<String> {
     }
 }
 
+
+fn forgejo_host_from_url(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let no_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let host = no_scheme.split('/').next().unwrap_or_default().trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 fn current_time_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -668,6 +686,26 @@ pub async fn run(
             "tmux session '{}' was created but is not responding.",
             session
         );
+    }
+
+    if let (Some(forgejo_url), Some(forgejo_token)) = (
+        config.forgejo_url.as_deref(),
+        config.forgejo_token.as_deref(),
+    ) {
+        if let Some(gh_host) = forgejo_host_from_url(forgejo_url) {
+            std::env::set_var("GH_HOST", &gh_host);
+            let _ = std::process::Command::new("tmux")
+                .args(["set-environment", "-t", &session, "GH_HOST", &gh_host])
+                .status();
+        }
+        std::env::set_var("GH_TOKEN", forgejo_token);
+        std::env::set_var("FORGEJO_URL", forgejo_url);
+        let _ = std::process::Command::new("tmux")
+            .args(["set-environment", "-t", &session, "GH_TOKEN", forgejo_token])
+            .status();
+        let _ = std::process::Command::new("tmux")
+            .args(["set-environment", "-t", &session, "FORGEJO_URL", forgejo_url])
+            .status();
     }
 
     // Set EXOMONAD_TMUX_SESSION
