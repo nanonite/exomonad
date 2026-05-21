@@ -457,3 +457,12 @@ live-teams-e2e:
 # Validate Gemini settings against schema
 validate-settings:
     nix-shell -p python3Packages.jsonschema --run "python3 scripts/validate_json.py .gemini/settings.json schema/gemini-cli/settings.schema.json"
+
+# Forgejo CI migration E2E
+# Requires: forgejo/docker-compose.yml stack and EXOMONAD_FORGEJO_TOKEN
+# export EXOMONAD_FORGEJO_TOKEN=...
+e2e-forgejo-ci:
+    ./tests/e2e/forgejo-ci/run.sh
+
+check-e2e-forgejo-ci:
+    bash -n tests/e2e/forgejo-ci/run.sh
