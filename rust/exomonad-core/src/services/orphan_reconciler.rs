@@ -12,19 +12,43 @@ pub async fn run_orphan_reconciler(
     project_dir: Arc<std::path::PathBuf>,
     git_wt: Arc<GitWorktreeService>,
     interval: Duration,
+    max_leaf_session_seconds: u64,
+    max_reviewer_session_seconds: u64,
+    tmux_session: Option<String>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
-        if let Err(err) = reconcile_once(&project_dir, git_wt.clone()).await {
+        if let Err(err) = reconcile_once(
+            &project_dir,
+            git_wt.clone(),
+            max_leaf_session_seconds,
+            max_reviewer_session_seconds,
+            tmux_session.as_deref(),
+        )
+        .await
+        {
             warn!(error = %err, "orphan reconciler tick failed");
         }
     }
 }
 
-pub async fn reconcile_once(project_dir: &Path, git_wt: Arc<GitWorktreeService>) -> Result<()> {
+pub async fn reconcile_once(
+    project_dir: &Path,
+    git_wt: Arc<GitWorktreeService>,
+    max_leaf_session_seconds: u64,
+    max_reviewer_session_seconds: u64,
+    tmux_session: Option<&str>,
+) -> Result<()> {
     reconcile_issue_worktrees(project_dir, git_wt.clone()).await?;
     reconcile_reviewer_worktrees(project_dir, git_wt).await?;
+    reconcile_session_timeouts(
+        project_dir,
+        max_leaf_session_seconds,
+        max_reviewer_session_seconds,
+        tmux_session,
+    )
+    .await?;
     Ok(())
 }
 
@@ -156,6 +180,163 @@ async fn append_issue_closed_event(
     use tokio::io::AsyncWriteExt;
     file.write_all(line.as_bytes()).await?;
     Ok(())
+}
+
+async fn reconcile_session_timeouts(
+    project_dir: &Path,
+    max_leaf_session_seconds: u64,
+    max_reviewer_session_seconds: u64,
+    tmux_session: Option<&str>,
+) -> Result<()> {
+    if max_leaf_session_seconds == 0 && max_reviewer_session_seconds == 0 {
+        return Ok(());
+    }
+
+    let agents_dir = project_dir.join(".exo/agents");
+    let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await else {
+        return Ok(());
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let Some(slug) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if slug == "root" {
+            continue;
+        }
+
+        let is_reviewer = slug.starts_with("review-pr-");
+        let limit = if is_reviewer {
+            max_reviewer_session_seconds
+        } else {
+            max_leaf_session_seconds
+        };
+        if limit == 0 {
+            continue;
+        }
+
+        let agent_dir = agents_dir.join(&slug);
+        let spawned_at = match tokio::fs::read_to_string(agent_dir.join("spawned_at")).await {
+            Ok(s) => match s.trim().parse::<u64>() {
+                Ok(t) => t,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        let age_secs = now_secs.saturating_sub(spawned_at);
+        if age_secs <= limit {
+            continue;
+        }
+
+        let active_issue = tokio::fs::read_to_string(agent_dir.join("active_issue"))
+            .await
+            .ok()
+            .map(|s| s.trim().to_string());
+
+        let limit_mins = limit / 60;
+        info!(
+            agent = %slug,
+            age_secs,
+            limit_secs = limit,
+            issue = ?active_issue,
+            "Session timeout: killing agent"
+        );
+
+        if let Some(session) = tmux_session {
+            kill_agent_window(session, &agent_dir, &slug).await;
+            notify_tl_of_timeout(project_dir, session, &slug, &active_issue, limit_mins).await;
+        }
+    }
+    Ok(())
+}
+
+async fn kill_agent_window(session: &str, agent_dir: &std::path::Path, slug: &str) {
+    let routing = match crate::domain::RoutingInfo::read_from_dir(agent_dir).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(agent = %slug, error = %e, "Could not read routing.json for timeout kill (non-fatal)");
+            return;
+        }
+    };
+
+    if let Some(window_id) = &routing.window_id {
+        let target = format!("{}:{}", session, window_id.as_str());
+        let status = Command::new("tmux")
+            .args(["kill-window", "-t", &target])
+            .status()
+            .await;
+        match status {
+            Ok(s) if s.success() => info!(agent = %slug, target = %target, "Killed timed-out agent window"),
+            Ok(s) => warn!(agent = %slug, target = %target, status = ?s, "kill-window returned non-zero (window may already be gone)"),
+            Err(e) => warn!(agent = %slug, error = %e, "Failed to run tmux kill-window"),
+        }
+    } else if let Some(pane_id) = &routing.pane_id {
+        let target = format!("{}:{}", session, pane_id.as_str());
+        let status = Command::new("tmux")
+            .args(["kill-pane", "-t", &target])
+            .status()
+            .await;
+        match status {
+            Ok(s) if s.success() => info!(agent = %slug, target = %target, "Killed timed-out agent pane"),
+            Ok(s) => warn!(agent = %slug, target = %target, status = ?s, "kill-pane returned non-zero"),
+            Err(e) => warn!(agent = %slug, error = %e, "Failed to run tmux kill-pane"),
+        }
+    }
+}
+
+async fn notify_tl_of_timeout(
+    project_dir: &Path,
+    session: &str,
+    slug: &str,
+    active_issue: &Option<String>,
+    limit_mins: u64,
+) {
+    let root_dir = project_dir.join(".exo/agents/root");
+    let Ok(routing) = crate::domain::RoutingInfo::read_from_dir(&root_dir).await else {
+        return;
+    };
+    let Some(window_id) = &routing.window_id else {
+        return;
+    };
+
+    let issue_hint = match active_issue {
+        Some(id) => format!(
+            " Issue #{id} — call chainlink_timer_stop {id} then re-spec or escalate."
+        ),
+        None => String::new(),
+    };
+    let message = format!(
+        "[TIMED OUT: {slug}] Exceeded {limit_mins}min session limit — killed.{issue_hint}"
+    );
+
+    let target = format!("{}:{}", session, window_id.as_str());
+    let tmp = std::env::temp_dir().join(format!("exomonad-timeout-{}.txt", slug));
+    if tokio::fs::write(&tmp, &message).await.is_ok() {
+        let _ = Command::new("tmux")
+            .args(["load-buffer", tmp.to_string_lossy().as_ref()])
+            .status()
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = Command::new("tmux")
+            .args(["paste-buffer", "-t", &target])
+            .status()
+            .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = Command::new("tmux")
+            .args(["send-keys", "-t", &target, "", "Enter"])
+            .status()
+            .await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
 }
 
 #[cfg(test)]

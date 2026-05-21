@@ -41,6 +41,12 @@ pub struct ReviewPolicy {
 
     /// CI merge gate behavior.
     pub ci: CiPolicy,
+
+    /// Maximum active session duration for leaf/worker agents in seconds. 0 = disabled.
+    pub max_leaf_session_seconds: u64,
+
+    /// Maximum active session duration for reviewer agents in seconds. 0 = disabled.
+    pub max_reviewer_session_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -97,6 +103,8 @@ impl Default for ReviewPolicy {
             require_second_reviewer_complexity: false,
             complexity_line_threshold: 500,
             ci: CiPolicy::default(),
+            max_leaf_session_seconds: 1800,
+            max_reviewer_session_seconds: 600,
         }
     }
 }

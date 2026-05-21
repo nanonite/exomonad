@@ -1121,6 +1121,8 @@ Run `exomonad recompile` first to build it.",
     let review_policy = exomonad_core::services::review_policy::ReviewPolicy::load(&project_dir)
         .await
         .context("Failed to load review policy")?;
+    let orphan_max_leaf = review_policy.max_leaf_session_seconds;
+    let orphan_max_reviewer = review_policy.max_reviewer_session_seconds;
 
     // Start Worktree Event Watcher (background service — replaces GitHub poller + Copilot review)
     let mut watcher = exomonad_core::services::worktree_event_watcher::WorktreeEventWatcher::new(
@@ -1157,11 +1159,15 @@ Run `exomonad recompile` first to build it.",
     }
     let orphan_project_dir = Arc::new(project_dir.clone());
     let orphan_git_wt = services.git_worktree_service().clone();
+    let orphan_tmux_session = Some(config.tmux_session.clone());
     tokio::spawn(async move {
         exomonad_core::services::orphan_reconciler::run_orphan_reconciler(
             orphan_project_dir,
             orphan_git_wt,
             orphan_reconciler_interval,
+            orphan_max_leaf,
+            orphan_max_reviewer,
+            orphan_tmux_session,
         )
         .await;
     });

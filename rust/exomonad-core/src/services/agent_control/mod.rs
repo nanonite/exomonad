@@ -793,6 +793,16 @@ impl<
         fs::create_dir_all(&agent_config_dir).await?;
         routing.write_to_dir(&agent_config_dir).await?;
 
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = fs::write(agent_config_dir.join("spawned_at"), now_secs.to_string()).await;
+
+        if let Some(issue_id) = issue_id_from_agent_name(agent_name.as_str()) {
+            let _ = fs::write(agent_config_dir.join("active_issue"), issue_id.to_string()).await;
+        }
+
         if let Some(record) = identity {
             if let Err(e) = self.agent_resolver().register(record).await {
                 warn!(agent = %agent_name, error = %e, "Failed to register agent identity (non-fatal)");
@@ -967,6 +977,17 @@ pub fn slugify(title: &str) -> String {
         .chars()
         .take(50)
         .collect()
+}
+
+/// Extract issue ID from an agent name slug, e.g. "issue-26-loader-alias-fallback-codex" → Some(26).
+pub(crate) fn issue_id_from_agent_name(slug: &str) -> Option<u64> {
+    let rest = slug.strip_prefix("issue-")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 #[cfg(test)]
