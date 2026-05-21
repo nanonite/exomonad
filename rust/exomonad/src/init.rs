@@ -1431,7 +1431,39 @@ async fn register_tangled_repo(cwd: &Path, config: &exomonad::config::Config) {
         }
     }
 
-    // Step 4: verify spindle.db contains the repo row before spindle starts.
+    // Step 4: prune unintended auto-discovered repos so spindle only watches the
+    // workspace repo explicitly seeded by exomonad init/new.
+    let prune_sql = format!(
+        "DELETE FROM repos WHERE NOT (knot = '{knot}' AND owner = '{did}' AND name = '{name}'); SELECT changes();",
+        knot = knot_sql,
+        did = owner_sql,
+        name = repo_sql
+    );
+    let out = std::process::Command::new("sqlite3")
+        .args([spindle_db, &prune_sql])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let pruned = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            info!(
+                spindle_db,
+                repo_name,
+                pruned_rows = %pruned,
+                "Spindle: pruned unintended repos from watch set"
+            );
+        }
+        Ok(o) => {
+            warn!(
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "Spindle: sqlite3 prune returned non-zero"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "Spindle: sqlite3 prune failed — is sqlite3 installed?");
+        }
+    }
+
+    // Step 5: verify spindle.db contains the repo row before spindle starts.
     let verify_sql = format!(
         "SELECT COUNT(*) FROM repos WHERE knot = '{knot}' AND owner = '{did}' AND name = '{name}';",
         knot = knot_sql,
