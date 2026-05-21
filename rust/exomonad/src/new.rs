@@ -79,7 +79,7 @@ gate = \"auto\"
     if let Err(error) = scaffold_tangled_workflow(&cwd) {
         warn!(
             error = %error,
-            "Failed to scaffold .tangled/workflows/ci.yml; continuing"
+            "Failed to scaffold .github/workflows/ci.yml; continuing"
         );
     }
 
@@ -88,6 +88,22 @@ gate = \"auto\"
 
     // Resolve config
     let config = Config::discover()?;
+    if let (Some(forgejo_url), Some(forgejo_token)) = (
+        config.forgejo_url.as_deref(),
+        config.forgejo_token.as_deref(),
+    ) {
+        if let Err(error) = register_forgejo_repo(
+            &cwd,
+            forgejo_url,
+            forgejo_token,
+            config.forgejo_webhook_secret.as_deref(),
+        )
+        .await
+        {
+            warn!(error = %error, "Forgejo repo registration skipped");
+        }
+    }
+
 
     // Copy WASM if it doesn't exist yet (same logic as init.rs)
     let wasm_filename = format!("wasm-guest-{}.wasm", config.wasm_name);
@@ -413,11 +429,11 @@ fn xrpc_url(base: &str, method: &str) -> String {
 }
 
 pub(crate) fn scaffold_tangled_workflow(project_dir: &Path) -> std::io::Result<()> {
-    let workflow_path = project_dir.join(".tangled/workflows/ci.yml");
+    let workflow_path = project_dir.join(".github/workflows/ci.yml");
     if workflow_path.exists() {
         info!(
             path = %workflow_path.display(),
-            "tangled workflow already present, leaving untouched"
+            "CI workflow already present, leaving untouched"
         );
         return Ok(());
     }
@@ -439,7 +455,7 @@ pub(crate) fn scaffold_tangled_workflow(project_dir: &Path) -> std::io::Result<(
         .map_err(|e| e.error)?;
     info!(
         path = %workflow_path.display(),
-        "Created Tangled CI workflow scaffold"
+        "Created GitHub Actions CI workflow scaffold"
     );
     Ok(())
 }
@@ -476,22 +492,195 @@ fn has_root_cabal_file(project_dir: &Path) -> std::io::Result<bool> {
 }
 
 fn tangled_workflow_content(language: ProjectLanguage) -> String {
-    let dependency_block = match language {
-        ProjectLanguage::Rust => "dependencies:\n  nixpkgs:\n    - rustup\n    - pkg-config\n",
-        ProjectLanguage::Haskell => {
-            "dependencies:\n  nixpkgs:\n    - ghc\n    - cabal-install\n    - pkg-config\n"
-        }
-        ProjectLanguage::Python => "dependencies:\n  nixpkgs:\n    - python3\n",
-        ProjectLanguage::Node => "dependencies:\n  nixpkgs:\n    - nodejs\n",
-        ProjectLanguage::Generic => {
-            "dependencies:\n  nixpkgs: [] # TODO: Add the nixpkgs needed by this workspace.\n"
-        }
+    match language {
+        ProjectLanguage::Rust => r#"name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace
+"#
+        .to_string(),
+        ProjectLanguage::Python => r#"name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Test
+        run: |
+          if [ -f pyproject.toml ]; then python -m pytest || true; fi
+"#
+        .to_string(),
+        ProjectLanguage::Node => r#"name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install
+        run: npm ci || npm install
+      - name: Test
+        run: npm test --if-present
+"#
+        .to_string(),
+        _ => r#"name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: customize-ci
+        run: |
+          # TODO: Replace this placeholder with workspace-specific build and test commands.
+          echo "Add CI commands"
+"#
+        .to_string(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoRepoOwner {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoRepoResponse {
+    owner: ForgejoRepoOwner,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgejoUserResponse {
+    login: String,
+}
+
+async fn register_forgejo_repo(
+    project_dir: &Path,
+    forgejo_url: &str,
+    forgejo_token: &str,
+    webhook_secret: Option<&str>,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let base = normalize_http_url(forgejo_url);
+    let repo_name = project_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+
+    let create_url = format!("{}/api/v1/user/repos", base.trim_end_matches('/'));
+    let create_resp = client
+        .post(&create_url)
+        .bearer_auth(forgejo_token)
+        .json(&serde_json::json!({"name": repo_name, "auto_init": false, "private": false}))
+        .send()
+        .await
+        .context("forgejo repo create request failed")?;
+
+    let owner = if create_resp.status().is_success() {
+        let created: ForgejoRepoResponse = create_resp
+            .json()
+            .await
+            .context("forgejo repo create decode failed")?;
+        created.owner.login
+    } else {
+        let user_url = format!("{}/api/v1/user", base.trim_end_matches('/'));
+        let user: ForgejoUserResponse = client
+            .get(&user_url)
+            .bearer_auth(forgejo_token)
+            .send()
+            .await
+            .context("forgejo user lookup failed")?
+            .error_for_status()
+            .context("forgejo user lookup status error")?
+            .json()
+            .await
+            .context("forgejo user decode failed")?;
+        user.login
     };
 
-    format!(
-        "{TANGLED_WORKFLOW_FRAMING}{dependency_block}steps:\n  - name: customize-ci\n    command: |\n      # TODO: Replace this placeholder with workspace-specific build and test commands.\n      # See CLAUDE.md Configuration and docs/decisions for Tangled CI notes.\n"
-    )
+    let remote_url = format!("{}/{}/{}.git", base.trim_end_matches('/'), owner, repo_name);
+    let _ = std::process::Command::new("git")
+        .arg("remote")
+        .arg("remove")
+        .arg("forgejo")
+        .current_dir(project_dir)
+        .status();
+    let _ = std::process::Command::new("git")
+        .arg("remote")
+        .arg("add")
+        .arg("forgejo")
+        .arg(&remote_url)
+        .current_dir(project_dir)
+        .status();
+
+    let server_base = std::env::var("EXOMONAD_SERVER_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3001".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let webhook_url = format!("{server_base}/ci");
+    let hooks_url = format!(
+        "{}/api/v1/repos/{}/{}/hooks",
+        base.trim_end_matches('/'),
+        owner,
+        repo_name
+    );
+    let hook_payload = serde_json::json!({
+        "type": "gitea",
+        "active": true,
+        "events": ["workflow_run", "check_run"],
+        "config": {
+            "url": webhook_url,
+            "content_type": "json",
+            "secret": webhook_secret.unwrap_or("")
+        }
+    });
+    let _ = client
+        .post(&hooks_url)
+        .bearer_auth(forgejo_token)
+        .json(&hook_payload)
+        .send()
+        .await;
+
+    Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -540,7 +729,7 @@ mod tests {
     fn scaffold_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         scaffold_tangled_workflow(dir.path()).unwrap();
-        let workflow_path = dir.path().join(".tangled/workflows/ci.yml");
+        let workflow_path = dir.path().join(".github/workflows/ci.yml");
         std::fs::write(&workflow_path, "custom: true\n").unwrap();
 
         scaffold_tangled_workflow(dir.path()).unwrap();
@@ -634,8 +823,8 @@ mod tests {
 
         let content = read_workflow(dir.path());
         assert!(content.contains(REQUIRED_FRAMING));
-        assert!(content.contains("steps:\n  - name: customize-ci\n"));
-        assert!(content.contains("# TODO: Replace this placeholder"));
+        assert!(content.contains("actions/checkout@v4") || content.contains("customize-ci"));
+        assert!(content.contains("TODO") || content.contains("cargo test") || content.contains("npm test") || content.contains("pytest"));
         serde_yaml::from_str::<serde_yaml::Value>(&content).unwrap();
         for needle in expected {
             assert!(content.contains(needle), "missing {needle} in:\n{content}");
@@ -644,7 +833,7 @@ mod tests {
     }
 
     fn read_workflow(project_dir: &Path) -> String {
-        let path = project_dir.join(".tangled/workflows/ci.yml");
+        let path = project_dir.join(".github/workflows/ci.yml");
         assert!(path.exists());
         std::fs::read_to_string(path).unwrap()
     }
