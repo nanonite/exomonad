@@ -1159,6 +1159,11 @@ Run `exomonad recompile` first to build it.",
         agent_resolver: agent_resolver.clone(),
     };
 
+    let forgejo_ci_state = exomonad_core::services::forgejo_ci::ForgejoCiWebhookState {
+        ctx: services.clone(),
+        webhook_secret: config.forgejo_webhook_secret.clone(),
+    };
+
     let hook_state = HookState {
         plugins: plugins.clone(),
         registry: rt_registry.clone(),
@@ -1189,6 +1194,13 @@ Run `exomonad recompile` first to build it.",
     let app = Router::new()
         .route("/health", get(health))
         .route("/hook", post(handle_hook_request).with_state(hook_state))
+        .route(
+            "/ci",
+            post(exomonad_core::services::forgejo_ci::handle::<
+                exomonad_core::services::Services,
+            >)
+            .with_state(forgejo_ci_state),
+        )
         .nest("/agents", agent_routes)
         .route(
             "/events",

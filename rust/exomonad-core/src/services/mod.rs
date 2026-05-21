@@ -13,6 +13,7 @@ pub mod event_queue;
 pub mod external;
 pub mod file_pr;
 pub mod file_pr_local;
+pub mod forgejo_ci;
 pub mod filesystem;
 pub mod git;
 pub mod git_worktree;
