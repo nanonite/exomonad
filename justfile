@@ -26,7 +26,7 @@ lint:
 
 # Run fast Rust tests only
 rust-test:
-    nix develop --command cargo test --workspace --lib
+    nix develop --command cargo nextest run --workspace --lib
 
 # Run native Haskell tests
 haskell-test:
@@ -37,7 +37,7 @@ test-fast: rust-test
 
 # Run every Rust test target through the dev shell
 rust-test-all:
-    nix develop --command cargo test --workspace
+    nix develop --command cargo nextest run --workspace
 
 # Run every Rust test target through the dev shell
 test-cargo-all: rust-test-all
@@ -45,7 +45,7 @@ test-cargo-all: rust-test-all
 # Build WASM, then run the Rust host ↔ Haskell WASM integration tests
 test-wasm-integration:
     just wasm-all
-    nix develop --command cargo test -p exomonad-core --test wasm_integration
+    nix develop --command cargo nextest run -p exomonad-core --test wasm_integration
 
 # Build and run the devswarm role-hook-tests WASM test suite
 role-hook-tests:
@@ -211,7 +211,7 @@ proto-test:
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> Running Rust proto wire format tests..."
-    nix develop --command cargo test -p exomonad-proto
+    nix develop --command cargo nextest run -p exomonad-proto
     echo ">>> Running Haskell proto tests..."
     nix develop --command cabal test exomonad-proto || echo "No tests defined yet"
     echo ">>> Running proto wire format compatibility test..."
@@ -270,7 +270,7 @@ check-e2e-codex-hooks:
 
 # Compare ExoMonad's trusted hook hash with the installed Codex CLI hash
 e2e-codex-hook-parity:
-    nix develop --command cargo test -p exomonad-core --lib codex_hook_hash_matches_installed_codex_cli -- --ignored --nocapture
+    nix develop --command cargo nextest run -p exomonad-core --lib codex_hook_hash_matches_installed_codex_cli --run-ignored ignored-only --no-capture
 
 # Run E2E Codex messaging test (send_message + notify_parent tmux delivery)
 e2e-codex-messaging:
@@ -457,7 +457,7 @@ e2e-tangled-ci:
 
 # Run live E2E Teams messaging test (requires active CC team "teams-e2e")
 live-teams-e2e:
-    nix develop --command cargo test -p claude-teams-bridge --test integration -- live_teams_e2e --ignored --nocapture
+    nix develop --command cargo nextest run -p claude-teams-bridge --test integration live_teams_e2e --run-ignored ignored-only --no-capture
 
 # Validate Gemini settings against schema
 validate-settings:

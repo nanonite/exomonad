@@ -28,6 +28,7 @@
           nodejs_20 # For quicktype codegen
           protobuf  # For proto codegen (prost/proto3-suite)
           go         # For Tangled spindle dev build/install
+          cargo-nextest
         ];
 
         # Proto3-suite code generator for Haskell
