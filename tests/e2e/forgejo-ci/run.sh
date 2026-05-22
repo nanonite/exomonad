@@ -41,8 +41,8 @@ fi
 
 exomonad new > "$LOG_DIR/new.log" 2>&1
 
-if [[ ! -f .github/workflows/ci.yml ]]; then
-  echo "ERROR: .github/workflows/ci.yml was not generated"
+if [[ ! -f .gitea/workflows/ci.yml ]]; then
+  echo "ERROR: .gitea/workflows/ci.yml was not generated"
   exit 1
 fi
 

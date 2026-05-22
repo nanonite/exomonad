@@ -11,15 +11,6 @@ const DEFAULT_TANGLED_SPINDLE_URL: &str = "ws://localhost:6555";
 const DEFAULT_TANGLED_APPVIEW_URL: &str = "http://localhost:3000";
 const DEFAULT_TANGLED_SPINDLE_DB: &str = "spindle.db";
 
-#[derive(Clone, Copy)]
-enum ProjectLanguage {
-    Rust,
-    Haskell,
-    Python,
-    Node,
-    Generic,
-}
-
 /// Initialize a new exomonad project in the current directory.
 /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
 pub async fn run(_name: Option<String>) -> Result<()> {
@@ -65,10 +56,10 @@ gate = \"auto\"
         info!("Created .exo/review-policy.toml (default review policy)");
     }
 
-    if let Err(error) = scaffold_tangled_workflow(&cwd) {
+    if let Err(error) = scaffold_gitea_workflow(&cwd) {
         warn!(
             error = %error,
-            "Failed to scaffold .github/workflows/ci.yml; continuing"
+            "Failed to scaffold .gitea/workflows/ci.yml; continuing"
         );
     }
 
@@ -450,8 +441,8 @@ fn xrpc_url(base: &str, method: &str) -> String {
     format!("{}/xrpc/{method}", base.trim_end_matches('/'))
 }
 
-pub(crate) fn scaffold_tangled_workflow(project_dir: &Path) -> std::io::Result<()> {
-    let workflow_path = project_dir.join(".github/workflows/ci.yml");
+pub(crate) fn scaffold_gitea_workflow(project_dir: &Path) -> std::io::Result<()> {
+    let workflow_path = project_dir.join(".gitea/workflows/ci.yml");
     if workflow_path.exists() {
         info!(
             path = %workflow_path.display(),
@@ -468,7 +459,7 @@ pub(crate) fn scaffold_tangled_workflow(project_dir: &Path) -> std::io::Result<(
     })?;
     std::fs::create_dir_all(parent)?;
 
-    let content = tangled_workflow_content(detect_language(project_dir)?);
+    let content = gitea_workflow_content();
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(content.as_bytes())?;
     temp.flush()?;
@@ -477,123 +468,31 @@ pub(crate) fn scaffold_tangled_workflow(project_dir: &Path) -> std::io::Result<(
         .map_err(|e| e.error)?;
     info!(
         path = %workflow_path.display(),
-        "Created GitHub Actions CI workflow scaffold"
+        "Created Forgejo Actions CI workflow scaffold"
     );
     Ok(())
 }
 
-fn detect_language(project_dir: &Path) -> std::io::Result<ProjectLanguage> {
-    if project_dir.join("Cargo.toml").exists() {
-        return Ok(ProjectLanguage::Rust);
-    }
-    if project_dir.join("cabal.project").exists() || has_root_cabal_file(project_dir)? {
-        return Ok(ProjectLanguage::Haskell);
-    }
-    if project_dir.join("pyproject.toml").exists() || project_dir.join("setup.py").exists() {
-        return Ok(ProjectLanguage::Python);
-    }
-    if project_dir.join("package.json").exists() {
-        return Ok(ProjectLanguage::Node);
-    }
-    Ok(ProjectLanguage::Generic)
-}
+fn gitea_workflow_content() -> &'static str {
+    r#"name: CI
 
-fn has_root_cabal_file(project_dir: &Path) -> std::io::Result<bool> {
-    for entry in std::fs::read_dir(project_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "cabal")
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
+# =====================================================================
+# EXOMONAD GENERATED PLACEHOLDER
+# Replace this scaffold with the build, test, lint, and release checks
+# your project needs before relying on Forgejo/Gitea Actions gating.
+# =====================================================================
 
-fn tangled_workflow_content(language: ProjectLanguage) -> String {
-    match language {
-        ProjectLanguage::Rust => r#"name: CI
-
-on:
-  push:
-  pull_request:
+on: push
 
 jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: cargo build --workspace
-      - name: Test
-        run: cargo test --workspace
-"#
-        .to_string(),
-        ProjectLanguage::Python => r#"name: CI
-
-on:
-  push:
-  pull_request:
-
-jobs:
-  ci:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-      - name: Install
+      - name: Customize workflow
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - name: Test
-        run: |
-          if [ -f pyproject.toml ]; then python -m pytest || true; fi
+          echo "Replace .gitea/workflows/ci.yml with project-specific CI commands."
+          echo "Add real build, test, lint, and release checks before merge gating."
 "#
-        .to_string(),
-        ProjectLanguage::Node => r#"name: CI
-
-on:
-  push:
-  pull_request:
-
-jobs:
-  ci:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: Install
-        run: npm ci || npm install
-      - name: Test
-        run: npm test --if-present
-"#
-        .to_string(),
-        _ => r#"name: CI
-
-on:
-  push:
-  pull_request:
-
-jobs:
-  ci:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: customize-ci
-        run: |
-          # TODO: Replace this placeholder with workspace-specific build and test commands.
-          echo "Add CI commands"
-"#
-        .to_string(),
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -707,63 +606,26 @@ async fn register_forgejo_repo(
 mod tests {
     use super::*;
 
-    const ACTIONS_WORKFLOW_FRAMING: &str = "name: CI\n\non:\n  push:\n  pull_request:\n\njobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n";
-
     #[test]
-    fn scaffolds_rust_ci_workflow() {
-        assert_language_scaffold(
-            &[("Cargo.toml", "[package]\n")],
-            &["dtolnay/rust-toolchain", "cargo test --workspace"],
-        );
-    }
+    fn scaffolds_gitea_ci_placeholder_workflow() {
+        let content = assert_gitea_scaffold(&[]);
 
-    #[test]
-    fn scaffolds_haskell_ci_workflow_from_cabal_project() {
-        assert_language_scaffold(
-            &[("cabal.project", "packages: .\n")],
-            &["customize-ci", "Add CI commands"],
-        );
-    }
-
-    #[test]
-    fn scaffolds_haskell_ci_workflow_from_root_cabal_file() {
-        assert_language_scaffold(
-            &[("example.cabal", "cabal-version: 3.0\n")],
-            &["customize-ci", "Add CI commands"],
-        );
-    }
-
-    #[test]
-    fn scaffolds_python_ci_workflow() {
-        assert_language_scaffold(
-            &[("pyproject.toml", "[project]\n")],
-            &["actions/setup-python", "python -m pytest"],
-        );
-    }
-
-    #[test]
-    fn scaffolds_node_ci_workflow() {
-        assert_language_scaffold(
-            &[("package.json", "{}\n")],
-            &["actions/setup-node", "npm test --if-present"],
-        );
-    }
-
-    #[test]
-    fn scaffolds_generic_ci_workflow() {
-        let content = assert_language_scaffold(&[], &["customize-ci"]);
-        assert!(content
-            .contains("Replace this placeholder with workspace-specific build and test commands"));
+        assert!(content.contains("EXOMONAD GENERATED PLACEHOLDER"));
+        assert!(content.contains("on: push"));
+        assert!(content.contains("jobs:\n  ci:"));
+        assert!(content.contains("Customize workflow"));
+        assert!(content.contains("Replace .gitea/workflows/ci.yml"));
+        assert!(!content.contains("TODO"));
     }
 
     #[test]
     fn scaffold_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        scaffold_tangled_workflow(dir.path()).unwrap();
-        let workflow_path = dir.path().join(".github/workflows/ci.yml");
+        scaffold_gitea_workflow(dir.path()).unwrap();
+        let workflow_path = dir.path().join(".gitea/workflows/ci.yml");
         std::fs::write(&workflow_path, "custom: true\n").unwrap();
 
-        scaffold_tangled_workflow(dir.path()).unwrap();
+        scaffold_gitea_workflow(dir.path()).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(workflow_path).unwrap(),
@@ -772,17 +634,12 @@ mod tests {
     }
 
     #[test]
-    fn ignores_language_markers_below_workspace_root() {
+    fn scaffold_does_not_create_legacy_github_workflow() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
-        std::fs::write(dir.path().join("vendor/Cargo.toml"), "[package]\n").unwrap();
+        scaffold_gitea_workflow(dir.path()).unwrap();
 
-        scaffold_tangled_workflow(dir.path()).unwrap();
-
-        let content = read_workflow(dir.path());
-        assert!(content
-            .contains("Replace this placeholder with workspace-specific build and test commands"));
-        assert!(!content.contains("dtolnay/rust-toolchain"));
+        assert!(dir.path().join(".gitea/workflows/ci.yml").exists());
+        assert!(!dir.path().join(".github/workflows/ci.yml").exists());
     }
 
     #[test]
@@ -862,32 +719,21 @@ mod tests {
         );
     }
 
-    fn assert_language_scaffold(markers: &[(&str, &str)], expected: &[&str]) -> String {
+    fn assert_gitea_scaffold(markers: &[(&str, &str)]) -> String {
         let dir = tempfile::tempdir().unwrap();
         for (path, content) in markers {
             std::fs::write(dir.path().join(path), content).unwrap();
         }
 
-        scaffold_tangled_workflow(dir.path()).unwrap();
+        scaffold_gitea_workflow(dir.path()).unwrap();
 
         let content = read_workflow(dir.path());
-        assert!(content.contains(ACTIONS_WORKFLOW_FRAMING));
-        assert!(content.contains("actions/checkout@v4") || content.contains("customize-ci"));
-        assert!(
-            content.contains("TODO")
-                || content.contains("cargo test")
-                || content.contains("npm test")
-                || content.contains("pytest")
-        );
         serde_yaml::from_str::<serde_yaml::Value>(&content).unwrap();
-        for needle in expected {
-            assert!(content.contains(needle), "missing {needle} in:\n{content}");
-        }
         content
     }
 
     fn read_workflow(project_dir: &Path) -> String {
-        let path = project_dir.join(".github/workflows/ci.yml");
+        let path = project_dir.join(".gitea/workflows/ci.yml");
         assert!(path.exists());
         std::fs::read_to_string(path).unwrap()
     }
