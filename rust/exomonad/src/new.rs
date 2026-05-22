@@ -707,43 +707,53 @@ async fn register_forgejo_repo(
 mod tests {
     use super::*;
 
-    const REQUIRED_FRAMING: &str = "engine: nixery\nwhen:\n  - event: [push, manual]\n    branch: [\"*\"]\n  - event: [pull_request]\n    branch: [main]\nclone:\n  depth: 1\n  submodules: false\n";
+    const ACTIONS_WORKFLOW_FRAMING: &str = "name: CI\n\non:\n  push:\n  pull_request:\n\njobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n";
 
     #[test]
-    fn scaffolds_rust_tangled_workflow() {
-        assert_language_scaffold(&[("Cargo.toml", "[package]\n")], &["rustup", "pkg-config"]);
+    fn scaffolds_rust_ci_workflow() {
+        assert_language_scaffold(
+            &[("Cargo.toml", "[package]\n")],
+            &["dtolnay/rust-toolchain", "cargo test --workspace"],
+        );
     }
 
     #[test]
-    fn scaffolds_haskell_tangled_workflow_from_cabal_project() {
+    fn scaffolds_haskell_ci_workflow_from_cabal_project() {
         assert_language_scaffold(
             &[("cabal.project", "packages: .\n")],
-            &["ghc", "cabal-install", "pkg-config"],
+            &["customize-ci", "Add CI commands"],
         );
     }
 
     #[test]
-    fn scaffolds_haskell_tangled_workflow_from_root_cabal_file() {
+    fn scaffolds_haskell_ci_workflow_from_root_cabal_file() {
         assert_language_scaffold(
             &[("example.cabal", "cabal-version: 3.0\n")],
-            &["ghc", "cabal-install", "pkg-config"],
+            &["customize-ci", "Add CI commands"],
         );
     }
 
     #[test]
-    fn scaffolds_python_tangled_workflow() {
-        assert_language_scaffold(&[("pyproject.toml", "[project]\n")], &["python3"]);
+    fn scaffolds_python_ci_workflow() {
+        assert_language_scaffold(
+            &[("pyproject.toml", "[project]\n")],
+            &["actions/setup-python", "python -m pytest"],
+        );
     }
 
     #[test]
-    fn scaffolds_node_tangled_workflow() {
-        assert_language_scaffold(&[("package.json", "{}\n")], &["nodejs"]);
+    fn scaffolds_node_ci_workflow() {
+        assert_language_scaffold(
+            &[("package.json", "{}\n")],
+            &["actions/setup-node", "npm test --if-present"],
+        );
     }
 
     #[test]
-    fn scaffolds_generic_tangled_workflow() {
-        let content = assert_language_scaffold(&[], &["TODO: Add the nixpkgs"]);
-        assert!(content.contains("nixpkgs: [] # TODO"));
+    fn scaffolds_generic_ci_workflow() {
+        let content = assert_language_scaffold(&[], &["customize-ci"]);
+        assert!(content
+            .contains("Replace this placeholder with workspace-specific build and test commands"));
     }
 
     #[test]
@@ -770,8 +780,9 @@ mod tests {
         scaffold_tangled_workflow(dir.path()).unwrap();
 
         let content = read_workflow(dir.path());
-        assert!(content.contains("TODO: Add the nixpkgs"));
-        assert!(!content.contains("rustup"));
+        assert!(content
+            .contains("Replace this placeholder with workspace-specific build and test commands"));
+        assert!(!content.contains("dtolnay/rust-toolchain"));
     }
 
     #[test]
@@ -860,7 +871,7 @@ mod tests {
         scaffold_tangled_workflow(dir.path()).unwrap();
 
         let content = read_workflow(dir.path());
-        assert!(content.contains(REQUIRED_FRAMING));
+        assert!(content.contains(ACTIONS_WORKFLOW_FRAMING));
         assert!(content.contains("actions/checkout@v4") || content.contains("customize-ci"));
         assert!(
             content.contains("TODO")
