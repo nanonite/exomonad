@@ -45,6 +45,21 @@ fn forgejo_host_from_url(input: &str) -> Option<String> {
     }
 }
 
+fn forgejo_env_vars(forgejo_url: &str, forgejo_token: &str) -> Vec<(&'static str, String)> {
+    if forgejo_token.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut vars = Vec::new();
+    if let Some(gh_host) = forgejo_host_from_url(forgejo_url) {
+        vars.push(("GH_HOST", gh_host));
+    }
+    vars.push(("GH_TOKEN", forgejo_token.to_string()));
+    vars.push(("GITHUB_TOKEN", forgejo_token.to_string()));
+    vars.push(("FORGEJO_URL", forgejo_url.to_string()));
+    vars
+}
+
 fn current_time_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -698,26 +713,12 @@ pub async fn run(
         config.forgejo_url.as_deref(),
         config.forgejo_token.as_deref(),
     ) {
-        if let Some(gh_host) = forgejo_host_from_url(forgejo_url) {
-            std::env::set_var("GH_HOST", &gh_host);
+        for (var, value) in forgejo_env_vars(forgejo_url, forgejo_token) {
+            std::env::set_var(var, &value);
             let _ = std::process::Command::new("tmux")
-                .args(["set-environment", "-t", &session, "GH_HOST", &gh_host])
+                .args(["set-environment", "-t", &session, var, &value])
                 .status();
         }
-        std::env::set_var("GH_TOKEN", forgejo_token);
-        std::env::set_var("FORGEJO_URL", forgejo_url);
-        let _ = std::process::Command::new("tmux")
-            .args(["set-environment", "-t", &session, "GH_TOKEN", forgejo_token])
-            .status();
-        let _ = std::process::Command::new("tmux")
-            .args([
-                "set-environment",
-                "-t",
-                &session,
-                "FORGEJO_URL",
-                forgejo_url,
-            ])
-            .status();
     }
 
     // Set EXOMONAD_TMUX_SESSION
@@ -2244,6 +2245,21 @@ mod tests {
             task: None,
             model: None,
         }
+    }
+
+    #[test]
+    fn forgejo_env_vars_include_gh_and_github_tokens() {
+        let vars = forgejo_env_vars("http://localhost:3000", "token-123");
+
+        assert!(vars.contains(&("GH_HOST", "localhost:3000".to_string())));
+        assert!(vars.contains(&("GH_TOKEN", "token-123".to_string())));
+        assert!(vars.contains(&("GITHUB_TOKEN", "token-123".to_string())));
+        assert!(vars.contains(&("FORGEJO_URL", "http://localhost:3000".to_string())));
+    }
+
+    #[test]
+    fn forgejo_env_vars_ignore_empty_tokens() {
+        assert!(forgejo_env_vars("http://localhost:3000", "  ").is_empty());
     }
 
     #[test]
