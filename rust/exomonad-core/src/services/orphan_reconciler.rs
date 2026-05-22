@@ -275,8 +275,12 @@ async fn kill_agent_window(session: &str, agent_dir: &std::path::Path, slug: &st
             .status()
             .await;
         match status {
-            Ok(s) if s.success() => info!(agent = %slug, target = %target, "Killed timed-out agent window"),
-            Ok(s) => warn!(agent = %slug, target = %target, status = ?s, "kill-window returned non-zero (window may already be gone)"),
+            Ok(s) if s.success() => {
+                info!(agent = %slug, target = %target, "Killed timed-out agent window")
+            }
+            Ok(s) => {
+                warn!(agent = %slug, target = %target, status = ?s, "kill-window returned non-zero (window may already be gone)")
+            }
             Err(e) => warn!(agent = %slug, error = %e, "Failed to run tmux kill-window"),
         }
     } else if let Some(pane_id) = &routing.pane_id {
@@ -286,8 +290,12 @@ async fn kill_agent_window(session: &str, agent_dir: &std::path::Path, slug: &st
             .status()
             .await;
         match status {
-            Ok(s) if s.success() => info!(agent = %slug, target = %target, "Killed timed-out agent pane"),
-            Ok(s) => warn!(agent = %slug, target = %target, status = ?s, "kill-pane returned non-zero"),
+            Ok(s) if s.success() => {
+                info!(agent = %slug, target = %target, "Killed timed-out agent pane")
+            }
+            Ok(s) => {
+                warn!(agent = %slug, target = %target, status = ?s, "kill-pane returned non-zero")
+            }
             Err(e) => warn!(agent = %slug, error = %e, "Failed to run tmux kill-pane"),
         }
     }
@@ -309,14 +317,13 @@ async fn notify_tl_of_timeout(
     };
 
     let issue_hint = match active_issue {
-        Some(id) => format!(
-            " Issue #{id} — call chainlink_timer_stop {id} then re-spec or escalate."
-        ),
+        Some(id) => {
+            format!(" Issue #{id} — call chainlink_timer_stop {id} then re-spec or escalate.")
+        }
         None => String::new(),
     };
-    let message = format!(
-        "[TIMED OUT: {slug}] Exceeded {limit_mins}min session limit — killed.{issue_hint}"
-    );
+    let message =
+        format!("[TIMED OUT: {slug}] Exceeded {limit_mins}min session limit — killed.{issue_hint}");
 
     let target = format!("{}:{}", session, window_id.as_str());
     let tmp = std::env::temp_dir().join(format!("exomonad-timeout-{}.txt", slug));

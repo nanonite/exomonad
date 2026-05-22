@@ -25,7 +25,10 @@ pub async fn handle<C: HasCiStatusMap>(
     body: Bytes,
 ) -> impl IntoResponse {
     let Some(secret) = state.webhook_secret.as_deref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "forgejo webhook secret not configured");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "forgejo webhook secret not configured",
+        );
     };
 
     if !verify_signature(secret, &headers, &body) {
@@ -110,7 +113,10 @@ fn verify_signature(secret: &str, headers: &HeaderMap, body: &[u8]) -> bool {
 }
 
 fn extract_signature(headers: &HeaderMap) -> Option<String> {
-    if let Some(raw) = headers.get("x-gitea-signature").and_then(|v| v.to_str().ok()) {
+    if let Some(raw) = headers
+        .get("x-gitea-signature")
+        .and_then(|v| v.to_str().ok())
+    {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());

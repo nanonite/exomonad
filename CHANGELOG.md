@@ -44,6 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- feat: replace Tangled/Spindle CI with Forgejo + Forgejo Actions (#343)
 - exomonad init: surface orphaned agent windows for TL review rather than auto-killing (#342)
 - orphan reconciler: enforce max session age to stop long-running leaves and reviewers (#340)
 - Add watcher CI trigger on reviewer approval and CI failure blocking (#337)
@@ -134,6 +135,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- e2e test: Forgejo CI pipeline end-to-end (#351)
+- update CLAUDE.md: replace Tangled CI references with Forgejo (#350)
+- update init.rs: inject GH_HOST and GH_TOKEN into agent env (#349)
+- update new.rs: GitHub Actions CI template + Forgejo repo registration (#348)
+- add Forgejo CI webhook handler feeding ci_status_map (#347)
+- add forgejo_url/forgejo_token/forgejo_webhook_secret config fields (#346)
+- remove Tangled/Spindle config fields and service code (#344)
 - add Forgejo + act_runner docker-compose (#345)
 - spindle auto-discovers and watches unintended repos from jetstream (#336)
 - Document knot HTTP API for repo registration and service auth (#339)
