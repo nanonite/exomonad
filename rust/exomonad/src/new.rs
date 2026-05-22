@@ -86,13 +86,13 @@ gate = \"auto\"
             forgejo_url,
             forgejo_token,
             config.forgejo_webhook_secret.as_deref(),
+            config.forgejo_ssh_port,
         )
         .await
         {
             warn!(error = %error, "Forgejo repo registration skipped");
         }
     }
-
 
     // Copy WASM if it doesn't exist yet (same logic as init.rs)
     let wasm_filename = format!("wasm-guest-{}.wasm", config.wasm_name);
@@ -237,12 +237,45 @@ fn config_content(tangled: Option<&TangledNewIntegration>) -> String {
          # forgejo_url = \"http://localhost:3000\"
          # forgejo_token = \"your_forgejo_token\"
          # forgejo_webhook_secret = \"your_webhook_secret\"
+         # forgejo_ssh_port = 2222
 "
     )
 }
 
 fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
+}
+
+fn forgejo_ssh_remote_url(
+    forgejo_url: &str,
+    configured_port: Option<u16>,
+    owner: &str,
+    repo_name: &str,
+) -> Result<String> {
+    let base = normalize_http_url(forgejo_url);
+    let parsed = reqwest::Url::parse(&base)
+        .with_context(|| format!("invalid forgejo_url for SSH remote: {base}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("forgejo_url has no host: {base}"))?;
+    let port = configured_port.unwrap_or_else(|| default_forgejo_ssh_port(host));
+    let host = ssh_remote_host(host);
+    Ok(format!("ssh://git@{host}:{port}/{owner}/{repo_name}.git"))
+}
+
+fn default_forgejo_ssh_port(host: &str) -> u16 {
+    match host {
+        "localhost" | "127.0.0.1" | "::1" => 2222,
+        _ => 22,
+    }
+}
+
+fn ssh_remote_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 async fn discover_tangled_integration(project_dir: &Path) -> Option<TangledNewIntegration> {
@@ -583,6 +616,7 @@ async fn register_forgejo_repo(
     forgejo_url: &str,
     forgejo_token: &str,
     webhook_secret: Option<&str>,
+    forgejo_ssh_port: Option<u16>,
 ) -> Result<()> {
     let client = reqwest::Client::new();
     let base = normalize_http_url(forgejo_url);
@@ -623,7 +657,7 @@ async fn register_forgejo_repo(
         user.login
     };
 
-    let remote_url = format!("{}/{}/{}.git", base.trim_end_matches('/'), owner, repo_name);
+    let remote_url = forgejo_ssh_remote_url(&base, forgejo_ssh_port, &owner, &repo_name)?;
     let _ = std::process::Command::new("git")
         .arg("remote")
         .arg("remove")
@@ -668,7 +702,6 @@ async fn register_forgejo_repo(
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -771,6 +804,23 @@ mod tests {
     }
 
     #[test]
+    fn forgejo_ssh_remote_url_defaults_localhost_to_dev_ssh_port() {
+        assert_eq!(
+            forgejo_ssh_remote_url("http://localhost:3000", None, "exomonad", "demo").unwrap(),
+            "ssh://git@localhost:2222/exomonad/demo.git"
+        );
+    }
+
+    #[test]
+    fn forgejo_ssh_remote_url_uses_configured_port() {
+        assert_eq!(
+            forgejo_ssh_remote_url("https://forge.example", Some(2223), "exomonad", "demo")
+                .unwrap(),
+            "ssh://git@forge.example:2223/exomonad/demo.git"
+        );
+    }
+
+    #[test]
     fn repo_create_request_matches_current_tangled_lexicon() {
         let request = repo_create_request("example");
         let json = serde_json::to_value(request).unwrap();
@@ -812,7 +862,12 @@ mod tests {
         let content = read_workflow(dir.path());
         assert!(content.contains(REQUIRED_FRAMING));
         assert!(content.contains("actions/checkout@v4") || content.contains("customize-ci"));
-        assert!(content.contains("TODO") || content.contains("cargo test") || content.contains("npm test") || content.contains("pytest"));
+        assert!(
+            content.contains("TODO")
+                || content.contains("cargo test")
+                || content.contains("npm test")
+                || content.contains("pytest")
+        );
         serde_yaml::from_str::<serde_yaml::Value>(&content).unwrap();
         for needle in expected {
             assert!(content.contains(needle), "missing {needle} in:\n{content}");

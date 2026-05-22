@@ -25,19 +25,24 @@ use super::tmux_events;
 ///
 /// Checks whether a `tangled` remote is configured in the workspace.
 /// If present, returns `"tangled"` so CI runs on the local knot.
-/// Falls back to `"origin"` when no tangled remote is configured.
+/// Otherwise prefers a Forgejo remote before falling back to `"origin"`.
 pub(crate) fn resolve_push_remote(workspace_path: &std::path::Path) -> &'static str {
-    let ok = std::process::Command::new("git")
-        .args(["remote", "get-url", "tangled"])
-        .current_dir(workspace_path)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if ok {
+    if remote_exists(workspace_path, "tangled") {
         "tangled"
+    } else if remote_exists(workspace_path, "forgejo") {
+        "forgejo"
     } else {
         "origin"
     }
+}
+
+fn remote_exists(workspace_path: &std::path::Path, remote: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["remote", "get-url", remote])
+        .current_dir(workspace_path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 // ============================================================================
@@ -440,6 +445,48 @@ mod tests {
     #[test]
     fn test_resolve_push_remote_tangled_configured_returns_tangled() {
         let tmp = init_git_repo();
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "tangled",
+                "git@local-tangled:repositories/owner/test.git",
+            ])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert_eq!(resolve_push_remote(tmp.path()), "tangled");
+    }
+
+    #[test]
+    fn test_resolve_push_remote_forgejo_configured_returns_forgejo() {
+        let tmp = init_git_repo();
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "forgejo",
+                "ssh://git@localhost:2222/owner/test.git",
+            ])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert_eq!(resolve_push_remote(tmp.path()), "forgejo");
+    }
+
+    #[test]
+    fn test_resolve_push_remote_prefers_tangled_over_forgejo() {
+        let tmp = init_git_repo();
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "forgejo",
+                "ssh://git@localhost:2222/owner/test.git",
+            ])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
         Command::new("git")
             .args([
                 "remote",

@@ -216,6 +216,9 @@ pub struct RawConfig {
     /// Shared secret used to verify Forgejo webhook signatures.
     pub forgejo_webhook_secret: Option<String>,
 
+    /// SSH port for Forgejo git remotes. Defaults to 2222 for localhost, otherwise 22.
+    pub forgejo_ssh_port: Option<u16>,
+
     /// PR reviewer agent configuration.
     #[serde(default)]
     pub reviewer: Option<ReviewerConfig>,
@@ -283,6 +286,9 @@ pub struct Config {
 
     /// Shared secret used to verify Forgejo webhook signatures.
     pub forgejo_webhook_secret: Option<String>,
+
+    /// SSH port for Forgejo git remotes. Defaults to 2222 for localhost, otherwise 22.
+    pub forgejo_ssh_port: Option<u16>,
 
     /// PR reviewer agent configuration.
     pub reviewer: ReviewerConfig,
@@ -469,6 +475,7 @@ impl Config {
         let forgejo_webhook_secret = local_raw
             .forgejo_webhook_secret
             .or(global_raw.forgejo_webhook_secret);
+        let forgejo_ssh_port = local_raw.forgejo_ssh_port.or(global_raw.forgejo_ssh_port);
 
         // Resolve reviewer: env > local > global > default
         let mut reviewer = local_raw
@@ -508,6 +515,7 @@ impl Config {
             forgejo_url,
             forgejo_token,
             forgejo_webhook_secret,
+            forgejo_ssh_port,
             reviewer,
         })
     }
@@ -553,6 +561,7 @@ impl Default for Config {
             forgejo_url: None,
             forgejo_token: None,
             forgejo_webhook_secret: None,
+            forgejo_ssh_port: None,
             reviewer: ReviewerConfig::default(),
         }
     }
