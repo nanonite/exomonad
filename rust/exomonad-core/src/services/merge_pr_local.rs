@@ -9,7 +9,7 @@ use crate::services::agent_resources::{dispose_agent_resources, dispose_reviewer
 use crate::services::file_pr_local::{
     read_pr_registry, resolve_push_remote, write_pr_registry, PrRegistry, PrState,
 };
-use crate::services::git_worktree::GitWorktreeService;
+use crate::services::git_worktree::{headless_git_command, GitWorktreeService};
 use crate::services::merge_pr::MergePROutput;
 pub use crate::services::review_policy::ReviewPolicy;
 use crate::services::CiStatusMap;
@@ -172,7 +172,7 @@ async fn run_git_capture(dir: &Path, args: &[&str]) -> Result<String> {
     let dir = dir.to_path_buf();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(&args)
             .current_dir(&dir)
             .output()
@@ -188,7 +188,7 @@ async fn run_git_capture(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn run_git_command(dir: &Path, args: &[String], author: Option<&GitAuthor>) -> Result<()> {
-    let mut command = std::process::Command::new("git");
+    let mut command = headless_git_command();
     command.args(args).current_dir(dir);
     if let Some(author) = author {
         command

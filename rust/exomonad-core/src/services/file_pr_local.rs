@@ -5,7 +5,7 @@
 
 use crate::domain::{AgentName, BranchName, PRNumber, Role};
 use crate::services::git;
-use crate::services::git_worktree::GitWorktreeService;
+use crate::services::git_worktree::{headless_git_command, GitWorktreeService};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -37,7 +37,7 @@ pub(crate) fn resolve_push_remote(workspace_path: &std::path::Path) -> &'static 
 }
 
 fn remote_exists(workspace_path: &std::path::Path, remote: &str) -> bool {
-    std::process::Command::new("git")
+    headless_git_command()
         .args(["remote", "get-url", remote])
         .current_dir(workspace_path)
         .output()

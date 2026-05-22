@@ -58,6 +58,36 @@ pub struct GitWorktreeService {
     project_dir: PathBuf,
 }
 
+pub(crate) fn headless_git_command() -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    apply_headless_git_env(&mut command);
+    command
+}
+
+pub(crate) fn apply_headless_git_env(
+    command: &mut std::process::Command,
+) -> &mut std::process::Command {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("SSH_ASKPASS_REQUIRE", "never");
+
+    command.env("GIT_SSH_COMMAND", headless_git_ssh_command());
+
+    command
+}
+
+fn headless_git_ssh_command() -> String {
+    let existing = std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh".to_string());
+    if existing.contains("BatchMode") {
+        existing
+    } else {
+        format!("{existing} -o BatchMode=yes")
+    }
+}
+
 impl GitWorktreeService {
     pub fn new(project_dir: PathBuf) -> Self {
         Self { project_dir }
@@ -74,7 +104,7 @@ impl GitWorktreeService {
     ) -> Result<(), WorktreeError> {
         info!(path = %path.display(), branch = %branch, base = %base, "Creating git worktree");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args([
                 "worktree",
                 "add",
@@ -111,7 +141,7 @@ impl GitWorktreeService {
             ("user.name", git_user_name.as_str()),
             ("user.email", git_user_email.as_str()),
         ] {
-            let out = std::process::Command::new("git")
+            let out = headless_git_command()
                 .args(["config", "--local", key, value])
                 .current_dir(path)
                 .output()
@@ -144,7 +174,7 @@ impl GitWorktreeService {
     ) -> Result<(), WorktreeError> {
         info!(path = %path.display(), at_ref, "Creating detached reviewer worktree");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args([
                 "worktree",
                 "add",
@@ -170,7 +200,7 @@ impl GitWorktreeService {
             ("user.name", git_user_name.as_str()),
             ("user.email", git_user_email.as_str()),
         ] {
-            let out = std::process::Command::new("git")
+            let out = headless_git_command()
                 .args(["config", "--local", key, value])
                 .current_dir(path)
                 .output()
@@ -191,7 +221,7 @@ impl GitWorktreeService {
     pub fn remove_workspace(&self, path: &Path) -> Result<(), WorktreeError> {
         info!(path = %path.display(), "Removing git worktree");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["worktree", "remove", "--force", &path.to_string_lossy()])
             .current_dir(&self.project_dir)
             .output()
@@ -211,7 +241,7 @@ impl GitWorktreeService {
                 warn!(stderr = %stderr, "git worktree remove failed (directory already gone)");
             }
             // Also prune stale worktree entries
-            let _ = std::process::Command::new("git")
+            let _ = headless_git_command()
                 .args(["worktree", "prune"])
                 .current_dir(&self.project_dir)
                 .output();
@@ -231,7 +261,7 @@ impl GitWorktreeService {
     ) -> Result<(), WorktreeError> {
         info!(branch = %branch, path = %workspace_path.display(), "Pushing branch");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["push", "origin", branch.as_str()])
             .current_dir(workspace_path)
             .output()
@@ -260,7 +290,7 @@ impl GitWorktreeService {
     ) -> Result<(), WorktreeError> {
         info!(branch = %branch, remote = %remote, path = %workspace_path.display(), "Pushing branch to remote");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["push", remote, branch.as_str()])
             .current_dir(workspace_path)
             .output()
@@ -284,7 +314,7 @@ impl GitWorktreeService {
     pub fn fetch(&self, workspace_path: &Path) -> Result<(), WorktreeError> {
         info!(path = %workspace_path.display(), "git fetch");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["fetch"])
             .current_dir(workspace_path)
             .output()
@@ -309,7 +339,7 @@ impl GitWorktreeService {
         &self,
         workspace_path: &Path,
     ) -> Result<Option<String>, WorktreeError> {
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["branch", "--show-current"])
             .current_dir(workspace_path)
             .output()
@@ -332,7 +362,7 @@ impl GitWorktreeService {
     pub fn delete_bookmark(&self, name: &BranchName) -> Result<(), WorktreeError> {
         info!(branch = %name, "Deleting local branch");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["branch", "-D", name.as_str()])
             .current_dir(&self.project_dir)
             .output()
@@ -368,7 +398,7 @@ impl GitWorktreeService {
             args.push(&rev_str);
         }
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(&args)
             .current_dir(workspace_path)
             .output()
@@ -426,6 +456,34 @@ mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn headless_git_command_sets_noninteractive_auth_env() {
+        let command = headless_git_command();
+        let envs = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| (key.to_string_lossy(), value.to_string_lossy()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            envs.get("GIT_TERMINAL_PROMPT").map(|v| v.as_ref()),
+            Some("0")
+        );
+        assert_eq!(
+            envs.get("GCM_INTERACTIVE").map(|v| v.as_ref()),
+            Some("never")
+        );
+        assert_eq!(envs.get("GIT_ASKPASS").map(|v| v.as_ref()), Some(""));
+        assert_eq!(
+            envs.get("SSH_ASKPASS_REQUIRE").map(|v| v.as_ref()),
+            Some("never")
+        );
+        assert!(envs
+            .get("GIT_SSH_COMMAND")
+            .is_some_and(|value| value.contains("BatchMode=yes")));
+    }
 
     fn init_test_repo() -> (TempDir, GitWorktreeService) {
         let temp = TempDir::new().expect("failed to create temp dir");
