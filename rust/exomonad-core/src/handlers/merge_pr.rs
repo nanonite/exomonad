@@ -1,12 +1,12 @@
 use crate::effects::{dispatch_merge_pr_effect, EffectResult, MergePrEffects, ResultExt};
-use crate::services::{file_pr_local, merge_pr, merge_pr_local};
+use crate::services::merge_pr;
 use async_trait::async_trait;
 use exomonad_proto::effects::merge_pr::*;
 use std::sync::Arc;
 use tracing::instrument;
 
 use crate::services::{
-    HasCiStatusMap, HasEventLog, HasGitHubClient, HasGitWorktreeService, HasProjectDir,
+    HasCiStatusMap, HasEventLog, HasForgejoClient, HasGitWorktreeService, HasProjectDir,
 };
 
 pub struct MergePRHandler<C> {
@@ -14,7 +14,7 @@ pub struct MergePRHandler<C> {
 }
 
 impl<
-        C: HasGitHubClient
+        C: HasForgejoClient
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
@@ -29,7 +29,7 @@ impl<
 
 #[async_trait]
 impl<
-        C: HasGitHubClient
+        C: HasForgejoClient
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
@@ -53,7 +53,7 @@ impl<
 
 #[async_trait]
 impl<
-        C: HasGitHubClient
+        C: HasForgejoClient
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
@@ -75,46 +75,17 @@ impl<
             "[MergePR] merge_pr starting"
         );
 
-        // Route: local registry when .exo/prs.json contains the PR, GitHub otherwise.
-        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
-        let use_local = if prs_path.exists() {
-            match file_pr_local::read_pr_registry(&prs_path).await {
-                Ok(reg) => reg.prs.contains_key(&pr_number.as_u64()),
-                Err(_) => false,
-            }
-        } else {
-            false
-        };
-
-        let result = if use_local {
+        let result = {
             tracing::info!(
                 pr_number = pr_number.as_u64(),
-                "[MergePR] routing to local registry"
-            );
-            let merger = ctx.agent_name.clone();
-            let policy = merge_pr_local::ReviewPolicy::default();
-            merge_pr_local::merge_pr_local(
-                pr_number,
-                &strategy,
-                self.ctx.project_dir(),
-                self.ctx.git_worktree_service().clone(),
-                &merger,
-                &policy,
-                self.ctx.ci_status_map(),
-            )
-            .await
-            .effect_err("merge_pr")?
-        } else {
-            tracing::info!(
-                pr_number = pr_number.as_u64(),
-                "[MergePR] routing to GitHub"
+                "[MergePR] routing to Forgejo"
             );
             merge_pr::merge_pr_async(
                 pr_number,
                 &strategy,
                 &req.working_dir,
                 self.ctx.git_worktree_service().clone(),
-                self.ctx.github_client().map(|arc| arc.as_ref()),
+                self.ctx.forgejo_client().map(|arc| arc.as_ref()),
             )
             .await
             .effect_err("merge_pr")?

@@ -2,13 +2,12 @@ use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::agent_resources::dispose_reviewers_for_pr;
-use crate::services::file_pr_local::{
-    read_pr_registry, write_pr_registry, LocalReviewState, PrEntry, PrRegistry, PrState,
-};
+use crate::services::file_pr_local::{LocalReviewState, PrEntry, PrRegistry, PrState};
+use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     CiStatusKey, CiStatusMap, HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue,
-    HasGitWorktreeService, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
+    HasForgejoClient, HasGitWorktreeService, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -26,7 +25,7 @@ use tracing::{debug, info, instrument, warn};
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
 const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
-/// Review state derived from local review files.
+/// Review state derived from Forgejo reviews or reviewer review files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReviewState {
@@ -248,6 +247,32 @@ struct ReviewStallDiagnostic {
     ci_status: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WatcherStateFile {
+    #[serde(default)]
+    prs: HashMap<u64, WatcherPrState>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WatcherPrState {
+    #[serde(default)]
+    rounds: u32,
+    #[serde(default)]
+    stuck: bool,
+    #[serde(default)]
+    needs_human_review: bool,
+}
+
+#[derive(Debug, Default)]
+struct PrBodyMetadata {
+    author_agent: Option<String>,
+    author_role: Option<String>,
+    birth_branch: Option<String>,
+    reviewer_agent: Option<String>,
+    reviewer_birth_branch: Option<String>,
+    chainlink_issue_id: Option<u64>,
+}
+
 impl WatchState {
     fn new(
         branch: &BranchName,
@@ -346,16 +371,16 @@ struct Observation {
     review_file_mtime: Option<SystemTime>,
 }
 
-/// Replaces `github_poller.rs` and `copilot_review.rs` by observing the local
-/// `.exo/prs.json` registry, `.exo/reviews/` files, and git worktree state.
+/// Replaces `github_poller.rs` and `copilot_review.rs` by observing Forgejo
+/// PR/review/CI state, reviewer review files, and git worktree state.
 pub struct WorktreeEventWatcher<C> {
     ctx: Arc<C>,
     poll_interval: Duration,
     state: Arc<Mutex<HashMap<u64, WatchState>>>,
-    prs_path: std::path::PathBuf,
+    watcher_state_path: std::path::PathBuf,
     plugins: Option<PluginMap>,
     policy: ReviewPolicy,
-    /// Shared CI status map updated by the spindle subscriber (branch → CIStatus).
+    /// Shared CI status map updated by Forgejo webhook fast-path notifications.
     ci_status_map: Arc<RwLock<CiStatusMap>>,
     ci_source_configured: bool,
     /// Spawns reviewer agents on PR creation.
@@ -369,17 +394,18 @@ where
         + HasAgentResolver
         + HasEventLog
         + HasEventQueue
+        + HasForgejoClient
         + HasGitWorktreeService
         + HasProjectDir
         + 'static,
 {
     pub fn new(ctx: Arc<C>) -> Self {
-        let prs_path = ctx.project_dir().join(".exo/prs.json");
+        let watcher_state_path = ctx.project_dir().join(".exo/watcher-state.json");
         Self {
             ctx,
             poll_interval: Duration::from_secs(60),
             state: Arc::new(Mutex::new(HashMap::new())),
-            prs_path,
+            watcher_state_path,
             plugins: None,
             policy: ReviewPolicy::default(),
             ci_status_map: Arc::new(RwLock::new(HashMap::new())),
@@ -430,19 +456,38 @@ where
             return CIStatus::Neutral;
         }
 
-        self.ci_status_map
+        if let Some(status) = self
+            .ci_status_map
             .read()
             .await
             .get(&ci_status_key(branch, head_sha))
             .copied()
-            .unwrap_or(CIStatus::Unknown)
+        {
+            return status;
+        }
+
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return CIStatus::Unknown;
+        };
+        let Ok(repo_info) = repo::get_repo_info(self.ctx.project_dir()).await else {
+            return CIStatus::Unknown;
+        };
+        match forgejo
+            .actions_status_for_head(&repo_info.owner, &repo_info.repo, branch, head_sha)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                debug!(branch = %branch, head_sha, error = %error, "Forgejo Actions status lookup failed");
+                CIStatus::Unknown
+            }
+        }
     }
     pub async fn run(&self) {
         tracing::info!(
             poll_interval_secs = self.poll_interval.as_secs(),
-            "Local worktree event watcher started"
+            "Forgejo worktree event watcher started"
         );
-
 
         let base_interval = self.poll_interval;
         let max_backoff = Duration::from_secs(600);
@@ -491,45 +536,110 @@ where
         }
     }
 
-    async fn bootstrap_registry_from_reviews(&self) -> Result<PrRegistry> {
-        Ok(PrRegistry::default())
+    async fn read_watcher_state(&self) -> Result<WatcherStateFile> {
+        if !self.watcher_state_path.exists() {
+            return Ok(WatcherStateFile::default());
+        }
+        let data = tokio::fs::read_to_string(&self.watcher_state_path)
+            .await
+            .with_context(|| format!("failed to read {}", self.watcher_state_path.display()))?;
+        serde_json::from_str(&data).context("failed to parse watcher-state.json")
+    }
+
+    async fn write_watcher_state(&self, state: &WatcherStateFile) -> Result<()> {
+        if let Some(parent) = self.watcher_state_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let data = serde_json::to_string_pretty(state)?;
+        tokio::fs::write(&self.watcher_state_path, data).await?;
+        Ok(())
+    }
+
+    async fn load_registry_from_forgejo(&self) -> Result<PrRegistry> {
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Ok(PrRegistry::default());
+        };
+        let repo_info = repo::get_repo_info(self.ctx.project_dir()).await?;
+        let watcher_state = self.read_watcher_state().await.unwrap_or_default();
+        let pull_requests = forgejo
+            .list_open_pull_requests(&repo_info.owner, &repo_info.repo)
+            .await?;
+        let mut registry = PrRegistry::default();
+
+        for pr in pull_requests {
+            let metadata = parse_pr_body_metadata(&pr.body);
+            let number = pr.number.as_u64();
+            let persisted = watcher_state.prs.get(&number).cloned().unwrap_or_default();
+            let birth_branch = metadata
+                .birth_branch
+                .as_deref()
+                .unwrap_or(pr.head_ref.as_str());
+            let author_agent = metadata
+                .author_agent
+                .or_else(|| author_agent_from_branch(birth_branch))
+                .unwrap_or_else(|| pr.head_ref.to_string());
+            let author_role = metadata.author_role.unwrap_or_else(|| "dev".to_string());
+            let head_sha = pr.head_sha.clone();
+            registry.prs.insert(
+                number,
+                PrEntry {
+                    number,
+                    head_branch: pr.head_ref.to_string(),
+                    base_branch: pr.base_ref.to_string(),
+                    title: pr.title,
+                    body: pr.body,
+                    author_agent,
+                    author_role,
+                    created_at: Utc::now(),
+                    state: PrState::Open,
+                    review_state: LocalReviewState::PendingReview,
+                    last_review_at: None,
+                    last_head_sha: head_sha,
+                    approved_at_sha: None,
+                    reviewer_agent: metadata.reviewer_agent,
+                    reviewer_birth_branch: metadata.reviewer_birth_branch,
+                    rounds: persisted.rounds,
+                    stuck: persisted.stuck,
+                    needs_human_review: persisted.needs_human_review,
+                    merge_blocked_on_ci: false,
+                    chainlink_issue_id: metadata.chainlink_issue_id,
+                },
+            );
+        }
+
+        Ok(registry)
     }
 
     async fn set_pr_stuck(&self, pr_number: u64, rounds: u32) -> anyhow::Result<()> {
-        let mut registry: PrRegistry = read_pr_registry(&self.prs_path).await?;
-        if let Some(pr) = registry.prs.get_mut(&pr_number) {
-            pr.stuck = true;
-            pr.rounds = rounds;
-            write_pr_registry(&self.prs_path, &registry).await?;
-            info!(pr_number, rounds, "Set stuck flag on PR");
-        }
+        let mut state = self.read_watcher_state().await.unwrap_or_default();
+        let entry = state.prs.entry(pr_number).or_default();
+        entry.stuck = true;
+        entry.rounds = rounds;
+        entry.needs_human_review = true;
+        self.write_watcher_state(&state).await?;
+        info!(pr_number, rounds, "Set stuck flag in watcher state");
         Ok(())
     }
 
     async fn set_pr_rounds(&self, pr_number: u64, rounds: u32) -> anyhow::Result<()> {
-        let mut registry: PrRegistry = read_pr_registry(&self.prs_path).await?;
-        if let Some(pr) = registry.prs.get_mut(&pr_number) {
-            if pr.rounds != rounds {
-                pr.rounds = rounds;
-                write_pr_registry(&self.prs_path, &registry).await?;
-                info!(pr_number, rounds, "Persisted PR review rounds");
-            }
+        let mut state = self.read_watcher_state().await.unwrap_or_default();
+        let entry = state.prs.entry(pr_number).or_default();
+        if entry.rounds != rounds {
+            entry.rounds = rounds;
+            self.write_watcher_state(&state).await?;
+            info!(
+                pr_number,
+                rounds, "Persisted PR review rounds in watcher state"
+            );
         }
         Ok(())
     }
 
     #[instrument(skip_all, name = "worktree_event_watcher.poll_cycle")]
     async fn poll_cycle(&self) -> Result<()> {
-        let mut registry = match read_pr_registry(&self.prs_path).await {
-            Ok(r) => r,
-            Err(_) => return Ok(()),
-        };
-
+        let registry = self.load_registry_from_forgejo().await?;
         if registry.prs.is_empty() {
-            registry = self.bootstrap_registry_from_reviews().await?;
-            if registry.prs.is_empty() {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         let observations = self.collect_observations(&registry).await?;
@@ -551,9 +661,13 @@ where
                 continue;
             }
 
-            let worktree_path = project_dir.join(".exo/worktrees").join(&pr.author_agent);
-
-            let head_sha = git_head_sha(&worktree_path).await.unwrap_or_default();
+            let head_sha = match pr.last_head_sha.as_deref() {
+                Some(sha) if !sha.is_empty() => sha.to_string(),
+                _ => {
+                    let worktree_path = project_dir.join(".exo/worktrees").join(&pr.author_agent);
+                    git_head_sha(&worktree_path).await.unwrap_or_default()
+                }
+            };
 
             let review_path = project_dir
                 .join(".exo/reviews")
@@ -566,10 +680,7 @@ where
             let review_file_seen = review_file.is_some();
             let (review_state, comments, reviews) = match review_file {
                 Some(rf) => review_file_parts(rf, Some(&head_sha)),
-                None => {
-                    let state = pr.review_state.clone();
-                    (state, vec![], vec![])
-                }
+                None => self.forgejo_review_parts(*number, &head_sha).await,
             };
 
             let branch = BranchName::try_from_str(pr.head_branch.as_str())
@@ -882,7 +993,7 @@ where
                                     "pr_review event fired but no reviewer is registered for \
                                      this PR — the leaf+reviewer convergence loop will \
                                      stall. Check that spawn_reviewer_for_pr ran for this \
-                                     PR and that the PR registry was updated."
+                                     PR and that the Forgejo PR body has reviewer metadata."
                                 );
                             }
                             ReviewerFanOut::SuppressedSelfEcho => {
@@ -953,23 +1064,12 @@ where
     }
 
     async fn persist_last_head_shas(&self, updates: &[(u64, String)]) -> Result<()> {
-        let mut registry = read_pr_registry(&self.prs_path).await?;
-        let mut changed = false;
-
-        for (pr_number, head_sha) in updates {
-            if let Some(pr) = registry.prs.get_mut(pr_number) {
-                if pr.last_head_sha.as_deref() != Some(head_sha.as_str()) {
-                    pr.last_head_sha = Some(head_sha.clone());
-                    pr.approved_at_sha = None;
-                    changed = true;
-                }
-            }
+        if !updates.is_empty() {
+            debug!(
+                count = updates.len(),
+                "PR head SHAs are sourced from Forgejo; skipping local persistence"
+            );
         }
-
-        if changed {
-            write_pr_registry(&self.prs_path, &registry).await?;
-        }
-
         Ok(())
     }
 
@@ -977,29 +1077,26 @@ where
         &self,
         updates: &[(u64, LocalReviewState, String)],
     ) -> Result<()> {
-        let mut registry = read_pr_registry(&self.prs_path).await?;
-        let mut changed = false;
-
-        for (pr_number, review_state, head_sha) in updates {
-            if let Some(pr) = registry.prs.get_mut(pr_number) {
-                if pr.review_state != *review_state {
-                    pr.review_state = review_state.clone();
-                    if matches!(review_state, LocalReviewState::Approved) {
-                        pr.approved_at_sha = Some(head_sha.clone());
-                        pr.stuck = false;
-                        pr.needs_human_review = false;
-                    } else {
-                        pr.approved_at_sha = None;
+        if updates
+            .iter()
+            .any(|(_, state, _)| matches!(state, LocalReviewState::Approved))
+        {
+            let mut watcher_state = self.read_watcher_state().await.unwrap_or_default();
+            let mut changed = false;
+            for (pr_number, review_state, _) in updates {
+                if matches!(review_state, LocalReviewState::Approved) {
+                    let entry = watcher_state.prs.entry(*pr_number).or_default();
+                    if entry.stuck || entry.needs_human_review {
+                        entry.stuck = false;
+                        entry.needs_human_review = false;
+                        changed = true;
                     }
-                    changed = true;
                 }
             }
+            if changed {
+                self.write_watcher_state(&watcher_state).await?;
+            }
         }
-
-        if changed {
-            write_pr_registry(&self.prs_path, &registry).await?;
-        }
-
         Ok(())
     }
 
@@ -1460,6 +1557,65 @@ where
             })),
         };
         self.ctx.event_queue().notify_event(branch, event).await;
+    }
+
+    async fn forgejo_review_parts(
+        &self,
+        pr_number: u64,
+        head_sha: &str,
+    ) -> (LocalReviewState, Vec<LocalReviewComment>, Vec<LocalReview>) {
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return (LocalReviewState::PendingReview, vec![], vec![]);
+        };
+        let Ok(repo_info) = repo::get_repo_info(self.ctx.project_dir()).await else {
+            return (LocalReviewState::PendingReview, vec![], vec![]);
+        };
+        let reviews = match forgejo
+            .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
+            .await
+        {
+            Ok(reviews) => reviews,
+            Err(error) => {
+                debug!(pr_number, error = %error, "Forgejo review lookup failed");
+                return (LocalReviewState::PendingReview, vec![], vec![]);
+            }
+        };
+
+        let mut local_reviews = Vec::new();
+        for review in reviews {
+            if review
+                .commit_id
+                .as_deref()
+                .is_some_and(|commit| !head_sha.is_empty() && commit != head_sha)
+            {
+                continue;
+            }
+            let state = review_state_from_str(&review.state);
+            if state == ReviewState::None {
+                continue;
+            }
+            local_reviews.push(LocalReview {
+                body: review.body,
+                state,
+                author_branch: None,
+            });
+        }
+
+        let review_state = if local_reviews
+            .iter()
+            .any(|review| review.state == ReviewState::ChangesRequested)
+        {
+            LocalReviewState::ChangesRequested
+        } else if local_reviews
+            .iter()
+            .any(|review| review.state == ReviewState::Approved)
+        {
+            LocalReviewState::Approved
+        } else {
+            LocalReviewState::PendingReview
+        };
+
+        (review_state, vec![], local_reviews)
     }
 
     async fn read_review_file(project_dir: &std::path::Path, pr_number: u64) -> Option<ReviewFile> {
@@ -1944,6 +2100,26 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
+fn parse_pr_body_metadata(body: &str) -> PrBodyMetadata {
+    PrBodyMetadata {
+        author_agent: pr_body_metadata_value(body, "Authoring-Agent"),
+        author_role: pr_body_metadata_value(body, "Authoring-Role"),
+        birth_branch: pr_body_metadata_value(body, "Birth-Branch"),
+        reviewer_agent: pr_body_metadata_value(body, "Reviewer-Agent"),
+        reviewer_birth_branch: pr_body_metadata_value(body, "Reviewer-Birth-Branch"),
+        chainlink_issue_id: pr_body_metadata_value(body, "Chainlink-Issue")
+            .and_then(|value| value.trim_start_matches('#').parse().ok()),
+    }
+}
+
+fn pr_body_metadata_value(body: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 #[allow(dead_code)]
 fn author_agent_from_branch(branch: &str) -> Option<String> {
     branch
@@ -2059,17 +2235,21 @@ fn review_comment_entry_to_local(c: ReviewCommentEntry) -> LocalReviewComment {
 }
 
 fn local_review_state_from_str(state: &str) -> LocalReviewState {
-    match state {
-        "approved" => LocalReviewState::Approved,
-        "changes_requested" => LocalReviewState::ChangesRequested,
+    match state.to_ascii_lowercase().as_str() {
+        "approved" | "approve" => LocalReviewState::Approved,
+        "changes_requested" | "request_changes" | "request_changes_requested" => {
+            LocalReviewState::ChangesRequested
+        }
         _ => LocalReviewState::PendingReview,
     }
 }
 
 fn review_state_from_str(state: &str) -> ReviewState {
-    match state {
-        "approved" => ReviewState::Approved,
-        "changes_requested" => ReviewState::ChangesRequested,
+    match state.to_ascii_lowercase().as_str() {
+        "approved" | "approve" => ReviewState::Approved,
+        "changes_requested" | "request_changes" | "request_changes_requested" => {
+            ReviewState::ChangesRequested
+        }
         _ => ReviewState::None,
     }
 }
@@ -4029,7 +4209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_observations_persists_last_head_sha() {
+    async fn test_process_observations_does_not_write_head_sha_registry() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
@@ -4037,9 +4217,6 @@ mod tests {
         let watcher = WorktreeEventWatcher::new(Arc::new(services));
         let pr = test_pr_entry();
         let registry = test_registry(pr);
-        write_pr_registry(&watcher.prs_path, &registry)
-            .await
-            .unwrap();
 
         let mut observations = HashMap::new();
         observations.insert(1u64, test_observation("def456"));
@@ -4049,31 +4226,27 @@ mod tests {
             .await
             .unwrap();
 
-        let persisted = read_pr_registry(&watcher.prs_path).await.unwrap();
-        assert_eq!(
-            persisted
-                .prs
-                .get(&1)
-                .and_then(|pr| pr.last_head_sha.as_deref()),
-            Some("def456")
-        );
+        assert!(!temp_dir.path().join(".exo/prs.json").exists());
     }
 
     #[tokio::test]
-    async fn test_process_observations_persists_approved_review_state() {
+    async fn test_process_observations_clears_watcher_state_on_approval() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
 
         let watcher = WorktreeEventWatcher::new(Arc::new(services));
-        let mut pr = test_pr_entry();
-        pr.review_state = crate::services::file_pr_local::LocalReviewState::PendingReview;
-        pr.stuck = true;
-        pr.needs_human_review = true;
-        let registry = test_registry(pr);
-        write_pr_registry(&watcher.prs_path, &registry)
-            .await
-            .unwrap();
+        let mut state = WatcherStateFile::default();
+        state.prs.insert(
+            1,
+            WatcherPrState {
+                rounds: 2,
+                stuck: true,
+                needs_human_review: true,
+            },
+        );
+        watcher.write_watcher_state(&state).await.unwrap();
+        let registry = test_registry(test_pr_entry());
 
         let mut observations = HashMap::new();
         observations.insert(
@@ -4094,56 +4267,12 @@ mod tests {
             .await
             .unwrap();
 
-        let persisted = read_pr_registry(&watcher.prs_path).await.unwrap();
-        let pr = persisted.prs.get(&1).unwrap();
-        assert_eq!(
-            pr.review_state,
-            crate::services::file_pr_local::LocalReviewState::Approved
-        );
-        assert_eq!(pr.approved_at_sha.as_deref(), Some("abc123"));
-        assert!(!pr.stuck);
-        assert!(!pr.needs_human_review);
-    }
-
-    #[tokio::test]
-    async fn test_process_observations_clears_approved_sha_on_new_head() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-
-        let watcher = WorktreeEventWatcher::new(Arc::new(services));
-        let mut pr = test_pr_entry();
-        pr.review_state = crate::services::file_pr_local::LocalReviewState::Approved;
-        pr.last_head_sha = Some("abc123".to_string());
-        pr.approved_at_sha = Some("abc123".to_string());
-        let registry = test_registry(pr);
-        write_pr_registry(&watcher.prs_path, &registry)
-            .await
-            .unwrap();
-
-        let mut observations = HashMap::new();
-        observations.insert(
-            1u64,
-            Observation {
-                head_sha: "def456".to_string(),
-                review_state: crate::services::file_pr_local::LocalReviewState::Approved,
-                comments: vec![],
-                reviews: vec![],
-                ci_status: CIStatus::Unknown,
-                review_file_seen: false,
-                review_file_mtime: None,
-            },
-        );
-
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-
-        let persisted = read_pr_registry(&watcher.prs_path).await.unwrap();
-        let pr = persisted.prs.get(&1).unwrap();
-        assert_eq!(pr.last_head_sha.as_deref(), Some("def456"));
-        assert_eq!(pr.approved_at_sha, None);
+        let persisted = watcher.read_watcher_state().await.unwrap();
+        let pr_state = persisted.prs.get(&1).unwrap();
+        assert_eq!(pr_state.rounds, 1);
+        assert!(!pr_state.stuck);
+        assert!(!pr_state.needs_human_review);
+        assert!(!temp_dir.path().join(".exo/prs.json").exists());
     }
 
     #[tokio::test]

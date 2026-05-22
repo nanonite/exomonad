@@ -15,7 +15,7 @@ Use exomonad MCP tools for orchestration. Git operations use `git` CLI. **Never 
 | `fork_wave` | root, tl | Fork N parallel Claude agents (own worktrees, context inherited by default via `fork_session`) |
 | `spawn_leaf` | root, tl | Spawn a leaf agent in its own worktree+branch (files PR when done). Agent type defaults to server config; pass `agent_type` only when this leaf needs a specific supported runtime. |
 | `spawn_worker` | root, tl | Spawn an ephemeral worker in a tmux pane (no branch, no PR). Agent type defaults to server config; pass `agent_type` only when this worker needs a specific supported runtime. |
-| `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming). Works locally via `.exo/prs.json` when no GitHub remote. |
+| `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) through the configured Forgejo API. |
 | `merge_pr` | root, tl | Merge a child's PR |
 | `notify_parent` | tl, dev, worker | Send message to parent agent |
 | `send_message` | all | Send message to any exomonad-spawned agent |
@@ -23,9 +23,9 @@ Use exomonad MCP tools for orchestration. Git operations use `git` CLI. **Never 
 | `task_get` | dev, worker | Get a task by ID |
 | `task_update` | dev, worker | Update task status, owner, or activeForm |
 
-## PR Status (No GitHub Remote)
+## PR Status (Forgejo)
 
-When there is no GitHub remote, PRs are tracked locally in `.exo/prs.json`. Do NOT use `gh` commands — they will fail. The worktree event watcher automatically spawns a reviewer and delivers `[PR READY]` / `[FIXES PUSHED]` notifications. You do not need to poll PR status manually.
+PRs are tracked in Forgejo. Do NOT use `gh` commands — they will fail. The worktree event watcher reads Forgejo PR/review/CI state, automatically spawns a reviewer, and delivers `[PR READY]` / `[FIXES PUSHED]` / `[MERGE READY]` notifications. You do not need to poll PR status manually.
 
 ## Agent Hierarchy
 

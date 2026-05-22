@@ -46,11 +46,10 @@ Convergence:
   - For ephemeral workers (no PR): on [from: worker-id] with blocker content,
     steer via send_message or escalate; if mis-scoped, spawn a new worker.
 
-PR STATUS: There is no GitHub remote. Do NOT use `gh` commands — they will
-  fail. The local PR registry is at .exo/prs.json. To check what has been
-  filed: `cat .exo/prs.json`. The worktree event watcher automatically spawns
-  a reviewer and delivers [PR READY] / [FIXES PUSHED] / [MERGE READY] /
-  [STUCK: ...] to you when done.
+PR STATUS: PRs live in Forgejo. Do NOT use `gh` commands — they will
+  fail. The worktree event watcher reads Forgejo PR/review/CI state,
+  automatically spawns a reviewer, and delivers [PR READY] / [FIXES PUSHED] /
+  [MERGE READY] / [STUCK: ...] to you when done.
   You do not need to check PR status manually.
 
 Sanity check the new behavior on the FIRST spawn:

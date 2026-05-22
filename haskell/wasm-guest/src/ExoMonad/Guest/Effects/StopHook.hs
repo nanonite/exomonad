@@ -42,7 +42,7 @@ checkUncommittedWork branch = do
         then pure $ Just $ "Commits on " <> branch <> " aren't in a PR yet. File a PR before stopping."
         else pure Nothing
 
--- | Check the local PR registry for an already-filed PR.
+-- | Check Forgejo-backed PR lookup for an already-filed PR.
 -- Hosted PR lookup is intentionally not performed here; file_pr owns remote
 -- creation and stop hooks must not depend on hosted API credentials.
 checkPRNotFiled :: Text -> Eff Effects (Maybe Text)

@@ -22,6 +22,8 @@ pub struct FilePRInput {
     pub body: String,
     pub base_branch: Option<BranchName>,
     pub working_dir: Option<String>,
+    pub author_agent: Option<String>,
+    pub author_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +69,36 @@ pub(crate) fn resolve_base_branch(head: &BranchName, explicit: Option<&BranchNam
         .unwrap_or_else(|| {
             BranchName::try_from_str("main").expect("literal validated string is non-empty")
         })
+}
+
+fn append_pr_body_metadata(
+    body: &str,
+    author_agent: Option<&str>,
+    author_role: Option<&str>,
+    head_branch: &BranchName,
+) -> String {
+    let extracted_agent = git::extract_agent_id(head_branch.as_str());
+    let author_agent = author_agent
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .or(extracted_agent.as_deref())
+        .unwrap_or_else(|| head_branch.as_str());
+    let author_role = author_role
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("dev");
+    format!(
+        "{}
+
+---
+Authoring-Agent: {}
+Authoring-Role:  {}
+Birth-Branch:    {}",
+        body.trim_end(),
+        author_agent,
+        author_role,
+        head_branch.as_str()
+    )
 }
 
 // ============================================================================
@@ -140,6 +172,12 @@ pub async fn file_pr_async(
         BranchName::try_from_str(head_str.as_str()).expect("validated string input is non-empty");
 
     let base = resolve_base_branch(&head, input.base_branch.as_ref());
+    let pr_body = append_pr_body_metadata(
+        &input.body,
+        input.author_agent.as_deref(),
+        input.author_role.as_deref(),
+        &head,
+    );
 
     info!("[FilePR] head={} base={} dir={}", head, base, dir);
 
@@ -168,7 +206,7 @@ pub async fn file_pr_async(
             &repo_info.repo,
             pr_number,
             &input.title,
-            &input.body,
+            &pr_body,
             &base,
         )
         .await?;
@@ -189,7 +227,7 @@ pub async fn file_pr_async(
         &repo_info.owner,
         &repo_info.repo,
         &input.title,
-        &input.body,
+        &pr_body,
         &base,
         &head,
     )
@@ -391,6 +429,8 @@ mod tests {
             body: "Test Body".to_string(),
             base_branch: None,
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+            author_agent: Some("test-agent".to_string()),
+            author_role: Some("dev".to_string()),
         };
 
         let forgejo = ForgejoClient::new("http://forgejo.local", "token").unwrap();
@@ -445,6 +485,8 @@ mod tests {
             body: "Test Body".to_string(),
             base_branch: None,
             working_dir: Some(dir.to_string_lossy().to_string()),
+            author_agent: Some("test-agent".to_string()),
+            author_role: Some("dev".to_string()),
         };
 
         let forgejo = ForgejoClient::new("http://forgejo.local", "token").unwrap();

@@ -30,7 +30,7 @@ message FilePrResponse {
 }
 
 // ============================================================================
-// LocalPR - Read entries from .exo/prs.json for local/Tangled PR flows
+// LocalPR - Compatibility lookups for the PR associated with a branch
 // ============================================================================
 
 message LocalPrGetRequest {

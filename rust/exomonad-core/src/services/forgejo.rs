@@ -1,4 +1,4 @@
-use crate::domain::{BranchName, GithubOwner, GithubRepo, PRNumber};
+use crate::domain::{BranchName, CIStatus, GithubOwner, GithubRepo, PRNumber};
 use anyhow::{anyhow, Context, Result};
 use reqwest::{header, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,20 @@ pub struct ForgejoClient {
 pub struct ForgejoPullRequest {
     pub number: PRNumber,
     pub url: String,
+    pub title: String,
+    pub body: String,
     pub head_ref: BranchName,
     pub base_ref: BranchName,
+    pub state: String,
+    pub merged: bool,
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoPullRequestReview {
+    pub state: String,
+    pub body: String,
+    pub commit_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,9 +46,23 @@ struct UpdatePullRequestBody<'a> {
     base: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+struct MergePullRequestBody<'a> {
+    #[serde(rename = "Do")]
+    method: &'a str,
+}
+
 #[derive(Debug, Deserialize)]
 struct PullRequestResponse {
     number: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    merged: bool,
     html_url: Option<String>,
     url: Option<String>,
     head: PullRequestBranch,
@@ -47,6 +73,36 @@ struct PullRequestResponse {
 struct PullRequestBranch {
     #[serde(rename = "ref")]
     ref_name: String,
+    #[serde(default)]
+    sha: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestReviewResponse {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    commit_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunsResponse {
+    #[serde(default)]
+    workflow_runs: Vec<WorkflowRunResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunResponse {
+    #[serde(default)]
+    head_branch: Option<String>,
+    #[serde(default)]
+    head_sha: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
 }
 
 impl ForgejoClient {
@@ -105,6 +161,96 @@ impl ForgejoClient {
             .transpose()
     }
 
+    pub async fn list_open_pull_requests(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+    ) -> Result<Vec<ForgejoPullRequest>> {
+        let url = self.repo_pulls_url(owner, repo)?;
+        let response = self
+            .http
+            .get(url)
+            .query(&[("state", "open"), ("limit", "100")])
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo PR list request failed")?;
+
+        let prs: Vec<PullRequestResponse> = self
+            .decode_response(response, "list Forgejo pull requests")
+            .await?;
+        prs.into_iter().map(ForgejoPullRequest::try_from).collect()
+    }
+
+    pub async fn list_pull_request_reviews(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        number: PRNumber,
+    ) -> Result<Vec<ForgejoPullRequestReview>> {
+        let number = number.as_u64().to_string();
+        let url = self.api_url(&[
+            "repos",
+            owner.as_str(),
+            repo.as_str(),
+            "pulls",
+            &number,
+            "reviews",
+        ])?;
+        let response = self
+            .http
+            .get(url)
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo PR reviews request failed")?;
+
+        let reviews: Vec<PullRequestReviewResponse> = self
+            .decode_response(response, "list Forgejo pull request reviews")
+            .await?;
+        Ok(reviews
+            .into_iter()
+            .map(|review| ForgejoPullRequestReview {
+                state: review.state,
+                body: review.body,
+                commit_id: review.commit_id,
+            })
+            .collect())
+    }
+
+    pub async fn actions_status_for_head(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        branch: &BranchName,
+        head_sha: &str,
+    ) -> Result<CIStatus> {
+        let url = self.api_url(&["repos", owner.as_str(), repo.as_str(), "actions", "runs"])?;
+        let response = self
+            .http
+            .get(url)
+            .query(&[("branch", branch.as_str()), ("limit", "20")])
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo Actions runs request failed")?;
+
+        let runs: WorkflowRunsResponse = self
+            .decode_response(response, "list Forgejo Actions runs")
+            .await?;
+        let Some(run) = runs.workflow_runs.into_iter().find(|run| {
+            run.head_sha.as_deref() == Some(head_sha)
+                && run.head_branch.as_deref() == Some(branch.as_str())
+        }) else {
+            return Ok(CIStatus::Unknown);
+        };
+        Ok(run
+            .conclusion
+            .or(run.status)
+            .map(|status| CIStatus::parse(&status))
+            .unwrap_or(CIStatus::Unknown))
+    }
+
     pub async fn create_pull_request(
         &self,
         owner: &GithubOwner,
@@ -135,6 +281,54 @@ impl ForgejoClient {
             .decode_response(response, "create Forgejo pull request")
             .await?;
         ForgejoPullRequest::try_from(pr)
+    }
+
+    pub async fn get_pull_request(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        number: PRNumber,
+    ) -> Result<ForgejoPullRequest> {
+        let url = self.repo_pull_url(owner, repo, number)?;
+        let response = self
+            .http
+            .get(url)
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo PR get request failed")?;
+        let pr: PullRequestResponse = self
+            .decode_response(response, "get Forgejo pull request")
+            .await?;
+        ForgejoPullRequest::try_from(pr)
+    }
+
+    pub async fn merge_pull_request(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        number: PRNumber,
+        method: &str,
+    ) -> Result<()> {
+        let number_segment = number.as_u64().to_string();
+        let url = self.api_url(&[
+            "repos",
+            owner.as_str(),
+            repo.as_str(),
+            "pulls",
+            &number_segment,
+            "merge",
+        ])?;
+        let response = self
+            .http
+            .post(url)
+            .headers(self.auth_headers()?)
+            .json(&MergePullRequestBody { method })
+            .send()
+            .await
+            .context("Forgejo PR merge request failed")?;
+        self.expect_success(response, "merge Forgejo pull request")
+            .await
     }
 
     pub async fn update_pull_request(
@@ -254,8 +448,13 @@ impl TryFrom<PullRequestResponse> for ForgejoPullRequest {
         Ok(Self {
             number: PRNumber::new(value.number),
             url: value.html_url.or(value.url).unwrap_or_default(),
+            title: value.title,
+            body: value.body,
             head_ref: BranchName::try_from(value.head.ref_name)?,
             base_ref: BranchName::try_from(value.base.ref_name)?,
+            state: value.state,
+            merged: value.merged,
+            head_sha: value.head.sha,
         })
     }
 }

@@ -810,6 +810,8 @@ mod tests {
             body: "Test Body".to_string(),
             base_branch: None,
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+            author_agent: Some("test-agent".to_string()),
+            author_role: Some("dev".to_string()),
         };
 
         let result =

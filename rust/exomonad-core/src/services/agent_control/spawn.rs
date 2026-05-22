@@ -234,6 +234,35 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 - Never create branches, commits, or PRs unless explicitly instructed.
 ";
 
+fn append_reviewer_metadata(
+    body: &str,
+    reviewer_agent: &str,
+    reviewer_birth_branch: &str,
+) -> String {
+    let mut lines: Vec<&str> = body
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("Reviewer-Agent:")
+                && !trimmed.starts_with("Reviewer-Birth-Branch:")
+        })
+        .collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    format!(
+        "{}
+Reviewer-Agent: {}
+Reviewer-Birth-Branch: {}",
+        lines.join(
+            "
+"
+        ),
+        reviewer_agent,
+        reviewer_birth_branch
+    )
+}
+
 pub const CODEX_REVIEWER_INSTRUCTIONS: &str = "\
 # ExoMonad Reviewer Agent Protocol
 
@@ -1558,16 +1587,6 @@ impl<
             .context("Failed to create reviewer worktree")?;
         }
 
-        let reviewer_internal_name = identity.internal_name().to_string();
-        // spawn_subtree (called below) computes its own birth_branch as
-        // `caller_bb.child(internal_name)` and registers THAT with AgentResolver —
-        // not the bare `branch_name` we pass in. To keep the watcher's reviewer
-        // fan-out lookup working (resolve_event_agent_name finds the record by
-        // birth_branch + agent_type), persist the same dotted form into the PR
-        // registry so reviewer_for_pr returns what AgentResolver actually has.
-        // See chainlink #256.
-        let reviewer_birth_branch = caller_bb.child(&reviewer_internal_name).to_string();
-
         let options = SpawnSubtreeOptions {
             task,
             branch_name,
@@ -1594,42 +1613,6 @@ impl<
 
         let result = self.spawn_subtree(&options, caller_bb).await?;
 
-        // Persist the reviewer→PR mapping so the worktree event watcher can fan out
-        // PR review events to the reviewer's plugin manager. Without this, handlers
-        // in .exo/roles/devswarm/ReviewerRole.hs (FixesPushed, ReviewerApproved, etc.)
-        // are unreachable and the leaf+reviewer convergence loop stalls indefinitely.
-        let prs_path = self.project_dir().join(".exo/prs.json");
-        match crate::services::file_pr_local::read_pr_registry(&prs_path).await {
-            Ok(mut registry) => {
-                if let Some(entry) = registry.prs.get_mut(&pr_entry.number) {
-                    entry.reviewer_agent = Some(reviewer_internal_name);
-                    entry.reviewer_birth_branch = Some(reviewer_birth_branch);
-                    if let Err(err) =
-                        crate::services::file_pr_local::write_pr_registry(&prs_path, &registry)
-                            .await
-                    {
-                        tracing::warn!(
-                            pr_number = pr_entry.number,
-                            error = %err,
-                            "Failed to persist reviewer registration to PR registry — \
-                             watcher will not fan out PR review events to this reviewer"
-                        );
-                    }
-                } else {
-                    tracing::warn!(
-                        pr_number = pr_entry.number,
-                        "PR entry missing from registry at reviewer-spawn time — \
-                         skipping reviewer registration"
-                    );
-                }
-            }
-            Err(err) => tracing::warn!(
-                pr_number = pr_entry.number,
-                error = %err,
-                "Failed to read PR registry to persist reviewer assignment"
-            ),
-        }
-
         Ok(result)
     }
 }
@@ -1637,6 +1620,7 @@ impl<
 #[async_trait::async_trait]
 impl<
         C: crate::services::HasGitHubClient
+            + crate::services::HasForgejoClient
             + crate::services::HasAcpRegistry
             + crate::services::HasTeamRegistry
             + crate::services::HasAgentResolver
@@ -1663,7 +1647,49 @@ impl<
         }
         let caller_bb = BirthBranch::try_from_str(pr.base_branch.as_str())
             .expect("validated string input is non-empty");
+        let reviewer_branch_name = format!("review-pr-{}", pr.number);
+        let reviewer_identity =
+            AgentIdentity::new(slugify(&reviewer_branch_name), self.reviewer_agent_type);
+        let reviewer_internal_name = reviewer_identity.internal_name().to_string();
+        let reviewer_birth_branch = caller_bb.child(&reviewer_internal_name).to_string();
         self.spawn_reviewer_subtree(pr, &caller_bb).await?;
+
+        if let Some(forgejo) = self.ctx.forgejo_client() {
+            match crate::services::repo::get_repo_info(self.project_dir()).await {
+                Ok(repo_info) => {
+                    let base_branch = BranchName::try_from_str(pr.base_branch.as_str())
+                        .expect("validated string input is non-empty");
+                    let body = append_reviewer_metadata(
+                        &pr.body,
+                        &reviewer_internal_name,
+                        &reviewer_birth_branch,
+                    );
+                    if let Err(err) = forgejo
+                        .update_pull_request(
+                            &repo_info.owner,
+                            &repo_info.repo,
+                            crate::domain::PRNumber::new(pr.number),
+                            &pr.title,
+                            &body,
+                            &base_branch,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            pr_number = pr.number,
+                            error = %err,
+                            "Failed to persist reviewer assignment to Forgejo PR body"
+                        );
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    pr_number = pr.number,
+                    error = %err,
+                    "Failed to resolve repository while persisting reviewer assignment"
+                ),
+            }
+        }
+
         Ok(())
     }
 }

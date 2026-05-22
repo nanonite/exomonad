@@ -5,10 +5,10 @@
 use super::non_empty;
 use crate::domain::BranchName;
 use crate::effects::{
-    dispatch_file_pr_effect, EffectHandler, EffectResult, FilePrEffects, ResultExt,
+    dispatch_file_pr_effect, EffectError, EffectHandler, EffectResult, FilePrEffects, ResultExt,
 };
 use crate::services::file_pr::{self, FilePRInput};
-use crate::services::file_pr_local;
+use crate::services::repo;
 use async_trait::async_trait;
 use exomonad_proto::effects::file_pr::*;
 use std::sync::Arc;
@@ -72,28 +72,23 @@ impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir +
             body: req.body,
             base_branch,
             working_dir: Some(working_dir.to_string_lossy().to_string()),
+            author_agent: Some(ctx.agent_name.to_string()),
+            author_role: Some("dev".to_string()),
         };
 
-        let output = if let Some(forgejo) = self.ctx.forgejo_client() {
-            file_pr::file_pr_async(
-                &input,
-                self.ctx.git_worktree_service().clone(),
-                forgejo.as_ref(),
-            )
-            .await
-            .effect_err("file_pr")?
-        } else {
-            tracing::info!("[FilePR] No Forgejo client — routing to local PR flow");
-            file_pr_local::file_pr_local(
-                &input,
-                self.ctx.git_worktree_service().clone(),
-                self.ctx.project_dir(),
-                &crate::domain::Role::dev(),
-                &ctx.agent_name,
-            )
-            .await
-            .effect_err("file_pr")?
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Err(EffectError::custom(
+                "file_pr_error",
+                "forgejo_url and forgejo_token are required; local prs.json PR flow has been removed",
+            ));
         };
+        let output = file_pr::file_pr_async(
+            &input,
+            self.ctx.git_worktree_service().clone(),
+            forgejo.as_ref(),
+        )
+        .await
+        .effect_err("file_pr")?;
 
         tracing::info!(
             pr_number = output.pr_number.as_u64(),
@@ -151,27 +146,22 @@ impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir +
         req: LocalPrGetRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<LocalPrResponse> {
-        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
-        let registry = match file_pr_local::read_pr_registry(&prs_path).await {
-            Ok(registry) => registry,
-            Err(error) => {
-                tracing::debug!(
-                    error = %error,
-                    path = %prs_path.display(),
-                    "[FilePR] local PR registry unavailable"
-                );
-                return Ok(LocalPrResponse::default());
-            }
+        let _ = ctx;
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Ok(LocalPrResponse::default());
         };
-
-        if let Some(response) = registry
-            .prs
-            .get(&(req.pr_number as u64))
-            .map(local_pr_response)
-        {
-            return Ok(response);
-        }
-        Ok(LocalPrResponse::default())
+        let repo_info = repo::get_repo_info(self.ctx.project_dir())
+            .await
+            .effect_err("file_pr")?;
+        let prs = forgejo
+            .list_open_pull_requests(&repo_info.owner, &repo_info.repo)
+            .await
+            .effect_err("file_pr")?;
+        Ok(prs
+            .into_iter()
+            .find(|pr| pr.number.as_u64() == req.pr_number as u64)
+            .map(|pr| forgejo_pr_response(&pr))
+            .unwrap_or_default())
     }
 
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, branch = %req.branch))]
@@ -180,47 +170,53 @@ impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir +
         req: LocalPrGetForBranchRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<LocalPrResponse> {
-        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
-        let registry = match file_pr_local::read_pr_registry(&prs_path).await {
-            Ok(registry) => registry,
-            Err(error) => {
-                tracing::debug!(
-                    error = %error,
-                    path = %prs_path.display(),
-                    "[FilePR] local PR registry unavailable"
-                );
-                return Ok(LocalPrResponse::default());
-            }
+        let _ = ctx;
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Ok(LocalPrResponse::default());
         };
-
-        if let Some(response) = registry
-            .prs
-            .values()
-            .find(|entry| entry.head_branch == req.branch)
-            .map(local_pr_response)
-        {
-            return Ok(response);
-        }
-        Ok(LocalPrResponse::default())
+        let repo_info = repo::get_repo_info(self.ctx.project_dir())
+            .await
+            .effect_err("file_pr")?;
+        let branch = BranchName::try_from_str(req.branch.as_str())
+            .expect("validated string input is non-empty");
+        Ok(forgejo
+            .find_open_pull_request(&repo_info.owner, &repo_info.repo, &branch)
+            .await
+            .effect_err("file_pr")?
+            .map(|pr| forgejo_pr_response(&pr))
+            .unwrap_or_default())
     }
 }
 
-fn local_pr_response(entry: &file_pr_local::PrEntry) -> LocalPrResponse {
+fn forgejo_pr_response(pr: &crate::services::forgejo::ForgejoPullRequest) -> LocalPrResponse {
+    let author_agent = pr_body_metadata_value(&pr.body, "Authoring-Agent")
+        .or_else(|| author_agent_from_branch(pr.head_ref.as_str()))
+        .unwrap_or_default();
     LocalPrResponse {
         found: true,
-        pr_number: entry.number as i64,
-        head_branch: entry.head_branch.clone(),
-        base_branch: entry.base_branch.clone(),
-        author_agent: entry.author_agent.clone(),
-        review_state: match entry.review_state {
-            file_pr_local::LocalReviewState::PendingReview => "pending_review",
-            file_pr_local::LocalReviewState::ChangesRequested => "changes_requested",
-            file_pr_local::LocalReviewState::Approved => "approved",
-        }
-        .to_string(),
-        last_head_sha: entry.last_head_sha.clone().unwrap_or_default(),
-        reviewer_agent: entry.reviewer_agent.clone().unwrap_or_default(),
+        pr_number: pr.number.as_u64() as i64,
+        head_branch: pr.head_ref.to_string(),
+        base_branch: pr.base_ref.to_string(),
+        author_agent,
+        review_state: "pending_review".to_string(),
+        last_head_sha: pr.head_sha.clone().unwrap_or_default(),
+        reviewer_agent: pr_body_metadata_value(&pr.body, "Reviewer-Agent").unwrap_or_default(),
     }
+}
+
+fn pr_body_metadata_value(body: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn author_agent_from_branch(branch: &str) -> Option<String> {
+    branch
+        .rsplit_once('.')
+        .map(|(_, slug)| slug.to_string())
+        .filter(|slug| !slug.is_empty())
 }
 
 #[cfg(test)]
@@ -302,54 +298,61 @@ mod tests {
         assert!(response.created);
     }
 
-    #[tokio::test]
-    async fn local_pr_get_reads_registry_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_test_registry(tmp.path());
-        let mut services = Services::test();
-        services.project_dir = tmp.path().to_path_buf();
-        let handler = FilePRHandler::new(Arc::new(services));
+    #[test]
+    fn forgejo_pr_response_maps_body_metadata() {
+        let pr = crate::services::forgejo::ForgejoPullRequest {
+            number: crate::domain::PRNumber::new(7),
+            url: "http://forgejo.local/owner/repo/pulls/7".to_string(),
+            title: "Fix local PR".to_string(),
+            body: "Body
 
-        let response = handler
-            .local_pr_get(LocalPrGetRequest { pr_number: 7 }, &test_ctx("main"))
-            .await
-            .unwrap();
+---
+Authoring-Agent: fix-local-pr-codex
+Reviewer-Agent: review-pr-7-codex"
+                .to_string(),
+            head_ref: BranchName::try_from_str("main.fix-local-pr-codex")
+                .expect("literal branch is valid"),
+            base_ref: BranchName::try_from_str("main").expect("literal branch is valid"),
+            state: "open".to_string(),
+            merged: false,
+            head_sha: Some("abc123".to_string()),
+        };
+
+        let response = forgejo_pr_response(&pr);
 
         assert!(response.found);
         assert_eq!(response.pr_number, 7);
         assert_eq!(response.head_branch, "main.fix-local-pr-codex");
         assert_eq!(response.author_agent, "fix-local-pr-codex");
-        assert_eq!(response.review_state, "approved");
+        assert_eq!(response.review_state, "pending_review");
         assert_eq!(response.last_head_sha, "abc123");
         assert_eq!(response.reviewer_agent, "review-pr-7-codex");
     }
 
-    #[tokio::test]
-    async fn local_pr_get_for_branch_reads_registry_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_test_registry(tmp.path());
-        let mut services = Services::test();
-        services.project_dir = tmp.path().to_path_buf();
-        let handler = FilePRHandler::new(Arc::new(services));
+    #[test]
+    fn forgejo_pr_response_falls_back_to_branch_author() {
+        let pr = crate::services::forgejo::ForgejoPullRequest {
+            number: crate::domain::PRNumber::new(7),
+            url: String::new(),
+            title: String::new(),
+            body: String::new(),
+            head_ref: BranchName::try_from_str("main.fix-local-pr-codex")
+                .expect("literal branch is valid"),
+            base_ref: BranchName::try_from_str("main").expect("literal branch is valid"),
+            state: "open".to_string(),
+            merged: false,
+            head_sha: None,
+        };
 
-        let response = handler
-            .local_pr_get_for_branch(
-                LocalPrGetForBranchRequest {
-                    branch: "main.fix-local-pr-codex".to_string(),
-                },
-                &test_ctx("main.fix-local-pr-codex"),
-            )
-            .await
-            .unwrap();
+        let response = forgejo_pr_response(&pr);
 
         assert!(response.found);
-        assert_eq!(response.pr_number, 7);
+        assert_eq!(response.author_agent, "fix-local-pr-codex");
     }
 
     #[tokio::test]
     async fn local_pr_get_missing_returns_not_found_response() {
         let tmp = tempfile::tempdir().unwrap();
-        write_test_registry(tmp.path());
         let mut services = Services::test();
         services.project_dir = tmp.path().to_path_buf();
         let handler = FilePRHandler::new(Arc::new(services));
@@ -367,7 +370,6 @@ mod tests {
     #[tokio::test]
     async fn local_pr_get_cache_miss_returns_not_found_response() {
         let tmp = tempfile::tempdir().unwrap();
-        write_test_registry(tmp.path());
         let mut services = Services::test();
         services.project_dir = tmp.path().to_path_buf();
         let handler = FilePRHandler::new(Arc::new(services));
@@ -384,7 +386,6 @@ mod tests {
     #[tokio::test]
     async fn local_pr_get_for_branch_cache_miss_returns_not_found_response() {
         let tmp = tempfile::tempdir().unwrap();
-        write_test_registry(tmp.path());
         let mut services = Services::test();
         services.project_dir = tmp.path().to_path_buf();
         let handler = FilePRHandler::new(Arc::new(services));
@@ -401,34 +402,5 @@ mod tests {
 
         assert!(!response.found);
         assert_eq!(response.pr_number, 0);
-    }
-
-    fn write_test_registry(project_dir: &std::path::Path) {
-        let exo_dir = project_dir.join(".exo");
-        std::fs::create_dir_all(&exo_dir).unwrap();
-        std::fs::write(
-            exo_dir.join("prs.json"),
-            r#"{
-  "prs": {
-    "7": {
-      "number": 7,
-      "head_branch": "main.fix-local-pr-codex",
-      "base_branch": "main",
-      "title": "Fix local PR",
-      "body": "Body",
-      "author_agent": "fix-local-pr-codex",
-      "author_role": "dev",
-      "created_at": "2026-05-18T00:00:00Z",
-      "state": "open",
-      "review_state": "approved",
-      "last_head_sha": "abc123",
-      "reviewer_agent": "review-pr-7-codex"
-    }
-  },
-  "next_number": 8
-}
-"#,
-        )
-        .unwrap();
     }
 }
