@@ -858,8 +858,27 @@ pub async fn shutdown_endpoint(
     State(signal): State<Arc<tokio::sync::Notify>>,
 ) -> impl IntoResponse {
     info!("Shutdown requested via /shutdown endpoint");
-    signal.notify_one();
+    signal.notify_waiters();
     Json(serde_json::json!({"status": "ok"}))
+}
+
+async fn shutdown_signal_future(signal: Arc<tokio::sync::Notify>, listener_name: &'static str) {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!(listener = listener_name, "Received SIGINT, initiating graceful shutdown"),
+        _ = terminate => info!(listener = listener_name, "Received SIGTERM, initiating graceful shutdown"),
+        _ = signal.notified() => info!(listener = listener_name, "Received /shutdown request, initiating graceful shutdown"),
+    }
 }
 
 // ============================================================================
@@ -969,7 +988,6 @@ Run `exomonad recompile` first to build it.",
     let ci_status_map = Arc::new(tokio::sync::RwLock::new(
         exomonad_core::services::CiStatusMap::new(),
     ));
-
 
     // Build Services once — all shared registries in one struct
     let services = Arc::new(exomonad_core::services::Services {
@@ -1191,15 +1209,24 @@ Run `exomonad recompile` first to build it.",
         ))
         .with_state(app_state.clone());
 
+    let tcp_app = Router::new()
+        .route("/health", get(health))
+        .route(
+            "/ci",
+            post(exomonad_core::services::forgejo_ci::handle::<exomonad_core::services::Services>)
+                .with_state(forgejo_ci_state.clone()),
+        )
+        .with_state(app_state.clone())
+        .layer(cors.clone())
+        .layer(TraceLayer::new_for_http());
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/hook", post(handle_hook_request).with_state(hook_state))
         .route(
             "/ci",
-            post(exomonad_core::services::forgejo_ci::handle::<
-                exomonad_core::services::Services,
-            >)
-            .with_state(forgejo_ci_state),
+            post(exomonad_core::services::forgejo_ci::handle::<exomonad_core::services::Services>)
+                .with_state(forgejo_ci_state),
         )
         .nest("/agents", agent_routes)
         .route(
@@ -1230,6 +1257,12 @@ Run `exomonad recompile` first to build it.",
         )
     })?;
 
+    let tcp_addr = format!("0.0.0.0:{}", config.port);
+    info!(address = %tcp_addr, "Binding public TCP webhook listener");
+    let tcp_listener = tokio::net::TcpListener::bind(&tcp_addr)
+        .await
+        .with_context(|| format!("Failed to bind TCP listener {tcp_addr}"))?;
+
     // Set socket permissions to owner-only (0600)
     #[cfg(unix)]
     {
@@ -1238,8 +1271,10 @@ Run `exomonad recompile` first to build it.",
     }
 
     info!(socket = %socket_path.display(), "MCP server listening on Unix domain socket");
+    info!(address = %tcp_addr, "Public TCP webhook listener ready");
     info!(
         socket = %socket_path.display(),
+        tcp_address = %tcp_addr,
         plugin_count = plugins.read().await.len(),
         "Plugins ready, accepting connections"
     );
@@ -1247,29 +1282,19 @@ Run `exomonad recompile` first to build it.",
     let socket_path_for_cleanup = socket_path.clone();
     let server_pid_for_cleanup = server_pid_path.clone();
 
-    // Run with graceful shutdown on SIGINT, SIGTERM, or /shutdown endpoint
-    let shutdown_signal_for_server = shutdown_signal.clone();
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let ctrl_c = tokio::signal::ctrl_c();
-            #[cfg(unix)]
-            let terminate = async {
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to install SIGTERM handler")
-                    .recv()
-                    .await;
-            };
-            #[cfg(not(unix))]
-            let terminate = std::future::pending::<()>();
+    // Run both listeners with graceful shutdown on SIGINT, SIGTERM, or /shutdown endpoint.
+    let uds_shutdown_signal = shutdown_signal.clone();
+    let uds_server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal_future(
+        uds_shutdown_signal,
+        "MCP Unix domain socket",
+    ));
 
-            tokio::select! {
-                _ = ctrl_c => info!("Received SIGINT, initiating graceful shutdown"),
-                _ = terminate => info!("Received SIGTERM, initiating graceful shutdown"),
-                _ = shutdown_signal_for_server.notified() => info!("Received /shutdown request, initiating graceful shutdown"),
-            }
-        })
-        .await;
-    if let Err(err) = serve_result {
+    let tcp_shutdown_signal = shutdown_signal.clone();
+    let tcp_server = axum::serve(tcp_listener, tcp_app).with_graceful_shutdown(
+        shutdown_signal_future(tcp_shutdown_signal, "public TCP webhook listener"),
+    );
+
+    if let Err(err) = tokio::try_join!(uds_server, tcp_server) {
         error!(error = %err, "MCP server exited with error");
         return Err(err.into());
     }

@@ -138,6 +138,9 @@ pub struct RawConfig {
     /// Canonical tmux session name for this project.
     pub tmux_session: Option<String>,
 
+    /// TCP port for public webhook and health endpoints.
+    pub port: Option<u16>,
+
     /// Base directory for worktrees (default: .exo/worktrees).
     pub worktree_base: Option<PathBuf>,
 
@@ -204,7 +207,6 @@ pub struct RawConfig {
     #[serde(default)]
     pub opencode_as_tl: Option<bool>,
 
-
     /// Forgejo base URL (e.g. "http://localhost:3000").
     pub forgejo_url: Option<String>,
 
@@ -226,6 +228,8 @@ pub struct Config {
     pub role: Role,
     /// Canonical tmux session name (required after discovery).
     pub tmux_session: String,
+    /// TCP port for public webhook and health endpoints.
+    pub port: u16,
     /// Base directory for worktrees.
     pub worktree_base: PathBuf,
     /// Shell command to wrap environment (e.g. "nix develop").
@@ -270,7 +274,6 @@ pub struct Config {
 
     /// Use OpenCode as the root TL agent instead of Claude.
     pub opencode_as_tl: bool,
-
 
     /// Forgejo base URL (e.g. "http://localhost:3000").
     pub forgejo_url: Option<String>,
@@ -345,6 +348,9 @@ impl Config {
                     .to_string()
             });
         let tmux_session = sanitize_session_name(tmux_session);
+
+        // Resolve TCP port: local > global > default.
+        let port = local_raw.port.or(global_raw.port).unwrap_or(7433);
 
         // Resolve worktree_base: global > local > default (.exo/worktrees)
         let worktree_base = global_raw
@@ -479,6 +485,7 @@ impl Config {
             project_dir,
             role,
             tmux_session,
+            port,
             worktree_base,
             shell_command,
             wasm_dir,
@@ -523,6 +530,7 @@ impl Default for Config {
             project_dir: PathBuf::from("."),
             role: Role::tl(),
             tmux_session: "default".to_string(),
+            port: 7433,
             worktree_base: PathBuf::from(".exo/worktrees"),
             shell_command: None,
             wasm_dir: PathBuf::from(".exo/wasm"),
@@ -632,6 +640,16 @@ mod tests {
         assert_eq!(config.project_dir, PathBuf::from("."));
         assert_eq!(config.role, Role::tl());
         assert_eq!(config.root_agent_type, AgentType::Claude);
+        assert_eq!(config.port, 7433);
+    }
+
+    #[test]
+    fn test_raw_config_parse_port() {
+        let content = r#"
+            port = 9001
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.port, Some(9001));
     }
 
     #[test]
