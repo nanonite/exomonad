@@ -15,6 +15,8 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::file_pr::{FilePRInput, FilePROutput};
+
+const FILE_PR_PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use super::tmux_events;
 
 // ============================================================================
@@ -296,12 +298,19 @@ pub async fn file_pr_local(
         let bookmark = head.clone();
         let git_wt_clone = git_wt.clone();
         let remote_str = remote.to_string();
-        tokio::task::spawn_blocking(move || {
+        let push_task = tokio::task::spawn_blocking(move || {
             git_wt_clone.push_to_remote(&dir_path, &bookmark, &remote_str)
-        })
-        .await
-        .context("spawn_blocking failed")?
-        .context("push failed")?;
+        });
+        let push_result = tokio::time::timeout(FILE_PR_PUSH_TIMEOUT, push_task)
+            .await
+            .with_context(|| {
+                format!(
+                    "git push to {remote} for {head} timed out after {}s",
+                    FILE_PR_PUSH_TIMEOUT.as_secs()
+                )
+            })?
+            .context("spawn_blocking failed")?;
+        push_result.with_context(|| format!("git push to {remote} for {head} failed"))?;
         info!("[FilePRLocal] Pushed bookmark {} to {}", head, remote);
     }
 
