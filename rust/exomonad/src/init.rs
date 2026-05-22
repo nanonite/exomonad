@@ -28,7 +28,6 @@ fn read_chainlink_tl_protocol(cwd: &Path) -> Option<String> {
     }
 }
 
-
 fn forgejo_host_from_url(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -320,6 +319,13 @@ pub async fn run(
     }
 
     let session = session_override.unwrap_or(config.tmux_session.clone());
+    let reset_count = refresh_agent_session_timestamps(&cwd)?;
+    if reset_count > 0 {
+        info!(
+            agents = reset_count,
+            "Reset orphan reconciler session timers for existing agents"
+        );
+    }
 
     // Auto-build or copy WASM if it doesn't exist yet
     let wasm_filename = format!("wasm-guest-{}.wasm", config.wasm_name);
@@ -704,7 +710,13 @@ pub async fn run(
             .args(["set-environment", "-t", &session, "GH_TOKEN", forgejo_token])
             .status();
         let _ = std::process::Command::new("tmux")
-            .args(["set-environment", "-t", &session, "FORGEJO_URL", forgejo_url])
+            .args([
+                "set-environment",
+                "-t",
+                &session,
+                "FORGEJO_URL",
+                forgejo_url,
+            ])
             .status();
     }
 
@@ -965,13 +977,7 @@ pub async fn run(
     // Auto-inject spindle as a process companion when Tangled is configured, unless the user
     // has already declared a companion named "spindle".
     let spindle_path = cwd.join(".exo/bin/spindle");
-    let auto_spindle = build_spindle_companion(
-        None,
-        None,
-        None,
-        &spindle_path,
-        &config.companions,
-    );
+    let auto_spindle = build_spindle_companion(None, None, None, &spindle_path, &config.companions);
 
     if auto_spindle.is_none() && !config.companions.iter().any(|c| c.name == "spindle") {
         warn!("Tangled CI not configured (tangled_owner_did missing from .exo/config.toml) — CI status events will not be tracked this session");
@@ -1334,15 +1340,36 @@ pub async fn run(
     TmuxIpc::attach_session(&session).await
 }
 
-/// Register the current workspace repo with the local Tangled knot and spindle.
-///
-/// Requires `tangled_knot_container`, `tangled_owner_did`, and `tangled_spindle_db` in config.
-/// Derives the repo name from the `origin` git remote URL (last path segment, `.git` stripped),
-/// falling back to the project directory name.
-///
-/// All steps are idempotent — safe to call on every `exomonad init`. Failures are warnings, not
-/// errors: a missing Docker container or unreachable spindle DB must not prevent the session from
-/// starting.
+/// Refresh orphan timeout baselines for agents that predate this `exomonad init` session.
+fn refresh_agent_session_timestamps(cwd: &Path) -> Result<usize> {
+    let agents_dir = cwd.join(".exo/agents");
+    if !agents_dir.is_dir() {
+        return Ok(0);
+    }
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let mut updated = 0;
+
+    for entry in std::fs::read_dir(&agents_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if entry.file_name().to_string_lossy() == "root" {
+            continue;
+        }
+
+        std::fs::write(entry.path().join("spawned_at"), &now_secs)?;
+        updated += 1;
+    }
+
+    Ok(updated)
+}
+
 async fn report_orphaned_agent_windows(session: &str, cwd: &Path) {
     let output = std::process::Command::new("tmux")
         .args([
@@ -1417,18 +1444,27 @@ async fn report_orphaned_agent_windows(session: &str, cwd: &Path) {
         return;
     }
 
-    warn!(session, count = rows.len(), "Orphaned agent windows detected (not auto-killed)");
+    warn!(
+        session,
+        count = rows.len(),
+        "Orphaned agent windows detected (not auto-killed)"
+    );
     for row in rows {
         warn!(session, "{}", row);
     }
 }
 
+/// Register the current workspace repo with the local Tangled knot and spindle.
+///
+/// Requires `tangled_knot_container`, `tangled_owner_did`, and `tangled_spindle_db` in config.
+/// Derives the repo name from the `origin` git remote URL (last path segment, `.git` stripped),
+/// falling back to the project directory name.
+///
+/// All steps are idempotent — safe to call on every `exomonad init`. Failures are warnings, not
+/// errors: a missing Docker container or unreachable spindle DB must not prevent the session from
+/// starting.
 async fn register_tangled_repo(cwd: &Path, _config: &exomonad::config::Config) {
-    let (container, owner_did, spindle_db) = match (
-        None,
-        None,
-        None,
-    ) {
+    let (container, owner_did, spindle_db) = match (None, None, None) {
         (Some(c), Some(d), Some(s)) => (c, d, s),
         _ => {
             debug!("Tangled registration skipped: tangled_knot_container / tangled_owner_did / tangled_spindle_db not set");
@@ -2208,6 +2244,39 @@ mod tests {
             task: None,
             model: None,
         }
+    }
+
+    #[test]
+    fn refresh_agent_session_timestamps_skips_root_and_updates_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(".exo/agents");
+        let root = agents.join("root");
+        let leaf = agents.join("issue-1-leaf-codex");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(root.join("spawned_at"), "1").unwrap();
+        std::fs::write(leaf.join("spawned_at"), "1").unwrap();
+
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let updated = refresh_agent_session_timestamps(dir.path()).unwrap();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        assert_eq!(updated, 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("spawned_at")).unwrap(),
+            "1"
+        );
+        let leaf_spawned_at = std::fs::read_to_string(leaf.join("spawned_at"))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!((before..=after).contains(&leaf_spawned_at));
     }
 
     #[test]
