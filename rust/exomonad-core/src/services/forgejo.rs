@@ -244,11 +244,33 @@ impl ForgejoClient {
         }) else {
             return Ok(CIStatus::Unknown);
         };
-        Ok(run
-            .conclusion
-            .or(run.status)
-            .map(|status| CIStatus::parse(&status))
-            .unwrap_or(CIStatus::Unknown))
+        Ok(workflow_status(run))
+    }
+
+    pub async fn latest_actions_status_for_branch(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        branch: &BranchName,
+    ) -> Result<Option<CIStatus>> {
+        let url = self.api_url(&["repos", owner.as_str(), repo.as_str(), "actions", "runs"])?;
+        let response = self
+            .http
+            .get(url)
+            .query(&[("branch", branch.as_str()), ("limit", "1")])
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo Actions runs request failed")?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let runs: WorkflowRunsResponse = self
+            .decode_response(response, "list Forgejo Actions runs")
+            .await?;
+        Ok(runs.workflow_runs.into_iter().next().map(workflow_status))
     }
 
     pub async fn create_pull_request(
@@ -433,6 +455,13 @@ impl ForgejoClient {
     }
 }
 
+fn workflow_status(run: WorkflowRunResponse) -> CIStatus {
+    run.conclusion
+        .or(run.status)
+        .map(|status| CIStatus::parse(&status))
+        .unwrap_or(CIStatus::Unknown)
+}
+
 struct ResponseBody(String);
 
 impl ResponseBody {
@@ -541,6 +570,54 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn latest_actions_status_for_branch_reads_newest_run() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/actions/runs"))
+            .and(query_param("branch", "main"))
+            .and(query_param("limit", "1"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workflow_runs": [
+                    {
+                        "head_branch": "main",
+                        "head_sha": "abc123",
+                        "status": "completed",
+                        "conclusion": "success"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let status = client
+            .latest_actions_status_for_branch(&owner(), &repo(), &branch("main"))
+            .await
+            .unwrap();
+
+        assert_eq!(status, Some(CIStatus::Success));
+    }
+
+    #[tokio::test]
+    async fn latest_actions_status_for_branch_treats_missing_actions_as_absent() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/actions/runs"))
+            .and(query_param("branch", "main"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let status = client
+            .latest_actions_status_for_branch(&owner(), &repo(), &branch("main"))
+            .await
+            .unwrap();
+
+        assert_eq!(status, None);
     }
 
     #[tokio::test]

@@ -2,7 +2,9 @@
 //!
 //! Uses proto-generated types from `exomonad_proto::effects::agent`.
 
-use crate::domain::{AgentName, AgentPermissions, BirthBranch, ClaudeSessionUuid, TeamName};
+use crate::domain::{
+    AgentName, AgentPermissions, BirthBranch, BranchName, CIStatus, ClaudeSessionUuid, TeamName,
+};
 use crate::effects::{
     dispatch_agent_effect, AgentEffects, EffectError, EffectHandler, EffectResult, ResultExt,
     ResultExtPreserve,
@@ -22,11 +24,12 @@ use async_trait::async_trait;
 use exomonad_proto::effects::agent::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::services::{
-    HasAcpRegistry, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasGitHubClient,
-    HasGitWorktreeService, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
+    HasAcpRegistry, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient,
+    HasGitHubClient, HasGitWorktreeService, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
 };
 
 /// Agent effect handler.
@@ -48,6 +51,7 @@ impl<
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
+            + HasForgejoClient
             + 'static,
     > AgentHandler<C>
 {
@@ -204,6 +208,96 @@ impl<
             team_reg.register(slug, team_info).await;
         }
     }
+
+    async fn ensure_tl_spawn_preflight(
+        &self,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<()> {
+        let mut failures = Vec::new();
+
+        match dirty_worktree_entries(&ctx.working_dir).await {
+            Ok(entries) if entries.is_empty() => {}
+            Ok(entries) => failures.push(dirty_worktree_message(&entries)),
+            Err(message) => failures.push(format!("worktree check failed: {message}")),
+        }
+
+        if let Err(message) = self.check_base_branch_ci(ctx).await {
+            failures.push(message);
+        }
+
+        if failures.is_empty() {
+            info!(
+                branch = %ctx.birth_branch,
+                working_dir = %ctx.working_dir.display(),
+                "TL preflight passed before spawning"
+            );
+            return Ok(());
+        }
+
+        if tl_preflight_acknowledged() {
+            warn!(
+                branch = %ctx.birth_branch,
+                failures = ?failures,
+                "TL preflight failed but user acknowledgment override is set"
+            );
+            return Ok(());
+        }
+
+        Err(EffectError::invalid_input(format!(
+            "TL preflight failed; spawning is blocked until the baseline is fixed or the user acknowledges with EXOMONAD_TL_PREFLIGHT_ACK=1.\n{}",
+            failures.join("\n")
+        )))
+    }
+
+    async fn check_base_branch_ci(
+        &self,
+        ctx: &crate::effects::EffectContext,
+    ) -> Result<(), String> {
+        let base_branch = BranchName::try_from_str(ctx.birth_branch.as_parent_branch())
+            .map_err(|error| format!("CI check failed: invalid base branch: {error}"))?;
+
+        if !forgejo_workflow_configured(&ctx.working_dir).await {
+            info!(
+                branch = %base_branch,
+                "TL preflight CI check skipped because no .gitea workflow is configured"
+            );
+            return Ok(());
+        }
+
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Err("CI check failed: .gitea/workflows exists but forgejo_url/forgejo_token are not configured".to_string());
+        };
+
+        let repo_info = crate::services::repo::get_repo_info(&ctx.working_dir)
+            .await
+            .map_err(|error| {
+                format!("CI check failed: could not resolve Forgejo repository: {error}")
+            })?;
+        let status = forgejo
+            .latest_actions_status_for_branch(&repo_info.owner, &repo_info.repo, &base_branch)
+            .await
+            .map_err(|error| format!("CI check failed: Forgejo Actions lookup failed: {error}"))?;
+
+        match status {
+            Some(CIStatus::Success | CIStatus::Neutral) => Ok(()),
+            Some(CIStatus::Failure) => Err(format!(
+                "CI check failed: latest Forgejo Actions run on base branch '{}' is failure",
+                base_branch
+            )),
+            Some(CIStatus::Pending) => Err(format!(
+                "CI check failed: latest Forgejo Actions run on base branch '{}' is still pending",
+                base_branch
+            )),
+            Some(CIStatus::Unknown) => Err(format!(
+                "CI check failed: latest Forgejo Actions run on base branch '{}' has unknown status",
+                base_branch
+            )),
+            None => Err(format!(
+                "CI check failed: .gitea/workflows exists but no Forgejo Actions run was found for base branch '{}'",
+                base_branch
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -217,6 +311,7 @@ impl<
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
+            + HasForgejoClient
             + 'static,
     > EffectHandler for AgentHandler<C>
 {
@@ -232,6 +327,65 @@ impl<
     ) -> EffectResult<Vec<u8>> {
         dispatch_agent_effect(self, effect_type, payload, ctx).await
     }
+}
+
+async fn dirty_worktree_entries(project_dir: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .await
+        .map_err(|error| format!("failed to run git status --porcelain: {error}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+fn dirty_worktree_message(entries: &[String]) -> String {
+    let listed = entries
+        .iter()
+        .take(10)
+        .map(|entry| format!("  - {entry}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let suffix = if entries.len() > 10 {
+        format!("\n  - ... and {} more", entries.len() - 10)
+    } else {
+        String::new()
+    };
+    format!("worktree check failed: uncommitted or untracked files are present\n{listed}{suffix}")
+}
+
+async fn forgejo_workflow_configured(project_dir: &Path) -> bool {
+    let workflows_dir = project_dir.join(".gitea/workflows");
+    let Ok(mut entries) = tokio::fs::read_dir(workflows_dir).await else {
+        return false;
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn tl_preflight_acknowledged() -> bool {
+    std::env::var("EXOMONAD_TL_PREFLIGHT_ACK")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "ack"))
+        .unwrap_or(false)
 }
 
 fn claude_spawn_flags(
@@ -294,6 +448,7 @@ impl<
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
+            + HasForgejoClient
             + 'static,
     > AgentEffects for AgentHandler<C>
 {
@@ -302,6 +457,7 @@ impl<
         req: SpawnRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnResponse> {
+        self.ensure_tl_spawn_preflight(ctx).await?;
         let issue_number = parse_issue_number(&req.issue)?;
         let options = SpawnOptions {
             owner: parse_owner(&req.owner)?,
@@ -329,6 +485,7 @@ impl<
         req: SpawnBatchRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnBatchResponse> {
+        self.ensure_tl_spawn_preflight(ctx).await?;
         let agent_type = convert_agent_type(req.agent_type())?;
         let mut agents = Vec::new();
         let mut errors = Vec::new();
@@ -367,6 +524,7 @@ impl<
         req: SpawnGeminiTeammateRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnGeminiTeammateResponse> {
+        self.ensure_tl_spawn_preflight(ctx).await?;
         let options = SpawnGeminiTeammateOptions {
             name: AgentName::try_from_str(req.name.as_str())
                 .expect("validated string input is non-empty"),
@@ -394,6 +552,7 @@ impl<
         req: SpawnWorkerRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnWorkerResponse> {
+        self.ensure_tl_spawn_preflight(ctx).await?;
         let default_type = self.service.default_spawn_agent_type();
         let options = SpawnWorkerOptions {
             name: AgentName::try_from_str(req.name.as_str())
@@ -464,6 +623,7 @@ impl<
         req: SpawnSubtreeRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnSubtreeResponse> {
+        self.ensure_tl_spawn_preflight(ctx).await?;
         // Only look up session for --fork-session when explicitly requested.
         // Default (fork_session=false) starts the child fresh — avoids stale/compacted
         // session IDs causing "No conversation found" errors.
@@ -578,6 +738,7 @@ impl<
         req: SpawnLeafSubtreeRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
+        self.ensure_tl_spawn_preflight(ctx).await?;
         let default_type = self.service.default_spawn_agent_type();
         let options = SpawnLeafOptions {
             task: req.task.clone(),
@@ -645,6 +806,7 @@ impl<
         req: SpawnAcpRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnAcpResponse> {
+        self.ensure_tl_spawn_preflight(ctx).await?;
         let registry = self.ctx.acp_registry();
 
         // Resolve working directory from context
