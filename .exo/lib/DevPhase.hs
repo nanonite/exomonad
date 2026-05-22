@@ -95,9 +95,11 @@ instance StateMachine DevPhase DevEvent where
         | triggeredPr == prNum -> Transitioned (DevCIBlocked prNum status_)
       _ -> InvalidTransition "CI can only block a PR after CI has been triggered"
     MergeReadyEv prNum _ci _branch -> case phase of
+      DevApproved approvedPr
+        | approvedPr == prNum -> Transitioned DevDone
       DevCITriggered triggeredPr _
         | triggeredPr == prNum -> Transitioned DevDone
-      _ -> InvalidTransition "MergeReady requires CITriggered first"
+      _ -> InvalidTransition "MergeReady requires reviewer approval first"
     IssueClosedEv issueId closedBy ->
       Transitioned (DevDismissed issueId closedBy)
 

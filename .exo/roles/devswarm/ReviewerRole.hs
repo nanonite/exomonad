@@ -462,10 +462,8 @@ reviewerPRReviewHandler (Stuck n rounds_) = do
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerStuckEv n rounds_)
   pure NoAction
-reviewerPRReviewHandler (MergeReady n ci branch_) = do
-  logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
-  branch <- getCurrentBranch
-  void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerMergeReadyEv n ci branch_)
+reviewerPRReviewHandler (MergeReady n ci _branch) = do
+  logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci <> " (watcher-owned; reviewer ignores)"
   pure NoAction
 
 reviewerSiblingMergedHandler :: SiblingMergedEvent -> Eff Effects EventAction

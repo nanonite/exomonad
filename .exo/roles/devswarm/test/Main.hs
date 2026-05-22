@@ -52,7 +52,7 @@ main = do
   assertReviewApprovedFromUnderReviewRoundZero
   assertFixesPushedFromChangesRequestedYieldsRoundOne
   assertFixesPushedIncrementsUnderReviewRound
-  assertApprovedRequiresCITriggeredBeforeMergeReady
+  assertApprovedCanExitOnWatcherMergeReady
   assertCITriggeredMergeReadyTransitionsToDoneAndExits
   assertCIFailureBlocksAfterTrigger
 
@@ -354,14 +354,15 @@ assertFixesPushedIncrementsUnderReviewRound = do
     Transitioned (DevUnderReview 9 2) -> pure ()
     other -> fail $ "expected DevUnderReview 9 2 after second fix push, got " <> showDevTransition other
 
--- DevApproved is not mergeable by itself. The watcher must trigger CI first,
--- then MergeReadyEv can finish the dev lifecycle after CI passes.
-assertApprovedRequiresCITriggeredBeforeMergeReady :: IO ()
-assertApprovedRequiresCITriggeredBeforeMergeReady = do
+-- The watcher owns CI gating. Once it emits MergeReadyEv, a previously
+-- approved dev leaf may exit even if the CI status was already green before
+-- the approval verdict was observed.
+assertApprovedCanExitOnWatcherMergeReady :: IO ()
+assertApprovedCanExitOnWatcherMergeReady = do
   case transition (DevApproved 9) (MergeReadyEv 9 "success" "main.feature") of
-    InvalidTransition _ -> pure ()
-    other -> fail $ "expected invalid MergeReadyEv before CITriggered, got " <> showDevTransition other
-  assertBlocks "approved waiting for CI trigger" (canExit @DevPhase @DevEvent (DevApproved 9))
+    Transitioned DevDone -> pure ()
+    other -> fail $ "expected DevDone after watcher merge-ready, got " <> showDevTransition other
+  assertBlocks "approved waiting for watcher merge-ready" (canExit @DevPhase @DevEvent (DevApproved 9))
 
 assertCITriggeredMergeReadyTransitionsToDoneAndExits :: IO ()
 assertCITriggeredMergeReadyTransitionsToDoneAndExits = do

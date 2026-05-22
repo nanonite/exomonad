@@ -121,12 +121,9 @@ fn reviewer_worktree_path(project_dir: &Path, reviewer_agent: &str) -> PathBuf {
 
 /// Decide whether to fan a PR review event out to the reviewer.
 ///
-/// Every `pr_review` event kind currently emitted by the watcher has a corresponding
-/// handler in `.exo/roles/devswarm/ReviewerRole.hs` (`fixes_pushed`, `commits_pushed`,
-/// `approved`, `reviewer_approved`, `reviewer_requested_changes`, `rate_limited`,
-/// `merge_ready`), so most fan-out is keyed by event_type alone. `review_received`
-/// is the exception: when the registered reviewer authored the review file, the
-/// leaf needs the feedback and the reviewer does not need its own comment echoed back.
+/// Only events that require a fresh reviewer action are fanned out to the
+/// reviewer. Approval and merge-ready events are watcher-owned terminal signals:
+/// the reviewer has already written its verdict and may exit.
 ///
 /// Non-`pr_review` event_types (`ci_status`, `agent.sibling_merged`, etc.) remain
 /// leaf-only because the reviewer has no handler for them.
@@ -142,7 +139,12 @@ fn reviewer_fanout_decision(
     if payload
         .get("kind")
         .and_then(|value| value.as_str())
-        .is_some_and(|kind| matches!(kind, "ci_triggered" | "ci_blocked"))
+        .is_some_and(|kind| {
+            matches!(
+                kind,
+                "approved" | "merge_ready" | "ci_triggered" | "ci_blocked"
+            )
+        })
     {
         return ReviewerFanOut::NotApplicable;
     }
@@ -355,6 +357,7 @@ pub struct WorktreeEventWatcher<C> {
     policy: ReviewPolicy,
     /// Shared CI status map updated by the spindle subscriber (branch → CIStatus).
     ci_status_map: Arc<RwLock<CiStatusMap>>,
+    ci_source_configured: bool,
     /// Spawns reviewer agents on PR creation.
     reviewer_spawner: Option<Arc<dyn ReviewerSpawner>>,
 }
@@ -380,6 +383,7 @@ where
             plugins: None,
             policy: ReviewPolicy::default(),
             ci_status_map: Arc::new(RwLock::new(HashMap::new())),
+            ci_source_configured: false,
             reviewer_spawner: None,
         }
     }
@@ -412,8 +416,13 @@ where
         self
     }
 
+    pub fn with_ci_source_configured(mut self, configured: bool) -> Self {
+        self.ci_source_configured = configured;
+        self
+    }
+
     fn ci_source_configured(&self) -> bool {
-        true
+        self.ci_source_configured
     }
 
     async fn observed_ci_status(&self, branch: &BranchName, head_sha: &str) -> CIStatus {
@@ -1720,14 +1729,27 @@ fn compute_pr_actions_with_context(
                 old_state.review_approved_at,
                 old_state.ci_mergeable_at,
             );
-        let kind = if merge_ready_now {
-            "merge_ready"
-        } else {
-            review_event_kind_for_state(&ReviewState::Approved)
-                .expect("approved review state has an event kind")
-        };
+        pending_actions.push(PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": review_event_kind_for_state(&ReviewState::Approved)
+                    .expect("approved review state has an event kind"),
+                "pr_number": pr_number.as_u64(),
+                "ci_status": ci_status.as_str(),
+                "branch": branch,
+            }),
+        });
         if merge_ready_now {
             old_state.merge_ready_notified = true;
+            pending_actions.push(PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload: serde_json::json!({
+                    "kind": "merge_ready",
+                    "pr_number": pr_number.as_u64(),
+                    "ci_status": ci_status.as_str(),
+                    "branch": branch,
+                }),
+            });
         } else if old_state.ci_triggered_sha.as_deref() != Some(pr_sha) {
             old_state.ci_triggered_sha = Some(pr_sha.to_string());
             pending_actions.push(PendingAction::TriggerManualCi {
@@ -1745,15 +1767,6 @@ fn compute_pr_actions_with_context(
                 }),
             });
         }
-        pending_actions.push(PendingAction::WasmEvent {
-            event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": kind,
-                "pr_number": pr_number.as_u64(),
-                "ci_status": ci_status.as_str(),
-                "branch": branch,
-            }),
-        });
     }
 
     let changes_requested = reviews
@@ -2675,23 +2688,17 @@ mod tests {
     }
 
     #[test]
-    fn test_reviewer_fanout_decision_dispatches_for_every_pr_review_kind() {
-        // Per #250: every pr_review kind currently emitted by the watcher has a
-        // corresponding handler in ReviewerRole.hs, so all of them fan out. The
-        // Haskell handler decides what to do per kind (some kinds the reviewer
-        // caused itself; the handler may return NoAction).
+    fn test_reviewer_fanout_decision_dispatches_for_reviewer_action_kinds() {
         let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
         for kind in [
             "fixes_pushed",
             "commits_pushed",
             "review_received",
-            "approved",
             "timeout",
             "reviewer_approved",
             "reviewer_requested_changes",
             "rate_limited",
             "stuck",
-            "merge_ready",
         ] {
             let payload = serde_json::json!({ "kind": kind, "pr_number": 1 });
             match reviewer_fanout_decision("pr_review", &payload, 1, &registry) {
@@ -2702,6 +2709,19 @@ mod tests {
                 }
                 other => panic!("kind {kind} expected DispatchTo, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn test_reviewer_fanout_decision_keeps_terminal_signals_leaf_only() {
+        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
+        for kind in ["approved", "merge_ready", "ci_triggered", "ci_blocked"] {
+            let payload = serde_json::json!({ "kind": kind, "pr_number": 1 });
+            assert_eq!(
+                reviewer_fanout_decision("pr_review", &payload, 1, &registry),
+                ReviewerFanOut::NotApplicable,
+                "kind {kind} should not be dispatched to the reviewer"
+            );
         }
     }
 
@@ -2848,7 +2868,42 @@ mod tests {
             .iter()
             .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "approved")));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
+            if payload["kind"] == "merge_ready")));
         assert!(state.notified_parent_approved);
+    }
+
+    #[test]
+    fn test_approval_with_unknown_ci_does_not_fire_merge_ready() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &reviews,
+            CIStatus::Unknown,
+            true,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "approved"
+        )));
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "merge_ready"
+        )));
+        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -2873,6 +2928,17 @@ mod tests {
             5,
         );
 
+        let pr_review_kinds: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                PendingAction::WasmEvent {
+                    event_type: "pr_review",
+                    payload,
+                } => payload.get("kind").and_then(|kind| kind.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pr_review_kinds, vec!["approved", "merge_ready"]);
         assert!(actions.iter().any(|a| matches!(
             a,
             PendingAction::WasmEvent {
@@ -2970,7 +3036,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
-        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_ci_source_configured(true);
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
 
@@ -3011,6 +3077,36 @@ mod tests {
             } if payload["merge_ready"] == true && payload["reviewer_approved"] == true
         )));
         assert!(state.merge_ready_notified);
+    }
+
+    #[test]
+    fn test_green_ci_without_approval_does_not_fire_merge_ready() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.last_ci_status = CIStatus::Pending;
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &[],
+            CIStatus::Success,
+            true,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "ci_status",
+                payload,
+            } if payload["status"] == "success" && payload["merge_ready"] == false
+        )));
+        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -4062,7 +4158,9 @@ mod tests {
             .write()
             .await
             .insert((branch.clone(), "abc123".to_string()), CIStatus::Success);
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_ci_status_map(ci_status_map);
+        let watcher = WorktreeEventWatcher::new(Arc::new(services))
+            .with_ci_status_map(ci_status_map)
+            .with_ci_source_configured(true);
 
         assert_eq!(
             watcher.observed_ci_status(&branch, "abc123").await,

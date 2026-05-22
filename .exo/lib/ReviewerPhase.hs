@@ -26,7 +26,6 @@ data ReviewerEvent
   | ReviewerRequestedChangesEv PRNumber Text
   | ReviewerFixesPushedEv PRNumber Text
   | ReviewerCommitsPushedEv PRNumber Text
-  | ReviewerMergeReadyEv PRNumber Text Text
   | ReviewerTimedOutEv PRNumber Int
   | ReviewerStuckEv PRNumber Int
   deriving (Show, Eq)
@@ -43,8 +42,6 @@ instance StateMachine ReviewerPhase ReviewerEvent where
       Transitioned (ReviewerReviewing prNum)
     ReviewerCommitsPushedEv prNum _ci ->
       Transitioned (ReviewerReviewing prNum)
-    ReviewerMergeReadyEv _prNum _ci _branch ->
-      Transitioned ReviewerDone
     ReviewerTimedOutEv _prNum _mins ->
       Transitioned ReviewerDone
     ReviewerStuckEv _prNum _rounds ->
