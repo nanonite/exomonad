@@ -50,6 +50,8 @@ module ExoMonad.Guest.Tools.Chainlink.Pure
     -- * Issue Update
     ChainlinkIssueUpdateArgs (..),
     buildUpdateArgs,
+    buildUpdateCommands,
+    isSupportedIssueUpdateStatus,
 
     -- * Block
     ChainlinkBlockArgs (..),
@@ -458,19 +460,46 @@ buildListArgs args =
 
 buildUpdateArgs :: ChainlinkIssueUpdateArgs -> [String]
 buildUpdateArgs args =
-  ["issue", "update", show (ciuIssueId args)]
-    ++ case ciuStatus args of
-      Just s -> ["-s", T.unpack s]
-      Nothing -> []
-    ++ case ciuPriority args of
-      Just p -> ["-p", T.unpack p]
-      Nothing -> []
-    ++ case ciuLabels args of
-      Just labels -> concatMap (\l -> ["-l", T.unpack l]) labels
-      Nothing -> []
-    ++ case ciuMilestone args of
-      Just m -> ["-m", T.unpack m]
-      Nothing -> []
+  case buildUpdateCommands args of
+    command : _ -> command
+    [] -> ["issue", "update", show (ciuIssueId args)]
+
+buildUpdateCommands :: ChainlinkIssueUpdateArgs -> [[String]]
+buildUpdateCommands args =
+  statusCommands
+    <> priorityCommands
+    <> labelCommands
+    <> milestoneCommands
+  where
+    issueId = show (ciuIssueId args)
+    statusCommands =
+      case ciuStatus args of
+        Just status -> issueStatusCommand issueId status
+        Nothing -> []
+    priorityCommands =
+      case ciuPriority args of
+        Just priority -> [["issue", "update", issueId, "--priority", T.unpack priority]]
+        Nothing -> []
+    labelCommands =
+      case ciuLabels args of
+        Just labels -> map (\label -> ["issue", "label", issueId, T.unpack label]) labels
+        Nothing -> []
+    milestoneCommands =
+      case ciuMilestone args of
+        Just milestone -> [["milestone", "add", T.unpack milestone, issueId]]
+        Nothing -> []
+
+issueStatusCommand :: String -> Text -> [[String]]
+issueStatusCommand issueId status =
+  case T.toLower status of
+    "in_progress" -> [["session", "work", issueId]]
+    "open" -> [["issue", "reopen", issueId, "--quiet"]]
+    "closed" -> [["issue", "close", issueId, "--quiet"]]
+    _ -> []
+
+isSupportedIssueUpdateStatus :: Text -> Bool
+isSupportedIssueUpdateStatus status =
+  T.toLower status `elem` ["in_progress", "open", "closed"]
 
 buildBlockArgs :: ChainlinkBlockArgs -> [String]
 buildBlockArgs args = ["block", show (cbChildId args), show (cbBlockerId args)]

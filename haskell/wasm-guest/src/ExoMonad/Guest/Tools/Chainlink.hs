@@ -946,31 +946,46 @@ instance ToJSON ChainlinkIssueUpdateArgs where
 
 chainlinkIssueUpdateDescription :: Text
 chainlinkIssueUpdateDescription =
-  "Update a chainlink issue's status, priority, labels, or milestone. Use this to track progress, mark blockers, or change priority."
+  "Update a chainlink issue using the current chainlink CLI. status=in_progress marks active work; status=open reopens; status=closed closes; priority, labels, and milestone use their dedicated commands."
 
 chainlinkIssueUpdateSchema :: Aeson.Object
 chainlinkIssueUpdateSchema =
   genericToolSchemaWith @ChainlinkIssueUpdateArgs
     [ ("issue_id", "The numeric ID of the issue to update"),
-      ("status", "Optional new status: open, in_progress, blocked, closed"),
+      ("status", "Optional status action: in_progress marks current work, open reopens, closed closes"),
       ("priority", "Optional new priority: low, medium, high, critical"),
-      ("labels", "Optional new list of labels to set"),
-      ("milestone", "Optional milestone name to assign")
+      ("labels", "Optional labels to add"),
+      ("milestone", "Optional milestone ID to assign")
     ]
 
 chainlinkIssueUpdateCore :: ChainlinkIssueUpdateArgs -> Eff Effects (Either Text ())
-chainlinkIssueUpdateCore args = do
-  let cmdArgs = buildUpdateArgs args
+chainlinkIssueUpdateCore args =
+  case ciuStatus args of
+    Just status
+      | not (isSupportedIssueUpdateStatus status) ->
+          pure $ Left ("unsupported chainlink issue status for update: " <> status)
+    _ -> runChainlinkUpdateCommands commands
+  where
+    builtCommands = buildUpdateCommands args
+    commands =
+      if null builtCommands
+        then [buildUpdateArgs args]
+        else builtCommands
+
+runChainlinkUpdateCommands :: [[String]] -> Eff Effects (Either Text ())
+runChainlinkUpdateCommands [] = pure $ Right ()
+runChainlinkUpdateCommands (cmdArgs : rest) = do
   result <- runChainlink cmdArgs
   case result of
     Left err -> pure $ Left ("chainlink update failed: " <> err)
     Right resp
-      | Proc.runResponseExitCode resp == 0 ->
-          pure $ Right ()
+      | Proc.runResponseExitCode resp == 0 -> runChainlinkUpdateCommands rest
       | otherwise ->
           pure $
             Left $
-              "chainlink update failed (exit "
+              "chainlink update failed running `chainlink "
+                <> T.pack (unwords cmdArgs)
+                <> "` (exit "
                 <> exitCodeToText (Proc.runResponseExitCode resp)
                 <> "): "
                 <> TL.toStrict (Proc.runResponseStderr resp)

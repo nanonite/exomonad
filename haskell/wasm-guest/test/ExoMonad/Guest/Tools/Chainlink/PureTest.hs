@@ -140,15 +140,20 @@ pureTests =
       testCase "buildUpdateArgs: id only" $
         buildUpdateArgs (ChainlinkIssueUpdateArgs 5 Nothing Nothing Nothing Nothing)
           @=? ["issue", "update", "5"],
-      testCase "buildUpdateArgs: status + priority" $
-        buildUpdateArgs (ChainlinkIssueUpdateArgs 5 (Just "blocked") (Just "high") Nothing Nothing)
-          @=? ["issue", "update", "5", "-s", "blocked", "-p", "high"],
-      testCase "buildUpdateArgs: with labels" $
-        buildUpdateArgs (ChainlinkIssueUpdateArgs 5 Nothing Nothing (Just ["bug", "frontend"]) Nothing)
-          @=? ["issue", "update", "5", "-l", "bug", "-l", "frontend"],
-      testCase "buildUpdateArgs: with milestone" $
-        buildUpdateArgs (ChainlinkIssueUpdateArgs 5 Nothing Nothing Nothing (Just "M2"))
-          @=? ["issue", "update", "5", "-m", "M2"],
+      testCase "buildUpdateArgs: in_progress status uses session work" $
+        buildUpdateArgs (ChainlinkIssueUpdateArgs 5 (Just "in_progress") Nothing Nothing Nothing)
+          @=? ["session", "work", "5"],
+      testCase "buildUpdateCommands: status + priority" $
+        buildUpdateCommands (ChainlinkIssueUpdateArgs 5 (Just "in_progress") (Just "high") Nothing Nothing)
+          @=? [["session", "work", "5"], ["issue", "update", "5", "--priority", "high"]],
+      testCase "buildUpdateCommands: with labels" $
+        buildUpdateCommands (ChainlinkIssueUpdateArgs 5 Nothing Nothing (Just ["bug", "frontend"]) Nothing)
+          @=? [["issue", "label", "5", "bug"], ["issue", "label", "5", "frontend"]],
+      testCase "buildUpdateCommands: with milestone" $
+        buildUpdateCommands (ChainlinkIssueUpdateArgs 5 Nothing Nothing Nothing (Just "2"))
+          @=? [["milestone", "add", "2", "5"]],
+      testCase "isSupportedIssueUpdateStatus: blocked unsupported" $
+        isSupportedIssueUpdateStatus "blocked" @?= False,
       -- buildBlockArgs
       testCase "buildBlockArgs: basic" $
         buildBlockArgs (ChainlinkBlockArgs 5 10)
