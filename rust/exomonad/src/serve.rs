@@ -941,20 +941,28 @@ Run `exomonad recompile` first to build it.",
     // Validate prerequisites
     exomonad_core::services::validate_git().context("Failed to validate git")?;
 
-    let secrets = exomonad_core::services::secrets::Secrets::load();
+    let _secrets = exomonad_core::services::secrets::Secrets::load();
     let executor: Arc<dyn exomonad_core::services::command::CommandExecutor> =
         Arc::new(exomonad_core::services::local::LocalExecutor::new());
     let git = Arc::new(exomonad_core::services::git::GitService::new(executor));
     let git_wt = Arc::new(
         exomonad_core::services::git_worktree::GitWorktreeService::new(project_dir.clone()),
     );
-    let github_client = secrets
-        .github_token()
-        .map(|_| exomonad_core::services::GitHubClient::new(5));
-
-    if github_client.is_some() {
-        exomonad_core::services::validate_gh_cli().context("Failed to validate gh CLI")?;
-    }
+    let forgejo_client = match (
+        config.forgejo_url.as_deref(),
+        config.forgejo_token.as_deref(),
+    ) {
+        (Some(url), Some(token)) => Some(exomonad_core::services::ForgejoClient::new(url, token)?),
+        (Some(_), None) => {
+            warn!("forgejo_url configured without forgejo_token; file_pr will use local PR flow");
+            None
+        }
+        (None, Some(_)) => {
+            warn!("forgejo_token configured without forgejo_url; file_pr will use local PR flow");
+            None
+        }
+        (None, None) => None,
+    };
 
     let team_registry = Arc::new(claude_teams_bridge::TeamRegistry::new());
     let acp_registry = Arc::new(exomonad_core::services::acp_registry::AcpRegistry::new());
@@ -992,7 +1000,8 @@ Run `exomonad recompile` first to build it.",
     // Build Services once — all shared registries in one struct
     let services = Arc::new(exomonad_core::services::Services {
         project_dir: project_dir.clone(),
-        github_client: github_client.clone(),
+        github_client: None,
+        forgejo_client: forgejo_client.clone(),
         event_log: event_log.clone(),
         team_registry: team_registry.clone(),
         acp_registry: acp_registry.clone(),

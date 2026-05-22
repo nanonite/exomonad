@@ -165,7 +165,12 @@ impl<
             }
         }
 
-        for var in ["GH_HOST", "GH_TOKEN", "GITHUB_TOKEN", "FORGEJO_URL"] {
+        for var in [
+            "FORGEJO_HOST",
+            "FORGEJO_TOKEN",
+            "FORGEJO_TOKEN",
+            "FORGEJO_URL",
+        ] {
             if let Ok(value) = std::env::var(var) {
                 if !value.is_empty() {
                     env_vars.insert(var.to_string(), value);

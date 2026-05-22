@@ -635,11 +635,6 @@ impl EffectHandler for MockGitHubHandler {
                 reviews: vec![],
             }
             .encode_to_vec()),
-            "github.get_pull_request_for_branch" => Ok(GetPullRequestForBranchResponse {
-                pull_request: None,
-                found: false,
-            }
-            .encode_to_vec()),
             "github.create_pull_request" => Ok(CreatePullRequestResponse {
                 pull_request: None,
                 url: "https://github.com/test/test/pull/99".into(),

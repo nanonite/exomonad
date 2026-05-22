@@ -192,8 +192,8 @@ cat > "$CODEX_HOME_DIR/config.toml" <<EOF
 trust_level = "trusted"
 EOF
 
-unset GITHUB_TOKEN
-unset GITHUB_API_URL
+unset FORGEJO_TOKEN
+unset FORGEJO_API_URL
 export CODEX_HOME="$CODEX_HOME_DIR"
 export EXOMONAD_LOG_FORMAT=""
 export EXOMONAD_SERVER_LOG_FILE="$SERVER_LOG"

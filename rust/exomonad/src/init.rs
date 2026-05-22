@@ -51,11 +51,10 @@ fn forgejo_env_vars(forgejo_url: &str, forgejo_token: &str) -> Vec<(&'static str
     }
 
     let mut vars = Vec::new();
-    if let Some(gh_host) = forgejo_host_from_url(forgejo_url) {
-        vars.push(("GH_HOST", gh_host));
+    if let Some(forgejo_host) = forgejo_host_from_url(forgejo_url) {
+        vars.push(("FORGEJO_HOST", forgejo_host));
     }
-    vars.push(("GH_TOKEN", forgejo_token.to_string()));
-    vars.push(("GITHUB_TOKEN", forgejo_token.to_string()));
+    vars.push(("FORGEJO_TOKEN", forgejo_token.to_string()));
     vars.push(("FORGEJO_URL", forgejo_url.to_string()));
     vars
 }
@@ -824,7 +823,7 @@ pub async fn run(
     }
     // Set env vars via tmux set-environment so they're inherited cleanly
     // (avoids inlining secrets in send-keys command strings / terminal scrollback)
-    for var in ["GITHUB_TOKEN", "GITHUB_API_URL"] {
+    for var in ["FORGEJO_TOKEN", "FORGEJO_API_URL"] {
         if let Ok(val) = std::env::var(var) {
             let _ = std::process::Command::new("tmux")
                 .args(["set-environment", "-t", &session, var, &val])
@@ -2248,12 +2247,11 @@ mod tests {
     }
 
     #[test]
-    fn forgejo_env_vars_include_gh_and_github_tokens() {
+    fn forgejo_env_vars_include_forgejo_token() {
         let vars = forgejo_env_vars("http://localhost:3000", "token-123");
 
-        assert!(vars.contains(&("GH_HOST", "localhost:3000".to_string())));
-        assert!(vars.contains(&("GH_TOKEN", "token-123".to_string())));
-        assert!(vars.contains(&("GITHUB_TOKEN", "token-123".to_string())));
+        assert!(vars.contains(&("FORGEJO_HOST", "localhost:3000".to_string())));
+        assert!(vars.contains(&("FORGEJO_TOKEN", "token-123".to_string())));
         assert!(vars.contains(&("FORGEJO_URL", "http://localhost:3000".to_string())));
     }
 

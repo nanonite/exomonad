@@ -126,7 +126,7 @@ echo "  Repo: $REPO_DIR"
 
 # --- Phase 2: Run ---
 
-export GITHUB_TOKEN="test-token-e2e"
+export FORGEJO_TOKEN="test-token-e2e"
 
 echo ""
 echo "============================================"

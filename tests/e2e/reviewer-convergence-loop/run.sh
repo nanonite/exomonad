@@ -199,8 +199,8 @@ echo "  Server log: $SERVER_LOG"
 echo "  CODEX_HOME: $CODEX_HOME_DIR"
 
 echo ">>> [Phase 2] Configuring environment..."
-unset GITHUB_TOKEN
-unset GITHUB_API_URL
+unset FORGEJO_TOKEN
+unset FORGEJO_API_URL
 export CODEX_HOME="$CODEX_HOME_DIR"
 export EXOMONAD_LOG_FORMAT=""
 # Route exomonad server stderr to a known file so validate.sh can grep it for

@@ -1,14 +1,11 @@
-// File PR service - creates/updates GitHub PRs using GitHub API via octocrab
-//
-// Replaces `gh` CLI subprocess calls with octocrab typed API.
+// File PR service - creates/updates Forgejo PRs using the Forgejo REST API.
 
 use crate::domain::{BirthBranch, BranchName, GithubOwner, GithubRepo, PRNumber};
+use crate::services::forgejo::{ForgejoClient, ForgejoPullRequest};
 use crate::services::git;
 use crate::services::git_worktree::GitWorktreeService;
-use crate::services::github::{build_octocrab, map_octo_err, GitHubClient};
 use crate::services::repo;
 use anyhow::{Context, Result};
-use octocrab::params;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -36,27 +33,19 @@ pub struct FilePROutput {
     pub created: bool,
 }
 
-/// Parsed from GitHub API response.
-#[derive(Debug)]
-struct GhPr {
-    number: u64,
-    url: String,
-    head_ref_name: BranchName,
-}
-
 /// Structured errors for file_pr operations.
 #[derive(Debug, thiserror::Error)]
 enum FilePrError {
     #[error("push failed: {0}")]
     Push(String),
 
-    #[error("GitHub PR create failed: {0}")]
+    #[error("Forgejo PR create failed: {0}")]
     Create(String),
 
-    #[error("GitHub PR edit failed: {0}")]
+    #[error("Forgejo PR edit failed: {0}")]
     Update(String),
 
-    #[error("GitHub PR list failed: {0}")]
+    #[error("Forgejo PR list failed: {0}")]
     List(String),
 }
 
@@ -81,39 +70,23 @@ pub(crate) fn resolve_base_branch(head: &BranchName, explicit: Option<&BranchNam
 }
 
 // ============================================================================
-// Octocrab operations
+// Forgejo operations
 // ============================================================================
 
 async fn find_existing_pr(
-    octo: &octocrab::Octocrab,
+    forgejo: &ForgejoClient,
     owner: &GithubOwner,
     repo: &GithubRepo,
     head_branch: &BranchName,
-) -> Result<Option<GhPr>, FilePrError> {
-    // GitHub API requires `owner:ref-name` format for the `head` parameter.
-    // Without the prefix, GitHub returns unfiltered results.
-    let qualified_head = format!("{}:{}", owner, head_branch);
-    let page = octo
-        .pulls(owner.as_str(), repo.as_str())
-        .list()
-        .head(&qualified_head)
-        .state(params::State::Open)
-        .per_page(1)
-        .send()
+) -> Result<Option<ForgejoPullRequest>, FilePrError> {
+    forgejo
+        .find_open_pull_request(owner, repo, head_branch)
         .await
-        .map_err(|e| FilePrError::List(map_octo_err(e)))?;
-
-    let pr = page.into_iter().next().map(|p| GhPr {
-        number: p.number,
-        url: p.html_url.map(|u| u.to_string()).unwrap_or_default(),
-        head_ref_name: BranchName::try_from_str(p.head.ref_field.as_str())
-            .expect("validated string input is non-empty"),
-    });
-    Ok(pr)
+        .map_err(|e| FilePrError::List(e.to_string()))
 }
 
 async fn update_pr(
-    octo: &octocrab::Octocrab,
+    forgejo: &ForgejoClient,
     owner: &GithubOwner,
     repo: &GithubRepo,
     number: PRNumber,
@@ -121,60 +94,38 @@ async fn update_pr(
     body: &str,
     base: &BranchName,
 ) -> Result<(), FilePrError> {
-    octo.pulls(owner.as_str(), repo.as_str())
-        .update(number.as_u64())
-        .title(title)
-        .body(body)
-        .base(base.as_str())
-        .send()
+    forgejo
+        .update_pull_request(owner, repo, number, title, body, base)
         .await
-        .map_err(|e| FilePrError::Update(map_octo_err(e)))?;
-    Ok(())
+        .map_err(|e| FilePrError::Update(e.to_string()))
 }
 
 async fn create_pr(
-    octo: &octocrab::Octocrab,
+    forgejo: &ForgejoClient,
     owner: &GithubOwner,
     repo: &GithubRepo,
     title: &str,
     body: &str,
     base: &BranchName,
     head: &BranchName,
-) -> Result<GhPr, FilePrError> {
-    let pr = octo
-        .pulls(owner.as_str(), repo.as_str())
-        .create(title, head.as_str(), base.as_str())
-        .body(body)
-        .send()
+) -> Result<ForgejoPullRequest, FilePrError> {
+    forgejo
+        .create_pull_request(owner, repo, title, body, base, head)
         .await
-        .map_err(|e| FilePrError::Create(map_octo_err(e)))?;
-
-    Ok(GhPr {
-        number: pr.number,
-        url: pr.html_url.map(|u| u.to_string()).unwrap_or_default(),
-        head_ref_name: BranchName::try_from_str(pr.head.ref_field.as_str())
-            .expect("validated string input is non-empty"),
-    })
+        .map_err(|e| FilePrError::Create(e.to_string()))
 }
 
 // ============================================================================
 // Main implementation
 // ============================================================================
 
-/// File a PR using GitHub API. Pushes the branch, creates or updates the PR.
-///
-/// If `github` is provided, uses its managed client. Otherwise falls back to `build_octocrab()`.
+/// File a PR using the Forgejo REST API. Pushes the branch, creates or updates the PR.
 pub async fn file_pr_async(
     input: &FilePRInput,
     git_wt: Arc<GitWorktreeService>,
-    github: Option<&GitHubClient>,
+    forgejo: &ForgejoClient,
 ) -> Result<FilePROutput> {
     let dir = input.working_dir.as_deref().unwrap_or(".");
-    let octo = match github {
-        Some(client) => client.get().await?,
-        None => build_octocrab()?,
-    };
-    let repo_info = repo::get_repo_info(dir).await?;
 
     // Get branch from the agent's working directory, not server CWD
     let dir_path = std::path::PathBuf::from(dir);
@@ -204,13 +155,15 @@ pub async fn file_pr_async(
         info!("[FilePR] Pushed bookmark: {}", head);
     }
 
+    let repo_info = repo::get_repo_info(dir).await?;
+
     // Check for existing PR
-    let existing = find_existing_pr(&octo, &repo_info.owner, &repo_info.repo, &head).await?;
+    let existing = find_existing_pr(forgejo, &repo_info.owner, &repo_info.repo, &head).await?;
     if let Some(pr) = existing {
-        let pr_number = PRNumber::new(pr.number);
+        let pr_number = pr.number;
         info!("[FilePR] Updating existing PR #{}", pr_number);
         update_pr(
-            &octo,
+            forgejo,
             &repo_info.owner,
             &repo_info.repo,
             pr_number,
@@ -223,7 +176,7 @@ pub async fn file_pr_async(
         return Ok(FilePROutput {
             pr_url: pr.url,
             pr_number,
-            head_branch: pr.head_ref_name,
+            head_branch: pr.head_ref,
             base_branch: base,
             created: false,
         });
@@ -232,7 +185,7 @@ pub async fn file_pr_async(
     // Create new PR
     info!("[FilePR] Creating PR: {}", input.title);
     let pr = create_pr(
-        &octo,
+        forgejo,
         &repo_info.owner,
         &repo_info.repo,
         &input.title,
@@ -249,7 +202,7 @@ pub async fn file_pr_async(
                 Ok(agent_id) => {
                     let event = crate::ui_protocol::AgentEvent::PrFiled {
                         agent_id,
-                        pr_number: PRNumber::new(pr.number),
+                        pr_number: pr.number,
                         timestamp: tmux_events::now_iso8601(),
                     };
                     if let Err(e) = tmux_events::emit_event(&session, &event) {
@@ -268,8 +221,8 @@ pub async fn file_pr_async(
 
     Ok(FilePROutput {
         pr_url: pr.url,
-        pr_number: PRNumber::new(pr.number),
-        head_branch: pr.head_ref_name,
+        pr_number: pr.number,
+        head_branch: pr.head_ref,
         base_branch: base,
         created: true,
     })
@@ -440,7 +393,8 @@ mod tests {
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
         };
 
-        let result = file_pr_async(&input, git_wt, None).await;
+        let forgejo = ForgejoClient::new("http://forgejo.local", "token").unwrap();
+        let result = file_pr_async(&input, git_wt, forgejo.as_ref()).await;
         assert!(result.is_err());
 
         Ok(())
@@ -493,13 +447,14 @@ mod tests {
             working_dir: Some(dir.to_string_lossy().to_string()),
         };
 
-        let result = file_pr_async(&input, git_wt, None).await;
+        let forgejo = ForgejoClient::new("http://forgejo.local", "token").unwrap();
+        let result = file_pr_async(&input, git_wt, forgejo.as_ref()).await;
 
         if let Err(ref e) = result {
             let err_msg = e.to_string();
             assert!(
-                err_msg.contains("push failed") || err_msg.contains("GitHub token"),
-                "Expected push or token error, got: {}",
+                err_msg.contains("push failed") || err_msg.contains("Failed to get remote URL"),
+                "Expected push or remote error, got: {}",
                 err_msg
             );
         } else {

@@ -237,11 +237,11 @@ mergeFromGitHub args prNum force owner repo currentBranch localPrResult = do
           message =
             "Failed to fetch PR #"
               <> T.pack (show prNum)
-              <> " for self-merge check from local registry or GitHub. "
+              <> " for self-merge check from local registry or hosted PR API. "
               <> localDetail
-              <> "; GitHub lookup failed: "
+              <> "; hosted lookup failed: "
               <> T.pack (show err)
-              <> ". If this is a hosted GitHub flow, set GITHUB_TOKEN."
+              <> ". If this is a hosted Forgejo flow, set forgejo_url and forgejo_token."
       void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict $ "MergePR: " <> message, Log.errorRequestFields = ""})
       pure $ Left message
     Right resp -> do

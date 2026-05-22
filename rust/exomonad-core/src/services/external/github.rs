@@ -44,10 +44,10 @@ impl GitHubService {
     /// Create a new GitHub service with the given personal access token.
     pub fn new(token: String) -> Result<Self, ServiceError> {
         let mut builder = OctocrabBuilder::new().personal_token(token);
-        if let Ok(base_url) = std::env::var("GITHUB_API_URL") {
+        if let Ok(base_url) = std::env::var("FORGEJO_API_URL") {
             builder = builder.base_uri(&base_url).map_err(|e| ServiceError::Api {
                 code: 400,
-                message: format!("Invalid GITHUB_API_URL: {}", e),
+                message: format!("Invalid FORGEJO_API_URL: {}", e),
             })?;
         }
         let client = builder.build().map_err(|e| ServiceError::Api {
@@ -78,11 +78,11 @@ impl GitHubService {
 
     /// Create a new GitHub service from environment variables.
     ///
-    /// Required: `GITHUB_TOKEN`.
-    /// Optional: `GITHUB_API_URL`.
+    /// Required: `FORGEJO_TOKEN`.
+    /// Optional: `FORGEJO_API_URL`.
     pub fn from_env() -> Result<Self, anyhow::Error> {
-        let token = std::env::var("GITHUB_TOKEN")?;
-        let base_url_str = std::env::var("GITHUB_API_URL")
+        let token = std::env::var("FORGEJO_TOKEN")?;
+        let base_url_str = std::env::var("FORGEJO_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_string());
         let base_url = Url::parse(&base_url_str)?;
 

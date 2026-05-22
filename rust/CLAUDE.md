@@ -135,7 +135,7 @@ echo '{"hook_event_name":"PreToolUse",...}' | exomonad hook pre-tool-use
 ### Environment Variables
 | Variable | Used By | Purpose |
 |----------|---------|---------|
-| `GITHUB_TOKEN` | services | GitHub API access |
+| `FORGEJO_TOKEN` | services | Forgejo API access |
 | `RUST_LOG` | all | Tracing log level |
 | `EXOMONAD_AGENT_ID` | agent spawn | Agent identity for spawned agents (read at spawn time) |
 | `EXOMONAD_SESSION_ID` | agent spawn | Parent's birth-branch, used for routing `notify_parent` |

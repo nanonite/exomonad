@@ -1,7 +1,7 @@
 //! Integration tests: octocrab against the Python mock_github.py server.
 //!
 //! These tests start mock_github.py on an ephemeral port, point octocrab at it
-//! via GITHUB_API_URL, and verify the PR lifecycle (list, create, list-with-filter).
+//! via FORGEJO_API_URL, and verify the PR lifecycle (list, create, list-with-filter).
 
 use octocrab::{params, params::repos::Commitish, OctocrabBuilder};
 use std::net::TcpListener;

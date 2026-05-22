@@ -13,8 +13,9 @@ pub mod event_queue;
 pub mod external;
 pub mod file_pr;
 pub mod file_pr_local;
-pub mod forgejo_ci;
 pub mod filesystem;
+pub mod forgejo;
+pub mod forgejo_ci;
 pub mod git;
 pub mod git_worktree;
 pub mod github;
@@ -46,6 +47,7 @@ pub use self::claude_session_registry::ClaudeSessionRegistry;
 pub use self::event_log::EventLog;
 pub use self::event_queue::EventQueue;
 pub use self::filesystem::FileSystemService;
+pub use self::forgejo::ForgejoClient;
 pub use self::git_worktree::GitWorktreeService;
 pub use self::github::GitHubClient;
 pub use self::mutex_registry::MutexRegistry;
@@ -90,6 +92,9 @@ pub trait HasMutexRegistry: Send + Sync {
 pub trait HasGitHubClient: Send + Sync {
     fn github_client(&self) -> Option<&Arc<GitHubClient>>;
 }
+pub trait HasForgejoClient: Send + Sync {
+    fn forgejo_client(&self) -> Option<&Arc<ForgejoClient>>;
+}
 pub type CiStatusKey = (crate::domain::BranchName, String);
 pub type CiStatusMap = std::collections::HashMap<CiStatusKey, crate::domain::CIStatus>;
 
@@ -123,6 +128,7 @@ pub trait ReviewerSpawner: Send + Sync {
 pub struct Services {
     pub project_dir: PathBuf,
     pub github_client: Option<Arc<GitHubClient>>,
+    pub forgejo_client: Option<Arc<ForgejoClient>>,
     pub event_log: Option<Arc<EventLog>>,
     pub team_registry: Arc<TeamRegistry>,
     pub acp_registry: Arc<AcpRegistry>,
@@ -198,6 +204,11 @@ impl HasGitHubClient for Services {
         self.github_client.as_ref()
     }
 }
+impl HasForgejoClient for Services {
+    fn forgejo_client(&self) -> Option<&Arc<ForgejoClient>> {
+        self.forgejo_client.as_ref()
+    }
+}
 impl HasGitWorktreeService for Services {
     fn git_worktree_service(&self) -> &Arc<GitWorktreeService> {
         &self.git_wt
@@ -216,6 +227,7 @@ impl Services {
         Self {
             project_dir: PathBuf::from("."),
             github_client: None,
+            forgejo_client: None,
             event_log: None,
             team_registry: Arc::new(TeamRegistry::new()),
             acp_registry: Arc::new(AcpRegistry::new()),

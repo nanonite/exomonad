@@ -55,7 +55,7 @@ cleanup() {
     echo ""
     echo ">>> [Cleanup] Tearing down..."
     # Clean up tmux global env vars
-    for var in GITHUB_API_URL MOCK_LOG GH_MOCK_LOG REMOTE_DIR MOCK_PORT E2E_SCRIPT_DIR MOCK_STDOUT; do
+    for var in FORGEJO_API_URL MOCK_LOG GH_MOCK_LOG REMOTE_DIR MOCK_PORT E2E_SCRIPT_DIR MOCK_STDOUT; do
         tmux set-environment -gu "$var" 2>/dev/null || true
     done
     tmux kill-session -t e2e-test 2>/dev/null || true
@@ -226,12 +226,12 @@ echo "  Remote: $REMOTE_DIR"
 echo ">>> [Phase 2] Configuring environment..."
 
 export PATH="$SCRIPT_DIR:$PATH"
-export GITHUB_TOKEN="test-token-e2e"
-export GITHUB_API_URL="http://127.0.0.1:$MOCK_PORT"
+export FORGEJO_TOKEN="test-token-e2e"
+export FORGEJO_API_URL="http://127.0.0.1:$MOCK_PORT"
 export GH_MOCK_LOG="$WORK_DIR/gh_mock.log"
 
 # Set tmux global env vars so companion windows inherit them
-tmux set-environment -g GITHUB_API_URL "http://127.0.0.1:$MOCK_PORT"
+tmux set-environment -g FORGEJO_API_URL "http://127.0.0.1:$MOCK_PORT"
 tmux set-environment -g MOCK_LOG "$MOCK_LOG"
 tmux set-environment -g GH_MOCK_LOG "$GH_MOCK_LOG"
 tmux set-environment -g REMOTE_DIR "$REMOTE_DIR"
@@ -240,8 +240,8 @@ tmux set-environment -g E2E_SCRIPT_DIR "$SCRIPT_DIR"
 tmux set-environment -g MOCK_STDOUT "$MOCK_STDOUT"
 
 echo "  PATH prepended with: $SCRIPT_DIR (mock_gh)"
-echo "  GITHUB_TOKEN=test-token-e2e"
-echo "  GITHUB_API_URL=http://127.0.0.1:$MOCK_PORT"
+echo "  FORGEJO_TOKEN=test-token-e2e"
+echo "  FORGEJO_API_URL=http://127.0.0.1:$MOCK_PORT"
 echo "  GH_MOCK_LOG=$GH_MOCK_LOG"
 echo "  MOCK_LOG=$MOCK_LOG"
 echo "  REMOTE_DIR=$REMOTE_DIR"

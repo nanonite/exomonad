@@ -312,8 +312,8 @@ fi
 echo "  relay pid: $RELAY_PID log: $RELAY_LOG"
 
 echo ">>> [Phase 4] Configuring environment..."
-unset GITHUB_TOKEN
-unset GITHUB_API_URL
+unset FORGEJO_TOKEN
+unset FORGEJO_API_URL
 export CODEX_HOME="$CODEX_HOME_DIR"
 export EXOMONAD_LOG_FORMAT=""
 echo "  GitHub auth unset; file_pr should use local .exo/prs.json flow"

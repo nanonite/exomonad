@@ -185,31 +185,6 @@ impl GitHubEffects for GitHubHandler {
         })
     }
 
-    async fn get_pull_request_for_branch(
-        &self,
-        req: GetPullRequestForBranchRequest,
-        _ctx: &crate::effects::EffectContext,
-    ) -> EffectResult<GetPullRequestForBranchResponse> {
-        tracing::info!(owner = %req.owner, repo = %req.repo, branch = %req.branch, "[GitHub] get_pull_request_for_branch starting");
-        let repo = make_repo(&req.owner, &req.repo);
-
-        let branch = BranchName::try_from_str(req.branch.as_str())
-            .expect("validated string input is non-empty");
-
-        let result = self
-            .service
-            .get_pr_for_branch(&repo, &branch)
-            .await
-            .map_err(|e| EffectError::network_error(e.to_string()))?;
-
-        let found = result.is_some();
-        tracing::info!(found, branch = %req.branch, "[GitHub] get_pull_request_for_branch complete");
-        Ok(GetPullRequestForBranchResponse {
-            pull_request: result.map(convert_pr),
-            found,
-        })
-    }
-
     async fn create_pull_request(
         &self,
         req: CreatePullRequestRequest,

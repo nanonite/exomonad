@@ -171,18 +171,15 @@ impl EffectRegistry {
 
         tracing::Span::current().record("namespace", namespace);
 
-        let handler = self
-            .handlers
-            .get(namespace)
-            .ok_or_else(|| {
-                if namespace == "github" {
-                    EffectError::not_found(
-                        "handler/github unavailable: GitHub effect handler is not registered because GITHUB_TOKEN is not set",
-                    )
-                } else {
-                    EffectError::not_found(format!("handler/{}", namespace))
-                }
-            })?;
+        let handler = self.handlers.get(namespace).ok_or_else(|| {
+            if namespace == "github" {
+                EffectError::not_found(
+                    "handler/github unavailable: hosted PR effect handler is not registered",
+                )
+            } else {
+                EffectError::not_found(format!("handler/{}", namespace))
+            }
+        })?;
 
         tracing::debug!(
             effect_type = %effect_type,

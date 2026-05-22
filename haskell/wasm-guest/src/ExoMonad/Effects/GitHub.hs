@@ -24,7 +24,6 @@ module ExoMonad.Effects.GitHub
     GitHubGetIssue,
     GitHubListPullRequests,
     GitHubGetPullRequest,
-    GitHubGetPullRequestForBranch,
     GitHubGetPullRequestReviewComments,
     GitHubCreatePullRequest,
 
@@ -68,13 +67,6 @@ instance Effect GitHubGetPullRequest where
   type Input GitHubGetPullRequest = GetPullRequestRequest
   type Output GitHubGetPullRequest = GetPullRequestResponse
   effectId = "github.get_pull_request"
-
-data GitHubGetPullRequestForBranch
-
-instance Effect GitHubGetPullRequestForBranch where
-  type Input GitHubGetPullRequestForBranch = GetPullRequestForBranchRequest
-  type Output GitHubGetPullRequestForBranch = GetPullRequestForBranchResponse
-  effectId = "github.get_pull_request_for_branch"
 
 data GitHubGetPullRequestReviewComments
 

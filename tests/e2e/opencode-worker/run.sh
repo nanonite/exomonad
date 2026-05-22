@@ -130,8 +130,8 @@ echo "  Remote: $REMOTE_DIR"
 # --- Phase 2: Set environment ---
 
 echo ">>> [Phase 2] Configuring environment..."
-export GITHUB_TOKEN="test-token-e2e"
-echo "  GITHUB_TOKEN=test-token-e2e"
+export FORGEJO_TOKEN="test-token-e2e"
+echo "  FORGEJO_TOKEN=test-token-e2e"
 
 # --- Phase 3: Run exomonad init ---
 

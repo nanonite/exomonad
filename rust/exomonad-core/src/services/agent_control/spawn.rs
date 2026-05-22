@@ -328,15 +328,15 @@ impl<
             // Resolve effective project dir.
             let effective_project_dir = self.effective_project_dir(options.subrepo.as_deref())?;
 
-            // Get GitHub client
+            // Get hosted issue client
             let github_client = self
                 .github()
-                .ok_or_else(|| anyhow!("GitHub service not available (GITHUB_TOKEN not set)"))?;
+                .ok_or_else(|| anyhow!("hosted issue service not available"))?;
             let github = GitHubService::new(github_client.clone());
 
-            // Fetch issue from GitHub
+            // Fetch issue from hosted service
             let issue_id = issue_number.as_u64().to_string();
-            info!(issue_id, "Fetching issue from GitHub");
+            info!(issue_id, "Fetching issue from hosted service");
             let repo = Repo {
                 owner: options.owner.clone(),
                 name: options.repo.clone(),

@@ -1,7 +1,7 @@
 syntax = "proto3";
 package exomonad.effects.file_pr;
 
-// File PR effects for creating/updating GitHub pull requests.
+// File PR effects for creating/updating pull requests.
 
 // ============================================================================
 // FilePR - Create or find existing PR for current branch

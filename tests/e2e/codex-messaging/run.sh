@@ -155,8 +155,8 @@ echo "  Result: $RESULT_FILE"
 echo "  CODEX_HOME: $CODEX_HOME_DIR"
 
 echo ">>> [Phase 2] Configuring environment..."
-unset GITHUB_TOKEN
-unset GITHUB_API_URL
+unset FORGEJO_TOKEN
+unset FORGEJO_API_URL
 export CODEX_HOME="$CODEX_HOME_DIR"
 export EXOMONAD_LOG_FORMAT=""
 echo "  GitHub auth unset"

@@ -137,9 +137,9 @@ echo "  Remote: $REMOTE_DIR"
 echo ">>> [Phase 2] Configuring environment..."
 
 # Messaging test doesn't need mock GitHub, but set token to avoid auth errors
-export GITHUB_TOKEN="test-token-e2e"
+export FORGEJO_TOKEN="test-token-e2e"
 
-echo "  GITHUB_TOKEN=test-token-e2e"
+echo "  FORGEJO_TOKEN=test-token-e2e"
 
 # --- Phase 3: Run exomonad init ---
 

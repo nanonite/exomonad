@@ -169,7 +169,6 @@ Git operations (proto-generated request/response types):
 GitHub API operations (proto-generated):
 - `ListIssuesRequest/Response`, `GetIssueRequest/Response`
 - `ListPullRequestsRequest/Response`, `GetPullRequestRequest/Response`
-- `GetPullRequestForBranchRequest/Response`, `CreatePullRequestRequest/Response`
 
 ### Effects.Log
 
