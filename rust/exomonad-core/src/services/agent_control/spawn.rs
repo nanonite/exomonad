@@ -843,10 +843,22 @@ impl<
             if routing.parent_tab.as_deref() != Some(parent_tab) {
                 continue;
             }
-            let Some(pane_id) = routing.pane_id.as_ref() else {
-                continue;
+            let worker_alive = if let Some(pane_id) = routing.pane_id.as_ref() {
+                self.tmux()?.pane_exists(pane_id).await.unwrap_or(false)
+            } else if let Some(window_id) = routing.window_id.as_ref() {
+                self.tmux()?.window_exists(window_id).await.unwrap_or(false)
+            } else {
+                false
             };
-            if !self.tmux()?.pane_exists(pane_id).await.unwrap_or(false) {
+            if !worker_alive {
+                warn!(
+                    worker = %name,
+                    path = %agent_dir.display(),
+                    "Removing stale active worker registration with no live tmux target"
+                );
+                if let Err(error) = fs::remove_dir_all(&agent_dir).await {
+                    warn!(worker = %name, error = %error, "Failed to remove stale active worker registration");
+                }
                 continue;
             }
 

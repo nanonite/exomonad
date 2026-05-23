@@ -705,6 +705,15 @@ impl TmuxIpc {
 
     // -- Query --
 
+    pub async fn window_exists(&self, window_id: &WindowId) -> Result<bool> {
+        let status = Command::new("tmux")
+            .args(["display-message", "-t", window_id.as_str(), "-p", ""])
+            .status()
+            .await
+            .context("Failed to run tmux display-message")?;
+        Ok(status.success())
+    }
+
     pub async fn pane_exists(&self, pane_id: &PaneId) -> Result<bool> {
         let status = Command::new("tmux")
             .args(["display-message", "-t", pane_id.as_str(), "-p", ""])
