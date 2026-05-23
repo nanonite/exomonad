@@ -16,6 +16,7 @@ use exomonad_proto::effects::file_pr::LocalPrResponse;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::process::Command;
@@ -385,6 +386,7 @@ pub struct WorktreeEventWatcher<C> {
     ci_source_configured: bool,
     /// Spawns reviewer agents on PR creation.
     reviewer_spawner: Option<Arc<dyn ReviewerSpawner>>,
+    forgejo_absent_warned: Arc<AtomicBool>,
 }
 
 impl<C> WorktreeEventWatcher<C>
@@ -411,6 +413,7 @@ where
             ci_status_map: Arc::new(RwLock::new(HashMap::new())),
             ci_source_configured: false,
             reviewer_spawner: None,
+            forgejo_absent_warned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -489,6 +492,8 @@ where
             "Forgejo worktree event watcher started"
         );
 
+        self.append_watcher_log("watcher started").await;
+
         let base_interval = self.poll_interval;
         let max_backoff = Duration::from_secs(600);
         let mut consecutive_failures: u32 = 0;
@@ -536,6 +541,24 @@ where
         }
     }
 
+    async fn append_watcher_log(&self, message: &str) {
+        let log_path = self.ctx.project_dir().join(".exo/logs/watcher.log");
+        let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let line = format!("{} [watcher] {}\n", timestamp, message);
+        if let Some(parent) = log_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        use tokio::io::AsyncWriteExt;
+        if let Ok(mut file) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .await
+        {
+            let _ = file.write_all(line.as_bytes()).await;
+        }
+    }
+
     async fn read_watcher_state(&self) -> Result<WatcherStateFile> {
         if !self.watcher_state_path.exists() {
             return Ok(WatcherStateFile::default());
@@ -557,6 +580,11 @@ where
 
     async fn load_registry_from_forgejo(&self) -> Result<PrRegistry> {
         let Some(forgejo) = self.ctx.forgejo_client() else {
+            if !self.forgejo_absent_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "[Watcher] Forgejo client not configured - watcher idle. Set forgejo_url and forgejo_token in .exo/config.toml"
+                );
+            }
             return Ok(PrRegistry::default());
         };
         let repo_info = repo::get_repo_info(self.ctx.project_dir()).await?;
@@ -638,11 +666,28 @@ where
     #[instrument(skip_all, name = "worktree_event_watcher.poll_cycle")]
     async fn poll_cycle(&self) -> Result<()> {
         let registry = self.load_registry_from_forgejo().await?;
+        let pr_count = registry.prs.len();
+        tracing::info!(pr_count, "[Watcher] poll cycle");
+        self.append_watcher_log(&format!("poll: {} open PR(s)", pr_count))
+            .await;
         if registry.prs.is_empty() {
             return Ok(());
         }
 
         let observations = self.collect_observations(&registry).await?;
+        for (num, obs) in &observations {
+            tracing::debug!(
+                pr = num,
+                review_state = ?obs.review_state,
+                ci_status = ?obs.ci_status,
+                "[Watcher] PR observation"
+            );
+        }
+        self.append_watcher_log(&format!(
+            "observations: {}",
+            format_observations(&observations)
+        ))
+        .await;
         let removed = self.process_observations(&registry, &observations).await?;
         self.detect_merged(&registry, &removed).await?;
 
@@ -2456,6 +2501,20 @@ fn format_review_message(comments: &[LocalReviewComment], reviews: &[LocalReview
     }
 
     msg
+}
+
+fn format_observations(observations: &HashMap<u64, Observation>) -> String {
+    let mut entries: Vec<_> = observations
+        .iter()
+        .map(|(number, observation)| {
+            format!(
+                "PR#{} review={:?} ci={:?}",
+                number, observation.review_state, observation.ci_status
+            )
+        })
+        .collect();
+    entries.sort();
+    entries.join(", ")
 }
 
 fn ci_status_key(branch: &BranchName, head_sha: &str) -> CiStatusKey {
