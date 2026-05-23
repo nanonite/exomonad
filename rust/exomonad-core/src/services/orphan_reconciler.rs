@@ -224,6 +224,10 @@ async fn reconcile_session_timeouts(
         }
 
         let agent_dir = agents_dir.join(&slug);
+        let routing_path = agent_dir.join("routing.json");
+        if !routing_path.exists() {
+            continue;
+        }
         let spawned_at = match tokio::fs::read_to_string(agent_dir.join("spawned_at")).await {
             Ok(s) => match s.trim().parse::<u64>() {
                 Ok(t) => t,
@@ -252,19 +256,28 @@ async fn reconcile_session_timeouts(
         );
 
         if let Some(session) = tmux_session {
-            kill_agent_window(session, &agent_dir, &slug).await;
-            notify_tl_of_timeout(project_dir, session, &slug, &active_issue, limit_mins).await;
+            let was_alive = kill_agent_window(session, &agent_dir, &slug).await;
+            let _ = tokio::fs::remove_file(&routing_path).await;
+            notify_tl_about_agent(
+                project_dir,
+                session,
+                &slug,
+                &active_issue,
+                limit_mins,
+                was_alive,
+            )
+            .await;
         }
     }
     Ok(())
 }
 
-async fn kill_agent_window(session: &str, agent_dir: &std::path::Path, slug: &str) {
+async fn kill_agent_window(session: &str, agent_dir: &std::path::Path, slug: &str) -> bool {
     let routing = match crate::domain::RoutingInfo::read_from_dir(agent_dir).await {
         Ok(r) => r,
         Err(e) => {
             warn!(agent = %slug, error = %e, "Could not read routing.json for timeout kill (non-fatal)");
-            return;
+            return false;
         }
     };
 
@@ -276,12 +289,17 @@ async fn kill_agent_window(session: &str, agent_dir: &std::path::Path, slug: &st
             .await;
         match status {
             Ok(s) if s.success() => {
-                info!(agent = %slug, target = %target, "Killed timed-out agent window")
+                info!(agent = %slug, target = %target, "Killed timed-out agent window");
+                true
             }
             Ok(s) => {
-                warn!(agent = %slug, target = %target, status = ?s, "kill-window returned non-zero (window may already be gone)")
+                warn!(agent = %slug, target = %target, status = ?s, "kill-window returned non-zero (window may already be gone)");
+                false
             }
-            Err(e) => warn!(agent = %slug, error = %e, "Failed to run tmux kill-window"),
+            Err(e) => {
+                warn!(agent = %slug, error = %e, "Failed to run tmux kill-window");
+                false
+            }
         }
     } else if let Some(pane_id) = &routing.pane_id {
         let target = format!("{}:{}", session, pane_id.as_str());
@@ -291,22 +309,30 @@ async fn kill_agent_window(session: &str, agent_dir: &std::path::Path, slug: &st
             .await;
         match status {
             Ok(s) if s.success() => {
-                info!(agent = %slug, target = %target, "Killed timed-out agent pane")
+                info!(agent = %slug, target = %target, "Killed timed-out agent pane");
+                true
             }
             Ok(s) => {
-                warn!(agent = %slug, target = %target, status = ?s, "kill-pane returned non-zero")
+                warn!(agent = %slug, target = %target, status = ?s, "kill-pane returned non-zero");
+                false
             }
-            Err(e) => warn!(agent = %slug, error = %e, "Failed to run tmux kill-pane"),
+            Err(e) => {
+                warn!(agent = %slug, error = %e, "Failed to run tmux kill-pane");
+                false
+            }
         }
+    } else {
+        false
     }
 }
 
-async fn notify_tl_of_timeout(
+async fn notify_tl_about_agent(
     project_dir: &Path,
     session: &str,
     slug: &str,
     active_issue: &Option<String>,
     limit_mins: u64,
+    was_alive: bool,
 ) {
     let root_dir = project_dir.join(".exo/agents/root");
     let Ok(routing) = crate::domain::RoutingInfo::read_from_dir(&root_dir).await else {
@@ -316,14 +342,7 @@ async fn notify_tl_of_timeout(
         return;
     };
 
-    let issue_hint = match active_issue {
-        Some(id) => {
-            format!(" Issue #{id} — call chainlink_timer_stop {id} then re-spec or escalate.")
-        }
-        None => String::new(),
-    };
-    let message =
-        format!("[TIMED OUT: {slug}] Exceeded {limit_mins}min session limit — killed.{issue_hint}");
+    let message = timeout_notification_message(slug, active_issue, limit_mins, was_alive);
 
     let target = format!("{}:{}", session, window_id.as_str());
     let tmp = std::env::temp_dir().join(format!("exomonad-timeout-{}.txt", slug));
@@ -346,9 +365,55 @@ async fn notify_tl_of_timeout(
     }
 }
 
+fn timeout_notification_message(
+    slug: &str,
+    active_issue: &Option<String>,
+    limit_mins: u64,
+    was_alive: bool,
+) -> String {
+    let issue_hint = timeout_issue_hint(active_issue, was_alive);
+    if was_alive {
+        format!("[TIMED OUT: {slug}] Exceeded {limit_mins}min session limit — killed.{issue_hint}")
+    } else {
+        format!(
+            "[STALE REGISTRY: {slug}] Agent window was already gone — registry entry cleaned up.{issue_hint}"
+        )
+    }
+}
+
+fn timeout_issue_hint(active_issue: &Option<String>, was_alive: bool) -> String {
+    match (active_issue, was_alive) {
+        (Some(id), true) => {
+            format!(" Issue #{id} — call chainlink_timer_stop {id} then re-spec or escalate.")
+        }
+        (Some(id), false) => {
+            format!(" Issue #{id} — verify status with chainlink show {id} and re-spec or close if done.")
+        }
+        (None, _) => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_message_reports_live_kill() {
+        let message = timeout_notification_message("agent-a", &Some("372".to_string()), 15, true);
+
+        assert!(message.contains("[TIMED OUT: agent-a]"));
+        assert!(message.contains("Exceeded 15min session limit"));
+        assert!(message.contains("chainlink_timer_stop 372"));
+    }
+
+    #[test]
+    fn timeout_message_reports_stale_registry() {
+        let message = timeout_notification_message("agent-b", &Some("372".to_string()), 15, false);
+
+        assert!(message.contains("[STALE REGISTRY: agent-b]"));
+        assert!(message.contains("registry entry cleaned up"));
+        assert!(message.contains("chainlink show 372"));
+    }
 
     #[test]
     fn parses_issue_id_from_worktree_slug() {
