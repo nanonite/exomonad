@@ -43,10 +43,30 @@ message DeregisterSupervisorResponse {
   bool success = 1;
 }
 
+message AgentStatus {
+  string name = 1;
+  string role = 2;
+  string issue = 3;
+  string window_id = 4;
+  string pane_id = 5;
+  bool window_alive = 6;
+  uint64 age_mins = 7;
+  string birth_branch = 8;
+}
+
+message ListAgentsRequest {
+  bool include_dead = 1;
+}
+
+message ListAgentsResponse {
+  repeated AgentStatus agents = 1;
+}
+
 service SessionEffects {
   rpc RegisterClaudeId(RegisterClaudeSessionRequest) returns (RegisterClaudeSessionResponse);
   rpc RegisterTeam(RegisterTeamRequest) returns (RegisterTeamResponse);
   rpc DeregisterTeam(DeregisterTeamRequest) returns (DeregisterTeamResponse);
   rpc RegisterSupervisor(RegisterSupervisorRequest) returns (RegisterSupervisorResponse);
   rpc DeregisterSupervisor(DeregisterSupervisorRequest) returns (DeregisterSupervisorResponse);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
 }

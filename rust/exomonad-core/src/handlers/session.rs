@@ -3,24 +3,35 @@
 //! Stores Claude Code session UUIDs so spawn_subtree can use --resume --fork-session.
 //! Stores Claude Teams info so notify_parent can route via Teams inbox.
 
-use crate::domain::ClaudeSessionUuid;
-use crate::effects::{dispatch_session_effect, EffectResult, SessionEffects};
+use crate::domain::{ClaudeSessionUuid, RoutingInfo};
+use crate::effects::{dispatch_session_effect, EffectResult, ResultExt, SessionEffects};
+use crate::services::agent_resolver::AgentIdentityRecord;
 use crate::services::supervisor_registry::SupervisorInfo;
+use crate::services::tmux_ipc::TmuxIpc;
 use async_trait::async_trait;
 use claude_teams_bridge::TeamInfo;
 use exomonad_proto::effects::session::*;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-use crate::services::{HasClaudeSessionRegistry, HasSupervisorRegistry, HasTeamRegistry};
+use crate::services::{
+    HasClaudeSessionRegistry, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
+};
 
 /// Session effect handler.
 pub struct SessionHandler<C> {
     ctx: Arc<C>,
 }
 
-impl<C: HasClaudeSessionRegistry + HasTeamRegistry + HasSupervisorRegistry + 'static>
-    SessionHandler<C>
+impl<
+        C: HasClaudeSessionRegistry
+            + HasTeamRegistry
+            + HasSupervisorRegistry
+            + HasProjectDir
+            + 'static,
+    > SessionHandler<C>
 {
     pub fn new(ctx: Arc<C>) -> Self {
         Self { ctx }
@@ -28,8 +39,13 @@ impl<C: HasClaudeSessionRegistry + HasTeamRegistry + HasSupervisorRegistry + 'st
 }
 
 #[async_trait]
-impl<C: HasClaudeSessionRegistry + HasTeamRegistry + HasSupervisorRegistry + 'static>
-    crate::effects::EffectHandler for SessionHandler<C>
+impl<
+        C: HasClaudeSessionRegistry
+            + HasTeamRegistry
+            + HasSupervisorRegistry
+            + HasProjectDir
+            + 'static,
+    > crate::effects::EffectHandler for SessionHandler<C>
 {
     fn namespace(&self) -> &str {
         "session"
@@ -46,8 +62,13 @@ impl<C: HasClaudeSessionRegistry + HasTeamRegistry + HasSupervisorRegistry + 'st
 }
 
 #[async_trait]
-impl<C: HasClaudeSessionRegistry + HasTeamRegistry + HasSupervisorRegistry + 'static> SessionEffects
-    for SessionHandler<C>
+impl<
+        C: HasClaudeSessionRegistry
+            + HasTeamRegistry
+            + HasSupervisorRegistry
+            + HasProjectDir
+            + 'static,
+    > SessionEffects for SessionHandler<C>
 {
     async fn register_claude_id(
         &self,
@@ -192,6 +213,21 @@ impl<C: HasClaudeSessionRegistry + HasTeamRegistry + HasSupervisorRegistry + 'st
         Ok(DeregisterSupervisorResponse { success: true })
     }
 
+    async fn list_agents(
+        &self,
+        req: ListAgentsRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<ListAgentsResponse> {
+        let tmux = std::env::var("EXOMONAD_TMUX_SESSION")
+            .ok()
+            .filter(|session| !session.trim().is_empty())
+            .map(|session| TmuxIpc::new(&session));
+        let agents = list_agent_statuses(self.ctx.project_dir(), tmux.as_ref(), req.include_dead)
+            .await
+            .effect_err("session")?;
+        Ok(ListAgentsResponse { agents })
+    }
+
     async fn deregister_team(
         &self,
         _req: DeregisterTeamRequest,
@@ -236,6 +272,138 @@ impl<C: HasClaudeSessionRegistry + HasTeamRegistry + HasSupervisorRegistry + 'st
         }
 
         Ok(DeregisterTeamResponse { success: true })
+    }
+}
+
+async fn list_agent_statuses(
+    project_dir: &Path,
+    tmux: Option<&TmuxIpc>,
+    include_dead: bool,
+) -> anyhow::Result<Vec<AgentStatus>> {
+    let agents_dir = project_dir.join(".exo/agents");
+    let mut entries = match tokio::fs::read_dir(&agents_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut agents = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let agent_dir = entry.path();
+        let status = agent_status_from_dir(&name, &agent_dir, tmux).await;
+        if include_dead || status.window_alive {
+            agents.push(status);
+        }
+    }
+    agents.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(agents)
+}
+
+async fn agent_status_from_dir(
+    name: &str,
+    agent_dir: &Path,
+    tmux: Option<&TmuxIpc>,
+) -> AgentStatus {
+    let routing = RoutingInfo::read_from_dir(agent_dir).await.ok();
+    let identity = read_identity(agent_dir).await;
+    let birth_branch = match identity.as_ref() {
+        Some(record) => record.birth_branch.to_string(),
+        None => read_trimmed(agent_dir.join(".birth_branch"))
+            .await
+            .unwrap_or_default(),
+    };
+    let issue = read_trimmed(agent_dir.join("active_issue"))
+        .await
+        .unwrap_or_default();
+    let spawned_at = read_trimmed(agent_dir.join("spawned_at"))
+        .await
+        .and_then(|value| value.parse::<u64>().ok());
+    let age_mins = spawned_at.map(age_mins_since).unwrap_or(0);
+    let window_id = routing
+        .as_ref()
+        .and_then(|routing| routing.window_id.as_ref())
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let pane_id = routing
+        .as_ref()
+        .and_then(|routing| routing.pane_id.as_ref())
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let window_alive = routing_alive(routing.as_ref(), tmux).await;
+    let role = infer_role(name, routing.as_ref(), &birth_branch);
+
+    AgentStatus {
+        name: name.to_string(),
+        role,
+        issue,
+        window_id,
+        pane_id,
+        window_alive,
+        age_mins,
+        birth_branch,
+    }
+}
+
+async fn routing_alive(routing: Option<&RoutingInfo>, tmux: Option<&TmuxIpc>) -> bool {
+    let Some(tmux) = tmux else {
+        return false;
+    };
+    let Some(routing) = routing else {
+        return false;
+    };
+    if let Some(window_id) = &routing.window_id {
+        return tmux.window_exists(window_id).await.unwrap_or(false);
+    }
+    if let Some(pane_id) = &routing.pane_id {
+        return tmux.pane_exists(pane_id).await.unwrap_or(false);
+    }
+    false
+}
+
+async fn read_identity(agent_dir: &Path) -> Option<AgentIdentityRecord> {
+    let content = tokio::fs::read_to_string(agent_dir.join("identity.json"))
+        .await
+        .ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+async fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn age_mins_since(spawned_at: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(spawned_at) / 60
+}
+
+fn infer_role(name: &str, routing: Option<&RoutingInfo>, birth_branch: &str) -> String {
+    if name.starts_with("review-pr-") || birth_branch.starts_with("review-pr-") {
+        "reviewer".to_string()
+    } else if routing
+        .and_then(|routing| routing.pane_id.as_ref())
+        .is_some()
+    {
+        "worker".to_string()
+    } else if name.contains("-tl-")
+        || birth_branch
+            .rsplit('.')
+            .next()
+            .is_some_and(|leaf| leaf.contains("-tl-"))
+    {
+        "tl".to_string()
+    } else {
+        "dev".to_string()
     }
 }
 

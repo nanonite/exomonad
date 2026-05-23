@@ -766,3 +766,390 @@ instance (HsJSONPB.ToJSON DeregisterSupervisorResponse) where
 
 instance (HsJSONPB.FromJSON DeregisterSupervisorResponse) where
   parseJSON = HsJSONPB.parseJSONPB
+
+data AgentStatus
+  = AgentStatus
+  { agentStatusName :: Hs.Text,
+    agentStatusRole :: Hs.Text,
+    agentStatusIssue :: Hs.Text,
+    agentStatusWindowId :: Hs.Text,
+    agentStatusPaneId :: Hs.Text,
+    agentStatusWindowAlive :: Hs.Bool,
+    agentStatusAgeMins :: Hs.Word64,
+    agentStatusBirthBranch :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData AgentStatus)
+
+instance (HsProtobuf.Named AgentStatus) where
+  nameOf _ = Hs.fromString "AgentStatus"
+
+instance (HsProtobuf.HasDefault AgentStatus)
+
+instance (HsProtobuf.Message AgentStatus) where
+  encodeMessage
+    _
+    AgentStatus
+      { agentStatusName,
+        agentStatusRole,
+        agentStatusIssue,
+        agentStatusWindowId,
+        agentStatusPaneId,
+        agentStatusWindowAlive,
+        agentStatusAgeMins,
+        agentStatusBirthBranch
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 1)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        agentStatusName
+                                    )
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 2)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        agentStatusRole
+                                    )
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 3)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    agentStatusIssue
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 4)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                agentStatusWindowId
+                            )
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 5)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            agentStatusPaneId
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 6)
+                    agentStatusWindowAlive
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 7)
+                agentStatusAgeMins
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 8)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                agentStatusBirthBranch
+            )
+        )
+  decodeMessage _ =
+    Hs.pure AgentStatus
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 6)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 7)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "name")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "role")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "issue")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "window_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "pane_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "window_alive")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "age_mins")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "birth_branch")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB AgentStatus) where
+  toJSONPB (AgentStatus f1 f2 f3 f4 f5 f6 f7 f8) =
+    HsJSONPB.object
+      [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "role" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "issue" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "window_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "pane_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "window_alive" .= f6,
+        "age_mins" .= f7,
+        "birth_branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+      ]
+  toEncodingPB (AgentStatus f1 f2 f3 f4 f5 f6 f7 f8) =
+    HsJSONPB.pairs
+      [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "role" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "issue" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "window_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "pane_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "window_alive" .= f6,
+        "age_mins" .= f7,
+        "birth_branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+      ]
+
+instance (HsJSONPB.FromJSONPB AgentStatus) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "AgentStatus"
+      ( \obj ->
+          Hs.pure AgentStatus
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "name")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "role")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "issue")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "window_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "pane_id")
+                )
+            <*> obj .: "window_alive"
+            <*> obj .: "age_mins"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "birth_branch")
+                )
+      )
+
+instance (HsJSONPB.ToJSON AgentStatus) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON AgentStatus) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+newtype ListAgentsRequest
+  = ListAgentsRequest {listAgentsRequestIncludeDead :: Hs.Bool}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData ListAgentsRequest)
+
+instance (HsProtobuf.Named ListAgentsRequest) where
+  nameOf _ = Hs.fromString "ListAgentsRequest"
+
+instance (HsProtobuf.HasDefault ListAgentsRequest)
+
+instance (HsProtobuf.Message ListAgentsRequest) where
+  encodeMessage _ ListAgentsRequest {listAgentsRequestIncludeDead} =
+    ( HsProtobuf.encodeMessageField
+        (HsProtobuf.FieldNumber 1)
+        listAgentsRequestIncludeDead
+    )
+  decodeMessage _ =
+    Hs.pure ListAgentsRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "include_dead")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB ListAgentsRequest) where
+  toJSONPB (ListAgentsRequest f1) =
+    HsJSONPB.object ["include_dead" .= f1]
+  toEncodingPB (ListAgentsRequest f1) =
+    HsJSONPB.pairs ["include_dead" .= f1]
+
+instance (HsJSONPB.FromJSONPB ListAgentsRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "ListAgentsRequest"
+      (\obj -> Hs.pure ListAgentsRequest <*> obj .: "include_dead")
+
+instance (HsJSONPB.ToJSON ListAgentsRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON ListAgentsRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+newtype ListAgentsResponse
+  = ListAgentsResponse {listAgentsResponseAgents :: (Hs.Vector Effects.Session.AgentStatus)}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData ListAgentsResponse)
+
+instance (HsProtobuf.Named ListAgentsResponse) where
+  nameOf _ = Hs.fromString "ListAgentsResponse"
+
+instance (HsProtobuf.HasDefault ListAgentsResponse)
+
+instance (HsProtobuf.Message ListAgentsResponse) where
+  encodeMessage _ ListAgentsResponse {listAgentsResponseAgents} =
+    ( HsProtobuf.encodeMessageField
+        (HsProtobuf.FieldNumber 1)
+        ( ( Hs.coerce
+              @(Hs.Vector Effects.Session.AgentStatus)
+              @(HsProtobuf.NestedVec Effects.Session.AgentStatus)
+          )
+            listAgentsResponseAgents
+        )
+    )
+  decodeMessage _ =
+    Hs.pure ListAgentsResponse
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.NestedVec Effects.Session.AgentStatus)
+                @(Hs.Vector Effects.Session.AgentStatus)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        ( HsProtobufAST.Repeated
+            (HsProtobufAST.Named (HsProtobufAST.Single "AgentStatus"))
+        )
+        (HsProtobufAST.Single "agents")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB ListAgentsResponse) where
+  toJSONPB (ListAgentsResponse f1) =
+    HsJSONPB.object
+      [ "agents"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Effects.Session.AgentStatus)
+                   @(HsProtobuf.NestedVec Effects.Session.AgentStatus)
+               )
+                 f1
+             )
+      ]
+  toEncodingPB (ListAgentsResponse f1) =
+    HsJSONPB.pairs
+      [ "agents"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Effects.Session.AgentStatus)
+                   @(HsProtobuf.NestedVec Effects.Session.AgentStatus)
+               )
+                 f1
+             )
+      ]
+
+instance (HsJSONPB.FromJSONPB ListAgentsResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "ListAgentsResponse"
+      ( \obj ->
+          Hs.pure ListAgentsResponse
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.NestedVec Effects.Session.AgentStatus)
+                      @(Hs.Vector Effects.Session.AgentStatus)
+                  )
+                    (obj .: "agents")
+                )
+      )
+
+instance (HsJSONPB.ToJSON ListAgentsResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON ListAgentsResponse) where
+  parseJSON = HsJSONPB.parseJSONPB

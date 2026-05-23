@@ -47,6 +47,7 @@ import ExoMonad.Guest.Tools.Events
   )
 import ExoMonad.Guest.Tools.FilePR (FilePRArgs, FilePROutput (..), filePRCore, filePRDescription, filePRSchema)
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
+import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
     ForkWaveArgs (..),
@@ -253,6 +254,7 @@ data Tools mode = Tools
     spawnReviewer :: mode :- TLSpawnReviewer,
     closeWorkerPane :: mode :- TLCloseWorkerPane,
     spawnCodex :: mode :- TLSpawnCodex,
+    sessionStatus :: mode :- SessionStatus,
     pr :: mode :- TLFilePR,
     mergePr :: mode :- TLMergePR,
     notifyParent :: mode :- TLNotifyParent,
@@ -292,6 +294,7 @@ config =
             spawnReviewer = mkHandler @TLSpawnReviewer,
             closeWorkerPane = mkHandler @TLCloseWorkerPane,
             spawnCodex = mkHandler @TLSpawnCodex,
+            sessionStatus = mkHandler @SessionStatus,
             pr = mkHandler @TLFilePR,
             mergePr = mkHandler @TLMergePR,
             notifyParent = mkHandler @TLNotifyParent,

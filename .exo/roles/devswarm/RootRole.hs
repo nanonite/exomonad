@@ -38,6 +38,7 @@ import ExoMonad.Guest.Tools.Chainlink
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
+import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
     ForkWaveArgs (..),
@@ -187,6 +188,7 @@ data Tools mode = Tools
     spawnReviewer :: mode :- RootSpawnReviewer,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
+    sessionStatus :: mode :- SessionStatus,
     mergePr :: mode :- RootMergePR,
     sendMessage :: mode :- SendMessage,
     chainlinkIssueCreate :: mode :- ChainlinkIssueCreate,
@@ -224,6 +226,7 @@ config =
             spawnReviewer = mkHandler @RootSpawnReviewer,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,
+            sessionStatus = mkHandler @SessionStatus,
             mergePr = mkHandler @RootMergePR,
             sendMessage = mkHandler @SendMessage,
             chainlinkIssueCreate = mkHandler @ChainlinkIssueCreate,
