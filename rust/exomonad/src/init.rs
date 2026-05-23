@@ -28,6 +28,26 @@ fn read_chainlink_tl_protocol(cwd: &Path) -> Option<String> {
     }
 }
 
+fn watcher_tail_command(cwd: &Path) -> Result<String> {
+    let watcher_log_dir = cwd.join(".exo/logs");
+    let watcher_log_path = watcher_log_dir.join("watcher.log");
+    std::fs::create_dir_all(&watcher_log_dir).with_context(|| {
+        format!(
+            "failed to create watcher log directory {}",
+            watcher_log_dir.display()
+        )
+    })?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&watcher_log_path)
+        .with_context(|| format!("failed to create {}", watcher_log_path.display()))?;
+    Ok(format!(
+        "tail -f {}",
+        shell_escape::escape(watcher_log_path.to_string_lossy())
+    ))
+}
+
 fn forgejo_host_from_url(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -972,6 +992,17 @@ pub async fn run(
 
     // 4. Poll for server socket
     wait_for_server_socket(&cwd).await?;
+
+    match watcher_tail_command(&cwd) {
+        Ok(watcher_tail_cmd) => match ipc
+            .new_window("Watcher", &cwd, &shell, &watcher_tail_cmd)
+            .await
+        {
+            Ok(watcher_win) => info!(window = %watcher_win, "Watcher log window created"),
+            Err(e) => warn!(error = %e, "Failed to create Watcher window (non-fatal)"),
+        },
+        Err(e) => warn!(error = %e, "Failed to prepare Watcher log window (non-fatal)"),
+    }
 
     // 5. Spawn companion agents
     // Auto-inject spindle as a process companion when Tangled is configured, unless the user
@@ -2234,6 +2265,17 @@ mod tests {
     use super::*;
     use crate::config::CompanionConfig;
     use exomonad_core::services::AgentType;
+
+    #[test]
+    fn watcher_tail_command_creates_log_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let command = watcher_tail_command(tmp.path()).unwrap();
+        let log_path = tmp.path().join(".exo/logs/watcher.log");
+
+        assert!(log_path.exists());
+        assert!(command.starts_with("tail -f "));
+        assert!(command.contains("watcher.log"));
+    }
 
     fn spindle_companion(name: &str) -> CompanionConfig {
         CompanionConfig {
