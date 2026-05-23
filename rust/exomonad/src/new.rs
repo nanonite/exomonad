@@ -488,6 +488,11 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        run: |
+          git clone --depth 1 "http://172.17.0.1:3000/${{ github.repository }}.git" .
+          git checkout "${{ github.sha }}"
+
       - name: Customize workflow
         run: |
           echo "Replace .gitea/workflows/ci.yml with project-specific CI commands."
@@ -613,6 +618,9 @@ mod tests {
         assert!(content.contains("EXOMONAD GENERATED PLACEHOLDER"));
         assert!(content.contains("on: push"));
         assert!(content.contains("jobs:\n  ci:"));
+        assert!(content.contains("git clone --depth 1"));
+        assert!(content.contains("http://172.17.0.1:3000/${{ github.repository }}.git"));
+        assert!(!content.contains("actions/checkout"));
         assert!(content.contains("Customize workflow"));
         assert!(content.contains("Replace .gitea/workflows/ci.yml"));
         assert!(!content.contains("TODO"));

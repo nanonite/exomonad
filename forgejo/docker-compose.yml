@@ -16,7 +16,7 @@ services:
       - FORGEJO__server__SSH_DOMAIN=localhost
       - FORGEJO__server__SSH_PORT=2222
       - FORGEJO__actions__ENABLED=true
-      - FORGEJO__actions__DEFAULT_ACTIONS_URL=https://code.forgejo.org
+      - FORGEJO__actions__DEFAULT_ACTIONS_URL=http://localhost:3000
       - FORGEJO__log__LEVEL=Info
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/healthz"]
