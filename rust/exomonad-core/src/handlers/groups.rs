@@ -9,9 +9,9 @@ use crate::services::github::GitHubService;
 use crate::services::Services;
 
 use super::{
-    AgentHandler, CoordinationHandler, EventHandler, FilePRHandler, FsHandler, GitHandler,
-    GitHubHandler, KvHandler, LogHandler, MergePRHandler, ProcessHandler, SessionHandler,
-    TasksHandler,
+    AgentHandler, CoordinationHandler, EventHandler, FilePRHandler, ForgejoAsGitHubHandler,
+    FsHandler, GitHandler, GitHubHandler, KvHandler, LogHandler, MergePRHandler, ProcessHandler,
+    SessionHandler, TasksHandler,
 };
 
 /// Core handlers every consumer needs: logging, key-value store, filesystem.
@@ -29,7 +29,8 @@ pub fn core_handlers(project_dir: PathBuf, services: Arc<Services>) -> Vec<Box<d
 /// Git and GitHub handlers for dev tooling.
 ///
 /// Includes: git, github, file_pr, merge_pr.
-/// GitHub client from `services` is optional — if None, GitHubHandler is not registered.
+/// GitHub client from `services` is optional. If None, Forgejo registers the
+/// `github` namespace when available so WASM hosted-PR effects still work.
 pub fn git_handlers(services: Arc<Services>, git: Arc<GitService>) -> Vec<Box<dyn EffectHandler>> {
     let mut handlers: Vec<Box<dyn EffectHandler>> = vec![
         Box::new(GitHandler::new(git)),
@@ -40,9 +41,12 @@ pub fn git_handlers(services: Arc<Services>, git: Arc<GitService>) -> Vec<Box<dy
         handlers.push(Box::new(GitHubHandler::new(GitHubService::new(
             client.clone(),
         ))));
+    } else if services.forgejo_client.is_some() {
+        tracing::info!("GitHub client absent; routing github.* effects to Forgejo");
+        handlers.push(Box::new(ForgejoAsGitHubHandler::new(services.clone())));
     } else {
         tracing::warn!(
-            "GitHub service not available; 'github' namespace handlers will not be registered."
+            "Neither GitHub nor Forgejo client configured; 'github' namespace handlers will not be registered."
         );
     }
     handlers
@@ -119,6 +123,22 @@ mod tests {
 
         let mut services_raw = Services::test();
         services_raw.github_client = Some(client);
+        let services = Arc::new(services_raw);
+        let handlers = git_handlers(services, git);
+        assert_eq!(handlers.len(), 4);
+        let namespaces: Vec<_> = handlers.iter().map(|h| h.namespace()).collect();
+        assert!(namespaces.contains(&"github"));
+    }
+
+    #[test]
+    fn test_git_handlers_with_forgejo_fallback() {
+        let git = Arc::new(GitService::new(Arc::new(MockExecutor)));
+
+        let mut services_raw = Services::test();
+        services_raw.forgejo_client = Some(
+            crate::services::forgejo::ForgejoClient::new("http://forgejo.local", "token")
+                .expect("literal Forgejo config is valid"),
+        );
         let services = Arc::new(services_raw);
         let handlers = git_handlers(services, git);
         assert_eq!(handlers.len(), 4);
