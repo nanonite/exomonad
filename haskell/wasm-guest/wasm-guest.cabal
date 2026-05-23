@@ -72,6 +72,7 @@ library wasm-guest-internal
         ExoMonad.Guest.Tools.Tasks
         ExoMonad.Guest.Tools.Chainlink
         ExoMonad.Guest.Tools.CloseIssueAndCleanup
+        ExoMonad.Guest.Tools.CleanupOrphan
         ExoMonad.Guest.Tools.DisposeLeaf
         ExoMonad.Guest.Tools.DiscardWorkerOutput
         ExoMonad.Guest.Tools.TestRunner

@@ -137,6 +137,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Add cleanup_orphan MCP tool and fix dispose_leaf force=true to actually clean up filesystem (#377)
 - e2e test: Forgejo CI pipeline end-to-end (#351)
 - update CLAUDE.md: replace Tangled CI references with Forgejo (#350)
 - update init.rs: inject GH_HOST and GH_TOKEN into agent env (#349)

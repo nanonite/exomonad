@@ -16,6 +16,7 @@ module ExoMonad.Effects.Agent
     AgentSpawnLeafSubtree,
     AgentSpawnAcp,
     AgentCleanup,
+    AgentDisposeOrphan,
     AgentCleanupBatch,
     AgentCleanupMerged,
     AgentList,
@@ -98,6 +99,13 @@ instance Effect AgentCleanup where
   type Input AgentCleanup = CleanupRequest
   type Output AgentCleanup = CleanupResponse
   effectId = "agent.cleanup"
+
+data AgentDisposeOrphan
+
+instance Effect AgentDisposeOrphan where
+  type Input AgentDisposeOrphan = DisposeOrphanRequest
+  type Output AgentDisposeOrphan = DisposeOrphanResponse
+  effectId = "agent.dispose_orphan"
 
 data AgentCleanupBatch
 

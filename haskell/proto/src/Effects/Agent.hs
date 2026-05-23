@@ -1850,6 +1850,185 @@ instance (HsJSONPB.ToJSON CleanupResponse) where
 instance (HsJSONPB.FromJSON CleanupResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
+newtype DisposeOrphanRequest
+  = DisposeOrphanRequest {disposeOrphanRequestAgentSlug :: Hs.Text}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData DisposeOrphanRequest)
+
+instance (HsProtobuf.Named DisposeOrphanRequest) where
+  nameOf _ = Hs.fromString "DisposeOrphanRequest"
+
+instance (HsProtobuf.HasDefault DisposeOrphanRequest)
+
+instance (HsProtobuf.Message DisposeOrphanRequest) where
+  encodeMessage
+    _
+    DisposeOrphanRequest {disposeOrphanRequestAgentSlug} =
+      ( HsProtobuf.encodeMessageField
+          (HsProtobuf.FieldNumber 1)
+          ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+              disposeOrphanRequestAgentSlug
+          )
+      )
+  decodeMessage _ =
+    Hs.pure DisposeOrphanRequest
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "agent_slug")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB DisposeOrphanRequest) where
+  toJSONPB (DisposeOrphanRequest f1) =
+    HsJSONPB.object
+      [ "agent_slug"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+      ]
+  toEncodingPB (DisposeOrphanRequest f1) =
+    HsJSONPB.pairs
+      [ "agent_slug"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+      ]
+
+instance (HsJSONPB.FromJSONPB DisposeOrphanRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "DisposeOrphanRequest"
+      ( \obj ->
+          Hs.pure DisposeOrphanRequest
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "agent_slug")
+                )
+      )
+
+instance (HsJSONPB.ToJSON DisposeOrphanRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON DisposeOrphanRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data DisposeOrphanResponse
+  = DisposeOrphanResponse
+  { disposeOrphanResponseRemovedWorktree :: Hs.Bool,
+    disposeOrphanResponseRemovedAgentDir :: Hs.Bool,
+    disposeOrphanResponseMessage :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData DisposeOrphanResponse)
+
+instance (HsProtobuf.Named DisposeOrphanResponse) where
+  nameOf _ = Hs.fromString "DisposeOrphanResponse"
+
+instance (HsProtobuf.HasDefault DisposeOrphanResponse)
+
+instance (HsProtobuf.Message DisposeOrphanResponse) where
+  encodeMessage
+    _
+    DisposeOrphanResponse
+      { disposeOrphanResponseRemovedWorktree,
+        disposeOrphanResponseRemovedAgentDir,
+        disposeOrphanResponseMessage
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 1)
+                disposeOrphanResponseRemovedWorktree
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 2)
+                disposeOrphanResponseRemovedAgentDir
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 3)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                disposeOrphanResponseMessage
+            )
+        )
+  decodeMessage _ =
+    Hs.pure DisposeOrphanResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 2)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "removed_worktree")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "removed_agent_dir")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "message")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB DisposeOrphanResponse) where
+  toJSONPB (DisposeOrphanResponse f1 f2 f3) =
+    HsJSONPB.object
+      [ "removed_worktree" .= f1,
+        "removed_agent_dir" .= f2,
+        "message"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+      ]
+  toEncodingPB (DisposeOrphanResponse f1 f2 f3) =
+    HsJSONPB.pairs
+      [ "removed_worktree" .= f1,
+        "removed_agent_dir" .= f2,
+        "message"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+      ]
+
+instance (HsJSONPB.FromJSONPB DisposeOrphanResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "DisposeOrphanResponse"
+      ( \obj ->
+          Hs.pure DisposeOrphanResponse
+            <*> obj .: "removed_worktree"
+            <*> obj .: "removed_agent_dir"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "message")
+                )
+      )
+
+instance (HsJSONPB.ToJSON DisposeOrphanResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON DisposeOrphanResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
 data CleanupBatchRequest
   = CleanupBatchRequest
   { cleanupBatchRequestIssues :: (Hs.Vector Hs.Text),

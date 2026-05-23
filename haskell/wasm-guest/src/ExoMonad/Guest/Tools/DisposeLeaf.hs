@@ -21,6 +21,7 @@ import Data.Text qualified as T
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tools.Chainlink (ChainlinkIssueCloseArgs (..), chainlinkIssueCloseCore)
+import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphanArgs (..), cleanupOrphanCore)
 import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
 
@@ -68,8 +69,7 @@ disposeLeafCore args =
         Left err -> pure $ Left err
         Right _ -> pure $ Right $ object ["success" .= True, "agent" .= dlaName args, "issue_id" .= issueId, "force" .= dlaForce args]
     Nothing
-      | dlaForce args ->
-          pure $ Right $ object ["success" .= True, "agent" .= dlaName args, "issue_id" .= (0 :: Int), "force" .= True, "reason" .= dlaReason args]
+      | dlaForce args -> cleanupOrphanCore (CleanupOrphanArgs (dlaName args) False)
       | otherwise -> pure $ Left "Could not infer a Chainlink issue id from the leaf name. Pass force=true only for a genuine orphan."
 
 inferIssueId :: Text -> Maybe Int

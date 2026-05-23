@@ -3,7 +3,8 @@
 //! Uses proto-generated types from `exomonad_proto::effects::agent`.
 
 use crate::domain::{
-    AgentName, AgentPermissions, BirthBranch, BranchName, CIStatus, ClaudeSessionUuid, TeamName,
+    AgentName, AgentPermissions, BirthBranch, BranchName, CIStatus, ClaudeSessionUuid, RoutingInfo,
+    TeamName,
 };
 use crate::effects::{
     dispatch_agent_effect, AgentEffects, EffectError, EffectHandler, EffectResult, ResultExt,
@@ -16,7 +17,7 @@ use crate::services::agent_control::{
     SpawnGeminiTeammateOptions, SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions,
     SpawnWorkerOptions,
 };
-use crate::services::agent_resources::dispose_reviewers_for_pr;
+use crate::services::agent_resources::{dispose_agent_resources, dispose_reviewers_for_pr};
 use crate::services::file_pr_local::{
     read_pr_registry, LocalReviewState, PrEntry, PrRegistry, PrState,
 };
@@ -961,6 +962,56 @@ impl<
         }
     }
 
+    async fn dispose_orphan(
+        &self,
+        req: DisposeOrphanRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<DisposeOrphanResponse> {
+        let agent_slug = req.agent_slug.trim();
+        if agent_slug.is_empty() {
+            return Err(EffectError::invalid_input("agent_slug is required"));
+        }
+        match orphan_agent_window_alive(self.ctx.project_dir(), agent_slug).await {
+            Ok(true) => {
+                return Err(EffectError::invalid_input(format!(
+                    "Agent {agent_slug} window is still alive; refusing orphan cleanup"
+                )));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return Err(EffectError::invalid_input(format!(
+                    "Could not verify {agent_slug} is dead: {error}"
+                )));
+            }
+        }
+
+        let worktree_path = self
+            .ctx
+            .project_dir()
+            .join(".exo/worktrees")
+            .join(agent_slug);
+        let agent_dir = self.ctx.project_dir().join(".exo/agents").join(agent_slug);
+        let had_worktree = worktree_path.exists();
+        let had_agent_dir = agent_dir.exists();
+
+        dispose_agent_resources(
+            self.ctx.project_dir(),
+            self.ctx.git_worktree_service().clone(),
+            agent_slug,
+        )
+        .await;
+
+        let removed_worktree = had_worktree && !worktree_path.exists();
+        let removed_agent_dir = had_agent_dir && !agent_dir.exists();
+        Ok(DisposeOrphanResponse {
+            removed_worktree,
+            removed_agent_dir,
+            message: format!(
+                "Cleaned orphan {agent_slug}: worktree_removed={removed_worktree}, agent_dir_removed={removed_agent_dir}"
+            ),
+        })
+    }
+
     async fn cleanup_batch(
         &self,
         req: CleanupBatchRequest,
@@ -1344,6 +1395,35 @@ fn author_agent_from_branch(branch: &str) -> Option<String> {
         .rsplit_once('.')
         .map(|(_, slug)| slug.to_string())
         .filter(|slug| !slug.is_empty())
+}
+
+async fn orphan_agent_window_alive(project_dir: &Path, agent_slug: &str) -> Result<bool, String> {
+    let agent_dir = project_dir.join(".exo/agents").join(agent_slug);
+    let Ok(routing) = RoutingInfo::read_from_dir(&agent_dir).await else {
+        return Ok(false);
+    };
+    if routing.window_id.is_none() && routing.pane_id.is_none() {
+        return Ok(false);
+    }
+    let session = std::env::var("EXOMONAD_TMUX_SESSION")
+        .map_err(|_| "EXOMONAD_TMUX_SESSION is not set".to_string())?;
+    if session.trim().is_empty() {
+        return Err("EXOMONAD_TMUX_SESSION is empty".to_string());
+    }
+    let tmux = crate::services::tmux_ipc::TmuxIpc::new(&session);
+    if let Some(window_id) = &routing.window_id {
+        return tmux
+            .window_exists(window_id)
+            .await
+            .map_err(|error| error.to_string());
+    }
+    if let Some(pane_id) = &routing.pane_id {
+        return tmux
+            .pane_exists(pane_id)
+            .await
+            .map_err(|error| error.to_string());
+    }
+    Ok(false)
 }
 
 fn close_issue_cleanup_error(message: &str) -> CloseIssueAndCleanupResponse {

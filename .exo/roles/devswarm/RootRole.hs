@@ -35,6 +35,7 @@ import ExoMonad.Guest.Tools.Chainlink
     ChainlinkTimerStatus (..),
     ChainlinkTimerStop (..),
   )
+import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
@@ -201,6 +202,7 @@ data Tools mode = Tools
     chainlinkSessionEnd :: mode :- ChainlinkSessionEnd,
     chainlinkIssueClose :: mode :- ChainlinkIssueClose,
     closeIssueAndCleanup :: mode :- CloseIssueAndCleanup,
+    cleanupOrphan :: mode :- CleanupOrphan,
     chainlinkTimerStart :: mode :- ChainlinkTimerStart,
     chainlinkTimerStop :: mode :- ChainlinkTimerStop,
     chainlinkTimerStatus :: mode :- ChainlinkTimerStatus,
@@ -239,6 +241,7 @@ config =
             chainlinkSessionEnd = mkHandler @ChainlinkSessionEnd,
             chainlinkIssueClose = mkHandler @ChainlinkIssueClose,
             closeIssueAndCleanup = mkHandler @CloseIssueAndCleanup,
+            cleanupOrphan = mkHandler @CleanupOrphan,
             chainlinkTimerStart = mkHandler @ChainlinkTimerStart,
             chainlinkTimerStop = mkHandler @ChainlinkTimerStop,
             chainlinkTimerStatus = mkHandler @ChainlinkTimerStatus,
