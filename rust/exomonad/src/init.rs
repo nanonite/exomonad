@@ -110,6 +110,12 @@ fn forgejo_token_remote_url(
     forgejo_url: &str,
     forgejo_token: &str,
 ) -> Option<String> {
+    let forgejo_token = forgejo_token.trim();
+    if forgejo_token.is_empty() {
+        debug!("Skipping Forgejo remote token auth setup without a forgejo_token");
+        return None;
+    }
+
     let remote = parse_remote_repo_parts(remote_url)?;
     let forgejo_host_raw = forgejo_host_from_url(forgejo_url)?;
     let forgejo_host = host_without_port(&forgejo_host_raw);
@@ -2438,6 +2444,16 @@ mod tests {
             url,
             "http://forgejo_pat:token-123@localhost:3000/exomonad/nemotron-port.git"
         );
+    }
+
+    #[test]
+    fn forgejo_token_remote_url_ignores_empty_token() {
+        assert!(forgejo_token_remote_url(
+            "git@localhost:exomonad/nemotron-port.git",
+            "http://localhost:3000",
+            "  ",
+        )
+        .is_none());
     }
 
     #[test]
