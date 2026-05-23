@@ -289,6 +289,19 @@ message SpawnSubtreeResponse {
 }
 
 // ============================================================================
+// SpawnReviewer - Spawn only a reviewer for an existing PR
+// ============================================================================
+
+message SpawnReviewerRequest {
+  // Existing PR number to review.
+  uint64 pr_number = 1;
+}
+
+message SpawnReviewerResponse {
+  AgentInfo agent = 1;
+}
+
+// ============================================================================
 // SpawnLeafSubtree - Spawn a Gemini leaf agent in a new git worktree
 // ============================================================================
 
@@ -395,6 +408,7 @@ service AgentEffects {
   rpc SpawnGeminiTeammate(SpawnGeminiTeammateRequest) returns (SpawnGeminiTeammateResponse);
   rpc SpawnWorker(SpawnWorkerRequest) returns (SpawnWorkerResponse);
   rpc SpawnSubtree(SpawnSubtreeRequest) returns (SpawnSubtreeResponse);
+  rpc SpawnReviewer(SpawnReviewerRequest) returns (SpawnReviewerResponse);
   rpc SpawnLeafSubtree(SpawnLeafSubtreeRequest) returns (SpawnLeafSubtreeResponse);
   rpc SpawnAcp(SpawnAcpRequest) returns (SpawnAcpResponse);
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);

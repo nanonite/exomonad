@@ -54,6 +54,7 @@ import ExoMonad.Guest.Tools.Spawn
     SpawnAcpArgs,
     SpawnLeafArgs,
     SpawnLeafSubtreeArgs,
+    SpawnReviewerArgs,
     SpawnWorkerToolArgs,
     closeWorkerPaneCore,
     closeWorkerPaneDescription,
@@ -67,6 +68,9 @@ import ExoMonad.Guest.Tools.Spawn
     spawnLeafDescription,
     spawnLeafRender,
     spawnLeafSchema,
+    spawnReviewerDescription,
+    spawnReviewerSchema,
+    spawnReviewerToolCore,
     spawnWorkerToolCore,
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
@@ -178,6 +182,15 @@ instance MCPTool TLSpawnLeaf where
         void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
         pure $ spawnLeafRender (Right (slug, sr))
 
+data TLSpawnReviewer
+
+instance MCPTool TLSpawnReviewer where
+  type ToolArgs TLSpawnReviewer = SpawnReviewerArgs
+  toolName = "spawn_reviewer"
+  toolDescription = spawnReviewerDescription
+  toolSchema = spawnReviewerSchema
+  toolHandlerEff args = spawnReviewerToolCore args
+
 -- | TL-specific spawn_worker: ephemeral pane, no state transition.
 data TLSpawnWorker
 
@@ -237,6 +250,7 @@ data Tools mode = Tools
   { forkWave :: mode :- TLForkWave,
     spawnLeaf :: mode :- TLSpawnLeaf,
     spawnWorker :: mode :- TLSpawnWorker,
+    spawnReviewer :: mode :- TLSpawnReviewer,
     closeWorkerPane :: mode :- TLCloseWorkerPane,
     spawnCodex :: mode :- TLSpawnCodex,
     pr :: mode :- TLFilePR,
@@ -275,6 +289,7 @@ config =
           { forkWave = mkHandler @TLForkWave,
             spawnLeaf = mkHandler @TLSpawnLeaf,
             spawnWorker = mkHandler @TLSpawnWorker,
+            spawnReviewer = mkHandler @TLSpawnReviewer,
             closeWorkerPane = mkHandler @TLCloseWorkerPane,
             spawnCodex = mkHandler @TLSpawnCodex,
             pr = mkHandler @TLFilePR,

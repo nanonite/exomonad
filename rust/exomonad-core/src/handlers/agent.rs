@@ -17,10 +17,14 @@ use crate::services::agent_control::{
     SpawnWorkerOptions,
 };
 use crate::services::agent_resources::dispose_reviewers_for_pr;
-use crate::services::file_pr_local::{read_pr_registry, PrEntry, PrRegistry, PrState};
+use crate::services::file_pr_local::{
+    read_pr_registry, LocalReviewState, PrEntry, PrRegistry, PrState,
+};
+use crate::services::forgejo::ForgejoPullRequest;
 use crate::services::supervisor_registry::SupervisorInfo;
-use crate::{GithubOwner, GithubRepo, IssueNumber};
+use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use async_trait::async_trait;
+use chrono::Utc;
 use exomonad_proto::effects::agent::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -733,6 +737,42 @@ impl<
         })
     }
 
+    async fn spawn_reviewer(
+        &self,
+        req: SpawnReviewerRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SpawnReviewerResponse> {
+        if req.pr_number == 0 {
+            return Err(EffectError::invalid_input("pr_number is required"));
+        }
+
+        let pr = self.resolve_reviewer_pr_entry(req.pr_number).await?;
+        let reviewer_branch = format!("review-pr-{}", pr.number);
+        let result = self
+            .service
+            .spawn_reviewer_for_recovery(&pr, &ctx.birth_branch)
+            .await
+            .effect_err_preserve("agent")?;
+        let agent_info = subtree_result_to_proto(&reviewer_branch, &result);
+
+        if result.agent_type == ServiceAgentType::Claude {
+            self.register_claude_team_child(
+                &result.agent_name,
+                &format!("{}-reviewer", result.agent_type.suffix()),
+                &reviewer_branch,
+                ctx,
+            )
+            .await;
+        } else {
+            self.register_child_supervisor(agent_info.id.as_str(), ctx)
+                .await;
+        }
+
+        Ok(SpawnReviewerResponse {
+            agent: Some(agent_info),
+        })
+    }
+
     async fn spawn_leaf_subtree(
         &self,
         req: SpawnLeafSubtreeRequest,
@@ -1193,6 +1233,117 @@ impl<
             cleaned_pr_numbers,
         })
     }
+}
+
+#[derive(Debug, Default)]
+struct PrBodyMetadata {
+    author_agent: Option<String>,
+    author_role: Option<String>,
+    birth_branch: Option<String>,
+    reviewer_agent: Option<String>,
+    reviewer_birth_branch: Option<String>,
+    chainlink_issue_id: Option<u64>,
+}
+
+impl<
+        C: HasTeamRegistry
+            + HasAcpRegistry
+            + HasAgentResolver
+            + HasGitHubClient
+            + HasProjectDir
+            + HasGitWorktreeService
+            + HasSupervisorRegistry
+            + HasClaudeSessionRegistry
+            + HasEventLog
+            + HasForgejoClient
+            + 'static,
+    > AgentHandler<C>
+{
+    async fn resolve_reviewer_pr_entry(&self, pr_number: u64) -> EffectResult<PrEntry> {
+        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
+        if let Ok(registry) = read_pr_registry(&prs_path).await {
+            if let Some(entry) = registry.prs.get(&pr_number) {
+                return Ok(entry.clone());
+            }
+        }
+
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Err(EffectError::not_found(format!(
+                "PR #{pr_number} not found in .exo/prs.json and Forgejo is not configured"
+            )));
+        };
+        let repo_info = crate::services::repo::get_repo_info(self.ctx.project_dir())
+            .await
+            .effect_err("agent")?;
+        let pr = forgejo
+            .get_pull_request(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
+            .await
+            .effect_err("agent")?;
+        Ok(pr_entry_from_forgejo_pull_request(pr))
+    }
+}
+
+fn pr_entry_from_forgejo_pull_request(pr: ForgejoPullRequest) -> PrEntry {
+    let metadata = parse_pr_body_metadata(&pr.body);
+    let birth_branch = metadata
+        .birth_branch
+        .as_deref()
+        .unwrap_or(pr.head_ref.as_ref());
+    let author_agent = metadata
+        .author_agent
+        .or_else(|| author_agent_from_branch(birth_branch))
+        .unwrap_or_else(|| pr.head_ref.to_string());
+    let author_role = metadata.author_role.unwrap_or_else(|| "dev".to_string());
+
+    PrEntry {
+        number: pr.number.as_u64(),
+        head_branch: pr.head_ref.to_string(),
+        base_branch: pr.base_ref.to_string(),
+        title: pr.title,
+        body: pr.body,
+        author_agent,
+        author_role,
+        created_at: Utc::now(),
+        state: PrState::Open,
+        review_state: LocalReviewState::PendingReview,
+        last_review_at: None,
+        last_head_sha: pr.head_sha,
+        approved_at_sha: None,
+        reviewer_agent: metadata.reviewer_agent,
+        reviewer_birth_branch: metadata.reviewer_birth_branch,
+        rounds: 0,
+        stuck: false,
+        needs_human_review: false,
+        merge_blocked_on_ci: false,
+        chainlink_issue_id: metadata.chainlink_issue_id,
+    }
+}
+
+fn parse_pr_body_metadata(body: &str) -> PrBodyMetadata {
+    PrBodyMetadata {
+        author_agent: pr_body_metadata_value(body, "Authoring-Agent"),
+        author_role: pr_body_metadata_value(body, "Authoring-Role"),
+        birth_branch: pr_body_metadata_value(body, "Birth-Branch"),
+        reviewer_agent: pr_body_metadata_value(body, "Reviewer-Agent"),
+        reviewer_birth_branch: pr_body_metadata_value(body, "Reviewer-Birth-Branch"),
+        chainlink_issue_id: pr_body_metadata_value(body, "Chainlink-Issue")
+            .and_then(|value| value.trim_start_matches('#').parse().ok()),
+    }
+}
+
+fn pr_body_metadata_value(body: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn author_agent_from_branch(branch: &str) -> Option<String> {
+    branch
+        .rsplit_once('.')
+        .map(|(_, slug)| slug.to_string())
+        .filter(|slug| !slug.is_empty())
 }
 
 fn close_issue_cleanup_error(message: &str) -> CloseIssueAndCleanupResponse {

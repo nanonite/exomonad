@@ -325,6 +325,7 @@ pub(crate) fn render_reviewer_context_section(
 
 impl<
         C: super::super::HasGitHubClient
+            + super::super::HasForgejoClient
             + super::super::HasAcpRegistry
             + super::super::HasTeamRegistry
             + super::super::HasAgentResolver
@@ -1627,6 +1628,74 @@ impl<
 
         Ok(result)
     }
+
+    pub async fn spawn_reviewer_for_recovery(
+        &self,
+        pr: &crate::services::file_pr_local::PrEntry,
+        caller_bb: &BirthBranch,
+    ) -> Result<SpawnResult> {
+        self.spawn_reviewer_with_metadata(pr, caller_bb).await
+    }
+
+    async fn spawn_reviewer_with_metadata(
+        &self,
+        pr: &crate::services::file_pr_local::PrEntry,
+        caller_bb: &BirthBranch,
+    ) -> Result<SpawnResult> {
+        let reviewer_branch_name = format!("review-pr-{}", pr.number);
+        let reviewer_identity =
+            AgentIdentity::new(slugify(&reviewer_branch_name), self.reviewer_agent_type);
+        let reviewer_internal_name = reviewer_identity.internal_name().to_string();
+        let reviewer_birth_branch = caller_bb.child(&reviewer_internal_name).to_string();
+        let result = self.spawn_reviewer_subtree(pr, caller_bb).await?;
+        self.persist_reviewer_assignment(pr, &reviewer_internal_name, &reviewer_birth_branch)
+            .await;
+        Ok(result)
+    }
+
+    async fn persist_reviewer_assignment(
+        &self,
+        pr: &crate::services::file_pr_local::PrEntry,
+        reviewer_internal_name: &str,
+        reviewer_birth_branch: &str,
+    ) {
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return;
+        };
+        match crate::services::repo::get_repo_info(self.project_dir()).await {
+            Ok(repo_info) => {
+                let base_branch = BranchName::try_from_str(pr.base_branch.as_str())
+                    .expect("validated string input is non-empty");
+                let body = append_reviewer_metadata(
+                    &pr.body,
+                    reviewer_internal_name,
+                    reviewer_birth_branch,
+                );
+                if let Err(err) = forgejo
+                    .update_pull_request(
+                        &repo_info.owner,
+                        &repo_info.repo,
+                        crate::domain::PRNumber::new(pr.number),
+                        &pr.title,
+                        &body,
+                        &base_branch,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        pr_number = pr.number,
+                        error = %err,
+                        "Failed to persist reviewer assignment to Forgejo PR body"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                pr_number = pr.number,
+                error = %err,
+                "Failed to resolve repository while persisting reviewer assignment"
+            ),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1659,48 +1728,7 @@ impl<
         }
         let caller_bb = BirthBranch::try_from_str(pr.base_branch.as_str())
             .expect("validated string input is non-empty");
-        let reviewer_branch_name = format!("review-pr-{}", pr.number);
-        let reviewer_identity =
-            AgentIdentity::new(slugify(&reviewer_branch_name), self.reviewer_agent_type);
-        let reviewer_internal_name = reviewer_identity.internal_name().to_string();
-        let reviewer_birth_branch = caller_bb.child(&reviewer_internal_name).to_string();
-        self.spawn_reviewer_subtree(pr, &caller_bb).await?;
-
-        if let Some(forgejo) = self.ctx.forgejo_client() {
-            match crate::services::repo::get_repo_info(self.project_dir()).await {
-                Ok(repo_info) => {
-                    let base_branch = BranchName::try_from_str(pr.base_branch.as_str())
-                        .expect("validated string input is non-empty");
-                    let body = append_reviewer_metadata(
-                        &pr.body,
-                        &reviewer_internal_name,
-                        &reviewer_birth_branch,
-                    );
-                    if let Err(err) = forgejo
-                        .update_pull_request(
-                            &repo_info.owner,
-                            &repo_info.repo,
-                            crate::domain::PRNumber::new(pr.number),
-                            &pr.title,
-                            &body,
-                            &base_branch,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            pr_number = pr.number,
-                            error = %err,
-                            "Failed to persist reviewer assignment to Forgejo PR body"
-                        );
-                    }
-                }
-                Err(err) => tracing::warn!(
-                    pr_number = pr.number,
-                    error = %err,
-                    "Failed to resolve repository while persisting reviewer assignment"
-                ),
-            }
-        }
+        self.spawn_reviewer_with_metadata(pr, &caller_bb).await?;
 
         Ok(())
     }

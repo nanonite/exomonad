@@ -12,6 +12,7 @@ module ExoMonad.Effects.Agent
     AgentSpawnGeminiTeammate,
     AgentSpawnWorker,
     AgentSpawnSubtree,
+    AgentSpawnReviewer,
     AgentSpawnLeafSubtree,
     AgentSpawnAcp,
     AgentCleanup,
@@ -69,6 +70,13 @@ instance Effect AgentSpawnSubtree where
   type Input AgentSpawnSubtree = SpawnSubtreeRequest
   type Output AgentSpawnSubtree = SpawnSubtreeResponse
   effectId = "agent.spawn_subtree"
+
+data AgentSpawnReviewer
+
+instance Effect AgentSpawnReviewer where
+  type Input AgentSpawnReviewer = SpawnReviewerRequest
+  type Output AgentSpawnReviewer = SpawnReviewerResponse
+  effectId = "agent.spawn_reviewer"
 
 data AgentSpawnLeafSubtree
 

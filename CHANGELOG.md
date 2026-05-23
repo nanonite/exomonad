@@ -44,6 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Allow TLs to request reviewer-only PR recovery reviews (#378)
 - feat: replace Tangled/Spindle CI with Forgejo + Forgejo Actions (#343)
 - exomonad init: surface orphaned agent windows for TL review rather than auto-killing (#342)
 - orphan reconciler: enforce max session age to stop long-running leaves and reviewers (#340)

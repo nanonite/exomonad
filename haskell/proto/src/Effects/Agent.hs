@@ -3704,6 +3704,143 @@ instance (HsJSONPB.ToJSON SpawnSubtreeResponse) where
 instance (HsJSONPB.FromJSON SpawnSubtreeResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
+newtype SpawnReviewerRequest
+  = SpawnReviewerRequest {spawnReviewerRequestPrNumber :: Hs.Word64}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData SpawnReviewerRequest)
+
+instance (HsProtobuf.Named SpawnReviewerRequest) where
+  nameOf _ = Hs.fromString "SpawnReviewerRequest"
+
+instance (HsProtobuf.HasDefault SpawnReviewerRequest)
+
+instance (HsProtobuf.Message SpawnReviewerRequest) where
+  encodeMessage _ SpawnReviewerRequest {spawnReviewerRequestPrNumber} =
+    ( HsProtobuf.encodeMessageField
+        (HsProtobuf.FieldNumber 1)
+        spawnReviewerRequestPrNumber
+    )
+  decodeMessage _ =
+    Hs.pure SpawnReviewerRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB SpawnReviewerRequest) where
+  toJSONPB (SpawnReviewerRequest f1) =
+    HsJSONPB.object ["pr_number" .= f1]
+  toEncodingPB (SpawnReviewerRequest f1) =
+    HsJSONPB.pairs ["pr_number" .= f1]
+
+instance (HsJSONPB.FromJSONPB SpawnReviewerRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "SpawnReviewerRequest"
+      (\obj -> Hs.pure SpawnReviewerRequest <*> obj .: "pr_number")
+
+instance (HsJSONPB.ToJSON SpawnReviewerRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON SpawnReviewerRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+newtype SpawnReviewerResponse
+  = SpawnReviewerResponse {spawnReviewerResponseAgent :: (Hs.Maybe Effects.Agent.AgentInfo)}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData SpawnReviewerResponse)
+
+instance (HsProtobuf.Named SpawnReviewerResponse) where
+  nameOf _ = Hs.fromString "SpawnReviewerResponse"
+
+instance (HsProtobuf.HasDefault SpawnReviewerResponse)
+
+instance (HsProtobuf.Message SpawnReviewerResponse) where
+  encodeMessage _ SpawnReviewerResponse {spawnReviewerResponseAgent} =
+    ( HsProtobuf.encodeMessageField
+        (HsProtobuf.FieldNumber 1)
+        ( ( Hs.coerce
+              @(Hs.Maybe Effects.Agent.AgentInfo)
+              @(HsProtobuf.Nested Effects.Agent.AgentInfo)
+          )
+            spawnReviewerResponseAgent
+        )
+    )
+  decodeMessage _ =
+    Hs.pure SpawnReviewerResponse
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Agent.AgentInfo)
+                @(Hs.Maybe Effects.Agent.AgentInfo)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "AgentInfo"))
+        )
+        (HsProtobufAST.Single "agent")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB SpawnReviewerResponse) where
+  toJSONPB (SpawnReviewerResponse f1) =
+    HsJSONPB.object
+      [ "agent"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.AgentInfo)
+                   @(HsProtobuf.Nested Effects.Agent.AgentInfo)
+               )
+                 f1
+             )
+      ]
+  toEncodingPB (SpawnReviewerResponse f1) =
+    HsJSONPB.pairs
+      [ "agent"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.AgentInfo)
+                   @(HsProtobuf.Nested Effects.Agent.AgentInfo)
+               )
+                 f1
+             )
+      ]
+
+instance (HsJSONPB.FromJSONPB SpawnReviewerResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "SpawnReviewerResponse"
+      ( \obj ->
+          Hs.pure SpawnReviewerResponse
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Agent.AgentInfo)
+                      @(Hs.Maybe Effects.Agent.AgentInfo)
+                  )
+                    (obj .: "agent")
+                )
+      )
+
+instance (HsJSONPB.ToJSON SpawnReviewerResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON SpawnReviewerResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
 data SpawnLeafSubtreeRequest
   = SpawnLeafSubtreeRequest
   { spawnLeafSubtreeRequestTask :: Hs.Text,

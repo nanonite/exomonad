@@ -44,6 +44,7 @@ import ExoMonad.Guest.Tools.Spawn
     ForkWaveResult (..),
     SpawnLeafArgs (..),
     SpawnLeafSubtreeArgs,
+    SpawnReviewerArgs,
     SpawnWorkerToolArgs,
     closeWorkerPaneCore,
     closeWorkerPaneDescription,
@@ -56,6 +57,9 @@ import ExoMonad.Guest.Tools.Spawn
     spawnLeafDescription,
     spawnLeafRender,
     spawnLeafSchema,
+    spawnReviewerDescription,
+    spawnReviewerSchema,
+    spawnReviewerToolCore,
     spawnWorkerToolCore,
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
@@ -111,6 +115,15 @@ instance MCPTool RootSpawnLeaf where
         branch <- getCurrentBranch
         void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
         pure $ spawnLeafRender (Right (slug, sr))
+
+data RootSpawnReviewer
+
+instance MCPTool RootSpawnReviewer where
+  type ToolArgs RootSpawnReviewer = SpawnReviewerArgs
+  toolName = "spawn_reviewer"
+  toolDescription = spawnReviewerDescription
+  toolSchema = spawnReviewerSchema
+  toolHandlerEff args = spawnReviewerToolCore args
 
 data RootSpawnWorker
 
@@ -171,6 +184,7 @@ data Tools mode = Tools
   { forkWave :: mode :- RootForkWave,
     spawnLeaf :: mode :- RootSpawnLeaf,
     spawnWorker :: mode :- RootSpawnWorker,
+    spawnReviewer :: mode :- RootSpawnReviewer,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
     mergePr :: mode :- RootMergePR,
@@ -207,6 +221,7 @@ config =
           { forkWave = mkHandler @RootForkWave,
             spawnLeaf = mkHandler @RootSpawnLeaf,
             spawnWorker = mkHandler @RootSpawnWorker,
+            spawnReviewer = mkHandler @RootSpawnReviewer,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,
             mergePr = mkHandler @RootMergePR,
