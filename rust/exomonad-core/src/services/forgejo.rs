@@ -95,9 +95,9 @@ struct WorkflowRunsResponse {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowRunResponse {
-    #[serde(default)]
-    head_branch: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "prettyref", alias = "head_branch")]
+    head_branch_ref: Option<String>,
+    #[serde(default, alias = "commit_sha")]
     head_sha: Option<String>,
     #[serde(default)]
     status: Option<String>,
@@ -238,10 +238,22 @@ impl ForgejoClient {
         let runs: WorkflowRunsResponse = self
             .decode_response(response, "list Forgejo Actions runs")
             .await?;
+        let total_runs = runs.workflow_runs.len();
         let Some(run) = runs.workflow_runs.into_iter().find(|run| {
-            run.head_sha.as_deref() == Some(head_sha)
-                && run.head_branch.as_deref() == Some(branch.as_str())
+            let sha_matches = run.head_sha.as_deref() == Some(head_sha);
+            let branch_matches = run
+                .head_branch_ref
+                .as_deref()
+                .map(|ref_name| ref_name.trim_start_matches("refs/heads/"))
+                == Some(branch.as_str());
+            sha_matches && branch_matches
         }) else {
+            tracing::debug!(
+                head_sha,
+                branch = %branch,
+                total_runs,
+                "[Forgejo] No Actions run matched branch+SHA; CI status unknown"
+            );
             return Ok(CIStatus::Unknown);
         };
         Ok(workflow_status(run))
@@ -570,6 +582,41 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actions_status_for_head_matches_forgejo_actions_fields() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/actions/runs"))
+            .and(query_param("branch", "main.feature"))
+            .and(query_param("limit", "20"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workflow_runs": [
+                    {
+                        "prettyref": "refs/heads/other",
+                        "commit_sha": "abc123",
+                        "status": "completed",
+                        "conclusion": "success"
+                    },
+                    {
+                        "prettyref": "refs/heads/main.feature",
+                        "commit_sha": "abc123",
+                        "status": "completed",
+                        "conclusion": "success"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let status = client
+            .actions_status_for_head(&owner(), &repo(), &branch("main.feature"), "abc123")
+            .await
+            .unwrap();
+
+        assert_eq!(status, CIStatus::Success);
     }
 
     #[tokio::test]
