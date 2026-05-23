@@ -309,10 +309,14 @@ message SpawnSubtreeResponse {
 message SpawnReviewerRequest {
   // Existing PR number to review.
   uint64 pr_number = 1;
+  // Spawn even if a reviewer for this PR is already active.
+  bool force = 2;
 }
 
 message SpawnReviewerResponse {
   AgentInfo agent = 1;
+  string reviewer_name = 2;
+  bool already_active = 3;
 }
 
 // ============================================================================

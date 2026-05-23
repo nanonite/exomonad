@@ -56,7 +56,6 @@ import ExoMonad.Guest.Tools.Spawn
     SpawnAcpArgs,
     SpawnLeafArgs,
     SpawnLeafSubtreeArgs,
-    SpawnReviewerArgs,
     SpawnWorkerToolArgs,
     closeWorkerPaneCore,
     closeWorkerPaneDescription,
@@ -70,13 +69,11 @@ import ExoMonad.Guest.Tools.Spawn
     spawnLeafDescription,
     spawnLeafRender,
     spawnLeafSchema,
-    spawnReviewerDescription,
-    spawnReviewerSchema,
-    spawnReviewerToolCore,
     spawnWorkerToolCore,
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
   )
+import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
 import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse)
 import ExoMonad.Types (Effects, HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
@@ -184,15 +181,6 @@ instance MCPTool TLSpawnLeaf where
         void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
         pure $ spawnLeafRender (Right (slug, sr))
 
-data TLSpawnReviewer
-
-instance MCPTool TLSpawnReviewer where
-  type ToolArgs TLSpawnReviewer = SpawnReviewerArgs
-  toolName = "spawn_reviewer"
-  toolDescription = spawnReviewerDescription
-  toolSchema = spawnReviewerSchema
-  toolHandlerEff args = spawnReviewerToolCore args
-
 -- | TL-specific spawn_worker: ephemeral pane, no state transition.
 data TLSpawnWorker
 
@@ -252,7 +240,7 @@ data Tools mode = Tools
   { forkWave :: mode :- TLForkWave,
     spawnLeaf :: mode :- TLSpawnLeaf,
     spawnWorker :: mode :- TLSpawnWorker,
-    spawnReviewer :: mode :- TLSpawnReviewer,
+    spawnReviewer :: mode :- SpawnReviewer,
     closeWorkerPane :: mode :- TLCloseWorkerPane,
     spawnCodex :: mode :- TLSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
@@ -293,7 +281,7 @@ config =
           { forkWave = mkHandler @TLForkWave,
             spawnLeaf = mkHandler @TLSpawnLeaf,
             spawnWorker = mkHandler @TLSpawnWorker,
-            spawnReviewer = mkHandler @TLSpawnReviewer,
+            spawnReviewer = mkHandler @SpawnReviewer,
             closeWorkerPane = mkHandler @TLCloseWorkerPane,
             spawnCodex = mkHandler @TLSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,

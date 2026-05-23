@@ -9,7 +9,6 @@ module ExoMonad.Guest.Tools.Spawn
     SpawnWorkers,
     SpawnLeaf,
     SpawnWorkerTool,
-    SpawnReviewerTool,
     CloseWorkerPaneTool,
     SpawnAcp,
 
@@ -20,7 +19,6 @@ module ExoMonad.Guest.Tools.Spawn
     SpawnWorkersArgs (..),
     SpawnLeafArgs (..),
     SpawnWorkerToolArgs (..),
-    SpawnReviewerArgs (..),
     CloseWorkerPaneArgs (..),
     WorkerSpec (..),
     WorkerType (..),
@@ -32,7 +30,6 @@ module ExoMonad.Guest.Tools.Spawn
     spawnWorkersCore,
     spawnLeafCore,
     spawnWorkerToolCore,
-    spawnReviewerToolCore,
     closeWorkerPaneCore,
     spawnAcpCore,
 
@@ -54,8 +51,6 @@ module ExoMonad.Guest.Tools.Spawn
     spawnLeafSchema,
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
-    spawnReviewerDescription,
-    spawnReviewerSchema,
     closeWorkerPaneDescription,
     closeWorkerPaneSchema,
 
@@ -612,42 +607,6 @@ spawnWorkerToolCore args = do
             wsDisallowedTools = Nothing
           }
   spawnWorkersCore (SpawnWorkersArgs [spec])
-
--- ============================================================================
--- SpawnReviewerTool (review-only recovery)
--- ============================================================================
-
-data SpawnReviewerTool
-
-data SpawnReviewerArgs = SpawnReviewerArgs
-  { srPrNumber :: Int
-  }
-  deriving (Show, Eq, Generic)
-
-instance FromJSON SpawnReviewerArgs where
-  parseJSON = withObject "SpawnReviewerArgs" $ \v ->
-    SpawnReviewerArgs <$> v .: "pr_number"
-
-spawnReviewerDescription :: Text
-spawnReviewerDescription = "Spawn only a reviewer for an existing PR. Use this for recovery when the original dev leaf is gone but the TL needs fresh review findings for the Forgejo PR. This does not spawn an implementation branch."
-
-spawnReviewerSchema :: Aeson.Object
-spawnReviewerSchema =
-  genericToolSchemaWith @SpawnReviewerArgs
-    [("pr_number", "Existing PR number to review")]
-
-spawnReviewerToolCore :: SpawnReviewerArgs -> Eff Effects MCPCallOutput
-spawnReviewerToolCore args
-  | srPrNumber args <= 0 = pure $ errorResult "pr_number must be positive"
-  | otherwise = do
-      let cfg =
-            AC.SpawnReviewerConfig
-              { AC.srcPrNumber = fromIntegral (srPrNumber args)
-              }
-      result <- AC.spawnReviewer cfg
-      pure $ case result of
-        Left err -> errorResult (spawnErrorMessage err)
-        Right spawnResult -> successResult (Aeson.toJSON spawnResult)
 
 data CloseWorkerPaneTool
 

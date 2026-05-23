@@ -1565,6 +1565,17 @@ impl<
         pr_entry: &crate::services::file_pr_local::PrEntry,
         caller_bb: &BirthBranch,
     ) -> Result<SpawnResult> {
+        let branch_name = format!("review-pr-{}", pr_entry.number);
+        self.spawn_reviewer_subtree_named(pr_entry, caller_bb, &branch_name)
+            .await
+    }
+
+    pub async fn spawn_reviewer_subtree_named(
+        &self,
+        pr_entry: &crate::services::file_pr_local::PrEntry,
+        caller_bb: &BirthBranch,
+        branch_name: &str,
+    ) -> Result<SpawnResult> {
         let context_section =
             render_reviewer_context_section(&self.reviewer_context, self.project_dir());
         let task = format!(
@@ -1576,12 +1587,11 @@ impl<
             pr_entry.author_agent,
             context_section,
         );
-        let branch_name = format!("review-pr-{}", pr_entry.number);
 
         // Compute the reviewer's own identity and path — same derivation spawn_subtree uses
         // internally so the MCP config agent_name matches the directory name.
         let agent_type = self.reviewer_agent_type;
-        let identity = AgentIdentity::new(slugify(&branch_name), agent_type);
+        let identity = AgentIdentity::new(slugify(branch_name), agent_type);
         let reviewer_path = self.worktree_base.join(identity.internal_name().as_str());
 
         // Create a detached-HEAD worktree at the PR branch tip unless it already exists.
@@ -1602,7 +1612,7 @@ impl<
 
         let options = SpawnSubtreeOptions {
             task,
-            branch_name,
+            branch_name: branch_name.to_string(),
             parent_session_id: None,
             role: Some(crate::domain::Role::reviewer()),
             agent_type,
@@ -1634,20 +1644,34 @@ impl<
         pr: &crate::services::file_pr_local::PrEntry,
         caller_bb: &BirthBranch,
     ) -> Result<SpawnResult> {
-        self.spawn_reviewer_with_metadata(pr, caller_bb).await
+        let reviewer_branch_name = format!("review-pr-{}", pr.number);
+        self.spawn_reviewer_with_metadata_named(pr, caller_bb, &reviewer_branch_name)
+            .await
     }
 
-    async fn spawn_reviewer_with_metadata(
+    pub async fn spawn_reviewer_for_recovery_named(
         &self,
         pr: &crate::services::file_pr_local::PrEntry,
         caller_bb: &BirthBranch,
+        reviewer_branch_name: &str,
     ) -> Result<SpawnResult> {
-        let reviewer_branch_name = format!("review-pr-{}", pr.number);
+        self.spawn_reviewer_with_metadata_named(pr, caller_bb, reviewer_branch_name)
+            .await
+    }
+
+    async fn spawn_reviewer_with_metadata_named(
+        &self,
+        pr: &crate::services::file_pr_local::PrEntry,
+        caller_bb: &BirthBranch,
+        reviewer_branch_name: &str,
+    ) -> Result<SpawnResult> {
         let reviewer_identity =
-            AgentIdentity::new(slugify(&reviewer_branch_name), self.reviewer_agent_type);
+            AgentIdentity::new(slugify(reviewer_branch_name), self.reviewer_agent_type);
         let reviewer_internal_name = reviewer_identity.internal_name().to_string();
         let reviewer_birth_branch = caller_bb.child(&reviewer_internal_name).to_string();
-        let result = self.spawn_reviewer_subtree(pr, caller_bb).await?;
+        let result = self
+            .spawn_reviewer_subtree_named(pr, caller_bb, reviewer_branch_name)
+            .await?;
         self.persist_reviewer_assignment(pr, &reviewer_internal_name, &reviewer_birth_branch)
             .await;
         Ok(result)
@@ -1728,7 +1752,7 @@ impl<
         }
         let caller_bb = BirthBranch::try_from_str(pr.base_branch.as_str())
             .expect("validated string input is non-empty");
-        self.spawn_reviewer_with_metadata(pr, &caller_bb).await?;
+        self.spawn_reviewer_for_recovery(pr, &caller_bb).await?;
 
         Ok(())
     }

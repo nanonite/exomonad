@@ -17,7 +17,6 @@ module ExoMonad.Guest.Effects.AgentControl
 
     -- * Smart constructors
     spawnSubtree,
-    spawnReviewer,
     spawnLeafSubtree,
     spawnWorker,
     spawnAcp,
@@ -32,7 +31,6 @@ module ExoMonad.Guest.Effects.AgentControl
     PermissionFlags (..),
     defaultPermFlags,
     SpawnSubtreeConfig (..),
-    SpawnReviewerConfig (..),
     SpawnLeafSubtreeConfig (..),
     SpawnWorkerConfig (..),
     SpawnAcpConfig (..),
@@ -155,12 +153,6 @@ data SpawnSubtreeConfig = SpawnSubtreeConfig
   }
   deriving (Show, Eq, Generic)
 
--- | Configuration for spawning a Gemini leaf subtree agent.
-data SpawnReviewerConfig = SpawnReviewerConfig
-  { srcPrNumber :: Word64
-  }
-  deriving (Show, Eq, Generic)
-
 data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
   { slcTask :: Text,
     slcBranchName :: Text,
@@ -192,7 +184,6 @@ data SpawnAcpConfig = SpawnAcpConfig
 -- | Agent control effect for spawning agents.
 data AgentControl a where
   SpawnSubtreeC :: SpawnSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
-  SpawnReviewerC :: SpawnReviewerConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnLeafSubtreeC :: SpawnLeafSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnWorkerC :: SpawnWorkerConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnAcpC :: SpawnAcpConfig -> AgentControl (Either EffectError SpawnResult)
@@ -201,9 +192,6 @@ data AgentControl a where
 -- Smart constructors (manually written - makeSem doesn't work with WASM cross-compilation)
 spawnSubtree :: (Member AgentControl r) => SpawnSubtreeConfig -> Eff r (Either EffectError SpawnResult)
 spawnSubtree cfg = send (SpawnSubtreeC cfg)
-
-spawnReviewer :: (Member AgentControl r) => SpawnReviewerConfig -> Eff r (Either EffectError SpawnResult)
-spawnReviewer cfg = send (SpawnReviewerC cfg)
 
 spawnLeafSubtree :: (Member AgentControl r) => SpawnLeafSubtreeConfig -> Eff r (Either EffectError SpawnResult)
 spawnLeafSubtree cfg = send (SpawnLeafSubtreeC cfg)
@@ -247,17 +235,6 @@ runAgentControlSuspend = interpret $ \case
       Left err -> Left err
       Right resp -> case PA.spawnSubtreeResponseAgent resp of
         Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnSubtree succeeded but no agent info returned"))))
-        Just info -> Right (protoAgentInfoToSpawnResult info)
-  SpawnReviewerC cfg -> do
-    let req =
-          PA.SpawnReviewerRequest
-            { PA.spawnReviewerRequestPrNumber = srcPrNumber cfg
-            }
-    result <- suspendEffect @Agent.AgentSpawnReviewer req
-    pure $ case result of
-      Left err -> Left err
-      Right resp -> case PA.spawnReviewerResponseAgent resp of
-        Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnReviewer succeeded but no agent info returned"))))
         Just info -> Right (protoAgentInfoToSpawnResult info)
   SpawnLeafSubtreeC cfg -> do
     let req =

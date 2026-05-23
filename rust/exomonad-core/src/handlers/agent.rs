@@ -27,6 +27,7 @@ use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use async_trait::async_trait;
 use chrono::Utc;
 use exomonad_proto::effects::agent::*;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
@@ -747,14 +748,34 @@ impl<
             return Err(EffectError::invalid_input("pr_number is required"));
         }
 
-        let pr = self.resolve_reviewer_pr_entry(req.pr_number).await?;
-        let reviewer_branch = format!("review-pr-{}", pr.number);
+        let pr = self.resolve_open_forgejo_pr_entry(req.pr_number).await?;
+        let active_reviewer = live_reviewer_for_pr(self.ctx.project_dir(), req.pr_number).await;
+        if !req.force {
+            if let Some(reviewer_name) = active_reviewer.as_ref() {
+                return Ok(SpawnReviewerResponse {
+                    agent: None,
+                    reviewer_name: reviewer_name.clone(),
+                    already_active: true,
+                });
+            }
+        }
+
+        clear_reviewer_review_artifacts(self.ctx.project_dir(), req.pr_number)
+            .await
+            .effect_err("agent")?;
+
+        let reviewer_branch = if req.force && active_reviewer.is_some() {
+            format!("review-pr-{}-{}", pr.number, Utc::now().timestamp_millis())
+        } else {
+            format!("review-pr-{}", pr.number)
+        };
         let result = self
             .service
-            .spawn_reviewer_for_recovery(&pr, &ctx.birth_branch)
+            .spawn_reviewer_for_recovery_named(&pr, &ctx.birth_branch, &reviewer_branch)
             .await
             .effect_err_preserve("agent")?;
         let agent_info = subtree_result_to_proto(&reviewer_branch, &result);
+        let reviewer_name = result.agent_name.to_string();
 
         if result.agent_type == ServiceAgentType::Claude {
             self.register_claude_team_child(
@@ -771,6 +792,8 @@ impl<
 
         Ok(SpawnReviewerResponse {
             agent: Some(agent_info),
+            reviewer_name,
+            already_active: false,
         })
     }
 
@@ -1310,18 +1333,11 @@ impl<
             + 'static,
     > AgentHandler<C>
 {
-    async fn resolve_reviewer_pr_entry(&self, pr_number: u64) -> EffectResult<PrEntry> {
-        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
-        if let Ok(registry) = read_pr_registry(&prs_path).await {
-            if let Some(entry) = registry.prs.get(&pr_number) {
-                return Ok(entry.clone());
-            }
-        }
-
+    async fn resolve_open_forgejo_pr_entry(&self, pr_number: u64) -> EffectResult<PrEntry> {
         let Some(forgejo) = self.ctx.forgejo_client() else {
-            return Err(EffectError::not_found(format!(
-                "PR #{pr_number} not found in .exo/prs.json and Forgejo is not configured"
-            )));
+            return Err(EffectError::not_found(
+                "Forgejo is not configured; cannot spawn a reviewer for a PR",
+            ));
         };
         let repo_info = crate::services::repo::get_repo_info(self.ctx.project_dir())
             .await
@@ -1330,6 +1346,11 @@ impl<
             .get_pull_request(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
             .await
             .effect_err("agent")?;
+        if pr.merged || !pr.state.eq_ignore_ascii_case("open") {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{pr_number} is not open and cannot be reviewed"
+            )));
+        }
         Ok(pr_entry_from_forgejo_pull_request(pr))
     }
 }
@@ -1395,6 +1416,62 @@ fn author_agent_from_branch(branch: &str) -> Option<String> {
         .rsplit_once('.')
         .map(|(_, slug)| slug.to_string())
         .filter(|slug| !slug.is_empty())
+}
+
+async fn live_reviewer_for_pr(project_dir: &Path, pr_number: u64) -> Option<String> {
+    let agents_dir = project_dir.join(".exo/agents");
+    let reviewer_prefix = format!("review-pr-{pr_number}-");
+    let mut entries = match tokio::fs::read_dir(&agents_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return None,
+        Err(error) => {
+            warn!(path = %agents_dir.display(), %error, "failed to scan reviewer agents");
+            return None;
+        }
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(agent_slug) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if !agent_slug.starts_with(&reviewer_prefix) {
+            continue;
+        }
+        match orphan_agent_window_alive(project_dir, &agent_slug).await {
+            Ok(true) => return Some(agent_slug),
+            Ok(false) => {}
+            Err(error) => warn!(agent = %agent_slug, %error, "failed to check reviewer liveness"),
+        }
+    }
+
+    None
+}
+
+async fn clear_reviewer_review_artifacts(project_dir: &Path, pr_number: u64) -> anyhow::Result<()> {
+    let review_path = project_dir
+        .join(".exo/reviews")
+        .join(format!("pr_{pr_number}.json"));
+    match tokio::fs::remove_file(&review_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let state_path = project_dir.join(".exo/watcher-state.json");
+    let state = match tokio::fs::read_to_string(&state_path).await {
+        Ok(state) => state,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&state)?;
+    if let Some(prs) = value
+        .get_mut("prs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        prs.remove(&pr_number.to_string());
+    }
+    tokio::fs::write(&state_path, serde_json::to_vec_pretty(&value)?).await?;
+    Ok(())
 }
 
 async fn orphan_agent_window_alive(project_dir: &Path, agent_slug: &str) -> Result<bool, String> {

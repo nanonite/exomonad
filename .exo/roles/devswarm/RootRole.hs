@@ -46,7 +46,6 @@ import ExoMonad.Guest.Tools.Spawn
     ForkWaveResult (..),
     SpawnLeafArgs (..),
     SpawnLeafSubtreeArgs,
-    SpawnReviewerArgs,
     SpawnWorkerToolArgs,
     closeWorkerPaneCore,
     closeWorkerPaneDescription,
@@ -59,13 +58,11 @@ import ExoMonad.Guest.Tools.Spawn
     spawnLeafDescription,
     spawnLeafRender,
     spawnLeafSchema,
-    spawnReviewerDescription,
-    spawnReviewerSchema,
-    spawnReviewerToolCore,
     spawnWorkerToolCore,
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
   )
+import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
 import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
 import ExoMonad.Types (Effects, HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
@@ -117,15 +114,6 @@ instance MCPTool RootSpawnLeaf where
         branch <- getCurrentBranch
         void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
         pure $ spawnLeafRender (Right (slug, sr))
-
-data RootSpawnReviewer
-
-instance MCPTool RootSpawnReviewer where
-  type ToolArgs RootSpawnReviewer = SpawnReviewerArgs
-  toolName = "spawn_reviewer"
-  toolDescription = spawnReviewerDescription
-  toolSchema = spawnReviewerSchema
-  toolHandlerEff args = spawnReviewerToolCore args
 
 data RootSpawnWorker
 
@@ -186,7 +174,7 @@ data Tools mode = Tools
   { forkWave :: mode :- RootForkWave,
     spawnLeaf :: mode :- RootSpawnLeaf,
     spawnWorker :: mode :- RootSpawnWorker,
-    spawnReviewer :: mode :- RootSpawnReviewer,
+    spawnReviewer :: mode :- SpawnReviewer,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
@@ -225,7 +213,7 @@ config =
           { forkWave = mkHandler @RootForkWave,
             spawnLeaf = mkHandler @RootSpawnLeaf,
             spawnWorker = mkHandler @RootSpawnWorker,
-            spawnReviewer = mkHandler @RootSpawnReviewer,
+            spawnReviewer = mkHandler @SpawnReviewer,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,
