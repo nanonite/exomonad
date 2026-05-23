@@ -20,6 +20,7 @@ pub mod agent;
 pub mod coordination;
 pub mod events;
 pub mod file_pr;
+pub mod forgejo_as_github;
 pub mod fs;
 pub mod git;
 pub mod github;
@@ -34,6 +35,7 @@ pub use agent::AgentHandler;
 pub use coordination::CoordinationHandler;
 pub use events::EventHandler;
 pub use file_pr::FilePRHandler;
+pub use forgejo_as_github::ForgejoAsGitHubHandler;
 pub use fs::FsHandler;
 
 pub use git::GitHandler;
