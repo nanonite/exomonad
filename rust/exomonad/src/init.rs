@@ -65,6 +65,134 @@ fn forgejo_host_from_url(input: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteRepoParts {
+    host: String,
+    owner: String,
+    repo: String,
+    has_http_auth: bool,
+}
+
+fn configure_forgejo_remote(cwd: &Path, forgejo_url: &str, forgejo_token: &str) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .context("failed to run git remote get-url origin")?;
+    if !output.status.success() {
+        warn!("No origin remote found; skipping Forgejo remote token auth setup");
+        return Ok(());
+    }
+
+    let old_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let Some(new_url) = forgejo_token_remote_url(&old_url, forgejo_url, forgejo_token) else {
+        return Ok(());
+    };
+    let status = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["remote", "set-url", "origin", &new_url])
+        .status()
+        .context("failed to run git remote set-url origin")?;
+    if !status.success() {
+        anyhow::bail!("git remote set-url origin exited with {status}");
+    }
+
+    info!(
+        old_url = %redact_remote_token(&old_url, forgejo_token),
+        new_url = %redact_remote_token(&new_url, forgejo_token),
+        "Configured git remote to use Forgejo HTTP token auth"
+    );
+    Ok(())
+}
+
+fn forgejo_token_remote_url(
+    remote_url: &str,
+    forgejo_url: &str,
+    forgejo_token: &str,
+) -> Option<String> {
+    let remote = parse_remote_repo_parts(remote_url)?;
+    let forgejo_host_raw = forgejo_host_from_url(forgejo_url)?;
+    let forgejo_host = host_without_port(&forgejo_host_raw);
+    if remote.host != forgejo_host {
+        debug!(
+            remote_host = %remote.host,
+            forgejo_host,
+            "Skipping Forgejo remote token auth setup for non-Forgejo origin"
+        );
+        return None;
+    }
+    if remote_url.contains(forgejo_token) || remote.has_http_auth {
+        debug!("Forgejo remote already has HTTP auth; skipping remote rewrite");
+        return None;
+    }
+
+    tokenized_forgejo_url(forgejo_url, forgejo_token, &remote.owner, &remote.repo)
+}
+
+// Token is embedded in the URL and visible in local git config.
+// Acceptable for local Forgejo instances. Do not use for public hosts.
+fn tokenized_forgejo_url(
+    forgejo_url: &str,
+    forgejo_token: &str,
+    owner: &str,
+    repo: &str,
+) -> Option<String> {
+    let base = forgejo_url.trim().trim_end_matches('/');
+    let (scheme, rest) = base.split_once("://")?;
+    Some(format!(
+        "{scheme}://forgejo_pat:{forgejo_token}@{rest}/{owner}/{repo}.git"
+    ))
+}
+
+fn parse_remote_repo_parts(remote_url: &str) -> Option<RemoteRepoParts> {
+    let trimmed = remote_url.trim();
+    if let Some(rest) = trimmed.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        return remote_parts(host, path, false);
+    }
+    if let Some(rest) = trimmed.strip_prefix("ssh://") {
+        let rest = rest.split_once('@').map(|(_, path)| path).unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        return remote_parts(host, path, false);
+    }
+    let (_, rest) = trimmed.split_once("://")?;
+    let (authority, path) = rest.split_once('/')?;
+    let has_http_auth = authority.contains('@');
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    remote_parts(host, path, has_http_auth)
+}
+
+fn remote_parts(host: &str, path: &str, has_http_auth: bool) -> Option<RemoteRepoParts> {
+    let cleaned = path
+        .trim_start_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(path);
+    let mut segments = cleaned.split('/').filter(|segment| !segment.is_empty());
+    let repo = segments.next_back()?.to_string();
+    let owner = segments.next_back()?.to_string();
+    Some(RemoteRepoParts {
+        host: host_without_port(host).to_string(),
+        owner,
+        repo,
+        has_http_auth,
+    })
+}
+
+fn host_without_port(host: &str) -> &str {
+    host.split(':').next().unwrap_or(host)
+}
+
+fn redact_remote_token(url: &str, token: &str) -> String {
+    if token.is_empty() {
+        url.to_string()
+    } else {
+        url.replace(token, "<token>")
+    }
+}
+
 fn forgejo_env_vars(forgejo_url: &str, forgejo_token: &str) -> Vec<(&'static str, String)> {
     if forgejo_token.trim().is_empty() {
         return Vec::new();
@@ -487,6 +615,15 @@ pub async fn run(
             .unwrap_or_else(|| "main".to_string());
         std::fs::write(root_agent_dir.join(".birth_branch"), &current_branch)?;
         info!(branch = %current_branch, "Wrote root agent birth branch");
+    }
+
+    if let (Some(forgejo_url), Some(forgejo_token)) = (
+        config.forgejo_url.as_deref(),
+        config.forgejo_token.as_deref(),
+    ) {
+        if let Err(e) = configure_forgejo_remote(&cwd, forgejo_url, forgejo_token) {
+            warn!(error = %e, "Failed to auto-configure Forgejo remote URL (non-fatal)");
+        }
     }
 
     // Write root runtime configuration.
@@ -2286,6 +2423,51 @@ mod tests {
             task: None,
             model: None,
         }
+    }
+
+    #[test]
+    fn forgejo_token_remote_url_rewrites_matching_ssh_origin() {
+        let url = forgejo_token_remote_url(
+            "git@localhost:exomonad/nemotron-port.git",
+            "http://localhost:3000",
+            "token-123",
+        )
+        .unwrap();
+
+        assert_eq!(
+            url,
+            "http://forgejo_pat:token-123@localhost:3000/exomonad/nemotron-port.git"
+        );
+    }
+
+    #[test]
+    fn forgejo_token_remote_url_ignores_different_origin_host() {
+        assert!(forgejo_token_remote_url(
+            "git@github.com:nanonite/exomonad.git",
+            "http://localhost:3000",
+            "token-123",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn forgejo_token_remote_url_is_idempotent_with_existing_auth() {
+        assert!(forgejo_token_remote_url(
+            "http://forgejo_pat:token-123@localhost:3000/exomonad/nemotron-port.git",
+            "http://localhost:3000",
+            "token-123",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_remote_repo_parts_uses_last_two_path_segments() {
+        let parts =
+            parse_remote_repo_parts("git@local-tangled:repositories/owner/exomonad.git").unwrap();
+
+        assert_eq!(parts.host, "local-tangled");
+        assert_eq!(parts.owner, "owner");
+        assert_eq!(parts.repo, "exomonad");
     }
 
     #[test]
