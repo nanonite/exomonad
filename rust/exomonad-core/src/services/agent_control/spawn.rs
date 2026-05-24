@@ -103,7 +103,8 @@ implements the spec, files a PR, and calls notify_parent when done. This is the 
 - file_pr: Create/update PR for your own branch.
 - merge_pr: Merge a child worker's PR after notification.
 - notify_parent: Send message to your parent agent.
-- send_message: Send message to any spawned agent.
+- send_tmux_message: Send a message by injecting it into a spawned agent tmux pane.
+- send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 
 ## Workflow: Plan → Spawn → Idle → Merge
 1. PLAN: Research until decomposition is clear.
@@ -159,7 +160,8 @@ Implement the spec in your task. File a PR when done. Call notify_parent to repo
 ## MCP Tools Available
 - file_pr: Create/update a PR for your branch. Call this when your implementation is ready.
 - notify_parent: Send a message to your parent TL. Use status 'success' when done, 'failure' if stuck.
-- send_message: Send a message to another agent.
+- send_tmux_message: Send a message by injecting it into another agent tmux pane.
+- send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 
 ## Workflow
 1. Read the spec carefully. Re-read any files mentioned before editing.
@@ -186,7 +188,8 @@ Implement the spec in your task. File a PR when done. Call notify_parent to repo
 ## MCP Tools Available
 - file_pr: Create/update a PR for your branch. Call this when your implementation is ready.
 - notify_parent: Send a message to your parent TL. Use status 'success' when done, 'failure' if stuck.
-- send_message: Send a message to another agent.
+- send_tmux_message: Send a message by injecting it into another agent tmux pane.
+- send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 
 ## Workflow
 1. Read the spec carefully. Re-read any files mentioned before editing.
@@ -216,7 +219,8 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 - chainlink_issue_comment: Post progress on the assigned Chainlink issue.
 - chainlink_session_end: End the Chainlink session with handoff notes.
 - notify_parent: Send a direct message to your parent TL when needed.
-- send_message: Send messages to other agents when explicitly instructed.
+- send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
+- send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
 
 ## Workflow
 1. Read the prompt carefully and use the issue ID provided by the TL.

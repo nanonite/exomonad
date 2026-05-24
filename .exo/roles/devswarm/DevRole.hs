@@ -115,7 +115,8 @@ instance MCPTool DevTaskUpdate where
 data Tools mode = Tools
   { pr :: mode :- DevFilePR,
     notifyParent :: mode :- DevNotifyParent,
-    sendMessage :: mode :- SendMessage,
+    sendTmuxMessage :: mode :- SendTmuxMessage,
+    sendMailboxMessage :: mode :- SendMailboxMessage,
     taskList :: mode :- DevTaskList,
     taskGet :: mode :- DevTaskGet,
     taskUpdate :: mode :- DevTaskUpdate,
@@ -138,7 +139,8 @@ config =
         Tools
           { pr = mkHandler @DevFilePR,
             notifyParent = mkHandler @DevNotifyParent,
-            sendMessage = mkHandler @SendMessage,
+            sendTmuxMessage = mkHandler @SendTmuxMessage,
+            sendMailboxMessage = mkHandler @SendMailboxMessage,
             taskList = mkHandler @DevTaskList,
             taskGet = mkHandler @DevTaskGet,
             taskUpdate = mkHandler @DevTaskUpdate,

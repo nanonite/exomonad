@@ -196,6 +196,10 @@ fn redact_remote_token(url: &str, token: &str) -> String {
     }
 }
 
+fn mailbox_protocol_available_for_config(config: &Config) -> bool {
+    config.root_agent_type == AgentType::Claude && config.spawn_agent_type == AgentType::Claude
+}
+
 fn forgejo_env_vars(forgejo_url: &str, forgejo_token: &str) -> Vec<(&'static str, String)> {
     if forgejo_token.trim().is_empty() {
         return Vec::new();
@@ -881,6 +885,25 @@ pub async fn run(
                 .status();
         }
     }
+
+    let mailbox_protocol_available = if mailbox_protocol_available_for_config(&config) {
+        "1"
+    } else {
+        "0"
+    };
+    std::env::set_var(
+        "EXOMONAD_MAILBOX_PROTOCOL_AVAILABLE",
+        mailbox_protocol_available,
+    );
+    let _ = std::process::Command::new("tmux")
+        .args([
+            "set-environment",
+            "-t",
+            &session,
+            "EXOMONAD_MAILBOX_PROTOCOL_AVAILABLE",
+            mailbox_protocol_available,
+        ])
+        .status();
 
     // Set EXOMONAD_TMUX_SESSION
     let env_output = std::process::Command::new("tmux")

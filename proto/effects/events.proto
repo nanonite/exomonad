@@ -77,6 +77,28 @@ message SendMessageResponse {
   string delivery_method = 2;  // "teams_inbox", "acp", "unix_socket", "tmux_stdin", "failed"
 }
 
+message SendTmuxMessageRequest {
+  Address recipient = 1;    // typed address
+  string content = 2;       // message body
+  string summary = 3;       // brief summary for traces
+}
+
+message SendTmuxMessageResponse {
+  bool success = 1;
+  string delivery_method = 2;  // "tmux_stdin" or "failed"
+}
+
+message SendMailboxMessageRequest {
+  Address recipient = 1;    // typed address
+  string content = 2;       // message body
+  string summary = 3;       // brief summary for inbox preview
+}
+
+message SendMailboxMessageResponse {
+  bool success = 1;
+  string delivery_method = 2;  // "teams_inbox" or "failed"
+}
+
 // ============================================================================
 // NotifyParent - Notify parent session of worker completion
 // ============================================================================
@@ -96,5 +118,7 @@ service EventEffects {
   rpc WaitForEvent(WaitForEventRequest) returns (WaitForEventResponse);
   rpc NotifyEvent(NotifyEventRequest) returns (NotifyEventResponse);
   rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  rpc SendTmuxMessage(SendTmuxMessageRequest) returns (SendTmuxMessageResponse);
+  rpc SendMailboxMessage(SendMailboxMessageRequest) returns (SendMailboxMessageResponse);
   rpc NotifyParent(NotifyParentRequest) returns (NotifyParentResponse);
 }

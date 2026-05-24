@@ -28,7 +28,7 @@ denyTools :: [Text]
 denyTools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
 
 allowTools :: [Text]
-allowTools = ["Read", "Grep", "Bash", "spawn_leaf", "spawn_worker", "send_message"]
+allowTools = ["Read", "Grep", "Bash", "spawn_leaf", "spawn_worker", "send_tmux_message", "send_mailbox_message"]
 
 main :: IO ()
 main = do
@@ -272,7 +272,8 @@ assertReviewerToolList =
         "reviewer tools"
         ["approve_pr", "request_changes", "post_review_comment"]
         names
-      assertBool "reviewer must not expose send_message" ("send_message" `notElem` names)
+      assertBool "reviewer must not expose send_tmux_message" ("send_tmux_message" `notElem` names)
+      assertBool "reviewer must not expose send_mailbox_message" ("send_mailbox_message" `notElem` names)
       assertBool "reviewer must not expose notify_parent" ("notify_parent" `notElem` names)
 
 assertReviewerCanExitDecisions :: IO ()

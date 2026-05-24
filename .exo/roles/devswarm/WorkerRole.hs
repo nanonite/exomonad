@@ -84,7 +84,8 @@ instance MCPTool WorkerTaskUpdate where
 
 data Tools mode = Tools
   { notifyParent :: mode :- WorkerNotifyParent,
-    sendMessage :: mode :- SendMessage,
+    sendTmuxMessage :: mode :- SendTmuxMessage,
+    sendMailboxMessage :: mode :- SendMailboxMessage,
     taskList :: mode :- WorkerTaskList,
     taskGet :: mode :- WorkerTaskGet,
     taskUpdate :: mode :- WorkerTaskUpdate,
@@ -103,7 +104,8 @@ config =
       tools =
         Tools
           { notifyParent = mkHandler @WorkerNotifyParent,
-            sendMessage = mkHandler @SendMessage,
+            sendTmuxMessage = mkHandler @SendTmuxMessage,
+            sendMailboxMessage = mkHandler @SendMailboxMessage,
             taskList = mkHandler @WorkerTaskList,
             taskGet = mkHandler @WorkerTaskGet,
             taskUpdate = mkHandler @WorkerTaskUpdate,

@@ -18,7 +18,7 @@ Use exomonad MCP tools for orchestration. Git operations use `git` CLI. **Never 
 | `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) through the configured Forgejo API. |
 | `merge_pr` | root, tl | Merge a child's PR |
 | `notify_parent` | tl, dev, worker | Send message to parent agent |
-| `send_message` | all | Send message to any exomonad-spawned agent |
+| `send_tmux_message` / `send_mailbox_message` | all | Send message to any exomonad-spawned agent |
 | `task_list` | dev, worker | List tasks from the shared task list |
 | `task_get` | dev, worker | Get a task by ID |
 | `task_update` | dev, worker | Update task status, owner, or activeForm |
@@ -103,6 +103,6 @@ See `.exo/review-policy.toml` for review round limits, timeouts, and complexity 
 ## Communication
 
 - `notify_parent` for completion/failure/status updates to parent
-- `send_message` for peer-to-peer messaging between any agents
+- `send_tmux_message` / `send_mailbox_message` for peer-to-peer messaging between any agents
 - Messages arrive as native `<teammate-message>` via Teams inbox
 - TL idles between spawning and receiving notifications — no polling

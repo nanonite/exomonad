@@ -5,6 +5,8 @@ module ExoMonad.Effects.Events
   ( EventsNotifyEvent,
     EventsNotifyParent,
     EventsSendMessage,
+    EventsSendTmuxMessage,
+    EventsSendMailboxMessage,
 
     -- * Proto types
     module Effects.Events,
@@ -37,3 +39,19 @@ instance Effect EventsSendMessage where
   type Input EventsSendMessage = SendMessageRequest
   type Output EventsSendMessage = SendMessageResponse
   effectId = "events.send_message"
+
+-- | Send message through tmux STDIN injection only
+data EventsSendTmuxMessage
+
+instance Effect EventsSendTmuxMessage where
+  type Input EventsSendTmuxMessage = SendTmuxMessageRequest
+  type Output EventsSendTmuxMessage = SendTmuxMessageResponse
+  effectId = "events.send_tmux_message"
+
+-- | Send message through Claude Teams inbox only
+data EventsSendMailboxMessage
+
+instance Effect EventsSendMailboxMessage where
+  type Input EventsSendMailboxMessage = SendMailboxMessageRequest
+  type Output EventsSendMailboxMessage = SendMailboxMessageResponse
+  effectId = "events.send_mailbox_message"

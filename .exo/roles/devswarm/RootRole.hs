@@ -76,7 +76,7 @@ rootRedispatchMessage toolName =
     <> toolName
     <> ". The TL plans and dispatches; implementation belongs to leaves and workers.\n"
     <> "If a leaf needs to fix code based on review feedback, the leaf does it; reviewer comments are injected into its pane automatically.\n"
-    <> "If a worker is blocked, use send_message to inject a clarification into the worker's pane. See Worker Correction Loop in .exo/roles/devswarm/context/root.md.\n"
+    <> "If a worker is blocked, use send_tmux_message to inject a clarification into the worker's pane. See Worker Correction Loop in .exo/roles/devswarm/context/root.md.\n"
     <> "If neither path fits, re-decompose with spawn_leaf or spawn_worker.\n"
     <> "See CLAUDE.md § Tech Lead Praxis for the full protocol."
 
@@ -179,7 +179,8 @@ data Tools mode = Tools
     spawnCodex :: mode :- RootSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
     mergePr :: mode :- RootMergePR,
-    sendMessage :: mode :- SendMessage,
+    sendTmuxMessage :: mode :- SendTmuxMessage,
+    sendMailboxMessage :: mode :- SendMailboxMessage,
     chainlinkIssueCreate :: mode :- ChainlinkIssueCreate,
     chainlinkSessionStart :: mode :- ChainlinkSessionStart,
     chainlinkSessionStatus :: mode :- ChainlinkSessionStatus,
@@ -218,7 +219,8 @@ config =
             spawnCodex = mkHandler @RootSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,
             mergePr = mkHandler @RootMergePR,
-            sendMessage = mkHandler @SendMessage,
+            sendTmuxMessage = mkHandler @SendTmuxMessage,
+            sendMailboxMessage = mkHandler @SendMailboxMessage,
             chainlinkIssueCreate = mkHandler @ChainlinkIssueCreate,
             chainlinkSessionStart = mkHandler @ChainlinkSessionStart,
             chainlinkSessionStatus = mkHandler @ChainlinkSessionStatus,

@@ -54,6 +54,31 @@ impl<C: HasEventQueue> EventHandler<C> {
     }
 }
 
+fn message_summary(content: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        content.chars().take(50).collect::<String>()
+    } else {
+        summary.to_string()
+    }
+}
+
+fn explicit_message_address(
+    recipient: Option<exomonad_proto::effects::events::Address>,
+    effect_name: &str,
+) -> EffectResult<Address> {
+    let address = Address::from_proto(recipient);
+    if matches!(address, Address::Supervisor) {
+        return Err(crate::effects::EffectError::custom(
+            "events.invalid_input",
+            format!(
+                "{} requires an explicit recipient (agent name or team); got empty/missing recipient",
+                effect_name
+            ),
+        ));
+    }
+    Ok(address)
+}
+
 impl<C: HasSupervisorRegistry> EventHandler<C> {
     async fn lookup_supervisor(
         &self,
@@ -325,21 +350,8 @@ impl<
         req: SendMessageRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SendMessageResponse> {
-        let summary = if req.summary.is_empty() {
-            req.content.chars().take(50).collect::<String>()
-        } else {
-            req.summary.clone()
-        };
-
-        let address = Address::from_proto(req.recipient.clone());
-
-        // Validate: send_message requires an explicit recipient, not Supervisor
-        if matches!(address, Address::Supervisor) {
-            return Err(crate::effects::EffectError::custom(
-                "events.invalid_input",
-                "send_message requires an explicit recipient (agent name or team); got empty/missing recipient".to_string(),
-            ));
-        }
+        let summary = message_summary(&req.content, &req.summary);
+        let address = explicit_message_address(req.recipient.clone(), "send_message")?;
 
         tracing::info!(
             address = %address,
@@ -368,6 +380,75 @@ impl<
         );
 
         Ok(SendMessageResponse {
+            success,
+            delivery_method: method_string.to_string(),
+        })
+    }
+
+    async fn send_tmux_message(
+        &self,
+        req: SendTmuxMessageRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SendTmuxMessageResponse> {
+        let summary = message_summary(&req.content, &req.summary);
+        let address = explicit_message_address(req.recipient.clone(), "send_tmux_message")?;
+
+        tracing::info!(
+            address = %address,
+            sender = %ctx.agent_name,
+            "send_tmux_message: routing via tmux stdin"
+        );
+
+        let outcome = crate::services::delivery::route_tmux_message(
+            &*self.ctx,
+            &address,
+            &ctx.agent_name,
+            &req.content,
+            &summary,
+        )
+        .await;
+        let method_string = outcome.method_string();
+        let success = outcome.is_success();
+
+        Ok(SendTmuxMessageResponse {
+            success,
+            delivery_method: method_string.to_string(),
+        })
+    }
+
+    async fn send_mailbox_message(
+        &self,
+        req: SendMailboxMessageRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SendMailboxMessageResponse> {
+        if !crate::services::delivery::mailbox_protocol_available() {
+            return Err(crate::effects::EffectError::custom(
+                "events.mailbox_unavailable",
+                crate::services::delivery::MAILBOX_PROTOCOL_UNAVAILABLE_MESSAGE.to_string(),
+            ));
+        }
+
+        let summary = message_summary(&req.content, &req.summary);
+        let address = explicit_message_address(req.recipient.clone(), "send_mailbox_message")?;
+
+        tracing::info!(
+            address = %address,
+            sender = %ctx.agent_name,
+            "send_mailbox_message: routing via Teams inbox"
+        );
+
+        let outcome = crate::services::delivery::route_mailbox_message(
+            &*self.ctx,
+            &address,
+            &ctx.agent_name,
+            &req.content,
+            &summary,
+        )
+        .await;
+        let method_string = outcome.method_string();
+        let success = outcome.is_success();
+
+        Ok(SendMailboxMessageResponse {
             success,
             delivery_method: method_string.to_string(),
         })

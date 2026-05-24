@@ -90,7 +90,7 @@ When a child sends `notify_parent` with success:
 | `chainlink_cascade` | Show falsification cascade for an issue |
 | `chainlink_milestone_create` | Create a milestone for grouping issues |
 | `chainlink_milestone_list` | List milestones and their progress |
-| `send_message` | Send notifications to parent/peers |
+| `send_tmux_message` | Send notifications to parent/peers |
 
 ## Cost Model
 
@@ -105,4 +105,4 @@ Chainlink operations are cheap. Use them liberally. Prefer chainlink for coordin
 - Close the issue when the work is merged, not when the PR is filed
 - Never ask a worker or dev leaf to close its own assigned issue
 - Never use Chainlink agent, sync, or lock commands
-- Use `chainlink_issue_comment` for progress notes, use `send_message` for urgent coordination only
+- Use `chainlink_issue_comment` for progress notes, use `send_tmux_message` for urgent coordination only

@@ -1,7 +1,9 @@
 -- | Events core re-exports for role code.
 module ExoMonad.Guest.Records.Events
-  ( -- * SendMessage (MCPTool instance stays in SDK)
-    SendMessage,
+  ( -- * Message tools (MCPTool instances stay in SDK)
+    SendTmuxMessage,
+    SendMailboxMessage,
+    SendMessageArgs (..),
 
     -- * NotifyParent (core + shared schema, no MCPTool instance)
     NotifyParent,

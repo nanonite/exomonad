@@ -191,7 +191,25 @@ impl DeliveryOutcome {
     }
 }
 
-/// Route a message to a typed Address.
+const MAILBOX_PROTOCOL_AVAILABLE_ENV: &str = "EXOMONAD_MAILBOX_PROTOCOL_AVAILABLE";
+
+pub const MAILBOX_PROTOCOL_UNAVAILABLE_MESSAGE: &str = "Mailbox protocol not available in this session: Teams inbox is not configured or has not passed e2e validation for this role/runtime combination.";
+
+#[derive(Clone, Copy)]
+enum MessageDeliveryPath {
+    Smart,
+    TmuxOnly,
+    MailboxOnly,
+}
+
+pub fn mailbox_protocol_available() -> bool {
+    matches!(
+        std::env::var(MAILBOX_PROTOCOL_AVAILABLE_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// Route a message to a typed Address using the default delivery fallback chain.
 ///
 /// Resolves the Address to a concrete agent key and tab name, then delegates
 /// to `deliver_to_agent()`. For `Address::Team` with no member, resolves the
@@ -207,30 +225,123 @@ pub async fn route_message(
     content: &str,
     summary: &str,
 ) -> DeliveryOutcome {
+    route_message_with(
+        ctx,
+        address,
+        from,
+        content,
+        summary,
+        MessageDeliveryPath::Smart,
+    )
+    .await
+}
+
+/// Route a message only through tmux STDIN injection.
+#[instrument(skip_all, fields(address = %address, from = %from))]
+pub async fn route_tmux_message(
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
+    address: &Address,
+    from: &crate::domain::AgentName,
+    content: &str,
+    summary: &str,
+) -> DeliveryOutcome {
+    route_message_with(
+        ctx,
+        address,
+        from,
+        content,
+        summary,
+        MessageDeliveryPath::TmuxOnly,
+    )
+    .await
+}
+
+/// Route a message only through the Claude Teams inbox mailbox protocol.
+#[instrument(skip_all, fields(address = %address, from = %from))]
+pub async fn route_mailbox_message(
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
+    address: &Address,
+    from: &crate::domain::AgentName,
+    content: &str,
+    summary: &str,
+) -> DeliveryOutcome {
+    route_message_with(
+        ctx,
+        address,
+        from,
+        content,
+        summary,
+        MessageDeliveryPath::MailboxOnly,
+    )
+    .await
+}
+
+async fn route_message_with(
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
+    address: &Address,
+    from: &crate::domain::AgentName,
+    content: &str,
+    summary: &str,
+    path: MessageDeliveryPath,
+) -> DeliveryOutcome {
     match address {
         Address::Agent(name) => {
             let tab_name = resolve_tab_name_for_agent(name, Some(ctx.agent_resolver()));
             let agent_key = name.as_str();
-            let result = deliver_to_agent(ctx, agent_key, &tab_name, from, content, summary).await;
+            let result =
+                deliver_to_agent_for(ctx, agent_key, &tab_name, from, content, summary, path).await;
             DeliveryOutcome::from_result(result, agent_key)
         }
         Address::Team { team, member } => {
             if let Some(member_name) = member {
-                // Direct team member delivery
                 let tab_name = resolve_tab_name_for_agent(member_name, Some(ctx.agent_resolver()));
                 let agent_key = member_name.as_str();
                 let result =
-                    deliver_to_agent(ctx, agent_key, &tab_name, from, content, summary).await;
+                    deliver_to_agent_for(ctx, agent_key, &tab_name, from, content, summary, path)
+                        .await;
                 DeliveryOutcome::from_result(result, agent_key)
             } else {
-                // Team lead resolution: find who owns this team
-                resolve_and_deliver_to_lead(ctx, team.as_str(), from, content, summary).await
+                resolve_and_deliver_to_lead(ctx, team.as_str(), from, content, summary, path).await
             }
         }
         Address::Supervisor => {
-            // Supervisor resolves to "root" by default (the root TL)
-            let result = deliver_to_agent(ctx, "root", "TL", from, content, summary).await;
+            let result =
+                deliver_to_agent_for(ctx, "root", "TL", from, content, summary, path).await;
             DeliveryOutcome::from_result(result, "root")
+        }
+    }
+}
+
+async fn deliver_to_agent_for(
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
+    agent_key: &str,
+    tmux_target: &str,
+    from: &crate::domain::AgentName,
+    message: &str,
+    summary: &str,
+    path: MessageDeliveryPath,
+) -> DeliveryResult {
+    match path {
+        MessageDeliveryPath::Smart => {
+            deliver_to_agent(ctx, agent_key, tmux_target, from, message, summary).await
+        }
+        MessageDeliveryPath::TmuxOnly => {
+            deliver_via_tmux(ctx.project_dir(), agent_key, tmux_target, from, message).await
+        }
+        MessageDeliveryPath::MailboxOnly => {
+            deliver_to_agent_mailbox(ctx, agent_key, from, message, summary).await
         }
     }
 }
@@ -246,10 +357,10 @@ async fn resolve_and_deliver_to_lead(
     from: &crate::domain::AgentName,
     content: &str,
     summary: &str,
+    path: MessageDeliveryPath,
 ) -> DeliveryOutcome {
     let original = format!("team:{}:lead", team_name);
 
-    // Resolve lead: config.json leadAgentId → in-memory first entry → "root"
     let lead_key = ctx
         .team_registry()
         .resolve_lead(team_name)
@@ -265,7 +376,8 @@ async fn resolve_and_deliver_to_lead(
     let lead_agent = crate::domain::AgentName::try_from_str(lead_key.as_str())
         .expect("validated string input is non-empty");
     let tab_name = resolve_tab_name_for_agent(&lead_agent, Some(ctx.agent_resolver()));
-    let result = deliver_to_agent(ctx, &lead_key, &tab_name, from, content, summary).await;
+    let result =
+        deliver_to_agent_for(ctx, &lead_key, &tab_name, from, content, summary, path).await;
 
     match result {
         DeliveryResult::Failed => DeliveryOutcome::Failed {
@@ -674,6 +786,110 @@ async fn deliver_via_tmux(
         tmux_target,
     )
     .await
+}
+
+async fn deliver_to_agent_mailbox(
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
+    agent_key: &str,
+    from: &crate::domain::AgentName,
+    message: &str,
+    summary: &str,
+) -> DeliveryResult {
+    let agent_type = agent_type_from_key(agent_key);
+    if !supports_teams_inbox(agent_type) {
+        tracing::info!(
+            otel.name = "message.delivery",
+            agent_id = %from,
+            recipient = %agent_key,
+            method = "teams_inbox",
+            outcome = "failed",
+            detail = "recipient runtime does not support Teams inbox",
+            "[event] message.delivery"
+        );
+        return DeliveryResult::Failed;
+    }
+
+    let team_registry = ctx.team_registry();
+    let (sender_info, recipient_info) = team_registry.get_pair(from.as_str(), agent_key).await;
+    let sender_team = sender_info.map(|info| info.team_name);
+    let resolved = recipient_info.or_else(|| {
+        sender_team
+            .as_deref()
+            .and_then(|team| TeamRegistry::resolve_from_config(team, agent_key))
+    });
+    let Some(team_info) = resolved else {
+        tracing::info!(
+            otel.name = "message.delivery",
+            agent_id = %from,
+            recipient = %agent_key,
+            method = "teams_inbox",
+            outcome = "failed",
+            detail = "recipient is not registered in Teams inbox",
+            "[event] message.delivery"
+        );
+        return DeliveryResult::Failed;
+    };
+
+    let team_name_ref = &team_info.team_name;
+    let inbox_name_ref = &team_info.inbox_name;
+    let inbox_policy = super::resilience::RetryPolicy::new(
+        3,
+        super::resilience::Backoff::Fixed(std::time::Duration::from_millis(100)),
+    );
+    let result = super::resilience::retry(&inbox_policy, || async {
+        teams_mailbox::write_to_inbox(
+            team_name_ref,
+            inbox_name_ref,
+            from.as_str(),
+            message,
+            summary,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))
+    })
+    .await;
+
+    match result {
+        Ok(timestamp) => {
+            tracing::Span::current().record("delivery_method", "teams");
+            info!(
+                agent = %agent_key,
+                team = %team_info.team_name,
+                inbox = %team_info.inbox_name,
+                timestamp = %timestamp,
+                "Wrote message to Teams inbox without fallback"
+            );
+            tracing::info!(
+                otel.name = "message.delivery",
+                agent_id = %from,
+                recipient = %agent_key,
+                method = "teams_inbox",
+                outcome = "success",
+                detail = format!("{}/{}", team_info.team_name, team_info.inbox_name),
+                "[event] message.delivery"
+            );
+            DeliveryResult::Teams
+        }
+        Err(e) => {
+            warn!(
+                agent = %agent_key,
+                error = %e,
+                "Teams inbox write failed after 3 attempts; mailbox-only delivery has no fallback"
+            );
+            tracing::info!(
+                otel.name = "message.delivery",
+                agent_id = %from,
+                recipient = %agent_key,
+                method = "teams_inbox",
+                outcome = "failed",
+                detail = %e,
+                "[event] message.delivery"
+            );
+            DeliveryResult::Failed
+        }
+    }
 }
 
 /// Deliver a message to an agent.

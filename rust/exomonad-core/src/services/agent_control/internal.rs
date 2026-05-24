@@ -127,6 +127,11 @@ impl<
         if let Some(ref session) = self.tmux_session {
             env_vars.insert("EXOMONAD_TMUX_SESSION".to_string(), session.clone());
         }
+        if let Ok(value) = std::env::var("EXOMONAD_MAILBOX_PROTOCOL_AVAILABLE") {
+            if !value.is_empty() {
+                env_vars.insert("EXOMONAD_MAILBOX_PROTOCOL_AVAILABLE".to_string(), value);
+            }
+        }
 
         // CHAINLINK_DB anchors every spawned agent to the project-root chainlink DB so a
         // dev-leaf inside its git worktree (which contains no `.chainlink/`) still resolves

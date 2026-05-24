@@ -6,7 +6,7 @@
 
 -- | E2E test root role: minimal tools with PII rewriting hooks.
 -- The Gemini root agent uses httpDevHooks for BeforeModel/AfterModel rewriting.
--- Only send_message tool is needed (Gemini writes files via its native tools).
+-- Only split message tools are needed (Gemini writes files via its native tools).
 module RootRole (config, Tools) where
 
 import ExoMonad
@@ -15,7 +15,8 @@ import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
 import HttpDevHooks (httpDevHooks)
 
 data Tools mode = Tools
-  { sendMessage :: mode :- SendMessage
+  { sendTmuxMessage :: mode :- SendTmuxMessage,
+    sendMailboxMessage :: mode :- SendMailboxMessage
   }
   deriving (Generic)
 
@@ -24,7 +25,8 @@ config =
   RoleConfig
     { roleName = "root",
       tools = Tools
-        { sendMessage = mkHandler @SendMessage
+        { sendTmuxMessage = mkHandler @SendTmuxMessage,
+            sendMailboxMessage = mkHandler @SendMailboxMessage
         },
       hooks = httpDevHooks,
       eventHandlers = defaultEventHandlers

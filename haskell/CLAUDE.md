@@ -29,7 +29,7 @@ The xmonad pattern for LLM agents: users define agent roles in Haskell, compiled
 .exo/roles/devswarm/
 ├── AllRoles.hs     # Role registry: Map Text SomeRoleConfig
 ├── RootRole.hs     # Root TL role (human-facing: spawn, merge, no file_pr/notify_parent)
-├── TLRole.hs       # Spawned TL role (spawn, PR, merge, notify_parent, send_message)
+├── TLRole.hs       # Spawned TL role (spawn, PR, merge, notify_parent, send_tmux_message)
 ├── DevRole.hs      # Dev role config (PR, notify_parent, task tools + permission cascade)
 ├── WorkerRole.hs   # Worker role config (notify_parent, task tools, allow-all hooks)
 ├── TestrunnerRole.hs # Testrunner role config (instruct + notify_parent, allow-all hooks)
@@ -65,7 +65,8 @@ data Tools mode = Tools
     pr :: FilePRTools mode,
     mergePr :: mode :- MergePR,
     notifyParent :: mode :- NotifyParent,
-    sendMessage :: mode :- SendMessage
+    sendTmuxMessage :: mode :- SendTmuxMessage,
+    sendMailboxMessage :: mode :- SendMailboxMessage
   } deriving Generic
 
 config :: RoleConfig (Tools AsHandler)

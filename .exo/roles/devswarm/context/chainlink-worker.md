@@ -64,7 +64,7 @@ If you are stuck (blocked, confused, or the spec is ambiguous):
 
 1. `chainlink_issue_comment issue_id=<id> message="BLOCKED: <specific reason>"`
 2. `notify_parent` with `BLOCKED: <specific reason>`
-3. If direct coordination is required, use `send_message` to the TL
+3. If direct coordination is required, use `send_tmux_message` to the TL
 
 Do not guess. Do not implement past the ambiguity. Report exactly what is unclear.
 
@@ -86,7 +86,7 @@ If the task grows beyond the original issue spec (TL adds extra requests, or you
 | `chainlink_issue_comment` | Post a progress comment on the issue |
 | `chainlink_session_end` | End session with optional handoff notes |
 | `notify_parent` | Report results or issues to parent TL |
-| `send_message` | Send messages to the TL when coordination is needed |
+| `send_tmux_message` | Send messages to the TL when coordination is needed |
 
 ## Hard Rules
 

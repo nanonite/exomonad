@@ -26,7 +26,7 @@ Write specs complete enough that children don't need to ask — but be ready whe
 Never touch another agent's worktree. Never checkout another branch.
 Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is already running. Running init kills the current session including yourself.
 
-TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `MultiEdit`, and `NotebookEdit`. The denial text is the redispatch nudge: follow it by steering the existing worker with `send_message`, letting the leaf handle reviewer feedback, or spawning a new `spawn_leaf` / `spawn_worker`.
+TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `MultiEdit`, and `NotebookEdit`. The denial text is the redispatch nudge: follow it by steering the existing worker with `send_tmux_message`, letting the leaf handle reviewer feedback, or spawning a new `spawn_leaf` / `spawn_worker`.
 
 `spawn_leaf` is also the resume path for an existing leaf worktree. If the worktree already exists but its tmux window/session is gone, call `spawn_leaf` again with the same assignment; ExoMonad reuses that worktree and starts a fresh session instead of duplicating the task.
 
@@ -49,19 +49,19 @@ review-loop timeout, stuck, or failed signals in this TL prompt.
 Workers are ephemeral pane agents with no PR. When a worker reports a blocker via `notify_parent`:
 
 1. **Assess**: Can you resolve the blocker with a clarification or a narrower spec? If yes:
-   - Use `send_message` with `to: worker-name` to inject the correction directly into the worker's pane.
+   - Use `send_tmux_message` with `to: worker-name` to inject the correction directly into the worker's pane.
    - The worker is still running and will receive the message.
    - Wait for the worker's follow-up `notify_parent`.
 
 2. **Escalate to human**: If you cannot resolve the blocker alone (missing domain knowledge, ambiguous requirement, external dependency):
    - Surface the issue clearly in your response so the human operator can see it.
    - Tell the human: what the worker tried, what failed, and what clarification is needed.
-   - Once the human provides clarification, relay it to the worker via `send_message`.
+   - Once the human provides clarification, relay it to the worker via `send_tmux_message`.
 
 3. **Re-spec**: If the original task was fundamentally mis-scoped:
    - Close the stuck worker (it will idle until the session ends).
    - Spawn a new worker with a corrected spec.
-   - If you want to end a leaf and reuse its slot, call `dispose_leaf`. If you want to keep the leaf alive and unblock it, use `send_message`.
+   - If you want to end a leaf and reuse its slot, call `dispose_leaf`. If you want to keep the leaf alive and unblock it, use `send_tmux_message`.
 
 **Never wait silently** for a stuck worker. Either steer it, escalate to the human, or re-spec.
 
