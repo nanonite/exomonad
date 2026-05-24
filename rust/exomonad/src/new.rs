@@ -56,10 +56,10 @@ gate = \"auto\"
         info!("Created .exo/review-policy.toml (default review policy)");
     }
 
-    if let Err(error) = scaffold_gitea_workflow(&cwd) {
+    if let Err(error) = scaffold_forgejo_workflow(&cwd) {
         warn!(
             error = %error,
-            "Failed to scaffold .gitea/workflows/ci.yml; continuing"
+            "Failed to scaffold .forgejo/workflows/ci.yml; continuing"
         );
     }
 
@@ -441,8 +441,8 @@ fn xrpc_url(base: &str, method: &str) -> String {
     format!("{}/xrpc/{method}", base.trim_end_matches('/'))
 }
 
-pub(crate) fn scaffold_gitea_workflow(project_dir: &Path) -> std::io::Result<()> {
-    let workflow_path = project_dir.join(".gitea/workflows/ci.yml");
+pub(crate) fn scaffold_forgejo_workflow(project_dir: &Path) -> std::io::Result<()> {
+    let workflow_path = project_dir.join(".forgejo/workflows/ci.yml");
     if workflow_path.exists() {
         info!(
             path = %workflow_path.display(),
@@ -459,7 +459,7 @@ pub(crate) fn scaffold_gitea_workflow(project_dir: &Path) -> std::io::Result<()>
     })?;
     std::fs::create_dir_all(parent)?;
 
-    let content = gitea_workflow_content();
+    let content = forgejo_workflow_content();
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(content.as_bytes())?;
     temp.flush()?;
@@ -473,7 +473,7 @@ pub(crate) fn scaffold_gitea_workflow(project_dir: &Path) -> std::io::Result<()>
     Ok(())
 }
 
-fn gitea_workflow_content() -> &'static str {
+fn forgejo_workflow_content() -> &'static str {
     r#"name: CI
 
 # =====================================================================
@@ -495,7 +495,7 @@ jobs:
 
       - name: Customize workflow
         run: |
-          echo "Replace .gitea/workflows/ci.yml with project-specific CI commands."
+          echo "Replace .forgejo/workflows/ci.yml with project-specific CI commands."
           echo "Add real build, test, lint, and release checks before merge gating."
 "#
 }
@@ -612,8 +612,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scaffolds_gitea_ci_placeholder_workflow() {
-        let content = assert_gitea_scaffold(&[]);
+    fn scaffolds_forgejo_ci_placeholder_workflow() {
+        let content = assert_forgejo_scaffold(&[]);
 
         assert!(content.contains("EXOMONAD GENERATED PLACEHOLDER"));
         assert!(content.contains("on: push"));
@@ -622,18 +622,18 @@ mod tests {
         assert!(content.contains("http://172.17.0.1:3000/${{ github.repository }}.git"));
         assert!(!content.contains("actions/checkout"));
         assert!(content.contains("Customize workflow"));
-        assert!(content.contains("Replace .gitea/workflows/ci.yml"));
+        assert!(content.contains("Replace .forgejo/workflows/ci.yml"));
         assert!(!content.contains("TODO"));
     }
 
     #[test]
     fn scaffold_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        scaffold_gitea_workflow(dir.path()).unwrap();
-        let workflow_path = dir.path().join(".gitea/workflows/ci.yml");
+        scaffold_forgejo_workflow(dir.path()).unwrap();
+        let workflow_path = dir.path().join(".forgejo/workflows/ci.yml");
         std::fs::write(&workflow_path, "custom: true\n").unwrap();
 
-        scaffold_gitea_workflow(dir.path()).unwrap();
+        scaffold_forgejo_workflow(dir.path()).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(workflow_path).unwrap(),
@@ -642,11 +642,12 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_does_not_create_legacy_github_workflow() {
+    fn scaffold_uses_forgejo_workflow_path() {
         let dir = tempfile::tempdir().unwrap();
-        scaffold_gitea_workflow(dir.path()).unwrap();
+        scaffold_forgejo_workflow(dir.path()).unwrap();
 
-        assert!(dir.path().join(".gitea/workflows/ci.yml").exists());
+        assert!(dir.path().join(".forgejo/workflows/ci.yml").exists());
+        assert!(!dir.path().join(".gitea/workflows/ci.yml").exists());
         assert!(!dir.path().join(".github/workflows/ci.yml").exists());
     }
 
@@ -727,13 +728,13 @@ mod tests {
         );
     }
 
-    fn assert_gitea_scaffold(markers: &[(&str, &str)]) -> String {
+    fn assert_forgejo_scaffold(markers: &[(&str, &str)]) -> String {
         let dir = tempfile::tempdir().unwrap();
         for (path, content) in markers {
             std::fs::write(dir.path().join(path), content).unwrap();
         }
 
-        scaffold_gitea_workflow(dir.path()).unwrap();
+        scaffold_forgejo_workflow(dir.path()).unwrap();
 
         let content = read_workflow(dir.path());
         serde_yaml::from_str::<serde_yaml::Value>(&content).unwrap();
@@ -741,7 +742,7 @@ mod tests {
     }
 
     fn read_workflow(project_dir: &Path) -> String {
-        let path = project_dir.join(".gitea/workflows/ci.yml");
+        let path = project_dir.join(".forgejo/workflows/ci.yml");
         assert!(path.exists());
         std::fs::read_to_string(path).unwrap()
     }

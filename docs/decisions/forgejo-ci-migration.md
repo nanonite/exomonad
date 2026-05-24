@@ -40,7 +40,7 @@ The Tangled/Spindle CI integration is broken for local development. The Tangled 
 ## CI Status Flow (After Migration)
 
 ```
-git push → Forgejo → triggers .github/workflows/ci.yml → act_runner executes
+git push → Forgejo → triggers .forgejo/workflows/ci.yml → act_runner executes
                    → sends workflow_run webhook → POST /ci on exomonad server
                    → forgejo_webhook_handler → CIStatus::parse() → ci_status_map
                    → merge gate reads ci_status_map → [MERGE READY] fires

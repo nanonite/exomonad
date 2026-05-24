@@ -265,13 +265,13 @@ impl<
         if !forgejo_workflow_configured(&ctx.working_dir).await {
             info!(
                 branch = %base_branch,
-                "TL preflight CI check skipped because no .gitea workflow is configured"
+                "TL preflight CI check skipped because no .forgejo workflow is configured"
             );
             return Ok(());
         }
 
         let Some(forgejo) = self.ctx.forgejo_client() else {
-            return Err("CI check failed: .gitea/workflows exists but forgejo_url/forgejo_token are not configured".to_string());
+            return Err("CI check failed: .forgejo/workflows exists but forgejo_url/forgejo_token are not configured".to_string());
         };
 
         let repo_info = crate::services::repo::get_repo_info(&ctx.working_dir)
@@ -299,7 +299,7 @@ impl<
                 base_branch
             )),
             None => Err(format!(
-                "CI check failed: .gitea/workflows exists but no Forgejo Actions run was found for base branch '{}'",
+                "CI check failed: .forgejo/workflows exists but no Forgejo Actions run was found for base branch '{}'",
                 base_branch
             )),
         }
@@ -370,7 +370,7 @@ fn dirty_worktree_message(entries: &[String]) -> String {
 }
 
 async fn forgejo_workflow_configured(project_dir: &Path) -> bool {
-    let workflows_dir = project_dir.join(".gitea/workflows");
+    let workflows_dir = project_dir.join(".forgejo/workflows");
     let Ok(mut entries) = tokio::fs::read_dir(workflows_dir).await else {
         return false;
     };
@@ -1754,6 +1754,26 @@ mod tests {
             ServiceAgentType::Codex
         );
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
+    }
+
+    #[tokio::test]
+    async fn forgejo_workflow_configured_detects_forgejo_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflows = dir.path().join(".forgejo/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("ci.yml"), "name: CI\n").unwrap();
+
+        assert!(forgejo_workflow_configured(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn forgejo_workflow_configured_ignores_legacy_gitea_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflows = dir.path().join(".gitea/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("ci.yml"), "name: CI\n").unwrap();
+
+        assert!(!forgejo_workflow_configured(dir.path()).await);
     }
 
     #[test]

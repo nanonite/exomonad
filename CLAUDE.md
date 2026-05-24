@@ -209,7 +209,7 @@ cargo build -p exomonad
 
 ### Configuration
 
-**Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults), `.gitignore` entries, and `.github/workflows/ci.yml` if missing. Works in any project directory. All fields are optional — auto-detection handles the common case. The CI scaffold uses GitHub Actions syntax with language-specific defaults, and leaves workspace-specific build/test customization where needed. **Claude rules:** `exomonad new` copies `.exo/rules/exomonad.md` → `.claude/rules/exomonad.md` (if the template exists and the destination doesn't). Template resolution: project-local `.exo/rules/` → global `~/.exo/rules/`. This gives fresh Claude instances automatic knowledge of exomonad MCP tools.
+**Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults), `.gitignore` entries, and `.forgejo/workflows/ci.yml` if missing. Works in any project directory. All fields are optional — auto-detection handles the common case. The CI scaffold uses GitHub Actions syntax with language-specific defaults, and leaves workspace-specific build/test customization where needed. **Claude rules:** `exomonad new` copies `.exo/rules/exomonad.md` → `.claude/rules/exomonad.md` (if the template exists and the destination doesn't). Template resolution: project-local `.exo/rules/` → global `~/.exo/rules/`. This gives fresh Claude instances automatic knowledge of exomonad MCP tools.
 
 ```toml
 # All fields below are optional — shown with their auto-detected defaults

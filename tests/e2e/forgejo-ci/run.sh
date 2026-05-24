@@ -41,8 +41,8 @@ fi
 
 exomonad new > "$LOG_DIR/new.log" 2>&1
 
-if [[ ! -f .gitea/workflows/ci.yml ]]; then
-  echo "ERROR: .gitea/workflows/ci.yml was not generated"
+if [[ ! -f .forgejo/workflows/ci.yml ]]; then
+  echo "ERROR: .forgejo/workflows/ci.yml was not generated"
   exit 1
 fi
 
