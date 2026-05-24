@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Inject GH_HOST and GH_TOKEN into agent tmux env alongside FORGEJO_* vars (#382)
 - reviewer pane does not exit after writing verdict (#333)
 - worktree event watcher prs.json empty — not tracking PRs through review cycle (#332)
 - root role missing chainlink MCP tools after #310 CLI block (#329)

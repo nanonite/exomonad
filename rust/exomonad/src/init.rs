@@ -206,9 +206,11 @@ fn forgejo_env_vars(forgejo_url: &str, forgejo_token: &str) -> Vec<(&'static str
 
     let mut vars = Vec::new();
     if let Some(forgejo_host) = forgejo_host_from_url(forgejo_url) {
-        vars.push(("FORGEJO_HOST", forgejo_host));
+        vars.push(("FORGEJO_HOST", forgejo_host.clone()));
+        vars.push(("GH_HOST", forgejo_host));
     }
     vars.push(("FORGEJO_TOKEN", forgejo_token.to_string()));
+    vars.push(("GH_TOKEN", forgejo_token.to_string()));
     vars.push(("FORGEJO_URL", forgejo_url.to_string()));
     vars
 }
@@ -2487,11 +2489,13 @@ mod tests {
     }
 
     #[test]
-    fn forgejo_env_vars_include_forgejo_token() {
+    fn forgejo_env_vars_include_forgejo_and_gh_auth() {
         let vars = forgejo_env_vars("http://localhost:3000", "token-123");
 
         assert!(vars.contains(&("FORGEJO_HOST", "localhost:3000".to_string())));
+        assert!(vars.contains(&("GH_HOST", "localhost:3000".to_string())));
         assert!(vars.contains(&("FORGEJO_TOKEN", "token-123".to_string())));
+        assert!(vars.contains(&("GH_TOKEN", "token-123".to_string())));
         assert!(vars.contains(&("FORGEJO_URL", "http://localhost:3000".to_string())));
     }
 
