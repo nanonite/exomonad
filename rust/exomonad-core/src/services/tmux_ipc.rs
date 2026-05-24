@@ -435,7 +435,7 @@ impl TmuxIpc {
     /// commands resolve to the same pane. Without qualification, tmux resolves
     /// display-name targets against the "most recently used" session, which is
     /// nondeterministic for subprocess calls.
-    pub async fn inject_input(&self, target: &str, text: &str) -> Result<()> {
+    pub async fn inject_input(&self, target: &str, text: &str, submit: bool) -> Result<()> {
         // Session-qualify the target so paste-buffer and send-keys resolve
         // to the same pane deterministically.
         let qualified_target = format!("{}:{}", self.session_name, target);
@@ -549,8 +549,8 @@ impl TmuxIpc {
             "tmux paste-buffer completed"
         );
 
-        // Wake before Enter so parked TUI event loops are listening when the
-        // submit key arrives. Non-fatal because pane resize can fail on stale
+        // Wake before optional Enter so parked TUI event loops are listening when
+        // the submit key arrives. Non-fatal because pane resize can fail on stale
         // targets while direct input still has a chance to land.
         if let Err(e) = self.wake_pane(target).await {
             warn!(target = %qualified_target, error = %e, "pre-submit SIGWINCH wake failed (non-fatal)");
@@ -558,6 +558,17 @@ impl TmuxIpc {
 
         let settle_delay = settle_delay_for_payload(payload);
         tokio::time::sleep(settle_delay).await;
+
+        if !submit {
+            debug!(
+                target = %qualified_target,
+                bytes = payload.len(),
+                paste_ms = paste_elapsed.as_millis(),
+                delay_ms = settle_delay.as_millis(),
+                "tmux paste completed without submit"
+            );
+            return Ok(());
+        }
 
         for attempt in 1..=3 {
             let enter_started = Instant::now();

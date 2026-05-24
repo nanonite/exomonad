@@ -48,6 +48,14 @@ fn should_try_acp(agent_type: crate::services::AgentType) -> bool {
     !matches!(agent_type, crate::services::AgentType::OpenCode)
 }
 
+fn tmux_injection_options(agent_type: crate::services::AgentType) -> tmux_events::InjectionOptions {
+    if matches!(agent_type, crate::services::AgentType::Claude) {
+        tmux_events::InjectionOptions::claude_default()
+    } else {
+        tmux_events::InjectionOptions::inline_submit()
+    }
+}
+
 /// Notification status for parent-facing messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifyStatus {
@@ -112,7 +120,6 @@ pub enum DeliveryMethod {
     Acp,
     Uds,
     Tmux,
-    AgentInbox,
 }
 
 /// Outcome of a routed message delivery.
@@ -155,7 +162,7 @@ impl DeliveryOutcome {
                 recipient: agent,
             },
             DeliveryResult::Tmux => DeliveryOutcome::Delivered {
-                method: DeliveryMethod::AgentInbox,
+                method: DeliveryMethod::Tmux,
                 recipient: agent,
             },
         }
@@ -178,7 +185,6 @@ impl DeliveryOutcome {
                 DeliveryMethod::Acp => "acp",
                 DeliveryMethod::Uds => "unix_socket",
                 DeliveryMethod::Tmux => "tmux_stdin",
-                DeliveryMethod::AgentInbox => "agent_inbox",
             },
             DeliveryOutcome::Failed { .. } => "failed",
         }
@@ -413,9 +419,13 @@ async fn spawn_inbox_consumer(agent: String) {
                 return;
             };
 
-            let result =
-                tmux_events::inject_input(&message.target, &message.body, &message.project_dir)
-                    .await;
+            let result = tmux_events::inject_input_with_options(
+                &message.target,
+                &message.body,
+                &message.project_dir,
+                message.injection_options,
+            )
+            .await;
             let success = result.is_ok();
             if let Err(e) = result {
                 warn!(
@@ -462,7 +472,8 @@ async fn enqueue_tmux_delivery(
         agent_key.to_string(),
         message.to_string(),
         detail.to_string(),
-    );
+    )
+    .with_injection_options(tmux_injection_options(agent_type_from_key(agent_key)));
 
     match GLOBAL_AGENT_INBOX.enqueue(agent_key, inbox_message).await {
         Ok(outcome) => {
@@ -573,7 +584,7 @@ async fn deliver_via_tmux(
     let routing_candidates = std::iter::once(agent_key.to_string())
         .chain(std::iter::once(slug.to_string()))
         .chain(
-            ["gemini", "claude", "shoal", "opencode"]
+            ["gemini", "claude", "shoal", "opencode", "codex"]
                 .iter()
                 .flat_map(|suffix| {
                     [
@@ -938,9 +949,25 @@ mod tests {
     use crate::domain::AgentName;
 
     #[test]
-    fn deliver_to_agent_reports_tmux_fallback_as_agent_inbox() {
+    fn deliver_to_agent_reports_tmux_fallback_as_tmux_stdin() {
         let outcome = DeliveryOutcome::from_result(DeliveryResult::Tmux, "worker-codex");
-        assert_eq!(outcome.method_string(), "agent_inbox");
+        assert_eq!(outcome.method_string(), "tmux_stdin");
+    }
+
+    #[test]
+    fn non_claude_tmux_delivery_uses_inline_submit() {
+        assert_eq!(
+            tmux_injection_options(crate::services::AgentType::Codex),
+            tmux_events::InjectionOptions::inline_submit()
+        );
+        assert_eq!(
+            tmux_injection_options(crate::services::AgentType::OpenCode),
+            tmux_events::InjectionOptions::inline_submit()
+        );
+        assert_eq!(
+            tmux_injection_options(crate::services::AgentType::Claude),
+            tmux_events::InjectionOptions::claude_default()
+        );
     }
 
     #[test]

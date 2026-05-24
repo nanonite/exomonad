@@ -10,6 +10,28 @@ use tracing::{info, warn};
 
 use super::tmux_ipc::{PaneId, TmuxIpc};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InjectionOptions {
+    pub file_indirect: bool,
+    pub submit: bool,
+}
+
+impl InjectionOptions {
+    pub fn claude_default() -> Self {
+        Self {
+            file_indirect: true,
+            submit: true,
+        }
+    }
+
+    pub fn inline_submit() -> Self {
+        Self {
+            file_indirect: false,
+            submit: true,
+        }
+    }
+}
+
 /// Emit an agent event. Log-only — no tmux interaction.
 /// Keeps function signature for callers.
 pub fn emit_event(_session: &str, event: &AgentEvent) -> Result<()> {
@@ -70,16 +92,31 @@ async fn gc_tmp_dir(tmp_dir: &Path) {
 /// a short `[label] @.exo/tmp/{uuid}.txt` pointer instead. This avoids shell
 /// metacharacter expansion (`!`, `$`, backticks) when pasting into tmux.
 /// Uses a relative path so directory names containing metacharacters are safe.
-/// Both Claude and Gemini auto-read `@filepath` references.
+/// Claude Code auto-reads `@filepath` references; other runtimes receive inline text.
 ///
 /// Tmp files older than 1 hour are garbage-collected on each write.
 pub async fn inject_input(target: &str, text: &str, project_dir: &Path) -> Result<()> {
+    inject_input_with_options(
+        target,
+        text,
+        project_dir,
+        InjectionOptions::claude_default(),
+    )
+    .await
+}
+
+pub async fn inject_input_with_options(
+    target: &str,
+    text: &str,
+    project_dir: &Path,
+    options: InjectionOptions,
+) -> Result<()> {
     let session =
         std::env::var("EXOMONAD_TMUX_SESSION").context("EXOMONAD_TMUX_SESSION not set")?;
 
     let ipc = TmuxIpc::new(&session);
 
-    if text.contains('\n') {
+    if options.file_indirect && text.contains('\n') {
         let tmp_dir = project_dir.join(".exo/tmp");
         tokio::fs::create_dir_all(&tmp_dir)
             .await
@@ -106,7 +143,7 @@ pub async fn inject_input(target: &str, text: &str, project_dir: &Path) -> Resul
         );
 
         let target = target.to_string();
-        ipc.inject_input(&target, &pointer).await
+        ipc.inject_input(&target, &pointer, options.submit).await
     } else {
         info!(
             "[TmuxEvents] Injecting input to target '{}': {} chars",
@@ -116,7 +153,7 @@ pub async fn inject_input(target: &str, text: &str, project_dir: &Path) -> Resul
 
         let target = target.to_string();
         let text = text.to_string();
-        ipc.inject_input(&target, &text).await
+        ipc.inject_input(&target, &text, options.submit).await
     }
 }
 

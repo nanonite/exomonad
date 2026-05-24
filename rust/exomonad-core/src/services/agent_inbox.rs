@@ -1,3 +1,4 @@
+use super::tmux_events::InjectionOptions;
 use anyhow::{anyhow, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -55,6 +56,7 @@ pub struct InboxMessage {
     pub recipient: String,
     pub body: String,
     pub detail: String,
+    pub injection_options: InjectionOptions,
     dedup_key: DedupKey,
 }
 
@@ -76,8 +78,14 @@ impl InboxMessage {
             recipient,
             body,
             detail,
+            injection_options: InjectionOptions::claude_default(),
             dedup_key,
         }
+    }
+
+    pub fn with_injection_options(mut self, injection_options: InjectionOptions) -> Self {
+        self.injection_options = injection_options;
+        self
     }
 }
 
@@ -305,6 +313,21 @@ mod tests {
             body.to_string(),
             "%1".to_string(),
         )
+    }
+
+    #[test]
+    fn message_defaults_to_claude_file_indirect_submit() {
+        let message = message("body");
+        assert_eq!(
+            message.injection_options,
+            InjectionOptions::claude_default()
+        );
+    }
+
+    #[test]
+    fn message_can_disable_file_indirect_for_non_claude_tmux_delivery() {
+        let message = message("body").with_injection_options(InjectionOptions::inline_submit());
+        assert_eq!(message.injection_options, InjectionOptions::inline_submit());
     }
 
     #[tokio::test]
