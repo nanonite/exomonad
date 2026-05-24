@@ -80,6 +80,8 @@ You own issue decomposition, timer lifecycle, PR merge decisions, and final issu
 
 Do not use Chainlink agent, sync, or lock commands. Do not ask workers or dev leaves to close their own assigned issue.
 
+Always pass the resolved absolute Chainlink db path to workers and leaves; they must not discover it themselves. Include `CHAINLINK_DB=/absolute/project/root/.chainlink/issues.db` in every task spec that references Chainlink, resolving the path from the current project root before spawning. Workers read `$CHAINLINK_DB` or the explicit path; they do not enumerate for it.
+
 ## Cost Model
 
 Your tokens cost 10-30x children's. Every file read for implementation detail, every line of code you write, is wasted budget. Decompose, spec, spawn — that's it.
