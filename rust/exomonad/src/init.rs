@@ -489,6 +489,13 @@ pub async fn run(
     }
 
     let session = session_override.unwrap_or(config.tmux_session.clone());
+    let session_alive = TmuxIpc::has_session(&session).await?;
+    if should_attach_existing_session(recreate, session_alive) {
+        report_orphaned_agent_windows(&session, &cwd).await;
+        info!(session = %session, "Attaching to existing session");
+        return TmuxIpc::attach_session(&session).await;
+    }
+
     let reset_count = refresh_agent_session_timestamps(&cwd)?;
     if reset_count > 0 {
         info!(
@@ -781,8 +788,6 @@ pub async fn run(
         }
     }
 
-    let session_alive = TmuxIpc::has_session(&session).await?;
-
     if recreate {
         // Kill the running server process before tearing down the session
         let pid_path = cwd.join(".exo/server.pid");
@@ -815,11 +820,6 @@ pub async fn run(
             info!(session = %session, "Deleting session (--recreate)");
             TmuxIpc::kill_session(&session).await?;
         }
-    } else if session_alive {
-        // Attach to running session
-        report_orphaned_agent_windows(&session, &cwd).await;
-        info!(session = %session, "Attaching to session");
-        return TmuxIpc::attach_session(&session).await;
     }
 
     // Create fresh session
@@ -1514,6 +1514,10 @@ pub async fn run(
     // 6. Attach
     info!(session = %session, "Attaching to session");
     TmuxIpc::attach_session(&session).await
+}
+
+fn should_attach_existing_session(recreate: bool, session_alive: bool) -> bool {
+    session_alive && !recreate
 }
 
 /// Refresh orphan timeout baselines for agents that predate this `exomonad init` session.
@@ -2486,6 +2490,21 @@ mod tests {
         assert_eq!(parts.host, "local-tangled");
         assert_eq!(parts.owner, "owner");
         assert_eq!(parts.repo, "exomonad");
+    }
+
+    #[test]
+    fn init_attaches_existing_session_without_recreate() {
+        assert!(should_attach_existing_session(false, true));
+    }
+
+    #[test]
+    fn init_does_not_attach_when_recreate_requested() {
+        assert!(!should_attach_existing_session(true, true));
+    }
+
+    #[test]
+    fn init_does_not_attach_missing_session() {
+        assert!(!should_attach_existing_session(false, false));
     }
 
     #[test]

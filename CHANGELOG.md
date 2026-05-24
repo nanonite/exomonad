@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix exomonad init resume to preserve existing tmux sessions (#386)
 - TL spec template must pass CHAINLINK_DB path to workers and leaves (#383)
 - Inject GH_HOST and GH_TOKEN into agent tmux env alongside FORGEJO_* vars (#382)
 - reviewer pane does not exit after writing verdict (#333)
