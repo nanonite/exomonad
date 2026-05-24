@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix Forgejo runner Docker archive upload failures (#387)
 - Fix Forgejo CI workflow dispatch failures (#385)
 - Fix exomonad init resume to preserve existing tmux sessions (#386)
 - TL spec template must pass CHAINLINK_DB path to workers and leaves (#383)

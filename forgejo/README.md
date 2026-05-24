@@ -37,6 +37,8 @@ docker compose up -d forgejo
    docker compose up -d runner
    ```
 
+   The compose entrypoint patches the generated runner config to mount `/var/run/act` as tmpfs in job containers. Docker 29 rejects Forgejo Runner archive uploads through the `/var/run` symlink unless that path exists as a real mount.
+
 4. Set config in `.exo/config.toml`:
    ```toml
    forgejo_url = "http://localhost:3000"

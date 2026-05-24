@@ -45,9 +45,10 @@ services:
       - docker-in-docker
     volumes:
       - ./runner-data:/data
+      - ./runner-entrypoint.sh:/runner-entrypoint.sh:ro
     environment:
       - DOCKER_HOST=tcp://docker-in-docker:2375
-    command: forgejo-runner daemon --config /data/runner-config.yml
+    command: /bin/sh /runner-entrypoint.sh
 
 volumes:
   forgejo-data:
