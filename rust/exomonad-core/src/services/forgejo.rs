@@ -31,6 +31,27 @@ pub struct ForgejoPullRequestReview {
     pub commit_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoWorkflowRun {
+    pub name: String,
+    pub display_title: String,
+    pub head_branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoRunner {
+    pub name: String,
+    pub status: String,
+    pub busy: bool,
+    pub disabled: bool,
+    pub last_online: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct CreatePullRequestBody<'a> {
     title: &'a str,
@@ -95,6 +116,10 @@ struct WorkflowRunsResponse {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowRunResponse {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    display_title: Option<String>,
     #[serde(default, rename = "prettyref", alias = "head_branch")]
     head_branch_ref: Option<String>,
     #[serde(default, alias = "commit_sha")]
@@ -103,6 +128,30 @@ struct WorkflowRunResponse {
     status: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunnersResponse {
+    #[serde(default)]
+    runners: Vec<RunnerResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunnerResponse {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    busy: bool,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default, alias = "last_online")]
+    last_online: Option<String>,
 }
 
 impl ForgejoClient {
@@ -283,6 +332,66 @@ impl ForgejoClient {
             .decode_response(response, "list Forgejo Actions runs")
             .await?;
         Ok(runs.workflow_runs.into_iter().next().map(workflow_status))
+    }
+
+    pub async fn list_workflow_runs_for_branch(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        branch: &BranchName,
+        limit: usize,
+    ) -> Result<Vec<ForgejoWorkflowRun>> {
+        let url = self.api_url(&["repos", owner.as_str(), repo.as_str(), "actions", "runs"])?;
+        let limit = limit.max(1).to_string();
+        let response = self
+            .http
+            .get(url)
+            .query(&[("branch", branch.as_str()), ("limit", limit.as_str())])
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo Actions runs request failed")?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+
+        let runs: WorkflowRunsResponse = self
+            .decode_response(response, "list Forgejo Actions runs")
+            .await?;
+        Ok(runs
+            .workflow_runs
+            .into_iter()
+            .map(ForgejoWorkflowRun::from)
+            .collect())
+    }
+
+    pub async fn list_global_runners(&self) -> Result<Vec<ForgejoRunner>> {
+        let url = self.api_url(&["admin", "actions", "runners"])?;
+        let response = self
+            .http
+            .get(url)
+            .query(&[("limit", "100")])
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo runner list request failed")?;
+
+        if matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        ) {
+            return Ok(Vec::new());
+        }
+
+        let runners: RunnersResponse = self
+            .decode_response(response, "list Forgejo runners")
+            .await?;
+        Ok(runners
+            .runners
+            .into_iter()
+            .map(ForgejoRunner::from)
+            .collect())
     }
 
     pub async fn create_pull_request(
@@ -500,6 +609,34 @@ impl TryFrom<PullRequestResponse> for ForgejoPullRequest {
     }
 }
 
+impl From<WorkflowRunResponse> for ForgejoWorkflowRun {
+    fn from(value: WorkflowRunResponse) -> Self {
+        let status = value.status.unwrap_or_else(|| "unknown".to_string());
+        Self {
+            name: value.name.unwrap_or_else(|| "workflow".to_string()),
+            display_title: value.display_title.unwrap_or_default(),
+            head_branch: value.head_branch_ref,
+            head_sha: value.head_sha,
+            status,
+            conclusion: value.conclusion,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+impl From<RunnerResponse> for ForgejoRunner {
+    fn from(value: RunnerResponse) -> Self {
+        Self {
+            name: value.name,
+            status: value.status,
+            busy: value.busy,
+            disabled: value.disabled,
+            last_online: value.last_online,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,5 +835,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(pr.number.as_u64(), 9);
+    }
+
+    #[tokio::test]
+    async fn lists_workflow_runs_for_branch_with_dashboard_fields() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/actions/runs"))
+            .and(query_param("branch", "main.feature"))
+            .and(query_param("limit", "4"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workflow_runs": [
+                    {
+                        "name": "ci",
+                        "display_title": "cargo test",
+                        "prettyref": "refs/heads/main.feature",
+                        "commit_sha": "abc123",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "created_at": "2026-05-24T03:00:00Z",
+                        "updated_at": "2026-05-24T03:02:00Z"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let runs = client
+            .list_workflow_runs_for_branch(&owner(), &repo(), &branch("main.feature"), 4)
+            .await
+            .unwrap();
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].name, "ci");
+        assert_eq!(runs[0].display_title, "cargo test");
+        assert_eq!(runs[0].conclusion.as_deref(), Some("success"));
+        assert_eq!(runs[0].head_sha.as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn lists_global_runners_for_dashboard() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/admin/actions/runners"))
+            .and(query_param("limit", "100"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "runners": [
+                    {
+                        "name": "local-runner",
+                        "status": "online",
+                        "busy": true,
+                        "disabled": false,
+                        "last_online": "2026-05-24T03:04:00Z"
+                    }
+                ],
+                "total_count": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let runners = client.list_global_runners().await.unwrap();
+
+        assert_eq!(runners.len(), 1);
+        assert_eq!(runners[0].name, "local-runner");
+        assert!(runners[0].busy);
+        assert_eq!(
+            runners[0].last_online.as_deref(),
+            Some("2026-05-24T03:04:00Z")
+        );
     }
 }

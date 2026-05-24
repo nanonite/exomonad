@@ -7,6 +7,7 @@
 //! WASM plugins are loaded from file (server-side only).
 
 mod app_state;
+mod dashboard;
 mod init;
 mod logging;
 mod mcp_stdio;
@@ -130,6 +131,13 @@ enum Commands {
         name: String,
     },
 
+    /// Show the live Forgejo and agent watcher dashboard
+    Watch {
+        /// Refresh interval in seconds
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+    },
+
     /// Reply to a UI request
     Reply {
         /// Request ID
@@ -205,6 +213,10 @@ async fn main() -> Result<()> {
 
         Commands::Serve => {
             return serve::run(&config).await;
+        }
+
+        Commands::Watch { interval } => {
+            return dashboard::run(&config, Duration::from_secs(interval.max(1))).await;
         }
 
         Commands::Hook { event, runtime } => {

@@ -38,4 +38,6 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+ratatui = "0.30"
+crossterm = "0.29"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }

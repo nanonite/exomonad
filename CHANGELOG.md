@@ -49,6 +49,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add Ratatui dashboard for the watcher pane (#384)
 - Add spawn_reviewer MCP tool so TL can trigger reviews on demand without clearing watcher state (#379)
 - Add session_status MCP tool so TL can see all live tmux windows cross-referenced with agent registry (#375)
 - Allow TLs to request reviewer-only PR recovery reviews (#378)
