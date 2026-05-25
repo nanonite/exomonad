@@ -776,7 +776,8 @@ data AgentStatus
     agentStatusPaneId :: Hs.Text,
     agentStatusWindowAlive :: Hs.Bool,
     agentStatusAgeMins :: Hs.Word64,
-    agentStatusBirthBranch :: Hs.Text
+    agentStatusBirthBranch :: Hs.Text,
+    agentStatusLifecycleStatus :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -798,7 +799,8 @@ instance (HsProtobuf.Message AgentStatus) where
         agentStatusPaneId,
         agentStatusWindowAlive,
         agentStatusAgeMins,
-        agentStatusBirthBranch
+        agentStatusBirthBranch,
+        agentStatusLifecycleStatus
       } =
       Hs.mappend
         ( Hs.mappend
@@ -807,54 +809,62 @@ instance (HsProtobuf.Message AgentStatus) where
                     ( Hs.mappend
                         ( Hs.mappend
                             ( Hs.mappend
-                                ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 1)
-                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        agentStatusName
+                                ( Hs.mappend
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 1)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            agentStatusName
+                                        )
+                                    )
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 2)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            agentStatusRole
+                                        )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 2)
+                                    (HsProtobuf.FieldNumber 3)
                                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        agentStatusRole
+                                        agentStatusIssue
                                     )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 3)
+                                (HsProtobuf.FieldNumber 4)
                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                    agentStatusIssue
+                                    agentStatusWindowId
                                 )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 4)
+                            (HsProtobuf.FieldNumber 5)
                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                agentStatusWindowId
+                                agentStatusPaneId
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 5)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            agentStatusPaneId
-                        )
+                        (HsProtobuf.FieldNumber 6)
+                        agentStatusWindowAlive
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 6)
-                    agentStatusWindowAlive
+                    (HsProtobuf.FieldNumber 7)
+                    agentStatusAgeMins
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 7)
-                agentStatusAgeMins
+                (HsProtobuf.FieldNumber 8)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    agentStatusBirthBranch
+                )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 8)
+            (HsProtobuf.FieldNumber 9)
             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                agentStatusBirthBranch
+                agentStatusLifecycleStatus
             )
         )
   decodeMessage _ =
@@ -899,6 +909,12 @@ instance (HsProtobuf.Message AgentStatus) where
               ( HsProtobuf.at
                   HsProtobuf.decodeMessageField
                   (HsProtobuf.FieldNumber 8)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 9)
               )
           )
   dotProto _ =
@@ -949,11 +965,17 @@ instance (HsProtobuf.Message AgentStatus) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "birth_branch")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "lifecycle_status")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB AgentStatus) where
-  toJSONPB (AgentStatus f1 f2 f3 f4 f5 f6 f7 f8) =
+  toJSONPB (AgentStatus f1 f2 f3 f4 f5 f6 f7 f8 f9) =
     HsJSONPB.object
       [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "role" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -965,9 +987,11 @@ instance (HsJSONPB.ToJSONPB AgentStatus) where
         "window_alive" .= f6,
         "age_mins" .= f7,
         "birth_branch"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "lifecycle_status"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9)
       ]
-  toEncodingPB (AgentStatus f1 f2 f3 f4 f5 f6 f7 f8) =
+  toEncodingPB (AgentStatus f1 f2 f3 f4 f5 f6 f7 f8 f9) =
     HsJSONPB.pairs
       [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "role" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -979,7 +1003,9 @@ instance (HsJSONPB.ToJSONPB AgentStatus) where
         "window_alive" .= f6,
         "age_mins" .= f7,
         "birth_branch"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "lifecycle_status"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9)
       ]
 
 instance (HsJSONPB.FromJSONPB AgentStatus) where
@@ -1007,6 +1033,9 @@ instance (HsJSONPB.FromJSONPB AgentStatus) where
             <*> obj .: "age_mins"
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "birth_branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "lifecycle_status")
                 )
       )
 

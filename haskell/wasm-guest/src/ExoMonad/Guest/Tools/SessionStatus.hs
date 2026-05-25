@@ -38,7 +38,7 @@ instance FromJSON SessionStatusArgs where
     SessionStatusArgs <$> v .:? "include_dead" .!= False
 
 sessionStatusDescription :: Text
-sessionStatusDescription = "List known ExoMonad agents with tmux liveness, issue, age, routing target, and birth branch. Pass include_dead=true to show stale registry entries whose windows or panes are gone."
+sessionStatusDescription = "List known ExoMonad agents with tmux liveness, Forgejo-aware work-unit status, issue, age, routing target, and birth branch. Pass include_dead=true to show stale registry entries whose windows or panes are gone."
 
 sessionStatusSchema :: Aeson.Object
 sessionStatusSchema =
@@ -95,7 +95,7 @@ renderAgentRow agent =
 renderRow :: [Text] -> Text
 renderRow fields = T.intercalate "  " (zipWith pad widths fields)
   where
-    widths = [34, 9, 7, 8, 6, 6, 10]
+    widths = [34, 9, 7, 8, 6, 6, 17]
 
 pad :: Int -> Text -> Text
 pad width value = value <> T.replicate (max 0 (width - T.length value)) " "
@@ -109,14 +109,17 @@ agentTarget agent =
 
 agentLifecycleStatus :: PS.AgentStatus -> Text
 agentLifecycleStatus agent
+  | not (T.null status) = status
   | PS.agentStatusWindowAlive agent = "LIVE"
   | not (T.null (lazyField PS.agentStatusIssue agent)) = "FINISHING"
   | otherwise = "ORPHAN"
+  where
+    status = lazyField PS.agentStatusLifecycleStatus agent
 
 deadAgentNote :: [PS.AgentStatus] -> Text
 deadAgentNote agents
   | null dead = ""
-  | otherwise = "Dead agents are safe to inspect before cleanup. FINISHING has an issue; ORPHAN has no issue and needs cleanup_orphan."
+  | otherwise = "Dead agents are safe to inspect before cleanup. WAITING-ON-* means a Forgejo work unit is still open; FINISHING has an issue; ORPHAN has no issue and needs cleanup_orphan."
   where
     dead = filter (not . PS.agentStatusWindowAlive) agents
 

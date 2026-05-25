@@ -52,6 +52,7 @@ message AgentStatus {
   bool window_alive = 6;
   uint64 age_mins = 7;
   string birth_branch = 8;
+  string lifecycle_status = 9;
 }
 
 message ListAgentsRequest {
