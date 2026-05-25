@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Watcher ci_status always Neutral — observed_ci_status never polls Forgejo commit statuses API, depends only on webhooks that are never delivered (#399)
+- spawn_reviewer --force: stale worktree, stale review file, and no watcher state reset — force-respawn cannot unblock a stuck reviewer (#395)
 - Fix Forgejo runner Docker archive upload failures (#387)
 - Fix Forgejo CI workflow dispatch failures (#385)
 - Fix exomonad init resume to preserve existing tmux sessions (#386)
@@ -49,6 +51,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add cleanup_reviewer_leaf MCP tool to kill, clean, and reset a stuck reviewer before respawn (#396)
+- Add cleanup_reviewer_leaf MCP tool to kill, clean, and reset a stuck reviewer before respawn (#396)
 - Add Ratatui dashboard for the watcher pane (#384)
 - Add spawn_reviewer MCP tool so TL can trigger reviews on demand without clearing watcher state (#379)
 - Add session_status MCP tool so TL can see all live tmux windows cross-referenced with agent registry (#375)
@@ -144,6 +148,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Dev-leaf burns tokens polling after file_pr — needs explicit IDLE instruction like root TL protocol (#401)
+- Cleanup: remove spindle, local PR registry, and file-based approvals — Forgejo is the single source of truth (#398)
+- Remove .exo/reviews/pr_N.json — make Forgejo the single source of truth for PR review state (#397)
+- Split send_message into send_tmux_message and send_mailbox_message (#389)
 - Add cleanup_orphan MCP tool and fix dispose_leaf force=true to actually clean up filesystem (#377)
 - e2e test: Forgejo CI pipeline end-to-end (#351)
 - update CLAUDE.md: replace Tangled CI references with Forgejo (#350)
