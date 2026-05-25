@@ -954,6 +954,8 @@ where
                             ReviewerFanOut::DispatchTo(_, _, _) => Some(payload.clone()),
                             _ => None,
                         };
+                        let requests_merge_ready_delivery =
+                            requests_merge_ready_parent_delivery(event_type, &payload);
 
                         if let Ok(Some(response)) = self
                             .call_handle_event_for_role(
@@ -965,12 +967,16 @@ where
                             )
                             .await
                         {
-                            self.handle_event_action(
-                                response,
-                                pending.branch.as_str(),
-                                pending.agent_type,
-                            )
-                            .await;
+                            let delivery_confirmed = self
+                                .handle_event_action(
+                                    response,
+                                    pending.branch.as_str(),
+                                    pending.agent_type,
+                                )
+                                .await;
+                            if delivery_confirmed && requests_merge_ready_delivery {
+                                self.mark_merge_ready_notified(pending.pr_number).await;
+                            }
                             if let Some(message) = release_message {
                                 self.deliver_release_message(
                                     pending.branch.as_str(),
@@ -1021,12 +1027,13 @@ where
                                         )
                                         .await
                                     {
-                                        self.handle_event_action(
-                                            response,
-                                            reviewer_branch.as_str(),
-                                            reviewer_agent_type,
-                                        )
-                                        .await;
+                                        let _ = self
+                                            .handle_event_action(
+                                                response,
+                                                reviewer_branch.as_str(),
+                                                reviewer_agent_type,
+                                            )
+                                            .await;
                                     }
                                 }
                             }
@@ -1373,12 +1380,24 @@ where
         AgentName::try_from_str(branch_tail).expect("validated string input is non-empty")
     }
 
+    async fn mark_merge_ready_notified(&self, pr_number: u64) {
+        let mut state_guard = self.state.lock().await;
+        if let Some(state) = state_guard.get_mut(&pr_number) {
+            state.merge_ready_notified = true;
+        } else {
+            warn!(
+                pr_number,
+                "Cannot mark merge-ready notification delivered because watcher state is missing"
+            );
+        }
+    }
+
     async fn handle_event_action(
         &self,
         action: EventActionResponse,
         branch: &str,
         agent_type: AgentType,
-    ) {
+    ) -> bool {
         match action {
             EventActionResponse::InjectMessage { message } => {
                 let agent_name =
@@ -1393,16 +1412,19 @@ where
                         let slug = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
                         agent_type.tab_display_name(slug)
                     });
-                crate::services::delivery::deliver_to_agent(
-                    &*self.ctx,
-                    branch,
-                    &tab_name,
-                    &AgentName::try_from_str("event-handler")
-                        .expect("literal validated string is non-empty"),
-                    &message,
-                    "Event handler action",
+                !matches!(
+                    crate::services::delivery::deliver_to_agent(
+                        &*self.ctx,
+                        branch,
+                        &tab_name,
+                        &AgentName::try_from_str("event-handler")
+                            .expect("literal validated string is non-empty"),
+                        &message,
+                        "Event handler action",
+                    )
+                    .await,
+                    crate::services::delivery::DeliveryResult::Failed
                 )
-                .await;
             }
             EventActionResponse::NotifyParent {
                 message,
@@ -1422,19 +1444,22 @@ where
 
                 let agent_name = AgentName::try_from_str(agent_slug)
                     .expect("validated string input is non-empty");
-                crate::services::delivery::notify_parent_delivery(
-                    &*self.ctx,
-                    &agent_name,
-                    &parent_session_id,
-                    &parent_tab,
-                    crate::services::delivery::NotifyStatus::Success,
-                    &message,
-                    None,
-                    "event_handler",
+                !matches!(
+                    crate::services::delivery::notify_parent_delivery(
+                        &*self.ctx,
+                        &agent_name,
+                        &parent_session_id,
+                        &parent_tab,
+                        crate::services::delivery::NotifyStatus::Success,
+                        &message,
+                        None,
+                        "event_handler",
+                    )
+                    .await,
+                    crate::services::delivery::DeliveryResult::Failed
                 )
-                .await;
             }
-            EventActionResponse::NoAction => {}
+            EventActionResponse::NoAction => false,
         }
     }
 
@@ -1802,6 +1827,7 @@ fn compute_pr_actions_with_context(
     max_wait_seconds: u64,
 ) -> Vec<PendingAction> {
     let mut pending_actions = Vec::new();
+    let mut emitted_merge_ready_notification = false;
     let comment_count = comments.len() + reviews.len();
 
     let now = Instant::now();
@@ -1941,7 +1967,7 @@ fn compute_pr_actions_with_context(
             }),
         });
         if merge_ready_now {
-            old_state.merge_ready_notified = true;
+            emitted_merge_ready_notification = true;
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
                 payload: serde_json::json!({
@@ -2034,7 +2060,7 @@ fn compute_pr_actions_with_context(
                 old_state.ci_mergeable_at,
             );
         if ci_completed_merge_ready {
-            old_state.merge_ready_notified = true;
+            emitted_merge_ready_notification = true;
         }
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "ci_status",
@@ -2054,6 +2080,18 @@ fn compute_pr_actions_with_context(
             reviews: None,
         });
         old_state.last_ci_status = ci_status;
+    }
+
+    if merge_ready_now && !emitted_merge_ready_notification {
+        pending_actions.push(PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": "merge_ready",
+                "pr_number": pr_number.as_u64(),
+                "ci_status": ci_status.as_str(),
+                "branch": branch,
+            }),
+        });
     }
 
     if !old_state.notified_parent_timeout
@@ -2429,6 +2467,17 @@ fn review_stall_diagnostic(
         ci_status: ci_status.to_string(),
     }
 }
+fn requests_merge_ready_parent_delivery(event_type: &str, payload: &serde_json::Value) -> bool {
+    match event_type {
+        "pr_review" => payload.get("kind").and_then(|value| value.as_str()) == Some("merge_ready"),
+        "ci_status" => payload
+            .get("merge_ready")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
     let kind_is_merge_ready = payload
         .get("kind")
@@ -3185,7 +3234,7 @@ mod tests {
                 payload,
             } if payload["kind"] == "merge_ready" && payload["ci_status"] == "success"
         )));
-        assert!(state.merge_ready_notified);
+        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -3222,7 +3271,7 @@ mod tests {
                 payload,
             } if payload["status"] == "success"
         )));
-        assert!(state.merge_ready_notified);
+        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -3252,7 +3301,44 @@ mod tests {
                 payload,
             } if payload["kind"] == "merge_ready" && payload["ci_status"] == "neutral"
         )));
-        assert!(state.merge_ready_notified);
+        assert!(!state.merge_ready_notified);
+    }
+
+    #[test]
+    fn test_merge_ready_retries_until_delivery_marks_notified() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.notified_parent_approved = true;
+        state.last_review_state = ReviewState::Approved;
+        state.last_ci_status = CIStatus::Success;
+        state.review_approved_at = Some(Instant::now() - Duration::from_secs(60));
+        state.ci_mergeable_at = Some(Instant::now() - Duration::from_secs(60));
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &[],
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload,
+            } if payload["kind"] == "merge_ready"
+        )));
+        assert!(
+            !state.merge_ready_notified,
+            "pure compute must not mark merge_ready_notified before async delivery succeeds"
+        );
     }
 
     #[tokio::test]
@@ -3315,7 +3401,7 @@ mod tests {
                 payload,
             } if payload["merge_ready"] == true && payload["reviewer_approved"] == true
         )));
-        assert!(state.merge_ready_notified);
+        assert!(!state.merge_ready_notified);
     }
 
     #[test]
