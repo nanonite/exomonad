@@ -131,6 +131,23 @@ fn evict_closed_prs_from_state(state: &mut WatcherStateFile, registry: &PrRegist
     evicted
 }
 
+fn dropped_review_by_sha_log_line(pr_number: u64, review_commit: &str, head_sha: &str) -> String {
+    format!(
+        "dropped-review-by-SHA: PR #{pr_number} review commit {review_commit} does not match head {head_sha}"
+    )
+}
+
+fn reviewer_disposal_log_line(pr_number: u64, reviewer_slugs: &[String]) -> String {
+    if reviewer_slugs.is_empty() {
+        format!("terminal review observed for PR #{pr_number} but no reviewer slug matched for disposal")
+    } else {
+        format!(
+            "terminal review observed for PR #{pr_number}; disposing reviewer slugs: {}",
+            reviewer_slugs.join(",")
+        )
+    }
+}
+
 /// Decide whether to fan a PR review event out to the reviewer.
 ///
 /// Only events that require a fresh reviewer action are fanned out to the
@@ -1077,12 +1094,19 @@ where
             self.persist_review_states(&review_state_updates).await?;
         }
         for pr_number in reviewer_disposals {
-            dispose_reviewers_for_pr(
+            let reviewer_slugs = dispose_reviewers_for_pr(
                 self.ctx.project_dir(),
                 self.ctx.git_worktree_service().clone(),
                 pr_number,
             )
             .await;
+            let log_line = reviewer_disposal_log_line(pr_number, &reviewer_slugs);
+            if reviewer_slugs.is_empty() {
+                warn!(pr_number, "{log_line}");
+            } else {
+                info!(pr_number, reviewer_slugs = ?reviewer_slugs, "terminal review triggered reviewer disposal");
+            }
+            self.append_watcher_log(&log_line).await;
         }
 
         for pending in pending_actions {
@@ -1833,11 +1857,17 @@ where
 
         let mut local_reviews = Vec::new();
         for review in reviews {
-            if review
+            if let Some(review_commit) = review
                 .commit_id
                 .as_deref()
-                .is_some_and(|commit| !head_sha.is_empty() && commit != head_sha)
+                .filter(|commit| !head_sha.is_empty() && *commit != head_sha)
             {
+                self.append_watcher_log(&dropped_review_by_sha_log_line(
+                    pr_number,
+                    review_commit,
+                    head_sha,
+                ))
+                .await;
                 continue;
             }
             let state = review_state_from_str(&review.state);
@@ -4376,6 +4406,22 @@ mod tests {
         assert!(!temp_dir.path().join(".exo/prs.json").exists());
     }
 
+    #[test]
+    fn watcher_log_line_formatters_include_review_disposal_and_sha_drop_context() {
+        assert_eq!(
+            dropped_review_by_sha_log_line(7, "old-sha", "new-sha"),
+            "dropped-review-by-SHA: PR #7 review commit old-sha does not match head new-sha"
+        );
+        assert_eq!(
+            reviewer_disposal_log_line(7, &["review-pr-7-codex".to_string()]),
+            "terminal review observed for PR #7; disposing reviewer slugs: review-pr-7-codex"
+        );
+        assert_eq!(
+            reviewer_disposal_log_line(7, &[]),
+            "terminal review observed for PR #7 but no reviewer slug matched for disposal"
+        );
+    }
+
     #[tokio::test]
     async fn test_process_observations_disposes_reviewer_when_restart_sees_approved_pr() {
         use std::sync::atomic::Ordering;
@@ -4431,6 +4477,50 @@ mod tests {
         );
         let state = watcher.state.lock().await;
         assert!(state.get(&1).is_some_and(|state| state.reviewer_disposed));
+        drop(state);
+        let watcher_log = tokio::fs::read_to_string(temp_dir.path().join(".exo/logs/watcher.log"))
+            .await
+            .unwrap();
+        assert!(watcher_log.contains(
+            "terminal review observed for PR #1; disposing reviewer slugs: review-pr-1-codex"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_warns_when_terminal_review_has_no_reviewer_slug() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let mut pr = test_pr_entry();
+        pr.review_state = crate::services::pr_registry::ForgejoReviewState::Approved;
+        let registry = test_registry(pr);
+
+        let mut observations = HashMap::new();
+        observations.insert(
+            1u64,
+            Observation {
+                head_sha: "abc123".to_string(),
+                review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
+                comments: vec![],
+                reviews: vec![test_review("approved", ForgejoReviewVerdict::Approved)],
+                ci_status: CIStatus::Unknown,
+                forgejo_review_present: true,
+            },
+        );
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        let watcher_log = tokio::fs::read_to_string(temp_dir.path().join(".exo/logs/watcher.log"))
+            .await
+            .unwrap();
+        assert!(watcher_log.contains(
+            "terminal review observed for PR #1 but no reviewer slug matched for disposal"
+        ));
     }
 
     #[tokio::test]

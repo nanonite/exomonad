@@ -7,12 +7,13 @@ pub async fn dispose_reviewers_for_pr(
     project_dir: &Path,
     git_wt: Arc<GitWorktreeService>,
     pr_number: u64,
-) {
+) -> Vec<String> {
     let slugs = reviewer_slugs_for_pr(project_dir, pr_number).await;
-    for slug in slugs {
+    for slug in &slugs {
         info!(pr_number, reviewer = %slug, "Disposing ephemeral reviewer agent");
-        dispose_agent_resources(project_dir, git_wt.clone(), &slug).await;
+        dispose_agent_resources(project_dir, git_wt.clone(), slug).await;
     }
+    slugs
 }
 
 async fn reviewer_slugs_for_pr(project_dir: &Path, pr_number: u64) -> Vec<String> {
