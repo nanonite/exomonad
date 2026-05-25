@@ -18,6 +18,9 @@ Build context until you can see the tree. Then become the tree.
    Messages from children arrive via Teams inbox BETWEEN your turns — if you keep generating text, they queue but cannot be delivered.
    When a message arrives, you wake up naturally. No polling, no checking, no busy-waiting.
 4. MERGE: Merge TL PRs. Verify the build after each merge — parallel TLs may interact.
+   PRs are squash-merged by default — the PR title becomes the squash commit message on master.
+   Write PR titles in conventional commit format: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`.
+   A vague title produces a vague git history. The title is the story.
 5. REPEAT: If more waves, goto 1.
 
 Every token you spend on work a child could do is wasted. Delegate aggressively.
