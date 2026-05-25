@@ -354,6 +354,159 @@ enum EventActionResponse {
     NoAction,
 }
 
+fn value_u64(payload: &serde_json::Value, key: &str) -> Option<u64> {
+    payload.get(key).and_then(|value| value.as_u64())
+}
+
+fn value_i64(payload: &serde_json::Value, key: &str) -> Option<i64> {
+    payload.get(key).and_then(|value| value.as_i64())
+}
+
+fn value_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    payload.get(key).and_then(|value| value.as_str())
+}
+
+fn review_received_message(pr_number: u64, comments: &str) -> String {
+    format!("## Review on PR #{pr_number}\n\n{comments}\n\nAddress these comments and push fixes.")
+}
+
+fn merge_ready_message(pr_number: u64, status: &str, branch: &str) -> String {
+    format!(
+        "[MERGE READY] PR #{pr_number} on branch {branch} has CI status {status} and reviewer approval. Merge with `merge_pr` tool."
+    )
+}
+
+fn ci_status_message(pr_number: u64, status: &str, branch: &str) -> String {
+    let suffix = match status {
+        "success" => "\n\nCI passed.",
+        "failure" => "\n\nCI failed. Check the logs and fix the issue before proceeding.",
+        _ => "",
+    };
+    format!("[CI Status] PR #{pr_number} on branch {branch}: {status}{suffix}")
+}
+
+fn ci_blocked_message(pr_number: u64, status: &str, branch: &str) -> String {
+    format!(
+        "[CI BLOCKED: PR #{pr_number}] CI finished with status {status} on {branch}. Dev leaf is staying alive and waiting for TL direction."
+    )
+}
+
+fn sibling_merged_message(merged_branch: &str, parent_branch: &str) -> String {
+    format!(
+        "[Sibling Merged] PR on branch {merged_branch} was merged into {parent_branch}. Rebase your branch to pick up the changes: git fetch origin && git rebase origin/{parent_branch}"
+    )
+}
+
+fn codex_dev_fallback_event_action(
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Option<EventActionResponse> {
+    match event_type {
+        "pr_review" => codex_dev_fallback_pr_review_action(payload),
+        "ci_status" => codex_dev_fallback_ci_status_action(payload),
+        "sibling_merged" => Some(EventActionResponse::InjectMessage {
+            message: sibling_merged_message(
+                value_str(payload, "merged_branch")?,
+                value_str(payload, "parent_branch")?,
+            ),
+        }),
+        "issue_closed" => Some(EventActionResponse::InjectMessage {
+            message: format!(
+                "[ISSUE CLOSED: #{} closed by {}. Exiting; your worktree will be cleaned up.]",
+                value_i64(payload, "issue_id")?,
+                value_str(payload, "closed_by")?
+            ),
+        }),
+        _ => None,
+    }
+}
+
+fn codex_dev_fallback_pr_review_action(payload: &serde_json::Value) -> Option<EventActionResponse> {
+    let kind = value_str(payload, "kind")?;
+    match kind {
+        "review_received" | "reviewer_requested_changes" => Some(EventActionResponse::InjectMessage {
+            message: review_received_message(
+                value_u64(payload, "pr_number")?,
+                value_str(payload, "comments")?,
+            ),
+        }),
+        "ci_triggered" => Some(EventActionResponse::InjectMessage {
+            message: format!(
+                "[CI TRIGGERED] PR #{} on {}. Waiting for CI result.",
+                value_u64(payload, "pr_number")?,
+                value_str(payload, "branch")?
+            ),
+        }),
+        "ci_blocked" => {
+            let pr_number = value_u64(payload, "pr_number")?;
+            Some(EventActionResponse::NotifyParent {
+                message: ci_blocked_message(
+                    pr_number,
+                    value_str(payload, "ci_status")?,
+                    value_str(payload, "branch")?,
+                ),
+                pr_number: pr_number as i64,
+            })
+        }
+        "stuck" => Some(EventActionResponse::InjectMessage {
+            message: format!(
+                "Review loop stopped for PR #{} after {} rounds. Stay alive and wait for TL clarification.",
+                value_u64(payload, "pr_number")?,
+                value_u64(payload, "rounds")?
+            ),
+        }),
+        "merge_ready" => Some(EventActionResponse::InjectMessage {
+            message: merge_ready_message(
+                value_u64(payload, "pr_number")?,
+                value_str(payload, "ci_status")?,
+                value_str(payload, "branch")?,
+            ),
+        }),
+        "approved"
+        | "reviewer_approved"
+        | "timeout"
+        | "fixes_pushed"
+        | "commits_pushed"
+        | "rate_limited"
+        | "dev_not_pushing"
+        | "reviewer_not_responding"
+        | "reviewer_never_started"
+        | "dev_failed" => Some(EventActionResponse::NoAction),
+        _ => None,
+    }
+}
+
+fn codex_dev_fallback_ci_status_action(payload: &serde_json::Value) -> Option<EventActionResponse> {
+    let pr_number = value_u64(payload, "pr_number")?;
+    let status = value_str(payload, "status")?;
+    let branch = value_str(payload, "branch")?;
+    let merge_blocked_on_ci = payload
+        .get("merge_blocked_on_ci")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let merge_ready = payload
+        .get("merge_ready")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    if (merge_blocked_on_ci || merge_ready) && matches!(status, "success" | "neutral") {
+        return Some(EventActionResponse::InjectMessage {
+            message: merge_ready_message(pr_number, status, branch),
+        });
+    }
+
+    if merge_blocked_on_ci && status == "failure" {
+        return Some(EventActionResponse::NotifyParent {
+            message: ci_blocked_message(pr_number, status, branch),
+            pr_number: pr_number as i64,
+        });
+    }
+
+    Some(EventActionResponse::InjectMessage {
+        message: ci_status_message(pr_number, status, branch),
+    })
+}
+
 /// Observation collected from local sources for one open PR.
 struct Observation {
     head_sha: String,
@@ -1256,6 +1409,18 @@ where
         let plugin = match plugins_guard.get(&agent_name) {
             Some(p) => p.clone(),
             None => {
+                if agent_type == AgentType::Codex && role == "dev" {
+                    if let Some(action) = codex_dev_fallback_event_action(event_type, &payload) {
+                        tracing::info!(
+                            branch,
+                            lookup_key = %agent_name,
+                            role,
+                            event_type,
+                            "No WASM plugin found for Codex dev event target; using tmux-first fallback dispatch"
+                        );
+                        return Ok(Some(action));
+                    }
+                }
                 tracing::error!(
                     branch,
                     lookup_key = %agent_name,
@@ -2360,6 +2525,78 @@ async fn git_head_sha(worktree_path: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_codex_dev_fallback_injects_review_received() {
+        let payload = serde_json::json!({
+            "kind": "review_received",
+            "pr_number": 42,
+            "comments": "Fix the failing assertion",
+        });
+
+        match codex_dev_fallback_event_action("pr_review", &payload) {
+            Some(EventActionResponse::InjectMessage { message }) => {
+                assert!(message.contains("## Review on PR #42"));
+                assert!(message.contains("Fix the failing assertion"));
+                assert!(message.contains("Address these comments and push fixes."));
+            }
+            other => panic!("expected InjectMessage fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_codex_dev_fallback_injects_merge_ready() {
+        let payload = serde_json::json!({
+            "kind": "merge_ready",
+            "pr_number": 43,
+            "ci_status": "success",
+            "branch": "main.feature-codex",
+        });
+
+        match codex_dev_fallback_event_action("pr_review", &payload) {
+            Some(EventActionResponse::InjectMessage { message }) => {
+                assert_eq!(
+                    message,
+                    "[MERGE READY] PR #43 on branch main.feature-codex has CI status success and reviewer approval. Merge with `merge_pr` tool."
+                );
+            }
+            other => panic!("expected merge-ready InjectMessage fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_codex_dev_fallback_notifies_parent_for_ci_blocked() {
+        let payload = serde_json::json!({
+            "pr_number": 44,
+            "status": "failure",
+            "branch": "main.feature-codex",
+            "merge_blocked_on_ci": true,
+        });
+
+        match codex_dev_fallback_event_action("ci_status", &payload) {
+            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
+                assert_eq!(pr_number, 44);
+                assert_eq!(
+                    message,
+                    "[CI BLOCKED: PR #44] CI finished with status failure on main.feature-codex. Dev leaf is staying alive and waiting for TL direction."
+                );
+            }
+            other => panic!("expected CI blocked NotifyParent fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_codex_dev_fallback_preserves_no_action_events() {
+        let payload = serde_json::json!({
+            "kind": "approved",
+            "pr_number": 45,
+        });
+
+        match codex_dev_fallback_event_action("pr_review", &payload) {
+            Some(EventActionResponse::NoAction) => {}
+            other => panic!("expected NoAction fallback, got {other:?}"),
+        }
+    }
 
     fn test_state(branch: &BranchName, agent_type: AgentType, sha: &str) -> WatchState {
         WatchState::new(branch, agent_type, sha, CIStatus::Unknown, 0)
