@@ -118,6 +118,19 @@ fn reviewer_worktree_path(project_dir: &Path, reviewer_agent: &str) -> PathBuf {
     project_dir.join(".exo/worktrees").join(reviewer_agent)
 }
 
+fn evict_closed_prs_from_state(state: &mut WatcherStateFile, registry: &PrRegistry) -> Vec<u64> {
+    let mut evicted = Vec::new();
+    state.prs.retain(|pr_number, _| {
+        let keep = registry.prs.contains_key(pr_number);
+        if !keep {
+            evicted.push(*pr_number);
+        }
+        keep
+    });
+    evicted.sort_unstable();
+    evicted
+}
+
 /// Decide whether to fan a PR review event out to the reviewer.
 ///
 /// Only events that require a fresh reviewer action are fanned out to the
@@ -713,6 +726,27 @@ where
         Ok(())
     }
 
+    async fn evict_closed_prs_from_watcher_state(&self, registry: &PrRegistry) -> Result<()> {
+        let mut state = self.read_watcher_state().await.unwrap_or_default();
+        let evicted = evict_closed_prs_from_state(&mut state, registry);
+        if evicted.is_empty() {
+            return Ok(());
+        }
+
+        self.write_watcher_state(&state).await?;
+        info!(prs = ?evicted, "Evicted closed PRs from watcher state");
+        self.append_watcher_log(&format!(
+            "evicted closed PR state: {}",
+            evicted
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+        .await;
+        Ok(())
+    }
+
     async fn load_registry_from_forgejo(&self) -> Result<PrRegistry> {
         let Some(forgejo) = self.ctx.forgejo_client() else {
             if !self.forgejo_absent_warned.swap(true, Ordering::Relaxed) {
@@ -805,6 +839,7 @@ where
         tracing::info!(pr_count, "[Watcher] poll cycle");
         self.append_watcher_log(&format!("poll: {} open PR(s)", pr_count))
             .await;
+        self.evict_closed_prs_from_watcher_state(&registry).await?;
         if registry.prs.is_empty() {
             return Ok(());
         }
@@ -4232,6 +4267,44 @@ mod tests {
             .unwrap();
 
         assert!(!temp_dir.path().join(".exo/prs.json").exists());
+    }
+
+    #[test]
+    fn evict_closed_prs_from_state_removes_prs_missing_from_open_registry() {
+        let mut state = WatcherStateFile::default();
+        state.prs.insert(
+            1,
+            WatcherPrState {
+                rounds: 1,
+                stuck: true,
+                needs_human_review: true,
+            },
+        );
+        state.prs.insert(
+            2,
+            WatcherPrState {
+                rounds: 2,
+                stuck: false,
+                needs_human_review: false,
+            },
+        );
+        state.prs.insert(
+            3,
+            WatcherPrState {
+                rounds: 3,
+                stuck: true,
+                needs_human_review: false,
+            },
+        );
+        let mut registry = PrRegistry::default();
+        let mut pr = test_pr_entry();
+        pr.number = 2;
+        registry.prs.insert(2, pr);
+
+        let evicted = evict_closed_prs_from_state(&mut state, &registry);
+
+        assert_eq!(evicted, vec![1, 3]);
+        assert_eq!(state.prs.keys().copied().collect::<Vec<_>>(), vec![2]);
     }
 
     #[tokio::test]
