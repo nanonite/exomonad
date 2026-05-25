@@ -45,6 +45,44 @@ fn watcher_dashboard_command(cwd: &Path) -> Result<String> {
     Ok("exomonad watch".to_string())
 }
 
+const WATCHER_WINDOW_NAME: &str = "Watcher";
+
+fn has_watcher_dashboard_window<'a>(window_names: impl IntoIterator<Item = &'a str>) -> bool {
+    window_names
+        .into_iter()
+        .any(|name| name == WATCHER_WINDOW_NAME)
+}
+
+async fn ensure_watcher_dashboard_window(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    cwd: &Path,
+    shell: &str,
+) {
+    let windows = match ipc.list_windows().await {
+        Ok(windows) => windows,
+        Err(e) => {
+            warn!(error = %e, "Failed to list tmux windows before checking Watcher dashboard (non-fatal)");
+            return;
+        }
+    };
+
+    if has_watcher_dashboard_window(windows.iter().map(|window| window.window_name.as_str())) {
+        debug!("Watcher dashboard window already exists");
+        return;
+    }
+
+    match watcher_dashboard_command(cwd) {
+        Ok(watcher_cmd) => match ipc
+            .new_window(WATCHER_WINDOW_NAME, cwd, shell, &watcher_cmd)
+            .await
+        {
+            Ok(watcher_win) => info!(window = %watcher_win, "Watcher dashboard window created"),
+            Err(e) => warn!(error = %e, "Failed to create Watcher dashboard window (non-fatal)"),
+        },
+        Err(e) => warn!(error = %e, "Failed to prepare Watcher dashboard window (non-fatal)"),
+    }
+}
+
 fn forgejo_host_from_url(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -505,6 +543,9 @@ pub async fn run(
     let session = session_override.unwrap_or(config.tmux_session.clone());
     let session_alive = TmuxIpc::has_session(&session).await?;
     if should_attach_existing_session(recreate, session_alive) {
+        let ipc = TmuxIpc::new(&session);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await;
         report_orphaned_agent_windows(&session, &cwd).await;
         info!(session = %session, "Attaching to existing session");
         return TmuxIpc::attach_session(&session).await;
@@ -1128,13 +1169,7 @@ pub async fn run(
     // 4. Poll for server socket
     wait_for_server_socket(&cwd).await?;
 
-    match watcher_dashboard_command(&cwd) {
-        Ok(watcher_cmd) => match ipc.new_window("Watcher", &cwd, &shell, &watcher_cmd).await {
-            Ok(watcher_win) => info!(window = %watcher_win, "Watcher dashboard window created"),
-            Err(e) => warn!(error = %e, "Failed to create Watcher dashboard window (non-fatal)"),
-        },
-        Err(e) => warn!(error = %e, "Failed to prepare Watcher dashboard window (non-fatal)"),
-    }
+    ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await;
 
     // 5. Spawn companion agents
     let companions_to_spawn: Vec<&crate::config::CompanionConfig> =
@@ -1838,6 +1873,12 @@ mod tests {
 
         assert!(log_path.exists());
         assert_eq!(command, "exomonad watch");
+    }
+
+    #[test]
+    fn watcher_dashboard_window_detection_uses_window_name() {
+        assert!(has_watcher_dashboard_window(["Server", "Watcher", "TL"]));
+        assert!(!has_watcher_dashboard_window(["Server", "TL"]));
     }
 
     #[test]
