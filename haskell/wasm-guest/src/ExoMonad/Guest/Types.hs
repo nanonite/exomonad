@@ -22,6 +22,7 @@ module ExoMonad.Guest.Types
     postToolUseResponse,
     allowStopResponse,
     blockStopResponse,
+    silentBlockStopResponse,
 
     -- * Gemini-specific hook types
     BeforeModelOutput (..),
@@ -317,6 +318,14 @@ blockStopResponse msg =
   StopHookOutput
     { decision = Block,
       reason = Just msg
+    }
+
+-- | Create a silent "block" response for Stop hooks that should keep the agent idle.
+silentBlockStopResponse :: StopHookOutput
+silentBlockStopResponse =
+  StopHookOutput
+    { decision = Block,
+      reason = Nothing
     }
 
 -- ============================================================================

@@ -630,14 +630,9 @@ fn format_codex_stop(envelope: HookEnvelope) -> HookEnvelope {
 
     let mut object = Map::new();
     object.insert("decision".to_string(), Value::String("block".to_string()));
-    object.insert(
-        "reason".to_string(),
-        Value::String(
-            output
-                .stop_reason
-                .unwrap_or_else(|| "Hook blocked stop".to_string()),
-        ),
-    );
+    if let Some(reason) = output.stop_reason {
+        object.insert("reason".to_string(), Value::String(reason));
+    }
     codex_json_envelope(Value::Object(object))
 }
 
@@ -871,6 +866,24 @@ mod tests {
         assert_eq!(formatted.exit_code, 0);
         assert_eq!(json["decision"], "block");
         assert_eq!(json["reason"], "run tests");
+    }
+
+    #[test]
+    fn test_format_codex_stop_block_without_reason_stays_silent() {
+        let output = ClaudeStopHookOutput {
+            continue_: false,
+            stop_reason: None,
+        };
+        let envelope = HookEnvelope {
+            stdout: serde_json::to_string(&output).unwrap(),
+            exit_code: 0,
+        };
+
+        let formatted = format_codex_hook_response(HookEventType::Stop, envelope);
+        let json: Value = serde_json::from_str(&formatted.stdout).unwrap();
+        assert_eq!(formatted.exit_code, 0);
+        assert_eq!(json["decision"], "block");
+        assert!(json.get("reason").is_none());
     }
 
     // =========================================================================

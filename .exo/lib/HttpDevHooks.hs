@@ -25,7 +25,7 @@ import ExoMonad.Effects.Log (LogEmitEvent, LogInfo)
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch, checkUncommittedWork, checkPRNotFiled)
 import ExoMonad.Guest.StateMachine (StopCheckResult(..), checkExit, describeStopResult)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
-import ExoMonad.Guest.Types (HookInput (..), HookOutput (..), Runtime (..), StopDecision(..), StopHookOutput(..), BeforeModelOutput (..), AfterModelOutput (..), allowResponse, denyResponse, postToolUseResponse, allowStopResponse, blockStopResponse)
+import ExoMonad.Guest.Types (HookInput (..), HookOutput (..), Runtime (..), StopDecision(..), StopHookOutput(..), BeforeModelOutput (..), AfterModelOutput (..), allowResponse, denyResponse, postToolUseResponse, allowStopResponse, silentBlockStopResponse)
 import ExoMonad.Permissions (PermissionCheck (..), checkAgentPermissions)
 import ExoMonad.Types (HookConfig (..), Effects, defaultSessionStartHook)
 import DevPhase (DevPhase(..), DevEvent)
@@ -126,7 +126,7 @@ devStopCheck = do
           Log.emitEventRequestTimestamp = 0
         })
       case result of
-        MustBlock msg -> pure $ blockStopResponse msg
+        MustBlock _ -> pure silentBlockStopResponse
         ShouldNudge msg -> pure $ StopHookOutput Allow (Just msg)
         Clean -> do
           uncommitted <- checkUncommittedWork branch
