@@ -14,6 +14,7 @@ module ExoMonad.Effects.Agent
     AgentSpawnSubtree,
     AgentSpawnReviewer,
     AgentCleanupReviewerLeaf,
+    AgentWatcherPrState,
     AgentSpawnLeafSubtree,
     AgentSpawnAcp,
     AgentCleanup,
@@ -86,6 +87,13 @@ instance Effect AgentCleanupReviewerLeaf where
   type Input AgentCleanupReviewerLeaf = CleanupReviewerLeafRequest
   type Output AgentCleanupReviewerLeaf = CleanupReviewerLeafResponse
   effectId = "agent.cleanup_reviewer_leaf"
+
+data AgentWatcherPrState
+
+instance Effect AgentWatcherPrState where
+  type Input AgentWatcherPrState = WatcherPrStateRequest
+  type Output AgentWatcherPrState = WatcherPrStateResponse
+  effectId = "agent.watcher_pr_state"
 
 data AgentSpawnLeafSubtree
 

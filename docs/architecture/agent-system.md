@@ -39,13 +39,17 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 | `spawn_leaf` | x | x | | | |
 | `spawn_codex` | x | x | | | |
 | `spawn_worker` | x | x | | | |
+| `spawn_reviewer` | x | x | | | |
 | `close_worker_pane` | x | x | | | |
 | `close_issue_and_cleanup` | x | x | | | |
 | `cleanup_reviewer_leaf` | x | x | | | |
+| `cleanup_orphan` | x | x | | | |
+| `watcher_pr_state` | x | x | | | |
 | `file_pr` | | x | x | | |
 | `merge_pr` | x | x | | | |
 | `notify_parent` | | x | x | | x |
-| `send_message` | x | x | x | | x |
+| `send_tmux_message` / `send_mailbox_message` | x | x | x | | x |
+| `session_status` | x | x | | | |
 | `task_list` / `task_get` / `task_update` | | | x | | x |
 | `approve_pr` | | | | x | |
 | `request_changes` | | | | x | |

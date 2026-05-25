@@ -18,7 +18,7 @@ use crate::services::agent_control::{
     SpawnWorkerOptions,
 };
 use crate::services::agent_resources::dispose_agent_resources;
-use crate::services::forgejo::ForgejoPullRequest;
+use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
 #[cfg(test)]
 use crate::services::pr_registry::PrRegistry;
 use crate::services::pr_registry::{LocalReviewState, PrEntry, PrState};
@@ -444,6 +444,93 @@ fn parse_repo(repo: &str) -> EffectResult<GithubRepo> {
     GithubRepo::try_from(repo.to_string()).map_err(|e| EffectError::invalid_input(e.to_string()))
 }
 
+fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPrStateResponse {
+    WatcherPrStateResponse {
+        success: false,
+        error: error.into(),
+        pr_number,
+        found: false,
+        merge_ready: false,
+        blocker: String::new(),
+        review_state: "unknown".to_string(),
+        ci_status: CIStatus::Unknown.as_str().to_string(),
+        head_sha: String::new(),
+        head_branch: String::new(),
+        base_branch: String::new(),
+        pr_state: String::new(),
+        merged: false,
+        review_count: 0,
+    }
+}
+
+fn review_state_from_forgejo_reviews(
+    reviews: &[ForgejoPullRequestReview],
+    head_sha: &str,
+) -> (String, u32) {
+    let mut has_approved = false;
+    let mut has_changes_requested = false;
+    let mut review_count = 0;
+
+    for review in reviews {
+        if review
+            .commit_id
+            .as_deref()
+            .is_some_and(|commit| !head_sha.is_empty() && commit != head_sha)
+        {
+            continue;
+        }
+
+        match review.state.to_ascii_lowercase().as_str() {
+            "approved" | "approve" => {
+                has_approved = true;
+                review_count += 1;
+            }
+            "changes_requested" | "request_changes" | "request_changes_requested" => {
+                has_changes_requested = true;
+                review_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    if has_changes_requested {
+        ("changes_requested".to_string(), review_count)
+    } else if has_approved {
+        ("approved".to_string(), review_count)
+    } else {
+        ("pending_review".to_string(), review_count)
+    }
+}
+
+fn watcher_pr_merge_diagnosis(
+    pr: &ForgejoPullRequest,
+    review_state: &str,
+    ci_status: CIStatus,
+) -> (bool, String) {
+    if pr.merged {
+        return (false, "PR is already merged".to_string());
+    }
+    if !pr.state.eq_ignore_ascii_case("open") {
+        return (false, format!("PR is {}", pr.state));
+    }
+    if pr.head_sha.as_deref().unwrap_or_default().is_empty() {
+        return (false, "PR head SHA is unavailable".to_string());
+    }
+    if review_state == "changes_requested" {
+        return (false, "review changes requested".to_string());
+    }
+    if review_state != "approved" {
+        return (false, "review approval pending".to_string());
+    }
+
+    match ci_status {
+        CIStatus::Success | CIStatus::Neutral => (true, String::new()),
+        CIStatus::Pending => (false, "CI status pending".to_string()),
+        CIStatus::Failure => (false, "CI status failure".to_string()),
+        CIStatus::Unknown => (false, "CI status unknown".to_string()),
+    }
+}
+
 #[async_trait]
 impl<
         C: HasTeamRegistry
@@ -828,6 +915,76 @@ impl<
                 cleaned_reviewers,
             }),
         }
+    }
+
+    async fn watcher_pr_state(
+        &self,
+        req: WatcherPrStateRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<WatcherPrStateResponse> {
+        if req.pr_number == 0 {
+            return Err(EffectError::invalid_input("pr_number is required"));
+        }
+
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Ok(watcher_pr_state_error(
+                req.pr_number,
+                "Forgejo is not configured; cannot query PR state",
+            ));
+        };
+        let repo_info = match crate::services::repo::get_repo_info(self.ctx.project_dir()).await {
+            Ok(repo_info) => repo_info,
+            Err(error) => return Ok(watcher_pr_state_error(req.pr_number, error.to_string())),
+        };
+
+        let pr = match forgejo
+            .get_pull_request(
+                &repo_info.owner,
+                &repo_info.repo,
+                PRNumber::new(req.pr_number),
+            )
+            .await
+        {
+            Ok(pr) => pr,
+            Err(error) => return Ok(watcher_pr_state_error(req.pr_number, error.to_string())),
+        };
+        let head_sha = pr.head_sha.clone().unwrap_or_default();
+
+        let reviews = forgejo
+            .list_pull_request_reviews(
+                &repo_info.owner,
+                &repo_info.repo,
+                PRNumber::new(req.pr_number),
+            )
+            .await
+            .effect_err("agent")?;
+        let (review_state, review_count) = review_state_from_forgejo_reviews(&reviews, &head_sha);
+        let ci_status = if head_sha.is_empty() {
+            CIStatus::Unknown
+        } else {
+            forgejo
+                .commit_status_for_head(&repo_info.owner, &repo_info.repo, &head_sha)
+                .await
+                .unwrap_or(CIStatus::Unknown)
+        };
+        let (merge_ready, blocker) = watcher_pr_merge_diagnosis(&pr, &review_state, ci_status);
+
+        Ok(WatcherPrStateResponse {
+            success: true,
+            error: String::new(),
+            pr_number: req.pr_number,
+            found: true,
+            merge_ready,
+            blocker,
+            review_state,
+            ci_status: ci_status.as_str().to_string(),
+            head_sha,
+            head_branch: pr.head_ref.to_string(),
+            base_branch: pr.base_ref.to_string(),
+            pr_state: pr.state,
+            merged: pr.merged,
+            review_count,
+        })
     }
 
     async fn spawn_leaf_subtree(
@@ -1856,6 +2013,61 @@ mod tests {
             ServiceAgentType::Codex
         );
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
+    }
+
+    fn test_forgejo_pr() -> ForgejoPullRequest {
+        ForgejoPullRequest {
+            number: PRNumber::new(7),
+            url: "https://forgejo.local/pr/7".to_string(),
+            title: "Test PR".to_string(),
+            body: String::new(),
+            head_ref: BranchName::try_from_str("main.feature-codex")
+                .expect("literal branch is non-empty"),
+            base_ref: BranchName::try_from_str("main").expect("literal branch is non-empty"),
+            state: "open".to_string(),
+            merged: false,
+            head_sha: Some("abc123".to_string()),
+        }
+    }
+
+    fn test_review(state: &str, commit_id: Option<&str>) -> ForgejoPullRequestReview {
+        ForgejoPullRequestReview {
+            state: state.to_string(),
+            body: String::new(),
+            commit_id: commit_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn watcher_pr_review_state_prefers_current_head_changes_requested() {
+        let reviews = vec![
+            test_review("APPROVED", Some("abc123")),
+            test_review("REQUEST_CHANGES", Some("abc123")),
+            test_review("APPROVED", Some("oldsha")),
+        ];
+
+        let (state, count) = review_state_from_forgejo_reviews(&reviews, "abc123");
+
+        assert_eq!(state, "changes_requested");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn watcher_pr_merge_diagnosis_requires_review_and_green_ci() {
+        let pr = test_forgejo_pr();
+
+        assert_eq!(
+            watcher_pr_merge_diagnosis(&pr, "approved", CIStatus::Success),
+            (true, String::new())
+        );
+        assert_eq!(
+            watcher_pr_merge_diagnosis(&pr, "approved", CIStatus::Pending),
+            (false, "CI status pending".to_string())
+        );
+        assert_eq!(
+            watcher_pr_merge_diagnosis(&pr, "pending_review", CIStatus::Success),
+            (false, "review approval pending".to_string())
+        );
     }
 
     #[tokio::test]

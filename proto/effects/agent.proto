@@ -336,6 +336,32 @@ message CleanupReviewerLeafResponse {
 }
 
 // ============================================================================
+// WatcherPrState - Query live Forgejo PR review/CI state for TL diagnostics
+// ============================================================================
+
+message WatcherPrStateRequest {
+  // Existing PR number to inspect.
+  uint64 pr_number = 1;
+}
+
+message WatcherPrStateResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 pr_number = 3;
+  bool found = 4;
+  bool merge_ready = 5;
+  string blocker = 6;
+  string review_state = 7;
+  string ci_status = 8;
+  string head_sha = 9;
+  string head_branch = 10;
+  string base_branch = 11;
+  string pr_state = 12;
+  bool merged = 13;
+  uint32 review_count = 14;
+}
+
+// ============================================================================
 // SpawnLeafSubtree - Spawn a Gemini leaf agent in a new git worktree
 // ============================================================================
 
@@ -444,6 +470,7 @@ service AgentEffects {
   rpc SpawnSubtree(SpawnSubtreeRequest) returns (SpawnSubtreeResponse);
   rpc SpawnReviewer(SpawnReviewerRequest) returns (SpawnReviewerResponse);
   rpc CleanupReviewerLeaf(CleanupReviewerLeafRequest) returns (CleanupReviewerLeafResponse);
+  rpc WatcherPrState(WatcherPrStateRequest) returns (WatcherPrStateResponse);
   rpc SpawnLeafSubtree(SpawnLeafSubtreeRequest) returns (SpawnLeafSubtreeResponse);
   rpc SpawnAcp(SpawnAcpRequest) returns (SpawnAcpResponse);
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);

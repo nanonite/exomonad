@@ -423,6 +423,23 @@ impl EffectHandler for MockAgentHandler {
                 errors: vec![],
             }
             .encode_to_vec()),
+            "agent.watcher_pr_state" => Ok(WatcherPrStateResponse {
+                success: true,
+                error: String::new(),
+                pr_number: 42,
+                found: true,
+                merge_ready: true,
+                blocker: String::new(),
+                review_state: "approved".into(),
+                ci_status: "success".into(),
+                head_sha: "abc123".into(),
+                head_branch: "main.test-leaf".into(),
+                base_branch: "main".into(),
+                pr_state: "open".into(),
+                merged: false,
+                review_count: 1,
+            }
+            .encode_to_vec()),
             _ => Err(EffectError::not_found(format!("mock_agent/{effect_type}"))),
         }
     }
@@ -731,6 +748,7 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
         "file_pr",
         "notify_parent",
         "cleanup_reviewer_leaf",
+        "watcher_pr_state",
     ] {
         assert!(
             names.contains(&expected),
@@ -872,7 +890,11 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
         "chainlink_worker_status",
     ];
 
-    let coordinator_cleanup_tools = ["close_issue_and_cleanup", "cleanup_reviewer_leaf"];
+    let coordinator_cleanup_tools = [
+        "close_issue_and_cleanup",
+        "cleanup_reviewer_leaf",
+        "watcher_pr_state",
+    ];
 
     let coordinator_chainlink_tools = [
         "chainlink_issue_create",

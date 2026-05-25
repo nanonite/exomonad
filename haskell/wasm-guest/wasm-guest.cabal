@@ -69,6 +69,7 @@ library wasm-guest-internal
         ExoMonad.Guest.Tools.SpawnCodex
         ExoMonad.Guest.Tools.SpawnReviewer
         ExoMonad.Guest.Tools.CleanupReviewerLeaf
+        ExoMonad.Guest.Tools.WatcherPrState
         ExoMonad.Guest.Tools.SessionStatus
         ExoMonad.Guest.Tools.Events
         ExoMonad.Guest.Tools.Tasks
