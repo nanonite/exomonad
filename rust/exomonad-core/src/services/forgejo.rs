@@ -32,6 +32,12 @@ pub struct ForgejoPullRequestReview {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoCommitStatus {
+    pub status: CIStatus,
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgejoWorkflowRun {
     pub name: String,
     pub display_title: String,
@@ -106,6 +112,14 @@ struct PullRequestReviewResponse {
     body: String,
     #[serde(default)]
     commit_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitStatusResponse {
+    #[serde(default, alias = "state")]
+    status: String,
+    #[serde(default)]
+    context: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +279,50 @@ impl ForgejoClient {
                 commit_id: review.commit_id,
             })
             .collect())
+    }
+
+    pub async fn list_commit_statuses(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        head_sha: &str,
+    ) -> Result<Vec<ForgejoCommitStatus>> {
+        let url = self.api_url(&[
+            "repos",
+            owner.as_str(),
+            repo.as_str(),
+            "commits",
+            head_sha,
+            "statuses",
+        ])?;
+        let response = self
+            .http
+            .get(url)
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo commit statuses request failed")?;
+
+        let statuses: Vec<CommitStatusResponse> = self
+            .decode_response(response, "list Forgejo commit statuses")
+            .await?;
+        Ok(statuses
+            .into_iter()
+            .map(|status| ForgejoCommitStatus {
+                status: CIStatus::parse(&status.status),
+                context: status.context,
+            })
+            .collect())
+    }
+
+    pub async fn commit_status_for_head(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        head_sha: &str,
+    ) -> Result<CIStatus> {
+        let statuses = self.list_commit_statuses(owner, repo, head_sha).await?;
+        Ok(combine_commit_statuses(&statuses))
     }
 
     pub async fn actions_status_for_head(
@@ -576,6 +634,28 @@ impl ForgejoClient {
     }
 }
 
+fn combine_commit_statuses(statuses: &[ForgejoCommitStatus]) -> CIStatus {
+    if statuses.is_empty() {
+        return CIStatus::Neutral;
+    }
+
+    let has = |status| statuses.iter().any(|commit| commit.status == status);
+    if has(CIStatus::Failure) {
+        CIStatus::Failure
+    } else if has(CIStatus::Pending) {
+        CIStatus::Pending
+    } else if has(CIStatus::Unknown) {
+        CIStatus::Unknown
+    } else if statuses
+        .iter()
+        .all(|commit| commit.status == CIStatus::Success)
+    {
+        CIStatus::Success
+    } else {
+        CIStatus::Neutral
+    }
+}
+
 fn workflow_status(run: WorkflowRunResponse) -> CIStatus {
     run.conclusion
         .or(run.status)
@@ -754,6 +834,55 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, CIStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn commit_status_for_head_reads_forgejo_commit_statuses() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/commits/abc123/statuses"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "status": "success", "context": "cargo test" },
+                { "state": "success", "context": "cargo fmt" }
+            ])))
+            .mount(&server)
+            .await;
+
+        let status = client
+            .commit_status_for_head(&owner(), &repo(), "abc123")
+            .await
+            .unwrap();
+
+        assert_eq!(status, CIStatus::Success);
+    }
+
+    #[test]
+    fn commit_status_combiner_prefers_failure_then_pending() {
+        let statuses = vec![
+            ForgejoCommitStatus {
+                status: CIStatus::Success,
+                context: Some("cargo test".to_string()),
+            },
+            ForgejoCommitStatus {
+                status: CIStatus::Pending,
+                context: Some("clippy".to_string()),
+            },
+        ];
+        assert_eq!(combine_commit_statuses(&statuses), CIStatus::Pending);
+
+        let statuses = vec![
+            ForgejoCommitStatus {
+                status: CIStatus::Pending,
+                context: Some("cargo test".to_string()),
+            },
+            ForgejoCommitStatus {
+                status: CIStatus::Failure,
+                context: Some("clippy".to_string()),
+            },
+        ];
+        assert_eq!(combine_commit_statuses(&statuses), CIStatus::Failure);
+        assert_eq!(combine_commit_statuses(&[]), CIStatus::Neutral);
     }
 
     #[tokio::test]

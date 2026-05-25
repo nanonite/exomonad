@@ -6,8 +6,8 @@ use crate::services::file_pr_local::{LocalReviewState, PrEntry, PrRegistry, PrSt
 use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
-    CiStatusKey, CiStatusMap, HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue,
-    HasForgejoClient, HasGitWorktreeService, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
+    CiStatusMap, HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasForgejoClient,
+    HasGitWorktreeService, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -460,22 +460,12 @@ where
     }
 
     fn ci_source_configured(&self) -> bool {
-        self.ci_source_configured
+        self.ci_source_configured || self.ctx.forgejo_client().is_some()
     }
 
     async fn observed_ci_status(&self, branch: &BranchName, head_sha: &str) -> CIStatus {
         if !self.policy.ci.gate.enabled(self.ci_source_configured()) {
             return CIStatus::Neutral;
-        }
-
-        if let Some(status) = self
-            .ci_status_map
-            .read()
-            .await
-            .get(&ci_status_key(branch, head_sha))
-            .copied()
-        {
-            return status;
         }
 
         let Some(forgejo) = self.ctx.forgejo_client() else {
@@ -485,12 +475,12 @@ where
             return CIStatus::Unknown;
         };
         match forgejo
-            .actions_status_for_head(&repo_info.owner, &repo_info.repo, branch, head_sha)
+            .commit_status_for_head(&repo_info.owner, &repo_info.repo, head_sha)
             .await
         {
             Ok(status) => status,
             Err(error) => {
-                debug!(branch = %branch, head_sha, error = %error, "Forgejo Actions status lookup failed");
+                debug!(branch = %branch, head_sha, error = %error, "Forgejo commit status lookup failed");
                 CIStatus::Unknown
             }
         }
@@ -2586,10 +2576,6 @@ fn format_observations(observations: &HashMap<u64, Observation>) -> String {
     entries.join(", ")
 }
 
-fn ci_status_key(branch: &BranchName, head_sha: &str) -> CiStatusKey {
-    (branch.clone(), head_sha.to_string())
-}
-
 /// Extracts the branch name and head SHA from a `sh.tangled.pipeline` event payload.
 /// Returns `None` if the trigger is not a push or is missing the ref/SHA fields.
 #[allow(dead_code)]
@@ -4552,7 +4538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_observed_ci_status_is_sha_keyed() {
+    async fn test_observed_ci_status_ignores_webhook_map_without_forgejo() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
@@ -4569,10 +4555,6 @@ mod tests {
 
         assert_eq!(
             watcher.observed_ci_status(&branch, "abc123").await,
-            CIStatus::Success
-        );
-        assert_eq!(
-            watcher.observed_ci_status(&branch, "def456").await,
             CIStatus::Unknown
         );
     }
