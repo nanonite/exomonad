@@ -1936,10 +1936,9 @@ fn compute_pr_actions_with_context(
         });
     }
 
-    if (old_state.notified_parent_approved || old_state.notified_parent_timeout || old_state.stuck)
-        && !recover_after_ci_block
-        && !merge_ready_now
-    {
+    let terminal_parent_notified =
+        old_state.merge_ready_notified || old_state.notified_parent_timeout || old_state.stuck;
+    if terminal_parent_notified && !recover_after_ci_block && !merge_ready_now {
         return pending_actions;
     }
 
@@ -2116,7 +2115,7 @@ fn compute_pr_actions_with_context(
     }
 
     if !old_state.notified_parent_timeout
-        && !old_state.notified_parent_approved
+        && !old_state.merge_ready_notified
         && old_state.first_seen.elapsed() > Duration::from_secs(max_wait_seconds)
     {
         let classification =
@@ -3519,7 +3518,17 @@ mod tests {
             5,
         );
 
-        assert!(actions.is_empty());
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent {
+                event_type: "ci_status",
+                payload,
+            } if payload["status"] == "success" && payload["merge_ready"] == false
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "merge_ready"
+        )));
         assert!(!state.merge_ready_notified);
     }
 
@@ -3771,25 +3780,68 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_guard_suppresses_after_approval() {
+    fn test_approved_pr_without_merge_ready_delivery_can_timeout() {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
-        state.last_ci_status = CIStatus::Pending;
+        state.last_review_state = ReviewState::Approved;
+        state.last_ci_status = CIStatus::Success;
+        state.review_approved_at =
+            Some(Instant::now() - MERGE_READY_SIGNAL_WINDOW - Duration::from_secs(60));
+        state.ci_mergeable_at =
+            Some(Instant::now() - MERGE_READY_SIGNAL_WINDOW - Duration::from_secs(60));
+        state.first_seen = Instant::now() - Duration::from_secs(16 * 60);
+
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
             "abc123",
-            &[test_comment("late")],
-            &[test_review("late review", ReviewState::Approved)],
+            &[],
+            &[],
             CIStatus::Success,
             false,
             branch.as_str(),
             &|_, _| String::new(),
             5,
         );
+
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::FileHumanEscalation {
+                classification: ReviewStallKind::ReviewerNotResponding,
+                ..
+            }
+        )));
+        assert!(state.notified_parent_timeout);
+    }
+
+    #[test]
+    fn test_merge_ready_delivery_suppresses_timeout_after_approval() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        state.notified_parent_approved = true;
+        state.last_review_state = ReviewState::Approved;
+        state.merge_ready_notified = true;
+        state.last_ci_status = CIStatus::Success;
+        state.first_seen = Instant::now() - Duration::from_secs(16 * 60);
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &[],
+            CIStatus::Success,
+            false,
+            branch.as_str(),
+            &|_, _| String::new(),
+            5,
+        );
+
         assert!(actions.is_empty());
+        assert!(!state.notified_parent_timeout);
     }
 
     #[test]
