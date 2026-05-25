@@ -9,6 +9,8 @@ docker compose up -d forgejo
 # Wait for Forgejo to be healthy, then complete setup (see below)
 ```
 
+After first-time setup, `docker compose up -d` starts Forgejo, the Docker-in-Docker daemon, and the runner. The dind service is health-gated so the runner waits for a reachable Docker daemon instead of crash-looping.
+
 ## First-Time Setup
 
 1. Open http://localhost:3000 and complete the installation wizard:
@@ -32,14 +34,14 @@ docker compose up -d forgejo
        --config /data/runner-config.yml
    ```
 
-4. Start the runner:
+4. Start the CI stack:
    ```bash
-   docker compose up -d runner
+   docker compose up -d
    ```
 
-   The compose entrypoint patches the generated runner config to mount `/var/run/act` as tmpfs in job containers. Docker 29 rejects Forgejo Runner archive uploads through the `/var/run` symlink unless that path exists as a real mount.
+   The compose entrypoint patches the generated runner config to mount `/var/run/act` as tmpfs in job containers. Docker 29 rejects Forgejo Runner archive uploads through the `/var/run` symlink unless that path exists as a real mount. Runner registration persists in `./runner-data/.runner`, and the generated config persists in `./runner-data/runner-config.yml`, both through the bind-mounted `/data` volume.
 
-4. Set config in `.exo/config.toml`:
+5. Set config in `.exo/config.toml`:
    ```toml
    forgejo_url = "http://localhost:3000"
    forgejo_token = "<personal-access-token>"
@@ -81,3 +83,18 @@ GH_HOST=localhost:3000 GH_TOKEN=<token> gh pr list
 docker compose down        # keep data
 docker compose down -v     # wipe data
 ```
+
+## Troubleshooting
+
+**Runner waits for Docker-in-Docker health.**
+The runner executes jobs inside the `docker-in-docker` (dind) service via `DOCKER_HOST=tcp://docker-in-docker:2375`. Compose pins dind to `docker:28-dind`, disables TLS for the local TCP daemon, and gates runner startup on a dind healthcheck. If the host reboots, all three services use `restart: unless-stopped`; after `docker compose up -d`, the runner should wait until dind is healthy instead of crash-looping.
+
+To verify recovery from a clean recreate:
+
+```bash
+docker compose down
+docker compose up -d
+docker compose ps
+```
+
+`forgejo`, `forgejo-dind`, and `forgejo-runner` should all be running, with dind healthy and the runner idle. Runner registration should survive because `./runner-data/.runner` and `./runner-data/runner-config.yml` are bind-mounted into `/data`.

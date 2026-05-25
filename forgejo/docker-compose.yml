@@ -25,11 +25,19 @@ services:
       retries: 10
 
   docker-in-docker:
-    image: docker:dind
+    image: docker:28-dind
     container_name: forgejo-dind
     privileged: true
     restart: unless-stopped
+    environment:
+      - DOCKER_TLS_CERTDIR=
     command: ["dockerd", "-H", "tcp://0.0.0.0:2375", "--tls=false"]
+    healthcheck:
+      test: ["CMD-SHELL", "docker --host tcp://localhost:2375 info >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
 
   runner:
     image: data.forgejo.org/forgejo/runner:12
@@ -40,7 +48,7 @@ services:
       forgejo:
         condition: service_healthy
       docker-in-docker:
-        condition: service_started
+        condition: service_healthy
     links:
       - docker-in-docker
     volumes:
