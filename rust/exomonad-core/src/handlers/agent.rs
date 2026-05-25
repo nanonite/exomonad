@@ -27,7 +27,6 @@ use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use async_trait::async_trait;
 use chrono::Utc;
 use exomonad_proto::effects::agent::*;
-use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -837,7 +836,7 @@ impl<
         }
 
         let pr = self.resolve_open_forgejo_pr_entry(req.pr_number).await?;
-        let active_reviewer = live_reviewer_for_pr(self.ctx.project_dir(), req.pr_number).await;
+        let active_reviewer = live_reviewer_for_pr(&self.service, req.pr_number).await;
         if !req.force {
             if let Some(reviewer_name) = active_reviewer.as_ref() {
                 return Ok(SpawnReviewerResponse {
@@ -852,8 +851,7 @@ impl<
             .await
             .effect_err("agent")?;
         if req.force {
-            cleanup_force_reviewer_resources(&self.service, self.ctx.project_dir(), req.pr_number)
-                .await;
+            cleanup_force_reviewer_resources(&self.service, req.pr_number).await;
         }
 
         let reviewer_branch = if req.force {
@@ -899,8 +897,7 @@ impl<
         }
 
         let cleaned_reviewers =
-            cleanup_force_reviewer_resources(&self.service, self.ctx.project_dir(), req.pr_number)
-                .await;
+            cleanup_force_reviewer_resources(&self.service, req.pr_number).await;
         match clear_reviewer_review_artifacts(self.ctx.project_dir(), req.pr_number).await {
             Ok(()) => Ok(CleanupReviewerLeafResponse {
                 success: true,
@@ -1614,33 +1611,35 @@ fn author_agent_from_branch(branch: &str) -> Option<String> {
         .filter(|slug| !slug.is_empty())
 }
 
-async fn live_reviewer_for_pr(project_dir: &Path, pr_number: u64) -> Option<String> {
-    let agents_dir = project_dir.join(".exo/agents");
-    let reviewer_prefix = format!("review-pr-{pr_number}-");
-    let mut entries = match tokio::fs::read_dir(&agents_dir).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return None,
+async fn live_reviewer_for_pr<C>(service: &AgentControlService<C>, pr_number: u64) -> Option<String>
+where
+    C: HasTeamRegistry
+        + HasAcpRegistry
+        + HasAgentResolver
+        + HasGitHubClient
+        + HasProjectDir
+        + HasGitWorktreeService
+        + 'static,
+{
+    let tmux = match service.tmux() {
+        Ok(tmux) => tmux,
         Err(error) => {
-            warn!(path = %agents_dir.display(), %error, "failed to scan reviewer agents");
+            warn!(%error, "failed to create tmux client while checking reviewer liveness");
+            return None;
+        }
+    };
+    let windows = match tmux.list_windows().await {
+        Ok(windows) => windows,
+        Err(error) => {
+            warn!(%error, "failed to list tmux windows while checking reviewer liveness");
             return None;
         }
     };
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Some(agent_slug) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-            continue;
-        };
-        if !agent_slug.starts_with(&reviewer_prefix) {
-            continue;
-        }
-        match orphan_agent_window_alive(project_dir, &agent_slug).await {
-            Ok(true) => return Some(agent_slug),
-            Ok(false) => {}
-            Err(error) => warn!(agent = %agent_slug, %error, "failed to check reviewer liveness"),
-        }
-    }
-
-    None
+    windows
+        .into_iter()
+        .find(|window| reviewer_window_matches_pr(&window.window_name, pr_number))
+        .map(|window| window.window_name)
 }
 
 async fn clear_reviewer_review_artifacts(project_dir: &Path, pr_number: u64) -> anyhow::Result<()> {
@@ -1679,7 +1678,6 @@ async fn clear_watcher_pr_state(project_dir: &Path, pr_number: u64) -> anyhow::R
 
 async fn cleanup_force_reviewer_resources<C>(
     service: &AgentControlService<C>,
-    project_dir: &Path,
     pr_number: u64,
 ) -> Vec<String>
 where
@@ -1691,45 +1689,38 @@ where
         + HasGitWorktreeService
         + 'static,
 {
-    let slugs = reviewer_resource_slugs_for_pr(project_dir, pr_number).await;
-    for slug in &slugs {
-        if let Err(error) = service.cleanup_agent(slug).await {
-            warn!(reviewer = %slug, %error, "failed to clean reviewer resource during forced respawn");
-        }
-    }
-    slugs
-}
-
-async fn reviewer_resource_slugs_for_pr(project_dir: &Path, pr_number: u64) -> Vec<String> {
-    let mut slugs = BTreeSet::new();
-    collect_reviewer_resource_slugs(&project_dir.join(".exo/agents"), pr_number, &mut slugs).await;
-    collect_reviewer_resource_slugs(&project_dir.join(".exo/worktrees"), pr_number, &mut slugs)
-        .await;
-    slugs.into_iter().collect()
-}
-
-async fn collect_reviewer_resource_slugs(dir: &Path, pr_number: u64, slugs: &mut BTreeSet<String>) {
-    let mut entries = match tokio::fs::read_dir(dir).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return,
+    let tmux = match service.tmux() {
+        Ok(tmux) => tmux,
         Err(error) => {
-            warn!(path = %dir.display(), %error, "failed to scan reviewer resources");
-            return;
+            warn!(%error, "failed to create tmux client while cleaning reviewer resources");
+            return Vec::new();
+        }
+    };
+    let windows = match tmux.list_windows().await {
+        Ok(windows) => windows,
+        Err(error) => {
+            warn!(%error, "failed to list tmux windows while cleaning reviewer resources");
+            return Vec::new();
         }
     };
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+    let mut killed = Vec::new();
+    for window in windows {
+        if !reviewer_window_matches_pr(&window.window_name, pr_number) {
             continue;
-        };
-        if is_reviewer_resource_slug_for_pr(&name, pr_number) {
-            slugs.insert(name);
+        }
+        if let Err(error) = tmux.kill_window(&window.window_id).await {
+            warn!(window = %window.window_name, %error, "failed to kill reviewer tmux window");
+        } else {
+            info!(window = %window.window_name, "killed reviewer tmux window");
+            killed.push(window.window_name);
         }
     }
+    killed
 }
 
-fn is_reviewer_resource_slug_for_pr(slug: &str, pr_number: u64) -> bool {
-    slug.starts_with(&format!("review-pr-{pr_number}-"))
+fn reviewer_window_matches_pr(window_name: &str, pr_number: u64) -> bool {
+    window_name.contains(&format!("review-pr-{pr_number}-"))
 }
 
 async fn orphan_agent_window_alive(project_dir: &Path, agent_slug: &str) -> Result<bool, String> {
@@ -2115,28 +2106,12 @@ mod tests {
         assert!(state["prs"].get("8").is_some());
     }
 
-    #[tokio::test]
-    async fn reviewer_resource_slugs_for_pr_collects_agents_and_worktrees() {
-        let dir = tempfile::tempdir().unwrap();
-        for path in [
-            ".exo/agents/review-pr-7-codex",
-            ".exo/worktrees/review-pr-7-codex",
-            ".exo/worktrees/review-pr-7-123-codex",
-            ".exo/agents/review-pr-70-codex",
-            ".exo/worktrees/issue-7-codex",
-        ] {
-            std::fs::create_dir_all(dir.path().join(path)).unwrap();
-        }
-
-        let slugs = reviewer_resource_slugs_for_pr(dir.path(), 7).await;
-
-        assert_eq!(
-            slugs,
-            vec![
-                "review-pr-7-123-codex".to_string(),
-                "review-pr-7-codex".to_string()
-            ]
-        );
+    #[test]
+    fn reviewer_window_matches_pr_uses_tmux_reviewer_window_pattern() {
+        assert!(reviewer_window_matches_pr("review-pr-7-codex", 7));
+        assert!(reviewer_window_matches_pr("2:review-pr-7-123-codex", 7));
+        assert!(!reviewer_window_matches_pr("review-pr-70-codex", 7));
+        assert!(!reviewer_window_matches_pr("issue-7-codex", 7));
     }
 
     #[test]
