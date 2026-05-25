@@ -79,19 +79,27 @@ impl<
             .join(".exo")
             .join("agents")
             .join(internal_name.as_str());
+        let worktree_config_dir = self
+            .project_dir()
+            .join(".exo")
+            .join("worktrees")
+            .join(internal_name.as_str());
 
         // Try direct cleanup via stored window_id (O(1), no listing needed)
         let mut window_closed = false;
-        if let Ok(routing) = RoutingInfo::read_from_dir(&agent_config_dir).await {
-            if let Some(wid) = routing.window_id {
-                let tmux = self.tmux()?;
-                match tmux.kill_window(&wid).await {
-                    Ok(()) => {
-                        info!(identifier, "Closed tmux window via stored window_id");
-                        window_closed = true;
-                    }
-                    Err(e) => {
-                        warn!(identifier, error = %e, "kill_window by stored ID failed, falling back to name match");
+        for routing_dir in [&agent_config_dir, &worktree_config_dir] {
+            if let Ok(routing) = RoutingInfo::read_from_dir(routing_dir).await {
+                if let Some(wid) = routing.window_id {
+                    let tmux = self.tmux()?;
+                    match tmux.kill_window(&wid).await {
+                        Ok(()) => {
+                            info!(identifier, path = %routing_dir.display(), "Closed tmux window via stored window_id");
+                            window_closed = true;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(identifier, path = %routing_dir.display(), error = %e, "kill_window by stored ID failed, falling back to name match");
+                        }
                     }
                 }
             }
