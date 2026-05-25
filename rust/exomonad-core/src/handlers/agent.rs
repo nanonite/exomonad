@@ -802,6 +802,34 @@ impl<
         })
     }
 
+    async fn cleanup_reviewer_leaf(
+        &self,
+        req: CleanupReviewerLeafRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<CleanupReviewerLeafResponse> {
+        if req.pr_number == 0 {
+            return Err(EffectError::invalid_input("pr_number is required"));
+        }
+
+        let cleaned_reviewers =
+            cleanup_force_reviewer_resources(&self.service, self.ctx.project_dir(), req.pr_number)
+                .await;
+        match clear_reviewer_review_artifacts(self.ctx.project_dir(), req.pr_number).await {
+            Ok(()) => Ok(CleanupReviewerLeafResponse {
+                success: true,
+                error: String::new(),
+                pr_number: req.pr_number,
+                cleaned_reviewers,
+            }),
+            Err(error) => Ok(CleanupReviewerLeafResponse {
+                success: false,
+                error: error.to_string(),
+                pr_number: req.pr_number,
+                cleaned_reviewers,
+            }),
+        }
+    }
+
     async fn spawn_leaf_subtree(
         &self,
         req: SpawnLeafSubtreeRequest,
@@ -1496,7 +1524,8 @@ async fn cleanup_force_reviewer_resources<C>(
     service: &AgentControlService<C>,
     project_dir: &Path,
     pr_number: u64,
-) where
+) -> Vec<String>
+where
     C: HasTeamRegistry
         + HasAcpRegistry
         + HasAgentResolver
@@ -1506,11 +1535,12 @@ async fn cleanup_force_reviewer_resources<C>(
         + 'static,
 {
     let slugs = reviewer_resource_slugs_for_pr(project_dir, pr_number).await;
-    for slug in slugs {
-        if let Err(error) = service.cleanup_agent(&slug).await {
+    for slug in &slugs {
+        if let Err(error) = service.cleanup_agent(slug).await {
             warn!(reviewer = %slug, %error, "failed to clean reviewer resource during forced respawn");
         }
     }
+    slugs
 }
 
 async fn reviewer_resource_slugs_for_pr(project_dir: &Path, pr_number: u64) -> Vec<String> {

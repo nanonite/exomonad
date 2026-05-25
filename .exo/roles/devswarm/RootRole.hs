@@ -36,6 +36,7 @@ import ExoMonad.Guest.Tools.Chainlink
     ChainlinkTimerStop (..),
   )
 import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
+import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
@@ -175,6 +176,7 @@ data Tools mode = Tools
     spawnLeaf :: mode :- RootSpawnLeaf,
     spawnWorker :: mode :- RootSpawnWorker,
     spawnReviewer :: mode :- SpawnReviewer,
+    cleanupReviewerLeaf :: mode :- CleanupReviewerLeaf,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
@@ -215,6 +217,7 @@ config =
             spawnLeaf = mkHandler @RootSpawnLeaf,
             spawnWorker = mkHandler @RootSpawnWorker,
             spawnReviewer = mkHandler @SpawnReviewer,
+            cleanupReviewerLeaf = mkHandler @CleanupReviewerLeaf,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,

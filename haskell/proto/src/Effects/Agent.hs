@@ -4100,6 +4100,217 @@ instance (HsJSONPB.ToJSON SpawnReviewerResponse) where
 instance (HsJSONPB.FromJSON SpawnReviewerResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
+newtype CleanupReviewerLeafRequest
+  = CleanupReviewerLeafRequest {cleanupReviewerLeafRequestPrNumber :: Hs.Word64}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData CleanupReviewerLeafRequest)
+
+instance (HsProtobuf.Named CleanupReviewerLeafRequest) where
+  nameOf _ = Hs.fromString "CleanupReviewerLeafRequest"
+
+instance (HsProtobuf.HasDefault CleanupReviewerLeafRequest)
+
+instance (HsProtobuf.Message CleanupReviewerLeafRequest) where
+  encodeMessage
+    _
+    CleanupReviewerLeafRequest {cleanupReviewerLeafRequestPrNumber} =
+      ( HsProtobuf.encodeMessageField
+          (HsProtobuf.FieldNumber 1)
+          cleanupReviewerLeafRequestPrNumber
+      )
+  decodeMessage _ =
+    Hs.pure CleanupReviewerLeafRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB CleanupReviewerLeafRequest) where
+  toJSONPB (CleanupReviewerLeafRequest f1) =
+    HsJSONPB.object ["pr_number" .= f1]
+  toEncodingPB (CleanupReviewerLeafRequest f1) =
+    HsJSONPB.pairs ["pr_number" .= f1]
+
+instance (HsJSONPB.FromJSONPB CleanupReviewerLeafRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "CleanupReviewerLeafRequest"
+      ( \obj ->
+          Hs.pure CleanupReviewerLeafRequest <*> obj .: "pr_number"
+      )
+
+instance (HsJSONPB.ToJSON CleanupReviewerLeafRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON CleanupReviewerLeafRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data CleanupReviewerLeafResponse
+  = CleanupReviewerLeafResponse
+  { cleanupReviewerLeafResponseSuccess :: Hs.Bool,
+    cleanupReviewerLeafResponseError :: Hs.Text,
+    cleanupReviewerLeafResponsePrNumber :: Hs.Word64,
+    cleanupReviewerLeafResponseCleanedReviewers :: (Hs.Vector Hs.Text)
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData CleanupReviewerLeafResponse)
+
+instance (HsProtobuf.Named CleanupReviewerLeafResponse) where
+  nameOf _ = Hs.fromString "CleanupReviewerLeafResponse"
+
+instance (HsProtobuf.HasDefault CleanupReviewerLeafResponse)
+
+instance (HsProtobuf.Message CleanupReviewerLeafResponse) where
+  encodeMessage
+    _
+    CleanupReviewerLeafResponse
+      { cleanupReviewerLeafResponseSuccess,
+        cleanupReviewerLeafResponseError,
+        cleanupReviewerLeafResponsePrNumber,
+        cleanupReviewerLeafResponseCleanedReviewers
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 1)
+                    cleanupReviewerLeafResponseSuccess
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 2)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        cleanupReviewerLeafResponseError
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 3)
+                cleanupReviewerLeafResponsePrNumber
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 4)
+            ( ( Hs.coerce
+                  @(Hs.Vector Hs.Text)
+                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+              )
+                cleanupReviewerLeafResponseCleanedReviewers
+            )
+        )
+  decodeMessage _ =
+    Hs.pure CleanupReviewerLeafResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 3)
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "cleaned_reviewers")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB CleanupReviewerLeafResponse) where
+  toJSONPB (CleanupReviewerLeafResponse f1 f2 f3 f4) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "pr_number" .= f3,
+        "cleaned_reviewers"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f4
+             )
+      ]
+  toEncodingPB (CleanupReviewerLeafResponse f1 f2 f3 f4) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "pr_number" .= f3,
+        "cleaned_reviewers"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f4
+             )
+      ]
+
+instance (HsJSONPB.FromJSONPB CleanupReviewerLeafResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "CleanupReviewerLeafResponse"
+      ( \obj ->
+          Hs.pure CleanupReviewerLeafResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+            <*> obj .: "pr_number"
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "cleaned_reviewers")
+                )
+      )
+
+instance (HsJSONPB.ToJSON CleanupReviewerLeafResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON CleanupReviewerLeafResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
 data SpawnLeafSubtreeRequest
   = SpawnLeafSubtreeRequest
   { spawnLeafSubtreeRequestTask :: Hs.Text,

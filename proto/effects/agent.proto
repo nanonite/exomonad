@@ -320,6 +320,22 @@ message SpawnReviewerResponse {
 }
 
 // ============================================================================
+// CleanupReviewerLeaf - Clean stuck reviewer resources for a PR
+// ============================================================================
+
+message CleanupReviewerLeafRequest {
+  // Existing PR number whose reviewer resources should be cleaned.
+  uint64 pr_number = 1;
+}
+
+message CleanupReviewerLeafResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 pr_number = 3;
+  repeated string cleaned_reviewers = 4;
+}
+
+// ============================================================================
 // SpawnLeafSubtree - Spawn a Gemini leaf agent in a new git worktree
 // ============================================================================
 
@@ -427,6 +443,7 @@ service AgentEffects {
   rpc SpawnWorker(SpawnWorkerRequest) returns (SpawnWorkerResponse);
   rpc SpawnSubtree(SpawnSubtreeRequest) returns (SpawnSubtreeResponse);
   rpc SpawnReviewer(SpawnReviewerRequest) returns (SpawnReviewerResponse);
+  rpc CleanupReviewerLeaf(CleanupReviewerLeafRequest) returns (CleanupReviewerLeafResponse);
   rpc SpawnLeafSubtree(SpawnLeafSubtreeRequest) returns (SpawnLeafSubtreeResponse);
   rpc SpawnAcp(SpawnAcpRequest) returns (SpawnAcpResponse);
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);

@@ -730,6 +730,7 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
         "merge_pr",
         "file_pr",
         "notify_parent",
+        "cleanup_reviewer_leaf",
     ] {
         assert!(
             names.contains(&expected),
@@ -871,7 +872,7 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
         "chainlink_worker_status",
     ];
 
-    let close_issue_cleanup_tool = ["close_issue_and_cleanup"];
+    let coordinator_cleanup_tools = ["close_issue_and_cleanup", "cleanup_reviewer_leaf"];
 
     let coordinator_chainlink_tools = [
         "chainlink_issue_create",
@@ -897,12 +898,12 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
 
     let tl_tools = list_tool_names(&runtime, "tl").await;
     assert_tools_present("tl", &tl_tools, &coordinator_chainlink_tools);
-    assert_tools_present("tl", &tl_tools, &close_issue_cleanup_tool);
+    assert_tools_present("tl", &tl_tools, &coordinator_cleanup_tools);
     assert_tools_absent("tl", &tl_tools, &dropped_chainlink_tools);
 
     let root_tools = list_tool_names(&runtime, "root").await;
     assert_tools_present("root", &root_tools, &coordinator_chainlink_tools);
-    assert_tools_present("root", &root_tools, &close_issue_cleanup_tool);
+    assert_tools_present("root", &root_tools, &coordinator_cleanup_tools);
     assert_tools_absent("root", &root_tools, &dropped_chainlink_tools);
 
     let dev_tools = list_tool_names(&runtime, "dev").await;
@@ -920,7 +921,7 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
             "chainlink_subissue_close",
         ],
     );
-    assert_tools_absent("dev", &dev_tools, &close_issue_cleanup_tool);
+    assert_tools_absent("dev", &dev_tools, &coordinator_cleanup_tools);
     assert_tools_absent("dev", &dev_tools, &dropped_chainlink_tools);
     assert_tools_absent(
         "dev",
@@ -974,13 +975,13 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
             "chainlink_milestone_list",
         ],
     );
-    assert_tools_absent("worker", &worker_tools, &close_issue_cleanup_tool);
+    assert_tools_absent("worker", &worker_tools, &coordinator_cleanup_tools);
     assert_tools_absent("worker", &worker_tools, &dropped_chainlink_tools);
 
     for role in ["reviewer", "testrunner"] {
         let names = list_tool_names(&runtime, role).await;
         assert_tools_absent(role, &names, &all_chainlink_tools);
-        assert_tools_absent(role, &names, &close_issue_cleanup_tool);
+        assert_tools_absent(role, &names, &coordinator_cleanup_tools);
         assert_tools_absent(role, &names, &dropped_chainlink_tools);
     }
 }
