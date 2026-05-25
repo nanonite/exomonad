@@ -64,6 +64,31 @@ feedback, addresses it, and pushes. The watcher then notifies the TL
 (`[FIXES PUSHED]` or `[PR READY]`). You do not need to notify anyone — the event
 watcher handles routing.
 
+## Comment Templates
+
+### request_changes
+
+```
+## Review findings
+
+**Blocking** (must fix before merge):
+- `path/to/file.rs:42` — {what is wrong and why it is a problem}
+- `path/to/file.rs:87` — {what is wrong and why it is a problem}
+
+**Non-blocking** (optional improvements):
+- `path/to/file.rs:15` — {suggestion}
+```
+
+Every blocking item must have a file:line reference. Vague comments like "error handling is missing" are not actionable — name the exact location.
+
+### approve_pr
+
+```
+LGTM. Verified: {what you checked — e.g. "logic in transcribe_samples, error paths, test coverage for silent input"}. {Optional: one note on what looks particularly solid.}
+```
+
+Do not approve with an empty body. Name what you actually checked.
+
 ## Stuck Detection
 
 If a PR goes through multiple rounds without converging, the system will
