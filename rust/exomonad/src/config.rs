@@ -213,6 +213,9 @@ pub struct RawConfig {
     /// Forgejo token for API/webhook setup.
     pub forgejo_token: Option<String>,
 
+    /// Forgejo token for reviewer API calls. Must belong to a different user from the PR author token.
+    pub forgejo_reviewer_token: Option<String>,
+
     /// Shared secret used to verify Forgejo webhook signatures.
     pub forgejo_webhook_secret: Option<String>,
 
@@ -283,6 +286,9 @@ pub struct Config {
 
     /// Forgejo token for API/webhook setup.
     pub forgejo_token: Option<String>,
+
+    /// Forgejo token for reviewer API calls. Must belong to a different user from the PR author token.
+    pub forgejo_reviewer_token: Option<String>,
 
     /// Shared secret used to verify Forgejo webhook signatures.
     pub forgejo_webhook_secret: Option<String>,
@@ -472,6 +478,9 @@ impl Config {
 
         let forgejo_url = local_raw.forgejo_url.or(global_raw.forgejo_url);
         let forgejo_token = local_raw.forgejo_token.or(global_raw.forgejo_token);
+        let forgejo_reviewer_token = local_raw
+            .forgejo_reviewer_token
+            .or(global_raw.forgejo_reviewer_token);
         let forgejo_webhook_secret = local_raw
             .forgejo_webhook_secret
             .or(global_raw.forgejo_webhook_secret);
@@ -514,6 +523,7 @@ impl Config {
             opencode_as_tl,
             forgejo_url,
             forgejo_token,
+            forgejo_reviewer_token,
             forgejo_webhook_secret,
             forgejo_ssh_port,
             reviewer,
@@ -560,6 +570,7 @@ impl Default for Config {
             opencode_as_tl: false,
             forgejo_url: None,
             forgejo_token: None,
+            forgejo_reviewer_token: None,
             forgejo_webhook_secret: None,
             forgejo_ssh_port: None,
             reviewer: ReviewerConfig::default(),
@@ -633,6 +644,21 @@ mod tests {
         let raw: RawConfig = toml::from_str(content).unwrap();
         assert_eq!(raw.project_dir, Some(PathBuf::from("/my/project")));
         assert_eq!(raw.default_role, Some(Role::tl()));
+    }
+
+    #[test]
+    fn test_raw_config_parse_forgejo_reviewer_token() {
+        let content = r#"
+            forgejo_url = "http://localhost:3000"
+            forgejo_token = "author-token"
+            forgejo_reviewer_token = "reviewer-token"
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.forgejo_token.as_deref(), Some("author-token"));
+        assert_eq!(
+            raw.forgejo_reviewer_token.as_deref(),
+            Some("reviewer-token")
+        );
     }
 
     #[test]

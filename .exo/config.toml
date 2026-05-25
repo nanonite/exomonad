@@ -8,6 +8,7 @@ orphan_reconciler_interval_secs = 60
 
 forgejo_url = "http://localhost:3000"
 forgejo_token = ""
+forgejo_reviewer_token = ""
 forgejo_webhook_secret = ""
 
 [extra_mcp_servers.notebooklm]

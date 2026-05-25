@@ -205,7 +205,8 @@ fn config_content(tangled: Option<&TangledNewIntegration>) -> String {
          {}\n\
          # Forgejo integration\n\
          # forgejo_url = \"http://localhost:3000\"\n\
-         # forgejo_token = \"...\"\n",
+         # forgejo_token = \"...\"\n\
+         # forgejo_reviewer_token = \"...\"  # must belong to a different Forgejo user than forgejo_token\n",
         tangled_block
     )
 }
@@ -629,6 +630,7 @@ mod tests {
 
         assert!(content.contains("# tangled_knot_url = \"http://localhost:5555\""));
         assert!(content.contains("# tangled_owner_did = \"did:plc:yourDID\""));
+        assert!(content.contains("# forgejo_reviewer_token = \"...\""));
         assert!(!content.contains("\ntangled_owner_did ="));
     }
 

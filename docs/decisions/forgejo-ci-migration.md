@@ -10,11 +10,11 @@ The project moved CI and pull-request orchestration to Forgejo and Forgejo Actio
 
 ## Current State
 
-- `.exo/config.toml` stores Forgejo URL, token, and webhook configuration.
+- `.exo/config.toml` stores Forgejo URL, author token, reviewer token, and webhook configuration.
 - `exomonad new` provisions Forgejo repositories and action workflow files.
 - `exomonad init` injects `GH_HOST` and `GH_TOKEN` for spawned agents.
 - `exomonad serve` receives Forgejo CI webhooks and the watcher also polls Forgejo commit statuses for PR head SHAs.
-- Reviewer tools submit Forgejo pull-request reviews directly.
+- Reviewer tools submit Forgejo pull-request reviews through `forgejo_reviewer_token`, which must belong to a different Forgejo user than the PR author token.
 
 ## CI Status Flow
 

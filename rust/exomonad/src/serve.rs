@@ -963,6 +963,21 @@ Run `exomonad recompile` first to build it.",
         }
         (None, None) => None,
     };
+    let forgejo_reviewer_client = match (
+        config.forgejo_url.as_deref(),
+        config.forgejo_reviewer_token.as_deref(),
+    ) {
+        (Some(url), Some(token)) => Some(exomonad_core::services::ForgejoClient::new(url, token)?),
+        (Some(_), None) => {
+            warn!("forgejo_reviewer_token not configured; reviewer MCP tools cannot submit Forgejo PR reviews");
+            None
+        }
+        (None, Some(_)) => {
+            warn!("forgejo_reviewer_token configured without forgejo_url; reviewer MCP tools cannot submit Forgejo PR reviews");
+            None
+        }
+        (None, None) => None,
+    };
 
     let team_registry = Arc::new(claude_teams_bridge::TeamRegistry::new());
     let acp_registry = Arc::new(exomonad_core::services::acp_registry::AcpRegistry::new());
@@ -1002,6 +1017,7 @@ Run `exomonad recompile` first to build it.",
         project_dir: project_dir.clone(),
         github_client: None,
         forgejo_client: forgejo_client.clone(),
+        forgejo_reviewer_client: forgejo_reviewer_client.clone(),
         event_log: event_log.clone(),
         team_registry: team_registry.clone(),
         acp_registry: acp_registry.clone(),

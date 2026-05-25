@@ -200,8 +200,16 @@ fn mailbox_protocol_available_for_config(config: &Config) -> bool {
     config.root_agent_type == AgentType::Claude && config.spawn_agent_type == AgentType::Claude
 }
 
-fn forgejo_env_vars(forgejo_url: &str, forgejo_token: &str) -> Vec<(&'static str, String)> {
-    if forgejo_token.trim().is_empty() {
+fn forgejo_env_vars(
+    forgejo_url: &str,
+    forgejo_token: &str,
+    forgejo_reviewer_token: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let forgejo_token = forgejo_token.trim();
+    let forgejo_reviewer_token = forgejo_reviewer_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    if forgejo_token.is_empty() && forgejo_reviewer_token.is_none() {
         return Vec::new();
     }
 
@@ -210,8 +218,13 @@ fn forgejo_env_vars(forgejo_url: &str, forgejo_token: &str) -> Vec<(&'static str
         vars.push(("FORGEJO_HOST", forgejo_host.clone()));
         vars.push(("GH_HOST", forgejo_host));
     }
-    vars.push(("FORGEJO_TOKEN", forgejo_token.to_string()));
-    vars.push(("GH_TOKEN", forgejo_token.to_string()));
+    if !forgejo_token.is_empty() {
+        vars.push(("FORGEJO_TOKEN", forgejo_token.to_string()));
+        vars.push(("GH_TOKEN", forgejo_token.to_string()));
+    }
+    if let Some(token) = forgejo_reviewer_token {
+        vars.push(("FORGEJO_REVIEWER_TOKEN", token.to_string()));
+    }
     vars.push(("FORGEJO_URL", forgejo_url.to_string()));
     vars
 }
@@ -830,11 +843,12 @@ pub async fn run(
         );
     }
 
-    if let (Some(forgejo_url), Some(forgejo_token)) = (
-        config.forgejo_url.as_deref(),
-        config.forgejo_token.as_deref(),
-    ) {
-        for (var, value) in forgejo_env_vars(forgejo_url, forgejo_token) {
+    if let Some(forgejo_url) = config.forgejo_url.as_deref() {
+        for (var, value) in forgejo_env_vars(
+            forgejo_url,
+            config.forgejo_token.as_deref().unwrap_or(""),
+            config.forgejo_reviewer_token.as_deref(),
+        ) {
             std::env::set_var(var, &value);
             let _ = std::process::Command::new("tmux")
                 .args(["set-environment", "-t", &session, var, &value])
@@ -1815,8 +1829,6 @@ fn gemini_hooks() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CompanionConfig;
-    use exomonad_core::services::AgentType;
 
     #[test]
     fn watcher_dashboard_command_creates_log_file() {
@@ -1900,18 +1912,19 @@ mod tests {
 
     #[test]
     fn forgejo_env_vars_include_forgejo_and_gh_auth() {
-        let vars = forgejo_env_vars("http://localhost:3000", "token-123");
+        let vars = forgejo_env_vars("http://localhost:3000", "token-123", Some("reviewer-456"));
 
         assert!(vars.contains(&("FORGEJO_HOST", "localhost:3000".to_string())));
         assert!(vars.contains(&("GH_HOST", "localhost:3000".to_string())));
         assert!(vars.contains(&("FORGEJO_TOKEN", "token-123".to_string())));
         assert!(vars.contains(&("GH_TOKEN", "token-123".to_string())));
+        assert!(vars.contains(&("FORGEJO_REVIEWER_TOKEN", "reviewer-456".to_string())));
         assert!(vars.contains(&("FORGEJO_URL", "http://localhost:3000".to_string())));
     }
 
     #[test]
     fn forgejo_env_vars_ignore_empty_tokens() {
-        assert!(forgejo_env_vars("http://localhost:3000", "  ").is_empty());
+        assert!(forgejo_env_vars("http://localhost:3000", "  ", None).is_empty());
     }
 
     #[test]

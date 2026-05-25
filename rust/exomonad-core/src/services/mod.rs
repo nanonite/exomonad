@@ -94,6 +94,10 @@ pub trait HasGitHubClient: Send + Sync {
 pub trait HasForgejoClient: Send + Sync {
     fn forgejo_client(&self) -> Option<&Arc<ForgejoClient>>;
 }
+
+pub trait HasForgejoReviewerClient: Send + Sync {
+    fn forgejo_reviewer_client(&self) -> Option<&Arc<ForgejoClient>>;
+}
 pub type CiStatusKey = (crate::domain::BranchName, String);
 pub type CiStatusMap = std::collections::HashMap<CiStatusKey, crate::domain::CIStatus>;
 
@@ -128,6 +132,7 @@ pub struct Services {
     pub project_dir: PathBuf,
     pub github_client: Option<Arc<GitHubClient>>,
     pub forgejo_client: Option<Arc<ForgejoClient>>,
+    pub forgejo_reviewer_client: Option<Arc<ForgejoClient>>,
     pub event_log: Option<Arc<EventLog>>,
     pub team_registry: Arc<TeamRegistry>,
     pub acp_registry: Arc<AcpRegistry>,
@@ -208,6 +213,11 @@ impl HasForgejoClient for Services {
         self.forgejo_client.as_ref()
     }
 }
+impl HasForgejoReviewerClient for Services {
+    fn forgejo_reviewer_client(&self) -> Option<&Arc<ForgejoClient>> {
+        self.forgejo_reviewer_client.as_ref()
+    }
+}
 impl HasGitWorktreeService for Services {
     fn git_worktree_service(&self) -> &Arc<GitWorktreeService> {
         &self.git_wt
@@ -227,6 +237,7 @@ impl Services {
             project_dir: PathBuf::from("."),
             github_client: None,
             forgejo_client: None,
+            forgejo_reviewer_client: None,
             event_log: None,
             team_registry: Arc::new(TeamRegistry::new()),
             acp_registry: Arc::new(AcpRegistry::new()),

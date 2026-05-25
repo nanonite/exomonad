@@ -14,7 +14,9 @@ use exomonad_proto::effects::file_pr::*;
 use std::sync::Arc;
 use tracing::instrument;
 
-use crate::services::{HasEventLog, HasForgejoClient, HasGitWorktreeService, HasProjectDir};
+use crate::services::{
+    HasEventLog, HasForgejoClient, HasForgejoReviewerClient, HasGitWorktreeService, HasProjectDir,
+};
 
 /// File PR effect handler.
 ///
@@ -24,8 +26,14 @@ pub struct FilePRHandler<C> {
     ctx: Arc<C>,
 }
 
-impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 'static>
-    FilePRHandler<C>
+impl<
+        C: HasForgejoClient
+            + HasForgejoReviewerClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + 'static,
+    > FilePRHandler<C>
 {
     pub fn new(ctx: Arc<C>) -> Self {
         Self { ctx }
@@ -33,8 +41,14 @@ impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir +
 }
 
 #[async_trait]
-impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 'static>
-    EffectHandler for FilePRHandler<C>
+impl<
+        C: HasForgejoClient
+            + HasForgejoReviewerClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + 'static,
+    > EffectHandler for FilePRHandler<C>
 {
     fn namespace(&self) -> &str {
         "file_pr"
@@ -51,8 +65,14 @@ impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir +
 }
 
 #[async_trait]
-impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir + 'static>
-    FilePrEffects for FilePRHandler<C>
+impl<
+        C: HasForgejoClient
+            + HasForgejoReviewerClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + 'static,
+    > FilePrEffects for FilePRHandler<C>
 {
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, pr_title = %req.title))]
     async fn file_pr(
@@ -172,10 +192,10 @@ impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir +
     ) -> EffectResult<SubmitReviewResponse> {
         let _ = ctx;
         let event = normalized_review_event(&req.event)?;
-        let Some(forgejo) = self.ctx.forgejo_client() else {
+        let Some(forgejo) = self.ctx.forgejo_reviewer_client() else {
             return Ok(SubmitReviewResponse {
                 success: false,
-                error: "forgejo_url and forgejo_token are required to submit PR reviews"
+                error: "forgejo_reviewer_token is required to submit PR reviews; Forgejo rejects reviews from the PR author token"
                     .to_string(),
             });
         };
@@ -271,6 +291,9 @@ mod tests {
     use crate::effects::{EffectContext, FilePrEffects};
     use crate::services::Services;
     use std::path::PathBuf;
+    use std::process::Command;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_ctx(branch: &str) -> EffectContext {
         EffectContext {
@@ -426,6 +449,83 @@ Reviewer-Agent: review-pr-7-codex"
 
         assert!(!response.found);
         assert_eq!(response.pr_number, 0);
+    }
+
+    #[tokio::test]
+    async fn submit_review_requires_reviewer_forgejo_token() {
+        let mut services = Services::test();
+        services.forgejo_client = Some(
+            crate::services::forgejo::ForgejoClient::new("http://forgejo.local", "author-token")
+                .unwrap(),
+        );
+        let handler = FilePRHandler::new(Arc::new(services));
+
+        let response = handler
+            .submit_review(
+                SubmitReviewRequest {
+                    pr_number: 9,
+                    event: "APPROVED".to_string(),
+                    body: "Looks good".to_string(),
+                },
+                &test_ctx("review-pr-9"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!response.success);
+        assert!(response.error.contains("forgejo_reviewer_token"));
+    }
+
+    #[tokio::test]
+    async fn submit_review_uses_reviewer_forgejo_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://forgejo.local/owner/repo.git",
+            ])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/owner/repo/pulls/9/reviews"))
+            .and(header("authorization", "token reviewer-token"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut services = Services::test();
+        services.project_dir = tmp.path().to_path_buf();
+        services.forgejo_client = Some(
+            crate::services::forgejo::ForgejoClient::new(&server.uri(), "author-token").unwrap(),
+        );
+        services.forgejo_reviewer_client = Some(
+            crate::services::forgejo::ForgejoClient::new(&server.uri(), "reviewer-token").unwrap(),
+        );
+        let handler = FilePRHandler::new(Arc::new(services));
+
+        let response = handler
+            .submit_review(
+                SubmitReviewRequest {
+                    pr_number: 9,
+                    event: "APPROVED".to_string(),
+                    body: "Looks good".to_string(),
+                },
+                &test_ctx("review-pr-9"),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.success, "{}", response.error);
     }
 
     #[tokio::test]

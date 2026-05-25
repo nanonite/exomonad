@@ -172,14 +172,23 @@ impl<
 
         for var in [
             "FORGEJO_HOST",
+            "GH_HOST",
             "FORGEJO_TOKEN",
-            "FORGEJO_TOKEN",
+            "GH_TOKEN",
+            "FORGEJO_REVIEWER_TOKEN",
             "FORGEJO_URL",
         ] {
             if let Ok(value) = std::env::var(var) {
                 if !value.is_empty() {
                     env_vars.insert(var.to_string(), value);
                 }
+            }
+        }
+
+        if role.as_str() == "reviewer" {
+            if let Some(reviewer_token) = env_vars.get("FORGEJO_REVIEWER_TOKEN").cloned() {
+                env_vars.insert("FORGEJO_TOKEN".to_string(), reviewer_token.clone());
+                env_vars.insert("GH_TOKEN".to_string(), reviewer_token);
             }
         }
 
@@ -1451,6 +1460,40 @@ mod tests {
             "CHAINLINK_DB must use the directory form, not the file form — both are valid for the \
              chainlink CLI but the directory is the canonical resource and the project's single \
              source of truth across all spawn sites (init.rs uses the same form)"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_common_spawn_env_uses_reviewer_token_for_reviewer_role() {
+        let services = test_services(PathBuf::from("."));
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+        );
+        let agent = AgentName::try_from_str("review-pr-7-codex")
+            .expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("review-pr-7").expect("literal validated string is non-empty");
+
+        std::env::set_var("FORGEJO_TOKEN", "author-token");
+        std::env::set_var("GH_TOKEN", "author-token");
+        std::env::set_var("FORGEJO_REVIEWER_TOKEN", "reviewer-token");
+        let env = service.common_spawn_env(&agent, &session_id, &crate::domain::Role::reviewer());
+        std::env::remove_var("FORGEJO_TOKEN");
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("FORGEJO_REVIEWER_TOKEN");
+
+        assert_eq!(
+            env.get("FORGEJO_TOKEN").map(String::as_str),
+            Some("reviewer-token")
+        );
+        assert_eq!(
+            env.get("GH_TOKEN").map(String::as_str),
+            Some("reviewer-token")
+        );
+        assert_eq!(
+            env.get("FORGEJO_REVIEWER_TOKEN").map(String::as_str),
+            Some("reviewer-token")
         );
     }
 
