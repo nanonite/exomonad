@@ -21,7 +21,7 @@ use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
 #[cfg(test)]
 use crate::services::pr_registry::PrRegistry;
-use crate::services::pr_registry::{LocalReviewState, PrEntry, PrState};
+use crate::services::pr_registry::{ForgejoReviewState, PrEntry, PrState};
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use async_trait::async_trait;
@@ -1570,7 +1570,7 @@ fn pr_entry_from_forgejo_pull_request(pr: ForgejoPullRequest) -> PrEntry {
         author_role,
         created_at: Utc::now(),
         state: PrState::Open,
-        review_state: LocalReviewState::PendingReview,
+        review_state: ForgejoReviewState::PendingReview,
         last_review_at: None,
         last_head_sha: pr.head_sha,
         approved_at_sha: None,

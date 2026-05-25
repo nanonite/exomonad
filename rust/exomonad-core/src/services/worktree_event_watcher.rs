@@ -2,7 +2,7 @@ use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::agent_resources::dispose_reviewers_for_pr;
-use crate::services::pr_registry::{LocalReviewState, PrEntry, PrRegistry, PrState};
+use crate::services::pr_registry::{ForgejoReviewState, PrEntry, PrRegistry, PrState};
 use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
@@ -25,18 +25,18 @@ use tracing::{debug, info, instrument, warn};
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
 const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
-/// Review state derived from Forgejo reviews or reviewer review files.
+/// Overall verdict derived from Forgejo reviews for a single open PR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum ReviewState {
+enum ForgejoReviewVerdict {
     None,
     ChangesRequested,
     Approved,
 }
 
-/// A review comment from a local review file.
+/// A review comment returned by Forgejo for an open PR.
 #[derive(Debug, Clone, Serialize)]
-struct LocalReviewComment {
+struct ForgejoReviewComment {
     body: String,
     path: Option<String>,
     diff_hunk: Option<String>,
@@ -45,11 +45,11 @@ struct LocalReviewComment {
     author_branch: Option<String>,
 }
 
-/// A local review with typed state.
+/// A Forgejo review with a typed verdict.
 #[derive(Debug, Clone, Serialize)]
-struct LocalReview {
+struct ForgejoReview {
     body: String,
-    state: ReviewState,
+    state: ForgejoReviewVerdict,
     author_branch: Option<String>,
 }
 
@@ -62,8 +62,8 @@ enum PendingAction {
     EmitEvent {
         status: String,
         message: String,
-        comments: Option<Vec<LocalReviewComment>>,
-        reviews: Option<Vec<LocalReview>>,
+        comments: Option<Vec<ForgejoReviewComment>>,
+        reviews: Option<Vec<ForgejoReview>>,
     },
     WriteRegistryStuck {
         pr_number: u64,
@@ -176,10 +176,10 @@ fn reviewer_fanout_decision(
     }
 }
 
-fn review_state_disposes_reviewer(review_state: &LocalReviewState) -> bool {
+fn review_state_disposes_reviewer(review_state: &ForgejoReviewState) -> bool {
     matches!(
         review_state,
-        LocalReviewState::Approved | LocalReviewState::ChangesRequested
+        ForgejoReviewState::Approved | ForgejoReviewState::ChangesRequested
     )
 }
 
@@ -200,7 +200,7 @@ struct WatchState {
     agent_type: AgentType,
     first_seen: Instant,
     notified_parent_timeout: bool,
-    last_review_state: ReviewState,
+    last_review_state: ForgejoReviewVerdict,
     last_sha: String,
     notified_parent_approved: bool,
     addressed_changes: bool,
@@ -335,7 +335,7 @@ impl WatchState {
             agent_type,
             first_seen: Instant::now(),
             notified_parent_timeout: false,
-            last_review_state: ReviewState::None,
+            last_review_state: ForgejoReviewVerdict::None,
             last_sha: sha.to_string(),
             notified_parent_approved: false,
             addressed_changes: false,
@@ -520,18 +520,18 @@ fn codex_dev_fallback_ci_status_action(payload: &serde_json::Value) -> Option<Ev
     })
 }
 
-/// Observation collected from local sources for one open PR.
+/// Observation collected from Forgejo and worktree state for one open PR.
 struct Observation {
     head_sha: String,
-    review_state: LocalReviewState,
-    comments: Vec<LocalReviewComment>,
-    reviews: Vec<LocalReview>,
+    review_state: ForgejoReviewState,
+    comments: Vec<ForgejoReviewComment>,
+    reviews: Vec<ForgejoReview>,
     ci_status: CIStatus,
     forgejo_review_present: bool,
 }
 
 /// Replaces `github_poller.rs` and `copilot_review.rs` by observing Forgejo
-/// PR/review/CI state, reviewer review files, and git worktree state.
+/// PR/review/CI state and git worktree state.
 pub struct WorktreeEventWatcher<C> {
     ctx: Arc<C>,
     poll_interval: Duration,
@@ -789,7 +789,7 @@ where
                     author_role,
                     created_at: Utc::now(),
                     state: PrState::Open,
-                    review_state: LocalReviewState::PendingReview,
+                    review_state: ForgejoReviewState::PendingReview,
                     last_review_at: None,
                     last_head_sha: head_sha,
                     approved_at_sha: None,
@@ -916,7 +916,7 @@ where
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
         let mut reviewer_disposals: Vec<u64> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
-        let mut review_state_updates: Vec<(u64, LocalReviewState, String)> = Vec::new();
+        let mut review_state_updates: Vec<(u64, ForgejoReviewState, String)> = Vec::new();
 
         {
             let mut state_guard = self.state.lock().await;
@@ -1295,16 +1295,16 @@ where
 
     async fn persist_review_states(
         &self,
-        updates: &[(u64, LocalReviewState, String)],
+        updates: &[(u64, ForgejoReviewState, String)],
     ) -> Result<()> {
         if updates
             .iter()
-            .any(|(_, state, _)| matches!(state, LocalReviewState::Approved))
+            .any(|(_, state, _)| matches!(state, ForgejoReviewState::Approved))
         {
             let mut watcher_state = self.read_watcher_state().await.unwrap_or_default();
             let mut changed = false;
             for (pr_number, review_state, _) in updates {
-                if matches!(review_state, LocalReviewState::Approved) {
+                if matches!(review_state, ForgejoReviewState::Approved) {
                     let entry = watcher_state.prs.entry(*pr_number).or_default();
                     if entry.stuck || entry.needs_human_review {
                         entry.stuck = false;
@@ -1744,8 +1744,8 @@ where
         status: &str,
         message: &str,
         _agent_type: AgentType,
-        comments: Option<Vec<LocalReviewComment>>,
-        reviews: Option<Vec<LocalReview>>,
+        comments: Option<Vec<ForgejoReviewComment>>,
+        reviews: Option<Vec<ForgejoReview>>,
     ) {
         info!(
             "Emitting event for branch {}: {} - {}",
@@ -1809,16 +1809,16 @@ where
         pr_number: u64,
         head_sha: &str,
     ) -> (
-        LocalReviewState,
-        Vec<LocalReviewComment>,
-        Vec<LocalReview>,
+        ForgejoReviewState,
+        Vec<ForgejoReviewComment>,
+        Vec<ForgejoReview>,
         bool,
     ) {
         let Some(forgejo) = self.ctx.forgejo_client() else {
-            return (LocalReviewState::PendingReview, vec![], vec![], false);
+            return (ForgejoReviewState::PendingReview, vec![], vec![], false);
         };
         let Ok(repo_info) = repo::get_repo_info(self.ctx.project_dir()).await else {
-            return (LocalReviewState::PendingReview, vec![], vec![], false);
+            return (ForgejoReviewState::PendingReview, vec![], vec![], false);
         };
         let reviews = match forgejo
             .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
@@ -1827,7 +1827,7 @@ where
             Ok(reviews) => reviews,
             Err(error) => {
                 debug!(pr_number, error = %error, "Forgejo review lookup failed");
-                return (LocalReviewState::PendingReview, vec![], vec![], false);
+                return (ForgejoReviewState::PendingReview, vec![], vec![], false);
             }
         };
 
@@ -1841,10 +1841,10 @@ where
                 continue;
             }
             let state = review_state_from_str(&review.state);
-            if state == ReviewState::None {
+            if state == ForgejoReviewVerdict::None {
                 continue;
             }
-            local_reviews.push(LocalReview {
+            local_reviews.push(ForgejoReview {
                 body: review.body,
                 state,
                 author_branch: None,
@@ -1853,16 +1853,16 @@ where
 
         let review_state = if local_reviews
             .iter()
-            .any(|review| review.state == ReviewState::ChangesRequested)
+            .any(|review| review.state == ForgejoReviewVerdict::ChangesRequested)
         {
-            LocalReviewState::ChangesRequested
+            ForgejoReviewState::ChangesRequested
         } else if local_reviews
             .iter()
-            .any(|review| review.state == ReviewState::Approved)
+            .any(|review| review.state == ForgejoReviewVerdict::Approved)
         {
-            LocalReviewState::Approved
+            ForgejoReviewState::Approved
         } else {
-            LocalReviewState::PendingReview
+            ForgejoReviewState::PendingReview
         };
 
         let forgejo_review_present = !local_reviews.is_empty();
@@ -1955,12 +1955,12 @@ fn compute_pr_actions(
     old_state: &mut WatchState,
     pr_number: PRNumber,
     pr_sha: &str,
-    comments: &[LocalReviewComment],
-    reviews: &[LocalReview],
+    comments: &[ForgejoReviewComment],
+    reviews: &[ForgejoReview],
     ci_status: CIStatus,
     merge_blocked_on_ci: bool,
     branch: &str,
-    format_message: &dyn Fn(&[LocalReviewComment], &[LocalReview]) -> String,
+    format_message: &dyn Fn(&[ForgejoReviewComment], &[ForgejoReview]) -> String,
     max_rounds: u32,
 ) -> Vec<PendingAction> {
     compute_pr_actions_with_context(
@@ -1984,14 +1984,14 @@ fn compute_pr_actions_with_context(
     old_state: &mut WatchState,
     pr_number: PRNumber,
     pr_sha: &str,
-    comments: &[LocalReviewComment],
-    reviews: &[LocalReview],
+    comments: &[ForgejoReviewComment],
+    reviews: &[ForgejoReview],
     ci_status: CIStatus,
     merge_blocked_on_ci: bool,
     reviewer_registered: bool,
     forgejo_review_present: bool,
     branch: &str,
-    format_message: &dyn Fn(&[LocalReviewComment], &[LocalReview]) -> String,
+    format_message: &dyn Fn(&[ForgejoReviewComment], &[ForgejoReview]) -> String,
     max_rounds: u32,
     max_wait_seconds: u64,
 ) -> Vec<PendingAction> {
@@ -2013,9 +2013,10 @@ fn compute_pr_actions_with_context(
     let recover_after_ci_block = merge_blocked_on_ci && ci_changed && ci_now_mergeable;
 
     if pr_sha != old_state.last_sha {
-        let was_changes_requested = old_state.last_review_state == ReviewState::ChangesRequested;
+        let was_changes_requested =
+            old_state.last_review_state == ForgejoReviewVerdict::ChangesRequested;
         old_state.last_sha = pr_sha.to_string();
-        old_state.last_review_state = ReviewState::None;
+        old_state.last_review_state = ForgejoReviewVerdict::None;
         old_state.notified_parent_approved = false;
         old_state.notified_parent_timeout = false;
         old_state.review_approved_at = None;
@@ -2095,14 +2096,14 @@ fn compute_pr_actions_with_context(
 
     let observed_request_change_rounds = reviews
         .iter()
-        .filter(|r| r.state == ReviewState::ChangesRequested)
+        .filter(|r| r.state == ForgejoReviewVerdict::ChangesRequested)
         .count() as u32;
     let next_review_round = observed_request_change_rounds.max(old_state.rounds + 1);
 
-    let approved = reviews
-        .iter()
-        .any(|r| r.state == ReviewState::Approved || r.body.to_lowercase().contains("approved"));
-    if approved && old_state.last_review_state != ReviewState::Approved {
+    let approved = reviews.iter().any(|r| {
+        r.state == ForgejoReviewVerdict::Approved || r.body.to_lowercase().contains("approved")
+    });
+    if approved && old_state.last_review_state != ForgejoReviewVerdict::Approved {
         let approved_round = if old_state.rounds == 0 {
             1
         } else if observed_request_change_rounds >= old_state.rounds {
@@ -2115,7 +2116,7 @@ fn compute_pr_actions_with_context(
             pr_number: pr_number.as_u64(),
             rounds: old_state.rounds,
         });
-        old_state.last_review_state = ReviewState::Approved;
+        old_state.last_review_state = ForgejoReviewVerdict::Approved;
         old_state.notified_parent_approved = true;
         old_state.review_approved_at = Some(now);
         let merge_ready_now = !old_state.merge_ready_notified
@@ -2126,7 +2127,7 @@ fn compute_pr_actions_with_context(
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
             payload: serde_json::json!({
-                "kind": review_event_kind_for_state(&ReviewState::Approved)
+                "kind": review_event_kind_for_state(&ForgejoReviewVerdict::Approved)
                     .expect("approved review state has an event kind"),
                 "pr_number": pr_number.as_u64(),
                 "ci_status": ci_status.as_str(),
@@ -2165,12 +2166,12 @@ fn compute_pr_actions_with_context(
 
     let changes_requested = reviews
         .iter()
-        .any(|r| r.state == ReviewState::ChangesRequested);
+        .any(|r| r.state == ForgejoReviewVerdict::ChangesRequested);
     if !approved
         && changes_requested
-        && old_state.last_review_state != ReviewState::ChangesRequested
+        && old_state.last_review_state != ForgejoReviewVerdict::ChangesRequested
     {
-        old_state.last_review_state = ReviewState::ChangesRequested;
+        old_state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
         old_state.first_seen = now;
         old_state.rounds = next_review_round;
 
@@ -2208,7 +2209,7 @@ fn compute_pr_actions_with_context(
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
                 payload: serde_json::json!({
-                    "kind": review_event_kind_for_state(&ReviewState::ChangesRequested)
+                    "kind": review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested)
                         .expect("changes_requested review state has an event kind"),
                     "pr_number": pr_number.as_u64(),
                     "comments": message,
@@ -2286,55 +2287,55 @@ fn compute_pr_actions_with_context(
 }
 
 #[allow(dead_code)]
-fn review_state_from_str(state: &str) -> ReviewState {
+fn review_state_from_str(state: &str) -> ForgejoReviewVerdict {
     match state.to_ascii_lowercase().as_str() {
-        "approved" | "approve" => ReviewState::Approved,
+        "approved" | "approve" => ForgejoReviewVerdict::Approved,
         "changes_requested" | "request_changes" | "request_changes_requested" => {
-            ReviewState::ChangesRequested
+            ForgejoReviewVerdict::ChangesRequested
         }
-        _ => ReviewState::None,
+        _ => ForgejoReviewVerdict::None,
     }
 }
 
-fn review_event_kind_for_state(state: &ReviewState) -> Option<&'static str> {
+fn review_event_kind_for_state(state: &ForgejoReviewVerdict) -> Option<&'static str> {
     match state {
-        ReviewState::Approved => Some("approved"),
-        ReviewState::ChangesRequested => Some("review_received"),
-        ReviewState::None => None,
+        ForgejoReviewVerdict::Approved => Some("approved"),
+        ForgejoReviewVerdict::ChangesRequested => Some("review_received"),
+        ForgejoReviewVerdict::None => None,
     }
 }
 
-fn obs_to_review_parts(obs: &Observation) -> (Vec<LocalReview>, ReviewState) {
+fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewVerdict) {
     let state = match obs.review_state {
-        LocalReviewState::Approved => ReviewState::Approved,
-        LocalReviewState::ChangesRequested => ReviewState::ChangesRequested,
-        LocalReviewState::PendingReview => ReviewState::None,
+        ForgejoReviewState::Approved => ForgejoReviewVerdict::Approved,
+        ForgejoReviewState::ChangesRequested => ForgejoReviewVerdict::ChangesRequested,
+        ForgejoReviewState::PendingReview => ForgejoReviewVerdict::None,
     };
 
     if !obs.reviews.is_empty() {
         return (obs.reviews.clone(), state);
     }
 
-    let mut reviews: Vec<LocalReview> = obs
+    let mut reviews: Vec<ForgejoReview> = obs
         .comments
         .iter()
-        .map(|c| LocalReview {
+        .map(|c| ForgejoReview {
             body: c.body.clone(),
             state: state.clone(),
             author_branch: c.author_branch.clone(),
         })
         .collect();
 
-    if obs.review_state == LocalReviewState::Approved && reviews.is_empty() {
-        reviews.push(LocalReview {
+    if obs.review_state == ForgejoReviewState::Approved && reviews.is_empty() {
+        reviews.push(ForgejoReview {
             body: "Approved".to_string(),
-            state: ReviewState::Approved,
+            state: ForgejoReviewVerdict::Approved,
             author_branch: None,
         });
-    } else if obs.review_state == LocalReviewState::ChangesRequested && reviews.is_empty() {
-        reviews.push(LocalReview {
+    } else if obs.review_state == ForgejoReviewState::ChangesRequested && reviews.is_empty() {
+        reviews.push(ForgejoReview {
             body: "Changes requested".to_string(),
-            state: ReviewState::ChangesRequested,
+            state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: None,
         });
     }
@@ -2342,11 +2343,11 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<LocalReview>, ReviewState) {
     (reviews, state)
 }
 
-fn review_author_branch(reviews: &[LocalReview]) -> Option<&str> {
+fn review_author_branch(reviews: &[ForgejoReview]) -> Option<&str> {
     reviews
         .iter()
         .rev()
-        .find(|review| review.state == ReviewState::ChangesRequested)
+        .find(|review| review.state == ForgejoReviewVerdict::ChangesRequested)
         .and_then(|review| review.author_branch.as_deref())
 }
 
@@ -2371,7 +2372,7 @@ fn classify_review_stall(
     reviewer_registered: bool,
     forgejo_review_present: bool,
 ) -> ReviewStallKind {
-    if state.last_review_state == ReviewState::ChangesRequested {
+    if state.last_review_state == ForgejoReviewVerdict::ChangesRequested {
         return ReviewStallKind::DevNotPushing;
     }
 
@@ -2452,7 +2453,7 @@ fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
     ))
 }
 
-fn format_review_message(comments: &[LocalReviewComment], reviews: &[LocalReview]) -> String {
+fn format_review_message(comments: &[ForgejoReviewComment], reviews: &[ForgejoReview]) -> String {
     let mut msg = String::new();
 
     if !reviews.is_empty() {
@@ -2637,8 +2638,8 @@ mod tests {
         WatchState::new(branch, agent_type, sha, CIStatus::Unknown, 0)
     }
 
-    fn test_comment(body: &str) -> LocalReviewComment {
-        LocalReviewComment {
+    fn test_comment(body: &str) -> ForgejoReviewComment {
+        ForgejoReviewComment {
             body: body.to_string(),
             path: None,
             diff_hunk: None,
@@ -2648,8 +2649,8 @@ mod tests {
         }
     }
 
-    fn test_review(body: &str, state: ReviewState) -> LocalReview {
-        LocalReview {
+    fn test_review(body: &str, state: ForgejoReviewVerdict) -> ForgejoReview {
+        ForgejoReview {
             body: body.to_string(),
             state,
             author_branch: None,
@@ -2688,7 +2689,7 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        state.last_review_state = ReviewState::Approved;
+        state.last_review_state = ForgejoReviewVerdict::Approved;
         state.notified_parent_approved = true;
         state.review_approved_at = Some(Instant::now());
 
@@ -2710,7 +2711,7 @@ mod tests {
             PendingAction::WasmEvent { payload, .. } if payload["kind"] == "commits_pushed"
         )));
         assert_eq!(state.last_sha, "def456");
-        assert_eq!(state.last_review_state, ReviewState::None);
+        assert_eq!(state.last_review_state, ForgejoReviewVerdict::None);
         assert!(!state.notified_parent_approved);
         assert_eq!(state.review_approved_at, None);
     }
@@ -2721,7 +2722,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.ci_mergeable_at = Some(Instant::now());
-        let reviews = vec![test_review("approved", ReviewState::Approved)];
+        let reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
             &mut state,
@@ -2752,7 +2753,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.rounds = 1;
-        state.last_review_state = ReviewState::Approved;
+        state.last_review_state = ForgejoReviewVerdict::Approved;
         state.notified_parent_approved = true;
         state.review_approved_at = Some(Instant::now());
 
@@ -2768,7 +2769,7 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        let reviews = vec![test_review("approved", ReviewState::Approved)];
+        let reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
@@ -2797,7 +2798,7 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        state.last_review_state = ReviewState::ChangesRequested;
+        state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
         state.addressed_changes = false;
 
         let actions = compute_pr_actions(
@@ -2823,7 +2824,7 @@ mod tests {
             .expect("fixes_pushed event should be emitted");
         assert_eq!(fixes_payload["head_sha"], "def456");
         assert!(state.addressed_changes);
-        assert_eq!(state.last_review_state, ReviewState::None);
+        assert_eq!(state.last_review_state, ForgejoReviewVerdict::None);
     }
 
     #[test]
@@ -2831,7 +2832,7 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        let reviews = vec![test_review("approved", ReviewState::Approved)];
+        let reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
             &mut state,
@@ -2865,7 +2866,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.last_ci_status = CIStatus::Pending;
-        state.last_review_state = ReviewState::Approved;
+        state.last_review_state = ForgejoReviewVerdict::Approved;
         state.notified_parent_approved = true;
         state.review_approved_at = Some(Instant::now());
         state.rounds = 1;
@@ -3075,7 +3076,7 @@ mod tests {
         let comments = vec![test_comment("Fix this")];
         let reviews = vec![test_review(
             "Please address comments",
-            ReviewState::ChangesRequested,
+            ForgejoReviewVerdict::ChangesRequested,
         )];
 
         let actions = compute_pr_actions(
@@ -3106,7 +3107,10 @@ mod tests {
         assert_eq!(review_received_count, 1);
         assert_eq!(emit_event_count, 1);
         assert_eq!(state.pr_review_cycle_count, 2);
-        assert_eq!(state.last_review_state, ReviewState::ChangesRequested);
+        assert_eq!(
+            state.last_review_state,
+            ForgejoReviewVerdict::ChangesRequested
+        );
     }
 
     #[test]
@@ -3114,9 +3118,9 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        let reviews = vec![LocalReview {
+        let reviews = vec![ForgejoReview {
             body: "Please address comments".to_string(),
-            state: ReviewState::ChangesRequested,
+            state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: Some("review-pr-1".to_string()),
         }];
 
@@ -3146,7 +3150,7 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
+        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
@@ -3175,7 +3179,7 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
+        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
             &mut state,
@@ -3208,7 +3212,7 @@ mod tests {
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.last_ci_status = CIStatus::Success;
         state.ci_mergeable_at = Some(Instant::now() - Duration::from_secs(60));
-        let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
+        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
             &mut state,
@@ -3249,7 +3253,7 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
+        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
             &mut state,
@@ -3286,7 +3290,7 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        let reviews = vec![test_review("LGTM!", ReviewState::Approved)];
+        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
             &mut state,
@@ -3317,7 +3321,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
-        state.last_review_state = ReviewState::Approved;
+        state.last_review_state = ForgejoReviewVerdict::Approved;
         state.last_ci_status = CIStatus::Success;
         state.review_approved_at = Some(Instant::now() - Duration::from_secs(60));
         state.ci_mergeable_at = Some(Instant::now() - Duration::from_secs(60));
@@ -3384,7 +3388,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
-        state.last_review_state = ReviewState::Approved;
+        state.last_review_state = ForgejoReviewVerdict::Approved;
         state.review_approved_at = Some(Instant::now() - Duration::from_secs(60));
         state.last_ci_status = CIStatus::Pending;
 
@@ -3487,7 +3491,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
-        state.last_review_state = ReviewState::Approved;
+        state.last_review_state = ForgejoReviewVerdict::Approved;
         state.review_approved_at =
             Some(Instant::now() - MERGE_READY_SIGNAL_WINDOW - Duration::from_secs(1));
         state.last_ci_status = CIStatus::Pending;
@@ -3524,7 +3528,10 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        let reviews = vec![test_review("Needs work", ReviewState::ChangesRequested)];
+        let reviews = vec![test_review(
+            "Needs work",
+            ForgejoReviewVerdict::ChangesRequested,
+        )];
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
@@ -3537,7 +3544,10 @@ mod tests {
             &|_, _| String::new(),
             5,
         );
-        assert_eq!(state.last_review_state, ReviewState::ChangesRequested);
+        assert_eq!(
+            state.last_review_state,
+            ForgejoReviewVerdict::ChangesRequested
+        );
         assert!(actions.iter().any(|a| matches!(
             a,
             PendingAction::WasmEvent {
@@ -3555,7 +3565,7 @@ mod tests {
         state.rounds = 1;
         let reviews = vec![test_review(
             "Still needs work",
-            ReviewState::ChangesRequested,
+            ForgejoReviewVerdict::ChangesRequested,
         )];
         let actions = compute_pr_actions(
             &mut state,
@@ -3596,7 +3606,7 @@ mod tests {
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let request_changes = vec![test_review(
             "Add required header",
-            ReviewState::ChangesRequested,
+            ForgejoReviewVerdict::ChangesRequested,
         )];
 
         let actions = compute_pr_actions(
@@ -3640,8 +3650,11 @@ mod tests {
         )));
 
         let approved = vec![
-            test_review("Add required header", ReviewState::ChangesRequested),
-            test_review("Approved", ReviewState::Approved),
+            test_review(
+                "Add required header",
+                ForgejoReviewVerdict::ChangesRequested,
+            ),
+            test_review("Approved", ForgejoReviewVerdict::Approved),
         ];
         let actions = compute_pr_actions(
             &mut state,
@@ -3658,7 +3671,7 @@ mod tests {
 
         assert_eq!(state.rounds, 1);
         assert!(!state.stuck);
-        assert_eq!(state.last_review_state, ReviewState::Approved);
+        assert_eq!(state.last_review_state, ForgejoReviewVerdict::Approved);
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WasmEvent { payload, .. }
@@ -3676,8 +3689,11 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "def456");
         let reviews = vec![
-            test_review("Add required header", ReviewState::ChangesRequested),
-            test_review("Approved", ReviewState::Approved),
+            test_review(
+                "Add required header",
+                ForgejoReviewVerdict::ChangesRequested,
+            ),
+            test_review("Approved", ForgejoReviewVerdict::Approved),
         ];
 
         let actions = compute_pr_actions(
@@ -3695,7 +3711,7 @@ mod tests {
 
         assert_eq!(state.rounds, 1);
         assert!(!state.stuck);
-        assert_eq!(state.last_review_state, ReviewState::Approved);
+        assert_eq!(state.last_review_state, ForgejoReviewVerdict::Approved);
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WriteRegistryRounds {
@@ -3772,7 +3788,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
-        state.last_review_state = ReviewState::Approved;
+        state.last_review_state = ForgejoReviewVerdict::Approved;
         state.last_ci_status = CIStatus::Success;
         state.review_approved_at =
             Some(Instant::now() - MERGE_READY_SIGNAL_WINDOW - Duration::from_secs(60));
@@ -3809,7 +3825,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.notified_parent_approved = true;
-        state.last_review_state = ReviewState::Approved;
+        state.last_review_state = ForgejoReviewVerdict::Approved;
         state.merge_ready_notified = true;
         state.last_ci_status = CIStatus::Success;
         state.first_seen = Instant::now() - Duration::from_secs(16 * 60);
@@ -3838,7 +3854,7 @@ mod tests {
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         state.stuck = true;
         state.rounds = 2;
-        let reviews = vec![test_review("Late approval", ReviewState::Approved)];
+        let reviews = vec![test_review("Late approval", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
             &mut state,
@@ -3895,9 +3911,12 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        state.last_review_state = ReviewState::Approved;
+        state.last_review_state = ForgejoReviewVerdict::Approved;
         state.notified_parent_approved = true;
-        let reviews = vec![test_review("Still approved", ReviewState::Approved)];
+        let reviews = vec![test_review(
+            "Still approved",
+            ForgejoReviewVerdict::Approved,
+        )];
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
@@ -3918,9 +3937,9 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
-        let reviews = vec![LocalReview {
+        let reviews = vec![ForgejoReview {
             body: "I have reviewed this and it is APPROVED".to_string(),
-            state: ReviewState::None,
+            state: ForgejoReviewVerdict::None,
             author_branch: None,
         }];
         let actions = compute_pr_actions(
@@ -3978,13 +3997,13 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
 
-        state.last_review_state = ReviewState::ChangesRequested;
+        state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
         assert_eq!(
             classify_review_stall(&state, true, true),
             ReviewStallKind::DevNotPushing
         );
 
-        state.last_review_state = ReviewState::None;
+        state.last_review_state = ForgejoReviewVerdict::None;
         state.addressed_changes = true;
         assert_eq!(
             classify_review_stall(&state, true, true),
@@ -4029,14 +4048,14 @@ mod tests {
     fn test_obs_to_review_parts_pending() {
         let obs = Observation {
             head_sha: "abc".into(),
-            review_state: LocalReviewState::PendingReview,
+            review_state: ForgejoReviewState::PendingReview,
             comments: vec![],
             reviews: vec![],
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
-        assert_eq!(state, ReviewState::None);
+        assert_eq!(state, ForgejoReviewVerdict::None);
         assert!(reviews.is_empty());
     }
 
@@ -4044,32 +4063,34 @@ mod tests {
     fn test_obs_to_review_parts_approved_with_no_comments_creates_synthetic() {
         let obs = Observation {
             head_sha: "abc".into(),
-            review_state: LocalReviewState::Approved,
+            review_state: ForgejoReviewState::Approved,
             comments: vec![],
             reviews: vec![],
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
-        assert_eq!(state, ReviewState::Approved);
-        assert!(reviews.iter().any(|r| r.state == ReviewState::Approved));
+        assert_eq!(state, ForgejoReviewVerdict::Approved);
+        assert!(reviews
+            .iter()
+            .any(|r| r.state == ForgejoReviewVerdict::Approved));
     }
 
     #[test]
     fn test_obs_to_review_parts_changes_requested() {
         let obs = Observation {
             head_sha: "abc".into(),
-            review_state: LocalReviewState::ChangesRequested,
+            review_state: ForgejoReviewState::ChangesRequested,
             comments: vec![],
             reviews: vec![],
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
-        assert_eq!(state, ReviewState::ChangesRequested);
+        assert_eq!(state, ForgejoReviewVerdict::ChangesRequested);
         assert!(reviews
             .iter()
-            .any(|r| r.state == ReviewState::ChangesRequested));
+            .any(|r| r.state == ForgejoReviewVerdict::ChangesRequested));
     }
 
     // ---------------------------------------------------------------------------
@@ -4085,14 +4106,14 @@ mod tests {
     #[test]
     fn test_format_message_with_reviews() {
         let reviews = vec![
-            LocalReview {
+            ForgejoReview {
                 body: "LGTM!".to_string(),
-                state: ReviewState::Approved,
+                state: ForgejoReviewVerdict::Approved,
                 author_branch: None,
             },
-            LocalReview {
+            ForgejoReview {
                 body: "Good work.".to_string(),
-                state: ReviewState::None,
+                state: ForgejoReviewVerdict::None,
                 author_branch: None,
             },
         ];
@@ -4104,7 +4125,7 @@ mod tests {
 
     #[test]
     fn test_format_message_with_inline_comments() {
-        let comments = vec![LocalReviewComment {
+        let comments = vec![ForgejoReviewComment {
             body: "Fix this typo".to_string(),
             path: Some("src/main.rs".to_string()),
             diff_hunk: Some("@@ -1,3 +1,3 @@".to_string()),
@@ -4130,7 +4151,7 @@ mod tests {
         let state = WatchState::new(&branch, AgentType::Gemini, "abc123", CIStatus::Unknown, 0);
         assert_eq!(state.branch_name.as_str(), "main.feat-gemini");
         assert_eq!(state.last_sha, "abc123");
-        assert_eq!(state.last_review_state, ReviewState::None);
+        assert_eq!(state.last_review_state, ForgejoReviewVerdict::None);
         assert!(!state.notified_parent_approved);
         assert!(!state.notified_parent_timeout);
         assert!(!state.addressed_changes);
@@ -4139,14 +4160,17 @@ mod tests {
     #[test]
     fn test_review_state_dispatch_kind_mapping() {
         assert_eq!(
-            review_event_kind_for_state(&ReviewState::ChangesRequested),
+            review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested),
             Some("review_received")
         );
         assert_eq!(
-            review_event_kind_for_state(&ReviewState::Approved),
+            review_event_kind_for_state(&ForgejoReviewVerdict::Approved),
             Some("approved")
         );
-        assert_eq!(review_event_kind_for_state(&ReviewState::None), None);
+        assert_eq!(
+            review_event_kind_for_state(&ForgejoReviewVerdict::None),
+            None
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -4179,7 +4203,7 @@ mod tests {
             author_role: "dev".to_string(),
             created_at: chrono::Utc::now(),
             state: crate::services::pr_registry::PrState::Open,
-            review_state: crate::services::pr_registry::LocalReviewState::PendingReview,
+            review_state: crate::services::pr_registry::ForgejoReviewState::PendingReview,
             last_review_at: None,
             last_head_sha: None,
             approved_at_sha: None,
@@ -4207,7 +4231,7 @@ mod tests {
     fn test_observation(sha: &str) -> Observation {
         Observation {
             head_sha: sha.to_string(),
-            review_state: crate::services::pr_registry::LocalReviewState::PendingReview,
+            review_state: crate::services::pr_registry::ForgejoReviewState::PendingReview,
             comments: vec![],
             reviews: vec![],
             ci_status: CIStatus::Unknown,
@@ -4331,7 +4355,7 @@ mod tests {
             1u64,
             Observation {
                 head_sha: "abc123".to_string(),
-                review_state: crate::services::pr_registry::LocalReviewState::Approved,
+                review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
                 comments: vec![],
                 reviews: vec![],
                 ci_status: CIStatus::Unknown,
@@ -4375,7 +4399,7 @@ mod tests {
 
         let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
         let mut pr = pr_with_reviewer(1, reviewer_slug, "review-pr-1");
-        pr.review_state = crate::services::pr_registry::LocalReviewState::Approved;
+        pr.review_state = crate::services::pr_registry::ForgejoReviewState::Approved;
         let registry = test_registry(pr);
 
         let mut observations = HashMap::new();
@@ -4383,9 +4407,9 @@ mod tests {
             1u64,
             Observation {
                 head_sha: "abc123".to_string(),
-                review_state: crate::services::pr_registry::LocalReviewState::Approved,
+                review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
                 comments: vec![],
-                reviews: vec![test_review("approved", ReviewState::Approved)],
+                reviews: vec![test_review("approved", ForgejoReviewVerdict::Approved)],
                 ci_status: CIStatus::Unknown,
                 forgejo_review_present: true,
             },

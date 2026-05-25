@@ -114,20 +114,20 @@ All messages are prefixed with `[from: id]` (or `[FAILED: id]` for failures). Ev
 
 `deliver_to_agent()` is correct for peer-to-peer messaging (send_message, event handler InjectMessage).
 
-## GitHub Poller State Machine (`services/github_poller.rs`)
+## Forgejo Watcher and GitHub Poller State Machines
 
-`GitHubPoller<C>` is currently hibernated: it has zero active call sites while the local Tangled path uses `services/worktree_event_watcher.rs`. Keep its review-loop semantics in parity with `worktree_event_watcher` so future GitHub Actions integration can re-enable it as a thin transport shim.
+`worktree_event_watcher.rs` is the active Forgejo-backed PR/review/CI watcher. It rebuilds PR registry state from Forgejo each cycle and persists only watcher bookkeeping such as review rounds and stuck flags. `github_poller.rs` is currently hibernated: it has zero active call sites. Keep its review-loop semantics in parity with `worktree_event_watcher` so future GitHub Actions integration can re-enable it as a thin transport shim.
 
 `GitHubPoller<C>` is generic over capability traits. Single-phase init: `GitHubPoller::new(ctx)` — no `with_services()`. Background tokio task polling GitHub every 60s. Tracks per-PR state in `HashMap<PRNumber, PRState>`.
 
 ### PR Lifecycle States
 
 ```
-ReviewState::None ──(Copilot approves)──→ ReviewState::Approved
+ForgejoReviewVerdict::None ──(Forgejo review approves)──→ ForgejoReviewVerdict::Approved
        │                                         │
        │                                    sends [PR READY] to parent
        │
-       ├──(Copilot requests changes)──→ ReviewState::ChangesRequested
+       ├──(Forgejo review requests changes)──→ ForgejoReviewVerdict::ChangesRequested
        │                                         │
        │                                    stop hook blocks exit
        │                                         │
@@ -143,7 +143,7 @@ ReviewState::None ──(Copilot approves)──→ ReviewState::Approved
               15 min (initial) / 5 min (after addressing changes)
 ```
 
-**Copilot review lifecycle:** Copilot's first review is automatic (triggered on PR creation). Subsequent reviews after pushing fixes are NOT — Copilot does not re-review. The `FixesPushed` event fills this gap: when the poller detects a SHA change on a PR that was `ChangesRequested`, it fires `fixes_pushed` immediately and uses a shorter 5-minute fallback timeout.
+**Copilot review lifecycle:** The first review is automatic (triggered on PR creation). Subsequent reviews after pushing fixes are NOT — automatic re-review is not guaranteed. The `FixesPushed` event fills this gap: when the poller detects a SHA change on a PR that was `ChangesRequested`, it fires `fixes_pushed` immediately and uses a shorter 5-minute fallback timeout.
 
 ### Event Dispatch Flow
 

@@ -20,13 +20,13 @@ impl Default for PrState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum LocalReviewState {
+pub enum ForgejoReviewState {
     PendingReview,
     ChangesRequested,
     Approved,
 }
 
-impl Default for LocalReviewState {
+impl Default for ForgejoReviewState {
     fn default() -> Self {
         Self::PendingReview
     }
@@ -45,7 +45,7 @@ pub struct PrEntry {
     #[serde(default)]
     pub state: PrState,
     #[serde(default)]
-    pub review_state: LocalReviewState,
+    pub review_state: ForgejoReviewState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_review_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
