@@ -246,11 +246,6 @@ role = "sleeptime"             # WASM role for MCP tools (default: "worker")
 command = "claude --dangerously-skip-permissions"
 task = "You are sleeptime"     # optional — omit for interactive session
 model = "haiku"                # optional — passed as --model flag to companion
-
-[[companions]]
-name = "mock-github"
-agent_type = "process"         # plain process: no MCP, no worktree, no agent identity
-command = "python3 tests/e2e/mock_github.py --port 9876"
 ```
 
 **Config hierarchy:**

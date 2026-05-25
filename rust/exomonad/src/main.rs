@@ -95,7 +95,7 @@ enum Commands {
         /// Model for the reviewer agent. Validated against the agent type.
         #[arg(long)]
         reviewer_model: Option<String>,
-        /// Enable verbose observability logging: hooks, Chainlink commands, decisions, reviewer spawns, spindle events.
+        /// Enable verbose observability logging: hooks, Chainlink commands, decisions, reviewer spawns, Forgejo CI events.
         /// Sets RUST_LOG=info, EXOMONAD_HOOK_TRACE=1, and EXOMONAD_CHAINLINK_TRACE=1 on the server; EXOMONAD_VERBOSE=1 session-wide.
         #[arg(long)]
         verbose: bool,

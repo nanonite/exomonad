@@ -200,15 +200,15 @@ sequenceDiagram
   participant Dev
   participant Watcher as Worktree Watcher
   participant Reviewer
-  participant CI as Spindle / CI
+  participant CI as Forgejo CI
 
   TL->>Dev: spawn_leaf(spec)
   Dev->>Dev: implement, commit
-  Dev->>Dev: file_pr (writes .exo/prs.json)
+  Dev->>Dev: file_pr (opens Forgejo PR)
   Note over Dev: DevPhase: DevPRFiled
   Watcher->>Reviewer: spawn (ephemeral) via review-loop
   Reviewer->>Reviewer: read diff
-  Reviewer->>Reviewer: approve_pr (writes .exo/reviews/pr_N.json)
+  Reviewer->>Reviewer: approve_pr (submits Forgejo review)
   Note over Reviewer: ReviewerPhase: ReviewerPosted
   Watcher->>Dev: handle_event(ReviewApproved)
   Note over Dev: DevPhase: DevApproved (MustBlock)
@@ -249,7 +249,7 @@ sequenceDiagram
 <h3>Event vocabulary</h3>
 <table>
 <tr><th>Event</th><th>Watcher trigger</th><th>Dev / TL handler</th><th>Reviewer handler</th></tr>
-<tr><td><code>ReviewReceived</code></td><td>new comments in <code>.exo/reviews/pr_N.json</code></td><td>log + <code>ReviewReceivedEv</code> + inject comments</td><td>log + <code>ReviewerRequestedChangesEv</code> + inject</td></tr>
+<tr><td><code>ReviewReceived</code></td><td>new Forgejo review comments</td><td>log + <code>ReviewReceivedEv</code> + inject comments</td><td>log + <code>ReviewerRequestedChangesEv</code> + inject</td></tr>
 <tr><td><code>ReviewApproved</code></td><td>review state = approved</td><td><code>ReviewApprovedEv</code> -&gt; <code>DevApproved</code></td><td><code>ReviewerApprovedEv</code> -&gt; <code>ReviewerPosted</code></td></tr>
 <tr><td><code>ReviewerApproved</code></td><td>reviewer agent set verdict approved</td><td>same as above</td><td>same as above</td></tr>
 <tr><td><code>ReviewerRequestedChanges</code></td><td>reviewer wrote requested-changes verdict</td><td><code>ReviewReceivedEv</code> (one fix round)</td><td><code>ReviewerRequestedChangesEv</code></td></tr>
@@ -276,7 +276,7 @@ flowchart TD
   F --> G[TL receives 'from: dev MERGE READY']
 </div>
 
-<p class="note">Without a spindle / GitHub Actions producing a CI status, <code>ci_mergeable_at</code> stays <code>None</code> and <code>MergeReady</code> never fires — even with reviewer approval the loop deadlocks at <code>DevApproved</code>.</p>
+<p class="note">Without Forgejo Actions producing a CI status, <code>ci_mergeable_at</code> stays <code>None</code> and <code>MergeReady</code> never fires even with reviewer approval.</p>
 
 <h2>6. Watcher Escalation Outputs</h2>
 <table>

@@ -164,6 +164,40 @@ impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir +
             .unwrap_or_default())
     }
 
+    #[instrument(skip_all, fields(agent_name = %ctx.agent_name, pr_number = req.pr_number, event = %req.event))]
+    async fn submit_review(
+        &self,
+        req: SubmitReviewRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SubmitReviewResponse> {
+        let _ = ctx;
+        let event = normalized_review_event(&req.event)?;
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Ok(SubmitReviewResponse {
+                success: false,
+                error: "forgejo_url and forgejo_token are required to submit PR reviews"
+                    .to_string(),
+            });
+        };
+        let repo_info = repo::get_repo_info(self.ctx.project_dir())
+            .await
+            .effect_err("file_pr")?;
+        forgejo
+            .submit_pull_request_review(
+                &repo_info.owner,
+                &repo_info.repo,
+                crate::domain::PRNumber::new(req.pr_number as u64),
+                event,
+                &req.body,
+            )
+            .await
+            .effect_err("file_pr")?;
+        Ok(SubmitReviewResponse {
+            success: true,
+            error: String::new(),
+        })
+    }
+
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, branch = %req.branch))]
     async fn local_pr_get_for_branch(
         &self,
@@ -185,6 +219,17 @@ impl<C: HasForgejoClient + HasEventLog + HasGitWorktreeService + HasProjectDir +
             .effect_err("file_pr")?
             .map(|pr| forgejo_pr_response(&pr))
             .unwrap_or_default())
+    }
+}
+
+fn normalized_review_event(event: &str) -> EffectResult<&'static str> {
+    match event.trim().to_ascii_uppercase().as_str() {
+        "APPROVED" | "APPROVE" => Ok("APPROVED"),
+        "REQUEST_CHANGES" | "CHANGES_REQUESTED" => Ok("REQUEST_CHANGES"),
+        "COMMENT" | "COMMENTED" => Ok("COMMENT"),
+        other => Err(EffectError::invalid_input(format!(
+            "unsupported review event '{other}'; expected APPROVED, REQUEST_CHANGES, or COMMENT"
+        ))),
     }
 }
 

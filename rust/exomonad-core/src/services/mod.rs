@@ -12,7 +12,6 @@ pub mod event_log;
 pub mod event_queue;
 pub mod external;
 pub mod file_pr;
-pub mod file_pr_local;
 pub mod filesystem;
 pub mod forgejo;
 pub mod forgejo_ci;
@@ -23,9 +22,9 @@ pub mod inbox_watcher;
 pub mod local;
 pub mod log;
 pub mod merge_pr;
-pub mod merge_pr_local;
 pub mod mutex_registry;
 pub mod orphan_reconciler;
+pub mod pr_registry;
 pub mod repo;
 pub mod resilience;
 pub mod review_policy;
@@ -104,16 +103,16 @@ pub trait HasGitWorktreeService: Send + Sync {
 pub trait HasCiStatusMap: Send + Sync {
     fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<CiStatusMap>>;
 }
-/// Spawns a reviewer agent for a local PR. Implemented by `AgentControlService`.
+/// Spawns a reviewer agent for a Forgejo PR. Implemented by `AgentControlService`.
 ///
-/// Reviewer creation is owned by the local PR watcher for automatic review
+/// Reviewer creation is owned by the Forgejo PR watcher for automatic review
 /// rounds. TL/root roles may request explicit reviewer-only recovery when a PR
 /// outlives its original author worktree.
 ///
 /// Decouples `WorktreeEventWatcher` from the concrete `AgentControlService` type.
 #[async_trait::async_trait]
 pub trait ReviewerSpawner: Send + Sync {
-    async fn spawn_reviewer_for_pr(&self, pr: &file_pr_local::PrEntry) -> anyhow::Result<()>;
+    async fn spawn_reviewer_for_pr(&self, pr: &pr_registry::PrEntry) -> anyhow::Result<()>;
 }
 
 // ============================================================================

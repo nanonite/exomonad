@@ -440,7 +440,6 @@ fn permissions_profiles_toml() -> String {
     permissions.insert(
         "reviewer".to_string(),
         toml::Value::Table(read_mostly_profile(&[
-            ".exo/reviews",
             ".exo/events",
             ".exo/tmp",
             "target",

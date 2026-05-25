@@ -24,7 +24,7 @@ Three invariants govern when agents end, when issues can close, and how worker c
 
 A dev-leaf's lifecycle ends when its assigned chainlink issue closes by any path other than the leaf's own PR merge. The TL keeps a leaf alive by keeping its issue open; the TL ends a leaf by closing its issue. Lifecycle correctness is structural, not a discipline rule the TL must remember.
 
-**Mechanism.** A new `IssueClosed` world event fires from every chainlink close path (`merge_pr_local`'s post-merge close, the `chainlink_issue_close` MCP tool, the `dispose_leaf` wrapper). The dev-leaf's event handler matches on the leaf's assigned issue id, transitions its state machine to a terminal `DevDismissed` phase, injects a final `[ISSUE CLOSED]` message, and triggers a shared `dispose_agent_resources(project_dir, agent_slug)` helper extracted from the existing merge cleanup in `merge_pr_local.rs:303-331`. Worktree, tmux window, agent dir, and branch are released through the same code path that successful merges already use.
+**Mechanism.** A new `IssueClosed` world event fires from every chainlink close path (`merge_pr`'s post-merge close, the `chainlink_issue_close` MCP tool, the `dispose_leaf` wrapper). The dev-leaf's event handler matches on the leaf's assigned issue id, transitions its state machine to a terminal `DevDismissed` phase, injects a final `[ISSUE CLOSED]` message, and triggers the shared `dispose_agent_resources(project_dir, agent_slug)` helper. Worktree, tmux window, agent dir, and branch are released through the same code path that successful merges already use.
 
 ### Invariant 2 — Issues cannot close while the calling worktree is dirty
 

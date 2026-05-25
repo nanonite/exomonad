@@ -110,22 +110,6 @@ wasm-all:
     @echo ">>> Installed to .exo/wasm/:"
     @ls -lh .exo/wasm/wasm-guest-*.wasm
 
-# Build Tangled Spindle and install it for consuming repos.
-spindle-dev:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ ! -d tangled-core/cmd/spindle ]; then
-        echo "ERROR: tangled-core/cmd/spindle not found."
-        exit 1
-    fi
-    echo ">>> Building Tangled spindle..."
-    mkdir -p .exo/bin ~/.exo/bin
-    nix develop --command bash -c 'cd tangled-core && go build -o ../.exo/bin/spindle ./cmd/spindle'
-    cp .exo/bin/spindle ~/.exo/bin/spindle
-    chmod 755 .exo/bin/spindle ~/.exo/bin/spindle
-    echo ">>> Installed spindle:"
-    ls -lh .exo/bin/spindle ~/.exo/bin/spindle
-
 # One-time WASM build environment setup (populates cabal package index)
 wasm-setup:
     @echo ">>> Setting up WASM build environment (one-time)..."
@@ -217,10 +201,6 @@ proto-test:
 test-mcp *args:
     ./scripts/test-mcp-integration.sh {{args}}
 
-# Run interactive E2E test (starts mocks, drops you into exomonad init session)
-test-e2e:
-    ./tests/e2e/run.sh
-
 # ============================================================================
 # E2E test recipes
 #
@@ -254,15 +234,6 @@ e2e-opencode-tl:
 e2e-opencode-worker:
     ./tests/e2e/opencode-worker/run.sh
 
-# Run E2E Codex hooks test (root/TL/dev/reviewer hook config and dispatch)
-e2e-codex-hooks:
-    ./tests/e2e/codex-hooks/run.sh
-
-# Check E2E Codex hooks harness scripts without launching Codex/tmux
-check-e2e-codex-hooks:
-    bash -n tests/e2e/codex-hooks/run.sh
-    bash -n tests/e2e/codex-hooks/validate.sh
-
 # Compare ExoMonad's trusted hook hash with the installed Codex CLI hash
 e2e-codex-hook-parity:
     nix develop --command cargo nextest run -p exomonad-core --lib codex_hook_hash_matches_installed_codex_cli --run-ignored ignored-only --no-capture
@@ -289,24 +260,6 @@ check-e2e-chainlink-codex:
     bash -n tests/e2e/chainlink-codex/run.sh
     bash -n tests/e2e/chainlink-codex/validate.sh
 
-# Run E2E reviewer convergence loop test (fixes_pushed fan-out to reviewer per chainlink #247)
-e2e-reviewer-convergence:
-    ./tests/e2e/reviewer-convergence-loop/run.sh
-
-# Check E2E reviewer convergence harness scripts without launching Codex/tmux
-check-e2e-reviewer-convergence:
-    bash -n tests/e2e/reviewer-convergence-loop/run.sh
-    bash -n tests/e2e/reviewer-convergence-loop/validate.sh
-
-# Run E2E reviewer ephemerality regression test.
-e2e-reviewer-ephemerality:
-    ./tests/e2e/reviewer-ephemerality/run.sh
-
-# Check E2E reviewer ephemerality harness scripts without launching agents.
-check-e2e-reviewer-ephemerality:
-    bash -n tests/e2e/reviewer-ephemerality/run.sh
-    bash -n tests/e2e/reviewer-ephemerality/validate.sh
-
 # Run E2E Chainlink sqlite direct DB access block test
 e2e-chainlink-sqlite-block:
     ./tests/e2e/chainlink-sqlite-block/run.sh
@@ -328,127 +281,6 @@ e2e-mcp-tool-visibility:
 check-e2e-mcp-tool-visibility:
     bash -n tests/e2e/mcp-tool-visibility/run.sh
 
-# Run Tangled PR integration test through Codex root/TL/worker/dev/reviewer roles.
-# Requires the local knot container: docker compose up -d  (in tests/e2e/tangled-ci/)
-e2e-tangled-pr-codex:
-    ./tests/e2e/tangled-pr-codex/run.sh
-
-# Check Tangled PR Codex E2E scripts without launching agents or containers.
-check-e2e-tangled-pr-codex:
-    bash -n tests/e2e/tangled-pr-codex/run.sh
-    bash -n tests/e2e/tangled-pr-codex/validate.sh
-    bash -n tests/e2e/tangled-pr-codex/deferred-spindle.sh
-    python3 -m py_compile tests/e2e/tangled-pr-codex/knot-event-relay.py
-
-
-# Run Tangled VM PR integration test against a pre-provisioned Tangled VM.
-e2e-tangled-vm-pr:
-    ./tests/e2e/tangled-vm-pr/run.sh
-
-# Check Tangled VM PR E2E scripts without launching agents or contacting the VM.
-check-e2e-tangled-vm-pr:
-    bash -n tests/e2e/tangled-vm-pr/run.sh
-    bash -n tests/e2e/tangled-vm-pr/validate.sh
-    python3 -m py_compile tests/e2e/tangled-vm-pr/pr-field.py
-
-# Run Tangled CI integration test.
-# Requires only the knot container: docker compose up -d  (in tests/e2e/tangled-ci/)
-# Manages spindle lifecycle entirely: kills any existing instance, starts fresh, cleans up on exit.
-e2e-tangled-ci:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    PROJECT_ROOT="$(pwd)"
-    SPINDLE_LOG="/tmp/spindle-e2e-$$.log"
-    SPINDLE_PID=""
-
-    cleanup() {
-        echo ""
-        echo "=== Cleanup ==="
-        [[ -n "$SPINDLE_PID" ]] && kill "$SPINDLE_PID" 2>/dev/null || true
-        rm -f "$SPINDLE_LOG"
-        rm -f "$PROJECT_ROOT/spindle.db"
-        rm -f /tmp/tangled-ci-e2e-rkey
-        rm -rf /tmp/spindle-logs
-        echo "Done."
-    }
-    trap cleanup EXIT
-
-    echo "=== Stopping any existing spindle on :6555 ==="
-    pkill -f 'tangled-core/cmd/spindle/spindle' 2>/dev/null || true
-    sleep 1
-
-    ./tests/e2e/tangled-ci/setup.sh
-
-    echo ""
-    echo "=== Starting spindle ==="
-    ./tests/e2e/tangled-ci/start-spindle.sh > "$SPINDLE_LOG" 2>&1 &
-    SPINDLE_PID=$!
-    echo "Spindle PID: $SPINDLE_PID  Log: $SPINDLE_LOG"
-
-    echo "Waiting for spindle to be ready..."
-    for i in $(seq 1 20); do
-        if curl -sf http://localhost:6555/ > /dev/null 2>&1; then break; fi
-        sleep 1
-    done
-    if ! curl -sf http://localhost:6555/ > /dev/null 2>&1; then
-        echo "ERROR: spindle did not come up within 20s. Logs:"
-        cat "$SPINDLE_LOG"
-        exit 1
-    fi
-    echo "Spindle ready."
-
-    RKEY="$(cat /tmp/tangled-ci-e2e-rkey 2>/dev/null)"
-    if [[ -z "$RKEY" ]]; then
-        echo "ERROR: could not read rkey from /tmp/tangled-ci-e2e-rkey"
-        exit 1
-    fi
-    # Spindle writes per-workflow logs to /tmp/spindle-logs/{rkey}-{name}.log
-    WORKFLOW_LOG="/tmp/spindle-logs/localhost-5555-${RKEY}-ci.yml.log"
-    echo ""
-    echo "=== Waiting for pipeline result (rkey=${RKEY}, timeout: 5m) ==="
-    DEADLINE=$((SECONDS + 300))
-    RESULT=""
-    ENQUEUED=0
-    while [[ $SECONDS -lt $DEADLINE ]]; do
-        if [[ $ENQUEUED -eq 0 ]] && grep -q "pipeline enqueued successfully.*${RKEY}" "$SPINDLE_LOG" 2>/dev/null; then
-            echo "  pipeline enqueued"
-            ENQUEUED=1
-        fi
-        if [[ -f "$WORKFLOW_LOG" ]]; then
-            # Last control line with step_status tells us if the final step completed
-            if grep -q '"step_status":"end"' "$WORKFLOW_LOG" && grep -q '"all tests passed"\|"step_status":"end"' "$WORKFLOW_LOG" 2>/dev/null; then
-                if ! grep -q '"step_status":"failed"\|"exit_code":[^0]' "$WORKFLOW_LOG" 2>/dev/null; then
-                    RESULT="pass"
-                    break
-                fi
-            fi
-            if grep -q '"step_status":"failed"' "$WORKFLOW_LOG" 2>/dev/null; then
-                RESULT="fail"
-                break
-            fi
-        fi
-        sleep 2
-    done
-
-    echo ""
-    echo "=== Spindle daemon log ==="
-    cat "$SPINDLE_LOG"
-    echo ""
-    if [[ -f "$WORKFLOW_LOG" ]]; then
-        echo "=== Workflow log ($RKEY) ==="
-        cat "$WORKFLOW_LOG" | python3 tests/e2e/tangled-ci/format-log.py
-    fi
-    echo ""
-
-    if [[ "$RESULT" == "pass" ]]; then
-        echo "PASS: pipeline completed successfully"
-    elif [[ "$RESULT" == "fail" ]]; then
-        echo "FAIL: pipeline step failed (see workflow log above)"
-        exit 1
-    else
-        echo "FAIL: timed out waiting for pipeline result"
-        exit 1
-    fi
 
 # Run live E2E Teams messaging test (requires active CC team "teams-e2e")
 live-teams-e2e:

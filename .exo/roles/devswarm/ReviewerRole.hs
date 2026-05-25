@@ -12,17 +12,13 @@ import Control.Monad (void)
 import Control.Monad.Freer (Eff)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as Aeson
-import Data.ByteString.Lazy qualified as BSL
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import Data.Text.Lazy qualified as TL
-import Data.Text.Lazy.Encoding qualified as TLE
-import ExoMonad
 import Effects.FilePr qualified as FPR
-import ExoMonad.Effects.FilePR (FilePRLocalPrGet)
+import ExoMonad
+import ExoMonad.Effects.FilePR (FilePRSubmitReview)
 import ExoMonad.Effects.Log qualified as Log
-import ExoMonad.Guest.Effects.FileSystem qualified as FS
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.Events
   ( CIStatusEvent (..),
@@ -48,7 +44,7 @@ reviewerRedispatchMessage toolName =
 
 reviewerVerdictExitNudge :: Text
 reviewerVerdictExitNudge =
-  "Verdict written. Exit now; do not continue reviewing or edit code. The watcher will route the result."
+  "Review submitted to Forgejo. Exit now; do not continue reviewing or edit code. The watcher will route the result."
 
 reviewerPostToolUse :: HookInput -> Eff Effects HookOutput
 reviewerPostToolUse input =
@@ -184,25 +180,6 @@ instance Aeson.FromJSON ReviewFile where
       <*> v Aeson..:? "comments" Aeson..!= []
       <*> v Aeson..:? "verdicts" Aeson..!= []
 
-reviewFilePath :: Int -> Text
-reviewFilePath prNumber = ".exo/reviews/pr_" <> T.pack (show prNumber) <> ".json"
-
-reviewFileToText :: ReviewFile -> Text
-reviewFileToText =
-  TL.toStrict . TLE.decodeUtf8 . Aeson.encode
-
-decodeReviewFile :: Text -> Maybe ReviewFile
-decodeReviewFile =
-  Aeson.decode . BSL.fromStrict . TE.encodeUtf8
-
-readExistingReviewFile :: Int -> Eff Effects ReviewFile
-readExistingReviewFile prNumber = do
-  result <- FS.readFile (reviewFilePath prNumber) 0
-  pure $ case result of
-    Right output ->
-      maybe emptyReviewFile id (decodeReviewFile (FS.rfoContent output))
-    Left _ -> emptyReviewFile
-
 emptyReviewFile :: ReviewFile
 emptyReviewFile = ReviewFile "none" [] []
 
@@ -243,72 +220,69 @@ missingHeadShaMessage :: Int -> Text
 missingHeadShaMessage prNumber =
   "Refused: cannot determine head SHA for PR #"
     <> T.pack (show prNumber)
-    <> ". Verdicts are locked per PR/SHA round, so the PR registry must include last_head_sha before review."
-
-currentHeadShaForPR :: Int -> Eff Effects (Either Text Text)
-currentHeadShaForPR prNumber = do
-  result <-
-    suspendEffect @FilePRLocalPrGet
-      FPR.LocalPrGetRequest
-        { FPR.localPrGetRequestPrNumber = fromIntegral prNumber
-        }
-  pure $ case result of
-    Right response
-      | FPR.localPrResponseFound response && not (TL.null (FPR.localPrResponseLastHeadSha response)) ->
-          Right (TL.toStrict (FPR.localPrResponseLastHeadSha response))
-    Right _ -> Left $ missingHeadShaMessage prNumber
-    Left err -> Left $ "Failed to load PR #" <> T.pack (show prNumber) <> " before writing verdict: " <> T.pack (show err)
+    <> ". Verdicts are locked per PR/SHA round, so Forgejo must report a PR head SHA before review."
 
 getReviewerBranch :: Eff Effects (Either Text Text)
 getReviewerBranch = do
   branch <- getCurrentBranch
   pure $
     if T.null branch || branch == "unknown"
-      then Left "Refused: reviewer branch identity is unknown. Detached reviewer worktrees must report the agent birth branch before writing verdicts."
+      then Left "Refused: reviewer branch identity is unknown. Detached reviewer worktrees must report the agent birth branch before submitting reviews."
       else Right branch
 
-writeReviewFile :: Int -> ReviewFile -> Eff Effects (Either Text Text)
-writeReviewFile prNumber reviewFile = do
-  result <- FS.writeFile (reviewFilePath prNumber) (reviewFileToText reviewFile) True
+submitReview :: Int -> Text -> Text -> Eff Effects (Either Text Text)
+submitReview prNumber event body = do
+  result <-
+    suspendEffect @FilePRSubmitReview
+      FPR.SubmitReviewRequest
+        { FPR.submitReviewRequestPrNumber = fromIntegral prNumber,
+          FPR.submitReviewRequestEvent = TL.fromStrict event,
+          FPR.submitReviewRequestBody = TL.fromStrict body
+        }
   pure $ case result of
-    Left err -> Left err
-    Right output -> Right (FS.wfoPath output)
+    Right response
+      | FPR.submitReviewResponseSuccess response -> Right "submitted"
+      | otherwise -> Left $ TL.toStrict (FPR.submitReviewResponseError response)
+    Left err -> Left $ "Failed to submit Forgejo review for PR #" <> T.pack (show prNumber) <> ": " <> T.pack (show err)
+
+reviewBodyWithLocation :: Text -> Maybe Text -> Maybe Text -> Text
+reviewBodyWithLocation body path diffHunk =
+  T.intercalate
+    "\n\n"
+    ( [body]
+        <> maybe [] (\p -> ["Path: `" <> p <> "`"]) path
+        <> maybe [] (\h -> ["```diff\n" <> h <> "\n```"]) diffHunk
+    )
 
 data ReviewerApprovePR
 
 instance MCPTool ReviewerApprovePR where
   type ToolArgs ReviewerApprovePR = ApprovePRArgs
   toolName = "approve_pr"
-  toolDescription = "Approve a local PR by writing `.exo/reviews/pr_{N}.json` for the ExoMonad review watcher."
+  toolDescription = "Approve a Forgejo PR by submitting an APPROVED review."
   toolSchema =
     genericToolSchemaWith @ApprovePRArgs
       [ ("pr_number", "Local PR number to approve"),
         ("body", "Concise approval summary")
       ]
   toolHandlerEff args = do
-    existing <- readExistingReviewFile (apPrNumber args)
     branchResult <- getReviewerBranch
-    headShaResult <- currentHeadShaForPR (apPrNumber args)
-    case (branchResult, headShaResult) of
-      (Left err, _) -> pure $ errorResult err
-      (_, Left err) -> pure $ errorResult err
-      (Right branch, Right headSha) ->
-        case appendVerdict (apPrNumber args) headSha "approved" (apBody args) (Just branch) [] existing of
+    case branchResult of
+      Left err -> pure $ errorResult err
+      Right branch -> do
+        result <- submitReview (apPrNumber args) "APPROVED" (apBody args)
+        case result of
           Left err -> pure $ errorResult err
-          Right next -> do
-            result <- writeReviewFile (apPrNumber args) next
-            case result of
-              Left err -> pure $ errorResult err
-              Right path -> do
-                void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv (apPrNumber args))
-                pure $ successResult $ object ["success" .= True, "path" .= path]
+          Right status -> do
+            void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv (apPrNumber args))
+            pure $ successResult $ object ["success" .= True, "status" .= status]
 
 data ReviewerRequestChanges
 
 instance MCPTool ReviewerRequestChanges where
   type ToolArgs ReviewerRequestChanges = RequestChangesArgs
   toolName = "request_changes"
-  toolDescription = "Request changes on a local PR by writing `.exo/reviews/pr_{N}.json` with review comments for the ExoMonad review watcher."
+  toolDescription = "Request changes on a Forgejo PR by submitting a REQUEST_CHANGES review."
   toolSchema =
     genericToolSchemaWith @RequestChangesArgs
       [ ("pr_number", "Local PR number to review"),
@@ -318,37 +292,23 @@ instance MCPTool ReviewerRequestChanges where
       ]
   toolHandlerEff args = do
     branchResult <- getReviewerBranch
-    headShaResult <- currentHeadShaForPR (rcPrNumber args)
-    case (branchResult, headShaResult) of
-      (Left err, _) -> pure $ errorResult err
-      (_, Left err) -> pure $ errorResult err
-      (Right branch, Right headSha) -> do
-        let comment =
-              ReviewComment
-                { commentBody = rcBody args,
-                  commentPath = rcPath args,
-                  commentDiffHunk = rcDiffHunk args,
-                  commentThreadId = Nothing,
-                  commentResolved = False,
-                  commentAuthorBranch = Just branch
-                }
-        existing <- readExistingReviewFile (rcPrNumber args)
-        case appendVerdict (rcPrNumber args) headSha "changes_requested" (rcBody args) (Just branch) [comment] existing of
+    case branchResult of
+      Left err -> pure $ errorResult err
+      Right branch -> do
+        let body = reviewBodyWithLocation (rcBody args) (rcPath args) (rcDiffHunk args)
+        result <- submitReview (rcPrNumber args) "REQUEST_CHANGES" body
+        case result of
           Left err -> pure $ errorResult err
-          Right next -> do
-            result <- writeReviewFile (rcPrNumber args) next
-            case result of
-              Left err -> pure $ errorResult err
-              Right path -> do
-                void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv (rcPrNumber args) (rcBody args))
-                pure $ successResult $ object ["success" .= True, "path" .= path]
+          Right status -> do
+            void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv (rcPrNumber args) (rcBody args))
+            pure $ successResult $ object ["success" .= True, "status" .= status]
 
 data ReviewerPostReviewComment
 
 instance MCPTool ReviewerPostReviewComment where
   type ToolArgs ReviewerPostReviewComment = PostReviewCommentArgs
   toolName = "post_review_comment"
-  toolDescription = "Append a local PR review comment to `.exo/reviews/pr_{N}.json` without changing an existing review decision."
+  toolDescription = "Post a comment-only Forgejo PR review without changing the approval decision."
   toolSchema =
     genericToolSchemaWith @PostReviewCommentArgs
       [ ("pr_number", "Local PR number to comment on"),
@@ -358,25 +318,15 @@ instance MCPTool ReviewerPostReviewComment where
         ("thread_id", "Optional thread identifier")
       ]
   toolHandlerEff args = do
-    existing <- readExistingReviewFile (pcPrNumber args)
     branchResult <- getReviewerBranch
     case branchResult of
       Left err -> pure $ errorResult err
-      Right branch -> do
-        let comment =
-              ReviewComment
-                { commentBody = pcBody args,
-                  commentPath = pcPath args,
-                  commentDiffHunk = pcDiffHunk args,
-                  commentThreadId = pcThreadId args,
-                  commentResolved = False,
-                  commentAuthorBranch = Just branch
-                }
-            next = existing {reviewComments = reviewComments existing <> [comment]}
-        result <- writeReviewFile (pcPrNumber args) next
+      Right _branch -> do
+        let body = reviewBodyWithLocation (pcBody args) (pcPath args) (pcDiffHunk args)
+        result <- submitReview (pcPrNumber args) "COMMENT" body
         case result of
           Left err -> pure $ errorResult err
-          Right path -> pure $ successResult $ object ["success" .= True, "path" .= path]
+          Right status -> pure $ successResult $ object ["success" .= True, "status" .= status]
 
 data Tools mode = Tools
   { approvePr :: mode :- ReviewerApprovePR,
@@ -390,10 +340,10 @@ config =
   RoleConfig
     { roleName = "reviewer",
       tools =
-          Tools
-            { approvePr = mkHandler @ReviewerApprovePR,
-              requestChanges = mkHandler @ReviewerRequestChanges,
-              postReviewComment = mkHandler @ReviewerPostReviewComment
+        Tools
+          { approvePr = mkHandler @ReviewerApprovePR,
+            requestChanges = mkHandler @ReviewerRequestChanges,
+            postReviewComment = mkHandler @ReviewerPostReviewComment
           },
       hooks =
         HookConfig

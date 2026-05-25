@@ -48,7 +48,6 @@ exomonad shutdown                 # Gracefully shut down the running server
 
 Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is newer (consuming projects only, not source projects with `.exo/roles/`).
 
-**Tangled auto-companion:** When `tangled_owner_did` is set in config, `exomonad init` automatically copies `~/.exo/bin/spindle` → `.exo/bin/spindle` (same pattern as WASM) and spawns spindle as a process companion. The spindle window subscribes to the knot's event stream (`tangled_knot_url/events`) and uses `tangled_spindle_db` as its database path. Declare a companion named `"spindle"` manually to override this behavior. `just install-all-dev` builds and installs the global Spindle binary.
 
 Claude MCP is auto-registered during init. For Gemini, register manually (`gemini mcp add ...`).
 
@@ -160,13 +159,11 @@ All effects flow through a single `yield_effect` host function using protobuf bi
 WASM must be built before running hooks or serve mode:
 
 ```bash
-# Full install (recommended): builds WASM, Rust, Spindle, then installs everything
 just install-all-dev
 
 # Or manually:
 just wasm-all                    # Build devswarm WASM plugin
 cargo build -p exomonad          # Build Rust binary
-just spindle-dev                 # Build/install Tangled Spindle
 ```
 
 ## Testing

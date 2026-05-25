@@ -990,7 +990,7 @@ Run `exomonad recompile` first to build it.",
     let claude_session_registry =
         Arc::new(exomonad_core::services::claude_session_registry::ClaudeSessionRegistry::new());
 
-    // Shared CI status map — updated by WorktreeEventWatcher's spindle subscriber,
+    // Shared CI status map retained for compatibility with legacy webhook integrations,
     // read by MergePRHandler gate 7. Keyed by (branch, SHA) so stale CI from
     // an older push cannot satisfy the reviewer-approved commit gate.
     let ci_status_map = Arc::new(tokio::sync::RwLock::new(

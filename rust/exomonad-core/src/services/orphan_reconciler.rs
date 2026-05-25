@@ -1,5 +1,4 @@
-use crate::services::agent_resources::{dispose_agent_resources, dispose_reviewers_for_pr};
-use crate::services::file_pr_local::{read_pr_registry, PrState};
+use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::git_worktree::GitWorktreeService;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -41,7 +40,7 @@ pub async fn reconcile_once(
     tmux_session: Option<&str>,
 ) -> Result<()> {
     reconcile_issue_worktrees(project_dir, git_wt.clone()).await?;
-    reconcile_reviewer_worktrees(project_dir, git_wt).await?;
+    let _ = git_wt;
     reconcile_session_timeouts(
         project_dir,
         max_leaf_session_seconds,
@@ -78,23 +77,6 @@ async fn reconcile_issue_worktrees(
             append_issue_closed_event(project_dir, issue_id, "orphan_reconciler").await?;
             dispose_agent_resources(project_dir, git_wt.clone(), &slug).await;
             info!(issue_id, agent = %slug, "Reconciled closed Chainlink issue for live worktree");
-        }
-    }
-    Ok(())
-}
-
-async fn reconcile_reviewer_worktrees(
-    project_dir: &Path,
-    git_wt: Arc<GitWorktreeService>,
-) -> Result<()> {
-    let prs_path = project_dir.join(".exo/prs.json");
-    let Ok(registry) = read_pr_registry(&prs_path).await else {
-        return Ok(());
-    };
-
-    for (pr_number, pr) in registry.prs {
-        if matches!(pr.state, PrState::Merged | PrState::Closed) {
-            dispose_reviewers_for_pr(project_dir, git_wt.clone(), pr_number).await;
         }
     }
     Ok(())

@@ -55,6 +55,25 @@ message LocalPrResponse {
   string reviewer_agent = 8;
 }
 
+
+// ============================================================================
+// SubmitReview - Submit a Forgejo PR review
+// ============================================================================
+
+message SubmitReviewRequest {
+  // PR number to review.
+  int64 pr_number = 1;
+  // Forgejo review event: APPROVED, REQUEST_CHANGES, or COMMENT.
+  string event = 2;
+  // Review body text.
+  string body = 3;
+}
+
+message SubmitReviewResponse {
+  bool success = 1;
+  string error = 2;
+}
+
 // ============================================================================
 // Service definition
 // ============================================================================
@@ -63,4 +82,5 @@ service FilePrEffects {
   rpc FilePr(FilePrRequest) returns (FilePrResponse);
   rpc LocalPrGet(LocalPrGetRequest) returns (LocalPrResponse);
   rpc LocalPrGetForBranch(LocalPrGetForBranchRequest) returns (LocalPrResponse);
+  rpc SubmitReview(SubmitReviewRequest) returns (SubmitReviewResponse);
 }

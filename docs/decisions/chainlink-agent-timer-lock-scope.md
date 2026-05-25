@@ -182,7 +182,7 @@ For ExoMonad, do not expose Chainlink agent commands through MCP. Audit correlat
 
 - birth branch
 - tmux/session id
-- local PR registry entry
+- Forgejo PR number and head branch
 - reviewer result
 - merge event
 

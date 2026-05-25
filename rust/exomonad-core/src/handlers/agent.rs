@@ -17,11 +17,11 @@ use crate::services::agent_control::{
     SpawnGeminiTeammateOptions, SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions,
     SpawnWorkerOptions,
 };
-use crate::services::agent_resources::{dispose_agent_resources, dispose_reviewers_for_pr};
-use crate::services::file_pr_local::{
-    read_pr_registry, LocalReviewState, PrEntry, PrRegistry, PrState,
-};
+use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::forgejo::ForgejoPullRequest;
+#[cfg(test)]
+use crate::services::pr_registry::PrRegistry;
+use crate::services::pr_registry::{LocalReviewState, PrEntry, PrState};
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use async_trait::async_trait;
@@ -1245,18 +1245,9 @@ impl<
             return Ok(close_issue_cleanup_error("leaf_name is required"));
         }
 
-        let prs_path = self.ctx.project_dir().join(".exo/prs.json");
-        let registry = read_pr_registry(&prs_path).await.ok();
-        let matching_prs = registry
-            .as_ref()
-            .map(|registry| cleanup_prs_for_leaf(registry, req.issue_id, &req.leaf_name))
-            .unwrap_or_default();
-
-        let open_prs: Vec<u64> = matching_prs
-            .iter()
-            .filter(|(_, pr)| pr.state != PrState::Merged)
-            .map(|(number, _)| *number)
-            .collect();
+        let open_prs = self
+            .matching_open_forgejo_prs_for_cleanup(req.issue_id, &req.leaf_name)
+            .await?;
         if !open_prs.is_empty() {
             return Ok(CloseIssueAndCleanupResponse {
                 success: false,
@@ -1290,21 +1281,11 @@ impl<
             });
         }
 
-        let cleaned_pr_numbers: Vec<u64> = matching_prs.iter().map(|(number, _)| *number).collect();
-        for pr_number in &cleaned_pr_numbers {
-            dispose_reviewers_for_pr(
-                self.ctx.project_dir(),
-                self.ctx.git_worktree_service().clone(),
-                *pr_number,
-            )
-            .await;
-        }
-
         Ok(CloseIssueAndCleanupResponse {
             success: true,
             error: String::new(),
             leaf_name: req.leaf_name,
-            cleaned_pr_numbers,
+            cleaned_pr_numbers: Vec::new(),
         })
     }
 }
@@ -1333,6 +1314,31 @@ impl<
             + 'static,
     > AgentHandler<C>
 {
+    async fn matching_open_forgejo_prs_for_cleanup(
+        &self,
+        issue_id: u64,
+        leaf_name: &str,
+    ) -> EffectResult<Vec<u64>> {
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Ok(Vec::new());
+        };
+        let repo_info = crate::services::repo::get_repo_info(self.ctx.project_dir())
+            .await
+            .effect_err("agent")?;
+        let prs = forgejo
+            .list_open_pull_requests(&repo_info.owner, &repo_info.repo)
+            .await
+            .effect_err("agent")?;
+        let mut numbers: Vec<u64> = prs
+            .into_iter()
+            .map(pr_entry_from_forgejo_pull_request)
+            .filter(|pr| pr_matches_cleanup_target(pr, issue_id, leaf_name))
+            .map(|pr| pr.number)
+            .collect();
+        numbers.sort_unstable();
+        Ok(numbers)
+    }
+
     async fn resolve_open_forgejo_pr_entry(&self, pr_number: u64) -> EffectResult<PrEntry> {
         let Some(forgejo) = self.ctx.forgejo_client() else {
             return Err(EffectError::not_found(
@@ -1448,15 +1454,6 @@ async fn live_reviewer_for_pr(project_dir: &Path, pr_number: u64) -> Option<Stri
 }
 
 async fn clear_reviewer_review_artifacts(project_dir: &Path, pr_number: u64) -> anyhow::Result<()> {
-    let review_path = project_dir
-        .join(".exo/reviews")
-        .join(format!("pr_{pr_number}.json"));
-    match tokio::fs::remove_file(&review_path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-
     let state_path = project_dir.join(".exo/watcher-state.json");
     let state = match tokio::fs::read_to_string(&state_path).await {
         Ok(state) => state,
@@ -1532,6 +1529,7 @@ async fn close_chainlink_issue_for_cleanup(
     }
 }
 
+#[cfg(test)]
 fn cleanup_prs_for_leaf<'a>(
     registry: &'a PrRegistry,
     issue_id: u64,
@@ -1777,6 +1775,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(test)]
     fn cleanup_prs_for_leaf_matches_issue_and_leaf_identity() {
         let mut registry = PrRegistry::default();
         registry.prs.insert(
@@ -1814,6 +1813,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(test)]
     fn cleanup_prs_for_leaf_ignores_other_leaf_prs() {
         let mut registry = PrRegistry::default();
         registry.prs.insert(

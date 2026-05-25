@@ -714,3 +714,208 @@ instance (HsJSONPB.ToJSON LocalPrResponse) where
 
 instance (HsJSONPB.FromJSON LocalPrResponse) where
   parseJSON = HsJSONPB.parseJSONPB
+
+data SubmitReviewRequest
+  = SubmitReviewRequest
+  { submitReviewRequestPrNumber :: Hs.Int64,
+    submitReviewRequestEvent :: Hs.Text,
+    submitReviewRequestBody :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData SubmitReviewRequest)
+
+instance (HsProtobuf.Named SubmitReviewRequest) where
+  nameOf _ = Hs.fromString "SubmitReviewRequest"
+
+instance (HsProtobuf.HasDefault SubmitReviewRequest)
+
+instance (HsProtobuf.Message SubmitReviewRequest) where
+  encodeMessage
+    _
+    SubmitReviewRequest
+      { submitReviewRequestPrNumber,
+        submitReviewRequestEvent,
+        submitReviewRequestBody
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 1)
+                submitReviewRequestPrNumber
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 2)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    submitReviewRequestEvent
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 3)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                submitReviewRequestBody
+            )
+        )
+  decodeMessage _ =
+    Hs.pure SubmitReviewRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Int64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "event")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "body")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB SubmitReviewRequest) where
+  toJSONPB (SubmitReviewRequest f1 f2 f3) =
+    HsJSONPB.object
+      [ "pr_number" .= f1,
+        "event" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "body" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+      ]
+  toEncodingPB (SubmitReviewRequest f1 f2 f3) =
+    HsJSONPB.pairs
+      [ "pr_number" .= f1,
+        "event" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "body" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+      ]
+
+instance (HsJSONPB.FromJSONPB SubmitReviewRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "SubmitReviewRequest"
+      ( \obj ->
+          Hs.pure SubmitReviewRequest
+            <*> obj .: "pr_number"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "event")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "body")
+                )
+      )
+
+instance (HsJSONPB.ToJSON SubmitReviewRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON SubmitReviewRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data SubmitReviewResponse
+  = SubmitReviewResponse
+  { submitReviewResponseSuccess :: Hs.Bool,
+    submitReviewResponseError :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData SubmitReviewResponse)
+
+instance (HsProtobuf.Named SubmitReviewResponse) where
+  nameOf _ = Hs.fromString "SubmitReviewResponse"
+
+instance (HsProtobuf.HasDefault SubmitReviewResponse)
+
+instance (HsProtobuf.Message SubmitReviewResponse) where
+  encodeMessage
+    _
+    SubmitReviewResponse
+      { submitReviewResponseSuccess,
+        submitReviewResponseError
+      } =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            submitReviewResponseSuccess
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                submitReviewResponseError
+            )
+        )
+  decodeMessage _ =
+    Hs.pure SubmitReviewResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB SubmitReviewResponse) where
+  toJSONPB (SubmitReviewResponse f1 f2) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+  toEncodingPB (SubmitReviewResponse f1 f2) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+
+instance (HsJSONPB.FromJSONPB SubmitReviewResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "SubmitReviewResponse"
+      ( \obj ->
+          Hs.pure SubmitReviewResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+      )
+
+instance (HsJSONPB.ToJSON SubmitReviewResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON SubmitReviewResponse) where
+  parseJSON = HsJSONPB.parseJSONPB

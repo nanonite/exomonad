@@ -7,9 +7,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const DEFAULT_TANGLED_KNOT_URL: &str = "http://localhost:5555";
-const DEFAULT_TANGLED_SPINDLE_URL: &str = "ws://localhost:6555";
 const DEFAULT_TANGLED_APPVIEW_URL: &str = "http://localhost:3000";
-const DEFAULT_TANGLED_SPINDLE_DB: &str = "spindle.db";
 
 /// Initialize a new exomonad project in the current directory.
 /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
@@ -25,12 +23,6 @@ pub async fn run(_name: Option<String>) -> Result<()> {
     std::fs::create_dir_all(cwd.join(".exo"))?;
     let tangled_integration = discover_tangled_integration(&cwd).await;
     std::fs::write(&config_path, config_content(tangled_integration.as_ref()))?;
-
-    let prs_path = cwd.join(".exo/prs.json");
-    if !prs_path.exists() {
-        std::fs::write(&prs_path, "{\"prs\":{},\"next_number\":1}\n")?;
-        info!("Created .exo/prs.json (empty PR registry)");
-    }
 
     let policy_path = cwd.join(".exo/review-policy.toml");
     if !policy_path.exists() {
@@ -164,11 +156,9 @@ gate = \"auto\"
 #[derive(Debug, Clone)]
 struct TangledNewIntegration {
     knot_url: String,
-    spindle_url: String,
     appview_url: String,
     owner_did: String,
     knot_container: String,
-    spindle_db: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,45 +181,32 @@ struct RepoCreateResponse {
 fn config_content(tangled: Option<&TangledNewIntegration>) -> String {
     let tangled_block = match tangled {
         Some(tangled) => format!(
-            "# Tangled CI integration (auto-detected by exomonad new)\n\
+            "# Tangled integration (auto-detected by exomonad new)\n\
              tangled_knot_url = {}\n\
-             tangled_spindle_url = {}\n\
              tangled_appview_url = {}\n\
              tangled_owner_did = {}\n\
-             tangled_knot_container = {}\n\
-             tangled_spindle_db = {}\n",
+             tangled_knot_container = {}\n",
             toml_string(&tangled.knot_url),
-            toml_string(&tangled.spindle_url),
             toml_string(&tangled.appview_url),
             toml_string(&tangled.owner_did),
             toml_string(&tangled.knot_container),
-            toml_string(&tangled.spindle_db),
         ),
-        None => "# Tangled CI integration (auto-detected when a local knot is reachable)\n\
+        None => "# Tangled integration (auto-detected when a local knot is reachable)\n\
                  # tangled_knot_url = \"http://localhost:5555\"\n\
-                 # tangled_spindle_url = \"ws://localhost:6555\"\n\
                  # tangled_appview_url = \"http://localhost:3000\"\n\
                  # tangled_owner_did = \"did:plc:yourDID\"\n\
-                 # tangled_knot_container = \"tangled-knot-knot-1\"\n\
-                 # tangled_spindle_db = \"spindle.db\"\n"
+                 # tangled_knot_container = \"tangled-knot-knot-1\"\n"
             .to_string(),
     };
 
     format!(
         "# ExoMonad project config\n\
-         # All fields are optional — see CLAUDE.md for full reference.\n\
-         \n\
-         # default_role = \"tl\"\n\
-         # tmux_session = \"my-project\"\n\
-         # model = \"sonnet\"\n\
-         \n\
-         {tangled_block}
-         # Forgejo CI integration
-         # forgejo_url = \"http://localhost:3000\"
-         # forgejo_token = \"your_forgejo_token\"
-         # forgejo_webhook_secret = \"your_webhook_secret\"
-         # forgejo_ssh_port = 2222
-"
+         # All fields are optional - see CLAUDE.md for full reference.\n\n\
+         {}\n\
+         # Forgejo integration\n\
+         # forgejo_url = \"http://localhost:3000\"\n\
+         # forgejo_token = \"...\"\n",
+        tangled_block
     )
 }
 
@@ -324,17 +301,12 @@ async fn discover_tangled_integration(project_dir: &Path) -> Option<TangledNewIn
 
     Some(TangledNewIntegration {
         knot_url,
-        spindle_url: std::env::var("EXOMONAD_TANGLED_SPINDLE_URL")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_TANGLED_SPINDLE_URL.to_string()),
         appview_url: std::env::var("EXOMONAD_TANGLED_APPVIEW_URL")
             .ok()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_TANGLED_APPVIEW_URL.to_string()),
         owner_did,
         knot_container: knot_container.clone(),
-        spindle_db: DEFAULT_TANGLED_SPINDLE_DB.to_string(),
     })
 }
 
@@ -664,19 +636,15 @@ mod tests {
     fn config_template_writes_active_tangled_fields_when_detected() {
         let content = config_content(Some(&TangledNewIntegration {
             knot_url: "http://localhost:5555".to_string(),
-            spindle_url: "ws://localhost:6555".to_string(),
             appview_url: "http://localhost:3000".to_string(),
             owner_did: "did:plc:owner".to_string(),
             knot_container: "tangled-knot-knot-1".to_string(),
-            spindle_db: "spindle.db".to_string(),
         }));
 
         assert!(content.contains("tangled_knot_url = \"http://localhost:5555\""));
-        assert!(content.contains("tangled_spindle_url = \"ws://localhost:6555\""));
         assert!(content.contains("tangled_appview_url = \"http://localhost:3000\""));
         assert!(content.contains("tangled_owner_did = \"did:plc:owner\""));
         assert!(content.contains("tangled_knot_container = \"tangled-knot-knot-1\""));
-        assert!(content.contains("tangled_spindle_db = \"spindle.db\""));
         toml::from_str::<toml::Value>(&content).unwrap();
     }
 

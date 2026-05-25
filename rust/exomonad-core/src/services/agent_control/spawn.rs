@@ -276,9 +276,9 @@ You are a Codex reviewer agent in an ExoMonad agent tree. You review a sibling a
 Review the PR assigned in your task prompt. Approve correct changes or request specific fixes. Do not implement the fix yourself.
 
 ## MCP Tools Available
-- approve_pr: Mark the PR approved in `.exo/reviews/pr_{N}.json`.
-- request_changes: Request changes in `.exo/reviews/pr_{N}.json`.
-- post_review_comment: Add a specific review comment to `.exo/reviews/pr_{N}.json`.
+- approve_pr: Submit an approved Forgejo PR review.
+- request_changes: Submit a request-changes Forgejo PR review.
+- post_review_comment: Submit a comment-only Forgejo PR review.
 
 ## Workflow
 1. Read the task prompt for the PR number, PR branch, base branch, and author.
@@ -286,7 +286,7 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 3. Review for correctness, edge cases, security issues, missing tests, and broken contracts.
 4. If issues are found, call request_changes with specific, actionable feedback that references files and functions or lines.
 5. If the code is correct, call approve_pr with a concise approving comment.
-6. Call notify_parent with status='success' after recording the review, then stop. The ExoMonad watcher also reads `.exo/reviews/pr_{N}.json` and routes the review result.
+6. Call notify_parent with status='success' after submitting the review, then stop. The ExoMonad watcher reads Forgejo reviews and routes the review result.
 
 ## Key Rules
 - Never modify code; reviewers only review.
@@ -1559,14 +1559,14 @@ impl<
     /// Spawn a reviewer agent for a sibling PR.
     ///
     /// Creates a tmux window with `role=reviewer` working from the project root.
-    /// The reviewer examines `git diff base..{pr_branch}`, writes review comments
-    /// to `.exo/reviews/pr_{N}.json`, and approves or requests changes.
+    /// The reviewer examines `git diff base..{pr_branch}` and submits a
+    /// Forgejo approval, request-changes review, or comment-only review.
     ///
     /// Use this when the TL receives `[PR READY]` from a child agent.
     #[instrument(skip_all, fields(pr_number = pr_entry.number))]
     pub async fn spawn_reviewer_subtree(
         &self,
-        pr_entry: &crate::services::file_pr_local::PrEntry,
+        pr_entry: &crate::services::pr_registry::PrEntry,
         caller_bb: &BirthBranch,
     ) -> Result<SpawnResult> {
         let branch_name = format!("review-pr-{}", pr_entry.number);
@@ -1576,7 +1576,7 @@ impl<
 
     pub async fn spawn_reviewer_subtree_named(
         &self,
-        pr_entry: &crate::services::file_pr_local::PrEntry,
+        pr_entry: &crate::services::pr_registry::PrEntry,
         caller_bb: &BirthBranch,
         branch_name: &str,
     ) -> Result<SpawnResult> {
@@ -1645,7 +1645,7 @@ impl<
 
     pub async fn spawn_reviewer_for_recovery(
         &self,
-        pr: &crate::services::file_pr_local::PrEntry,
+        pr: &crate::services::pr_registry::PrEntry,
         caller_bb: &BirthBranch,
     ) -> Result<SpawnResult> {
         let reviewer_branch_name = format!("review-pr-{}", pr.number);
@@ -1655,7 +1655,7 @@ impl<
 
     pub async fn spawn_reviewer_for_recovery_named(
         &self,
-        pr: &crate::services::file_pr_local::PrEntry,
+        pr: &crate::services::pr_registry::PrEntry,
         caller_bb: &BirthBranch,
         reviewer_branch_name: &str,
     ) -> Result<SpawnResult> {
@@ -1665,7 +1665,7 @@ impl<
 
     async fn spawn_reviewer_with_metadata_named(
         &self,
-        pr: &crate::services::file_pr_local::PrEntry,
+        pr: &crate::services::pr_registry::PrEntry,
         caller_bb: &BirthBranch,
         reviewer_branch_name: &str,
     ) -> Result<SpawnResult> {
@@ -1683,7 +1683,7 @@ impl<
 
     async fn persist_reviewer_assignment(
         &self,
-        pr: &crate::services::file_pr_local::PrEntry,
+        pr: &crate::services::pr_registry::PrEntry,
         reviewer_internal_name: &str,
         reviewer_birth_branch: &str,
     ) {
@@ -1740,7 +1740,7 @@ impl<
 {
     async fn spawn_reviewer_for_pr(
         &self,
-        pr: &crate::services::file_pr_local::PrEntry,
+        pr: &crate::services::pr_registry::PrEntry,
     ) -> anyhow::Result<()> {
         // Guard: if the author's worktree is gone, this PR is stale from a previous
         // session (crash or --recreate). Skip — no agent will respond to feedback.

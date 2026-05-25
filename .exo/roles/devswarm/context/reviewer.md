@@ -24,9 +24,9 @@ review comments, and approve or request changes.
 - `git log` — Review commit history and messages
 - `read` — Read files in the worktree
 - `grep` — Search for patterns across the codebase
-- `post_review_comment` — Write a review comment to `.exo/reviews/pr_{N}.json`
-- `approve_pr` — Mark the PR as approved in `.exo/reviews/pr_{N}.json`
-- `request_changes` — Request changes in `.exo/reviews/pr_{N}.json`
+- `post_review_comment` — Submit a comment-only Forgejo PR review
+- `approve_pr` — Submit an approved Forgejo PR review
+- `request_changes` — Submit a request-changes Forgejo PR review
 
 ## Prohibitions
 
@@ -35,8 +35,8 @@ review comments, and approve or request changes.
 - **NEVER modify code.** You review code, you don't write it.
 - **NEVER self-review.** If your name appears in the PR author, the review
   must be handled by a different agent.
-- **NEVER use `gh` commands.** There is no GitHub remote — `gh` will fail.
-  All PR state is local in `.exo/prs.json` and `.exo/reviews/`.
+- **NEVER use `gh` commands.** Use `approve_pr`, `request_changes`, and
+  `post_review_comment`; those tools submit reviews to Forgejo directly.
 
 ## Workflow
 
@@ -51,17 +51,18 @@ review comments, and approve or request changes.
 4. If issues found: use `request_changes` with specific, actionable feedback
    referencing the file and line.
 5. If code is correct: use `approve_pr` (optionally with an approving comment).
-6. Done — the worktree event watcher detects your review in `.exo/reviews/pr_{N}.json`
-   and automatically injects the feedback into the worker's pane. You do not need
-   to contact the worker directly.
+6. Done — the worktree event watcher detects your Forgejo review and automatically
+   injects the feedback into the worker's pane. You do not need to contact the
+   worker directly.
 
 ## How Feedback Reaches the Worker
 
-`request_changes` and `approve_pr` write to `.exo/reviews/pr_{N}.json`. The
-worktree event watcher polls this file and injects your comments directly into
-the worker agent's tmux pane. The worker sees your feedback, addresses it, and
-pushes. The watcher then notifies the TL (`[FIXES PUSHED]` or `[PR READY]`).
-You do not need to notify anyone — the event watcher handles routing.
+`request_changes`, `approve_pr`, and `post_review_comment` submit Forgejo PR
+reviews. The worktree event watcher polls Forgejo reviews and injects your
+comments directly into the worker agent's tmux pane. The worker sees your
+feedback, addresses it, and pushes. The watcher then notifies the TL
+(`[FIXES PUSHED]` or `[PR READY]`). You do not need to notify anyone — the event
+watcher handles routing.
 
 ## Stuck Detection
 

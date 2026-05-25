@@ -10,6 +10,7 @@ module ExoMonad.Effects.FilePR
     FilePRFilePr,
     FilePRLocalPrGet,
     FilePRLocalPrGetForBranch,
+    FilePRSubmitReview,
 
     -- * Re-exported proto types
     module Effects.FilePr,
@@ -43,3 +44,10 @@ instance Effect FilePRLocalPrGetForBranch where
   type Input FilePRLocalPrGetForBranch = LocalPrGetForBranchRequest
   type Output FilePRLocalPrGetForBranch = LocalPrResponse
   effectId = "file_pr.local_pr_get_for_branch"
+
+data FilePRSubmitReview
+
+instance Effect FilePRSubmitReview where
+  type Input FilePRSubmitReview = SubmitReviewRequest
+  type Output FilePRSubmitReview = SubmitReviewResponse
+  effectId = "file_pr.submit_review"

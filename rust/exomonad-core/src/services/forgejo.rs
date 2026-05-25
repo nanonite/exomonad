@@ -79,6 +79,12 @@ struct MergePullRequestBody<'a> {
     method: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+struct SubmitPullRequestReviewBody<'a> {
+    event: &'a str,
+    body: &'a str,
+}
+
 #[derive(Debug, Deserialize)]
 struct PullRequestResponse {
     number: u64,
@@ -279,6 +285,36 @@ impl ForgejoClient {
                 commit_id: review.commit_id,
             })
             .collect())
+    }
+
+    pub async fn submit_pull_request_review(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        number: PRNumber,
+        event: &str,
+        body: &str,
+    ) -> Result<()> {
+        let number = number.as_u64().to_string();
+        let url = self.api_url(&[
+            "repos",
+            owner.as_str(),
+            repo.as_str(),
+            "pulls",
+            &number,
+            "reviews",
+        ])?;
+        let response = self
+            .http
+            .post(url)
+            .headers(self.auth_headers()?)
+            .json(&SubmitPullRequestReviewBody { event, body })
+            .send()
+            .await
+            .context("Forgejo PR review submit request failed")?;
+
+        self.expect_success(response, "submit Forgejo pull request review")
+            .await
     }
 
     pub async fn list_commit_statuses(
@@ -834,6 +870,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, CIStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn submits_pull_request_review_with_forgejo_token() {
+        let (client, server) = client().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/owner/repo/pulls/9/reviews"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        client
+            .submit_pull_request_review(
+                &owner(),
+                &repo(),
+                PRNumber::new(9),
+                "APPROVED",
+                "Looks good",
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

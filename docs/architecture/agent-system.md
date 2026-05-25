@@ -221,15 +221,15 @@ sequenceDiagram
   participant Dev
   participant Watcher as Worktree Watcher
   participant Reviewer
-  participant CI as Spindle / CI
+  participant CI as Forgejo CI
 
   TL->>Dev: spawn_leaf(spec)
   Dev->>Dev: implement, commit
-  Dev->>Dev: file_pr (writes .exo/prs.json)
+  Dev->>Dev: file_pr (opens Forgejo PR)
   Note over Dev: DevPhase: DevPRFiled
   Watcher->>Reviewer: spawn (ephemeral) via review-loop
   Reviewer->>Reviewer: read diff
-  Reviewer->>Reviewer: approve_pr (writes .exo/reviews/pr_N.json)
+  Reviewer->>Reviewer: approve_pr (submits Forgejo review)
   Note over Reviewer: ReviewerPhase: ReviewerPosted
   Watcher->>Dev: handle_event(ReviewApproved) -> NoAction
   Note over Dev: DevPhase: DevApproved (MustBlock)
@@ -274,7 +274,7 @@ These are the `PRReviewEvent` constructors the watcher emits. Each role's `prRev
 
 | Event | Watcher trigger | Dev/TL handler | Reviewer handler |
 |-------|-----------------|----------------|------------------|
-| `ReviewReceived` | new comments in `.exo/reviews/pr_N.json` | log + `ReviewReceivedEv` + inject comments | log + `ReviewerRequestedChangesEv` + inject |
+| `ReviewReceived` | new Forgejo review comments | log + `ReviewReceivedEv` + inject comments | log + `ReviewerRequestedChangesEv` + inject |
 | `ReviewApproved` | review state = approved | `ReviewApprovedEv` -> `DevApproved` | `ReviewerApprovedEv` -> `ReviewerPosted` |
 | `ReviewerApproved` | reviewer agent set verdict approved | same as above | same as above |
 | `ReviewerRequestedChanges` | reviewer wrote requested-changes verdict | `ReviewReceivedEv` (one fix round) | `ReviewerRequestedChangesEv` |
@@ -301,7 +301,7 @@ flowchart TD
   F --> G[TL receives 'from: dev MERGE READY']
 ```
 
-Without a spindle / GitHub Actions producing a CI status, `ci_mergeable_at` stays `None` and `MergeReady` never fires — even with reviewer approval the loop deadlocks at `DevApproved`. This is what the local Tangled-without-spindle setup hits.
+Without Forgejo Actions producing a CI status, `ci_mergeable_at` stays `None` and `MergeReady` never fires even with reviewer approval.
 
 ---
 

@@ -24,7 +24,7 @@ The write-path inventory below was produced with `strace -f -e trace=%file` agai
 | `just <test target>` | Delegates to build tools; writes `target/`, `dist-newstyle/`, generated logs under project temp/cache directories | Reviewer profile includes common build artifact roots but not arbitrary source writes. |
 | `nix develop --command ...` | Nix store is external and managed by the host; project-local writes come from the nested command | No extra project write root beyond the nested workflow. |
 | `gh pr view`, `gh pr diff`, `gh pr checks` | User cache/config under `$HOME`, not project source | Agents should prefer ExoMonad MCP tools over raw `gh`; #308 still blocks gh from hook shell commands. |
-| ExoMonad MCP calls | `.exo/` state (`reviews`, events, session metadata), `.git` only for coordinator merge/write tools | TL/root need `.exo` and `.git`; reviewer needs `.exo/reviews` and event/session surfaces; dev/worker need full workspace write. |
+| ExoMonad MCP calls | `.exo/` state (events, session metadata), `.git` only for coordinator merge/write tools | TL/root need `.exo` and `.git`; reviewers need event/session surfaces and build output roots; dev/worker need full workspace write. |
 
 ## Decision
 
@@ -46,7 +46,7 @@ writable_roots = [".exo", ".git"]
 [permissions.reviewer]
 sandbox_mode = "workspace-write"
 network_access = false
-writable_roots = [".exo/reviews", ".exo/events", ".exo/tmp", "target", "rust/target", "dist-newstyle", "haskell/dist-newstyle", ".stack-work", ".cache"]
+writable_roots = [".exo/events", ".exo/tmp", "target", "rust/target", "dist-newstyle", "haskell/dist-newstyle", ".stack-work", ".cache"]
 
 [permissions.dev]
 sandbox_mode = "workspace-write"
@@ -73,7 +73,7 @@ The custom-role fallback keeps unknown implementation roles functional while pre
 
 ## Reviewer Cargo Tradeoff
 
-Reviewer test runs are the tension point. A reviewer that can run `cargo test` needs broad build-artifact writes, but a reviewer that can write arbitrary source files undermines #298. The current profile chooses the middle path: reviewers may write common build/cache output roots and `.exo/reviews`, but not source paths or `Cargo.lock`.
+Reviewer test runs are the tension point. A reviewer that can run `cargo test` needs broad build-artifact writes, but a reviewer that can write arbitrary source files undermines #298. The current profile chooses the middle path: reviewers may write common build/cache output roots and ExoMonad event/session state, but not source paths or `Cargo.lock`. Review verdicts are submitted through Forgejo rather than written to workspace files.
 
 If this proves too narrow, prefer moving reviewer test execution into an ExoMonad MCP tool that runs outside the Codex sandbox and returns structured results. Broadening reviewer workspace writes should be the fallback, not the default, because it weakens the reviewer authorship invariant.
 
@@ -84,6 +84,6 @@ This is the structural fix for Codex. The runtime hook parity from #308 remains 
 ## Consequences
 
 - Root and TL Codex agents can mutate orchestration state and git metadata, but not source files through ordinary file writes.
-- Reviewers can write review records and build artifacts, but source modification attempts must fail at the sandbox layer and at the PreToolUse hook layer.
+- Reviewers can submit review records through Forgejo and write build artifacts, but source modification attempts must fail at the sandbox layer and at the PreToolUse hook layer.
 - Dev leaves and workers keep full workspace write because implementation is their job.
 - Network remains disabled in all generated profiles; networked operations should route through approved tools or explicit operator policy.

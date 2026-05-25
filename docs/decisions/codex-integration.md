@@ -92,7 +92,7 @@ Codex reviewers run as ordinary ExoMonad reviewer agents in tmux with `role=revi
 codex exec --dangerously-bypass-approvals-and-sandbox --cd <worktree_dir> "$(cat <prompt_file>)"
 ```
 
-Do not use `codex exec review` for ExoMonad reviewer agents. That subcommand emits Codex-native review output, but it does not write ExoMonad's `.exo/reviews/pr_N.json` files. ExoMonad reviewer convergence depends on the reviewer agent calling the MCP review tools (`approve_pr`, `request_changes`, or `post_review_comment`) from the `role=reviewer` configuration.
+Do not use `codex exec review` for ExoMonad reviewer agents. That subcommand emits Codex-native review output, but it does not submit ExoMonad Forgejo reviews. ExoMonad reviewer convergence depends on the reviewer agent calling the MCP review tools (`approve_pr`, `request_changes`, or `post_review_comment`) from the `role=reviewer` configuration.
 
 The reviewer identity discipline still applies: reviewer agents use distinct git identities and never review under the identity that authored the PR.
 
@@ -103,10 +103,10 @@ Local CLI/source research for #163 found that `codex exec review` is useful as a
 - Supported targets are mutually exclusive: `--uncommitted`, `--base <BRANCH>`, `--commit <SHA>`, or a positional custom prompt. If none is supplied, the CLI errors.
 - `--base <BRANCH>` resolves the merge base with `HEAD` and prompts Codex to inspect `git diff <merge_base_sha>`, so it is a valid standalone diff-review primitive.
 - The command accepts normal exec options including `--model`, `--json`, `--output-last-message <FILE>`, and `--dangerously-bypass-approvals-and-sandbox`.
-- Output is Codex-native review-mode data rendered as plain text or JSONL events. It does not call ExoMonad review MCP tools and does not write `.exo/reviews/pr_N.json`.
+- Output is Codex-native review-mode data rendered as plain text or JSONL events. It does not call ExoMonad review MCP tools and does not submit a Forgejo review.
 - Exit status indicates execution success or failure only; it does not encode approve versus changes-requested.
 
-If ExoMonad ever wants to use `codex exec review` directly, it needs an explicit translator from the Codex review output into `.exo/reviews/pr_N.json`. Until then, Codex reviewer agents must run through the normal `role=reviewer` MCP path.
+If ExoMonad ever wants to use `codex exec review` directly, it needs an explicit translator from the Codex review output into a Forgejo review submission. Until then, Codex reviewer agents must run through the normal `role=reviewer` MCP path.
 
 ## Authentication
 
@@ -123,7 +123,7 @@ ExoMonad does not inject an auth token or provider-specific environment variable
 - `rust/exomonad-core/src/codex_config.rs`
 - `rust/exomonad-core/src/services/agent_control/internal.rs`
 - `rust/exomonad/src/init.rs`
-- `tests/e2e/codex-hooks/validate.sh`
+- `tests/e2e/codex-messaging/validate.sh`
 - `haskell/wasm-guest/src/ExoMonad/Guest/Tools/SpawnCodex.hs`
 - `docs/decisions/codex-hook-wire-format.md`
 
