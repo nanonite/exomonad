@@ -164,6 +164,13 @@ fn reviewer_fanout_decision(
     }
 }
 
+fn review_state_disposes_reviewer(review_state: &LocalReviewState) -> bool {
+    matches!(
+        review_state,
+        LocalReviewState::Approved | LocalReviewState::ChangesRequested
+    )
+}
+
 fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
     match agent_type {
         AgentType::Claude => "tl",
@@ -188,6 +195,7 @@ struct WatchState {
     rounds: u32,
     stuck: bool,
     reviewer_spawned: bool,
+    reviewer_disposed: bool,
     review_approved_at: Option<Instant>,
     ci_mergeable_at: Option<Instant>,
     merge_ready_notified: bool,
@@ -296,6 +304,7 @@ impl WatchState {
             rounds: 0,
             stuck: false,
             reviewer_spawned: false,
+            reviewer_disposed: false,
             review_approved_at: None,
             ci_mergeable_at: if matches!(ci_status, CIStatus::Success | CIStatus::Neutral) {
                 Some(Instant::now())
@@ -756,6 +765,7 @@ where
     ) -> Result<Vec<u64>> {
         let mut removed_prs = Vec::new();
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
+        let mut reviewer_disposals: Vec<u64> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
         let mut review_state_updates: Vec<(u64, LocalReviewState, String)> = Vec::new();
 
@@ -773,6 +783,7 @@ where
                 let agent_role = pr.author_role.clone();
                 let branch = BranchName::try_from_str(pr.head_branch.as_str())
                     .expect("validated string input is non-empty");
+                let terminal_review_observed = review_state_disposes_reviewer(&obs.review_state);
                 let (local_reviews, _local_review_state) = obs_to_review_parts(obs);
                 let head_sha_changed = pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str());
                 if head_sha_changed {
@@ -789,25 +800,28 @@ where
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
                     if head_sha_changed {
                         old_state.reviewer_spawned = false;
-                        if let Some(spawner) = &self.reviewer_spawner {
-                            let spawner = spawner.clone();
-                            let pr_clone = pr.clone();
-                            let pr_num = *pr_number;
-                            let sha = obs.head_sha.clone();
-                            tokio::spawn(async move {
-                                info!(pr_number = pr_num, head_sha = %sha, "Spawning reviewer agent for new PR head SHA");
-                                match spawner.spawn_reviewer_for_pr(&pr_clone).await {
-                                    Ok(_) => info!(
-                                        pr_number = pr_num,
-                                        head_sha = %sha,
-                                        "Reviewer agent spawned successfully for new PR head SHA"
-                                    ),
-                                    Err(e) => {
-                                        warn!(pr_number = pr_num, head_sha = %sha, error = %e, "Failed to spawn reviewer for new PR head SHA")
+                        old_state.reviewer_disposed = false;
+                        if !terminal_review_observed {
+                            if let Some(spawner) = &self.reviewer_spawner {
+                                let spawner = spawner.clone();
+                                let pr_clone = pr.clone();
+                                let pr_num = *pr_number;
+                                let sha = obs.head_sha.clone();
+                                tokio::spawn(async move {
+                                    info!(pr_number = pr_num, head_sha = %sha, "Spawning reviewer agent for new PR head SHA");
+                                    match spawner.spawn_reviewer_for_pr(&pr_clone).await {
+                                        Ok(_) => info!(
+                                            pr_number = pr_num,
+                                            head_sha = %sha,
+                                            "Reviewer agent spawned successfully for new PR head SHA"
+                                        ),
+                                        Err(e) => {
+                                            warn!(pr_number = pr_num, head_sha = %sha, error = %e, "Failed to spawn reviewer for new PR head SHA")
+                                        }
                                     }
-                                }
-                            });
-                            old_state.reviewer_spawned = true;
+                                });
+                                old_state.reviewer_spawned = true;
+                            }
                         }
                     }
                     compute_pr_actions_with_context(
@@ -850,30 +864,42 @@ where
                         self.policy.reviewer_max_wait_seconds,
                     );
                     // Spawn reviewer immediately on first sighting of a new open PR
-                    if let Some(spawner) = &self.reviewer_spawner {
-                        if let Some(pr_entry) = registry.prs.get(pr_number) {
-                            let spawner = spawner.clone();
-                            let pr_clone = pr_entry.clone();
-                            let pr_num = *pr_number;
-                            tokio::spawn(async move {
-                                info!(pr_number = pr_num, "Spawning reviewer agent for new PR");
-                                match spawner.spawn_reviewer_for_pr(&pr_clone).await {
-                                    Ok(_) => info!(
-                                        pr_number = pr_num,
-                                        "Reviewer agent spawned successfully"
-                                    ),
-                                    Err(e) => {
-                                        warn!(pr_number = pr_num, error = %e, "Failed to spawn reviewer for PR")
+                    // unless the watcher restarted after a terminal review verdict.
+                    if !terminal_review_observed {
+                        if let Some(spawner) = &self.reviewer_spawner {
+                            if let Some(pr_entry) = registry.prs.get(pr_number) {
+                                let spawner = spawner.clone();
+                                let pr_clone = pr_entry.clone();
+                                let pr_num = *pr_number;
+                                tokio::spawn(async move {
+                                    info!(pr_number = pr_num, "Spawning reviewer agent for new PR");
+                                    match spawner.spawn_reviewer_for_pr(&pr_clone).await {
+                                        Ok(_) => info!(
+                                            pr_number = pr_num,
+                                            "Reviewer agent spawned successfully"
+                                        ),
+                                        Err(e) => {
+                                            warn!(pr_number = pr_num, error = %e, "Failed to spawn reviewer for PR")
+                                        }
                                     }
+                                });
+                                if let Some(ws) = state_guard.get_mut(pr_number) {
+                                    ws.reviewer_spawned = true;
                                 }
-                            });
-                            if let Some(ws) = state_guard.get_mut(pr_number) {
-                                ws.reviewer_spawned = true;
                             }
                         }
                     }
                     actions
                 };
+
+                if terminal_review_observed {
+                    if let Some(ws) = state_guard.get_mut(pr_number) {
+                        if !ws.reviewer_disposed {
+                            reviewer_disposals.push(*pr_number);
+                            ws.reviewer_disposed = true;
+                        }
+                    }
+                }
 
                 if !actions.is_empty() {
                     pending_actions.push(PendingPrActions {
@@ -902,19 +928,14 @@ where
         }
         if !review_state_updates.is_empty() {
             self.persist_review_states(&review_state_updates).await?;
-            for (pr_number, review_state, _) in &review_state_updates {
-                if matches!(
-                    review_state,
-                    LocalReviewState::Approved | LocalReviewState::ChangesRequested
-                ) {
-                    dispose_reviewers_for_pr(
-                        self.ctx.project_dir(),
-                        self.ctx.git_worktree_service().clone(),
-                        *pr_number,
-                    )
-                    .await;
-                }
-            }
+        }
+        for pr_number in reviewer_disposals {
+            dispose_reviewers_for_pr(
+                self.ctx.project_dir(),
+                self.ctx.git_worktree_service().clone(),
+                pr_number,
+            )
+            .await;
         }
 
         for pending in pending_actions {
@@ -4418,6 +4439,64 @@ mod tests {
         assert!(!pr_state.stuck);
         assert!(!pr_state.needs_human_review);
         assert!(!temp_dir.path().join(".exo/prs.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_disposes_reviewer_when_restart_sees_approved_pr() {
+        use std::sync::atomic::Ordering;
+
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawner = Arc::new(MockReviewerSpawner {
+            called: called.clone(),
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let reviewer_slug = "review-pr-1-codex";
+        let reviewer_worktree = temp_dir.path().join(".exo/worktrees").join(reviewer_slug);
+        let reviewer_agent_dir = temp_dir.path().join(".exo/agents").join(reviewer_slug);
+        tokio::fs::create_dir_all(&reviewer_worktree).await.unwrap();
+        tokio::fs::create_dir_all(&reviewer_agent_dir)
+            .await
+            .unwrap();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
+        let mut pr = pr_with_reviewer(1, reviewer_slug, "review-pr-1");
+        pr.review_state = crate::services::file_pr_local::LocalReviewState::Approved;
+        let registry = test_registry(pr);
+
+        let mut observations = HashMap::new();
+        observations.insert(
+            1u64,
+            Observation {
+                head_sha: "abc123".to_string(),
+                review_state: crate::services::file_pr_local::LocalReviewState::Approved,
+                comments: vec![],
+                reviews: vec![test_review("approved", ReviewState::Approved)],
+                ci_status: CIStatus::Unknown,
+                review_file_seen: true,
+                review_file_mtime: None,
+            },
+        );
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "already-approved PRs observed after restart must not spawn a fresh reviewer"
+        );
+        assert!(
+            !reviewer_agent_dir.exists(),
+            "already-approved PRs observed after restart should dispose reviewer agent resources"
+        );
+        let state = watcher.state.lock().await;
+        assert!(state.get(&1).is_some_and(|state| state.reviewer_disposed));
     }
 
     #[tokio::test]
