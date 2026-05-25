@@ -40,6 +40,23 @@ The review-loop watcher routes all non-merge-ready outcomes (`dev_not_pushing`,
 human escalation surface as Chainlink `review-stuck` issues. Do not branch on
 review-loop timeout, stuck, or failed signals in this TL prompt.
 
+### Direct merge escalation (broken event chain)
+
+If `[MERGE READY]` never arrives but you believe the PR is ready, self-diagnose via Forgejo before escalating to human:
+
+```bash
+# Check review state
+curl -s -H "Authorization: token $FORGEJO_REVIEWER_TOKEN" \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$REPO/pulls/$PR_NUMBER/reviews"
+
+# Check CI status
+curl -s -H "Authorization: token $FORGEJO_TOKEN" \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$REPO/commits/$HEAD_SHA/statuses"
+```
+
+If the review shows `APPROVED` and CI shows `success` or no statuses (neutral), call `merge_pr` directly.
+This is the correct escalation when the watcher event chain is broken (e.g. Codex agent has no WASM plugin).
+
 ### Worker signals (ephemeral pane, no PR)
 - `[from: worker-name]` with success content — worker completed. Acknowledge, no merge needed.
 - `[from: worker-name]` with blocker/partial content — worker hit an issue. See Worker Correction Loop below.
