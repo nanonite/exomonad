@@ -806,7 +806,6 @@ where
                     author_role,
                     created_at: Utc::now(),
                     state: PrState::Open,
-                    review_state: ForgejoReviewState::PendingReview,
                     last_review_at: None,
                     last_head_sha: head_sha,
                     approved_at_sha: None,
@@ -933,7 +932,6 @@ where
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
         let mut reviewer_disposals: Vec<u64> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
-        let mut review_state_updates: Vec<(u64, ForgejoReviewState, String)> = Vec::new();
 
         {
             let mut state_guard = self.state.lock().await;
@@ -955,14 +953,6 @@ where
                 if head_sha_changed {
                     head_sha_updates.push((*pr_number, obs.head_sha.clone()));
                 }
-                if pr.review_state != obs.review_state {
-                    review_state_updates.push((
-                        *pr_number,
-                        obs.review_state.clone(),
-                        obs.head_sha.clone(),
-                    ));
-                }
-
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
                     if head_sha_changed {
                         old_state.reviewer_spawned = false;
@@ -1089,9 +1079,6 @@ where
 
         if !head_sha_updates.is_empty() {
             self.persist_last_head_shas(&head_sha_updates).await?;
-        }
-        if !review_state_updates.is_empty() {
-            self.persist_review_states(&review_state_updates).await?;
         }
         for pr_number in reviewer_disposals {
             let reviewer_slugs = dispose_reviewers_for_pr(
@@ -1313,33 +1300,6 @@ where
                 count = updates.len(),
                 "PR head SHAs are sourced from Forgejo; skipping local persistence"
             );
-        }
-        Ok(())
-    }
-
-    async fn persist_review_states(
-        &self,
-        updates: &[(u64, ForgejoReviewState, String)],
-    ) -> Result<()> {
-        if updates
-            .iter()
-            .any(|(_, state, _)| matches!(state, ForgejoReviewState::Approved))
-        {
-            let mut watcher_state = self.read_watcher_state().await.unwrap_or_default();
-            let mut changed = false;
-            for (pr_number, review_state, _) in updates {
-                if matches!(review_state, ForgejoReviewState::Approved) {
-                    let entry = watcher_state.prs.entry(*pr_number).or_default();
-                    if entry.stuck || entry.needs_human_review {
-                        entry.stuck = false;
-                        entry.needs_human_review = false;
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                self.write_watcher_state(&watcher_state).await?;
-            }
         }
         Ok(())
     }
@@ -4233,7 +4193,6 @@ mod tests {
             author_role: "dev".to_string(),
             created_at: chrono::Utc::now(),
             state: crate::services::pr_registry::PrState::Open,
-            review_state: crate::services::pr_registry::ForgejoReviewState::PendingReview,
             last_review_at: None,
             last_head_sha: None,
             approved_at_sha: None,
@@ -4362,7 +4321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_observations_clears_watcher_state_on_approval() {
+    async fn test_process_observations_does_not_persist_review_state_on_approval() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
@@ -4401,8 +4360,8 @@ mod tests {
         let persisted = watcher.read_watcher_state().await.unwrap();
         let pr_state = persisted.prs.get(&1).unwrap();
         assert_eq!(pr_state.rounds, 1);
-        assert!(!pr_state.stuck);
-        assert!(!pr_state.needs_human_review);
+        assert!(pr_state.stuck);
+        assert!(pr_state.needs_human_review);
         assert!(!temp_dir.path().join(".exo/prs.json").exists());
     }
 
@@ -4444,8 +4403,7 @@ mod tests {
             .unwrap();
 
         let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
-        let mut pr = pr_with_reviewer(1, reviewer_slug, "review-pr-1");
-        pr.review_state = crate::services::pr_registry::ForgejoReviewState::Approved;
+        let pr = pr_with_reviewer(1, reviewer_slug, "review-pr-1");
         let registry = test_registry(pr);
 
         let mut observations = HashMap::new();
@@ -4493,8 +4451,7 @@ mod tests {
         services.project_dir = temp_dir.path().to_path_buf();
 
         let watcher = WorktreeEventWatcher::new(Arc::new(services));
-        let mut pr = test_pr_entry();
-        pr.review_state = crate::services::pr_registry::ForgejoReviewState::Approved;
+        let pr = test_pr_entry();
         let registry = test_registry(pr);
 
         let mut observations = HashMap::new();

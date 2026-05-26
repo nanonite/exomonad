@@ -44,8 +44,6 @@ pub struct PrEntry {
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub state: PrState,
-    #[serde(default)]
-    pub review_state: ForgejoReviewState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_review_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]

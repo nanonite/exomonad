@@ -263,7 +263,7 @@ fn forgejo_pr_response(pr: &crate::services::forgejo::ForgejoPullRequest) -> Loc
         head_branch: pr.head_ref.to_string(),
         base_branch: pr.base_ref.to_string(),
         author_agent,
-        review_state: "pending_review".to_string(),
+        review_state: "unknown".to_string(),
         last_head_sha: pr.head_sha.clone().unwrap_or_default(),
         reviewer_agent: pr_body_metadata_value(&pr.body, "Reviewer-Agent").unwrap_or_default(),
     }
@@ -392,7 +392,7 @@ Reviewer-Agent: review-pr-7-codex"
         assert_eq!(response.pr_number, 7);
         assert_eq!(response.head_branch, "main.fix-local-pr-codex");
         assert_eq!(response.author_agent, "fix-local-pr-codex");
-        assert_eq!(response.review_state, "pending_review");
+        assert_eq!(response.review_state, "unknown");
         assert_eq!(response.last_head_sha, "abc123");
         assert_eq!(response.reviewer_agent, "review-pr-7-codex");
     }
