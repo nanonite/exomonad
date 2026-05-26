@@ -357,8 +357,26 @@ impl ForgejoClient {
         repo: &GithubRepo,
         head_sha: &str,
     ) -> Result<CIStatus> {
-        let statuses = self.list_commit_statuses(owner, repo, head_sha).await?;
-        Ok(combine_commit_statuses(&statuses))
+        let url = self.api_url(&[
+            "repos",
+            owner.as_str(),
+            repo.as_str(),
+            "commits",
+            head_sha,
+            "status",
+        ])?;
+        let response = self
+            .http
+            .get(url)
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo combined commit status request failed")?;
+
+        let status: CommitStatusResponse = self
+            .decode_response(response, "get Forgejo combined commit status")
+            .await?;
+        Ok(CIStatus::parse(&status.status))
     }
 
     pub async fn actions_status_for_head(
@@ -670,28 +688,6 @@ impl ForgejoClient {
     }
 }
 
-fn combine_commit_statuses(statuses: &[ForgejoCommitStatus]) -> CIStatus {
-    if statuses.is_empty() {
-        return CIStatus::Neutral;
-    }
-
-    let has = |status| statuses.iter().any(|commit| commit.status == status);
-    if has(CIStatus::Failure) {
-        CIStatus::Failure
-    } else if has(CIStatus::Pending) {
-        CIStatus::Pending
-    } else if has(CIStatus::Unknown) {
-        CIStatus::Unknown
-    } else if statuses
-        .iter()
-        .all(|commit| commit.status == CIStatus::Success)
-    {
-        CIStatus::Success
-    } else {
-        CIStatus::Neutral
-    }
-}
-
 fn workflow_status(run: WorkflowRunResponse) -> CIStatus {
     run.conclusion
         .or(run.status)
@@ -895,15 +891,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_status_for_head_reads_forgejo_commit_statuses() {
+    async fn commit_status_for_head_reads_forgejo_combined_status() {
         let (client, server) = client().await;
         Mock::given(method("GET"))
-            .and(path("/api/v1/repos/owner/repo/commits/abc123/statuses"))
+            .and(path("/api/v1/repos/owner/repo/commits/abc123/status"))
             .and(header("authorization", "token token-123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                { "status": "success", "context": "cargo test" },
-                { "state": "success", "context": "cargo fmt" }
-            ])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "success",
+                "statuses": [
+                    { "status": "pending", "context": "cargo test" },
+                    { "status": "success", "context": "cargo test" }
+                ]
+            })))
             .mount(&server)
             .await;
 
@@ -913,34 +912,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, CIStatus::Success);
-    }
-
-    #[test]
-    fn commit_status_combiner_prefers_failure_then_pending() {
-        let statuses = vec![
-            ForgejoCommitStatus {
-                status: CIStatus::Success,
-                context: Some("cargo test".to_string()),
-            },
-            ForgejoCommitStatus {
-                status: CIStatus::Pending,
-                context: Some("clippy".to_string()),
-            },
-        ];
-        assert_eq!(combine_commit_statuses(&statuses), CIStatus::Pending);
-
-        let statuses = vec![
-            ForgejoCommitStatus {
-                status: CIStatus::Pending,
-                context: Some("cargo test".to_string()),
-            },
-            ForgejoCommitStatus {
-                status: CIStatus::Failure,
-                context: Some("clippy".to_string()),
-            },
-        ];
-        assert_eq!(combine_commit_statuses(&statuses), CIStatus::Failure);
-        assert_eq!(combine_commit_statuses(&[]), CIStatus::Neutral);
     }
 
     #[tokio::test]
