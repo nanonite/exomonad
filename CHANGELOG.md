@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- merge_pr gates on stale local registry review_state instead of live Forgejo state (#418)
 - combine_commit_statuses uses /statuses list endpoint causing false Pending from historical entries (#419)
 - Update TL spawn preflight and leaf timeout behavior (#417)
 - Watcher ci_status always Neutral — observed_ci_status never polls Forgejo commit statuses API, depends only on webhooks that are never delivered (#399)
