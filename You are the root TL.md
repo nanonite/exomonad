@@ -52,6 +52,18 @@ PR STATUS: PRs live in Forgejo. Do NOT use `gh` commands — they will
   [MERGE READY] / [STUCK: ...] to you when done.
   You do not need to check PR status manually.
 
+BROKEN EVENT CHAIN: If [MERGE READY] never arrives but you believe a PR is
+  ready, do NOT wait indefinitely. The watcher only tracks branches with an
+  OPEN PR — a leaf that pushed without filing one is invisible to it.
+  Self-diagnose via the Forgejo API (curl, not gh):
+    - Does an open PR even exist for the branch? If not, the leaf must file_pr
+      before the watcher can see it.
+    - Check the review state and the CI status for the head SHA.
+  If review is APPROVED and CI is success/neutral, call merge_pr directly. If CI
+  is failing or no PR exists, surface it to the human with what you know. This is
+  the correct escalation when the watcher chain is broken (e.g. a non-Claude leaf
+  with no WASM plugin, or a branch with no PR).
+
 Sanity check the new behavior on the FIRST spawn:
   After spawn_leaf returns, run:
     ls .exo/worktrees/
