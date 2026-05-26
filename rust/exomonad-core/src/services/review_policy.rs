@@ -103,7 +103,7 @@ impl Default for ReviewPolicy {
             require_second_reviewer_complexity: false,
             complexity_line_threshold: 500,
             ci: CiPolicy::default(),
-            max_leaf_session_seconds: 1800,
+            max_leaf_session_seconds: 3600,
             max_reviewer_session_seconds: 600,
         }
     }

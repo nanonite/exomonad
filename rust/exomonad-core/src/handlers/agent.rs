@@ -2,9 +2,10 @@
 //!
 //! Uses proto-generated types from `exomonad_proto::effects::agent`.
 
+#[cfg(test)]
+use crate::domain::BranchName;
 use crate::domain::{
-    AgentName, AgentPermissions, BirthBranch, BranchName, CIStatus, ClaudeSessionUuid, RoutingInfo,
-    TeamName,
+    AgentName, AgentPermissions, BirthBranch, CIStatus, ClaudeSessionUuid, RoutingInfo, TeamName,
 };
 use crate::effects::{
     dispatch_agent_effect, AgentEffects, EffectError, EffectHandler, EffectResult, ResultExt,
@@ -227,10 +228,6 @@ impl<
             Err(message) => failures.push(format!("worktree check failed: {message}")),
         }
 
-        if let Err(message) = self.check_base_branch_ci(ctx).await {
-            failures.push(message);
-        }
-
         if failures.is_empty() {
             info!(
                 branch = %ctx.birth_branch,
@@ -250,59 +247,9 @@ impl<
         }
 
         Err(EffectError::invalid_input(format!(
-            "TL preflight failed; spawning is blocked until the baseline is fixed or the user acknowledges with EXOMONAD_TL_PREFLIGHT_ACK=1.\n{}",
+            "TL preflight failed; spawning is blocked until the worktree is clean or the user acknowledges with EXOMONAD_TL_PREFLIGHT_ACK=1.\n{}",
             failures.join("\n")
         )))
-    }
-
-    async fn check_base_branch_ci(
-        &self,
-        ctx: &crate::effects::EffectContext,
-    ) -> Result<(), String> {
-        let base_branch = BranchName::try_from_str(ctx.birth_branch.as_parent_branch())
-            .map_err(|error| format!("CI check failed: invalid base branch: {error}"))?;
-
-        if !forgejo_workflow_configured(&ctx.working_dir).await {
-            info!(
-                branch = %base_branch,
-                "TL preflight CI check skipped because no .forgejo workflow is configured"
-            );
-            return Ok(());
-        }
-
-        let Some(forgejo) = self.ctx.forgejo_client() else {
-            return Err("CI check failed: .forgejo/workflows exists but forgejo_url/forgejo_token are not configured".to_string());
-        };
-
-        let repo_info = crate::services::repo::get_repo_info(&ctx.working_dir)
-            .await
-            .map_err(|error| {
-                format!("CI check failed: could not resolve Forgejo repository: {error}")
-            })?;
-        let status = forgejo
-            .latest_actions_status_for_branch(&repo_info.owner, &repo_info.repo, &base_branch)
-            .await
-            .map_err(|error| format!("CI check failed: Forgejo Actions lookup failed: {error}"))?;
-
-        match status {
-            Some(CIStatus::Success | CIStatus::Neutral) => Ok(()),
-            Some(CIStatus::Failure) => Err(format!(
-                "CI check failed: latest Forgejo Actions run on base branch '{}' is failure",
-                base_branch
-            )),
-            Some(CIStatus::Pending) => Err(format!(
-                "CI check failed: latest Forgejo Actions run on base branch '{}' is still pending",
-                base_branch
-            )),
-            Some(CIStatus::Unknown) => Err(format!(
-                "CI check failed: latest Forgejo Actions run on base branch '{}' has unknown status",
-                base_branch
-            )),
-            None => Err(format!(
-                "CI check failed: .forgejo/workflows exists but no Forgejo Actions run was found for base branch '{}'",
-                base_branch
-            )),
-        }
     }
 }
 
@@ -367,25 +314,6 @@ fn dirty_worktree_message(entries: &[String]) -> String {
         String::new()
     };
     format!("worktree check failed: uncommitted or untracked files are present\n{listed}{suffix}")
-}
-
-async fn forgejo_workflow_configured(project_dir: &Path) -> bool {
-    let workflows_dir = project_dir.join(".forgejo/workflows");
-    let Ok(mut entries) = tokio::fs::read_dir(workflows_dir).await else {
-        return false;
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("yml" | "yaml")
-        ) {
-            return true;
-        }
-    }
-
-    false
 }
 
 fn tl_preflight_acknowledged() -> bool {
@@ -2059,26 +1987,6 @@ mod tests {
             watcher_pr_merge_diagnosis(&pr, "pending_review", CIStatus::Success),
             (false, "review approval pending".to_string())
         );
-    }
-
-    #[tokio::test]
-    async fn forgejo_workflow_configured_detects_forgejo_yaml() {
-        let dir = tempfile::tempdir().unwrap();
-        let workflows = dir.path().join(".forgejo/workflows");
-        std::fs::create_dir_all(&workflows).unwrap();
-        std::fs::write(workflows.join("ci.yml"), "name: CI\n").unwrap();
-
-        assert!(forgejo_workflow_configured(dir.path()).await);
-    }
-
-    #[tokio::test]
-    async fn forgejo_workflow_configured_ignores_legacy_gitea_yaml() {
-        let dir = tempfile::tempdir().unwrap();
-        let workflows = dir.path().join(".gitea/workflows");
-        std::fs::create_dir_all(&workflows).unwrap();
-        std::fs::write(workflows.join("ci.yml"), "name: CI\n").unwrap();
-
-        assert!(!forgejo_workflow_configured(dir.path()).await);
     }
 
     #[tokio::test]

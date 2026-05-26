@@ -39,7 +39,7 @@ require_second_reviewer_complexity = false
 complexity_line_threshold = 500
 
 # Maximum active session duration for leaf/worker agents (seconds). 0 = disabled.
-max_leaf_session_seconds = 1800
+max_leaf_session_seconds = 3600
 
 # Maximum active session duration for reviewer agents (seconds). 0 = disabled.
 max_reviewer_session_seconds = 600
