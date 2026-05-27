@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Fix OpenCode worker E2E root TL task delivery (#424)
 - Avoid Claude Code workspace trust prompts in E2E harnesses (#423)
 - Fix OpenCode TL E2E observer path and message assertion (#422)
 - Remove persist_review_states and watcher file writes for review_state — WatchState is the state machine (#420)

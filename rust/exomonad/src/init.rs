@@ -330,6 +330,29 @@ fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+fn build_claude_root_command(model: Option<&str>, initial_prompt: Option<&str>) -> String {
+    let model_flag = model
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" --model {}", shell_escape::escape(value.into())))
+        .unwrap_or_default();
+
+    let launch = initial_prompt
+        .filter(|value| !value.is_empty())
+        .map(|prompt| {
+            format!(
+                "claude --dangerously-skip-permissions{model_flag} {}",
+                shell_escape::escape(prompt.into())
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "claude --dangerously-skip-permissions{model_flag} -c || claude --dangerously-skip-permissions{model_flag}"
+            )
+        });
+
+    format!("{launch}; echo; echo [Claude Code exited]; exec bash -l")
+}
+
 fn build_codex_root_command(
     cwd: &Path,
     model: Option<&str>,
@@ -1128,34 +1151,55 @@ pub async fn run(
             .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
             .unwrap_or_default();
         match (config.root_agent_type, config.initial_prompt.as_deref()) {
-            (AgentType::Claude, _) => format!("claude --dangerously-skip-permissions{model_flag} -c || claude --dangerously-skip-permissions{model_flag}; echo; echo [Claude Code exited]; exec bash -l"),
+            (AgentType::Claude, prompt) => {
+                build_claude_root_command(config.model.as_deref(), prompt)
+            }
             (AgentType::Gemini, Some(prompt)) => {
                 let yolo_flag = if config.yolo { " --yolo" } else { "" };
-                format!("gemini{model_flag}{yolo_flag} --prompt-interactive '{}'", prompt.replace('\'', "'\\''"))
+                format!(
+                    "gemini{model_flag}{yolo_flag} --prompt-interactive '{}'",
+                    prompt.replace('\'', "'\\''")
+                )
             }
             (AgentType::Gemini, None) => {
                 let yolo_flag = if config.yolo { " --yolo" } else { "" };
                 format!("gemini{model_flag}{yolo_flag}")
             }
-            (AgentType::Shoal, Some(prompt)) => format!("shoal-agent --exo root --prompt '{}'", prompt.replace('\'', "'\\''")),
+            (AgentType::Shoal, Some(prompt)) => format!(
+                "shoal-agent --exo root --prompt '{}'",
+                prompt.replace('\'', "'\\''")
+            ),
             (AgentType::Shoal, None) => "shoal-agent --exo root".to_string(),
             (AgentType::OpenCode, Some(prompt)) => {
-                let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
+                let yolo = if config.yolo {
+                    " --dangerously-skip-permissions"
+                } else {
+                    ""
+                };
                 let chainlink_protocol = read_chainlink_tl_protocol(&cwd);
                 let augmented = match chainlink_protocol {
                     Some(ref protocol) => format!("{}\n\n---\n\n{}", protocol, prompt),
                     None => prompt.to_string(),
                 };
-                format!("opencode run{yolo}{opencode_model_flag} '{}'", augmented.replace('\'', "'\\''"))
+                format!(
+                    "opencode run{yolo}{opencode_model_flag} '{}'",
+                    augmented.replace('\'', "'\\''")
+                )
             }
             (AgentType::OpenCode, None) => {
-                let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
+                let yolo = if config.yolo {
+                    " --dangerously-skip-permissions"
+                } else {
+                    ""
+                };
                 format!("opencode{opencode_model_flag}{yolo}")
             }
             (AgentType::Codex, prompt) => {
                 build_codex_root_command(&cwd, config.model.as_deref(), prompt)
             }
-            (AgentType::Process, _) => unreachable!("Process is for companions only, not root agent"),
+            (AgentType::Process, _) => {
+                unreachable!("Process is for companions only, not root agent")
+            }
         }
     };
 
@@ -2136,6 +2180,28 @@ mod tests {
         assert!(validate_claude_model("").is_err());
         assert!(validate_claude_model("haiku").is_err());
         assert!(validate_claude_model("haiku-model").is_err());
+    }
+
+    #[test]
+    fn claude_root_command_uses_initial_prompt() {
+        let command = build_claude_root_command(Some("sonnet"), Some("Spawn the worker"));
+
+        assert_eq!(
+            command,
+            "claude --dangerously-skip-permissions --model sonnet 'Spawn the worker'; echo; echo [Claude Code exited]; exec bash -l"
+        );
+        assert!(!command.contains(" -c"));
+        assert!(command.ends_with("exec bash -l"));
+    }
+
+    #[test]
+    fn claude_root_command_without_prompt_preserves_resume_fallback() {
+        let command = build_claude_root_command(Some("sonnet"), None);
+
+        assert_eq!(
+            command,
+            "claude --dangerously-skip-permissions --model sonnet -c || claude --dangerously-skip-permissions --model sonnet; echo; echo [Claude Code exited]; exec bash -l"
+        );
     }
 
     #[test]

@@ -145,6 +145,10 @@ root_agent_type = "claude"
 spawn_agent_type = "opencode"
 model = "sonnet"
 yolo = true
+initial_prompt = """You are in automated E2E OpenCode worker test mode. Do exactly these steps on your first turn and nothing else:
+1. Create a team via TeamCreate.
+2. Call fork_wave with exactly one agent named oc-worker, agent_type='opencode', fork_session=false, and this task: You are an E2E test subject. Write oc-worker-output.txt containing the single line OpenCode worker test passed. Stage and commit it with git add oc-worker-output.txt && git commit -m 'e2e: add oc-worker-output.txt'. Push to your branch. Call notify_parent with status='success' and message='[OC-WORKER-DONE] OpenCode worker test complete. File written and committed.' Then stop.
+3. Stop and idle. Do not edit files yourself, do not merge PRs, and wait for [OC-WORKER-DONE]."""
 
 [opencode]
 worker_model = "opencode-go/deepseek-v4-flash"
