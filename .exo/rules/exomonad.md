@@ -6,25 +6,32 @@ description: "ExoMonad agent orchestration rules — loaded into every agent's c
 
 ## MCP Tools
 
-Use exomonad MCP tools for orchestration. Git and GitHub operations use `git` and `gh` CLI commands, NOT MCP tools.
+Use exomonad MCP tools for orchestration. Git operations use `git` CLI. **Never use `gh pr create`** — use the `file_pr` MCP tool instead (works with or without a GitHub remote).
+
+**Never run `exomonad init`, `exomonad serve`, or `exomonad new`** — the server is already running. Those commands manage the session itself and will kill the current session including yourself.
 
 | Tool | Role | What it does |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents (own worktrees, context inherited by default via `fork_session`) |
-| `spawn_gemini` | root, tl | Spawn Gemini agent: `worktree` (branch+PR), `inline` (ephemeral pane), `standalone` (own repo) |
-| `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) |
+| `spawn_leaf` | root, tl | Spawn a leaf agent in its own worktree+branch (files PR when done). Agent type defaults to server config; pass `agent_type` only when this leaf needs a specific supported runtime. |
+| `spawn_worker` | root, tl | Spawn an ephemeral worker in a tmux pane (no branch, no PR). Agent type defaults to server config; pass `agent_type` only when this worker needs a specific supported runtime. |
+| `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) through the configured Forgejo API. |
 | `merge_pr` | root, tl | Merge a child's PR |
 | `notify_parent` | tl, dev, worker | Send message to parent agent |
-| `send_message` | all | Send message to any exomonad-spawned agent |
+| `send_tmux_message` / `send_mailbox_message` | all | Send message to any exomonad-spawned agent |
 | `task_list` | dev, worker | List tasks from the shared task list |
 | `task_get` | dev, worker | Get a task by ID |
 | `task_update` | dev, worker | Update task status, owner, or activeForm |
 
+## PR Status (Forgejo)
+
+PRs are tracked in Forgejo. Do NOT use `gh` commands — they will fail. The worktree event watcher reads Forgejo PR/review/CI state, automatically spawns a reviewer, and delivers `[PR READY]` / `[FIXES PUSHED]` / `[MERGE READY]` notifications. You do not need to poll PR status manually.
+
 ## Agent Hierarchy
 
-- **TL (Tech Lead)**: Claude (Opus). Decomposes, specs, scaffolds, spawns, merges. Never implements directly.
-- **Dev (Leaf)**: Gemini. Implements a focused spec, files PR. No spawning.
-- **Worker**: Gemini. Ephemeral pane, no branch. Research or in-place edits.
+- **TL (Tech Lead)**: Claude. Decomposes, specs, scaffolds, spawns, merges. Never implements directly.
+- **Dev (Leaf)**: Configured agent type (OpenCode, Gemini, etc. — set via `--worker` flag at init). Implements a focused spec, files PR via `file_pr` MCP. No spawning.
+- **Worker**: Ephemeral pane agent. Research or non-conflicting in-place edits. No branch, no PR.
 
 ## The TL Protocol: Scaffold-Fork-Converge
 
@@ -45,8 +52,8 @@ Commit and push. Children fork from this commit.
 
 Spawn children for wave N. Zero dependencies between siblings in the same wave.
 
-- **Sub-TLs**: `fork_wave` (Claude). They inherit full conversation context — they already know the plan and the scaffolding.
-- **Devs**: `spawn_gemini` with `isolation: "worktree"` (Gemini). They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
+- **Sub-TLs**: `fork_wave` (Claude). They inherit full conversation context.
+- **Devs**: `spawn_leaf`. They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
 
 ### 3. Converge (merge wave)
 
@@ -78,27 +85,24 @@ Include complete code snippets. Name every file by full path. Include exact comm
 
 ## Convergence Protocol
 
-The TL does NOT iterate on children's work. Convergence is **leaf + Copilot**, not TL:
+The TL does NOT iterate on children's work. Convergence is **leaf + reviewer**, not TL:
 
-1. Leaf implements spec, commits, files PR
-2. Copilot reviews automatically on PR creation
-3. If Copilot requests changes → injected into leaf's pane → leaf fixes → pushes
-4. System notifies parent: `[FIXES PUSHED]`, `[PR READY]`, or `[REVIEW TIMEOUT]`
-5. TL merges when notified
+1. Leaf implements spec, commits, files PR via `file_pr` MCP
+2. Reviewer agent reviews automatically on PR creation
+3. If reviewer requests changes → injected into leaf's pane → leaf fixes → pushes
+4. System notifies parent: `[FIXES PUSHED]`, `[PR READY]`, `[MERGE READY]`, `[REVIEW TIMEOUT]`, or `[STUCK]`
+5. TL merges on `[MERGE READY]`. On `[STUCK]`, ask the human for clarification; the leaf remains alive in its PR worktree.
 
 The TL never manually reviews code, never fixes a leaf's implementation.
+See `.exo/review-policy.toml` for review round limits, timeouts, and complexity thresholds.
 
 ## Branch Naming
 
 `{parent_branch}.{slug}` (dot separator). PRs target the parent branch, not main. Merged via recursive fold up the tree.
 
-## State Machines
-
-Agent lifecycle is tracked via `StateMachine` typeclass instances. Phase types live in role code (`.exo/roles/`). The framework handles persistence (KV), logging, and stop hook integration. Agents cannot exit during critical phases (e.g., `ChangesRequested`).
-
 ## Communication
 
 - `notify_parent` for completion/failure/status updates to parent
-- `send_message` for peer-to-peer messaging between any agents
+- `send_tmux_message` / `send_mailbox_message` for peer-to-peer messaging between any agents
 - Messages arrive as native `<teammate-message>` via Teams inbox
 - TL idles between spawning and receiving notifications — no polling

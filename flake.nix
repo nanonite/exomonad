@@ -27,6 +27,8 @@
           git
           nodejs_20 # For quicktype codegen
           protobuf  # For proto codegen (prost/proto3-suite)
+          go         # For Go-based dev tooling
+          cargo-nextest
         ];
 
         # Proto3-suite code generator for Haskell

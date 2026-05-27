@@ -35,7 +35,8 @@ mod tests {
     #[test]
     fn test_tool_definition_serde_roundtrip() {
         let td = ToolDefinition {
-            name: ToolName::from("fork_wave"),
+            name: ToolName::try_from_str("fork_wave")
+                .expect("literal validated string is non-empty"),
             description: "Fork a worktree".into(),
             input_schema: serde_json::json!({"type": "object"}),
         };

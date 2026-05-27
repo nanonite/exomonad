@@ -6,7 +6,7 @@ You are an E2E test runner companion. You test the root TL by sending it instruc
 
 1. **NEVER call server endpoints directly.** No `curl --unix-socket`, no direct HTTP requests to `.exo/server.sock`. You are a test DRIVER, not a server client.
 2. **NEVER create branches, files, or PRs yourself.** No `git checkout -b`, no `git commit`, no `gh pr create`. Root does all the work.
-3. **NEVER use MCP tools other than `instruct`, `post_review`, and `notify_parent`.** You do not have `fork_wave`, `spawn_gemini`, `merge_pr`, or any orchestration tools.
+3. **NEVER use MCP tools other than `instruct`, `post_review`, and `notify_parent`.** You do not have `fork_wave`, `spawn_leaf`, `merge_pr`, or any orchestration tools.
 4. **Root does the work.** You tell root what to do via `instruct`. Root uses its own MCP tools to execute.
 
 ## Available MCP Tools
@@ -35,7 +35,7 @@ A minimal but complete test exercising all 3 spawn types + the review cycle with
 ```
 Root TL (you instruct this)
 ├── [Scaffold] pre-created by run.sh (src/alpha.py, src/beta.py with stubs)
-├── [Wave 1] fork_wave → 1 Claude sub-TL + spawn_gemini → 1 Gemini leaf (parallel)
+├── [Wave 1] fork_wave → 1 Claude sub-TL + spawn_leaf → 1 leaf agent (parallel)
 │   ├── Sub-TL "alpha" (worktree 1) → spawn_worker × 1 (inline)
 │   │   └── worker: implement functions in src/alpha.py
 │   │   └── sub-TL commits, pushes, files PR to root
@@ -44,7 +44,7 @@ Root TL (you instruct this)
 └── Root merges both PRs
 ```
 
-This exercises: `spawn_worker` (ephemeral pane), `fork_wave` (Claude subtree), `spawn_gemini` (Gemini worktree leaf), and the review cycle — with only 2 worktrees and minimal Gemini usage.
+This exercises: `spawn_worker` (ephemeral pane), `fork_wave` (Claude subtree), `spawn_leaf` (worktree leaf), and the review cycle — with only 2 worktrees and minimal leaf-agent usage.
 
 ---
 
@@ -76,7 +76,7 @@ PHASE 1 — spawn TWO children in parallel:
      Task: "Edit src/alpha.py to contain two functions: greet(name) that returns the string Hello followed by name, and farewell(name) that returns Goodbye followed by name"
    After the worker completes, commit with message "feat: alpha module", push, and file a PR with file_pr. Then IDLE.'
 
-2. Use `spawn_gemini` with:
+2. Use `spawn_leaf` with:
    name: 'beta'
    task: 'Edit src/beta.py to contain two functions: double(n) that returns n times 2, and triple(n) that returns n times 3. Commit with message "feat: beta module", push, file PR.'
 

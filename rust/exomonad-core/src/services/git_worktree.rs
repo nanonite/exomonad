@@ -58,6 +58,36 @@ pub struct GitWorktreeService {
     project_dir: PathBuf,
 }
 
+pub(crate) fn headless_git_command() -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    apply_headless_git_env(&mut command);
+    command
+}
+
+pub(crate) fn apply_headless_git_env(
+    command: &mut std::process::Command,
+) -> &mut std::process::Command {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("SSH_ASKPASS_REQUIRE", "never");
+
+    command.env("GIT_SSH_COMMAND", headless_git_ssh_command());
+
+    command
+}
+
+fn headless_git_ssh_command() -> String {
+    let existing = std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh".to_string());
+    if existing.contains("BatchMode") {
+        existing
+    } else {
+        format!("{existing} -o BatchMode=yes")
+    }
+}
+
 impl GitWorktreeService {
     pub fn new(project_dir: PathBuf) -> Self {
         Self { project_dir }
@@ -74,7 +104,7 @@ impl GitWorktreeService {
     ) -> Result<(), WorktreeError> {
         info!(path = %path.display(), branch = %branch, base = %base, "Creating git worktree");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args([
                 "worktree",
                 "add",
@@ -96,6 +126,92 @@ impl GitWorktreeService {
         }
 
         info!(path = %path.display(), branch = %branch, "Worktree created successfully");
+
+        // Set per-agent git identity so commits are attributed to the agent.
+        // The last dot-segment of the birth-branch is the canonical agent name.
+        let agent_name = branch
+            .as_str()
+            .rsplit('.')
+            .next()
+            .unwrap_or(branch.as_str());
+        let git_user_name = format!("exomonad-{}", agent_name);
+        let git_user_email = format!("{}@exomonad.local", agent_name);
+
+        for (key, value) in [
+            ("user.name", git_user_name.as_str()),
+            ("user.email", git_user_email.as_str()),
+        ] {
+            let out = headless_git_command()
+                .args(["config", "--local", key, value])
+                .current_dir(path)
+                .output()
+                .map_err(|e| WorktreeError::GitError {
+                    message: format!("Failed to set git config {}: {}", key, e),
+                })?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                error!(key, stderr = %stderr, "git config --local failed");
+                return Err(WorktreeError::GitError {
+                    message: format!("git config --local {} failed: {}", key, stderr),
+                });
+            }
+        }
+        info!(user_name = %git_user_name, user_email = %git_user_email, "Set worktree git identity");
+
+        Ok(())
+    }
+
+    /// Create a detached-HEAD worktree at the tip of an existing branch or ref.
+    ///
+    /// Unlike `create_workspace`, this does not create a new branch — the
+    /// worktree is in detached HEAD state. Used for read-only agents (reviewers)
+    /// that need the same code as a worker without competing for the branch.
+    pub fn create_workspace_detached(
+        &self,
+        path: &Path,
+        at_ref: &str,
+        identity_name: &str,
+    ) -> Result<(), WorktreeError> {
+        info!(path = %path.display(), at_ref, "Creating detached reviewer worktree");
+
+        let output = headless_git_command()
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                &path.to_string_lossy(),
+                at_ref,
+            ])
+            .current_dir(&self.project_dir)
+            .output()
+            .map_err(|e| WorktreeError::GitError {
+                message: format!("Failed to run git worktree add --detach: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(stderr = %stderr, "git worktree add --detach failed");
+            return Err(self.parse_git_stderr(&stderr));
+        }
+
+        let git_user_name = format!("exomonad-{}", identity_name);
+        let git_user_email = format!("{}@exomonad.local", identity_name);
+        for (key, value) in [
+            ("user.name", git_user_name.as_str()),
+            ("user.email", git_user_email.as_str()),
+        ] {
+            let out = headless_git_command()
+                .args(["config", "--local", key, value])
+                .current_dir(path)
+                .output()
+                .map_err(|e| WorktreeError::GitError {
+                    message: format!("Failed to set git config {}: {}", key, e),
+                })?;
+            if !out.status.success() {
+                warn!(key, stderr = %String::from_utf8_lossy(&out.stderr), "git config --local failed in reviewer worktree (non-fatal)");
+            }
+        }
+        info!(path = %path.display(), at_ref, "Reviewer worktree created (detached HEAD)");
         Ok(())
     }
 
@@ -105,7 +221,7 @@ impl GitWorktreeService {
     pub fn remove_workspace(&self, path: &Path) -> Result<(), WorktreeError> {
         info!(path = %path.display(), "Removing git worktree");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["worktree", "remove", "--force", &path.to_string_lossy()])
             .current_dir(&self.project_dir)
             .output()
@@ -125,7 +241,7 @@ impl GitWorktreeService {
                 warn!(stderr = %stderr, "git worktree remove failed (directory already gone)");
             }
             // Also prune stale worktree entries
-            let _ = std::process::Command::new("git")
+            let _ = headless_git_command()
                 .args(["worktree", "prune"])
                 .current_dir(&self.project_dir)
                 .output();
@@ -145,7 +261,7 @@ impl GitWorktreeService {
     ) -> Result<(), WorktreeError> {
         info!(branch = %branch, path = %workspace_path.display(), "Pushing branch");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["push", "origin", branch.as_str()])
             .current_dir(workspace_path)
             .output()
@@ -163,13 +279,42 @@ impl GitWorktreeService {
         Ok(())
     }
 
+    /// Push a branch to a named remote.
+    ///
+    /// Equivalent to: `git push {remote} {branch}` (run in workspace_path)
+    pub fn push_to_remote(
+        &self,
+        workspace_path: &Path,
+        branch: &BranchName,
+        remote: &str,
+    ) -> Result<(), WorktreeError> {
+        info!(branch = %branch, remote = %remote, path = %workspace_path.display(), "Pushing branch to remote");
+
+        let output = headless_git_command()
+            .args(["push", remote, branch.as_str()])
+            .current_dir(workspace_path)
+            .output()
+            .map_err(|e| WorktreeError::GitError {
+                message: format!("Failed to run git push: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!(stderr = %stderr, "git push failed");
+            return Err(self.parse_git_stderr(&stderr));
+        }
+
+        info!(branch = %branch, remote = %remote, "Branch pushed successfully");
+        Ok(())
+    }
+
     /// Fetch from remote.
     ///
     /// Equivalent to: `git fetch` (run in workspace_path)
     pub fn fetch(&self, workspace_path: &Path) -> Result<(), WorktreeError> {
         info!(path = %workspace_path.display(), "git fetch");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["fetch"])
             .current_dir(workspace_path)
             .output()
@@ -194,7 +339,7 @@ impl GitWorktreeService {
         &self,
         workspace_path: &Path,
     ) -> Result<Option<String>, WorktreeError> {
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["branch", "--show-current"])
             .current_dir(workspace_path)
             .output()
@@ -217,7 +362,7 @@ impl GitWorktreeService {
     pub fn delete_bookmark(&self, name: &BranchName) -> Result<(), WorktreeError> {
         info!(branch = %name, "Deleting local branch");
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(["branch", "-D", name.as_str()])
             .current_dir(&self.project_dir)
             .output()
@@ -253,7 +398,7 @@ impl GitWorktreeService {
             args.push(&rev_str);
         }
 
-        let output = std::process::Command::new("git")
+        let output = headless_git_command()
             .args(&args)
             .current_dir(workspace_path)
             .output()
@@ -312,6 +457,34 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
+    #[test]
+    fn headless_git_command_sets_noninteractive_auth_env() {
+        let command = headless_git_command();
+        let envs = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| (key.to_string_lossy(), value.to_string_lossy()))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            envs.get("GIT_TERMINAL_PROMPT").map(|v| v.as_ref()),
+            Some("0")
+        );
+        assert_eq!(
+            envs.get("GCM_INTERACTIVE").map(|v| v.as_ref()),
+            Some("never")
+        );
+        assert_eq!(envs.get("GIT_ASKPASS").map(|v| v.as_ref()), Some(""));
+        assert_eq!(
+            envs.get("SSH_ASKPASS_REQUIRE").map(|v| v.as_ref()),
+            Some("never")
+        );
+        assert!(envs
+            .get("GIT_SSH_COMMAND")
+            .is_some_and(|value| value.contains("BatchMode=yes")));
+    }
+
     fn init_test_repo() -> (TempDir, GitWorktreeService) {
         let temp = TempDir::new().expect("failed to create temp dir");
         let repo_dir = temp.path();
@@ -348,8 +521,10 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("worktree-1");
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -364,8 +539,10 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("worktree-1");
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -379,7 +556,8 @@ mod tests {
     #[test]
     fn test_create_bookmark_delete_bookmark_roundtrip() {
         let (temp, service) = init_test_repo();
-        let branch = BranchName::from("test-branch");
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
 
         service.create_bookmark(temp.path(), &branch, None).unwrap();
 
@@ -405,8 +583,10 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("worktree-1");
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -420,8 +600,10 @@ mod tests {
     fn test_create_workspace_duplicate_branch() {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&temp.path().join("wt1"), &branch, &base)
@@ -439,8 +621,10 @@ mod tests {
     fn test_create_workspace_non_existent_base() {
         let (temp, service) = init_test_repo();
         let worktree_path = temp.path().join("worktree-1");
-        let branch = BranchName::from("test-branch");
-        let base = BranchName::from("nonexistent-base-xyz");
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str("nonexistent-base-xyz")
+            .expect("literal validated string is non-empty");
 
         let result = service.create_workspace(&worktree_path, &branch, &base);
 
@@ -463,12 +647,67 @@ mod tests {
     #[test]
     fn test_push_bookmark_without_remote() {
         let (temp, service) = init_test_repo();
-        let branch = BranchName::from("test-branch");
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
         service.create_bookmark(temp.path(), &branch, None).unwrap();
 
         let result = service.push_bookmark(temp.path(), &branch);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_push_to_remote_without_remote() {
+        let (temp, service) = init_test_repo();
+        let branch =
+            BranchName::try_from_str("test-branch").expect("literal validated string is non-empty");
+        service.create_bookmark(temp.path(), &branch, None).unwrap();
+
+        let result = service.push_to_remote(temp.path(), &branch, "origin");
+        assert!(result.is_err());
+
+        let result = service.push_to_remote(temp.path(), &branch, "tangled");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_push_to_remote_with_remote() {
+        let bare = TempDir::new().expect("failed to create bare dir");
+        let work = TempDir::new().expect("failed to create work dir");
+        let work_dir = work.path();
+
+        // Create a bare "remote"
+        let run_bare = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(bare.path())
+                .status()
+                .expect("git failed")
+        };
+        run_bare(&["init", "--bare"]);
+
+        // Create working repo with tangled remote pointing at the bare repo
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(work_dir)
+                .status()
+                .expect("git failed");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        run(&["commit", "--allow-empty", "-m", "Initial commit"]);
+        run(&["remote", "add", "tangled", bare.path().to_str().unwrap()]);
+
+        let service = GitWorktreeService::new(work_dir.to_path_buf());
+        let default_branch = get_default_branch(work_dir);
+        let branch = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+
+        let result = service.push_to_remote(work_dir, &branch, "tangled");
+        assert!(result.is_ok(), "push_to_remote failed: {:?}", result);
     }
 
     /// End-to-end: simulates the file_pr resolution chain.
@@ -487,8 +726,10 @@ mod tests {
 
         // Simulate exomonad's dot-separated branch naming (suffixed agent names)
         let birth_branch = format!("{}.remove-option-mcp-gemini", default_branch);
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         // Step 1: resolve_working_dir (same logic as EffectContext construction)
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
@@ -523,8 +764,10 @@ mod tests {
             "{}.tui-port-2-claude.pdv-snapshot-enums-gemini",
             default_branch
         );
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
@@ -548,8 +791,10 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("wt-verify");
-        let branch = BranchName::from("test-verify-branch");
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str("test-verify-branch")
+            .expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -566,8 +811,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("wt-dotted");
         let branch_name = format!("{}.feat-a-gemini", default_branch);
-        let branch = BranchName::from(branch_name.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(branch_name.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -584,8 +831,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("wt-deep");
         let branch_name = format!("{}.tl.sub.leaf-gemini", default_branch);
-        let branch = BranchName::from(branch_name.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(branch_name.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         service
             .create_workspace(&worktree_path, &branch, &base)
@@ -602,8 +851,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
 
         let birth_branch = format!("{}.fix-auth-gemini", default_branch);
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
@@ -628,8 +879,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
 
         let birth_branch = format!("{}.tl-auth-claude", default_branch);
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         let worktree_path = temp.path().join(&relative_dir);
@@ -649,8 +902,10 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
 
         let birth_branch = format!("{}.tl.sub.leaf.worker-gemini", default_branch);
-        let branch = BranchName::from(birth_branch.as_str());
-        let base = BranchName::from(default_branch.as_str());
+        let branch = BranchName::try_from_str(birth_branch.as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
@@ -703,7 +958,8 @@ mod tests {
     fn test_file_pr_resolution_chain_sibling_isolation() {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
-        let base = BranchName::from(default_branch.as_str());
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
 
         let branch_a = format!("{}.feature-a-claude", default_branch);
         let branch_b = format!("{}.feature-b-claude", default_branch);
@@ -721,10 +977,20 @@ mod tests {
 
         std::fs::create_dir_all(dir_a.parent().unwrap()).unwrap();
         service
-            .create_workspace(&dir_a, &BranchName::from(branch_a.as_str()), &base)
+            .create_workspace(
+                &dir_a,
+                &BranchName::try_from_str(branch_a.as_str())
+                    .expect("validated string input is non-empty"),
+                &base,
+            )
             .unwrap();
         service
-            .create_workspace(&dir_b, &BranchName::from(branch_b.as_str()), &base)
+            .create_workspace(
+                &dir_b,
+                &BranchName::try_from_str(branch_b.as_str())
+                    .expect("validated string input is non-empty"),
+                &base,
+            )
             .unwrap();
 
         let resolved_a = service.get_workspace_bookmark(&dir_a).unwrap();

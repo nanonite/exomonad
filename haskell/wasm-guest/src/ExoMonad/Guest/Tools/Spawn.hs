@@ -7,8 +7,9 @@ module ExoMonad.Guest.Tools.Spawn
     ForkWave,
     SpawnLeafSubtree,
     SpawnWorkers,
-    SpawnGemini,
+    SpawnLeaf,
     SpawnWorkerTool,
+    CloseWorkerPaneTool,
     SpawnAcp,
 
     -- * Args types
@@ -16,8 +17,9 @@ module ExoMonad.Guest.Tools.Spawn
     ForkWaveChild (..),
     SpawnLeafSubtreeArgs (..),
     SpawnWorkersArgs (..),
-    SpawnGeminiArgs (..),
+    SpawnLeafArgs (..),
     SpawnWorkerToolArgs (..),
+    CloseWorkerPaneArgs (..),
     WorkerSpec (..),
     WorkerType (..),
     SpawnAcpArgs (..),
@@ -26,8 +28,9 @@ module ExoMonad.Guest.Tools.Spawn
     forkWaveCore,
     spawnLeafSubtreeCore,
     spawnWorkersCore,
-    spawnGeminiCore,
+    spawnLeafCore,
     spawnWorkerToolCore,
+    closeWorkerPaneCore,
     spawnAcpCore,
 
     -- * Result types
@@ -44,10 +47,12 @@ module ExoMonad.Guest.Tools.Spawn
     spawnLeafSubtreeSchema,
     spawnWorkersDescription,
     spawnWorkersSchema,
-    spawnGeminiDescription,
-    spawnGeminiSchema,
+    spawnLeafDescription,
+    spawnLeafSchema,
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
+    closeWorkerPaneDescription,
+    closeWorkerPaneSchema,
 
     -- * Helpers (re-exported for role code)
     spawnErrorMessage,
@@ -74,6 +79,7 @@ import ExoMonad.Guest.Effects.AgentControl qualified as AC
 import ExoMonad.Guest.Tool.Class (MCPCallOutput (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (JsonSchema (..), genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
+import ExoMonad.Guest.Tools.Chainlink.Pure (chainlinkWorkerProtocolText)
 import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
 
@@ -110,7 +116,8 @@ data ForkWave
 data ForkWaveChild = ForkWaveChild
   { fwcSlug :: Text,
     fwcTask :: Text,
-    fwcForkSession :: Maybe Bool
+    fwcForkSession :: Maybe Bool,
+    fwcAgentType :: Maybe AC.AgentType
   }
   deriving (Show, Eq, Generic)
 
@@ -120,6 +127,7 @@ instance FromJSON ForkWaveChild where
       <$> v .: "slug"
       <*> v .: "task"
       <*> v .:? "fork_session"
+      <*> v .:? "agent_type"
 
 instance JsonSchema ForkWaveChild where
   toSchema =
@@ -127,7 +135,8 @@ instance JsonSchema ForkWaveChild where
       genericToolSchemaWith @ForkWaveChild
         [ ("slug", "Branch name suffix (will be prefixed with current branch)"),
           ("task", "One-line task description — the child inherits your full context, so keep it brief"),
-          ("fork_session", "Inherit parent conversation context via --fork-session (default: true). Set false to start the child with a fresh context window.")
+          ("fork_session", "Inherit parent conversation context via --fork-session (default: true). Set false to start the child with a fresh context window."),
+          ("agent_type", "Agent type for the child: 'claude' (default), 'opencode', or 'codex'. OpenCode and Codex children get TL role and can spawn their own children.")
         ]
 
 data ForkWaveArgs = ForkWaveArgs
@@ -147,7 +156,7 @@ data ForkWaveResult = ForkWaveResult
 
 -- | Shared tool description for fork_wave.
 forkWaveDescription :: Text
-forkWaveDescription = "Fork any number of parallel Claude agents. Each starts in a worktree branched off your branch. Children inherit your full context window by default (fork_session defaults to true). Set fork_session: false for children that need a fresh start. Requires clean git state (committed and pushed). IMPORTANT: Create a team using TeamCreate BEFORE calling."
+forkWaveDescription = "Fork any number of parallel agents. Each starts in a worktree branched off your branch. Children inherit your full context window by default when supported (fork_session defaults to true). Set fork_session: false for children that need a fresh start. Requires clean git state (committed and pushed). Claude Code parents should create a team using TeamCreate before spawning Claude Code children."
 
 -- | Shared tool schema for fork_wave.
 forkWaveSchema :: Aeson.Object
@@ -181,13 +190,15 @@ forkWaveCore args = do
         _ -> do
           -- Spawn each child
           results <- forM (fwaChildren args) $ \child -> do
-            let cfg =
+            let childAgentType = fwcAgentType child
+                labelStr = maybe "auto" AC.agentTypeLabel childAgentType
+                cfg =
                   AC.SpawnSubtreeConfig
                     { AC.stcTask = fwcTask child,
                       AC.stcBranchName = fwcSlug child,
                       AC.stcForkSession = fromMaybe True (fwcForkSession child),
                       AC.stcRole = Nothing,
-                      AC.stcAgentType = AC.Claude,
+                      AC.stcAgentType = childAgentType,
                       AC.stcPerms = AC.defaultPermFlags,
                       AC.stcWorkingDir = Nothing,
                       AC.stcPermissions = Nothing,
@@ -203,11 +214,11 @@ forkWaveCore args = do
                 case result' of
                   Left err' -> pure (Left (spawnErrorMessage err'))
                   Right spawnResult -> do
-                    emitSpawnEvent retrySlug "claude" (fwcTask child)
+                    emitSpawnEvent retrySlug labelStr (fwcTask child)
                     pure (Right (retrySlug, spawnResult))
               Left err -> pure (Left (spawnErrorMessage err))
               Right spawnResult -> do
-                emitSpawnEvent (fwcSlug child) "claude" (fwcTask child)
+                emitSpawnEvent (fwcSlug child) labelStr (fwcTask child)
                 pure (Right (fwcSlug child, spawnResult))
 
           let (errs, successes) = partitionEithers results
@@ -236,6 +247,7 @@ data SpawnLeafSubtree
 data SpawnLeafSubtreeArgs = SpawnLeafSubtreeArgs
   { slsTask :: Text,
     slsBranchName :: Text,
+    slsAgentType :: Maybe AC.AgentType,
     slsPermissionMode :: Maybe Text,
     slsAllowedTools :: Maybe [Text],
     slsDisallowedTools :: Maybe [Text],
@@ -249,6 +261,7 @@ instance FromJSON SpawnLeafSubtreeArgs where
     SpawnLeafSubtreeArgs
       <$> v .: "task"
       <*> v .: "branch_name"
+      <*> v .:? "agent_type"
       <*> v .:? "permission_mode"
       <*> v .:? "allowed_tools"
       <*> v .:? "disallowed_tools"
@@ -257,7 +270,7 @@ instance FromJSON SpawnLeafSubtreeArgs where
 
 -- | Shared tool description for spawn_leaf_subtree.
 spawnLeafSubtreeDescription :: Text
-spawnLeafSubtreeDescription = "Fork a Gemini agent into its own worktree and tmux window. Gets dev role (files PR, cannot spawn children). Gemini is a capable implementer — give it acceptance criteria and file paths, not line-by-line instructions. IMPORTANT: You MUST create a team using TeamCreate BEFORE calling any spawn tool — without a team, child agent messages will not be delivered to you. After spawning, return immediately — you will be notified when the agent sends updates or when Copilot approves their PR."
+spawnLeafSubtreeDescription = "Fork a leaf agent into its own worktree and tmux window. Gets dev role (files PR, cannot spawn children). Leaf agents are capable implementers — give them acceptance criteria and file paths, not line-by-line instructions. Claude Code parents should create a team using TeamCreate before spawning Claude Code children. After spawning, return immediately."
 
 -- | Shared tool schema for spawn_leaf_subtree.
 spawnLeafSubtreeSchema :: Aeson.Object
@@ -265,6 +278,7 @@ spawnLeafSubtreeSchema =
   genericToolSchemaWith @SpawnLeafSubtreeArgs
     [ ("task", "Description of the sub-problem to solve"),
       ("branch_name", "Branch name suffix (will be prefixed with current branch)"),
+      ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
       ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
       ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
       ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction."),
@@ -289,7 +303,7 @@ spawnLeafSubtreeCore args = do
           { AC.slcTask = renderedTask,
             AC.slcBranchName = slsBranchName args,
             AC.slcRole = Nothing,
-            AC.slcAgentType = AC.Gemini,
+            AC.slcAgentType = slsAgentType args,
             AC.slcPerms = perms,
             AC.slcStandaloneRepo = standaloneRepo,
             AC.slcAllowedDirs = fromMaybe [] (slsAllowedDirs args)
@@ -303,11 +317,11 @@ spawnLeafSubtreeCore args = do
       case result' of
         Left err' -> pure $ Left (spawnErrorMessage err')
         Right spawnResult -> do
-          emitSpawnEvent retrySlug "gemini" (slsTask args)
+          emitSpawnEvent retrySlug "auto" (slsTask args)
           pure $ Right (retrySlug, spawnResult)
     Left err -> pure $ Left (spawnErrorMessage err)
     Right spawnResult -> do
-      emitSpawnEvent (slsBranchName args) "gemini" (slsTask args)
+      emitSpawnEvent (slsBranchName args) "auto" (slsTask args)
       pure $ Right (slsBranchName args, spawnResult)
 
 -- | Render a spawn leaf result to MCPCallOutput.
@@ -347,6 +361,7 @@ data WorkerSpec = WorkerSpec
     wsContextFiles :: Maybe [Text],
     wsVerifyTemplates :: Maybe [Text],
     wsType :: Maybe WorkerType,
+    wsAgentType :: Maybe AC.AgentType,
     wsPermissionMode :: Maybe Text,
     wsAllowedTools :: Maybe [Text],
     wsDisallowedTools :: Maybe [Text]
@@ -370,6 +385,7 @@ instance JsonSchema WorkerSpec where
           ("context_files", "Paths to files to include in context"),
           ("verify_templates", "Verification script templates"),
           ("type", "Worker type: 'implementation' (default) or 'research'. Research workers are read-only — they explore, search, and report findings via notify_parent."),
+          ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
           ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
           ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
           ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction.")
@@ -391,6 +407,7 @@ instance FromJSON WorkerSpec where
       <*> v .:? "context_files"
       <*> v .:? "verify_templates"
       <*> v .:? "type"
+      <*> v .:? "agent_type"
       <*> v .:? "permission_mode"
       <*> v .:? "allowed_tools"
       <*> v .:? "disallowed_tools"
@@ -406,7 +423,7 @@ instance FromJSON SpawnWorkersArgs where
 
 -- | Shared tool description for spawn_workers.
 spawnWorkersDescription :: Text
-spawnWorkersDescription = "Spawn multiple Gemini worker agents in one call. PREFER WORKERS OVER DOING WORK YOURSELF — Gemini costs 10-30x less than your Opus tokens. Any task you can specify clearly (implementation, research, file edits, test writing) should be a worker. If it touches 2+ files or takes more than 5 tool calls, spawn a worker. Give them acceptance criteria, key file paths, and anti-patterns, not step-by-step code. Each gets a tmux pane in YOUR window, working in YOUR directory on YOUR branch (ephemeral, no isolation, no PR). Workers send messages via notify_parent. Set type to 'research' for read-only exploration workers that search, read, and report findings without modifying anything. IMPORTANT: You MUST create a team using TeamCreate BEFORE calling any spawn tool — without a team, child agent messages will not be delivered to you. After spawning, return immediately — do not poll or wait."
+spawnWorkersDescription = "Spawn multiple worker agents in one call. PREFER WORKERS OVER DOING WORK YOURSELF — worker tokens cost far less than TL tokens. Any task you can specify clearly (implementation, research, file edits, test writing) should be a worker. If it touches 2+ files or takes more than 5 tool calls, spawn a worker. Give them acceptance criteria, key file paths, and anti-patterns, not step-by-step code. Each gets a tmux pane in YOUR window, working in YOUR directory on YOUR branch (ephemeral, no isolation, no PR), so the TL worktree must be clean before spawning. Commit the scaffold or discard throwaway output before retrying. Workers are sequential per TL tab; wait for the active worker handoff before spawning another worker, or use spawn_leaf for parallel PR work. Workers send messages via notify_parent. Set type to 'research' for read-only exploration workers that search, read, and report findings without modifying anything. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately — do not poll or wait."
 
 -- | Shared tool schema for spawn_workers.
 spawnWorkersSchema :: Aeson.Object
@@ -435,11 +452,12 @@ spawnWorkersCore args = do
           AC.SpawnWorkerConfig
             { AC.swcName = wsName spec,
               AC.swcPrompt = prompt,
+              AC.swcAgentType = wsAgentType spec,
               AC.swcPerms = perms
             }
     r <- AC.spawnWorker cfg
     case r of
-      Right _ -> emitSpawnEvent (wsName spec) "gemini-worker" (wsTask spec)
+      Right _ -> emitSpawnEvent (wsName spec) "worker" (wsTask spec)
       Left _ -> pure ()
     pure r
   let (errs, successes) = partitionEithers results
@@ -451,41 +469,44 @@ spawnWorkersCore args = do
         ]
 
 -- ============================================================================
--- SpawnGemini (worktree — branch + PR)
+-- SpawnLeaf (worktree — branch + PR)
 -- ============================================================================
 
-data SpawnGemini
+data SpawnLeaf
 
-data SpawnGeminiArgs = SpawnGeminiArgs
-  { sgName :: Text,
-    sgTask :: Text,
-    sgReadFirst :: Maybe [Text],
-    sgSteps :: Maybe [Text],
-    sgVerify :: Maybe [Text],
-    sgBoundary :: Maybe [Text],
-    sgContext :: Maybe Text
+data SpawnLeafArgs = SpawnLeafArgs
+  { slName :: Text,
+    slTask :: Text,
+    slAgentType :: Maybe AC.AgentType,
+    slReadFirst :: Maybe [Text],
+    slSteps :: Maybe [Text],
+    slVerify :: Maybe [Text],
+    slBoundary :: Maybe [Text],
+    slContext :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
-instance FromJSON SpawnGeminiArgs where
-  parseJSON = withObject "SpawnGeminiArgs" $ \v ->
-    SpawnGeminiArgs
+instance FromJSON SpawnLeafArgs where
+  parseJSON = withObject "SpawnLeafArgs" $ \v ->
+    SpawnLeafArgs
       <$> v .: "name"
       <*> v .: "task"
+      <*> v .:? "agent_type"
       <*> v .:? "read_first"
       <*> v .:? "steps"
       <*> v .:? "verify"
       <*> v .:? "boundary"
       <*> v .:? "context"
 
-spawnGeminiDescription :: Text
-spawnGeminiDescription = "Spawn a Gemini agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. Gemini is a capable implementer \x2014 give it acceptance criteria and file paths, not line-by-line instructions. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately \x2014 you will be notified when the agent completes."
+spawnLeafDescription :: Text
+spawnLeafDescription = "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). The TL worktree must be clean before spawning because dev-leaves fork from branch HEAD and cannot see uncommitted scaffold. Agent type defaults to the server config; pass agent_type only when this leaf needs a specific supported runtime. Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. Claude Code parents should create a team using TeamCreate before spawning Claude Code leaves. After spawning, return immediately."
 
-spawnGeminiSchema :: Aeson.Object
-spawnGeminiSchema =
-  genericToolSchemaWith @SpawnGeminiArgs
+spawnLeafSchema :: Aeson.Object
+spawnLeafSchema =
+  genericToolSchemaWith @SpawnLeafArgs
     [ ("name", "Branch name suffix (e.g., 'fix-clippy' \x2192 'main.fix-clippy')"),
       ("task", "What to build. Combined with steps/verify/boundary into structured spec"),
+      ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
       ("steps", "Numbered implementation steps with code snippets and exact file paths"),
       ("verify", "Exact verification commands (e.g., 'cargo test --workspace')"),
       ("boundary", "DO NOT rules for known failure modes"),
@@ -493,12 +514,13 @@ spawnGeminiSchema =
       ("read_first", "File paths to read before starting (CLAUDE.md, source patterns)")
     ]
 
-spawnGeminiCore :: SpawnGeminiArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
-spawnGeminiCore args = do
+spawnLeafCore :: SpawnLeafArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
+spawnLeafCore args = do
   let leafArgs =
         SpawnLeafSubtreeArgs
-          { slsTask = buildGeminiTask args,
-            slsBranchName = sgName args,
+          { slsTask = buildLeafTask args,
+            slsBranchName = slName args,
+            slsAgentType = slAgentType args,
             slsPermissionMode = Nothing,
             slsAllowedTools = Nothing,
             slsDisallowedTools = Nothing,
@@ -507,23 +529,24 @@ spawnGeminiCore args = do
           }
   spawnLeafSubtreeCore leafArgs
 
-buildGeminiTask :: SpawnGeminiArgs -> Text
-buildGeminiTask args =
+buildLeafTask :: SpawnLeafArgs -> Text
+buildLeafTask args =
   let spec =
         WorkerSpec
-          { wsName = sgName args,
-            wsTask = sgTask args,
-            wsReadFirst = sgReadFirst args,
-            wsSteps = sgSteps args,
-            wsVerify = sgVerify args,
+          { wsName = slName args,
+            wsTask = slTask args,
+            wsReadFirst = slReadFirst args,
+            wsSteps = slSteps args,
+            wsVerify = slVerify args,
             wsDoneCriteria = Nothing,
-            wsBoundary = sgBoundary args,
-            wsContext = sgContext args,
+            wsBoundary = slBoundary args,
+            wsContext = slContext args,
             wsPrompt = Nothing,
             wsProfiles = Nothing,
             wsContextFiles = Nothing,
             wsVerifyTemplates = Nothing,
             wsType = Nothing,
+            wsAgentType = Nothing,
             wsPermissionMode = Nothing,
             wsAllowedTools = Nothing,
             wsDisallowedTools = Nothing
@@ -538,7 +561,8 @@ data SpawnWorkerTool
 
 data SpawnWorkerToolArgs = SpawnWorkerToolArgs
   { swtName :: Text,
-    swtTask :: Text
+    swtTask :: Text,
+    swtAgentType :: Maybe AC.AgentType
   }
   deriving (Show, Eq, Generic)
 
@@ -547,15 +571,17 @@ instance FromJSON SpawnWorkerToolArgs where
     SpawnWorkerToolArgs
       <$> v .: "name"
       <*> v .: "task"
+      <*> v .:? "agent_type"
 
 spawnWorkerToolDescription :: Text
-spawnWorkerToolDescription = "Spawn an ephemeral Gemini worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 Gemini costs 10-30x less than your Opus tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. IMPORTANT: Create a team using TeamCreate BEFORE calling. After spawning, return immediately."
+spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR, so the TL worktree must be clean before spawning. Commit the scaffold or discard throwaway output before retrying. Workers are sequential per TL tab; wait for the active worker handoff before spawning another worker, or use spawn_leaf for parallel PR work. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately."
 
 spawnWorkerToolSchema :: Aeson.Object
 spawnWorkerToolSchema =
   genericToolSchemaWith @SpawnWorkerToolArgs
     [ ("name", "Worker name (pane title, messaging identity)"),
-      ("task", "The full prompt. Everything the worker needs in one string")
+      ("task", "The full prompt. Everything the worker needs in one string"),
+      ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default.")
     ]
 
 spawnWorkerToolCore :: SpawnWorkerToolArgs -> Eff Effects MCPCallOutput
@@ -575,11 +601,38 @@ spawnWorkerToolCore args = do
             wsContextFiles = Nothing,
             wsVerifyTemplates = Nothing,
             wsType = Nothing,
+            wsAgentType = swtAgentType args,
             wsPermissionMode = Nothing,
             wsAllowedTools = Nothing,
             wsDisallowedTools = Nothing
           }
   spawnWorkersCore (SpawnWorkersArgs [spec])
+
+data CloseWorkerPaneTool
+
+data CloseWorkerPaneArgs = CloseWorkerPaneArgs
+  { cwpPaneId :: Text
+  }
+  deriving (Show, Eq, Generic)
+
+instance FromJSON CloseWorkerPaneArgs where
+  parseJSON = withObject "CloseWorkerPaneArgs" $ \v ->
+    CloseWorkerPaneArgs <$> v .: "pane_id"
+
+closeWorkerPaneDescription :: Text
+closeWorkerPaneDescription = "Close an ephemeral worker tmux pane by pane_id. Use the pane_id returned by spawn_worker after you have received the worker's final result or no longer need the worker pane."
+
+closeWorkerPaneSchema :: Aeson.Object
+closeWorkerPaneSchema =
+  genericToolSchemaWith @CloseWorkerPaneArgs
+    [("pane_id", "Stable tmux pane id returned by spawn_worker, such as '%42'")]
+
+closeWorkerPaneCore :: CloseWorkerPaneArgs -> Eff Effects MCPCallOutput
+closeWorkerPaneCore args = do
+  result <- AC.closeWorkerPane (cwpPaneId args)
+  pure $ case result of
+    Left err -> errorResult (spawnErrorMessage err)
+    Right resp -> successResult (Aeson.toJSON resp)
 
 -- ============================================================================
 -- SpawnAcp (single ACP agent)
@@ -625,7 +678,7 @@ spawnAcpCore args = do
   case result of
     Left err -> pure $ errorResult (spawnErrorMessage err)
     Right spawnResult -> do
-      emitSpawnEvent (saName args) "gemini-acp" (saName args)
+      emitSpawnEvent (saName args) "leaf-acp" (saName args)
       pure $ successResult $ Aeson.toJSON spawnResult
 
 -- | Helper to emit 'agent.spawned' event to the host.
@@ -668,11 +721,14 @@ renderSpec spec =
 
 -- | Pre-rendered leaf profile text.
 leafProfileText :: Text
-leafProfileText = "## Completion Protocol (Leaf Subtree)\nYou are a **leaf agent** in your own git worktree and branch. Your branch name follows the pattern `{parent}.{slug}`.\n\nWhen you are done:\n\n1. **Commit your changes** with a descriptive message.\n   - `git add <specific files>` \x2014 NEVER `git add .` or `git add -A`\n   - `git commit -m \"feat: <description>\"`\n2. **File a PR** using `file_pr` tool. The base branch is auto-detected from your branch name.\n3. **Copilot review is automatic.** After you file a PR, the system monitors for Copilot review and will notify your parent when approved. If Copilot posts comments, they'll appear in your pane \x2014 address them and push fixes.\n4. **Use `notify_parent` to send status updates** \x2014 e.g., \"PR filed, awaiting review\" or \"hit a blocker, need guidance.\" Call with `failure` status to escalate problems.\n\n**DO NOT:**\n- Merge your own PR (the parent TL merges)\n- Push to main or any branch other than your own\n- Create additional branches"
+leafProfileText = "## Completion Protocol (Leaf Subtree)\nYou are a **leaf agent** in your own git worktree and branch. Your branch name follows the pattern `{parent}.{slug}`.\n\nWhen you are done:\n\n1. **Commit your changes** with a descriptive message.\n   - `git add <specific files>` \x2014 NEVER `git add .` or `git add -A`\n   - `git commit -m \"feat: <description>\"`\n2. **File a PR** using `file_pr` tool. The base branch is auto-detected from your branch name.\n3. **Review and CI are automatic.** After you file a PR, stay alive. The watcher routes reviewer comments, CI status, and merge-ready back into this pane.\n4. **Use `notify_parent` to send status updates** \x2014 e.g., \"PR filed, awaiting review\" or \"hit a blocker, need guidance.\" Call with `failure` status to escalate problems.\n5. **Stop only after merge-ready.** Merge-ready means reviewer approval plus passing/neutral CI; your parent TL merges after that.\n\n**DO NOT:**\n- Merge your own PR (the parent TL merges)\n- Push to main or any branch other than your own\n- Create additional branches\n- Stop immediately after filing a PR"
 
 -- | Pre-rendered worker profile text.
 workerProfileText :: Text
-workerProfileText = "## Completion Protocol (Worker)\nYou are an **ephemeral worker** \x2014 you run in the parent's directory on the parent's branch. You do NOT have your own worktree or branch.\n\nWhen you are done:\n\n1. **Call `notify_parent`** with status `success` and a DETAILED message containing your complete findings.\n   - Include FULL code snippets, exact file paths with line numbers, and concrete data.\n   - Your parent CANNOT see your terminal output. `notify_parent` is your ONLY communication channel.\n   - A terse summary like \"Task complete\" is useless \x2014 include everything the parent needs to act on your findings.\n   - For research tasks: include the actual code/data you found, not just \"I found it.\"\n   - For implementation tasks: describe exactly what you changed and how to verify it.\n2. If you failed after multiple attempts, call `notify_parent` with status `failure` and explain what went wrong.\n\n**DO NOT:**\n- Commit, push, or file PRs (you are ephemeral \x2014 the parent owns the branch)\n- Create new branches\n- Run `git checkout` or `git switch`\n- Print findings to stdout instead of sending them via `notify_parent`"
+workerProfileText =
+  "## Completion Protocol (Worker)\nYou are an **ephemeral worker** \x2014 you run in the parent's directory on the parent's branch. You do NOT have your own worktree or branch.\n\nWhen you are done:\n\n1. **Call `notify_parent`** with status `success` and a DETAILED message containing your complete findings.\n   - Include FULL code snippets, exact file paths with line numbers, and concrete data.\n   - Your parent CANNOT see your terminal output. `notify_parent` is your ONLY communication channel.\n   - A terse summary like \"Task complete\" is useless \x2014 include everything the parent needs to act on your findings.\n   - For research tasks: include the actual code/data you found, not just \"I found it.\"\n   - For implementation tasks: describe exactly what you changed and how to verify it.\n2. If you failed after multiple attempts, call `notify_parent` with status `failure` and explain what went wrong.\n\n**DO NOT:**\n- Commit, push, or file PRs (you are ephemeral \x2014 the parent owns the branch)\n- Create new branches\n- Run `git checkout` or `git switch`\n- Print findings to stdout instead of sending them via `notify_parent`"
+    <> "\n\n"
+    <> chainlinkWorkerProtocolText
 
 -- | Pre-rendered research worker profile text.
 researchProfileText :: Text

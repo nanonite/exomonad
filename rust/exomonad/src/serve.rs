@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use exomonad_core::protocol::Runtime as HookRuntime;
-use exomonad_core::services::{git, tmux_events};
+use exomonad_core::services::{git, tmux_events, HasGitWorktreeService};
 use exomonad_core::{
     AgentName, BirthBranch, ClaudePreToolUseOutput, HookEnvelope, HookEventType, HookInput,
     InternalAfterModelOutput, InternalBeforeModelOutput, InternalStopHookOutput, PluginManager,
@@ -24,7 +24,7 @@ use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, info, instrument, warn, Instrument};
+use tracing::{debug, error, info, instrument, warn, Instrument};
 
 // ============================================================================
 // Config Helpers
@@ -160,7 +160,7 @@ pub async fn resolve_plugin(
     wasm_path: &StdPath,
     agent_resolver: Option<&exomonad_core::services::AgentResolver>,
 ) -> anyhow::Result<Arc<PluginManager>> {
-    let agent_name = AgentName::from(name);
+    let agent_name = AgentName::try_from_str(name).context("agent name must not be empty")?;
 
     // Root's birth branch is written to .exo/agents/root/.birth_branch by init.
     // Re-resolve on every request to detect branch changes between sessions.
@@ -215,6 +215,11 @@ pub async fn resolve_plugin(
             .await
             .with_context(|| format!("Failed to create plugin for agent {}", agent_name))?,
     );
+    let mut cache = plugins.write().await;
+    if let Some(existing) = cache.get(&agent_name) {
+        return Ok(existing.clone());
+    }
+    cache.insert(agent_name, p.clone());
     Ok(p)
 }
 
@@ -266,7 +271,8 @@ async fn resolve_agent_birth_branch(
             let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !branch.is_empty() {
                 tracing::debug!(agent = %agent_name, branch = %branch, "Resolved agent birth branch from worktree");
-                return Ok(BirthBranch::from(branch.as_str()));
+                return BirthBranch::try_from_str(branch.as_str())
+                    .context("resolved git branch must not be empty");
             }
         }
         _ => {}
@@ -281,7 +287,8 @@ async fn resolve_agent_birth_branch(
         if let Ok(contents) = tokio::fs::read_to_string(&bb_file).await {
             let branch = contents.trim().to_string();
             tracing::debug!(agent = %agent_name, branch = %branch, "Resolved agent birth branch from .birth_branch file");
-            return Ok(BirthBranch::from(branch.as_str()));
+            return BirthBranch::try_from_str(branch.as_str())
+                .context(".birth_branch must not be empty");
         }
     }
 
@@ -379,10 +386,22 @@ pub async fn handle_hook_inner(
         }
     }
 
+    let hook_trace = std::env::var("EXOMONAD_HOOK_TRACE").is_ok();
+
     // Parse and inject runtime
     let mut hook_input: HookInput =
         serde_json::from_str(body).context("Failed to parse hook input")?;
     hook_input.runtime = Some(runtime);
+
+    if hook_trace {
+        info!(
+            runtime = ?runtime,
+            event = ?event_type,
+            tool = hook_input.tool_name.as_ref().map(|t| t.as_str()).unwrap_or("-"),
+            agent = params.agent_id.as_deref().unwrap_or("root"),
+            "[hook] received"
+        );
+    }
 
     // Classify hook event into dispatch category. Exhaustive match ensures new
     // event types get handled explicitly rather than silently falling through.
@@ -394,9 +413,10 @@ pub async fn handle_hook_inner(
         ToolUse,
         /// Worker exit: WASM handles notifyParent as side effect, returns simple allow
         WorkerExit,
-        /// Gemini BeforeModel/AfterModel: passed through to WASM, response serialized as-is
-        GeminiBeforeModel,
-        GeminiAfterModel,
+        /// BeforeModel/AfterModel: passed through to WASM, response serialized as-is.
+        /// Currently only Gemini fires these; the dispatch arm is runtime-agnostic.
+        BeforeModel,
+        AfterModel,
     }
 
     let dispatch = match event_type {
@@ -405,8 +425,8 @@ pub async fn handle_hook_inner(
         HookEventType::SessionEnd => HookDispatch::Stop,
         HookEventType::PreToolUse => HookDispatch::ToolUse,
         HookEventType::BeforeTool => HookDispatch::ToolUse,
-        HookEventType::BeforeModel => HookDispatch::GeminiBeforeModel,
-        HookEventType::AfterModel => HookDispatch::GeminiAfterModel,
+        HookEventType::BeforeModel => HookDispatch::BeforeModel,
+        HookEventType::AfterModel => HookDispatch::AfterModel,
         HookEventType::PostToolUse => HookDispatch::ToolUse,
         HookEventType::WorkerExit => HookDispatch::WorkerExit,
         HookEventType::SessionStart => HookDispatch::ToolUse,
@@ -448,12 +468,14 @@ pub async fn handle_hook_inner(
 
     // Resolve agent identity: try resolver first for authoritative identity,
     // fall back to query params (which may be inaccurate for hooks fired before first tool call).
-    let agent_name_for_hook = AgentName::from(params.agent_id.as_deref().unwrap_or("root"));
+    let agent_name_for_hook = AgentName::try_from_str(params.agent_id.as_deref().unwrap_or("root"))
+        .context("hook agent_id must not be empty")?;
     let birth_branch_for_hook =
         if let Some(record) = state.agent_resolver.get(&agent_name_for_hook).await {
             record.birth_branch
         } else {
-            BirthBranch::from(params.session_id.as_deref().unwrap_or("main"))
+            BirthBranch::try_from_str(params.session_id.as_deref().unwrap_or("main"))
+                .context("hook session_id must not be empty")?
         };
 
     // Always inject identity into WASM input (hooks need it even when env vars aren't set)
@@ -570,7 +592,7 @@ pub async fn handle_hook_inner(
             })
         }
 
-        HookDispatch::GeminiBeforeModel => {
+        HookDispatch::BeforeModel => {
             let output: InternalBeforeModelOutput = plugin
                 .call("handle_pre_tool_use", &hook_input_value)
                 .await
@@ -587,7 +609,7 @@ pub async fn handle_hook_inner(
             })
         }
 
-        HookDispatch::GeminiAfterModel => {
+        HookDispatch::AfterModel => {
             let output: InternalAfterModelOutput = plugin
                 .call("handle_pre_tool_use", &hook_input_value)
                 .await
@@ -615,6 +637,18 @@ pub async fn handle_hook_inner(
 
             let exit_code = if output.continue_ { 0 } else { 2 };
 
+            if hook_trace {
+                info!(
+                    runtime = ?runtime,
+                    event = ?event_type,
+                    tool = hook_input.tool_name.as_ref().map(|t| t.as_str()).unwrap_or("-"),
+                    agent = params.agent_id.as_deref().unwrap_or("root"),
+                    exit_code,
+                    response = %output_json,
+                    "[hook] dispatched"
+                );
+            }
+
             Ok(HookEnvelope {
                 stdout: output_json,
                 exit_code,
@@ -628,9 +662,25 @@ pub async fn handle_hook_inner(
 // ============================================================================
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    // We need to resolve the root plugin for health
-    let cache = state.plugins.read().await;
-    let plugin = cache.get(&AgentName::from("root")).cloned();
+    let plugins: Vec<Arc<PluginManager>> = {
+        let cache = state.plugins.read().await;
+        cache.values().cloned().collect()
+    };
+
+    for plugin in &plugins {
+        if let Err(e) = plugin.reload_if_changed().await {
+            warn!(error = %e, "WASM hot-reload check failed during health probe");
+        }
+    }
+
+    let root = AgentName::try_from_str("root").expect("literal agent name is non-empty");
+    let plugin = {
+        let cache = state.plugins.read().await;
+        cache
+            .get(&root)
+            .cloned()
+            .or_else(|| cache.values().next().cloned())
+    };
 
     let wasm_hash = if let Some(p) = plugin {
         p.content_hash()
@@ -808,8 +858,27 @@ pub async fn shutdown_endpoint(
     State(signal): State<Arc<tokio::sync::Notify>>,
 ) -> impl IntoResponse {
     info!("Shutdown requested via /shutdown endpoint");
-    signal.notify_one();
+    signal.notify_waiters();
     Json(serde_json::json!({"status": "ok"}))
+}
+
+async fn shutdown_signal_future(signal: Arc<tokio::sync::Notify>, listener_name: &'static str) {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!(listener = listener_name, "Received SIGINT, initiating graceful shutdown"),
+        _ = terminate => info!(listener = listener_name, "Received SIGTERM, initiating graceful shutdown"),
+        _ = signal.notified() => info!(listener = listener_name, "Received /shutdown request, initiating graceful shutdown"),
+    }
 }
 
 // ============================================================================
@@ -872,20 +941,43 @@ Run `exomonad recompile` first to build it.",
     // Validate prerequisites
     exomonad_core::services::validate_git().context("Failed to validate git")?;
 
-    let secrets = exomonad_core::services::secrets::Secrets::load();
+    let _secrets = exomonad_core::services::secrets::Secrets::load();
     let executor: Arc<dyn exomonad_core::services::command::CommandExecutor> =
         Arc::new(exomonad_core::services::local::LocalExecutor::new());
     let git = Arc::new(exomonad_core::services::git::GitService::new(executor));
     let git_wt = Arc::new(
         exomonad_core::services::git_worktree::GitWorktreeService::new(project_dir.clone()),
     );
-    let github_client = secrets
-        .github_token()
-        .map(|_| exomonad_core::services::GitHubClient::new(5));
-
-    if github_client.is_some() {
-        exomonad_core::services::validate_gh_cli().context("Failed to validate gh CLI")?;
-    }
+    let forgejo_client = match (
+        config.forgejo_url.as_deref(),
+        config.forgejo_token.as_deref(),
+    ) {
+        (Some(url), Some(token)) => Some(exomonad_core::services::ForgejoClient::new(url, token)?),
+        (Some(_), None) => {
+            warn!("forgejo_url configured without forgejo_token; file_pr will use local PR flow");
+            None
+        }
+        (None, Some(_)) => {
+            warn!("forgejo_token configured without forgejo_url; file_pr will use local PR flow");
+            None
+        }
+        (None, None) => None,
+    };
+    let forgejo_reviewer_client = match (
+        config.forgejo_url.as_deref(),
+        config.forgejo_reviewer_token.as_deref(),
+    ) {
+        (Some(url), Some(token)) => Some(exomonad_core::services::ForgejoClient::new(url, token)?),
+        (Some(_), None) => {
+            warn!("forgejo_reviewer_token not configured; reviewer MCP tools cannot submit Forgejo PR reviews");
+            None
+        }
+        (None, Some(_)) => {
+            warn!("forgejo_reviewer_token configured without forgejo_url; reviewer MCP tools cannot submit Forgejo PR reviews");
+            None
+        }
+        (None, None) => None,
+    };
 
     let team_registry = Arc::new(claude_teams_bridge::TeamRegistry::new());
     let acp_registry = Arc::new(exomonad_core::services::acp_registry::AcpRegistry::new());
@@ -913,10 +1005,19 @@ Run `exomonad recompile` first to build it.",
     let claude_session_registry =
         Arc::new(exomonad_core::services::claude_session_registry::ClaudeSessionRegistry::new());
 
+    // Shared CI status map retained for compatibility with legacy webhook integrations,
+    // read by MergePRHandler gate 7. Keyed by (branch, SHA) so stale CI from
+    // an older push cannot satisfy the reviewer-approved commit gate.
+    let ci_status_map = Arc::new(tokio::sync::RwLock::new(
+        exomonad_core::services::CiStatusMap::new(),
+    ));
+
     // Build Services once — all shared registries in one struct
     let services = Arc::new(exomonad_core::services::Services {
         project_dir: project_dir.clone(),
-        github_client: github_client.clone(),
+        github_client: None,
+        forgejo_client: forgejo_client.clone(),
+        forgejo_reviewer_client: forgejo_reviewer_client.clone(),
         event_log: event_log.clone(),
         team_registry: team_registry.clone(),
         acp_registry: acp_registry.clone(),
@@ -926,6 +1027,8 @@ Run `exomonad recompile` first to build it.",
         event_queue: event_queue.clone(),
         mutex_registry,
         git_wt,
+        opencode_worker_model: config.opencode.worker_model.clone(),
+        ci_status_map: ci_status_map.clone(),
     });
 
     let mut agent_control =
@@ -937,6 +1040,11 @@ Run `exomonad recompile` first to build it.",
         agent_control.with_birth_branch(resolve_agent_birth_branch(&worktree_base, "root").await?);
     agent_control = agent_control.with_tmux_session(config.tmux_session.clone());
     agent_control = agent_control.with_yolo(config.yolo);
+    agent_control = agent_control.with_spawn_agent_type(config.spawn_agent_type);
+    agent_control = agent_control.with_spawn_agent_model(config.opencode.worker_model.clone());
+    agent_control = agent_control.with_reviewer_agent_type(config.reviewer.agent_type);
+    agent_control = agent_control.with_reviewer_model(config.reviewer.model.clone());
+    agent_control = agent_control.with_reviewer_context(config.reviewer.context.clone());
     agent_control = agent_control
         .with_extra_mcp_servers(serialize_extra_mcp_servers(&config.extra_mcp_servers));
     let event_session_id = uuid::Uuid::new_v4().to_string();
@@ -974,7 +1082,13 @@ Run `exomonad recompile` first to build it.",
         services.clone(),
         Some(event_session_id),
     ));
+    let plugin_build_started_at = std::time::Instant::now();
     let rt = builder.build().await.context("Failed to build runtime")?;
+    info!(
+        wasm_path = %wasm_path.display(),
+        elapsed_ms = plugin_build_started_at.elapsed().as_millis(),
+        "WASM plugins ready for root role"
+    );
 
     // Extract the shared registry for creating per-agent plugins
     let rt_registry = rt.registry.clone();
@@ -985,10 +1099,14 @@ Run `exomonad recompile` first to build it.",
         Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     // Pre-populate with the root agent's plugin
-    plugins
-        .write()
-        .await
-        .insert(AgentName::from("root"), root_plugin.clone());
+    plugins.write().await.insert(
+        AgentName::try_from_str("root").expect("literal agent name is non-empty"),
+        root_plugin.clone(),
+    );
+    info!(
+        plugin_count = plugins.read().await.len(),
+        "Plugin cache initialized; server can dispatch root-role requests after listen"
+    );
 
     // Check for existing server BEFORE writing our own PID
     let socket_path = project_dir.join(".exo/server.sock");
@@ -1025,17 +1143,50 @@ Run `exomonad recompile` first to build it.",
     std::fs::write(&server_pid_path, serde_json::to_string_pretty(&pid_info)?)?;
     info!(path = %server_pid_path.display(), "Wrote server.pid");
 
-    // Start GitHub Poller (background service)
-    let mut poller = exomonad_core::services::github_poller::GitHubPoller::new(services.clone())
-        .with_plugins(plugins.clone());
+    let review_policy = exomonad_core::services::review_policy::ReviewPolicy::load(&project_dir)
+        .await
+        .context("Failed to load review policy")?;
+    let orphan_max_leaf = review_policy.max_leaf_session_seconds;
+    let orphan_max_reviewer = review_policy.max_reviewer_session_seconds;
+
+    // Start Worktree Event Watcher (background service — replaces GitHub poller + Copilot review)
+    let mut watcher = exomonad_core::services::worktree_event_watcher::WorktreeEventWatcher::new(
+        services.clone(),
+    )
+    .with_plugins(plugins.clone())
+    .with_reviewer_spawner(agent_control.clone())
+    .with_ci_status_map(ci_status_map.clone())
+    .with_policy(review_policy);
     if let Some(interval) = config.poll_interval {
         if interval == 0 {
             anyhow::bail!("Invalid configuration: `poll_interval` must be >= 1 second, got 0");
         }
-        poller = poller.with_poll_interval(Duration::from_secs(interval));
+        watcher = watcher.with_poll_interval(Duration::from_secs(interval));
     }
     tokio::spawn(async move {
-        poller.run().await;
+        watcher.run().await;
+    });
+
+    let orphan_reconciler_interval =
+        Duration::from_secs(config.orphan_reconciler_interval_secs.unwrap_or(60));
+    if orphan_reconciler_interval.is_zero() {
+        anyhow::bail!(
+            "Invalid configuration: `orphan_reconciler_interval_secs` must be >= 1 second, got 0"
+        );
+    }
+    let orphan_project_dir = Arc::new(project_dir.clone());
+    let orphan_git_wt = services.git_worktree_service().clone();
+    let orphan_tmux_session = Some(config.tmux_session.clone());
+    tokio::spawn(async move {
+        exomonad_core::services::orphan_reconciler::run_orphan_reconciler(
+            orphan_project_dir,
+            orphan_git_wt,
+            orphan_reconciler_interval,
+            orphan_max_leaf,
+            orphan_max_reviewer,
+            orphan_tmux_session,
+        )
+        .await;
     });
 
     let app_state = AppState {
@@ -1049,6 +1200,11 @@ Run `exomonad recompile` first to build it.",
         event_log: event_log.clone(),
         run_id: run_id.clone(),
         agent_resolver: agent_resolver.clone(),
+    };
+
+    let forgejo_ci_state = exomonad_core::services::forgejo_ci::ForgejoCiWebhookState {
+        ctx: services.clone(),
+        webhook_secret: config.forgejo_webhook_secret.clone(),
     };
 
     let hook_state = HookState {
@@ -1078,9 +1234,25 @@ Run `exomonad recompile` first to build it.",
         ))
         .with_state(app_state.clone());
 
+    let tcp_app = Router::new()
+        .route("/health", get(health))
+        .route(
+            "/ci",
+            post(exomonad_core::services::forgejo_ci::handle::<exomonad_core::services::Services>)
+                .with_state(forgejo_ci_state.clone()),
+        )
+        .with_state(app_state.clone())
+        .layer(cors.clone())
+        .layer(TraceLayer::new_for_http());
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/hook", post(handle_hook_request).with_state(hook_state))
+        .route(
+            "/ci",
+            post(exomonad_core::services::forgejo_ci::handle::<exomonad_core::services::Services>)
+                .with_state(forgejo_ci_state),
+        )
         .nest("/agents", agent_routes)
         .route(
             "/events",
@@ -1101,6 +1273,7 @@ Run `exomonad recompile` first to build it.",
         std::fs::create_dir_all(parent)?;
     }
 
+    info!(socket = %socket_path.display(), "Binding MCP Unix domain socket");
     let listener = tokio::net::UnixListener::bind(&socket_path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to bind Unix socket {}: {}",
@@ -1108,6 +1281,12 @@ Run `exomonad recompile` first to build it.",
             e
         )
     })?;
+
+    let tcp_addr = format!("0.0.0.0:{}", config.port);
+    info!(address = %tcp_addr, "Binding public TCP webhook listener");
+    let tcp_listener = tokio::net::TcpListener::bind(&tcp_addr)
+        .await
+        .with_context(|| format!("Failed to bind TCP listener {tcp_addr}"))?;
 
     // Set socket permissions to owner-only (0600)
     #[cfg(unix)]
@@ -1117,32 +1296,34 @@ Run `exomonad recompile` first to build it.",
     }
 
     info!(socket = %socket_path.display(), "MCP server listening on Unix domain socket");
+    info!(address = %tcp_addr, "Public TCP webhook listener ready");
+    info!(
+        socket = %socket_path.display(),
+        tcp_address = %tcp_addr,
+        plugin_count = plugins.read().await.len(),
+        "Plugins ready, accepting connections"
+    );
 
     let socket_path_for_cleanup = socket_path.clone();
     let server_pid_for_cleanup = server_pid_path.clone();
 
-    // Run with graceful shutdown on SIGINT, SIGTERM, or /shutdown endpoint
-    let shutdown_signal_for_server = shutdown_signal.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let ctrl_c = tokio::signal::ctrl_c();
-            #[cfg(unix)]
-            let terminate = async {
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to install SIGTERM handler")
-                    .recv()
-                    .await;
-            };
-            #[cfg(not(unix))]
-            let terminate = std::future::pending::<()>();
+    // Run both listeners with graceful shutdown on SIGINT, SIGTERM, or /shutdown endpoint.
+    let uds_shutdown_signal = shutdown_signal.clone();
+    let uds_server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal_future(
+        uds_shutdown_signal,
+        "MCP Unix domain socket",
+    ));
 
-            tokio::select! {
-                _ = ctrl_c => info!("Received SIGINT, initiating graceful shutdown"),
-                _ = terminate => info!("Received SIGTERM, initiating graceful shutdown"),
-                _ = shutdown_signal_for_server.notified() => info!("Received /shutdown request, initiating graceful shutdown"),
-            }
-        })
-        .await?;
+    let tcp_shutdown_signal = shutdown_signal.clone();
+    let tcp_server = axum::serve(tcp_listener, tcp_app).with_graceful_shutdown(
+        shutdown_signal_future(tcp_shutdown_signal, "public TCP webhook listener"),
+    );
+
+    if let Err(err) = tokio::try_join!(uds_server, tcp_server) {
+        error!(error = %err, "MCP server exited with error");
+        return Err(err.into());
+    }
+    info!("MCP server exited gracefully");
 
     // Clean up socket and pid on shutdown
     if socket_path_for_cleanup.exists() {

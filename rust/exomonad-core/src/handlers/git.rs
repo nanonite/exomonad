@@ -52,10 +52,14 @@ impl GitEffects for GitHandler {
             .await
             .effect_err("git")?;
 
-        info!(branch = %branch, "[Git] get_branch complete");
+        info!(branch = ?branch, "[Git] get_branch complete");
+        let detached = branch.is_none();
+        let branch_name = branch
+            .map(|branch| branch.to_string())
+            .unwrap_or_else(|| ctx.birth_branch.to_string());
         Ok(GetBranchResponse {
-            branch: branch.to_string(),
-            detached: false,
+            branch: branch_name,
+            detached,
         })
     }
 
@@ -224,10 +228,13 @@ impl GitEffects for GitHandler {
             .await
             .effect_err("git")?;
 
-        info!(path = %info.path, branch = %info.branch, "[Git] get_worktree complete");
+        info!(path = %info.path, branch = ?info.branch, "[Git] get_worktree complete");
         Ok(GetWorktreeResponse {
             path: info.path,
-            branch: info.branch.to_string(),
+            branch: info
+                .branch
+                .map(|branch| branch.to_string())
+                .unwrap_or_default(),
             head_commit: String::new(),
             is_linked: false,
         })
@@ -254,12 +261,41 @@ fn parse_git_date(date: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch};
+    use crate::services::command::CommandExecutor;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
 
     fn test_ctx(branch: &str) -> EffectContext {
         EffectContext {
-            agent_name: AgentName::from("test"),
-            birth_branch: BirthBranch::from(branch),
+            agent_name: AgentName::try_from_str("test")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str(branch)
+                .expect("validated string input is non-empty"),
             working_dir: crate::services::agent_control::resolve_working_dir(branch),
+        }
+    }
+
+    struct MockExecutor {
+        responses: Mutex<Vec<anyhow::Result<String>>>,
+    }
+
+    impl MockExecutor {
+        fn new(responses: Vec<anyhow::Result<String>>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+    }
+
+    impl CommandExecutor for MockExecutor {
+        fn exec<'a>(
+            &'a self,
+            _dir: &'a str,
+            _cmd: &'a [&'a str],
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+            let response = self.responses.lock().unwrap().remove(0);
+            Box::pin(async move { response })
         }
     }
 
@@ -270,6 +306,25 @@ mod tests {
             Some("john@example.com".to_string())
         );
         assert_eq!(extract_email("No Email"), None);
+    }
+
+    #[tokio::test]
+    async fn test_get_branch_uses_birth_branch_when_head_is_detached() {
+        let handler = GitHandler::new(Arc::new(GitService::new(Arc::new(MockExecutor::new(
+            vec![Ok("\n".to_string())],
+        )))));
+        let response = handler
+            .get_branch(
+                GetBranchRequest {
+                    working_dir: ".".to_string(),
+                },
+                &test_ctx("main.review-pr-7-codex"),
+            )
+            .await
+            .expect("get_branch succeeds");
+
+        assert!(response.detached);
+        assert_eq!(response.branch, "main.review-pr-7-codex");
     }
 
     #[test]

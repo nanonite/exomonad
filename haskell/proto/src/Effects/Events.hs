@@ -478,6 +478,15 @@ instance (HsProtobuf.Message Event) where
                     )
                       (Hs.Just y)
                   )
+              EventEventTypeIssueClosed y ->
+                HsProtobuf.encodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+                  ( ( Hs.coerce
+                        @(Hs.Maybe Effects.Events.IssueClosed)
+                        @(HsProtobuf.Nested Effects.Events.IssueClosed)
+                    )
+                      (Hs.Just y)
+                  )
       )
   decodeMessage _ =
     Hs.pure Event
@@ -503,6 +512,15 @@ instance (HsProtobuf.Message Event) where
                     )
                       HsProtobuf.decodeMessageField
                   )
+          ),
+          ( (HsProtobuf.FieldNumber 4),
+            Hs.pure (Hs.fmap EventEventTypeIssueClosed)
+              <*> ( ( HsProtobuf.coerceOver
+                        @(HsProtobuf.Nested Effects.Events.IssueClosed)
+                        @(Hs.Maybe Effects.Events.IssueClosed)
+                    )
+                      HsProtobuf.decodeMessageField
+                  )
           )
         ]
   dotProto _ =
@@ -515,14 +533,16 @@ instance (HsProtobuf.Message Event) where
     ]
 
 instance (HsJSONPB.ToJSONPB Event) where
-  toJSONPB (Event f3 f1_or_f2) =
+  toJSONPB (Event f3 f1_or_f2_or_f4) =
     HsJSONPB.object
       [ "event_id" .= f3,
         ( let encodeEvent_type =
-                ( case f1_or_f2 of
+                ( case f1_or_f2_or_f4 of
                     Hs.Just (EventEventTypeAgentMessage f1) ->
                       HsJSONPB.pair "agent_message" f1
                     Hs.Just (EventEventTypeTimeout f2) -> HsJSONPB.pair "timeout" f2
+                    Hs.Just (EventEventTypeIssueClosed f4) ->
+                      HsJSONPB.pair "issue_closed" f4
                     Hs.Nothing -> Hs.mempty
                 )
            in ( \options ->
@@ -535,14 +555,16 @@ instance (HsJSONPB.ToJSONPB Event) where
               )
         )
       ]
-  toEncodingPB (Event f3 f1_or_f2) =
+  toEncodingPB (Event f3 f1_or_f2_or_f4) =
     HsJSONPB.pairs
       [ "event_id" .= f3,
         ( let encodeEvent_type =
-                ( case f1_or_f2 of
+                ( case f1_or_f2_or_f4 of
                     Hs.Just (EventEventTypeAgentMessage f1) ->
                       HsJSONPB.pair "agent_message" f1
                     Hs.Just (EventEventTypeTimeout f2) -> HsJSONPB.pair "timeout" f2
+                    Hs.Just (EventEventTypeIssueClosed f4) ->
+                      HsJSONPB.pair "issue_closed" f4
                     Hs.Nothing -> Hs.mempty
                 )
            in ( \options ->
@@ -569,6 +591,8 @@ instance (HsJSONPB.FromJSONPB Event) where
                               <$> HsJSONPB.parseField parseObj "agent_message",
                             Hs.Just Hs.. EventEventTypeTimeout
                               <$> HsJSONPB.parseField parseObj "timeout",
+                            Hs.Just Hs.. EventEventTypeIssueClosed
+                              <$> HsJSONPB.parseField parseObj "issue_closed",
                             Hs.pure Hs.Nothing
                           ]
                    in ( obj .: "event_type"
@@ -588,6 +612,7 @@ instance (HsJSONPB.FromJSON Event) where
 data EventEventType
   = EventEventTypeAgentMessage Effects.Events.AgentMessage
   | EventEventTypeTimeout Effects.Events.Timeout
+  | EventEventTypeIssueClosed Effects.Events.IssueClosed
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
 instance (Hs.NFData EventEventType)
@@ -816,6 +841,94 @@ instance (HsJSONPB.ToJSON Timeout) where
   toEncoding = HsJSONPB.toAesonEncoding
 
 instance (HsJSONPB.FromJSON Timeout) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data IssueClosed
+  = IssueClosed
+  { issueClosedIssueId :: Hs.Word64,
+    issueClosedClosedBy :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData IssueClosed)
+
+instance (HsProtobuf.Named IssueClosed) where
+  nameOf _ = Hs.fromString "IssueClosed"
+
+instance (HsProtobuf.HasDefault IssueClosed)
+
+instance (HsProtobuf.Message IssueClosed) where
+  encodeMessage
+    _
+    IssueClosed {issueClosedIssueId, issueClosedClosedBy} =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            issueClosedIssueId
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                issueClosedClosedBy
+            )
+        )
+  decodeMessage _ =
+    Hs.pure IssueClosed
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "issue_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "closed_by")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB IssueClosed) where
+  toJSONPB (IssueClosed f1 f2) =
+    HsJSONPB.object
+      [ "issue_id" .= f1,
+        "closed_by"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+  toEncodingPB (IssueClosed f1 f2) =
+    HsJSONPB.pairs
+      [ "issue_id" .= f1,
+        "closed_by"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+
+instance (HsJSONPB.FromJSONPB IssueClosed) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "IssueClosed"
+      ( \obj ->
+          Hs.pure IssueClosed
+            <*> obj .: "issue_id"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "closed_by")
+                )
+      )
+
+instance (HsJSONPB.ToJSON IssueClosed) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON IssueClosed) where
   parseJSON = HsJSONPB.parseJSONPB
 
 newtype Address
@@ -1283,6 +1396,488 @@ instance (HsJSONPB.ToJSON SendMessageResponse) where
   toEncoding = HsJSONPB.toAesonEncoding
 
 instance (HsJSONPB.FromJSON SendMessageResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data SendTmuxMessageRequest
+  = SendTmuxMessageRequest
+  { sendTmuxMessageRequestRecipient :: (Hs.Maybe Effects.Events.Address),
+    sendTmuxMessageRequestContent :: Hs.Text,
+    sendTmuxMessageRequestSummary :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData SendTmuxMessageRequest)
+
+instance (HsProtobuf.Named SendTmuxMessageRequest) where
+  nameOf _ = Hs.fromString "SendTmuxMessageRequest"
+
+instance (HsProtobuf.HasDefault SendTmuxMessageRequest)
+
+instance (HsProtobuf.Message SendTmuxMessageRequest) where
+  encodeMessage
+    _
+    SendTmuxMessageRequest
+      { sendTmuxMessageRequestRecipient,
+        sendTmuxMessageRequestContent,
+        sendTmuxMessageRequestSummary
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 1)
+                ( ( Hs.coerce
+                      @(Hs.Maybe Effects.Events.Address)
+                      @(HsProtobuf.Nested Effects.Events.Address)
+                  )
+                    sendTmuxMessageRequestRecipient
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 2)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    sendTmuxMessageRequestContent
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 3)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                sendTmuxMessageRequestSummary
+            )
+        )
+  decodeMessage _ =
+    Hs.pure SendTmuxMessageRequest
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Events.Address)
+                @(Hs.Maybe Effects.Events.Address)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "Address"))
+        )
+        (HsProtobufAST.Single "recipient")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "content")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "summary")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB SendTmuxMessageRequest) where
+  toJSONPB (SendTmuxMessageRequest f1 f2 f3) =
+    HsJSONPB.object
+      [ "recipient"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Events.Address)
+                   @(HsProtobuf.Nested Effects.Events.Address)
+               )
+                 f1
+             ),
+        "content"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "summary"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+      ]
+  toEncodingPB (SendTmuxMessageRequest f1 f2 f3) =
+    HsJSONPB.pairs
+      [ "recipient"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Events.Address)
+                   @(HsProtobuf.Nested Effects.Events.Address)
+               )
+                 f1
+             ),
+        "content"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "summary"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+      ]
+
+instance (HsJSONPB.FromJSONPB SendTmuxMessageRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "SendTmuxMessageRequest"
+      ( \obj ->
+          Hs.pure SendTmuxMessageRequest
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Events.Address)
+                      @(Hs.Maybe Effects.Events.Address)
+                  )
+                    (obj .: "recipient")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "content")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "summary")
+                )
+      )
+
+instance (HsJSONPB.ToJSON SendTmuxMessageRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON SendTmuxMessageRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data SendTmuxMessageResponse
+  = SendTmuxMessageResponse
+  { sendTmuxMessageResponseSuccess :: Hs.Bool,
+    sendTmuxMessageResponseDeliveryMethod :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData SendTmuxMessageResponse)
+
+instance (HsProtobuf.Named SendTmuxMessageResponse) where
+  nameOf _ = Hs.fromString "SendTmuxMessageResponse"
+
+instance (HsProtobuf.HasDefault SendTmuxMessageResponse)
+
+instance (HsProtobuf.Message SendTmuxMessageResponse) where
+  encodeMessage
+    _
+    SendTmuxMessageResponse
+      { sendTmuxMessageResponseSuccess,
+        sendTmuxMessageResponseDeliveryMethod
+      } =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            sendTmuxMessageResponseSuccess
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                sendTmuxMessageResponseDeliveryMethod
+            )
+        )
+  decodeMessage _ =
+    Hs.pure SendTmuxMessageResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "delivery_method")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB SendTmuxMessageResponse) where
+  toJSONPB (SendTmuxMessageResponse f1 f2) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "delivery_method"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+  toEncodingPB (SendTmuxMessageResponse f1 f2) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "delivery_method"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+
+instance (HsJSONPB.FromJSONPB SendTmuxMessageResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "SendTmuxMessageResponse"
+      ( \obj ->
+          Hs.pure SendTmuxMessageResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "delivery_method")
+                )
+      )
+
+instance (HsJSONPB.ToJSON SendTmuxMessageResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON SendTmuxMessageResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data SendMailboxMessageRequest
+  = SendMailboxMessageRequest
+  { sendMailboxMessageRequestRecipient :: (Hs.Maybe Effects.Events.Address),
+    sendMailboxMessageRequestContent :: Hs.Text,
+    sendMailboxMessageRequestSummary :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData SendMailboxMessageRequest)
+
+instance (HsProtobuf.Named SendMailboxMessageRequest) where
+  nameOf _ = Hs.fromString "SendMailboxMessageRequest"
+
+instance (HsProtobuf.HasDefault SendMailboxMessageRequest)
+
+instance (HsProtobuf.Message SendMailboxMessageRequest) where
+  encodeMessage
+    _
+    SendMailboxMessageRequest
+      { sendMailboxMessageRequestRecipient,
+        sendMailboxMessageRequestContent,
+        sendMailboxMessageRequestSummary
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 1)
+                ( ( Hs.coerce
+                      @(Hs.Maybe Effects.Events.Address)
+                      @(HsProtobuf.Nested Effects.Events.Address)
+                  )
+                    sendMailboxMessageRequestRecipient
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 2)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    sendMailboxMessageRequestContent
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 3)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                sendMailboxMessageRequestSummary
+            )
+        )
+  decodeMessage _ =
+    Hs.pure SendMailboxMessageRequest
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Events.Address)
+                @(Hs.Maybe Effects.Events.Address)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "Address"))
+        )
+        (HsProtobufAST.Single "recipient")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "content")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "summary")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB SendMailboxMessageRequest) where
+  toJSONPB (SendMailboxMessageRequest f1 f2 f3) =
+    HsJSONPB.object
+      [ "recipient"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Events.Address)
+                   @(HsProtobuf.Nested Effects.Events.Address)
+               )
+                 f1
+             ),
+        "content"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "summary"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+      ]
+  toEncodingPB (SendMailboxMessageRequest f1 f2 f3) =
+    HsJSONPB.pairs
+      [ "recipient"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Events.Address)
+                   @(HsProtobuf.Nested Effects.Events.Address)
+               )
+                 f1
+             ),
+        "content"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "summary"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+      ]
+
+instance (HsJSONPB.FromJSONPB SendMailboxMessageRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "SendMailboxMessageRequest"
+      ( \obj ->
+          Hs.pure SendMailboxMessageRequest
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Events.Address)
+                      @(Hs.Maybe Effects.Events.Address)
+                  )
+                    (obj .: "recipient")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "content")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "summary")
+                )
+      )
+
+instance (HsJSONPB.ToJSON SendMailboxMessageRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON SendMailboxMessageRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data SendMailboxMessageResponse
+  = SendMailboxMessageResponse
+  { sendMailboxMessageResponseSuccess :: Hs.Bool,
+    sendMailboxMessageResponseDeliveryMethod :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData SendMailboxMessageResponse)
+
+instance (HsProtobuf.Named SendMailboxMessageResponse) where
+  nameOf _ = Hs.fromString "SendMailboxMessageResponse"
+
+instance (HsProtobuf.HasDefault SendMailboxMessageResponse)
+
+instance (HsProtobuf.Message SendMailboxMessageResponse) where
+  encodeMessage
+    _
+    SendMailboxMessageResponse
+      { sendMailboxMessageResponseSuccess,
+        sendMailboxMessageResponseDeliveryMethod
+      } =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            sendMailboxMessageResponseSuccess
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                sendMailboxMessageResponseDeliveryMethod
+            )
+        )
+  decodeMessage _ =
+    Hs.pure SendMailboxMessageResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "delivery_method")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB SendMailboxMessageResponse) where
+  toJSONPB (SendMailboxMessageResponse f1 f2) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "delivery_method"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+  toEncodingPB (SendMailboxMessageResponse f1 f2) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "delivery_method"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+
+instance (HsJSONPB.FromJSONPB SendMailboxMessageResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "SendMailboxMessageResponse"
+      ( \obj ->
+          Hs.pure SendMailboxMessageResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "delivery_method")
+                )
+      )
+
+instance (HsJSONPB.ToJSON SendMailboxMessageResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON SendMailboxMessageResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
 data NotifyParentRequest

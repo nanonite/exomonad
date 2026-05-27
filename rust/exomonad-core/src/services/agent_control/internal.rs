@@ -120,8 +120,76 @@ impl<
         env_vars.insert("EXOMONAD_AGENT_ID".to_string(), agent_name.to_string());
         env_vars.insert("EXOMONAD_SESSION_ID".to_string(), session_id.to_string());
         env_vars.insert("EXOMONAD_ROLE".to_string(), role.as_str().to_string());
+        env_vars.insert(
+            "EXOMONAD_SPAWN_AGENT_TYPE".to_string(),
+            self.spawn_agent_type.suffix().to_string(),
+        );
         if let Some(ref session) = self.tmux_session {
             env_vars.insert("EXOMONAD_TMUX_SESSION".to_string(), session.clone());
+        }
+        if let Ok(value) = std::env::var("EXOMONAD_MAILBOX_PROTOCOL_AVAILABLE") {
+            if !value.is_empty() {
+                env_vars.insert("EXOMONAD_MAILBOX_PROTOCOL_AVAILABLE".to_string(), value);
+            }
+        }
+
+        // CHAINLINK_DB anchors every spawned agent to the project-root chainlink DB so a
+        // dev-leaf inside its git worktree (which contains no `.chainlink/`) still resolves
+        // issues against the canonical tracker. The directory form is canonical (chainlink
+        // CLI accepts either, but the directory is the resource and `issues.db` is an
+        // artifact inside it). init.rs uses the same directory form when seeding the tmux
+        // session env as a fallback for processes that bypass this HashMap.
+        //
+        // Propagation contract: this HashMap flows into `build_agent_command` which renders
+        // entries as `KEY=value` shell-prefix tokens (see line ~343) ahead of the agent
+        // command. tmux executes that string, the agent process inherits the env, and every
+        // subsequent subprocess — MCP servers, hook scripts, direct `chainlink` calls —
+        // inherits it transitively. The same path covers windows (TLs, dev-leaves, sub-TLs)
+        // and panes (workers), so adding an entry here reaches all five agent runtimes
+        // (Claude, Codex, Gemini, OpenCode, worker) uniformly.
+        env_vars.insert(
+            "CHAINLINK_DB".to_string(),
+            self.ctx
+                .project_dir()
+                .join(".chainlink")
+                .display()
+                .to_string(),
+        );
+
+        // Propagate CODEX_HOME to every spawned codex pane. install_codex_hook_trust
+        // seeds [hooks.state] entries in `$CODEX_HOME/config.toml`; without this
+        // pass-through, spawned codex agents fall back to ~/.codex and see the hooks
+        // as untrusted, firing "3 hooks need review" (chainlink #259). The init.rs
+        // tmux set-environment for CODEX_HOME covers the root TL pane but does not
+        // reliably reach panes created later by spawn_leaf — this shell-prefix entry
+        // closes that gap explicitly on the production code path. Harmless for non-
+        // codex agents (they ignore an unfamiliar env var).
+        if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+            if !codex_home.is_empty() {
+                env_vars.insert("CODEX_HOME".to_string(), codex_home);
+            }
+        }
+
+        for var in [
+            "FORGEJO_HOST",
+            "GH_HOST",
+            "FORGEJO_TOKEN",
+            "GH_TOKEN",
+            "FORGEJO_REVIEWER_TOKEN",
+            "FORGEJO_URL",
+        ] {
+            if let Ok(value) = std::env::var(var) {
+                if !value.is_empty() {
+                    env_vars.insert(var.to_string(), value);
+                }
+            }
+        }
+
+        if role.as_str() == "reviewer" {
+            if let Some(reviewer_token) = env_vars.get("FORGEJO_REVIEWER_TOKEN").cloned() {
+                env_vars.insert("FORGEJO_TOKEN".to_string(), reviewer_token.clone());
+                env_vars.insert("GH_TOKEN".to_string(), reviewer_token);
+            }
         }
 
         // Propagate swarm run_id and parent agent identity for OTel resource attributes
@@ -146,6 +214,20 @@ impl<
             }
         }
 
+        // Route Claude CLI calls through OpenRouter when configured.
+        // ANTHROPIC_AUTH_TOKEN + empty ANTHROPIC_API_KEY tells Claude Code to use the token
+        // against ANTHROPIC_BASE_URL (OpenRouter's Anthropic-compatible endpoint).
+        if let Some(ref api_key) = self.openrouter_api_key {
+            env_vars.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://openrouter.ai/api".to_string(),
+            );
+            env_vars.insert("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.clone());
+            env_vars.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+            // OpenCode uses OPENROUTER_API_KEY directly
+            env_vars.insert("OPENROUTER_API_KEY".to_string(), api_key.clone());
+        }
+
         env_vars
     }
 
@@ -165,6 +247,27 @@ impl<
         Ok(())
     }
 
+    /// Copy a role context file with template interpolation.
+    ///
+    /// Replaces `{{spawn_agent_type}}` with the configured spawn agent type suffix.
+    /// Falls back to raw copy if the source is not valid UTF-8.
+    pub(crate) async fn copy_role_context_with_interpolation(
+        src: &std::path::Path,
+        dest: &std::path::Path,
+        spawn_type: &str,
+    ) -> std::io::Result<()> {
+        match tokio::fs::read_to_string(src).await {
+            Ok(content) => {
+                let interpolated = content.replace("{{spawn_agent_type}}", spawn_type);
+                tokio::fs::write(dest, interpolated).await
+            }
+            Err(_) => {
+                tokio::fs::copy(src, dest).await?;
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) async fn new_tmux_window(
         &self,
         name: &str,
@@ -173,7 +276,7 @@ impl<
         prompt: Option<&str>,
         env_vars: HashMap<String, String>,
     ) -> Result<super::tmux_ipc::WindowId> {
-        self.new_tmux_window_inner(name, cwd, agent_type, prompt, env_vars, None, None)
+        self.new_tmux_window_inner(name, cwd, agent_type, prompt, env_vars, None, None, None)
             .await
     }
 
@@ -192,6 +295,7 @@ impl<
         cwd: &Path,
         claude_flags: Option<&ClaudeSpawnFlags>,
         yolo: bool,
+        model: Option<&str>,
     ) -> String {
         let cmd = agent_type.command();
 
@@ -226,34 +330,76 @@ impl<
                     String::new()
                 }
             }
+            AgentType::Codex => String::new(),
+            AgentType::OpenCode => String::new(),
             AgentType::Shoal | AgentType::Process => String::new(),
         };
+
+        let model_flag = model
+            .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
+            .unwrap_or_default();
 
         let agent_command = match (prompt_file, fork_session_id) {
             (Some(pf), Some(session_id)) => {
                 let escaped_session = Self::escape_for_shell_command(session_id);
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
-                format!(
-                    "{}{} --resume {} --fork-session \"$(cat {})\"",
-                    cmd, perms_flags, escaped_session, escaped_path
-                )
+                match agent_type {
+                    AgentType::Codex => {
+                        Self::build_codex_command(cwd, Some(pf), model, Some(session_id))
+                    }
+                    AgentType::OpenCode => {
+                        format!(
+                            "{} run{} --session {} --fork \"$(cat {})\"{}",
+                            cmd, perms_flags, escaped_session, escaped_path, model_flag
+                        )
+                    }
+                    _ => {
+                        format!(
+                            "{}{}{} --resume {} --fork-session \"$(cat {})\"",
+                            cmd, perms_flags, model_flag, escaped_session, escaped_path
+                        )
+                    }
+                }
             }
             (Some(pf), None) => {
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
-                let flag = agent_type.prompt_flag();
-                if flag.is_empty() {
-                    format!("{}{} \"$(cat {})\"", cmd, perms_flags, escaped_path)
-                } else {
-                    format!(
-                        "{}{} {} \"$(cat {})\"",
-                        cmd, perms_flags, flag, escaped_path
-                    )
+                match agent_type {
+                    AgentType::Codex => Self::build_codex_command(cwd, Some(pf), model, None),
+                    AgentType::OpenCode => {
+                        format!(
+                            "{} run{} \"$(cat {})\"{}",
+                            cmd, perms_flags, escaped_path, model_flag
+                        )
+                    }
+                    _ => {
+                        let flag = agent_type.prompt_flag();
+                        if flag.is_empty() {
+                            format!(
+                                "{}{}{} \"$(cat {})\"",
+                                cmd, perms_flags, model_flag, escaped_path
+                            )
+                        } else {
+                            format!(
+                                "{}{}{} {} \"$(cat {})\"",
+                                cmd, perms_flags, model_flag, flag, escaped_path
+                            )
+                        }
+                    }
                 }
             }
-            _ => format!("{}{}", cmd, perms_flags),
+            _ => match agent_type {
+                AgentType::Codex => Self::build_codex_command(cwd, None, model, fork_session_id),
+                _ => format!("{}{}{}", cmd, perms_flags, model_flag),
+            },
         };
 
-        // Prepend env vars
+        // Shell-prefix every entry in env_vars (`KEY=value KEY2=value2 ...`) ahead of the
+        // agent command. This is the single propagation point that delivers everything
+        // common_spawn_env adds — EXOMONAD_*, CHAINLINK_DB, TRACEPARENT, model API keys — to
+        // the spawned agent process and every subprocess it forks. Both new_tmux_window_inner
+        // and new_tmux_pane (worker panes) call build_agent_command, so this covers all five
+        // agent runtimes uniformly. If a future agent type needs out-of-band propagation
+        // (e.g., a per-process config file), wire it next to this prefix, not instead of it.
         let env_prefix = env_vars
             .iter()
             .map(|(k, v)| format!("{}={}", k, shell_escape::escape(v.into())))
@@ -272,6 +418,41 @@ impl<
             format!("nix develop -c sh -c '{}'", escaped)
         } else {
             full_command
+        }
+    }
+
+    pub(crate) fn build_codex_command(
+        worktree_dir: &Path,
+        prompt_file: Option<&Path>,
+        model: Option<&str>,
+        fork_session_id: Option<&str>,
+    ) -> String {
+        let escaped_dir = Self::escape_for_shell_command(&worktree_dir.display().to_string());
+        let model_flag = model
+            .map(|model| format!(" --model {}", shell_escape::escape(model.into())))
+            .unwrap_or_default();
+
+        match fork_session_id {
+            Some(session_id) => format!(
+                "codex fork {} --dangerously-bypass-approvals-and-sandbox --cd {}{}",
+                Self::escape_for_shell_command(session_id),
+                escaped_dir,
+                model_flag
+            ),
+            None => {
+                let prompt = prompt_file
+                    .map(|path| {
+                        format!(
+                            " \"$(cat {})\"",
+                            Self::escape_for_shell_command(&path.display().to_string())
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
+                    escaped_dir, model_flag, prompt
+                )
+            }
         }
     }
 
@@ -309,6 +490,7 @@ impl<
         env_vars: HashMap<String, String>,
         fork_session_id: Option<&str>,
         claude_flags: Option<&ClaudeSpawnFlags>,
+        model_override: Option<&str>,
     ) -> Result<super::tmux_ipc::WindowId> {
         info!(name, cwd = %cwd.display(), agent_type = ?agent_type, fork = fork_session_id.is_some(), "Creating tmux window");
 
@@ -318,6 +500,7 @@ impl<
             None => None,
         };
 
+        let model = model_override.or_else(|| self.spawn_agent_model());
         let full_command = Self::build_agent_command(
             agent_type,
             prompt_file.as_deref(),
@@ -326,6 +509,7 @@ impl<
             cwd,
             claude_flags,
             self.yolo,
+            model,
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let tmux = self.tmux()?;
@@ -435,6 +619,7 @@ impl<
             cwd,
             claude_flags,
             self.yolo,
+            self.spawn_agent_model(),
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let tmux = self.tmux()?;
@@ -495,6 +680,7 @@ impl<
     /// Write MCP config for the agent directory.
     ///
     /// Claude agents get `.mcp.json`. Gemini agents get `.gemini/settings.json`.
+    /// Codex agents get `.codex/config.toml`; shared hooks live in Codex user config.
     /// Uses stdio transport via `exomonad mcp-stdio`.
     pub(crate) async fn write_agent_mcp_config(
         &self,
@@ -534,7 +720,70 @@ impl<
                 fs::write(exo_dir.join("mcp.json"), mcp_content).await?;
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote .exo/mcp.json for Shoal agent");
             }
+            AgentType::OpenCode => {
+                fs::write(agent_dir.join("opencode.json"), mcp_content).await?;
+                info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json for OpenCode agent");
+            }
+            AgentType::Codex => {
+                self.write_codex_config_files(
+                    agent_dir,
+                    role,
+                    &AgentName::try_from_str(agent_name)
+                        .expect("validated string input is non-empty"),
+                    self.spawn_agent_model(),
+                    &self.extra_mcp_servers,
+                )
+                .await?;
+            }
         }
+        Ok(())
+    }
+
+    pub(crate) async fn write_codex_config_files(
+        &self,
+        dir: &Path,
+        role: &crate::domain::Role,
+        agent_name: &AgentName,
+        model: Option<&str>,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        let codex_dir = dir.join(".codex");
+        fs::create_dir_all(&codex_dir).await?;
+
+        let instructions = match role.as_str() {
+            "tl" | "root" => super::spawn::CODEX_TL_INSTRUCTIONS,
+            "worker" => super::spawn::CODEX_WORKER_INSTRUCTIONS,
+            "reviewer" => super::spawn::CODEX_REVIEWER_INSTRUCTIONS,
+            _ => super::spawn::CODEX_DEV_INSTRUCTIONS,
+        };
+        let config = crate::codex_config::render_codex_config(
+            agent_name.as_str(),
+            role.as_str(),
+            instructions,
+            model,
+            extra_mcp_servers,
+            &crate::util::find_exomonad_binary(),
+        );
+        let codex_config_path = codex_dir.join("config.toml");
+        fs::write(&codex_config_path, config).await?;
+
+        if let Some(config_path) = crate::codex_config::codex_user_config_path() {
+            crate::codex_config::trust_codex_project(&config_path, dir).with_context(|| {
+                format!("Failed to trust Codex project in {}", config_path.display())
+            })?;
+            crate::codex_config::install_codex_hook_trust(&config_path, &codex_config_path)
+                .with_context(|| {
+                    format!("Failed to trust Codex hooks in {}", config_path.display())
+                })?;
+            info!(path = %config_path.display(), "Marked Codex agent worktree as trusted");
+        } else {
+            warn!("Could not determine Codex home; worktree may not be trusted automatically");
+        }
+        let legacy_hooks_path = codex_dir.join("hooks.json");
+        if legacy_hooks_path.exists() {
+            fs::remove_file(&legacy_hooks_path).await?;
+        }
+        info!(agent_dir = %dir.display(), role = %role.as_str(), "Wrote .codex/config.toml for Codex agent");
         Ok(())
     }
 
@@ -736,6 +985,23 @@ impl<
                 "args": ["mcp-stdio", "--role", role, "--name", name]
             }))
             .unwrap(),
+            AgentType::OpenCode => {
+                let mut config = serde_json::json!({
+                    "mcp": {
+                        "exomonad": {
+                            "type": "local",
+                            "command": ["exomonad", "mcp-stdio", "--role", role, "--name", name]
+                        }
+                    }
+                });
+                if let Some(mcp) = config["mcp"].as_object_mut() {
+                    for (k, v) in extra_mcp_servers {
+                        mcp.insert(k.clone(), v.clone());
+                    }
+                }
+                serde_json::to_string_pretty(&config).unwrap()
+            }
+            AgentType::Codex => String::new(),
             AgentType::Process => String::new(),
         }
     }
@@ -985,6 +1251,89 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn test_codex_reviewer_config_uses_reviewer_instructions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let codex_home = project_dir.join("codex-home");
+        std::env::set_var("CODEX_HOME", &codex_home);
+        let services = test_services(project_dir.clone());
+        let service = AgentControlService::new(services);
+        let agent_dir = project_dir.join("reviewer-agent");
+
+        service
+            .write_codex_config_files(
+                &agent_dir,
+                &crate::domain::Role::reviewer(),
+                &AgentName::try_from_str("reviewer-agent")
+                    .expect("literal validated string is non-empty"),
+                Some("gpt-5.2"),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let config = tokio::fs::read_to_string(agent_dir.join(".codex/config.toml"))
+            .await
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+        let instructions = parsed["developer_instructions"]
+            .as_str()
+            .expect("developer instructions are rendered");
+
+        assert!(instructions.contains("# ExoMonad Reviewer Agent Protocol"));
+        assert!(instructions.contains("approve_pr"));
+        assert!(instructions.contains("request_changes"));
+        assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
+        assert!(codex_home.join("config.toml").exists());
+        assert!(!agent_dir.join(".codex/hooks.json").exists());
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_codex_worker_config_uses_worker_instructions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let codex_home = project_dir.join("codex-home");
+        std::env::set_var("CODEX_HOME", &codex_home);
+        let services = test_services(project_dir.clone());
+        let service = AgentControlService::new(services);
+        let agent_dir = project_dir.join("worker-agent");
+
+        service
+            .write_codex_config_files(
+                &agent_dir,
+                &crate::domain::Role::worker(),
+                &AgentName::try_from_str("worker-agent")
+                    .expect("literal validated string is non-empty"),
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let config = tokio::fs::read_to_string(agent_dir.join(".codex/config.toml"))
+            .await
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+        let instructions = parsed["developer_instructions"]
+            .as_str()
+            .expect("developer instructions are rendered");
+
+        assert!(instructions.contains("# ExoMonad Worker Agent Protocol"));
+        assert!(instructions.contains("chainlink_session_work"));
+        assert!(instructions.contains("chainlink_session_end"));
+        assert!(!instructions.contains("chainlink_issue_close"));
+        assert!(!instructions.contains("chainlink_agent_init"));
+        assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
+        assert!(codex_home.join("config.toml").exists());
+        assert!(!agent_dir.join(".codex/hooks.json").exists());
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[tokio::test]
     async fn test_create_socket_symlink() {
         let temp_dir = tempfile::tempdir().unwrap();
         let project_dir = temp_dir.path().to_path_buf();
@@ -1011,11 +1360,15 @@ mod tests {
     #[test]
     fn test_common_spawn_env_core_vars() {
         let services = test_services(PathBuf::from("."));
-        let service =
-            AgentControlService::new(services).with_birth_branch(BirthBranch::from("main.tl-auth"));
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main.tl-auth")
+                .expect("literal validated string is non-empty"),
+        );
 
-        let agent = AgentName::from("fix-oauth-gemini");
-        let session_id = BranchName::from("main.tl-auth.fix-oauth-gemini");
+        let agent = AgentName::try_from_str("fix-oauth-gemini")
+            .expect("literal validated string is non-empty");
+        let session_id = BranchName::try_from_str("main.tl-auth.fix-oauth-gemini")
+            .expect("literal validated string is non-empty");
         let role = crate::domain::Role::dev();
 
         let env = service.common_spawn_env(&agent, &session_id, &role);
@@ -1037,11 +1390,15 @@ mod tests {
     fn test_common_spawn_env_tmux_session() {
         let services = test_services(PathBuf::from("."));
         let service = AgentControlService::new(services)
-            .with_birth_branch(BirthBranch::from("main"))
+            .with_birth_branch(
+                BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+            )
             .with_tmux_session("exo-test-session".to_string());
 
-        let agent = AgentName::from("worker-1");
-        let session_id = BranchName::from("main");
+        let agent =
+            AgentName::try_from_str("worker-1").expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("main").expect("literal validated string is non-empty");
         let role = crate::domain::Role::worker();
 
         let env = service.common_spawn_env(&agent, &session_id, &role);
@@ -1055,11 +1412,14 @@ mod tests {
     #[test]
     fn test_common_spawn_env_no_tmux_session() {
         let services = test_services(PathBuf::from("."));
-        let service =
-            AgentControlService::new(services).with_birth_branch(BirthBranch::from("main"));
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+        );
 
-        let agent = AgentName::from("worker-1");
-        let session_id = BranchName::from("main");
+        let agent =
+            AgentName::try_from_str("worker-1").expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("main").expect("literal validated string is non-empty");
         let role = crate::domain::Role::worker();
 
         let env = service.common_spawn_env(&agent, &session_id, &role);
@@ -1067,6 +1427,260 @@ mod tests {
         assert!(
             env.get("EXOMONAD_TMUX_SESSION").is_none(),
             "No tmux session should be set when not configured"
+        );
+    }
+
+    #[test]
+    fn test_common_spawn_env_chainlink_db_directory_form() {
+        let project_dir = PathBuf::from("/tmp/exo-test-project");
+        let services = test_services(project_dir.clone());
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+        );
+
+        let agent =
+            AgentName::try_from_str("leaf-1").expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("main.leaf-1").expect("literal validated string is non-empty");
+        let role = crate::domain::Role::dev();
+
+        let env = service.common_spawn_env(&agent, &session_id, &role);
+
+        let chainlink_db = env
+            .get("CHAINLINK_DB")
+            .expect("CHAINLINK_DB must be set so spawned agents resolve the canonical issues DB");
+
+        assert_eq!(
+            chainlink_db,
+            &project_dir.join(".chainlink").display().to_string(),
+            "CHAINLINK_DB must point at the project-root .chainlink directory"
+        );
+        assert!(
+            !chainlink_db.ends_with("/issues.db"),
+            "CHAINLINK_DB must use the directory form, not the file form — both are valid for the \
+             chainlink CLI but the directory is the canonical resource and the project's single \
+             source of truth across all spawn sites (init.rs uses the same form)"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_common_spawn_env_uses_reviewer_token_for_reviewer_role() {
+        let services = test_services(PathBuf::from("."));
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+        );
+        let agent = AgentName::try_from_str("review-pr-7-codex")
+            .expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("review-pr-7").expect("literal validated string is non-empty");
+
+        std::env::set_var("FORGEJO_TOKEN", "author-token");
+        std::env::set_var("GH_TOKEN", "author-token");
+        std::env::set_var("FORGEJO_REVIEWER_TOKEN", "reviewer-token");
+        let env = service.common_spawn_env(&agent, &session_id, &crate::domain::Role::reviewer());
+        std::env::remove_var("FORGEJO_TOKEN");
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("FORGEJO_REVIEWER_TOKEN");
+
+        assert_eq!(
+            env.get("FORGEJO_TOKEN").map(String::as_str),
+            Some("reviewer-token")
+        );
+        assert_eq!(
+            env.get("GH_TOKEN").map(String::as_str),
+            Some("reviewer-token")
+        );
+        assert_eq!(
+            env.get("FORGEJO_REVIEWER_TOKEN").map(String::as_str),
+            Some("reviewer-token")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_common_spawn_env_codex_home_propagated() {
+        // Sibling to the CHAINLINK_DB test — confirms CODEX_HOME flows through the
+        // shell-prefix env path so spawned codex agents see install_codex_hook_trust's
+        // seeded [hooks.state] entries instead of falling back to ~/.codex.
+        // #[serial] required because this test mutates CODEX_HOME, which other env-mutating
+        // tests in this module also touch (test_codex_*_config_uses_*_instructions).
+        let project_dir = PathBuf::from("/tmp/exo-test-project");
+        let services = test_services(project_dir.clone());
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+        );
+
+        let agent =
+            AgentName::try_from_str("leaf-1").expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("main.leaf-1").expect("literal validated string is non-empty");
+        let role = crate::domain::Role::dev();
+
+        std::env::set_var("CODEX_HOME", "/tmp/exo-test-codex-home");
+        let env_set = service.common_spawn_env(&agent, &session_id, &role);
+        std::env::remove_var("CODEX_HOME");
+        let env_unset = service.common_spawn_env(&agent, &session_id, &role);
+
+        assert_eq!(
+            env_set.get("CODEX_HOME").map(String::as_str),
+            Some("/tmp/exo-test-codex-home"),
+            "CODEX_HOME must be propagated into the spawn env so spawned codex panes \
+             see the same hook-trust DB that install_codex_hook_trust seeded \
+             (chainlink #259)"
+        );
+        assert!(
+            env_unset.get("CODEX_HOME").is_none(),
+            "CODEX_HOME must NOT be present in the spawn env when unset in the parent \
+             process — propagation is opt-in, not synthetic"
+        );
+    }
+
+    // =========================================================================
+    // build_agent_command — OpenCode tests
+    // =========================================================================
+
+    fn empty_env() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_no_prompt() {
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            None,
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(cmd, "opencode");
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_with_prompt_no_model() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            Some(prompt),
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(cmd, "opencode run \"$(cat '/tmp/test-prompt.txt')\"");
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_with_prompt_and_model() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            Some(prompt),
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            Some("anthropic/claude-sonnet-4-5"),
+        );
+        assert_eq!(
+            cmd,
+            "opencode run \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_fork_session_with_model() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            Some(prompt),
+            Some("main.feature-a-opencode"),
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            Some("anthropic/claude-haiku-4-5"),
+        );
+        assert_eq!(
+            cmd,
+            "opencode run --session 'main.feature-a-opencode' --fork \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-haiku-4-5"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_model_shell_escaping() {
+        let cmd = ACS::build_agent_command(
+            AgentType::OpenCode,
+            None,
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            Some("anthropic/claude's-model"),
+        );
+        // Single quote in model name must be shell-escaped
+        assert_eq!(cmd, "opencode --model 'anthropic/claude'\\''s-model'");
+    }
+
+    #[test]
+    fn test_build_codex_command_fresh_with_prompt_and_model() {
+        let cmd = ACS::build_codex_command(
+            Path::new("/tmp/worktree"),
+            Some(Path::new("/tmp/test-prompt.txt")),
+            Some("gpt-5.2"),
+            None,
+        );
+
+        assert_eq!(
+            cmd,
+            "codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' --model gpt-5.2 \"$(cat '/tmp/test-prompt.txt')\""
+        );
+    }
+
+    #[test]
+    fn test_build_codex_command_fork_with_model() {
+        let cmd = ACS::build_codex_command(
+            Path::new("/tmp/worktree"),
+            Some(Path::new("/tmp/test-prompt.txt")),
+            Some("gpt-5.2"),
+            Some("session-123"),
+        );
+
+        assert_eq!(
+            cmd,
+            "codex fork 'session-123' --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' --model gpt-5.2"
+        );
+    }
+
+    #[test]
+    fn test_build_agent_command_codex_includes_env_prefix() {
+        let mut env = HashMap::new();
+        env.insert(
+            "EXOMONAD_AGENT_ID".to_string(),
+            "worker-1-codex".to_string(),
+        );
+
+        let cmd = ACS::build_agent_command(
+            AgentType::Codex,
+            Some(Path::new("/tmp/test-prompt.txt")),
+            None,
+            &env,
+            Path::new("/tmp/worktree"),
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(
+            cmd,
+            "EXOMONAD_AGENT_ID=worker-1-codex codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' \"$(cat '/tmp/test-prompt.txt')\""
         );
     }
 }

@@ -276,7 +276,7 @@ data PRReviewEvent
   = ReviewReceived  { prNumber :: Int, comments :: Text }
   | ReviewApproved  { prNumber :: Int }
   | ReviewTimeout   { prNumber :: Int, minutesElapsed :: Int }
-  | FixesPushed     { prNumber :: Int, fpCiStatus :: Text }
+  | FixesPushed     { prNumber :: Int, fpCiStatus :: Text, fpHeadSha :: Text }
   | CommitsPushed   { prNumber :: Int, cpCiStatus :: Text }
 
 data CIStatusEvent = CIStatusEvent

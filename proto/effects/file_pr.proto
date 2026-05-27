@@ -1,7 +1,7 @@
 syntax = "proto3";
 package exomonad.effects.file_pr;
 
-// File PR effects for creating/updating GitHub pull requests.
+// File PR effects for creating/updating pull requests.
 
 // ============================================================================
 // FilePR - Create or find existing PR for current branch
@@ -30,9 +30,57 @@ message FilePrResponse {
 }
 
 // ============================================================================
+// LocalPR - Compatibility lookups for the PR associated with a branch
+// ============================================================================
+
+message LocalPrGetRequest {
+  // PR number to look up.
+  int64 pr_number = 1;
+}
+
+message LocalPrGetForBranchRequest {
+  // Head branch to look up.
+  string branch = 1;
+}
+
+message LocalPrResponse {
+  // True when the local registry contains a matching PR.
+  bool found = 1;
+  int64 pr_number = 2;
+  string head_branch = 3;
+  string base_branch = 4;
+  string author_agent = 5;
+  string review_state = 6;
+  string last_head_sha = 7;
+  string reviewer_agent = 8;
+}
+
+
+// ============================================================================
+// SubmitReview - Submit a Forgejo PR review
+// ============================================================================
+
+message SubmitReviewRequest {
+  // PR number to review.
+  int64 pr_number = 1;
+  // Forgejo review event: APPROVED, REQUEST_CHANGES, or COMMENT.
+  string event = 2;
+  // Review body text.
+  string body = 3;
+}
+
+message SubmitReviewResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// ============================================================================
 // Service definition
 // ============================================================================
 
 service FilePrEffects {
   rpc FilePr(FilePrRequest) returns (FilePrResponse);
+  rpc LocalPrGet(LocalPrGetRequest) returns (LocalPrResponse);
+  rpc LocalPrGetForBranch(LocalPrGetForBranchRequest) returns (LocalPrResponse);
+  rpc SubmitReview(SubmitReviewRequest) returns (SubmitReviewResponse);
 }

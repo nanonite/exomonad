@@ -1,0 +1,16 @@
+[profile.default]
+failure-output = "immediate"
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[profile.default.junit]
+path = "target/nextest/default/junit.xml"
+
+[[profile.default.overrides]]
+filter = "test(wasm_integration)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = 1
+
+[[profile.default.overrides]]
+filter = "test(live_teams_e2e)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+retries = 1

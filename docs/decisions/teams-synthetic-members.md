@@ -98,7 +98,7 @@ Gemini→Claude:
 
 4. **claude-teams-bridge** (`claude-teams-bridge/src/inbox.rs`) — Writes to Claude Code's Teams inbox format (JSON array, atomic temp+rename)
 
-5. **spawn_worker/spawn_gemini** — After spawning a Gemini agent, registers it as a synthetic member in the parent's team
+5. **spawn_worker/spawn_leaf** — After spawning a Gemini agent, registers it as a synthetic member in the parent's team
 
 ### What changes where
 

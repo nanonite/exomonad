@@ -14,10 +14,11 @@ PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 echo ">>> [Phase 0] Checking preconditions..."
 
 EXOMONAD_BIN=""
-if command -v exomonad &>/dev/null; then
-    EXOMONAD_BIN="$(command -v exomonad)"
-elif [[ -x "$PROJECT_ROOT/target/debug/exomonad" ]]; then
+if [[ -x "$PROJECT_ROOT/target/debug/exomonad" ]]; then
     EXOMONAD_BIN="$PROJECT_ROOT/target/debug/exomonad"
+    export PATH="$PROJECT_ROOT/target/debug:$PATH"
+elif command -v exomonad &>/dev/null; then
+    EXOMONAD_BIN="$(command -v exomonad)"
 else
     echo "ERROR: exomonad binary not found. Run 'just install-all-dev' or 'cargo build -p exomonad'."
     exit 1
@@ -42,7 +43,8 @@ echo "  tmux, git: OK"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-WORK_DIR="$(mktemp -d /tmp/exomonad-e2e-msg.XXXXXXXX)"
+mkdir -p "$HOME/.cache/exomonad-e2e"
+WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/msg.XXXXXXXX")"
 echo "  Work dir: $WORK_DIR"
 
 cleanup() {
@@ -135,9 +137,9 @@ echo "  Remote: $REMOTE_DIR"
 echo ">>> [Phase 2] Configuring environment..."
 
 # Messaging test doesn't need mock GitHub, but set token to avoid auth errors
-export GITHUB_TOKEN="test-token-e2e"
+export FORGEJO_TOKEN="test-token-e2e"
 
-echo "  GITHUB_TOKEN=test-token-e2e"
+echo "  FORGEJO_TOKEN=test-token-e2e"
 
 # --- Phase 3: Run exomonad init ---
 

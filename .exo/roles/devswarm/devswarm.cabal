@@ -48,12 +48,16 @@ executable wasm-guest-devswarm
         TLRole
         DevRole
         WorkerRole
+        ReviewerRole
         TestrunnerRole
         DevPhase
+        ReviewerPhase
         TLPhase
         TLStopCheck
+        WorkerStopCheck
         WorkerPhase
         HttpDevHooks
+        HookPolicy
         PRReviewHandler
     ghc-options: -no-hs-main -optl-mexec-model=reactor -optl-Wl,--export=hs_init -optl-Wl,--export=handle_mcp_call -optl-Wl,--export=handle_pre_tool_use -optl-Wl,--export=handle_list_tools -optl-Wl,--export=handle_event -optl-Wl,--export=resume -optl-Wl,--allow-undefined
     build-depends:
@@ -61,4 +65,35 @@ executable wasm-guest-devswarm
         wasm-guest:wasm-guest-internal,
         exomonad-pdk,
         exomonad-proto,
-        proto3-runtime
+        proto3-runtime,
+        vector
+
+test-suite role-hook-tests
+    import: shared
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test . ../../lib
+    main-is: Main.hs
+    other-modules:
+        AllRoles
+        RootRole
+        TLRole
+        DevRole
+        WorkerRole
+        ReviewerRole
+        TestrunnerRole
+        DevPhase
+        ReviewerPhase
+        TLPhase
+        TLStopCheck
+        WorkerStopCheck
+        WorkerPhase
+        HttpDevHooks
+        HookPolicy
+        PRReviewHandler
+    build-depends:
+        base,
+        wasm-guest:wasm-guest-internal,
+        exomonad-pdk,
+        exomonad-proto,
+        proto3-runtime,
+        vector

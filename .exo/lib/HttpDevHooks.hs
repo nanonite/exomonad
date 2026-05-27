@@ -25,10 +25,11 @@ import ExoMonad.Effects.Log (LogEmitEvent, LogInfo)
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch, checkUncommittedWork, checkPRNotFiled)
 import ExoMonad.Guest.StateMachine (StopCheckResult(..), checkExit, describeStopResult)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
-import ExoMonad.Guest.Types (HookInput (..), HookOutput (..), Runtime (..), StopDecision(..), StopHookOutput(..), BeforeModelOutput (..), AfterModelOutput (..), allowResponse, denyResponse, postToolUseResponse, allowStopResponse, blockStopResponse)
+import ExoMonad.Guest.Types (HookInput (..), HookOutput (..), Runtime (..), StopDecision(..), StopHookOutput(..), BeforeModelOutput (..), AfterModelOutput (..), allowResponse, denyResponse, postToolUseResponse, allowStopResponse, silentBlockStopResponse)
 import ExoMonad.Permissions (PermissionCheck (..), checkAgentPermissions)
 import ExoMonad.Types (HookConfig (..), Effects, defaultSessionStartHook)
 import DevPhase (DevPhase(..), DevEvent)
+import HookPolicy (preToolUseWithGhBlock)
 
 -- ============================================================================
 -- Gemini Tool Types
@@ -69,6 +70,25 @@ checkPragmaCorruption (Replace fp old new)
         <> "Re-do this edit preserving all `{-# LANGUAGE ... #-}` pragma syntax exactly."
 checkPragmaCorruption _ = Nothing
 
+-- ============================================================================
+-- Chainlink Guards
+-- ============================================================================
+
+-- | Block direct sqlite access to Chainlink state from dev agents.
+-- Dev agents should use the scoped Chainlink MCP tools exposed by DevRole.
+checkChainlinkSqlAccess :: HookInput -> Maybe Text
+checkChainlinkSqlAccess hookInput =
+  case hiToolInput hookInput of
+    Just (Object obj)
+      | Just (String cmd) <- KM.lookup "command" obj,
+        let normalized = T.toCaseFold cmd,
+        "sqlite3" `T.isInfixOf` normalized,
+        ".chainlink" `T.isInfixOf` normalized ->
+            Just $
+              "BLOCKED: Do not access .chainlink/issues.db directly via sqlite3. "
+                <> "Use the scoped chainlink MCP tools such as chainlink_issue_show and chainlink_issue_comment instead."
+    _ -> Nothing
+
 -- | Apply a check only when the agent is Gemini.
 geminiOnly :: (GeminiTool -> Maybe Text) -> HookInput -> GeminiTool -> Maybe Text
 geminiOnly check hookInput tool =
@@ -83,7 +103,7 @@ geminiOnly check hookInput tool =
 httpDevHooks :: HookConfig
 httpDevHooks =
   HookConfig
-    { preToolUse = permissionCascade,
+    { preToolUse = preToolUseWithGhBlock permissionCascade,
       postToolUse = \_ -> pure (postToolUseResponse Nothing),
       onStop = \_ -> devStopCheck,
       onSubagentStop = \_ -> devStopCheck,
@@ -106,7 +126,7 @@ devStopCheck = do
           Log.emitEventRequestTimestamp = 0
         })
       case result of
-        MustBlock msg -> pure $ blockStopResponse msg
+        MustBlock _ -> pure silentBlockStopResponse
         ShouldNudge msg -> pure $ StopHookOutput Allow (Just msg)
         Clean -> do
           uncommitted <- checkUncommittedWork branch
@@ -133,7 +153,10 @@ permissionCascade hookInput = do
   case geminiOnly checkPragmaCorruption hookInput geminiTool of
     Just reason -> pure (denyResponse reason)
     Nothing ->
-      case checkAgentPermissions "dev" tool args of
-        Allowed -> pure (allowResponse Nothing)
-        Escalate -> pure (allowResponse (Just "escalation-needed"))
-        Denied reason -> pure (denyResponse reason)
+      case checkChainlinkSqlAccess hookInput of
+        Just reason -> pure (denyResponse reason)
+        Nothing ->
+          case checkAgentPermissions "dev" tool args of
+            Allowed -> pure (allowResponse Nothing)
+            Escalate -> pure (allowResponse (Just "escalation-needed"))
+            Denied reason -> pure (denyResponse reason)

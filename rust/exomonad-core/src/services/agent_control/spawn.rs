@@ -1,7 +1,335 @@
 use super::*;
 
+fn parse_git_status_paths(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let path = line.get(3..)?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(
+                path.rsplit_once(" -> ")
+                    .map(|(_, target)| target)
+                    .unwrap_or(path)
+                    .trim_matches('"')
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn dirty_spawn_error(files: &[String]) -> anyhow::Error {
+    let mut message = format!(
+        "BLOCKED: cannot spawn agent into a dirty TL worktree. {} file(s) have uncommitted changes:",
+        files.len()
+    );
+    for file in files {
+        message.push_str("\n  ");
+        message.push_str(file);
+    }
+    message.push_str("\nCommit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` if throwaway, then retry. Workers spawn in-place and would inherit this state; dev-leaves fork from your branch HEAD and would not see your uncommitted work.");
+    anyhow!(message)
+}
+
+async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree)
+        .output()
+        .await
+        .with_context(|| format!("failed to inspect git status in {}", worktree.display()))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to inspect git status in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let files = parse_git_status_paths(&String::from_utf8_lossy(&output.stdout));
+    if files.is_empty() {
+        Ok(())
+    } else {
+        Err(dirty_spawn_error(&files))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveWorker {
+    name: String,
+    age: String,
+}
+
+fn format_worker_age(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / (60 * 60))
+    }
+}
+
+fn active_worker_error(worker: &ActiveWorker) -> anyhow::Error {
+    anyhow!(
+        "BLOCKED: workers are sequential per CLAUDE.md and docs/decisions/agent-lifecycle-invariants.md. Active worker in this TL worktree: `{}` (spawned {} ago).\n\nOptions:\n1. Wait for the active worker's handoff before spawning the next.\n2. Use `spawn_leaf` for parallel work that warrants its own PR — dev-leaves have their own worktrees and don't share state.\n\nPer-worker attribution to allow parallel workers in one worktree is explicitly out of scope (see ADR § Out of Scope).",
+        worker.name,
+        worker.age
+    )
+}
+
+macro_rules! exomonad_tl_instructions {
+    ($runtime_notes:literal) => {
+        concat!(
+            "\
+# ExoMonad Root TL Protocol
+
+You are the root TL of an ExoMonad agent tree. You are running inside a supported coding harness and have access to the `exomonad` MCP server.
+
+## Your Job
+Decompose the request into independent tasks. Spawn implementation workers via spawn_leaf. \
+Idle until notifications arrive. Merge results.
+
+## Spawn Tool Selection
+- spawn_leaf: Use this for implementation tasks. Each worker gets its own worktree+branch, \
+implements the spec, files a PR, and calls notify_parent when done. This is the primary tool.
+- fork_wave: Use this only for sub-TLs that need to further decompose and spawn children.
+- spawn_worker: Ephemeral pane (no branch, no PR). Research or quick in-place edits only.
+
+## Other MCP Tools
+- file_pr: Create/update PR for your own branch.
+- merge_pr: Merge a child worker's PR after notification.
+- notify_parent: Send message to your parent agent.
+- send_tmux_message: Send a message by injecting it into a spawned agent tmux pane.
+- send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
+
+## Workflow: Plan → Spawn → Idle → Merge
+1. PLAN: Research until decomposition is clear.
+2. SPAWN: Call spawn_leaf for each independent implementation task. Do NOT set agent_type.
+3. IDLE: Stop immediately after spawning. Do NOT poll or check status.
+4. MERGE: On [PR READY] or [REVIEW TIMEOUT] with green CI → call merge_pr.
+
+## Convergence Signals
+- [PR READY] — worker PR approved. Call merge_pr.
+- [FIXES PUSHED] — worker pushed fixes. Merge if CI passes.
+- [REVIEW TIMEOUT] — no review after timeout. Merge if CI passes.
+- [FAILED: id] — worker failed. Re-spec or escalate.
+- [from: id] — informational. Read, do not merge.
+
+## Worker Verification
+Workers are managed by ExoMonad in tmux windows or panes. Use tmux inspection commands when you need to confirm that a spawned worker exists.
+
+## Key Rules
+- Never implement directly. Decompose and delegate everything.
+- Never checkout another branch or touch another agent's worktree.
+- After spawning, STOP. Wait for notifications.
+- Git operations (status, commit, push) use the harness shell. Never use `gh pr create`; file_pr MCP is the PR tool.
+",
+            $runtime_notes
+        )
+    };
+}
+
+pub const OPENCODE_TL_INSTRUCTIONS: &str = exomonad_tl_instructions!(
+    "\n## OpenCode Runtime Notes
+- ExoMonad manages OpenCode TLs in tmux and routes messages through OpenCode's supported delivery paths, not Claude Code Teams inboxes.
+- OpenCode hooks are installed through the ExoMonad TypeScript plugin bridge and should behave like the same PreToolUse/PostToolUse/Stop policy layer used by other runtimes.
+"
+);
+
+pub const CODEX_TL_INSTRUCTIONS: &str = exomonad_tl_instructions!(
+    "\n## Codex Runtime Notes
+- ExoMonad manages Codex TLs in tmux and routes messages through Codex's supported delivery paths, not Claude Code Teams inboxes.
+- Codex hooks are shell-native and configured in `.codex/hooks.json` for PreToolUse, PostToolUse, and Stop. SessionStart is Claude-specific and is not part of the Codex hook set.
+- If you manually restart Codex from the TL shell, restart with `codex --dangerously-bypass-approvals-and-sandbox --cd <project-root>` so ExoMonad hooks do not enter Codex's hook review queue.
+- Context inheritance for Codex children uses `codex fork <session_id>`, not ClaudeSessionRegistry.
+"
+);
+
+pub const OPENCODE_DEV_INSTRUCTIONS: &str = "\
+# ExoMonad Dev Agent Protocol
+
+You are a dev agent in an ExoMonad agent tree. You work in your own git worktree on your own branch.
+
+## Your Job
+Implement the spec in your task. File a PR when done. Call notify_parent to report completion or failure.
+
+## MCP Tools Available
+- file_pr: Create/update a PR for your branch. Call this when your implementation is ready.
+- notify_parent: Send a message to your parent TL. Use status 'success' when done, 'failure' if stuck.
+- send_tmux_message: Send a message by injecting it into another agent tmux pane.
+- send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
+
+## Workflow
+1. Read the spec carefully. Re-read any files mentioned before editing.
+2. Implement the changes on your branch.
+3. Build and verify (exact commands in your spec).
+4. Call file_pr to create the PR.
+5. Call notify_parent with status='success' and a summary of what you did.
+
+## Key Rules
+- Work only in your worktree. Never checkout another branch.
+- Never call fork_wave or spawn_leaf — you are a leaf, not a TL.
+- Git operations (status, commit, push) use bash. EXCEPTION: file_pr is the MCP tool for PRs — never use `gh pr create`.
+- If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
+";
+
+pub const CODEX_DEV_INSTRUCTIONS: &str = "\
+# ExoMonad Dev Agent Protocol
+
+You are a Codex dev agent in an ExoMonad agent tree. You work in your own git worktree on your own branch.
+
+## Your Job
+Implement the spec in your task. File a PR when done. Call notify_parent to report completion or failure.
+
+## MCP Tools Available
+- file_pr: Create/update a PR for your branch. Call this when your implementation is ready.
+- notify_parent: Send a message to your parent TL. Use status 'success' when done, 'failure' if stuck.
+- send_tmux_message: Send a message by injecting it into another agent tmux pane.
+- send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
+
+## Workflow
+1. Read the spec carefully. Re-read any files mentioned before editing.
+2. Implement the changes on your branch.
+3. Build and verify using the exact commands in your spec.
+4. Call file_pr to create the PR.
+5. Call notify_parent with status='success' and a summary of what you did.
+
+## Key Rules
+- Work only in your worktree. Never checkout another branch.
+- Never call fork_wave or spawn_leaf; you are a leaf, not a TL.
+- Git operations use shell commands. Use file_pr for PR creation.
+- If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
+";
+
+pub const CODEX_WORKER_INSTRUCTIONS: &str = "\
+# ExoMonad Worker Agent Protocol
+
+You are a Codex worker in an ExoMonad agent tree. You run in a shared workspace pane and do not have your own branch.
+
+## Your Job
+Complete the narrow task assigned by your parent TL. Report completion through the provided MCP tools.
+
+## MCP Tools Available
+- chainlink_session_start: Start the Chainlink session before marking work active.
+- chainlink_session_work: Mark the assigned Chainlink issue as the active work item.
+- chainlink_issue_comment: Post progress on the assigned Chainlink issue.
+- chainlink_session_end: End the Chainlink session with handoff notes.
+- notify_parent: Send a direct message to your parent TL when needed.
+- send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
+- send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
+
+## Workflow
+1. Read the prompt carefully and use the issue ID provided by the TL.
+2. Call chainlink_session_start.
+3. Call chainlink_session_work before doing the requested work.
+4. Call chainlink_issue_comment for the required progress marker.
+5. Call chainlink_session_end with concise handoff notes when done.
+6. Call notify_parent with status='success' and include the issue ID.
+
+## Key Rules
+- Never spawn agents; workers are leaf executors.
+- Never create Chainlink issues; only the parent TL creates issues.
+- Never initialize Chainlink agent identity; ExoMonad branch/session identity is authoritative.
+- Never close Chainlink issues; your parent coordinator reviews the handoff and closes.
+- Never create branches, commits, or PRs unless explicitly instructed.
+";
+
+fn append_reviewer_metadata(
+    body: &str,
+    reviewer_agent: &str,
+    reviewer_birth_branch: &str,
+) -> String {
+    let mut lines: Vec<&str> = body
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("Reviewer-Agent:")
+                && !trimmed.starts_with("Reviewer-Birth-Branch:")
+        })
+        .collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    format!(
+        "{}
+Reviewer-Agent: {}
+Reviewer-Birth-Branch: {}",
+        lines.join(
+            "
+"
+        ),
+        reviewer_agent,
+        reviewer_birth_branch
+    )
+}
+
+pub const CODEX_REVIEWER_INSTRUCTIONS: &str = "\
+# ExoMonad Reviewer Agent Protocol
+
+You are a Codex reviewer agent in an ExoMonad agent tree. You review a sibling agent's PR from your own reviewer worktree.
+
+## Your Job
+Review the PR assigned in your task prompt. Approve correct changes or request specific fixes. Do not implement the fix yourself.
+
+## MCP Tools Available
+- approve_pr: Submit an approved Forgejo PR review.
+- request_changes: Submit a request-changes Forgejo PR review.
+- post_review_comment: Submit a comment-only Forgejo PR review.
+
+## Workflow
+1. Read the task prompt for the PR number, PR branch, base branch, and author.
+2. Run `git diff {base_branch}..HEAD` using the base branch from the prompt.
+3. Review for correctness, edge cases, security issues, missing tests, and broken contracts.
+4. If issues are found, call request_changes with specific, actionable feedback that references files and functions or lines.
+5. If the code is correct, call approve_pr with a concise approving comment.
+6. Call notify_parent with status='success' after submitting the review, then stop. The ExoMonad watcher reads Forgejo reviews and routes the review result.
+
+## Key Rules
+- Never modify code; reviewers only review.
+- Never merge a PR; only the TL merges.
+- Never spawn agents; reviewer is a leaf role.
+- Never review your own PR. If the PR author is you, report failure with notify_parent.
+- Do not use `codex exec review`; it emits Codex-native review text and does not write ExoMonad review files.
+- Prefer 3-5 high-impact comments over exhaustive style feedback.
+";
+
+/// Render the reviewer's `Read first:` context section for the spawn task prompt.
+///
+/// Relative paths in `reviewer_context` are resolved against `project_dir` so they
+/// remain readable from the reviewer's detached worktree (where cwd is the worktree,
+/// not the project root, and the context files live outside the worktree's tracked
+/// tree). Absolute paths pass through unchanged. Empty `reviewer_context` returns
+/// "" — no "Read first:" header emitted in that case (production default).
+pub(crate) fn render_reviewer_context_section(
+    reviewer_context: &[String],
+    project_dir: &std::path::Path,
+) -> String {
+    if reviewer_context.is_empty() {
+        return String::new();
+    }
+    let lines = reviewer_context
+        .iter()
+        .map(|p| {
+            let path = std::path::Path::new(p);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                project_dir.join(path)
+            };
+            format!("- {}", resolved.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n\nRead first:\n{lines}")
+}
+
 impl<
         C: super::super::HasGitHubClient
+            + super::super::HasForgejoClient
             + super::super::HasAcpRegistry
             + super::super::HasTeamRegistry
             + super::super::HasAgentResolver
@@ -34,15 +362,15 @@ impl<
             // Resolve effective project dir.
             let effective_project_dir = self.effective_project_dir(options.subrepo.as_deref())?;
 
-            // Get GitHub client
+            // Get hosted issue client
             let github_client = self
                 .github()
-                .ok_or_else(|| anyhow!("GitHub service not available (GITHUB_TOKEN not set)"))?;
+                .ok_or_else(|| anyhow!("hosted issue service not available"))?;
             let github = GitHubService::new(github_client.clone());
 
-            // Fetch issue from GitHub
+            // Fetch issue from hosted service
             let issue_id = issue_number.as_u64().to_string();
-            info!(issue_id, "Fetching issue from GitHub");
+            info!(issue_id, "Fetching issue from hosted service");
             let repo = Repo {
                 owner: options.owner.clone(),
                 name: options.repo.clone(),
@@ -63,18 +391,18 @@ impl<
                 .map(|b| b.as_str().to_string())
                 .unwrap_or(default_base);
             let agent_suffix = options.agent_type.suffix();
-            let branch_name = BranchName::from(
-                if self.birth_branch.depth() == 0 {
-                    format!("gh-{}/{}-{}", issue_id, slug, agent_suffix)
-                } else {
-                    format!("{}/{}-{}", base, slug, agent_suffix)
-                }
-                .as_str(),
-            );
+            let branch_name_raw = if self.birth_branch.depth() == 0 {
+                format!("gh-{}/{}-{}", issue_id, slug, agent_suffix)
+            } else {
+                format!("{}/{}-{}", base, slug, agent_suffix)
+            };
+            let branch_name = BranchName::try_from_str(&branch_name_raw)
+                .context("generated spawn branch name was empty")?;
 
             // Create worktree
             let worktree_path = self.worktree_base.join(agent_name.as_str());
-            let base_branch = BranchName::from(base.as_str());
+            let base_branch = BranchName::try_from_str(base.as_str())
+                .expect("validated string input is non-empty");
 
             self.create_worktree_checked(&worktree_path, &branch_name, &base_branch)
                 .await?;
@@ -87,6 +415,8 @@ impl<
                 AgentType::Claude => crate::domain::Role::tl(),
                 AgentType::Gemini => crate::domain::Role::dev(),
                 AgentType::Shoal => crate::domain::Role::shoal(),
+                AgentType::OpenCode => crate::domain::Role::dev(),
+                AgentType::Codex => crate::domain::Role::dev(),
                 AgentType::Process => unreachable!("Process agents are not spawned via effects"),
             };
             self.write_agent_mcp_config(
@@ -120,7 +450,8 @@ impl<
             let display_name = options.agent_type.display_name(&issue_id, &slug);
 
             let parent_bb = self.effective_birth_branch(Some(caller_bb));
-            let session_branch = BranchName::from(parent_bb.as_str());
+            let session_branch = BranchName::try_from_str(parent_bb.as_str())
+                .expect("validated string input is non-empty");
             let env_vars = self.common_spawn_env(&agent_name, &session_branch, &role);
 
             // Open tmux window with cwd = worktree_path
@@ -139,9 +470,11 @@ impl<
             let effective_birth = self.effective_birth_branch(Some(caller_bb));
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
                 agent_type: options.agent_type,
-                birth_branch: BirthBranch::from(branch_name.as_str()),
+                birth_branch: BirthBranch::try_from_str(branch_name.as_str())
+                    .expect("validated string input is non-empty"),
                 parent_branch: effective_birth,
                 working_dir: agent_dir.clone(),
                 display_name: display_name.clone(),
@@ -157,6 +490,7 @@ impl<
                 agent_name,
                 issue_title: issue.title,
                 agent_type: options.agent_type,
+                pane_id: None,
             })
         })
         .await
@@ -246,12 +580,13 @@ impl<
                     agent_name,
                     issue_title: options.name.to_string(),
                     agent_type: options.agent_type,
+                    pane_id: None,
                 });
             }
 
             // Determine base branch
             let base_branch = if let Some(ref b) = options.base_branch {
-                BranchName::from(b.as_str())
+                BranchName::try_from_str(b.as_str()).expect("validated string input is non-empty")
             } else {
                 // Default to current branch
                 let current_branch_output = Command::new("git")
@@ -263,13 +598,16 @@ impl<
                 let branch_str = String::from_utf8_lossy(&current_branch_output.stdout)
                     .trim()
                     .to_string();
-                BranchName::from(branch_str.as_str())
+                BranchName::try_from_str(branch_str.as_str())
+                    .expect("validated string input is non-empty")
             };
 
             // Use '.' separator to avoid directory/file conflicts in git refs
             // and avoid ambiguity with '-' word separators in slugs.
             // Branch includes type suffix so rsplit_once('.') yields the AgentName directly.
-            let branch_name = BranchName::from(format!("{}.{}", base_branch, agent_name).as_str());
+            let branch_name =
+                BranchName::try_from_str(format!("{}.{}", base_branch, agent_name).as_str())
+                    .expect("validated string input is non-empty");
             let worktree_path = self.worktree_base.join(agent_name.as_str());
 
             self.create_worktree_checked(&worktree_path, &branch_name, &base_branch)
@@ -313,7 +651,8 @@ impl<
             let child_birth = effective_birth.child(agent_name.as_str());
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
                 agent_type: options.agent_type,
                 birth_branch: child_birth,
                 parent_branch: effective_birth,
@@ -331,6 +670,7 @@ impl<
                 agent_name,
                 issue_title: options.name.to_string(),
                 agent_type: options.agent_type,
+                pane_id: None,
             })
         })
         .await
@@ -431,47 +771,170 @@ impl<
         settings
     }
 
-    /// Spawn a Gemini worker agent (Phase 2/3).
+    /// Generate opencode.json content for an OpenCode agent.
     ///
-    /// Creates a new git worktree and branch for isolation.
-    #[instrument(skip_all, fields(name = %options.name, agent_type = "gemini"))]
+    /// Constructs the JSON configuration including MCP server connection, role instructions,
+    /// and plugin registration pointing at `.exo/opencode-plugin`. The plugin package files
+    /// must be written separately via `write_opencode_plugin_files`.
+    pub fn generate_opencode_tl_settings(
+        agent_name: &str,
+        role: &str,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut mcp_servers = serde_json::Map::new();
+        mcp_servers.insert(
+            "exomonad".to_string(),
+            serde_json::json!({
+                "type": "local",
+                "command": ["exomonad", "mcp-stdio", "--role", role, "--name", agent_name]
+            }),
+        );
+        for (k, v) in extra_mcp_servers {
+            mcp_servers.insert(k.clone(), v.clone());
+        }
+
+        // instructions must be an array per OpenCode's schema.
+        // Only inject TL instructions for root/tl roles; dev/worker roles get no override.
+        let instructions = match role {
+            "root" | "tl" => serde_json::json!([OPENCODE_TL_INSTRUCTIONS]),
+            _ => serde_json::json!([OPENCODE_DEV_INSTRUCTIONS]),
+        };
+        serde_json::json!({
+            "mcp": mcp_servers,
+            "instructions": instructions,
+            "plugin": ["./.exo/opencode-plugin"],
+        })
+    }
+
+    /// Write the exomonad OpenCode plugin package to `<dir>/.exo/opencode-plugin/`.
+    ///
+    /// Creates `index.ts` (the TypeScript bridge) and `package.json`. The plugin
+    /// is referenced by `opencode.json` via `"plugin": ["./.exo/opencode-plugin"]`.
+    pub async fn write_opencode_plugin_files(dir: &Path) -> Result<()> {
+        use crate::opencode_plugin::{OPENCODE_PLUGIN_PKG_JSON, OPENCODE_PLUGIN_TS};
+        let plugin_dir = dir.join(".exo/opencode-plugin");
+        fs::create_dir_all(&plugin_dir).await?;
+        fs::write(plugin_dir.join("index.ts"), OPENCODE_PLUGIN_TS).await?;
+        fs::write(plugin_dir.join("package.json"), OPENCODE_PLUGIN_PKG_JSON).await?;
+        info!(path = %plugin_dir.display(), "Wrote OpenCode plugin files");
+        Ok(())
+    }
+
+    async fn active_worker_for_parent_tab(
+        &self,
+        agents_dir: &Path,
+        parent_tab: &str,
+        current_agent_name: &AgentName,
+    ) -> Result<Option<ActiveWorker>> {
+        let Ok(mut entries) = fs::read_dir(agents_dir).await else {
+            return Ok(None);
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == current_agent_name.as_str() {
+                continue;
+            }
+
+            let agent_dir = entry.path();
+            let Ok(routing) = RoutingInfo::read_from_dir(&agent_dir).await else {
+                continue;
+            };
+            if routing.parent_tab.as_deref() != Some(parent_tab) {
+                continue;
+            }
+            let worker_alive = if let Some(pane_id) = routing.pane_id.as_ref() {
+                self.tmux()?.pane_exists(pane_id).await.unwrap_or(false)
+            } else if let Some(window_id) = routing.window_id.as_ref() {
+                self.tmux()?.window_exists(window_id).await.unwrap_or(false)
+            } else {
+                false
+            };
+            if !worker_alive {
+                warn!(
+                    worker = %name,
+                    path = %agent_dir.display(),
+                    "Removing stale active worker registration with no live tmux target"
+                );
+                if let Err(error) = fs::remove_dir_all(&agent_dir).await {
+                    warn!(worker = %name, error = %error, "Failed to remove stale active worker registration");
+                }
+                continue;
+            }
+
+            let age = entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+                .map(format_worker_age)
+                .unwrap_or_else(|| "unknown time".to_string());
+            return Ok(Some(ActiveWorker { name, age }));
+        }
+
+        Ok(None)
+    }
+
+    /// Spawn a worker agent in the current worktree (no branch/worktree).
+    #[instrument(skip_all, fields(name = %options.name, agent_type = %options.agent_type.suffix()))]
     pub async fn spawn_worker(
         &self,
         options: &SpawnWorkerOptions,
         ctx: &crate::effects::EffectContext,
     ) -> Result<SpawnResult> {
-        info!(name = %options.name, timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_worker");
+        let agent_type = options.agent_type;
+        info!(name = %options.name, agent_type = agent_type.suffix(), timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_worker");
 
         let result = timeout(SPAWN_TIMEOUT, async {
             self.resolve_tmux_session()?;
 
+            // Workers run in the caller's worktree and inherit any dirty state.
+            let caller_tab = resolve_own_tab_name(ctx);
+            let caller_worktree = ctx.working_dir.clone();
+            let absolute_worktree = self.project_dir().join(&caller_worktree);
+            ensure_clean_spawn_worktree(&absolute_worktree).await?;
+
             // Sanitize name and construct typed identity
-            let identity = AgentIdentity::new(slugify(options.name.as_str()), AgentType::Gemini);
+            let identity = AgentIdentity::new(slugify(options.name.as_str()), agent_type);
             let agent_name = identity.internal_name();
             let display_name = identity.display_name();
+            let agents_dir = self.project_dir().join(".exo").join("agents");
+
+            if let Some(active_worker) = self
+                .active_worker_for_parent_tab(&agents_dir, &caller_tab, &agent_name)
+                .await?
+            {
+                return Err(active_worker_error(&active_worker));
+            }
 
             // Idempotency: check if agent config dir already exists (workers are panes, not tabs)
-            let agent_config_dir = self.project_dir()
-                .join(".exo")
-                .join("agents")
-                .join(agent_name.as_str());
+            let agent_config_dir = agents_dir.join(agent_name.as_str());
             let settings_path = agent_config_dir.join("settings.json");
             if settings_path.exists() {
                 // Check tmux pane liveness — settings.json can outlive the pane
-                let pane_alive = match RoutingInfo::read_from_dir(&agent_config_dir).await {
+                let existing_pane_id = match RoutingInfo::read_from_dir(&agent_config_dir).await {
                     Ok(routing) => match routing.pane_id {
-                        Some(ref pane_id) => self.tmux()?.pane_exists(pane_id).await.unwrap_or(false),
-                        None => false,
+                        Some(ref pane_id) if self.tmux()?.pane_exists(pane_id).await.unwrap_or(false) => {
+                            Some(pane_id.as_str().to_string())
+                        }
+                        _ => None,
                     },
-                    Err(_) => false,
+                    Err(_) => None,
                 };
-                if pane_alive {
+                if let Some(pane_id) = existing_pane_id {
                     info!(name = %options.name, "Worker pane still alive, returning existing");
                     return Ok(SpawnResult {
                         agent_dir: PathBuf::new(),
                         agent_name,
                         issue_title: options.name.to_string(),
-                        agent_type: AgentType::Gemini,
+                        agent_type,
+                        pane_id: Some(pane_id),
                     });
                 }
                 // Stale: pane is dead but config dir remains. Clean up and respawn.
@@ -483,10 +946,17 @@ impl<
 
             let role = crate::domain::Role::worker();
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
-            let session_branch = BranchName::from(parent_bb.as_str());
+            let session_branch = BranchName::try_from_str(parent_bb.as_str()).expect("validated string input is non-empty");
             let mut env_vars = self.common_spawn_env(&agent_name, &session_branch, &role);
+              env_vars.insert(
+                  "GIT_AUTHOR_NAME".to_string(),
+                  format!("exomonad-{}", agent_name.as_str()),
+              );
+              env_vars.insert(
+                  "GIT_AUTHOR_EMAIL".to_string(),
+                  format!("{}@exomonad.local", agent_name.as_str()),
+              );
 
-            // Write Gemini settings to worker config dir in project root
             fs::create_dir_all(&agent_config_dir).await?;
 
             // Legacy .birth_branch file for serve.rs fallback resolution.
@@ -494,53 +964,78 @@ impl<
             // but keep this for backward compatibility with older server instances.
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             fs::write(agent_config_dir.join(".birth_branch"), parent_bb.as_str()).await?;
-            let context_path = self.resolve_role_context(&role);
-            let settings = Self::generate_gemini_worker_settings(agent_name.as_str(), context_path.as_deref(), &self.extra_mcp_servers);
-            fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
-            info!(
-                path = %settings_path.display(),
-                agent_name = %agent_name,
-                "Wrote worker Gemini settings to agent config dir"
-            );
 
-            env_vars.insert(
-                "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
-                settings_path.to_string_lossy().to_string(),
-            );
+            match agent_type {
+                AgentType::Gemini => {
+                    let context_path = self.resolve_role_context(&role);
+                    let settings = Self::generate_gemini_worker_settings(agent_name.as_str(), context_path.as_deref(), &self.extra_mcp_servers);
+                    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
+                    info!(path = %settings_path.display(), agent_name = %agent_name, "Wrote worker Gemini settings to agent config dir");
+                    env_vars.insert(
+                        "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
+                        settings_path.to_string_lossy().to_string(),
+                    );
+                    let caller_worktree_for_trust = self.project_dir().join(&ctx.working_dir);
+                    Self::gemini_trust_folder(&caller_worktree_for_trust).await;
+                }
+                AgentType::OpenCode => {
+                    // Write worker-specific opencode.json so the worker gets
+                    // its own role/name (not the caller's root config, which
+                    // lacks notify_parent and other worker tools).
+                    let worker_config = Self::generate_opencode_tl_settings(
+                        agent_name.as_str(),
+                        "worker",
+                        &self.extra_mcp_servers,
+                    );
+                    let opencode_json_path = agent_config_dir.join("opencode.json");
+                    fs::write(&opencode_json_path, serde_json::to_string_pretty(&worker_config)?).await?;
+                    Self::write_opencode_plugin_files(&agent_config_dir).await?;
+                    info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json and plugin to agent config dir");
+                }
+                AgentType::Codex => {
+                    self.write_codex_config_files(
+                        &agent_config_dir,
+                        &role,
+                        &agent_name,
+                        self.spawn_agent_model(),
+                        &self.extra_mcp_servers,
+                    )
+                    .await?;
+                    info!(path = %agent_config_dir.join(".codex/config.toml").display(), agent_name = %agent_name, "Wrote worker Codex config to agent config dir");
+                }
+                _ => {}
+            }
 
-            // Pre-trust the caller's worktree for Gemini
-            let caller_worktree_for_trust = self.project_dir().join(&ctx.working_dir);
-            Self::gemini_trust_folder(&caller_worktree_for_trust).await;
+            // Config-discovered runtimes run in their agent config dir so they
+            // receive the worker role/name instead of inheriting the caller's
+            // project config.
+            let worker_cwd = match agent_type {
+                AgentType::OpenCode | AgentType::Codex => agent_config_dir.clone(),
+                _ => absolute_worktree.clone(),
+            };
 
-            // Resolve caller's context (tab and worktree) from its context.
-            let caller_tab = resolve_own_tab_name(ctx);
-            let caller_worktree = ctx.working_dir.clone();
-            let absolute_worktree = self.project_dir().join(caller_worktree);
-
-            // Worker role context is loaded via context.fileName in settings.json.
+            // Workers are panes in the parent's tab — pane_id is the stable identifier.
             // Prompt goes through a temp file to avoid shell quoting issues.
-
-            // Write routing info so send_message can target this pane correctly.
-            // Workers are panes in the parent's tab — pane_id is the stable identifier
-            // Spawn pane in caller's tab, cwd = caller's worktree
             let pane_id = self.new_tmux_pane(
                 &display_name,
-                &absolute_worktree,
-                AgentType::Gemini,
+                &worker_cwd,
+                agent_type,
                 Some(&options.prompt),
                 env_vars,
                 Some(&caller_tab),
                 Some(&options.claude_flags),
-            )
-            .await?;
+              )
+              .await?;
+              let pane_id_string = pane_id.as_str().to_string();
 
-            // Store pane_id for message delivery and cleanup
-            let routing = RoutingInfo::pane(pane_id, &caller_tab);
+              // Store pane_id for message delivery and cleanup
+              let routing = RoutingInfo::pane(pane_id, &caller_tab);
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
-                agent_type: AgentType::Gemini,
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
+                agent_type,
                 birth_branch: parent_bb.clone(),
                 parent_branch: parent_bb,
                 working_dir: ctx.working_dir.clone(),
@@ -556,7 +1051,8 @@ impl<
                 agent_dir: PathBuf::new(),
                 agent_name,
                 issue_title: options.name.to_string(),
-                agent_type: AgentType::Gemini,
+                agent_type,
+                pane_id: Some(pane_id_string),
             })
         })
         .await
@@ -605,14 +1101,19 @@ impl<
                 info!(slug = %identity.slug(), "Subtree already running, returning existing");
                 return Ok(SpawnResult {
                     agent_dir: self.worktree_base.join(agent_name.as_str()),
-                    agent_name,
-                    issue_title: options.branch_name.clone(),
-                    agent_type,
-                });
+                      agent_name,
+                      issue_title: options.branch_name.clone(),
+                      agent_type,
+                      pane_id: None,
+                  });
             }
 
             // Parent branch derived from typed birth-branch.
-            let current_branch = BranchName::from(effective_birth.as_parent_branch());
+            let current_branch = BranchName::try_from_str(effective_birth.as_parent_branch())
+                .context("effective birth branch was empty")?;
+
+            // Ensure a remote exists for local-only workflows
+            ensure_remote_exists(effective_project_dir).await;
 
             // Push parent branch so child PRs can reference it as base
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
@@ -636,7 +1137,7 @@ impl<
                     self.copy_allowed_dirs(&worktree_path, &options.allowed_dirs).await?;
                 }
             } else if !is_custom_dir {
-                let branch = BranchName::from(branch_name.as_str());
+                let branch = BranchName::try_from_str(branch_name.as_str()).expect("validated string input is non-empty");
                 self.create_worktree_checked(&worktree_path, &branch, &current_branch).await?;
             }
 
@@ -649,20 +1150,19 @@ impl<
             // Must be a copy, not a symlink — symlinks escape the worktree boundary
             // and cause Claude Code to discover parent context files.
             if let Some(context_src) = self.resolve_role_context(role) {
+                let spawn_type = self.spawn_agent_type.suffix();
                 match agent_type {
                     AgentType::Claude => {
-                        // Claude: .claude/rules/exomonad_role.md (loaded as rules file)
                         let rules_dir = worktree_path.join(".claude/rules");
                         let _ = fs::create_dir_all(&rules_dir).await;
                         let dest = rules_dir.join("exomonad_role.md");
                         let _ = fs::remove_file(&dest).await;
-                        match fs::copy(&context_src, &dest).await {
+                        match Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type).await {
                             Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into worktree"),
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy role context (non-fatal)"),
                         }
                     }
                     AgentType::Gemini => {
-                        // Gemini: .exo/roles/{wasm}/context/{role}.md (matched by context.fileName in settings)
                         let dest_dir = worktree_path.join(format!(".exo/roles/{}/context", self.wasm_name));
                         let _ = fs::create_dir_all(&dest_dir).await;
                         let dest = dest_dir.join(format!("{}.md", role));
@@ -672,61 +1172,101 @@ impl<
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy Gemini role context (non-fatal)"),
                         }
                     }
+                    AgentType::OpenCode => {
+                        let rules_dir = worktree_path.join(".claude/rules");
+                        let _ = fs::create_dir_all(&rules_dir).await;
+                        let dest = rules_dir.join("exomonad_role.md");
+                        let _ = fs::remove_file(&dest).await;
+                        match Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type).await {
+                            Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into OpenCode worktree"),
+                            Err(e) => warn!(role = %role, error = %e, "Failed to copy OpenCode role context (non-fatal)"),
+                        }
+                    }
+                    AgentType::Codex => {
+                        let dest_dir = worktree_path.join(".codex");
+                        let _ = fs::create_dir_all(&dest_dir).await;
+                        let dest = dest_dir.join("exomonad_role.md");
+                        let _ = fs::remove_file(&dest).await;
+                        match Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type).await {
+                            Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into Codex worktree"),
+                            Err(e) => warn!(role = %role, error = %e, "Failed to copy Codex role context (non-fatal)"),
+                        }
+                    }
                     AgentType::Shoal | AgentType::Process => {}
                 }
             }
 
-            let session_branch = BranchName::from(branch_name.as_str());
+            let session_branch = BranchName::try_from_str(branch_name.as_str()).expect("validated string input is non-empty");
             let mut env_vars = self.common_spawn_env(&agent_name, &session_branch, role);
-            // Enable Claude Code Agent Teams for native inter-agent messaging
-            env_vars.insert(
-                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".to_string(),
-                "1".to_string(),
-            );
+
+            // Write agent MCP config
             self.write_agent_mcp_config(effective_project_dir, &worktree_path, agent_type, role)
                 .await?;
 
+            match agent_type {
+                AgentType::Claude => {
+                    // Enable Claude Code Agent Teams for native inter-agent messaging
+                    env_vars.insert(
+                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".to_string(),
+                        "1".to_string(),
+                    );
 
-            // Write .claude/settings.local.json with hooks (SessionStart registers UUID for --fork-session)
-            let binary_path = crate::util::find_exomonad_binary();
-            crate::hooks::HookConfig::write_persistent(&worktree_path, &binary_path, options.permissions.as_ref(), Some(self.project_dir()))
-                .map_err(|e| anyhow!("Failed to write hook config in worktree: {}", e))?;
-            info!(worktree = %worktree_path.display(), "Wrote hook configuration for spawned Claude agent");
+                    // Write .claude/settings.local.json with hooks (SessionStart registers UUID for --fork-session)
+                    let binary_path = crate::util::find_exomonad_binary();
+                    crate::hooks::HookConfig::write_persistent(&worktree_path, &binary_path, options.permissions.as_ref(), Some(self.project_dir()))
+                        .map_err(|e| anyhow!("Failed to write hook config in worktree: {}", e))?;
+                    info!(worktree = %worktree_path.display(), "Wrote hook configuration for spawned Claude agent");
 
-            // Symlink Claude project dir so child can discover parent's sessions for --fork-session.
-            // Claude Code encodes paths via [^a-zA-Z0-9] → '-' (lossy regex replacement).
-            // Without this symlink, --resume --fork-session fails with "no conversation ID found".
-            {
-                let claude_projects_dir = dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".claude")
-                    .join("projects");
-                let encode_path = |p: &Path| -> String {
-                    p.to_string_lossy()
-                        .chars()
-                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                        .collect()
-                };
-                let canonical_project_dir = self.project_dir().canonicalize().unwrap_or_else(|_| self.project_dir().to_path_buf());
-                let parent_encoded = encode_path(&canonical_project_dir);
-                let worktree_encoded = encode_path(&worktree_path);
-                let parent_project = claude_projects_dir.join(&parent_encoded);
-                let child_project = claude_projects_dir.join(&worktree_encoded);
-                if parent_project.exists() && !child_project.exists() {
-                    match std::os::unix::fs::symlink(&parent_project, &child_project) {
-                        Ok(()) => info!(
-                            parent = %parent_encoded,
-                            child = %worktree_encoded,
-                            "Symlinked Claude project dir for session inheritance"
-                        ),
-                        Err(e) => warn!(
-                            parent = %parent_encoded,
-                            child = %worktree_encoded,
-                            error = %e,
-                            "Failed to symlink Claude project dir (fork-session may not work)"
-                        ),
+                    // Symlink Claude project dir so child can discover parent's sessions for --fork-session.
+                    // Claude Code encodes paths via [^a-zA-Z0-9] → '-' (lossy regex replacement).
+                    // Without this symlink, --resume --fork-session fails with "no conversation ID found".
+                    {
+                        let claude_projects_dir = dirs::home_dir()
+                            .unwrap_or_default()
+                            .join(".claude")
+                            .join("projects");
+                        let encode_path = |p: &Path| -> String {
+                            p.to_string_lossy()
+                                .chars()
+                                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                                .collect()
+                        };
+                        let canonical_project_dir = self.project_dir().canonicalize().unwrap_or_else(|_| self.project_dir().to_path_buf());
+                        let parent_encoded = encode_path(&canonical_project_dir);
+                        let worktree_encoded = encode_path(&worktree_path);
+                        let parent_project = claude_projects_dir.join(&parent_encoded);
+                        let child_project = claude_projects_dir.join(&worktree_encoded);
+                        if parent_project.exists() && !child_project.exists() {
+                            match std::os::unix::fs::symlink(&parent_project, &child_project) {
+                                Ok(()) => info!(
+                                    parent = %parent_encoded,
+                                    child = %worktree_encoded,
+                                    "Symlinked Claude project dir for session inheritance"
+                                ),
+                                Err(e) => warn!(
+                                    parent = %parent_encoded,
+                                    child = %worktree_encoded,
+                                    error = %e,
+                                    "Failed to symlink Claude project dir (fork-session may not work)"
+                                ),
+                            }
+                        }
                     }
                 }
+                AgentType::OpenCode => {
+                    let opencode_config = Self::generate_opencode_tl_settings(
+                        agent_name.as_str(),
+                        role.as_str(),
+                        &self.extra_mcp_servers,
+                    );
+                    fs::write(
+                        worktree_path.join("opencode.json"),
+                        serde_json::to_string_pretty(&opencode_config)?,
+                    ).await?;
+                    Self::write_opencode_plugin_files(&worktree_path).await?;
+                    info!(worktree = %worktree_path.display(), "Wrote opencode.json and plugin for OpenCode TL agent");
+                }
+                _ => {}
             }
 
             // Build task prompt with worktree context warning
@@ -739,40 +1279,98 @@ impl<
                 task_with_context.push_str("\n\nShared technical dependencies are available as read-only reference in `.exo/context/`. Do not modify files in this directory.");
             }
 
-            // Determine fork mode from parent_session_id
-            let fork_id = options.parent_session_id.as_ref().map(|id| id.as_str());
+            // Inject workspace-level agent.md if present
+            let agent_md_path = self.project_dir().join("agent.md");
+            if agent_md_path.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(&agent_md_path).await {
+                    task_with_context.push_str("\n\n---\n\n# Workspace Context (from agent.md)\n\n");
+                    task_with_context.push_str(&content);
+                }
+            }
 
             // Open tmux window with cwd = worktree_path
-            let agent_config_dir = self.project_dir().join(".exo").join("agents").join(agent_name.as_str());
-            let window_id = match self.new_tmux_window_inner(
-                &display_name,
-                &worktree_path,
-                agent_type,
-                Some(&task_with_context),
-                env_vars,
-                fork_id,
-                Some(&options.claude_flags),
-            )
-            .await {
-                Ok(wid) => wid,
-                Err(e) => {
-                    warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
-                    let _ = fs::remove_dir_all(&agent_config_dir).await;
-                    // Remove worktree if it was created
-                    if worktree_path.exists() {
-                        let git_wt = self.git_wt().clone();
-                        let path = worktree_path.clone();
-                        let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
-                    }
-                    return Err(e);
+            let routing = match agent_type {
+                AgentType::OpenCode => {
+                    // OpenCode workers run in a tmux window like Claude workers.
+                    // `build_agent_command` generates `opencode run "$(cat '<prompt_file>')"`.
+                    // MCP is configured via opencode.json in the worktree.
+                    // Messages are delivered via tmux STDIN injection (same as all other agents).
+                    let window_id = self.new_tmux_window_inner(
+                        &display_name,
+                        &worktree_path,
+                        agent_type,
+                        Some(&task_with_context),
+                        env_vars,
+                        None, // no fork_session for OpenCode
+                        None, // no claude_flags
+                        options.model.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
+                        e
+                    })?;
+                    RoutingInfo::window(window_id)
+                }
+                AgentType::Codex => {
+                    let fork_id = options.parent_session_id.as_ref().map(|id| id.as_str());
+                    let window_id = self.new_tmux_window_inner(
+                        &display_name,
+                        &worktree_path,
+                        agent_type,
+                        Some(&task_with_context),
+                        env_vars,
+                        fork_id,
+                        None,
+                        options.model.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
+                        e
+                    })?;
+                    RoutingInfo::window(window_id)
+                }
+                AgentType::Claude => {
+                    // Determine fork mode from parent_session_id
+                    let fork_id = options.parent_session_id.as_ref().map(|id| id.as_str());
+                    let window_id = self.new_tmux_window_inner(
+                        &display_name,
+                        &worktree_path,
+                        agent_type,
+                        Some(&task_with_context),
+                        env_vars,
+                        fork_id,
+                        Some(&options.claude_flags),
+                        options.model.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
+                        e
+                    })?;
+                    RoutingInfo::window(window_id)
+                }
+                _ => {
+                    let window_id = self.new_tmux_window(
+                        &display_name,
+                        &worktree_path,
+                        agent_type,
+                        Some(&task_with_context),
+                        env_vars,
+                    )
+                    .await
+                    .map_err(|e| {
+                        warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
+                        e
+                    })?;
+                    RoutingInfo::window(window_id)
                 }
             };
-
-            // Store window_id for message delivery and cleanup
-            let routing = RoutingInfo::window(window_id);
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
                 agent_type,
                 birth_branch: child_birth,
                 parent_branch: effective_birth,
@@ -785,10 +1383,11 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: worktree_path.clone(),
-                agent_name,
-                issue_title: options.branch_name.clone(),
-                agent_type,
-            })
+                  agent_name,
+                  issue_title: options.branch_name.clone(),
+                  agent_type,
+                  pane_id: None,
+              })
         })
         .await
         .map_err(|_| {
@@ -817,9 +1416,11 @@ impl<
 
             let effective_birth = self.effective_birth_branch(Some(caller_bb));
             let effective_project_dir = self.project_dir();
+            ensure_clean_spawn_worktree(effective_project_dir).await?;
 
             // Parent branch derived from typed birth-branch.
-            let current_branch = BranchName::from(effective_birth.as_parent_branch());
+            let current_branch = BranchName::try_from_str(effective_birth.as_parent_branch())
+                .context("effective birth branch was empty")?;
 
             // Sanitize branch name and construct typed identity
             let agent_type = options.agent_type;
@@ -833,27 +1434,46 @@ impl<
                 info!(slug = %identity.slug(), "Leaf subtree already running, returning existing");
                 return Ok(SpawnResult {
                     agent_dir: self.worktree_base.join(agent_name.as_str()),
-                    agent_name,
-                    issue_title: options.branch_name.clone(),
-                    agent_type,
-                });
+                      agent_name,
+                      issue_title: options.branch_name.clone(),
+                      agent_type,
+                      pane_id: None,
+                  });
             }
+
+            // Ensure a remote exists for local-only workflows
+            ensure_remote_exists(effective_project_dir).await;
 
             // Push parent branch so child PRs can reference it as base
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
             let child_birth = effective_birth.child(agent_name.as_str());
-            let branch_name = BranchName::from(child_birth.to_string().as_str());
+            let branch_name = BranchName::try_from_str(child_birth.to_string().as_str()).expect("validated string input is non-empty");
 
             let worktree_path = self.worktree_base.join(agent_name.as_str());
+            let mut remove_worktree_on_spawn_failure = false;
 
             if options.standalone_repo {
                 self.init_standalone_repo(&worktree_path).await?;
+                remove_worktree_on_spawn_failure = true;
                 if !options.allowed_dirs.is_empty() {
                     self.copy_allowed_dirs(&worktree_path, &options.allowed_dirs).await?;
                 }
+            } else if worktree_path.exists() {
+                if !worktree_path.is_dir() {
+                    return Err(anyhow!(
+                        "Existing leaf worktree path is not a directory: {}",
+                        worktree_path.display()
+                    ));
+                }
+                info!(
+                    worktree_path = %worktree_path.display(),
+                    branch_name = %branch_name,
+                    "Reusing existing leaf worktree"
+                );
             } else {
                 self.create_worktree_checked(&worktree_path, &branch_name, &current_branch).await?;
+                remove_worktree_on_spawn_failure = true;
             }
 
             self.create_socket_symlink(&worktree_path).await;
@@ -892,8 +1512,7 @@ impl<
                 Err(e) => {
                     warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
                     let _ = fs::remove_dir_all(&agent_config_dir).await;
-                    // Remove worktree if it was created
-                    if worktree_path.exists() {
+                    if remove_worktree_on_spawn_failure && worktree_path.exists() {
                         let git_wt = self.git_wt().clone();
                         let path = worktree_path.clone();
                         let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
@@ -906,7 +1525,8 @@ impl<
             let routing = RoutingInfo::window(window_id);
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
-                slug: Slug::from(identity.slug()),
+                slug: Slug::try_from_str(identity.slug())
+                    .context("generated agent slug was empty")?,
                 agent_type,
                 birth_branch: child_birth,
                 parent_branch: effective_birth,
@@ -919,10 +1539,11 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: worktree_path.clone(),
-                agent_name,
-                issue_title: options.branch_name.clone(),
-                agent_type,
-            })
+                  agent_name,
+                  issue_title: options.branch_name.clone(),
+                  agent_type,
+                  pane_id: None,
+              })
         })
         .await
         .map_err(|_| {
@@ -934,11 +1555,317 @@ impl<
         info!(branch_name = %options.branch_name, "spawn_leaf_subtree completed successfully");
         Ok(result)
     }
+
+    /// Spawn a reviewer agent for a sibling PR.
+    ///
+    /// Creates a tmux window with `role=reviewer` working from the project root.
+    /// The reviewer examines `git diff base..{pr_branch}` and submits a
+    /// Forgejo approval, request-changes review, or comment-only review.
+    ///
+    /// Use this when the TL receives `[PR READY]` from a child agent.
+    #[instrument(skip_all, fields(pr_number = pr_entry.number))]
+    pub async fn spawn_reviewer_subtree(
+        &self,
+        pr_entry: &crate::services::pr_registry::PrEntry,
+        caller_bb: &BirthBranch,
+    ) -> Result<SpawnResult> {
+        let branch_name = format!("review-pr-{}", pr_entry.number);
+        self.spawn_reviewer_subtree_named(pr_entry, caller_bb, &branch_name)
+            .await
+    }
+
+    pub async fn spawn_reviewer_subtree_named(
+        &self,
+        pr_entry: &crate::services::pr_registry::PrEntry,
+        caller_bb: &BirthBranch,
+        branch_name: &str,
+    ) -> Result<SpawnResult> {
+        let context_section =
+            render_reviewer_context_section(&self.reviewer_context, self.project_dir());
+        let task = format!(
+            "Review PR #{}: {}\n\nBranch: {}\nBase: {}\nAuthor: {}{}",
+            pr_entry.number,
+            pr_entry.title,
+            pr_entry.head_branch,
+            pr_entry.base_branch,
+            pr_entry.author_agent,
+            context_section,
+        );
+
+        // Compute the reviewer's own identity and path — same derivation spawn_subtree uses
+        // internally so the MCP config agent_name matches the directory name.
+        let agent_type = self.reviewer_agent_type;
+        let identity = AgentIdentity::new(slugify(branch_name), agent_type);
+        let reviewer_path = self.worktree_base.join(identity.internal_name().as_str());
+
+        // Create a detached-HEAD worktree at the PR branch tip unless it already exists.
+        // Detached so we don't compete with the worker's branch; the reviewer never commits.
+        // This prevents clobbering the worker's opencode.json/MCP config while both run.
+        if !reviewer_path.exists() {
+            let git_wt = self.git_wt().clone();
+            let path = reviewer_path.clone();
+            let at_ref = pr_entry.head_branch.clone();
+            let name = identity.internal_name().to_string();
+            tokio::task::spawn_blocking(move || {
+                git_wt.create_workspace_detached(&path, &at_ref, &name)
+            })
+            .await
+            .context("tokio join error creating reviewer worktree")?
+            .context("Failed to create reviewer worktree")?;
+        }
+
+        let options = SpawnSubtreeOptions {
+            task,
+            branch_name: branch_name.to_string(),
+            parent_session_id: None,
+            role: Some(crate::domain::Role::reviewer()),
+            agent_type,
+            claude_flags: ClaudeSpawnFlags::default(),
+            working_dir: Some(reviewer_path),
+            permissions: Some(AgentPermissions {
+                allow: vec![],
+                deny: vec![
+                    "fork_wave".into(),
+                    "spawn_leaf".into(),
+                    "spawn_worker".into(),
+                    "merge_pr".into(),
+                    "file_pr".into(),
+                ],
+                default_mode: None,
+            }),
+            standalone_repo: false,
+            allowed_dirs: vec![],
+            model: self.reviewer_model.clone(),
+        };
+
+        let result = self.spawn_subtree(&options, caller_bb).await?;
+
+        Ok(result)
+    }
+
+    pub async fn spawn_reviewer_for_recovery(
+        &self,
+        pr: &crate::services::pr_registry::PrEntry,
+        caller_bb: &BirthBranch,
+    ) -> Result<SpawnResult> {
+        let reviewer_branch_name = format!("review-pr-{}", pr.number);
+        self.spawn_reviewer_with_metadata_named(pr, caller_bb, &reviewer_branch_name)
+            .await
+    }
+
+    pub async fn spawn_reviewer_for_recovery_named(
+        &self,
+        pr: &crate::services::pr_registry::PrEntry,
+        caller_bb: &BirthBranch,
+        reviewer_branch_name: &str,
+    ) -> Result<SpawnResult> {
+        self.spawn_reviewer_with_metadata_named(pr, caller_bb, reviewer_branch_name)
+            .await
+    }
+
+    async fn spawn_reviewer_with_metadata_named(
+        &self,
+        pr: &crate::services::pr_registry::PrEntry,
+        caller_bb: &BirthBranch,
+        reviewer_branch_name: &str,
+    ) -> Result<SpawnResult> {
+        let reviewer_identity =
+            AgentIdentity::new(slugify(reviewer_branch_name), self.reviewer_agent_type);
+        let reviewer_internal_name = reviewer_identity.internal_name().to_string();
+        let reviewer_birth_branch = caller_bb.child(&reviewer_internal_name).to_string();
+        let result = self
+            .spawn_reviewer_subtree_named(pr, caller_bb, reviewer_branch_name)
+            .await?;
+        self.persist_reviewer_assignment(pr, &reviewer_internal_name, &reviewer_birth_branch)
+            .await;
+        Ok(result)
+    }
+
+    async fn persist_reviewer_assignment(
+        &self,
+        pr: &crate::services::pr_registry::PrEntry,
+        reviewer_internal_name: &str,
+        reviewer_birth_branch: &str,
+    ) {
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return;
+        };
+        match crate::services::repo::get_repo_info(self.project_dir()).await {
+            Ok(repo_info) => {
+                let base_branch = BranchName::try_from_str(pr.base_branch.as_str())
+                    .expect("validated string input is non-empty");
+                let body = append_reviewer_metadata(
+                    &pr.body,
+                    reviewer_internal_name,
+                    reviewer_birth_branch,
+                );
+                if let Err(err) = forgejo
+                    .update_pull_request(
+                        &repo_info.owner,
+                        &repo_info.repo,
+                        crate::domain::PRNumber::new(pr.number),
+                        &pr.title,
+                        &body,
+                        &base_branch,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        pr_number = pr.number,
+                        error = %err,
+                        "Failed to persist reviewer assignment to Forgejo PR body"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                pr_number = pr.number,
+                error = %err,
+                "Failed to resolve repository while persisting reviewer assignment"
+            ),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<
+        C: crate::services::HasGitHubClient
+            + crate::services::HasForgejoClient
+            + crate::services::HasAcpRegistry
+            + crate::services::HasTeamRegistry
+            + crate::services::HasAgentResolver
+            + crate::services::HasProjectDir
+            + crate::services::HasGitWorktreeService
+            + 'static,
+    > crate::services::ReviewerSpawner for AgentControlService<C>
+{
+    async fn spawn_reviewer_for_pr(
+        &self,
+        pr: &crate::services::pr_registry::PrEntry,
+    ) -> anyhow::Result<()> {
+        // Guard: if the author's worktree is gone, this PR is stale from a previous
+        // session (crash or --recreate). Skip — no agent will respond to feedback.
+        let worktree_path = self.worktree_base.join(&pr.author_agent);
+        if !worktree_path.exists() {
+            tracing::warn!(
+                pr_number = pr.number,
+                agent = %pr.author_agent,
+                path = %worktree_path.display(),
+                "Skipping reviewer spawn — author worktree absent (stale PR from previous session)"
+            );
+            return Ok(());
+        }
+        let caller_bb = BirthBranch::try_from_str(pr.base_branch.as_str())
+            .expect("validated string input is non-empty");
+        self.spawn_reviewer_for_recovery(pr, &caller_bb).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_git_status_paths_lists_status_entries() {
+        let paths = parse_git_status_paths(
+            " M src/lib.rs\nA  docs/new.md\nR  old.rs -> new.rs\n?? scratch.txt\n",
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "src/lib.rs".to_string(),
+                "docs/new.md".to_string(),
+                "new.rs".to_string(),
+                "scratch.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dirty_spawn_error_includes_count_files_and_recovery() {
+        let files = vec!["src/lib.rs".to_string(), "docs/new.md".to_string()];
+        let message = dirty_spawn_error(&files).to_string();
+        assert!(message.contains(
+            "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes:"
+        ));
+        assert!(message.contains("  src/lib.rs"));
+        assert!(message.contains("  docs/new.md"));
+        assert!(message.contains("Commit the scaffold"));
+        assert!(message.contains("discard_worker_output"));
+        assert!(message.contains("dev-leaves fork from your branch HEAD"));
+    }
+
+    #[test]
+    fn test_format_worker_age_uses_readable_units() {
+        assert_eq!(format_worker_age(std::time::Duration::from_secs(42)), "42s");
+        assert_eq!(format_worker_age(std::time::Duration::from_secs(125)), "2m");
+        assert_eq!(
+            format_worker_age(std::time::Duration::from_secs(7_400)),
+            "2h"
+        );
+    }
+
+    #[test]
+    fn test_active_worker_error_includes_name_options_and_scope() {
+        let worker = ActiveWorker {
+            name: "alpha-codex".to_string(),
+            age: "2m".to_string(),
+        };
+        let message = active_worker_error(&worker).to_string();
+        assert!(message.contains("Active worker in this TL worktree: `alpha-codex`"));
+        assert!(message.contains("spawned 2m ago"));
+        assert!(message.contains("Wait for the active worker's handoff"));
+        assert!(message.contains("Use `spawn_leaf` for parallel work"));
+        assert!(message.contains("Per-worker attribution"));
+    }
+
+    #[test]
+    fn test_render_reviewer_context_section_resolves_relative_paths_against_project_dir() {
+        let project_dir = std::path::PathBuf::from("/tmp/exo-project");
+        let ctx = vec![
+            ".exo/context/reviewer-checklist.md".to_string(),
+            "AGENTS.md".to_string(),
+        ];
+        let section = render_reviewer_context_section(&ctx, &project_dir);
+        assert!(
+            section.contains("/tmp/exo-project/.exo/context/reviewer-checklist.md"),
+            "relative paths must be joined with project_dir; got: {section}"
+        );
+        assert!(
+            section.contains("/tmp/exo-project/AGENTS.md"),
+            "second relative path must also be resolved; got: {section}"
+        );
+        assert!(
+            section.starts_with("\n\nRead first:\n"),
+            "header line must precede the bullet list; got: {section}"
+        );
+    }
+
+    #[test]
+    fn test_render_reviewer_context_section_passes_absolute_paths_through() {
+        let project_dir = std::path::PathBuf::from("/tmp/exo-project");
+        let ctx = vec!["/etc/some/absolute.md".to_string()];
+        let section = render_reviewer_context_section(&ctx, &project_dir);
+        assert!(
+            section.contains("/etc/some/absolute.md"),
+            "absolute paths must pass through; got: {section}"
+        );
+        assert!(
+            !section.contains("/tmp/exo-project/etc"),
+            "absolute paths must NOT be joined with project_dir; got: {section}"
+        );
+    }
+
+    #[test]
+    fn test_render_reviewer_context_section_empty_emits_nothing() {
+        let project_dir = std::path::PathBuf::from("/tmp/exo-project");
+        let section = render_reviewer_context_section(&[], &project_dir);
+        assert!(
+            section.is_empty(),
+            "empty ctx must emit no header; got: {section}"
+        );
+    }
 
     #[tokio::test]
     async fn test_copy_allowed_dirs_validation() {

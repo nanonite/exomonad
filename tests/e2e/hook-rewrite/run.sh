@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# E2E Hook Rewrite Test — Gemini Root Agent with PII Rewriting
+# E2E OC Rewrite Test — OpenCode Root Agent with PII Rewriting
 # Uses a dedicated e2e-test WASM where the root role includes httpDevHooks.
-# Gemini IS the root agent (--role root → e2e-test WASM root → PII hooks active).
+# OpenCode IS the root agent (--role root → e2e-test WASM root → PII hooks active).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -14,10 +14,11 @@ PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 echo ">>> [Phase 0] Checking preconditions..."
 
 EXOMONAD_BIN=""
-if command -v exomonad &>/dev/null; then
-    EXOMONAD_BIN="$(command -v exomonad)"
-elif [[ -x "$PROJECT_ROOT/target/debug/exomonad" ]]; then
+if [[ -x "$PROJECT_ROOT/target/debug/exomonad" ]]; then
     EXOMONAD_BIN="$PROJECT_ROOT/target/debug/exomonad"
+    export PATH="$PROJECT_ROOT/target/debug:$PATH"
+elif command -v exomonad &>/dev/null; then
+    EXOMONAD_BIN="$(command -v exomonad)"
 else
     echo "ERROR: exomonad binary not found. Run 'just install-all-dev' or 'cargo build -p exomonad'."
     exit 1
@@ -31,6 +32,12 @@ if [[ ! -f "$PROJECT_ROOT/.exo/wasm/wasm-guest-e2e-test.wasm" ]]; then
 fi
 echo "  WASM: wasm-guest-e2e-test.wasm found"
 
+if ! command -v opencode &>/dev/null; then
+    echo "ERROR: opencode binary not found in PATH."
+    exit 1
+fi
+echo "  opencode: $(command -v opencode)"
+
 for cmd in tmux git; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: $cmd not found in PATH."
@@ -43,13 +50,14 @@ echo "  tmux, git: OK"
 
 echo ">>> [Phase 1] Creating temp environment..."
 
-WORK_DIR="$(mktemp -d /tmp/exomonad-e2e-rewrite.XXXXXXXX)"
+mkdir -p "$HOME/.cache/exomonad-e2e"
+WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/oc-rewrite.XXXXXXXX")"
 echo "  Work dir: $WORK_DIR"
 
 cleanup() {
     echo ""
     echo ">>> [Cleanup] Tearing down..."
-    tmux kill-session -t e2e-rewrite 2>/dev/null || true
+    tmux kill-session -t e2e-oc-rewrite 2>/dev/null || true
     echo "  Killed tmux session"
     rm -rf "$WORK_DIR"
     echo "  Removed $WORK_DIR"
@@ -57,7 +65,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Create bare remote (Gemini agent needs a pushable remote)
+# Create bare remote (OpenCode agent needs a pushable remote)
 REMOTE_DIR="$WORK_DIR/remote.git"
 git init --bare "$REMOTE_DIR" -q
 
@@ -84,15 +92,19 @@ for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
     ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
 done
 
-# Write config: Gemini root with e2e-test WASM
+# Write config: OpenCode root with e2e-test WASM
 cat > .exo/config.toml <<'EOF'
 default_role = "root"
 wasm_name = "e2e-test"
 shell_command = "bash"
-tmux_session = "e2e-rewrite"
-root_agent_type = "gemini"
+tmux_session = "e2e-oc-rewrite"
+root_agent_type = "opencode"
 yolo = true
 initial_prompt = "Write a file named greeting.txt containing a greeting to John Smith, CEO of Acme Corp. Include jane.doe@acme.com. After writing, exit."
+
+[opencode]
+tl_model = "opencode-go/deepseek-v4-flash"
+use_embedded_key = true
 
 [[companions]]
 name = "test-runner"
@@ -102,22 +114,6 @@ model = "haiku"
 command = "claude --dangerously-skip-permissions"
 task = "Execute the test plan from your role context. Start immediately."
 EOF
-
-# Write GEMINI.md so the Gemini root understands PII token rewriting
-cat > GEMINI.md <<'GEMINIEOF'
-# PII Token Rewriting
-
-This environment uses automatic PII term rewriting via BeforeModel/AfterModel hooks.
-
-Your prompts are rewritten BEFORE you see them: real names and emails are replaced
-with placeholder tokens like PERSON_ONE, COMPANY_ALPHA, EMAIL_ONE. Your responses
-are rewritten AFTER you produce them: tokens are replaced back with the real values.
-
-**Use these tokens literally.** They are NOT variables to resolve. They are NOT
-environment variables. Do not search for their definitions. When your prompt says
-"write a greeting to PERSON_ONE", write the greeting using "PERSON_ONE" exactly
-as-is. The hook system handles the real values automatically.
-GEMINIEOF
 
 # Copy testrunner context into the e2e-test role
 mkdir -p .exo/roles/e2e-test/context
@@ -135,8 +131,8 @@ echo "  Remote: $REMOTE_DIR"
 echo ">>> [Phase 2] Configuring environment..."
 
 # Set dummy token to avoid auth errors
-export GITHUB_TOKEN="test-token-e2e"
-echo "  GITHUB_TOKEN=test-token-e2e"
+export FORGEJO_TOKEN="test-token-e2e"
+echo "  FORGEJO_TOKEN=test-token-e2e"
 
 # --- Phase 3: Run exomonad init ---
 
@@ -144,15 +140,15 @@ echo ">>> [Phase 3] Launching exomonad init..."
 
 echo ""
 echo "============================================"
-echo "  E2E Hook Rewrite Test Ready"
-echo "  Session: e2e-rewrite"
+echo "  E2E OC Rewrite Test Ready"
+echo "  Session: e2e-oc-rewrite"
 echo "  Work dir: $WORK_DIR/repo"
 echo ""
-echo "  Gemini root writes greeting.txt with PII terms"
+echo "  OpenCode root writes greeting.txt with PII terms"
 echo "  PII hooks rewrite terms in BeforeModel/AfterModel"
 echo "  Testrunner validates hook rewriting worked"
 echo "============================================"
 echo ""
 
 # Launch exomonad init — creates tmux session and attaches.
-"$EXOMONAD_BIN" init --session e2e-rewrite
+"$EXOMONAD_BIN" init --session e2e-oc-rewrite

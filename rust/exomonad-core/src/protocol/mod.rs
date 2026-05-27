@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 // Re-export commonly used types
 pub use hook::{
+    codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload,
     ClaudePreToolUseOutput, ClaudeStopHookOutput, GeminiStopDecision, GeminiStopHookOutput,
     HookEnvelope, HookInput, HookSpecificOutput, InternalAfterModelOutput,
     InternalBeforeModelOutput, InternalStopHookOutput, PermissionDecision, StopDecision,
@@ -50,6 +51,13 @@ pub enum Runtime {
     Claude,
     /// Google's Gemini CLI.
     Gemini,
+    /// SST OpenCode CLI.
+    #[value(name = "opencode")]
+    #[serde(rename = "opencode")]
+    #[strum(serialize = "opencode")]
+    OpenCode,
+    /// OpenAI Codex CLI.
+    Codex,
 }
 
 /// Hook event type for CLI hooks.
@@ -116,6 +124,24 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_opencode_serialization() {
+        let val = Runtime::OpenCode;
+        let json = serde_json::to_string(&val).unwrap();
+        assert_eq!(json, "\"opencode\"");
+        let display = val.to_string();
+        assert_eq!(display, "opencode");
+    }
+
+    #[test]
+    fn test_runtime_codex_serialization() {
+        let val = Runtime::Codex;
+        let json = serde_json::to_string(&val).unwrap();
+        assert_eq!(json, "\"codex\"");
+        let display = val.to_string();
+        assert_eq!(display, "codex");
+    }
+
+    #[test]
     fn test_runtime_roundtrip() {
         let val = Runtime::Gemini;
         let json = serde_json::to_string(&val).unwrap();
@@ -127,6 +153,8 @@ mod tests {
     fn test_runtime_display() {
         assert_eq!(Runtime::Claude.to_string(), "claude");
         assert_eq!(Runtime::Gemini.to_string(), "gemini");
+        assert_eq!(Runtime::OpenCode.to_string(), "opencode");
+        assert_eq!(Runtime::Codex.to_string(), "codex");
     }
 
     #[test]
@@ -159,6 +187,7 @@ mod proptest_tests {
         fn test_runtime_roundtrip_proptest(val in prop_oneof![
             Just(Runtime::Claude),
             Just(Runtime::Gemini),
+            Just(Runtime::OpenCode),
         ]) {
             let json = serde_json::to_string(&val).unwrap();
             let back: Runtime = serde_json::from_str(&json).unwrap();

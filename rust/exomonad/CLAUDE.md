@@ -41,12 +41,13 @@ exomonad shutdown                 # Gracefully shut down the running server
 
 `exomonad init` creates a tmux session with:
 - **Server window**: Runs `exomonad serve` (binds .exo/server.sock)
-- **TL window**: Runs the configured shell command (focused by default)
+- **TL window**: Runs the configured root agent (Claude by default; `--tl codex` writes `.codex/config.toml`, installs the shared ExoMonad hook block in the Codex user config, and launches Codex with `--cd` in the project root)
 - **Companion windows**: One per `[[companions]]` entry in config. Claude companions get isolated git worktrees at `.exo/companions/{name}/` with `.mcp.json`, hooks, and socket symlink. Worktrees persist across `--recreate`. Process companions (`agent_type = "process"`) run a plain command — no MCP, no worktree, no agent identity.
 
 `exomonad init` requires `exomonad new` to have been run first to bootstrap the project configuration and WASM plugins.
 
 Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is newer (consuming projects only, not source projects with `.exo/roles/`).
+
 
 Claude MCP is auto-registered during init. For Gemini, register manually (`gemini mcp add ...`).
 
@@ -97,7 +98,7 @@ Register manually in `.mcp.json`:
 | Tool | Role | Description |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree |
-| `spawn_gemini` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
+| `spawn_leaf` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
 | `file_pr` | tl, dev | Create/update PR for current branch |
 | `merge_pr` | root, tl | Merge child PR (gh merge + git fetch) |
 | `notify_parent` | tl, dev, worker | Send message to parent agent |
@@ -158,7 +159,6 @@ All effects flow through a single `yield_effect` host function using protobuf bi
 WASM must be built before running hooks or serve mode:
 
 ```bash
-# Full install (recommended): builds WASM, then Rust, installs everything
 just install-all-dev
 
 # Or manually:
@@ -177,7 +177,7 @@ just test-mcp
 
 # E2E tests (interactive — launches tmux, you observe companions work)
 just e2e-messaging         # Teams inbox delivery pipeline
-just e2e-hook-rewrite      # BeforeModel/AfterModel PII rewriting
+just e2e-oc-rewrite        # BeforeModel/AfterModel PII rewriting
 
 # Quick hook smoke test (requires running server: exomonad serve)
 echo '{"session_id":"test","hook_event_name":"PreToolUse","tool_name":"Write","transcript_path":"/tmp/t.jsonl","cwd":"/","permission_mode":"default"}' | \

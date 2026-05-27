@@ -22,6 +22,7 @@ module ExoMonad.Guest.Types
     postToolUseResponse,
     allowStopResponse,
     blockStopResponse,
+    silentBlockStopResponse,
 
     -- * Gemini-specific hook types
     BeforeModelOutput (..),
@@ -98,16 +99,20 @@ instance FromJSON HookEventType where
     "AfterModel" -> pure AfterModel
     other -> fail $ "Unknown hook event type: " <> T.unpack other
 
--- | Runtime environment (Claude or Gemini).
-data Runtime = Claude | Gemini
+-- | Runtime environment (Claude, Gemini, OpenCode, or Codex).
+data Runtime = Claude | Gemini | OpenCode | Codex
   deriving (Show, Eq, Generic)
 
 instance FromJSON Runtime where
   parseJSON = Aeson.withText "Runtime" $ \case
     "claude" -> pure Claude
     "gemini" -> pure Gemini
+    "opencode" -> pure OpenCode
+    "codex" -> pure Codex
     "Claude" -> pure Claude
     "Gemini" -> pure Gemini
+    "OpenCode" -> pure OpenCode
+    "Codex" -> pure Codex
     other -> fail $ "Unknown runtime: " <> T.unpack other
 
 -- | Input for a hook event.
@@ -315,12 +320,21 @@ blockStopResponse msg =
       reason = Just msg
     }
 
+-- | Create a silent "block" response for Stop hooks that should keep the agent idle.
+silentBlockStopResponse :: StopHookOutput
+silentBlockStopResponse =
+  StopHookOutput
+    { decision = Block,
+      reason = Nothing
+    }
+
 -- ============================================================================
 -- Gemini-Specific Hook Types
 -- ============================================================================
 
--- | BeforeModel hook response (Gemini-specific).
--- Can bypass the LLM call entirely with a synthetic response.
+-- | BeforeModel hook response.
+-- Fires before the LLM call. Can modify the request or bypass the LLM entirely
+-- with a synthetic response. Currently triggered by Gemini; runtime-agnostic.
 data BeforeModelOutput
   = -- | Allow with optional modified llm_request
     BeforeModelAllow (Maybe Value)
@@ -362,8 +376,9 @@ denyBeforeModel = BeforeModelDeny
 syntheticBeforeModel :: Value -> BeforeModelOutput
 syntheticBeforeModel = BeforeModelSynthetic
 
--- | AfterModel hook response (Gemini-specific).
+-- | AfterModel hook response.
 -- Fires per LLM response chunk. Can rewrite, discard, or halt.
+-- Currently triggered by Gemini; runtime-agnostic.
 data AfterModelOutput
   = -- | Allow with optional rewritten llm_response chunk
     AfterModelAllow (Maybe Value)

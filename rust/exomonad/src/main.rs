@@ -7,9 +7,11 @@
 //! WASM plugins are loaded from file (server-side only).
 
 mod app_state;
+mod dashboard;
 mod init;
 mod logging;
 mod mcp_stdio;
+mod models;
 mod new;
 mod serve;
 mod uds_client;
@@ -22,7 +24,10 @@ use clap::{Parser, Subcommand};
 use exomonad_core::protocol::{Runtime as HookRuntime, ServiceRequest};
 use std::time::{Duration, Instant};
 
-use exomonad_core::{HookEnvelope, HookEventType};
+use exomonad_core::{
+    codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload, HookEnvelope,
+    HookEventType,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tracing::warn;
@@ -61,9 +66,39 @@ enum Commands {
         /// Optionally override session name (default: from config)
         #[arg(long)]
         session: Option<String>,
-        /// Delete existing session and create fresh (use after binary/layout updates)
+        /// Delete existing session and create fresh
         #[arg(long)]
         recreate: bool,
+        /// Use OpenCode as the root TL agent (default: Claude)
+        #[arg(long)]
+        opencode_as_tl: bool,
+        /// Enable OpenRouter for LLM routing
+        #[arg(long)]
+        openrouter: bool,
+        /// Set root agent type (overrides --opencode-as-tl)
+        #[arg(long)]
+        tl: Option<String>,
+        /// Set spawn agent type for workers/teammates
+        #[arg(long)]
+        worker: Option<String>,
+        /// Model for the root TL when --tl=opencode (e.g. anthropic/claude-sonnet-4-5).
+        /// Default: opencode picks (uses its built-in default model).
+        #[arg(long)]
+        tl_model: Option<String>,
+        /// Model for spawned workers when --worker=opencode.
+        /// Default: opencode picks (uses its built-in default model).
+        #[arg(long)]
+        worker_model: Option<String>,
+        /// Set reviewer agent type (claude|opencode). Overrides [reviewer] in config.toml.
+        #[arg(long)]
+        reviewer: Option<String>,
+        /// Model for the reviewer agent. Validated against the agent type.
+        #[arg(long)]
+        reviewer_model: Option<String>,
+        /// Enable verbose observability logging: hooks, Chainlink commands, decisions, reviewer spawns, Forgejo CI events.
+        /// Sets RUST_LOG=info, EXOMONAD_HOOK_TRACE=1, and EXOMONAD_CHAINLINK_TRACE=1 on the server; EXOMONAD_VERBOSE=1 session-wide.
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Initialize a new exomonad project in the current directory.
@@ -96,6 +131,13 @@ enum Commands {
         name: String,
     },
 
+    /// Show the live Forgejo and agent watcher dashboard
+    Watch {
+        /// Refresh interval in seconds
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+    },
+
     /// Reply to a UI request
     Reply {
         /// Request ID
@@ -109,6 +151,16 @@ enum Commands {
         /// Cancel the request
         #[arg(long)]
         cancel: bool,
+    },
+
+    /// List available models per agent harness.
+    Models {
+        /// Harness: opencode, gemini, or claude. Omit for all.
+        #[arg(value_name = "HARNESS")]
+        harness: Option<String>,
+        /// Provider filter (opencode only). E.g. "anthropic", "openai".
+        #[arg(value_name = "PROVIDER")]
+        provider: Option<String>,
     },
 
     /// Reload WASM plugins (clears plugin cache, next call loads fresh from disk)
@@ -132,7 +184,12 @@ async fn main() -> Result<()> {
 
     let agent_id = std::env::var("EXOMONAD_AGENT_ID").unwrap_or_else(|_| "root".to_string());
     let service_name = format!("exomonad/{}", agent_id);
-    let _guard = logging::init(config.otlp_endpoint.as_deref(), &service_name);
+    let _guard = match &cli.command {
+        Commands::McpStdio { role, name } => {
+            logging::init_mcp_stdio(config.otlp_endpoint.as_deref(), &service_name, role, name)
+        }
+        _ => logging::init(config.otlp_endpoint.as_deref(), &service_name),
+    };
 
     match cli.command {
         Commands::McpStdio { ref role, ref name } => {
@@ -158,7 +215,16 @@ async fn main() -> Result<()> {
             return serve::run(&config).await;
         }
 
+        Commands::Watch { interval } => {
+            return dashboard::run(&config, Duration::from_secs(interval.max(1))).await;
+        }
+
         Commands::Hook { event, runtime } => {
+            let fail_open_stdout = || match runtime {
+                HookRuntime::Codex => codex_noop_envelope().stdout,
+                _ => r#"{"continue":true}"#.to_string(),
+            };
+
             let mut path = format!("/hook?event={}&runtime={}", event, runtime);
             if let Ok(agent_id) = std::env::var("EXOMONAD_AGENT_ID") {
                 path.push_str(&format!("&agent_id={}", encode(&agent_id)));
@@ -191,7 +257,7 @@ async fn main() -> Result<()> {
                 match found {
                     Some(s) => s,
                     None => {
-                        println!(r#"{{"continue":true}}"#);
+                        println!("{}", fail_open_stdout());
                         return Ok(());
                     }
                 }
@@ -199,7 +265,7 @@ async fn main() -> Result<()> {
                 match uds_client::find_server_socket() {
                     Ok(s) => s,
                     Err(_) => {
-                        println!(r#"{{"continue":true}}"#);
+                        println!("{}", fail_open_stdout());
                         return Ok(());
                     }
                 }
@@ -213,23 +279,59 @@ async fn main() -> Result<()> {
                     serde_json::json!({})
                 }
             };
+            let json_body = match runtime {
+                HookRuntime::Codex => normalize_codex_hook_payload(event, json_body),
+                _ => json_body,
+            };
 
             match client
                 .post_json::<serde_json::Value, HookEnvelope>(&path, &json_body)
                 .await
             {
-                Ok(resp) => {
+                Ok(mut resp) => {
+                    if runtime == HookRuntime::Codex {
+                        resp = format_codex_hook_response(event, resp);
+                    }
                     print!("{}", resp.stdout);
                     if resp.exit_code != 0 {
                         std::process::exit(resp.exit_code);
                     }
                 }
-                Err(_) => println!(r#"{{"continue":true}}"#),
+                Err(_) => println!("{}", fail_open_stdout()),
             }
         }
 
-        Commands::Init { session, recreate } => {
-            init::run(session, recreate).await?;
+        Commands::Init {
+            session,
+            recreate,
+            opencode_as_tl,
+            openrouter,
+            tl,
+            worker,
+            tl_model,
+            worker_model,
+            reviewer,
+            reviewer_model,
+            verbose,
+        } => {
+            if let Err(e) = init::run(
+                session,
+                recreate,
+                opencode_as_tl,
+                openrouter,
+                tl,
+                worker,
+                tl_model,
+                worker_model,
+                reviewer,
+                reviewer_model,
+                verbose,
+            )
+            .await
+            {
+                tracing::error!(error = %e, "exomonad init failed: {:#}", e);
+                return Err(e);
+            }
         }
 
         Commands::New { name } => {
@@ -266,6 +368,10 @@ async fn main() -> Result<()> {
             let resp: serde_json::Value =
                 client.post_json("/reload", &serde_json::json!({})).await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+
+        Commands::Models { harness, provider } => {
+            return models::run(harness, provider).await;
         }
 
         Commands::Shutdown => {

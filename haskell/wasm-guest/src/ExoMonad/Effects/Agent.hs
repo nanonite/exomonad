@@ -12,13 +12,19 @@ module ExoMonad.Effects.Agent
     AgentSpawnGeminiTeammate,
     AgentSpawnWorker,
     AgentSpawnSubtree,
+    AgentSpawnReviewer,
+    AgentCleanupReviewerLeaf,
+    AgentWatcherPrState,
     AgentSpawnLeafSubtree,
     AgentSpawnAcp,
     AgentCleanup,
+    AgentDisposeOrphan,
     AgentCleanupBatch,
     AgentCleanupMerged,
     AgentList,
     AgentCloseSelf,
+    AgentCloseWorkerPane,
+    AgentCloseIssueAndCleanup,
 
     -- * Re-exported proto types
     module Effects.Agent,
@@ -68,6 +74,27 @@ instance Effect AgentSpawnSubtree where
   type Output AgentSpawnSubtree = SpawnSubtreeResponse
   effectId = "agent.spawn_subtree"
 
+data AgentSpawnReviewer
+
+instance Effect AgentSpawnReviewer where
+  type Input AgentSpawnReviewer = SpawnReviewerRequest
+  type Output AgentSpawnReviewer = SpawnReviewerResponse
+  effectId = "agent.spawn_reviewer"
+
+data AgentCleanupReviewerLeaf
+
+instance Effect AgentCleanupReviewerLeaf where
+  type Input AgentCleanupReviewerLeaf = CleanupReviewerLeafRequest
+  type Output AgentCleanupReviewerLeaf = CleanupReviewerLeafResponse
+  effectId = "agent.cleanup_reviewer_leaf"
+
+data AgentWatcherPrState
+
+instance Effect AgentWatcherPrState where
+  type Input AgentWatcherPrState = WatcherPrStateRequest
+  type Output AgentWatcherPrState = WatcherPrStateResponse
+  effectId = "agent.watcher_pr_state"
+
 data AgentSpawnLeafSubtree
 
 instance Effect AgentSpawnLeafSubtree where
@@ -88,6 +115,13 @@ instance Effect AgentCleanup where
   type Input AgentCleanup = CleanupRequest
   type Output AgentCleanup = CleanupResponse
   effectId = "agent.cleanup"
+
+data AgentDisposeOrphan
+
+instance Effect AgentDisposeOrphan where
+  type Input AgentDisposeOrphan = DisposeOrphanRequest
+  type Output AgentDisposeOrphan = DisposeOrphanResponse
+  effectId = "agent.dispose_orphan"
 
 data AgentCleanupBatch
 
@@ -116,3 +150,17 @@ instance Effect AgentCloseSelf where
   type Input AgentCloseSelf = CloseSelfRequest
   type Output AgentCloseSelf = CloseSelfResponse
   effectId = "agent.close_self"
+
+data AgentCloseWorkerPane
+
+instance Effect AgentCloseWorkerPane where
+  type Input AgentCloseWorkerPane = CloseWorkerPaneRequest
+  type Output AgentCloseWorkerPane = CloseWorkerPaneResponse
+  effectId = "agent.close_worker_pane"
+
+data AgentCloseIssueAndCleanup
+
+instance Effect AgentCloseIssueAndCleanup where
+  type Input AgentCloseIssueAndCleanup = CloseIssueAndCleanupRequest
+  type Output AgentCloseIssueAndCleanup = CloseIssueAndCleanupResponse
+  effectId = "agent.close_issue_and_cleanup"

@@ -1,14 +1,11 @@
-// File PR service - creates/updates GitHub PRs using GitHub API via octocrab
-//
-// Replaces `gh` CLI subprocess calls with octocrab typed API.
+// File PR service - creates/updates Forgejo PRs using the Forgejo REST API.
 
 use crate::domain::{BirthBranch, BranchName, GithubOwner, GithubRepo, PRNumber};
+use crate::services::forgejo::{ForgejoClient, ForgejoPullRequest};
 use crate::services::git;
 use crate::services::git_worktree::GitWorktreeService;
-use crate::services::github::{build_octocrab, map_octo_err, GitHubClient};
 use crate::services::repo;
 use anyhow::{Context, Result};
-use octocrab::params;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -25,6 +22,8 @@ pub struct FilePRInput {
     pub body: String,
     pub base_branch: Option<BranchName>,
     pub working_dir: Option<String>,
+    pub author_agent: Option<String>,
+    pub author_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,27 +35,19 @@ pub struct FilePROutput {
     pub created: bool,
 }
 
-/// Parsed from GitHub API response.
-#[derive(Debug)]
-struct GhPr {
-    number: u64,
-    url: String,
-    head_ref_name: BranchName,
-}
-
 /// Structured errors for file_pr operations.
 #[derive(Debug, thiserror::Error)]
 enum FilePrError {
     #[error("push failed: {0}")]
     Push(String),
 
-    #[error("GitHub PR create failed: {0}")]
+    #[error("Forgejo PR create failed: {0}")]
     Create(String),
 
-    #[error("GitHub PR edit failed: {0}")]
+    #[error("Forgejo PR edit failed: {0}")]
     Update(String),
 
-    #[error("GitHub PR list failed: {0}")]
+    #[error("Forgejo PR list failed: {0}")]
     List(String),
 }
 
@@ -67,49 +58,67 @@ enum FilePrError {
 /// Resolve the base branch for a PR using the `BirthBranch` domain type.
 ///
 /// Priority: explicit override > `BirthBranch::parent()` (dot hierarchy) > "main".
-fn resolve_base_branch(head: &BranchName, explicit: Option<&BranchName>) -> BranchName {
+pub(crate) fn resolve_base_branch(head: &BranchName, explicit: Option<&BranchName>) -> BranchName {
     if let Some(base) = explicit {
         return base.clone();
     }
-    BirthBranch::from(head.as_str())
+    BirthBranch::try_from_str(head.as_str())
+        .expect("validated string input is non-empty")
         .parent()
-        .map(|p| BranchName::from(p.as_str()))
-        .unwrap_or_else(|| BranchName::from("main"))
+        .map(|p| BranchName::try_from_str(p.as_str()).expect("validated string input is non-empty"))
+        .unwrap_or_else(|| {
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        })
+}
+
+fn append_pr_body_metadata(
+    body: &str,
+    author_agent: Option<&str>,
+    author_role: Option<&str>,
+    head_branch: &BranchName,
+) -> String {
+    let extracted_agent = git::extract_agent_id(head_branch.as_str());
+    let author_agent = author_agent
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .or(extracted_agent.as_deref())
+        .unwrap_or_else(|| head_branch.as_str());
+    let author_role = author_role
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("dev");
+    format!(
+        "{}
+
+---
+Authoring-Agent: {}
+Authoring-Role:  {}
+Birth-Branch:    {}",
+        body.trim_end(),
+        author_agent,
+        author_role,
+        head_branch.as_str()
+    )
 }
 
 // ============================================================================
-// Octocrab operations
+// Forgejo operations
 // ============================================================================
 
 async fn find_existing_pr(
-    octo: &octocrab::Octocrab,
+    forgejo: &ForgejoClient,
     owner: &GithubOwner,
     repo: &GithubRepo,
     head_branch: &BranchName,
-) -> Result<Option<GhPr>, FilePrError> {
-    // GitHub API requires `owner:ref-name` format for the `head` parameter.
-    // Without the prefix, GitHub returns unfiltered results.
-    let qualified_head = format!("{}:{}", owner, head_branch);
-    let page = octo
-        .pulls(owner.as_str(), repo.as_str())
-        .list()
-        .head(&qualified_head)
-        .state(params::State::Open)
-        .per_page(1)
-        .send()
+) -> Result<Option<ForgejoPullRequest>, FilePrError> {
+    forgejo
+        .find_open_pull_request(owner, repo, head_branch)
         .await
-        .map_err(|e| FilePrError::List(map_octo_err(e)))?;
-
-    let pr = page.into_iter().next().map(|p| GhPr {
-        number: p.number,
-        url: p.html_url.map(|u| u.to_string()).unwrap_or_default(),
-        head_ref_name: BranchName::from(p.head.ref_field.as_str()),
-    });
-    Ok(pr)
+        .map_err(|e| FilePrError::List(e.to_string()))
 }
 
 async fn update_pr(
-    octo: &octocrab::Octocrab,
+    forgejo: &ForgejoClient,
     owner: &GithubOwner,
     repo: &GithubRepo,
     number: PRNumber,
@@ -117,59 +126,38 @@ async fn update_pr(
     body: &str,
     base: &BranchName,
 ) -> Result<(), FilePrError> {
-    octo.pulls(owner.as_str(), repo.as_str())
-        .update(number.as_u64())
-        .title(title)
-        .body(body)
-        .base(base.as_str())
-        .send()
+    forgejo
+        .update_pull_request(owner, repo, number, title, body, base)
         .await
-        .map_err(|e| FilePrError::Update(map_octo_err(e)))?;
-    Ok(())
+        .map_err(|e| FilePrError::Update(e.to_string()))
 }
 
 async fn create_pr(
-    octo: &octocrab::Octocrab,
+    forgejo: &ForgejoClient,
     owner: &GithubOwner,
     repo: &GithubRepo,
     title: &str,
     body: &str,
     base: &BranchName,
     head: &BranchName,
-) -> Result<GhPr, FilePrError> {
-    let pr = octo
-        .pulls(owner.as_str(), repo.as_str())
-        .create(title, head.as_str(), base.as_str())
-        .body(body)
-        .send()
+) -> Result<ForgejoPullRequest, FilePrError> {
+    forgejo
+        .create_pull_request(owner, repo, title, body, base, head)
         .await
-        .map_err(|e| FilePrError::Create(map_octo_err(e)))?;
-
-    Ok(GhPr {
-        number: pr.number,
-        url: pr.html_url.map(|u| u.to_string()).unwrap_or_default(),
-        head_ref_name: BranchName::from(pr.head.ref_field.as_str()),
-    })
+        .map_err(|e| FilePrError::Create(e.to_string()))
 }
 
 // ============================================================================
 // Main implementation
 // ============================================================================
 
-/// File a PR using GitHub API. Pushes the branch, creates or updates the PR.
-///
-/// If `github` is provided, uses its managed client. Otherwise falls back to `build_octocrab()`.
+/// File a PR using the Forgejo REST API. Pushes the branch, creates or updates the PR.
 pub async fn file_pr_async(
     input: &FilePRInput,
     git_wt: Arc<GitWorktreeService>,
-    github: Option<&GitHubClient>,
+    forgejo: &ForgejoClient,
 ) -> Result<FilePROutput> {
     let dir = input.working_dir.as_deref().unwrap_or(".");
-    let octo = match github {
-        Some(client) => client.get().await?,
-        None => build_octocrab()?,
-    };
-    let repo_info = repo::get_repo_info(dir).await?;
 
     // Get branch from the agent's working directory, not server CWD
     let dir_path = std::path::PathBuf::from(dir);
@@ -180,9 +168,16 @@ pub async fn file_pr_async(
             .context("spawn_blocking failed")?
             .context("Failed to get workspace bookmark")?
             .ok_or_else(|| anyhow::anyhow!("No bookmark found for workspace at {}", dir))?;
-    let head = BranchName::from(head_str.as_str());
+    let head =
+        BranchName::try_from_str(head_str.as_str()).expect("validated string input is non-empty");
 
     let base = resolve_base_branch(&head, input.base_branch.as_ref());
+    let pr_body = append_pr_body_metadata(
+        &input.body,
+        input.author_agent.as_deref(),
+        input.author_role.as_deref(),
+        &head,
+    );
 
     info!("[FilePR] head={} base={} dir={}", head, base, dir);
 
@@ -198,18 +193,20 @@ pub async fn file_pr_async(
         info!("[FilePR] Pushed bookmark: {}", head);
     }
 
+    let repo_info = repo::get_repo_info(dir).await?;
+
     // Check for existing PR
-    let existing = find_existing_pr(&octo, &repo_info.owner, &repo_info.repo, &head).await?;
+    let existing = find_existing_pr(forgejo, &repo_info.owner, &repo_info.repo, &head).await?;
     if let Some(pr) = existing {
-        let pr_number = PRNumber::new(pr.number);
+        let pr_number = pr.number;
         info!("[FilePR] Updating existing PR #{}", pr_number);
         update_pr(
-            &octo,
+            forgejo,
             &repo_info.owner,
             &repo_info.repo,
             pr_number,
             &input.title,
-            &input.body,
+            &pr_body,
             &base,
         )
         .await?;
@@ -217,7 +214,7 @@ pub async fn file_pr_async(
         return Ok(FilePROutput {
             pr_url: pr.url,
             pr_number,
-            head_branch: pr.head_ref_name,
+            head_branch: pr.head_ref,
             base_branch: base,
             created: false,
         });
@@ -226,11 +223,11 @@ pub async fn file_pr_async(
     // Create new PR
     info!("[FilePR] Creating PR: {}", input.title);
     let pr = create_pr(
-        &octo,
+        forgejo,
         &repo_info.owner,
         &repo_info.repo,
         &input.title,
-        &input.body,
+        &pr_body,
         &base,
         &head,
     )
@@ -243,7 +240,7 @@ pub async fn file_pr_async(
                 Ok(agent_id) => {
                     let event = crate::ui_protocol::AgentEvent::PrFiled {
                         agent_id,
-                        pr_number: PRNumber::new(pr.number),
+                        pr_number: pr.number,
                         timestamp: tmux_events::now_iso8601(),
                     };
                     if let Err(e) = tmux_events::emit_event(&session, &event) {
@@ -262,8 +259,8 @@ pub async fn file_pr_async(
 
     Ok(FilePROutput {
         pr_url: pr.url,
-        pr_number: PRNumber::new(pr.number),
-        head_branch: pr.head_ref_name,
+        pr_number: pr.number,
+        head_branch: pr.head_ref,
         base_branch: base,
         created: true,
     })
@@ -279,70 +276,98 @@ mod tests {
 
     #[test]
     fn test_resolve_base_branch_explicit_override() {
-        let head = BranchName::from("main.feat");
-        let explicit = BranchName::from("develop");
+        let head =
+            BranchName::try_from_str("main.feat").expect("literal validated string is non-empty");
+        let explicit =
+            BranchName::try_from_str("develop").expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, Some(&explicit)),
-            BranchName::from("develop")
+            BranchName::try_from_str("develop").expect("literal validated string is non-empty")
         );
     }
 
     #[test]
     fn test_resolve_base_branch_root_no_dots() {
-        let head = BranchName::from("my-branch");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head =
+            BranchName::try_from_str("my-branch").expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
     fn test_resolve_base_branch_single_dot() {
-        let head = BranchName::from("main.my-feature");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head = BranchName::try_from_str("main.my-feature")
+            .expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
     fn test_resolve_base_branch_double_dot() {
-        let head = BranchName::from("main.auth-service.middleware");
+        let head = BranchName::try_from_str("main.auth-service.middleware")
+            .expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, None),
-            BranchName::from("main.auth-service")
+            BranchName::try_from_str("main.auth-service")
+                .expect("literal validated string is non-empty")
         );
     }
 
     #[test]
     fn test_resolve_base_branch_deep_nesting() {
-        let head = BranchName::from("main.a.b.c.d.e");
+        let head = BranchName::try_from_str("main.a.b.c.d.e")
+            .expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, None),
-            BranchName::from("main.a.b.c.d")
+            BranchName::try_from_str("main.a.b.c.d")
+                .expect("literal validated string is non-empty")
         );
     }
 
     #[test]
     fn test_resolve_base_branch_agent_suffixed() {
-        let head = BranchName::from("main.fix-auth-gemini");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head = BranchName::try_from_str("main.fix-auth-gemini")
+            .expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
     fn test_resolve_base_branch_agent_suffixed_nested() {
-        let head = BranchName::from("main.tl-auth-claude.fix-oauth-gemini");
+        let head = BranchName::try_from_str("main.tl-auth-claude.fix-oauth-gemini")
+            .expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, None),
-            BranchName::from("main.tl-auth-claude")
+            BranchName::try_from_str("main.tl-auth-claude")
+                .expect("literal validated string is non-empty")
         );
     }
 
     #[test]
     fn test_resolve_base_branch_no_slash_convention() {
         // Slash convention is dead — no dots means fallback to "main"
-        let head = BranchName::from("feature/my-work");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head = BranchName::try_from_str("feature/my-work")
+            .expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
     fn test_resolve_base_branch_none_explicit() {
-        let head = BranchName::from("main.feat");
-        assert_eq!(resolve_base_branch(&head, None), BranchName::from("main"));
+        let head =
+            BranchName::try_from_str("main.feat").expect("literal validated string is non-empty");
+        assert_eq!(
+            resolve_base_branch(&head, None),
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
     }
 
     #[test]
@@ -357,11 +382,18 @@ mod tests {
             "main.tl-auth-claude.fix-oauth-gemini",
         ];
         for case in &cases {
-            let head = BranchName::from(*case);
-            let expected = BirthBranch::from(*case)
+            let head =
+                BranchName::try_from_str(*case).expect("validated string input is non-empty");
+            let expected = BirthBranch::try_from_str(*case)
+                .expect("validated string input is non-empty")
                 .parent()
-                .map(|p| BranchName::from(p.as_str()))
-                .unwrap_or_else(|| BranchName::from("main"));
+                .map(|p| {
+                    BranchName::try_from_str(p.as_str())
+                        .expect("validated string input is non-empty")
+                })
+                .unwrap_or_else(|| {
+                    BranchName::try_from_str("main").expect("literal validated string is non-empty")
+                });
             assert_eq!(
                 resolve_base_branch(&head, None),
                 expected,
@@ -375,10 +407,12 @@ mod tests {
     fn test_resolve_base_branch_depth_4() {
         assert_eq!(
             resolve_base_branch(
-                &BranchName::from("main.core-eval.optimize.inline.inline-coalg"),
+                &BranchName::try_from_str("main.core-eval.optimize.inline.inline-coalg")
+                    .expect("literal validated string is non-empty"),
                 None
             ),
-            BranchName::from("main.core-eval.optimize.inline")
+            BranchName::try_from_str("main.core-eval.optimize.inline")
+                .expect("literal validated string is non-empty")
         );
     }
 
@@ -395,9 +429,12 @@ mod tests {
             body: "Test Body".to_string(),
             base_branch: None,
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+            author_agent: Some("test-agent".to_string()),
+            author_role: Some("dev".to_string()),
         };
 
-        let result = file_pr_async(&input, git_wt, None).await;
+        let forgejo = ForgejoClient::new("http://forgejo.local", "token").unwrap();
+        let result = file_pr_async(&input, git_wt, forgejo.as_ref()).await;
         assert!(result.is_err());
 
         Ok(())
@@ -448,15 +485,18 @@ mod tests {
             body: "Test Body".to_string(),
             base_branch: None,
             working_dir: Some(dir.to_string_lossy().to_string()),
+            author_agent: Some("test-agent".to_string()),
+            author_role: Some("dev".to_string()),
         };
 
-        let result = file_pr_async(&input, git_wt, None).await;
+        let forgejo = ForgejoClient::new("http://forgejo.local", "token").unwrap();
+        let result = file_pr_async(&input, git_wt, forgejo.as_ref()).await;
 
         if let Err(ref e) = result {
             let err_msg = e.to_string();
             assert!(
-                err_msg.contains("push failed") || err_msg.contains("GitHub token"),
-                "Expected push or token error, got: {}",
+                err_msg.contains("push failed") || err_msg.contains("Failed to get remote URL"),
+                "Expected push or remote error, got: {}",
                 err_msg
             );
         } else {
@@ -511,9 +551,13 @@ mod tests {
         assert_eq!(bookmark, Some("main.feat-a-gemini".to_string()));
 
         // Verify base detection via resolve_base_branch
-        let head = BranchName::from("main.feat-a-gemini");
+        let head = BranchName::try_from_str("main.feat-a-gemini")
+            .expect("literal validated string is non-empty");
         let base = resolve_base_branch(&head, None);
-        assert_eq!(base, BranchName::from("main"));
+        assert_eq!(
+            base,
+            BranchName::try_from_str("main").expect("literal validated string is non-empty")
+        );
 
         Ok(())
     }

@@ -14,9 +14,11 @@ module ExoMonad.Guest.Events.Templates
     reviewTimeout,
     fixesPushed,
     commitsPushed,
-    copilotReviewReceived,
+    reviewReceived,
     siblingMerged,
     ciStatus,
+    mergeReady,
+    stuck,
   )
 where
 
@@ -60,13 +62,13 @@ fixesPushed n ci =
       "pending" -> " CI running \x2014 merge when green."
       _ -> " CI status: " <> ci <> "."
 
--- | Copilot posted review comments — injected into the agent's pane.
+-- | Reviewer posted review comments — injected into the agent's pane.
 --
--- >>> copilotReviewReceived 42 "Fix the typo on line 3."
--- "## Copilot Review on PR #42\n\nFix the typo on line 3.\n\nAddress these comments and push fixes."
-copilotReviewReceived :: Int -> Text -> Text
-copilotReviewReceived n comments =
-  "## Copilot Review on PR #"
+-- >>> reviewReceived 42 "Fix the typo on line 3."
+-- "## Review on PR #42\n\nFix the typo on line 3.\n\nAddress these comments and push fixes."
+reviewReceived :: Int -> Text -> Text
+reviewReceived n comments =
+  "## Review on PR #"
     <> T.pack (show n)
     <> "\n\n"
     <> comments
@@ -102,6 +104,17 @@ ciStatus n status branch =
       "failure" -> "\n\nCI failed. Check the logs and fix the issue before proceeding."
       _ -> ""
 
+-- | Review and CI are both satisfied, so the TL can merge.
+mergeReady :: Int -> Text -> Text -> Text
+mergeReady n status branch =
+  "[MERGE READY] PR #"
+    <> T.pack (show n)
+    <> " on branch "
+    <> branch
+    <> " has CI status "
+    <> status
+    <> " and reviewer approval. Merge with `merge_pr` tool."
+
 -- | New commits pushed to a PR — informational notification to parent.
 --
 -- >>> commitsPushed 42 "success"
@@ -116,3 +129,17 @@ commitsPushed n ci =
       "pending" -> " CI running."
       "failure" -> " CI failing."
       _ -> " CI status: " <> ci <> "."
+
+-- | PR stuck after max review rounds — signals TL human intervention needed.
+--
+-- >>> stuck 42 7
+-- "[STUCK: 42, rounds=7] Review did not converge after 7 rounds. Dev leaf remains alive. Ask the human for clarification before continuing."
+stuck :: Int -> Int -> Text
+stuck n rounds_ =
+  "[STUCK: "
+    <> T.pack (show n)
+    <> ", rounds="
+    <> T.pack (show rounds_)
+    <> "] Review did not converge after "
+    <> T.pack (show rounds_)
+    <> " rounds. Dev leaf remains alive. Ask the human for clarification before continuing."

@@ -28,7 +28,7 @@ The parent of `main.feature.auth.middleware` is `main.feature.auth`. PRs always 
 The TL decomposes work and spawns children:
 
 1. TL writes a spec commit (type stubs, interface definitions, failing tests)
-2. TL calls `fork_wave` or `spawn_gemini`
+2. TL calls `fork_wave` or `spawn_leaf`
 3. Server creates a git worktree at `.exo/worktrees/{slug}/`
 4. Server creates a new branch `{parent_branch}.{slug}`
 5. Server creates a tmux window for the child agent
@@ -73,7 +73,7 @@ Each level of the tree is one PR. The merge cascade is not automated — each pa
 ## Implementation
 
 - `fork_wave`: Creates worktree + tmux window for Claude agent (TL role, can spawn children). Depth-capped at 2.
-- `spawn_gemini`: Creates worktree + tmux window for Gemini agent (dev role, files PR).
+- `spawn_leaf`: Creates worktree + tmux window for Gemini agent (dev role, files PR).
 - `spawn_worker`: Creates Gemini pane in parent directory (ephemeral, no worktree, no branch).
 - `file_pr`: Creates PR with auto-detected base branch from dot-separated naming.
 - `merge_pr`: Merges child PR (`gh pr merge` + `git fetch`).

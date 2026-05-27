@@ -1,6 +1,7 @@
 packages:
     haskell/proto
     haskell/vendor/ginger
+    haskell/vendor/freer-simple
     haskell/vendor/proto3-runtime
     haskell/wasm-guest
 

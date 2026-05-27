@@ -2,7 +2,7 @@
 
 Exomonad builds on the agentic loop to provide a Tree-of-agents model where a root 'tech lead' agent forks its context windows across multiple worktrees to recursively unfold an 'agentic tree' that accumulates scaffolding commits and context as it grows. Swarms of fast cheap agents implement specs at the leaf nodes. Each node is an agent that files PRs against its parent over waves of recursively nested trunk based development. Agents form a supervision hierarchy, reviewing and merging PRs filed by their child agents. All agents can communicate with their spawned child agents and their parent agent, using the tree to route messages.
 
-It hooks into Claude Code and Gemini CLI, using their existing binaries and your existing subscription plans. Opus decomposes and dispatches. Gemini implements. Copilot reviews. Each model does what it's best at. All orchestration logic — tool dispatch, hooks, event handling, PR review routing — is defined in Haskell effects executed by a shared Rust server. Agents run in tmux windows and panes, isolated via git worktrees. No Docker, no web dashboard, no new UI to learn.
+It hooks into Claude Code and Gemini CLI, using their existing binaries and your existing subscription plans. Opus decomposes and dispatches. Gemini implements. Reviewer agent reviews. Each model does what it's best at. All orchestration logic — tool dispatch, hooks, event handling, PR review routing — is defined in Haskell effects executed by a shared Rust server. Agents run in tmux windows and panes, isolated via git worktrees. No Docker, no web dashboard, no new UI to learn.
 
 ![tmux devswarm — TL dispatching to three Gemini workers in parallel, each in its own worktree. Bottom panes show workers mid-execution.](img/exomonad_tmux_devswarm.png)
 
@@ -81,8 +81,8 @@ Haskell WASM is a typed configuration DSL — tool schemas, dispatch logic, hook
 
 | Spawn tool | Creates | Isolation | Use case |
 |------------|---------|-----------|----------|
-| `spawn_gemini` (inline) | Gemini panes in your window | Shared directory, no branch | Fast parallel tasks (10-30x cheaper than Opus) |
-| `spawn_gemini` (worktree) | Gemini in own worktree + window | Own branch, files PR | Independent features that need isolation |
+| `spawn_leaf` (inline) | Gemini panes in your window | Shared directory, no branch | Fast parallel tasks (10-30x cheaper than Opus) |
+| `spawn_leaf` (worktree) | Gemini in own worktree + window | Own branch, files PR | Independent features that need isolation |
 | `fork_wave` | Claude in own worktree + window | Own branch, can spawn children | Complex decomposition (TL role, recursive) |
 
 **Communication:** Child agents call `notify_parent` when done. Messages arrive in your Claude conversation as native teammate notifications via the Teams inbox. No polling, no stdin hacks.
@@ -92,7 +92,7 @@ Haskell WASM is a typed configuration DSL — tool schemas, dispatch logic, hook
 | Tool | Role | Description |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree |
-| `spawn_gemini` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
+| `spawn_leaf` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
 | `file_pr` | tl, dev | Create or update a PR for the current branch |
 | `merge_pr` | root, tl | Merge a child agent's PR and fetch changes |
 | `notify_parent` | tl, dev, worker | Send message to parent agent via Teams inbox |
@@ -106,6 +106,7 @@ Haskell WASM is a typed configuration DSL — tool schemas, dispatch logic, hook
 ```bash
 just install-all-dev    # Full build (WASM + Rust + install)
 just wasm-all           # Rebuild WASM only (after Haskell changes)
+just role-hook-tests    # Run devswarm role hook/state-machine tests in WASM
 just proto-gen          # Regenerate proto types (Rust + Haskell)
 cargo test --workspace  # Rust tests
 just fmt                # Format all code

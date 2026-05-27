@@ -10,6 +10,7 @@ Usage:
 Endpoints:
     GET  /repos/{owner}/{repo}/pulls          - List open PRs
     POST /repos/{owner}/{repo}/pulls          - Create a PR
+    PATCH /repos/{owner}/{repo}/pulls/{n}     - Update PR body/title
     PUT  /repos/{owner}/{repo}/pulls/{n}/merge - Merge a PR
     GET  /repos/{owner}/{repo}/pulls/{n}/reviews - Get reviews (from review queue)
     GET  /repos/{owner}/{repo}/pulls/{n}      - Get PR details
@@ -273,13 +274,29 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         # GET /repos/{owner}/{repo}/commits/{sha}/check-runs
         m = re.match(r"^/repos/([^/]+)/([^/]+)/commits/([^/]+)/check-runs$", path)
         if m:
+            owner, repo, sha = m.groups()
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             data = {
                 "total_count": 1,
                 "check_runs": [
                     {
+                        "id": 1,
+                        "node_id": "CR_kw_mock1",
+                        "head_sha": sha,
+                        "url": f"https://api.github.com/repos/{owner}/{repo}/check-runs/1",
+                        "html_url": f"https://github.com/{owner}/{repo}/runs/1",
+                        "details_url": None,
                         "name": "build",
-                        "status": "completed",
                         "conclusion": "success",
+                        "output": {
+                            "title": None,
+                            "summary": None,
+                            "text": None,
+                            "annotations_count": 0,
+                            "annotations_url": f"https://api.github.com/repos/{owner}/{repo}/check-runs/1/annotations",
+                        },
+                        "started_at": now,
+                        "completed_at": now,
                     }
                 ],
             }
@@ -334,6 +351,30 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
 
         return self._send_error(404, "Not Found")
 
+    def do_PATCH(self):
+        path = self._path_only()
+
+        # PATCH /repos/{owner}/{repo}/pulls/{n} — update PR body/title
+        m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls/(\d+)$", path)
+        if m:
+            pr_number = int(m.group(3))
+            if pr_number not in state.prs:
+                return self._send_error(404, "PR not found")
+            try:
+                data = self._read_body()
+                pr = state.prs[pr_number]
+                if "body" in data:
+                    pr["body"] = data["body"]
+                if "title" in data:
+                    pr["title"] = data["title"]
+                pr["updated_at"] = datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat()
+                return self._send_json(pr)
+            except json.JSONDecodeError:
+                return self._send_error(400, "Invalid JSON")
+
+        return self._send_error(404, "Not Found")
 
 def run_server():
     parser = argparse.ArgumentParser(description="Mock GitHub API server")

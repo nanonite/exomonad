@@ -14,8 +14,8 @@ Use exomonad MCP tools for orchestration. Git and GitHub operations use `git` an
 
 | Tool | Role | What it does |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel Claude agents (own worktrees, context inherited by default via `fork_session`) |
-| `spawn_gemini` | root, tl | Spawn Gemini agent in own worktree+branch (files PR). Structured spec fields: steps, verify, boundary, context, read_first |
+| `fork_wave` | root, tl | Fork N parallel agents — Claude, Codex, or OpenCode (own worktrees, agent type from config or explicit `agent_type`). Claude inherits context via `--fork-session`; Codex/OpenCode require context injected in the task spec. |
+| `spawn_leaf` | root, tl | Spawn Gemini agent in own worktree+branch (files PR). Structured spec fields: steps, verify, boundary, context, read_first |
 | `spawn_worker` | root, tl | Spawn ephemeral Gemini worker in tmux pane (no branch, no PR). Just name + task |
 | `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) |
 | `merge_pr` | root, tl | Merge a child's PR |
@@ -30,6 +30,8 @@ Use exomonad MCP tools for orchestration. Git and GitHub operations use `git` an
 - **TL (Tech Lead)**: Claude (Opus). Decomposes, specs, scaffolds, spawns, merges. Never implements directly.
 - **Dev (Leaf)**: Gemini. Implements a focused spec, files PR. No spawning.
 - **Worker**: Gemini. Ephemeral pane, no branch. Research or in-place edits.
+
+TL/root roles structurally deny `Edit`, `Write`, `MultiEdit`, and `NotebookEdit` in PreToolUse. That deny is the redispatch nudge, not a transient error: use `send_message` for an existing worker, let the dev leaf address reviewer feedback, or re-decompose with `spawn_leaf` / `spawn_worker`.
 
 ## The TL Protocol: Scaffold-Fork-Converge
 
@@ -50,8 +52,8 @@ Commit and push. Children fork from this commit.
 
 Spawn children for wave N. Zero dependencies between siblings in the same wave.
 
-- **Sub-TLs**: `fork_wave` (Claude). They inherit full conversation context — they already know the plan and the scaffolding.
-- **Devs**: `spawn_gemini` (Gemini, worktree). They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
+- **Sub-TLs**: `fork_wave` (Claude, Codex, or OpenCode — agent type from config or explicit `agent_type`). Claude inherits context via `--fork-session`. Codex and OpenCode have no team messaging — context must be explicitly injected in the task spec.
+- **Devs**: `spawn_leaf` (Gemini, worktree). They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
 - **Workers**: `spawn_worker` (Gemini, ephemeral pane). Research, boilerplate, or non-conflicting edits.
 
 ### 3. Converge (merge wave)
@@ -84,15 +86,16 @@ Include complete code snippets. Name every file by full path. Include exact comm
 
 ## Convergence Protocol
 
-The TL does NOT iterate on children's work. Convergence is **leaf + Copilot**, not TL:
+The TL does NOT iterate on children's work. Convergence is **leaf + reviewer**, not TL:
 
 1. Leaf implements spec, commits, files PR
-2. Copilot reviews automatically on PR creation
-3. If Copilot requests changes → injected into leaf's pane → leaf fixes → pushes
-4. System notifies parent: `[FIXES PUSHED]`, `[PR READY]`, or `[REVIEW TIMEOUT]`
+2. Reviewer agent reviews automatically on PR creation
+3. If reviewer requests changes → injected into leaf's pane → leaf fixes → pushes
+4. System notifies parent: `[FIXES PUSHED]`, `[PR READY]`, `[REVIEW TIMEOUT]`, or `[STUCK]`
 5. TL merges when notified
 
 The TL never manually reviews code, never fixes a leaf's implementation.
+See `.exo/review-policy.toml` for review round limits, timeouts, and complexity thresholds.
 
 ## Branch Naming
 

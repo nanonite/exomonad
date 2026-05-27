@@ -2,7 +2,7 @@
 //!
 //! Uses proto-generated types from `exomonad_proto::effects::github`.
 
-use crate::domain::{BranchName, IssueNumber, PRNumber};
+use crate::domain::{BranchName, GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use crate::effects::{
     dispatch_github_effect, EffectError, EffectHandler, EffectResult, GitHubEffects,
 };
@@ -185,30 +185,6 @@ impl GitHubEffects for GitHubHandler {
         })
     }
 
-    async fn get_pull_request_for_branch(
-        &self,
-        req: GetPullRequestForBranchRequest,
-        _ctx: &crate::effects::EffectContext,
-    ) -> EffectResult<GetPullRequestForBranchResponse> {
-        tracing::info!(owner = %req.owner, repo = %req.repo, branch = %req.branch, "[GitHub] get_pull_request_for_branch starting");
-        let repo = make_repo(&req.owner, &req.repo);
-
-        let branch = BranchName::from(req.branch.as_str());
-
-        let result = self
-            .service
-            .get_pr_for_branch(&repo, &branch)
-            .await
-            .map_err(|e| EffectError::network_error(e.to_string()))?;
-
-        let found = result.is_some();
-        tracing::info!(found, branch = %req.branch, "[GitHub] get_pull_request_for_branch complete");
-        Ok(GetPullRequestForBranchResponse {
-            pull_request: result.map(convert_pr),
-            found,
-        })
-    }
-
     async fn create_pull_request(
         &self,
         req: CreatePullRequestRequest,
@@ -220,11 +196,13 @@ impl GitHubEffects for GitHubHandler {
         let spec = CreatePRSpec {
             title: req.title,
             body: req.body,
-            head: BranchName::from(req.head.as_str()),
+            head: BranchName::try_from_str(req.head.as_str())
+                .expect("validated string input is non-empty"),
             base: if req.base.is_empty() {
-                BranchName::from("main")
+                BranchName::try_from_str("main").expect("literal validated string is non-empty")
             } else {
-                BranchName::from(req.base.as_str())
+                BranchName::try_from_str(req.base.as_str())
+                    .expect("validated string input is non-empty")
             },
         };
 
@@ -287,8 +265,8 @@ impl GitHubEffects for GitHubHandler {
 
 fn make_repo(owner: &str, repo: &str) -> Repo {
     Repo {
-        owner: owner.into(),
-        name: repo.into(),
+        owner: GithubOwner::try_from_str(owner).expect("test GitHub owner fixture is non-empty"),
+        name: GithubRepo::try_from_str(repo).expect("test GitHub repo fixture is non-empty"),
     }
 }
 
@@ -390,8 +368,10 @@ mod tests {
 
     fn test_ctx() -> EffectContext {
         EffectContext {
-            agent_name: AgentName::from("test"),
-            birth_branch: BirthBranch::from("main"),
+            agent_name: AgentName::try_from_str("test")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty"),
             working_dir: std::path::PathBuf::from("."),
         }
     }

@@ -20,6 +20,7 @@ module ExoMonad.Guest.Effects.AgentControl
     spawnLeafSubtree,
     spawnWorker,
     spawnAcp,
+    closeWorkerPane,
 
     -- * Interpreters
     runAgentControlSuspend,
@@ -33,19 +34,25 @@ module ExoMonad.Guest.Effects.AgentControl
     SpawnLeafSubtreeConfig (..),
     SpawnWorkerConfig (..),
     SpawnAcpConfig (..),
+
+    -- * Helpers
+    agentTypeLabel,
   )
 where
 
 import Control.Monad.Freer (Eff, Member, interpret, send)
-import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, withText, (.:), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, withText, (.:), (.:?), (.=))
+import Data.Aeson qualified as Aeson
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
+import Data.Word (Word64)
 import Effects.Agent qualified as PA
 import Effects.EffectError (EffectError (..), EffectErrorKind (..), InvalidInput (..))
 import ExoMonad.Effects.Agent qualified as Agent
 import ExoMonad.Guest.Proto (fromText, toText)
+import ExoMonad.Guest.Tool.Schema (JsonSchema (..))
 import ExoMonad.Guest.Tool.Suspend.Types (SuspendYield)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
 import ExoMonad.Guest.Types.Permissions
@@ -57,20 +64,31 @@ import Proto3.Suite.Types (Enumerated (..))
 -- ============================================================================
 
 -- | Agent type for spawned agents.
-data AgentType = Claude | Gemini | Shoal
+data AgentType = Claude | Gemini | Shoal | OpenCode | Codex
   deriving (Show, Eq, Generic)
 
 instance ToJSON AgentType where
   toJSON Claude = "claude"
   toJSON Gemini = "gemini"
   toJSON Shoal = "shoal"
+  toJSON OpenCode = "opencode"
+  toJSON Codex = "codex"
 
 instance FromJSON AgentType where
   parseJSON = withText "AgentType" $ \case
     "claude" -> pure Claude
     "gemini" -> pure Gemini
     "shoal" -> pure Shoal
+    "opencode" -> pure OpenCode
+    "codex" -> pure Codex
     other -> fail $ "Invalid agent type: " <> T.unpack other
+
+instance JsonSchema AgentType where
+  toSchema =
+    object
+      [ "type" .= ("string" :: Text),
+        "enum" .= (["claude", "opencode", "codex"] :: [Text])
+      ]
 
 -- | Result of spawning an agent.
 data SpawnResult = SpawnResult
@@ -78,7 +96,8 @@ data SpawnResult = SpawnResult
     branchName :: Text,
     tabName :: Text,
     issueTitle :: Text,
-    agentTypeResult :: Text
+    agentTypeResult :: Text,
+    paneId :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -90,15 +109,17 @@ instance FromJSON SpawnResult where
       <*> v .: "tab_name"
       <*> v .: "issue_title"
       <*> v .: "agent_type"
+      <*> v .:? "pane_id"
 
 instance ToJSON SpawnResult where
-  toJSON (SpawnResult w b t i a) =
+  toJSON (SpawnResult w b t i a p) =
     object
       [ "worktree_path" .= w,
         "branch_name" .= b,
         "tab_name" .= t,
         "issue_title" .= i,
-        "agent_type" .= a
+        "agent_type" .= a,
+        "pane_id" .= p
       ]
 
 -- ============================================================================
@@ -123,7 +144,7 @@ data SpawnSubtreeConfig = SpawnSubtreeConfig
     stcBranchName :: Text,
     stcForkSession :: Bool,
     stcRole :: Maybe Text,
-    stcAgentType :: AgentType,
+    stcAgentType :: Maybe AgentType,
     stcPerms :: PermissionFlags,
     stcWorkingDir :: Maybe Text,
     stcPermissions :: Maybe ClaudePermissions,
@@ -132,12 +153,11 @@ data SpawnSubtreeConfig = SpawnSubtreeConfig
   }
   deriving (Show, Eq, Generic)
 
--- | Configuration for spawning a Gemini leaf subtree agent.
 data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
   { slcTask :: Text,
     slcBranchName :: Text,
     slcRole :: Maybe Text,
-    slcAgentType :: AgentType,
+    slcAgentType :: Maybe AgentType,
     slcPerms :: PermissionFlags,
     slcStandaloneRepo :: Bool,
     slcAllowedDirs :: [Text]
@@ -148,6 +168,7 @@ data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
 data SpawnWorkerConfig = SpawnWorkerConfig
   { swcName :: Text,
     swcPrompt :: Text,
+    swcAgentType :: Maybe AgentType,
     swcPerms :: PermissionFlags
   }
   deriving (Show, Eq, Generic)
@@ -166,6 +187,7 @@ data AgentControl a where
   SpawnLeafSubtreeC :: SpawnLeafSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnWorkerC :: SpawnWorkerConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnAcpC :: SpawnAcpConfig -> AgentControl (Either EffectError SpawnResult)
+  CloseWorkerPaneC :: Text -> AgentControl (Either EffectError PA.CloseWorkerPaneResponse)
 
 -- Smart constructors (manually written - makeSem doesn't work with WASM cross-compilation)
 spawnSubtree :: (Member AgentControl r) => SpawnSubtreeConfig -> Eff r (Either EffectError SpawnResult)
@@ -179,6 +201,9 @@ spawnWorker cfg = send (SpawnWorkerC cfg)
 
 spawnAcp :: (Member AgentControl r) => SpawnAcpConfig -> Eff r (Either EffectError SpawnResult)
 spawnAcp cfg = send (SpawnAcpC cfg)
+
+closeWorkerPane :: (Member AgentControl r) => Text -> Eff r (Either EffectError PA.CloseWorkerPaneResponse)
+closeWorkerPane pane = send (CloseWorkerPaneC pane)
 
 -- ============================================================================
 -- Interpreter (uses yield_effect via Effect typeclass)
@@ -196,7 +221,7 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnSubtreeRequestParentSessionId = fromText "",
               PA.spawnSubtreeRequestForkSession = stcForkSession cfg,
               PA.spawnSubtreeRequestRole = fromText (fromMaybe "" (stcRole cfg)),
-              PA.spawnSubtreeRequestAgentType = Enumerated (Right (toProtoAgentType (stcAgentType cfg))),
+              PA.spawnSubtreeRequestAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (stcAgentType cfg))),
               PA.spawnSubtreeRequestPermissionMode = fromText (fromMaybe "" (permMode (stcPerms cfg))),
               PA.spawnSubtreeRequestAllowedTools = V.fromList (map fromText (allowedTools (stcPerms cfg))),
               PA.spawnSubtreeRequestDisallowedTools = V.fromList (map fromText (disallowedTools (stcPerms cfg))),
@@ -217,7 +242,7 @@ runAgentControlSuspend = interpret $ \case
             { PA.spawnLeafSubtreeRequestTask = fromText (slcTask cfg),
               PA.spawnLeafSubtreeRequestBranchName = fromText (slcBranchName cfg),
               PA.spawnLeafSubtreeRequestRole = fromText (fromMaybe "" (slcRole cfg)),
-              PA.spawnLeafSubtreeRequestAgentType = Enumerated (Right (toProtoAgentType (slcAgentType cfg))),
+              PA.spawnLeafSubtreeRequestAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (slcAgentType cfg))),
               PA.spawnLeafSubtreeRequestPermissionMode = fromText (fromMaybe "" (permMode (slcPerms cfg))),
               PA.spawnLeafSubtreeRequestAllowedTools = V.fromList (map fromText (allowedTools (slcPerms cfg))),
               PA.spawnLeafSubtreeRequestDisallowedTools = V.fromList (map fromText (disallowedTools (slcPerms cfg))),
@@ -237,7 +262,8 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnWorkerRequestPrompt = fromText (swcPrompt cfg),
               PA.spawnWorkerRequestPermissionMode = fromText (fromMaybe "" (permMode (swcPerms cfg))),
               PA.spawnWorkerRequestAllowedTools = V.fromList (map fromText (allowedTools (swcPerms cfg))),
-              PA.spawnWorkerRequestDisallowedTools = V.fromList (map fromText (disallowedTools (swcPerms cfg)))
+              PA.spawnWorkerRequestDisallowedTools = V.fromList (map fromText (disallowedTools (swcPerms cfg))),
+              PA.spawnWorkerRequestAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (swcAgentType cfg)))
             }
     result <- suspendEffect @Agent.AgentSpawnWorker req
     pure $ case result of
@@ -260,6 +286,12 @@ runAgentControlSuspend = interpret $ \case
       Right resp -> case PA.spawnAcpResponseAgent resp of
         Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnAcp succeeded but no agent info returned"))))
         Just info -> Right (protoAgentInfoToSpawnResult info)
+  CloseWorkerPaneC pane -> do
+    let req =
+          PA.CloseWorkerPaneRequest
+            { PA.closeWorkerPaneRequestPaneId = fromText pane
+            }
+    suspendEffect @Agent.AgentCloseWorkerPane req
 
 -- ============================================================================
 -- Conversion helpers
@@ -269,6 +301,15 @@ toProtoAgentType :: AgentType -> PA.AgentType
 toProtoAgentType Claude = PA.AgentTypeAGENT_TYPE_CLAUDE
 toProtoAgentType Gemini = PA.AgentTypeAGENT_TYPE_GEMINI
 toProtoAgentType Shoal = PA.AgentTypeAGENT_TYPE_SHOAL
+toProtoAgentType OpenCode = PA.AgentTypeAGENT_TYPE_OPENCODE
+toProtoAgentType Codex = PA.AgentTypeAGENT_TYPE_CODEX
+
+agentTypeLabel :: AgentType -> Text
+agentTypeLabel Claude = "claude"
+agentTypeLabel Gemini = "gemini"
+agentTypeLabel Shoal = "shoal"
+agentTypeLabel OpenCode = "opencode"
+agentTypeLabel Codex = "codex"
 
 permissionsToProto :: ClaudePermissions -> PA.Permissions
 permissionsToProto perms =
@@ -288,5 +329,10 @@ protoAgentInfoToSpawnResult info =
         Enumerated (Right PA.AgentTypeAGENT_TYPE_CLAUDE) -> "claude"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_GEMINI) -> "gemini"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_SHOAL) -> "shoal"
-        _ -> "unknown"
+        Enumerated (Right PA.AgentTypeAGENT_TYPE_OPENCODE) -> "opencode"
+        Enumerated (Right PA.AgentTypeAGENT_TYPE_CODEX) -> "codex"
+        _ -> "unknown",
+      paneId =
+        let value = toText (PA.agentInfoPaneId info)
+         in if T.null value then Nothing else Just value
     }

@@ -7,31 +7,92 @@
 -- | TL role config: spawn, PR, merge tools with state transitions and stop hook checks.
 module TLRole (config, Tools) where
 
-import Control.Monad (void, forM_, when)
-import Control.Monad.Freer (Eff)
+import Control.Monad (forM_, void, when)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as Aeson
+import Data.Text (Text)
 import ExoMonad
-import ExoMonad.Guest.StateMachine (applyEvent, StopCheckResult(..), checkExit)
-import ExoMonad.Guest.Effects.StopHook (checkUncommittedWork, getCurrentBranch)
-import ExoMonad.Guest.Tools.FilePR (filePRCore, filePRDescription, filePRSchema, FilePRArgs, FilePROutput (..))
-import ExoMonad.Guest.Tools.Events
-  ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs (..)
-  )
-import ExoMonad.Guest.Tools.MergePR (mergePRCore, mergePRDescription, mergePRSchema, mergePRRender, MergePRArgs (..), MergePROutput (..), extractAgentName)
-import ExoMonad.Guest.Tools.Spawn
-  ( forkWaveCore, forkWaveDescription, forkWaveSchema, forkWaveRender, ForkWaveArgs (..), ForkWaveResult (..),
-    spawnGeminiCore, spawnGeminiDescription, spawnGeminiSchema, SpawnGeminiArgs,
-    spawnLeafRender,
-    spawnWorkerToolCore, spawnWorkerToolDescription, spawnWorkerToolSchema, SpawnWorkerToolArgs,
-    spawnAcpCore, SpawnAcpArgs
-  )
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
-import ExoMonad.Guest.Types (StopDecision(..), StopHookOutput(..), blockStopResponse, allowStopResponse, allowResponse, BeforeModelOutput (..), AfterModelOutput (..))
-import ExoMonad.Types (HookConfig (..), Effects, defaultSessionStartHook, teamRegistrationPostToolUse)
-import PRReviewHandler (prReviewEventHandlers)
-import TLPhase (TLPhase (..), TLEvent (..), ChildHandle (..))
+import ExoMonad.Guest.Effects.StopHook (checkUncommittedWork, getCurrentBranch)
+import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
+import ExoMonad.Guest.Tools.Chainlink
+  ( ChainlinkBlock (..),
+    ChainlinkCascade (..),
+    ChainlinkIssueClose (..),
+    ChainlinkIssueComment (..),
+    ChainlinkIssueCreate (..),
+    ChainlinkIssueList (..),
+    ChainlinkIssueShow (..),
+    ChainlinkIssueUpdate (..),
+    ChainlinkMilestoneCreate (..),
+    ChainlinkMilestoneList (..),
+    ChainlinkRelate (..),
+    ChainlinkSessionEnd (..),
+    ChainlinkSessionStart (..),
+    ChainlinkSessionStatus (..),
+    ChainlinkSessionWork (..),
+    ChainlinkSubissueCreate (..),
+    ChainlinkTimerStart (..),
+    ChainlinkTimerStatus (..),
+    ChainlinkTimerStop (..),
+  )
+import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
+import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
+import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
+import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
+import ExoMonad.Guest.Tools.DiscardWorkerOutput (DiscardWorkerOutput (..))
+import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
+import ExoMonad.Guest.Tools.Events
+  ( NotifyParentArgs (..),
+    notifyParentCore,
+    notifyParentDescription,
+    notifyParentSchema,
+  )
+import ExoMonad.Guest.Tools.FilePR (FilePRArgs, FilePROutput (..), filePRCore, filePRDescription, filePRSchema)
+import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
+import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
+import ExoMonad.Guest.Tools.Spawn
+  ( CloseWorkerPaneArgs,
+    ForkWaveArgs (..),
+    ForkWaveResult (..),
+    SpawnAcpArgs,
+    SpawnLeafArgs,
+    SpawnLeafSubtreeArgs,
+    SpawnWorkerToolArgs,
+    closeWorkerPaneCore,
+    closeWorkerPaneDescription,
+    closeWorkerPaneSchema,
+    forkWaveCore,
+    forkWaveDescription,
+    forkWaveRender,
+    forkWaveSchema,
+    spawnAcpCore,
+    spawnLeafCore,
+    spawnLeafDescription,
+    spawnLeafRender,
+    spawnLeafSchema,
+    spawnWorkerToolCore,
+    spawnWorkerToolDescription,
+    spawnWorkerToolSchema,
+  )
+import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
+import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
+import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse)
+import ExoMonad.Types (Effects, HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
+import HookPolicy (preToolUseWithImplementationBlock)
+import PRReviewHandler (tlPRReviewEventHandlers)
+import TLPhase (ChildHandle (..), TLEvent (..), TLPhase (..))
 import TLStopCheck (tlStopCheck)
+
+tlRedispatchMessage :: Text -> Text
+tlRedispatchMessage toolName =
+  "TL agents cannot use "
+    <> toolName
+    <> ". The TL plans and dispatches; implementation belongs to leaves and workers.\n"
+    <> "If a leaf needs to fix code based on review feedback, the leaf does it; reviewer comments are injected into its pane automatically.\n"
+    <> "If a worker is blocked, use send_tmux_message to inject a clarification into the worker's pane. See Worker Correction Loop in .exo/roles/devswarm/context/root.md.\n"
+    <> "If neither path fits, re-decompose with spawn_leaf or spawn_worker.\n"
+    <> "See CLAUDE.md § Tech Lead Praxis for the full protocol."
 
 -- | TL-specific file_pr: files PR, transitions TLPhase.
 data TLFilePR
@@ -47,8 +108,11 @@ instance MCPTool TLFilePR where
       Left err -> pure $ errorResult err
       Right output -> do
         branch <- getCurrentBranch
-        void $ applyEvent @TLPhase @TLEvent branch TLPlanning
-          (OwnPRFiled (fpoNumber output) (fpoUrl output) (fpoHeadBranch output))
+        void $
+          applyEvent @TLPhase @TLEvent
+            branch
+            TLPlanning
+            (OwnPRFiled (fpoNumber output) (fpoUrl output) (fpoHeadBranch output))
         pure $ successResult (Aeson.toJSON output)
 
 -- | TL-specific merge_pr: merges child PR, transitions TLPhase via ChildCompleted.
@@ -86,33 +150,35 @@ instance MCPTool TLForkWave where
       Left err -> pure $ errorResult err
       Right fwResult -> do
         forM_ (fwrSpawned fwResult) $ \(slug, sr) -> do
-          let handle = ChildHandle
-                { chSlug = slug
-                , chBranch = branchName sr
-                , chAgentType = agentTypeResult sr
-                }
+          let handle =
+                ChildHandle
+                  { chSlug = slug,
+                    chBranch = branchName sr,
+                    chAgentType = agentTypeResult sr
+                  }
           branch <- getCurrentBranch
           void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
         pure $ forkWaveRender fwResult
 
--- | TL-specific spawn_gemini: worktree spawn fires ChildSpawned.
-data TLSpawnGemini
+-- | TL-specific spawn_leaf: worktree spawn fires ChildSpawned.
+data TLSpawnLeaf
 
-instance MCPTool TLSpawnGemini where
-  type ToolArgs TLSpawnGemini = SpawnGeminiArgs
-  toolName = "spawn_gemini"
-  toolDescription = spawnGeminiDescription
-  toolSchema = spawnGeminiSchema
+instance MCPTool TLSpawnLeaf where
+  type ToolArgs TLSpawnLeaf = SpawnLeafArgs
+  toolName = "spawn_leaf"
+  toolDescription = spawnLeafDescription
+  toolSchema = spawnLeafSchema
   toolHandlerEff args = do
-    result <- spawnGeminiCore args
+    result <- spawnLeafCore args
     case result of
       Left err -> pure $ errorResult err
       Right (slug, sr) -> do
-        let handle = ChildHandle
-              { chSlug = slug
-              , chBranch = branchName sr
-              , chAgentType = agentTypeResult sr
-              }
+        let handle =
+              ChildHandle
+                { chSlug = slug,
+                  chBranch = branchName sr,
+                  chAgentType = agentTypeResult sr
+                }
         branch <- getCurrentBranch
         void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
         pure $ spawnLeafRender (Right (slug, sr))
@@ -126,6 +192,37 @@ instance MCPTool TLSpawnWorker where
   toolDescription = spawnWorkerToolDescription
   toolSchema = spawnWorkerToolSchema
   toolHandlerEff args = spawnWorkerToolCore args
+
+data TLCloseWorkerPane
+
+instance MCPTool TLCloseWorkerPane where
+  type ToolArgs TLCloseWorkerPane = CloseWorkerPaneArgs
+  toolName = "close_worker_pane"
+  toolDescription = closeWorkerPaneDescription
+  toolSchema = closeWorkerPaneSchema
+  toolHandlerEff args = closeWorkerPaneCore args
+
+data TLSpawnCodex
+
+instance MCPTool TLSpawnCodex where
+  type ToolArgs TLSpawnCodex = SpawnLeafSubtreeArgs
+  toolName = "spawn_codex"
+  toolDescription = spawnCodexDescription
+  toolSchema = spawnCodexSchema
+  toolHandlerEff args = do
+    result <- handleSpawnCodex args
+    case result of
+      Left err -> pure $ errorResult err
+      Right (slug, sr) -> do
+        let handle =
+              ChildHandle
+                { chSlug = slug,
+                  chBranch = branchName sr,
+                  chAgentType = agentTypeResult sr
+                }
+        branch <- getCurrentBranch
+        void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
+        pure $ spawnLeafRender (Right (slug, sr))
 
 -- | TL notify_parent: thin wrapper, no phase transitions.
 data TLNotifyParent
@@ -143,12 +240,40 @@ instance MCPTool TLNotifyParent where
 
 data Tools mode = Tools
   { forkWave :: mode :- TLForkWave,
-    spawnGemini :: mode :- TLSpawnGemini,
+    spawnLeaf :: mode :- TLSpawnLeaf,
     spawnWorker :: mode :- TLSpawnWorker,
+    spawnReviewer :: mode :- SpawnReviewer,
+    cleanupReviewerLeaf :: mode :- CleanupReviewerLeaf,
+    watcherPrState :: mode :- WatcherPrState,
+    closeWorkerPane :: mode :- TLCloseWorkerPane,
+    spawnCodex :: mode :- TLSpawnCodex,
+    sessionStatus :: mode :- SessionStatus,
     pr :: mode :- TLFilePR,
     mergePr :: mode :- TLMergePR,
     notifyParent :: mode :- TLNotifyParent,
-    sendMessage :: mode :- SendMessage
+    sendTmuxMessage :: mode :- SendTmuxMessage,
+    sendMailboxMessage :: mode :- SendMailboxMessage,
+    chainlinkIssueCreate :: mode :- ChainlinkIssueCreate,
+    chainlinkSessionStart :: mode :- ChainlinkSessionStart,
+    chainlinkSessionStatus :: mode :- ChainlinkSessionStatus,
+    chainlinkIssueShow :: mode :- ChainlinkIssueShow,
+    chainlinkIssueComment :: mode :- ChainlinkIssueComment,
+    chainlinkSubissueCreate :: mode :- ChainlinkSubissueCreate,
+    chainlinkSessionWork :: mode :- ChainlinkSessionWork,
+    chainlinkSessionEnd :: mode :- ChainlinkSessionEnd,
+    chainlinkIssueClose :: mode :- ChainlinkIssueClose,
+    closeIssueAndCleanup :: mode :- CloseIssueAndCleanup,
+    cleanupOrphan :: mode :- CleanupOrphan,
+    chainlinkTimerStart :: mode :- ChainlinkTimerStart,
+    chainlinkTimerStop :: mode :- ChainlinkTimerStop,
+    chainlinkTimerStatus :: mode :- ChainlinkTimerStatus,
+    chainlinkIssueList :: mode :- ChainlinkIssueList,
+    chainlinkIssueUpdate :: mode :- ChainlinkIssueUpdate,
+    chainlinkIssueBlock :: mode :- ChainlinkBlock,
+    chainlinkIssueRelate :: mode :- ChainlinkRelate,
+    chainlinkIssueCascade :: mode :- ChainlinkCascade,
+    chainlinkMilestoneCreate :: mode :- ChainlinkMilestoneCreate,
+    chainlinkMilestoneList :: mode :- ChainlinkMilestoneList
   }
   deriving (Generic)
 
@@ -159,16 +284,44 @@ config =
       tools =
         Tools
           { forkWave = mkHandler @TLForkWave,
-            spawnGemini = mkHandler @TLSpawnGemini,
+            spawnLeaf = mkHandler @TLSpawnLeaf,
             spawnWorker = mkHandler @TLSpawnWorker,
+            spawnReviewer = mkHandler @SpawnReviewer,
+            cleanupReviewerLeaf = mkHandler @CleanupReviewerLeaf,
+            watcherPrState = mkHandler @WatcherPrState,
+            closeWorkerPane = mkHandler @TLCloseWorkerPane,
+            spawnCodex = mkHandler @TLSpawnCodex,
+            sessionStatus = mkHandler @SessionStatus,
             pr = mkHandler @TLFilePR,
             mergePr = mkHandler @TLMergePR,
             notifyParent = mkHandler @TLNotifyParent,
-            sendMessage = mkHandler @SendMessage
+            sendTmuxMessage = mkHandler @SendTmuxMessage,
+            sendMailboxMessage = mkHandler @SendMailboxMessage,
+            chainlinkIssueCreate = mkHandler @ChainlinkIssueCreate,
+            chainlinkSessionStart = mkHandler @ChainlinkSessionStart,
+            chainlinkSessionStatus = mkHandler @ChainlinkSessionStatus,
+            chainlinkIssueShow = mkHandler @ChainlinkIssueShow,
+            chainlinkIssueComment = mkHandler @ChainlinkIssueComment,
+            chainlinkSubissueCreate = mkHandler @ChainlinkSubissueCreate,
+            chainlinkSessionWork = mkHandler @ChainlinkSessionWork,
+            chainlinkSessionEnd = mkHandler @ChainlinkSessionEnd,
+            chainlinkIssueClose = mkHandler @ChainlinkIssueClose,
+            closeIssueAndCleanup = mkHandler @CloseIssueAndCleanup,
+            cleanupOrphan = mkHandler @CleanupOrphan,
+            chainlinkTimerStart = mkHandler @ChainlinkTimerStart,
+            chainlinkTimerStop = mkHandler @ChainlinkTimerStop,
+            chainlinkTimerStatus = mkHandler @ChainlinkTimerStatus,
+            chainlinkIssueList = mkHandler @ChainlinkIssueList,
+            chainlinkIssueUpdate = mkHandler @ChainlinkIssueUpdate,
+            chainlinkIssueBlock = mkHandler @ChainlinkBlock,
+            chainlinkIssueRelate = mkHandler @ChainlinkRelate,
+            chainlinkIssueCascade = mkHandler @ChainlinkCascade,
+            chainlinkMilestoneCreate = mkHandler @ChainlinkMilestoneCreate,
+            chainlinkMilestoneList = mkHandler @ChainlinkMilestoneList
           },
       hooks =
         HookConfig
-          { preToolUse = \_ -> pure (allowResponse Nothing),
+          { preToolUse = preToolUseWithImplementationBlock tlRedispatchMessage (\_ -> pure (allowResponse Nothing)),
             postToolUse = teamRegistrationPostToolUse,
             onStop = \_ -> tlStopCheck,
             onSubagentStop = \_ -> tlStopCheck,
@@ -176,5 +329,5 @@ config =
             beforeModel = \_ -> pure (BeforeModelAllow Nothing),
             afterModel = \_ -> pure (AfterModelAllow Nothing)
           },
-      eventHandlers = prReviewEventHandlers
+      eventHandlers = tlPRReviewEventHandlers
     }

@@ -33,7 +33,8 @@ impl<
         // Try resolver first for authoritative identity, then fall back to derivation.
         let identity = {
             let resolver = self.agent_resolver();
-            let agent_name_key = AgentName::from(identifier);
+            let agent_name_key =
+                AgentName::try_from_str(identifier).expect("validated string input is non-empty");
             if let Some(record) = resolver.get(&agent_name_key).await {
                 let slug = record.slug.as_str().to_string();
                 AgentIdentity::new(slug, record.agent_type)
@@ -56,7 +57,8 @@ impl<
             };
             let member_name = identity.internal_name();
             if let Some(info) = team_info {
-                let team_name = TeamName::from(info.team_name.as_str());
+                let team_name = TeamName::try_from_str(info.team_name.as_str())
+                    .expect("validated string input is non-empty");
                 if let Err(e) = crate::services::synthetic_members::remove_synthetic_member(
                     &team_name,
                     &member_name,
@@ -77,19 +79,27 @@ impl<
             .join(".exo")
             .join("agents")
             .join(internal_name.as_str());
+        let worktree_config_dir = self
+            .project_dir()
+            .join(".exo")
+            .join("worktrees")
+            .join(internal_name.as_str());
 
         // Try direct cleanup via stored window_id (O(1), no listing needed)
         let mut window_closed = false;
-        if let Ok(routing) = RoutingInfo::read_from_dir(&agent_config_dir).await {
-            if let Some(wid) = routing.window_id {
-                let tmux = self.tmux()?;
-                match tmux.kill_window(&wid).await {
-                    Ok(()) => {
-                        info!(identifier, "Closed tmux window via stored window_id");
-                        window_closed = true;
-                    }
-                    Err(e) => {
-                        warn!(identifier, error = %e, "kill_window by stored ID failed, falling back to name match");
+        for routing_dir in [&agent_config_dir, &worktree_config_dir] {
+            if let Ok(routing) = RoutingInfo::read_from_dir(routing_dir).await {
+                if let Some(wid) = routing.window_id {
+                    let tmux = self.tmux()?;
+                    match tmux.kill_window(&wid).await {
+                        Ok(()) => {
+                            info!(identifier, path = %routing_dir.display(), "Closed tmux window via stored window_id");
+                            window_closed = true;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(identifier, path = %routing_dir.display(), error = %e, "kill_window by stored ID failed, falling back to name match");
+                        }
                     }
                 }
             }
@@ -295,11 +305,15 @@ impl<
                         let has_tab = windows.iter().any(|t| t == &display_name);
 
                         agents.push(AgentInfo {
-                            internal_name: AgentName::from(name),
+                            internal_name: AgentName::try_from_str(name)
+                                .expect("validated string input is non-empty"),
                             has_tab,
                             topology: Topology::WorktreePerAgent,
                             agent_dir: Some(path.clone()),
-                            slug: Some(AgentName::from(slug_str)),
+                            slug: Some(
+                                AgentName::try_from_str(slug_str)
+                                    .expect("validated string input is non-empty"),
+                            ),
                             agent_type: Some(agent_type),
                             pr: None,
                         });
@@ -358,11 +372,15 @@ impl<
                     let has_tab = windows.iter().any(|t| t == &display_name);
 
                     agents.push(AgentInfo {
-                        internal_name: AgentName::from(name),
+                        internal_name: AgentName::try_from_str(name)
+                            .expect("validated string input is non-empty"),
                         has_tab,
                         topology: Topology::SharedDir,
                         agent_dir: Some(path.clone()),
-                        slug: Some(AgentName::from(base_name)),
+                        slug: Some(
+                            AgentName::try_from_str(base_name)
+                                .expect("validated string input is non-empty"),
+                        ),
                         agent_type: Some(AgentType::Gemini),
                         pr: None,
                     });

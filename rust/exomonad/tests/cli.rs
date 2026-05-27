@@ -88,6 +88,20 @@ fn test_hook_invalid_json_fails_open() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// Codex hooks fail open with Codex's no-op stdout shape.
+#[test]
+fn test_codex_hook_fails_open_when_server_unreachable() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = cargo_bin_cmd!("exomonad");
+
+    cmd.args(["hook", "pre-tool-use", "--runtime", "codex"])
+        .write_stdin(r#"{"event":"pre-tool-use","tool":"bash","args":{"command":"ls"}}"#)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("{}"));
+
+    Ok(())
+}
+
 /// Different hook types all work as thin client.
 #[test]
 fn test_hook_other_event_types_fail_open() -> Result<(), Box<dyn std::error::Error>> {

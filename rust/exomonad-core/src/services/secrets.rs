@@ -52,9 +52,9 @@ impl Secrets {
             .or_else(|| std::env::var(key).ok())
     }
 
-    /// Get GITHUB_TOKEN.
-    pub fn github_token(&self) -> Option<String> {
-        self.get("GITHUB_TOKEN")
+    /// Get FORGEJO_TOKEN.
+    pub fn forgejo_token(&self) -> Option<String> {
+        self.get("FORGEJO_TOKEN")
     }
 }
 
@@ -88,7 +88,7 @@ mod tests {
     fn test_parse_env_file() {
         let content = r#"
 # Comment
-GITHUB_TOKEN=ghp_123
+FORGEJO_TOKEN=forgejo_123
 ANTHROPIC_API_KEY=sk-ant-456
 
 # Another comment
@@ -97,7 +97,10 @@ QUOTED="value with spaces"
 "#;
 
         let parsed = parse_env_file(content);
-        assert_eq!(parsed.get("GITHUB_TOKEN"), Some(&"ghp_123".to_string()));
+        assert_eq!(
+            parsed.get("FORGEJO_TOKEN"),
+            Some(&"forgejo_123".to_string())
+        );
         assert_eq!(
             parsed.get("ANTHROPIC_API_KEY"),
             Some(&"sk-ant-456".to_string())
@@ -111,6 +114,6 @@ QUOTED="value with spaces"
         let secrets = Secrets::default();
         // This will check env var, which may or may not be set
         // Just verify it doesn't panic
-        let _ = secrets.get("GITHUB_TOKEN");
+        let _ = secrets.get("FORGEJO_TOKEN");
     }
 }

@@ -9,6 +9,8 @@ mod cleanup;
 mod internal;
 mod spawn;
 
+pub use spawn::{CODEX_TL_INSTRUCTIONS, OPENCODE_TL_INSTRUCTIONS};
+
 pub(crate) use crate::common::TimeoutError;
 pub(crate) use crate::domain::{
     AgentName, AgentPermissions, BirthBranch, BranchName, ClaudeSessionUuid, ItemState,
@@ -61,6 +63,51 @@ pub(crate) async fn ensure_branch_pushed(
         }
         Err(e) => warn!(branch = %branch, error = %e, "Push task panicked (non-fatal)"),
     }
+}
+
+/// If no git remote is configured, create a local bare repo and set it as origin.
+/// This enables local-only workflows where agents need a remote for PR creation.
+pub(crate) async fn ensure_remote_exists(project_dir: &Path) {
+    let output = tokio::process::Command::new("git")
+        .args(["remote"])
+        .current_dir(project_dir)
+        .output()
+        .await;
+
+    let has_remote = output
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+
+    if has_remote {
+        return;
+    }
+
+    let dir_name = project_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let bare_path = project_dir
+        .parent()
+        .unwrap_or(project_dir)
+        .join(format!("{}.git-remote", dir_name));
+
+    info!(
+        path = %bare_path.display(),
+        "No git remote configured — creating local bare repo as origin"
+    );
+
+    let _ = tokio::process::Command::new("git")
+        .args(["init", "--bare", bare_path.to_str().unwrap_or("")])
+        .output()
+        .await;
+
+    let _ = tokio::process::Command::new("git")
+        .args(["remote", "add", "origin", bare_path.to_str().unwrap_or("")])
+        .current_dir(project_dir)
+        .output()
+        .await;
+
+    info!(path = %bare_path.display(), "Local bare repo set as origin");
 }
 
 // ============================================================================
@@ -117,7 +164,8 @@ impl AgentIdentity {
     pub fn internal_name(&self) -> AgentName {
         // Safe: slug is non-empty (validated at construction) and suffix is non-empty,
         // so the formatted string is always non-empty.
-        AgentName::from(format!("{}-{}", self.slug, self.agent_type.suffix()).as_str())
+        AgentName::try_from_str(format!("{}-{}", self.slug, self.agent_type.suffix()).as_str())
+            .expect("validated string input is non-empty")
     }
 
     /// tmux window display name (e.g., `"🤖 feature-a-claude"`).
@@ -148,6 +196,12 @@ pub enum AgentType {
 
     /// Custom binary agent (e.g., shoal-agent).
     Shoal,
+
+    /// OpenCode CLI (spawns with `opencode run "..."`).
+    OpenCode,
+
+    /// OpenAI Codex CLI.
+    Codex,
 
     /// Plain long-running process (no MCP, no agent identity, no worktree).
     /// Used for companion processes like mock servers, log tailers, etc.
@@ -183,6 +237,20 @@ pub(crate) const SHOAL_META: AgentMetadata = AgentMetadata {
     emoji: "\u{1F30A}", // 🌊
 };
 
+pub(crate) const OPENCODE_META: AgentMetadata = AgentMetadata {
+    command: "opencode",
+    prompt_flag: "run",
+    suffix: "opencode",
+    emoji: "\u{1F4BB}", // 💻
+};
+
+pub(crate) const CODEX_META: AgentMetadata = AgentMetadata {
+    command: "codex",
+    prompt_flag: "",
+    suffix: "codex",
+    emoji: "\u{1F916}", // 🤖
+};
+
 pub(crate) const PROCESS_META: AgentMetadata = AgentMetadata {
     command: "",
     prompt_flag: "",
@@ -196,6 +264,8 @@ impl AgentType {
             AgentType::Claude => &CLAUDE_META,
             AgentType::Gemini => &GEMINI_META,
             AgentType::Shoal => &SHOAL_META,
+            AgentType::OpenCode => &OPENCODE_META,
+            AgentType::Codex => &CODEX_META,
             AgentType::Process => &PROCESS_META,
         }
     }
@@ -234,6 +304,10 @@ impl AgentType {
             AgentType::Claude
         } else if dir_name.ends_with("-shoal") {
             AgentType::Shoal
+        } else if dir_name.ends_with("-opencode") {
+            AgentType::OpenCode
+        } else if dir_name.ends_with("-codex") {
+            AgentType::Codex
         } else if dir_name.ends_with("-process") {
             AgentType::Process
         } else {
@@ -349,7 +423,10 @@ pub struct SpawnWorkerOptions {
     pub name: AgentName,
     /// Implementation instructions
     pub prompt: String,
-    /// Claude-specific permission flags (ignored for Gemini).
+    /// Agent type (default: Gemini).
+    #[serde(default)]
+    pub agent_type: AgentType,
+    /// Claude-specific permission flags (ignored for non-Claude agents).
     #[serde(default)]
     pub claude_flags: ClaudeSpawnFlags,
 }
@@ -378,6 +455,9 @@ pub struct SpawnSubtreeOptions {
     pub standalone_repo: bool,
     /// Directories from the parent project to be copied into the agent's worktree.
     pub allowed_dirs: Vec<String>,
+    /// Model override for this spawn. None = use service default (spawn_agent_model).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Options for spawning a Gemini leaf subtree agent.
@@ -412,6 +492,8 @@ pub struct SpawnResult {
     pub issue_title: String,
     /// Agent type
     pub agent_type: AgentType,
+    /// Stable tmux pane id for ephemeral worker panes.
+    pub pane_id: Option<String>,
 }
 
 impl FFIBoundary for SpawnResult {}
@@ -521,10 +603,23 @@ pub struct AgentControlService<C> {
     pub(crate) birth_branch: BirthBranch,
     /// When true, spawned Gemini agents receive `--yolo` flag.
     pub(crate) yolo: bool,
+    /// Agent type for spawned workers/teammates.
+    pub(crate) spawn_agent_type: AgentType,
+    /// Model for spawned OpenCode workers (passed to `opencode serve --model` / `opencode run --model`).
+    /// `None` means let opencode pick.
+    pub(crate) spawn_agent_model: Option<String>,
     /// WASM name for role context resolution (default: "devswarm").
     pub(crate) wasm_name: String,
     /// Pre-serialized extra MCP servers to include in spawned agent configs.
     pub(crate) extra_mcp_servers: HashMap<String, serde_json::Value>,
+    /// OpenRouter API key. When Some, all LLM calls route through OpenRouter.
+    pub(crate) openrouter_api_key: Option<String>,
+    /// Agent type for the reviewer. Default: Claude.
+    pub(crate) reviewer_agent_type: AgentType,
+    /// Model for the reviewer agent. None = agent picks its default.
+    pub(crate) reviewer_model: Option<String>,
+    /// Context file paths injected into the reviewer's task (e.g. CLAUDE.md, reviewer rules).
+    pub(crate) reviewer_context: Vec<String>,
 }
 
 impl<
@@ -545,10 +640,17 @@ impl<
             worktree_base,
             tmux_session: None,
             tmux_ipc: None,
-            birth_branch: BirthBranch::from("unset"),
+            birth_branch: BirthBranch::try_from_str("unset")
+                .expect("literal validated string is non-empty"),
             yolo: false,
+            spawn_agent_type: AgentType::Gemini,
+            spawn_agent_model: None,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: HashMap::new(),
+            openrouter_api_key: None,
+            reviewer_agent_type: AgentType::Claude,
+            reviewer_model: None,
+            reviewer_context: vec![],
         }
     }
 
@@ -583,9 +685,55 @@ impl<
         self
     }
 
+    /// Set the agent type for spawned workers/teammates.
+    pub fn with_spawn_agent_type(mut self, agent_type: AgentType) -> Self {
+        self.spawn_agent_type = agent_type;
+        self
+    }
+
+    /// Get the configured default agent type for spawned workers/teammates.
+    pub fn default_spawn_agent_type(&self) -> AgentType {
+        self.spawn_agent_type
+    }
+
+    /// Set the model for spawned OpenCode workers.
+    pub fn with_spawn_agent_model(mut self, model: Option<String>) -> Self {
+        self.spawn_agent_model = model;
+        self
+    }
+
+    /// Get the configured model for spawned OpenCode workers, if any.
+    pub fn spawn_agent_model(&self) -> Option<&str> {
+        self.spawn_agent_model.as_deref()
+    }
+
+    /// Set the agent type for the reviewer.
+    pub fn with_reviewer_agent_type(mut self, agent_type: AgentType) -> Self {
+        self.reviewer_agent_type = agent_type;
+        self
+    }
+
+    /// Set the model for the reviewer agent.
+    pub fn with_reviewer_model(mut self, model: Option<String>) -> Self {
+        self.reviewer_model = model;
+        self
+    }
+
+    /// Set context file paths injected into the reviewer's task.
+    pub fn with_reviewer_context(mut self, context: Vec<String>) -> Self {
+        self.reviewer_context = context;
+        self
+    }
+
     /// Set extra MCP servers to include in spawned agent configs.
     pub fn with_extra_mcp_servers(mut self, servers: HashMap<String, serde_json::Value>) -> Self {
         self.extra_mcp_servers = servers;
+        self
+    }
+
+    /// Enable OpenRouter routing: all Claude CLI agents get ANTHROPIC_BASE_URL injected.
+    pub fn with_openrouter(mut self, api_key: String) -> Self {
+        self.openrouter_api_key = Some(api_key);
         self
     }
 
@@ -644,6 +792,16 @@ impl<
             .join(agent_name.as_str());
         fs::create_dir_all(&agent_config_dir).await?;
         routing.write_to_dir(&agent_config_dir).await?;
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = fs::write(agent_config_dir.join("spawned_at"), now_secs.to_string()).await;
+
+        if let Some(issue_id) = issue_id_from_agent_name(agent_name.as_str()) {
+            let _ = fs::write(agent_config_dir.join("active_issue"), issue_id.to_string()).await;
+        }
 
         if let Some(record) = identity {
             if let Err(e) = self.agent_resolver().register(record).await {
@@ -821,6 +979,17 @@ pub fn slugify(title: &str) -> String {
         .collect()
 }
 
+/// Extract issue ID from an agent name slug, e.g. "issue-26-loader-alias-fallback-codex" → Some(26).
+pub(crate) fn issue_id_from_agent_name(slug: &str) -> Option<u64> {
+    let rest = slug.strip_prefix("issue-")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Legacy helpers used only by tests for issue-driven agent dir name parsing.
@@ -839,6 +1008,8 @@ mod tests {
             "claude" => Some(super::AgentType::Claude),
             "gemini" => Some(super::AgentType::Gemini),
             "shoal" => Some(super::AgentType::Shoal),
+            "opencode" => Some(super::AgentType::OpenCode),
+            "codex" => Some(super::AgentType::Codex),
             "process" => Some(super::AgentType::Process),
             _ => None,
         };
@@ -861,6 +1032,7 @@ mod tests {
     fn test_agent_type_command() {
         assert_eq!(AgentType::Claude.command(), "claude");
         assert_eq!(AgentType::Gemini.command(), "gemini");
+        assert_eq!(AgentType::Codex.command(), "codex");
     }
 
     #[test]
@@ -873,6 +1045,7 @@ mod tests {
     fn test_agent_type_suffix() {
         assert_eq!(AgentType::Claude.suffix(), "claude");
         assert_eq!(AgentType::Gemini.suffix(), "gemini");
+        assert_eq!(AgentType::Codex.suffix(), "codex");
     }
 
     #[test]
@@ -918,6 +1091,9 @@ mod tests {
         let gemini: AgentType = serde_json::from_str("\"gemini\"").unwrap();
         assert_eq!(gemini, AgentType::Gemini);
 
+        let codex: AgentType = serde_json::from_str("\"codex\"").unwrap();
+        assert_eq!(codex, AgentType::Codex);
+
         // Invalid agent type should fail at parse boundary
         let invalid = serde_json::from_str::<AgentType>("\"invalid\"");
         assert!(invalid.is_err());
@@ -937,6 +1113,14 @@ mod tests {
         assert_eq!(parsed.issue_id, "456");
         assert_eq!(parsed.slug, "add-feature");
         assert_eq!(parsed.agent_type, Some(AgentType::Gemini));
+    }
+
+    #[test]
+    fn test_parse_agent_dir_name_codex() {
+        let parsed = parse_agent_dir_name("gh-456-add-feature-codex").unwrap();
+        assert_eq!(parsed.issue_id, "456");
+        assert_eq!(parsed.slug, "add-feature");
+        assert_eq!(parsed.agent_type, Some(AgentType::Codex));
     }
 
     #[test]

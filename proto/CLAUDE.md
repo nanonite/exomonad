@@ -163,7 +163,6 @@ GitHub API operations (`github.*` namespace):
 - `GetIssue`: Get issue with comments
 - `ListPullRequests`: List PRs
 - `GetPullRequest`: Get PR with reviews
-- `GetPullRequestForBranch`: Find PR for branch
 - `CreatePullRequest`: Create new PR
 - `GetPullRequestReviewComments`: Get inline comments
 

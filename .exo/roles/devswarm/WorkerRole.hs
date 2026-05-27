@@ -4,11 +4,18 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 
--- | Worker role config: notify_parent + task tools, allow-all hooks, no state transitions.
+-- | Worker role config: notify_parent + task tools + chainlink tools, allow-all hooks, no state transitions.
 module WorkerRole (config, Tools) where
 
 import Data.Aeson (object, (.=))
 import ExoMonad
+import ExoMonad.Guest.Tools.Chainlink
+  ( ChainlinkSessionStart (..),
+    ChainlinkIssueShow (..),
+    ChainlinkIssueComment (..),
+    ChainlinkSessionWork (..),
+    ChainlinkSessionEnd (..)
+  )
 import ExoMonad.Guest.Tools.Events
   ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs
   )
@@ -19,6 +26,8 @@ import ExoMonad.Guest.Tools.Tasks
   )
 import ExoMonad.Guest.Types (allowResponse, allowStopResponse, postToolUseResponse, BeforeModelOutput (..), AfterModelOutput (..))
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
+import HookPolicy (preToolUseWithGhBlock)
+import WorkerStopCheck (workerStopCheck)
 
 -- | Worker notify_parent: thin wrapper, no phase transitions.
 data WorkerNotifyParent
@@ -75,10 +84,16 @@ instance MCPTool WorkerTaskUpdate where
 
 data Tools mode = Tools
   { notifyParent :: mode :- WorkerNotifyParent,
-    sendMessage :: mode :- SendMessage,
+    sendTmuxMessage :: mode :- SendTmuxMessage,
+    sendMailboxMessage :: mode :- SendMailboxMessage,
     taskList :: mode :- WorkerTaskList,
     taskGet :: mode :- WorkerTaskGet,
-    taskUpdate :: mode :- WorkerTaskUpdate
+    taskUpdate :: mode :- WorkerTaskUpdate,
+    chainlinkSessionStart :: mode :- ChainlinkSessionStart,
+    chainlinkIssueShow :: mode :- ChainlinkIssueShow,
+    chainlinkIssueComment :: mode :- ChainlinkIssueComment,
+    chainlinkSessionWork :: mode :- ChainlinkSessionWork,
+    chainlinkSessionEnd :: mode :- ChainlinkSessionEnd
   }
   deriving (Generic)
 
@@ -89,16 +104,22 @@ config =
       tools =
         Tools
           { notifyParent = mkHandler @WorkerNotifyParent,
-            sendMessage = mkHandler @SendMessage,
+            sendTmuxMessage = mkHandler @SendTmuxMessage,
+            sendMailboxMessage = mkHandler @SendMailboxMessage,
             taskList = mkHandler @WorkerTaskList,
             taskGet = mkHandler @WorkerTaskGet,
-            taskUpdate = mkHandler @WorkerTaskUpdate
+            taskUpdate = mkHandler @WorkerTaskUpdate,
+            chainlinkSessionStart = mkHandler @ChainlinkSessionStart,
+            chainlinkIssueShow = mkHandler @ChainlinkIssueShow,
+            chainlinkIssueComment = mkHandler @ChainlinkIssueComment,
+            chainlinkSessionWork = mkHandler @ChainlinkSessionWork,
+            chainlinkSessionEnd = mkHandler @ChainlinkSessionEnd
           },
       hooks =
         HookConfig
-          { preToolUse = \_ -> pure (allowResponse Nothing),
+          { preToolUse = preToolUseWithGhBlock (\_ -> pure (allowResponse Nothing)),
             postToolUse = \_ -> pure (postToolUseResponse Nothing),
-            onStop = \_ -> pure allowStopResponse,
+            onStop = \_ -> workerStopCheck,
             onSubagentStop = \_ -> pure allowStopResponse,
             onSessionStart = defaultSessionStartHook,
             beforeModel = \_ -> pure (BeforeModelAllow Nothing),

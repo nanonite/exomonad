@@ -3,15 +3,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 
--- | Event tools: notify_parent, send_message, shutdown.
+-- | Event tools: notify_parent, send_tmux_message, send_mailbox_message, shutdown.
 --
 -- Core I/O functions ('notifyParentCore', 'shutdownCore') are role-agnostic.
 -- Role-specific MCPTool wrappers apply their own state transitions.
--- 'SendMessage' stays in the SDK (no state transitions needed).
+-- Message tools stay in the SDK (no state transitions needed).
 module ExoMonad.Guest.Tools.Events
   ( -- * Marker types
     NotifyParent (..),
-    SendMessage (..),
+    SendTmuxMessage (..),
+    SendMailboxMessage (..),
     Shutdown,
 
     -- * Core functions (role wrappers call these)
@@ -28,6 +29,7 @@ module ExoMonad.Guest.Tools.Events
     NotifyParentArgs (..),
     NotifyStatus (..),
     TaskReport (..),
+    SendMessageArgs (..),
     ShutdownArgs (..),
 
     -- * Helpers
@@ -184,9 +186,7 @@ composeNotifyMessage args =
         Nothing -> ""
    in base <> prSuffix <> taskLines
 
--- | Send message tool (stays in SDK — no state transitions needed)
-data SendMessage = SendMessage
-
+-- | Shared args for agent-to-agent message tools.
 data SendMessageArgs = SendMessageArgs
   { smRecipient :: Text,
     smContent :: Text,
@@ -209,27 +209,41 @@ instance ToJSON SendMessageArgs where
         "summary" .= smSummary args
       ]
 
-instance MCPTool SendMessage where
-  type ToolArgs SendMessage = SendMessageArgs
-  toolName = "send_message"
-  toolDescription = "for sending messages to other exomonad-spawned agents (workers, leaves, subtrees) not Claude Code native teammates"
-  toolSchema =
-    genericToolSchemaWith @SendMessageArgs
-      [ ("recipient", "The name of the agent to receive the message"),
-        ("content", "The content of the message"),
-        ("summary", "An optional summary of the message")
-      ]
+sendMessageAddress :: SendMessageArgs -> ProtoEvents.Address
+sendMessageAddress args =
+  ProtoEvents.Address
+    { ProtoEvents.addressKind = Just (ProtoEvents.AddressKindAgent (TL.fromStrict (smRecipient args)))
+    }
+
+sendTmuxMessageDescription :: Text
+sendTmuxMessageDescription = "Send a message to an exomonad-spawned agent by injecting it into that agent's tmux pane. Use this for Codex, OpenCode, Gemini, and any non-Claude runtime, or when you need to steer a live pane directly."
+
+sendMailboxMessageDescription :: Text
+sendMailboxMessageDescription = "Send a message through the Claude Teams inbox mailbox protocol. This only works when the current session has mailbox support configured and validated."
+
+sendMessageSchema :: Aeson.Object
+sendMessageSchema =
+  genericToolSchemaWith @SendMessageArgs
+    [ ("recipient", "The name of the agent to receive the message"),
+      ("content", "The content of the message"),
+      ("summary", "An optional summary of the message")
+    ]
+
+-- | Tmux-only message tool.
+data SendTmuxMessage = SendTmuxMessage
+
+instance MCPTool SendTmuxMessage where
+  type ToolArgs SendTmuxMessage = SendMessageArgs
+  toolName = "send_tmux_message"
+  toolDescription = sendTmuxMessageDescription
+  toolSchema = sendMessageSchema
   toolHandlerEff args = do
-    let address =
-          ProtoEvents.Address
-            { ProtoEvents.addressKind = Just (ProtoEvents.AddressKindAgent (TL.fromStrict (smRecipient args)))
-            }
     result <-
-      suspendEffect @ProtoEvents.EventsSendMessage
-        ( ProtoEvents.SendMessageRequest
-            { ProtoEvents.sendMessageRequestRecipient = Just address,
-              ProtoEvents.sendMessageRequestContent = TL.fromStrict (smContent args),
-              ProtoEvents.sendMessageRequestSummary = maybe "" TL.fromStrict (smSummary args)
+      suspendEffect @ProtoEvents.EventsSendTmuxMessage
+        ( ProtoEvents.SendTmuxMessageRequest
+            { ProtoEvents.sendTmuxMessageRequestRecipient = Just (sendMessageAddress args),
+              ProtoEvents.sendTmuxMessageRequestContent = TL.fromStrict (smContent args),
+              ProtoEvents.sendTmuxMessageRequestSummary = maybe "" TL.fromStrict (smSummary args)
             }
         )
     case result of
@@ -238,8 +252,35 @@ instance MCPTool SendMessage where
         pure $
           successResult $
             object
-              [ "success" .= ProtoEvents.sendMessageResponseSuccess resp,
-                "delivery_method" .= ProtoEvents.sendMessageResponseDeliveryMethod resp
+              [ "success" .= ProtoEvents.sendTmuxMessageResponseSuccess resp,
+                "delivery_method" .= ProtoEvents.sendTmuxMessageResponseDeliveryMethod resp
+              ]
+
+-- | Mailbox-only message tool.
+data SendMailboxMessage = SendMailboxMessage
+
+instance MCPTool SendMailboxMessage where
+  type ToolArgs SendMailboxMessage = SendMessageArgs
+  toolName = "send_mailbox_message"
+  toolDescription = sendMailboxMessageDescription
+  toolSchema = sendMessageSchema
+  toolHandlerEff args = do
+    result <-
+      suspendEffect @ProtoEvents.EventsSendMailboxMessage
+        ( ProtoEvents.SendMailboxMessageRequest
+            { ProtoEvents.sendMailboxMessageRequestRecipient = Just (sendMessageAddress args),
+              ProtoEvents.sendMailboxMessageRequestContent = TL.fromStrict (smContent args),
+              ProtoEvents.sendMailboxMessageRequestSummary = maybe "" TL.fromStrict (smSummary args)
+            }
+        )
+    case result of
+      Left err -> pure $ errorResult (T.pack (show err))
+      Right resp ->
+        pure $
+          successResult $
+            object
+              [ "success" .= ProtoEvents.sendMailboxMessageResponseSuccess resp,
+                "delivery_method" .= ProtoEvents.sendMailboxMessageResponseDeliveryMethod resp
               ]
 
 -- | Shutdown tool for cooperative agent exit

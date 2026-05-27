@@ -5,21 +5,37 @@ use exomonad_proto::effects::merge_pr::*;
 use std::sync::Arc;
 use tracing::instrument;
 
-use crate::services::{HasEventLog, HasGitHubClient, HasGitWorktreeService};
+use crate::services::{
+    HasCiStatusMap, HasEventLog, HasForgejoClient, HasGitWorktreeService, HasProjectDir,
+};
 
 pub struct MergePRHandler<C> {
     ctx: Arc<C>,
 }
 
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> MergePRHandler<C> {
+impl<
+        C: HasForgejoClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasCiStatusMap
+            + 'static,
+    > MergePRHandler<C>
+{
     pub fn new(ctx: Arc<C>) -> Self {
         Self { ctx }
     }
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static>
-    crate::effects::EffectHandler for MergePRHandler<C>
+impl<
+        C: HasForgejoClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasCiStatusMap
+            + 'static,
+    > crate::effects::EffectHandler for MergePRHandler<C>
 {
     fn namespace(&self) -> &str {
         "merge_pr"
@@ -36,8 +52,14 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static>
 }
 
 #[async_trait]
-impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> MergePrEffects
-    for MergePRHandler<C>
+impl<
+        C: HasForgejoClient
+            + HasEventLog
+            + HasGitWorktreeService
+            + HasProjectDir
+            + HasCiStatusMap
+            + 'static,
+    > MergePrEffects for MergePRHandler<C>
 {
     #[instrument(skip_all, fields(agent_name = %ctx.agent_name, pr_number = req.pr_number))]
     async fn merge_pr(
@@ -52,15 +74,22 @@ impl<C: HasGitHubClient + HasEventLog + HasGitWorktreeService + 'static> MergePr
             strategy = strategy.as_str(),
             "[MergePR] merge_pr starting"
         );
-        let result = merge_pr::merge_pr_async(
-            pr_number,
-            &strategy,
-            &req.working_dir,
-            self.ctx.git_worktree_service().clone(),
-            self.ctx.github_client().map(|arc| arc.as_ref()),
-        )
-        .await
-        .effect_err("merge_pr")?;
+
+        let result = {
+            tracing::info!(
+                pr_number = pr_number.as_u64(),
+                "[MergePR] routing to Forgejo"
+            );
+            merge_pr::merge_pr_async(
+                pr_number,
+                &strategy,
+                &req.working_dir,
+                self.ctx.git_worktree_service().clone(),
+                self.ctx.forgejo_client().map(|arc| arc.as_ref()),
+            )
+            .await
+            .effect_err("merge_pr")?
+        };
         tracing::info!(
             success = result.success,
             git_fetched = result.git_fetched,
@@ -123,8 +152,10 @@ mod tests {
 
     fn test_ctx() -> EffectContext {
         EffectContext {
-            agent_name: AgentName::from("test"),
-            birth_branch: BirthBranch::from("main"),
+            agent_name: AgentName::try_from_str("test")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty"),
             working_dir: std::path::PathBuf::from("."),
         }
     }

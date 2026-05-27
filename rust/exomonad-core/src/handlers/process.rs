@@ -12,6 +12,8 @@ use exomonad_proto::effects::process::*;
 use std::path::Component;
 use std::time::Duration;
 
+const CHAINLINK_TRACE_ENV: &str = "EXOMONAD_CHAINLINK_TRACE";
+
 /// Process execution effect handler.
 ///
 /// Executes commands within the agent's worktree. No command allowlist —
@@ -49,6 +51,29 @@ impl ProcessHandler {
 
         Ok(())
     }
+
+    fn should_trace_chainlink(req: &RunRequest) -> bool {
+        req.command == "chainlink" && std::env::var_os(CHAINLINK_TRACE_ENV).is_some()
+    }
+
+    fn format_command_line(command: &str, args: &[String]) -> String {
+        std::iter::once(command.to_string())
+            .chain(args.iter().map(|arg| Self::quote_command_arg(arg)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn quote_command_arg(arg: &str) -> String {
+        if !arg.is_empty()
+            && arg.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=')
+            })
+        {
+            return arg.to_string();
+        }
+
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
 }
 
 crate::impl_pass_through_handler!(ProcessHandler, "process", dispatch_process_effect);
@@ -71,6 +96,15 @@ impl ProcessEffects for ProcessHandler {
             dir = %resolved_dir.display(),
             "[Process] run starting"
         );
+        let trace_chainlink = Self::should_trace_chainlink(&req);
+        if trace_chainlink {
+            tracing::info!(
+                chainlink_command = %Self::format_command_line(&req.command, &req.args),
+                args = ?req.args,
+                dir = %resolved_dir.display(),
+                "[Chainlink] command starting"
+            );
+        }
 
         let mut cmd = tokio::process::Command::new(&req.command);
         cmd.args(&req.args)
@@ -107,6 +141,13 @@ impl ProcessEffects for ProcessHandler {
                 let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
                 tracing::info!(exit_code, "[Process] run completed");
+                if trace_chainlink {
+                    tracing::info!(
+                        exit_code,
+                        chainlink_command = %Self::format_command_line(&req.command, &req.args),
+                        "[Chainlink] command completed"
+                    );
+                }
 
                 Ok(RunResponse {
                     exit_code,
@@ -130,8 +171,10 @@ mod tests {
 
     fn test_ctx() -> EffectContext {
         EffectContext {
-            agent_name: AgentName::from("test"),
-            birth_branch: BirthBranch::from("main"),
+            agent_name: AgentName::try_from_str("test")
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str("main")
+                .expect("literal validated string is non-empty"),
             working_dir: std::path::PathBuf::from("."),
         }
     }
@@ -271,5 +314,19 @@ mod tests {
         assert!(ProcessHandler::validate_working_dir("..").is_err());
         assert!(ProcessHandler::validate_working_dir("../foo").is_err());
         assert!(ProcessHandler::validate_working_dir("foo/../../bar").is_err());
+    }
+
+    #[test]
+    fn test_format_command_line_quotes_spaced_args() {
+        let args = vec![
+            "timer".to_string(),
+            "start".to_string(),
+            "Issue with spaces".to_string(),
+        ];
+
+        assert_eq!(
+            ProcessHandler::format_command_line("chainlink", &args),
+            "chainlink timer start 'Issue with spaces'"
+        );
     }
 }

@@ -3,9 +3,9 @@
 //! Types for Claude Code hook stdin/stdout communication.
 
 use crate::domain::{PermissionMode, SessionId, ToolName, ToolPermission};
-use crate::protocol::Runtime;
+use crate::protocol::{HookEventType, Runtime};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 // ============================================================================
 // Hook Event Types (from Claude Code stdin)
@@ -384,12 +384,16 @@ impl InternalStopHookOutput {
                 .unwrap_or_else(|_| r#"{"continue":true}"#.to_string()),
             Runtime::Gemini => serde_json::to_string(&self.to_gemini())
                 .unwrap_or_else(|_| r#"{"decision":"allow"}"#.to_string()),
+            Runtime::OpenCode => serde_json::to_string(&self.to_claude())
+                .unwrap_or_else(|_| r#"{"continue":true}"#.to_string()),
+            Runtime::Codex => serde_json::to_string(&self.to_claude())
+                .unwrap_or_else(|_| r#"{"continue":true}"#.to_string()),
         }
     }
 }
 
 /// Claude Code stop hook output format.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClaudeStopHookOutput {
     /// Whether to continue (true = allow stop, false = block)
     #[serde(rename = "continue")]
@@ -445,6 +449,218 @@ pub struct HookEnvelope {
     pub stdout: String,
     /// Process exit code (0 = success, 2 = block).
     pub exit_code: i32,
+}
+
+// ============================================================================
+// Codex Hook Adapter
+// ============================================================================
+
+/// Normalize Codex hook stdin into ExoMonad's internal `HookInput` shape.
+pub fn normalize_codex_hook_payload(event_type: HookEventType, input: Value) -> Value {
+    let mut object = match input {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+
+    insert_default_string(&mut object, "session_id", "codex");
+    insert_default_string(&mut object, "cwd", ".");
+    insert_default_string(&mut object, "permission_mode", "default");
+    normalize_optional_string(&mut object, "transcript_path");
+
+    if !has_non_empty_string(&object, "hook_event_name") {
+        object.insert(
+            "hook_event_name".to_string(),
+            Value::String(codex_hook_event_name(event_type).to_string()),
+        );
+    }
+
+    if !object.contains_key("tool_name") {
+        if let Some(tool) = object.remove("tool") {
+            object.insert("tool_name".to_string(), tool);
+        }
+    }
+
+    if !object.contains_key("tool_input") {
+        if let Some(args) = object.remove("args") {
+            object.insert("tool_input".to_string(), args);
+        }
+    }
+
+    Value::Object(object)
+}
+
+/// Format a server HookEnvelope as Codex hook stdout/exit semantics.
+pub fn format_codex_hook_response(
+    event_type: HookEventType,
+    envelope: HookEnvelope,
+) -> HookEnvelope {
+    if envelope.stdout.trim().is_empty() {
+        return codex_noop_envelope();
+    }
+
+    match event_type {
+        HookEventType::PreToolUse => format_codex_pre_tool_use(envelope),
+        HookEventType::PostToolUse => format_codex_post_tool_use(envelope),
+        HookEventType::Stop => format_codex_stop(envelope),
+        _ => envelope,
+    }
+}
+
+/// Empty Codex stdout is also a no-op, but `{}` is easier to smoke-test.
+pub fn codex_noop_envelope() -> HookEnvelope {
+    HookEnvelope {
+        stdout: "{}".to_string(),
+        exit_code: 0,
+    }
+}
+
+fn codex_hook_event_name(event_type: HookEventType) -> &'static str {
+    match event_type {
+        HookEventType::PreToolUse => "PreToolUse",
+        HookEventType::PostToolUse => "PostToolUse",
+        HookEventType::Stop => "Stop",
+        HookEventType::SubagentStop => "Stop",
+        HookEventType::SessionEnd => "Stop",
+        _ => "PreToolUse",
+    }
+}
+
+fn insert_default_string(object: &mut Map<String, Value>, key: &str, default: &str) {
+    if !has_non_empty_string(object, key) {
+        object.insert(key.to_string(), Value::String(default.to_string()));
+    }
+}
+
+fn normalize_optional_string(object: &mut Map<String, Value>, key: &str) {
+    match object.get(key) {
+        Some(Value::Null) | None => {
+            object.insert(key.to_string(), Value::String(String::new()));
+        }
+        _ => {}
+    }
+}
+
+fn has_non_empty_string(object: &Map<String, Value>, key: &str) -> bool {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
+}
+
+fn format_codex_pre_tool_use(envelope: HookEnvelope) -> HookEnvelope {
+    let Ok(output) = serde_json::from_str::<ClaudePreToolUseOutput>(&envelope.stdout) else {
+        return codex_noop_envelope();
+    };
+
+    if !output.continue_ {
+        return codex_deny_envelope(
+            output
+                .stop_reason
+                .unwrap_or_else(|| "Hook blocked tool execution".to_string()),
+        );
+    }
+
+    match output.hook_specific_output {
+        Some(HookSpecificOutput::PreToolUse {
+            permission_decision,
+            permission_decision_reason,
+            updated_input,
+        }) => match permission_decision {
+            crate::domain::ToolPermission::Deny => codex_deny_envelope(
+                permission_decision_reason
+                    .unwrap_or_else(|| "Hook denied tool execution".to_string()),
+            ),
+            crate::domain::ToolPermission::Allow => match updated_input {
+                Some(updated_input) => codex_updated_input_envelope(updated_input),
+                None => codex_noop_envelope(),
+            },
+            crate::domain::ToolPermission::Ask => {
+                codex_deny_envelope(permission_decision_reason.unwrap_or_else(|| {
+                    "Interactive permission requests are unsupported".to_string()
+                }))
+            }
+        },
+        _ => codex_noop_envelope(),
+    }
+}
+
+fn format_codex_post_tool_use(envelope: HookEnvelope) -> HookEnvelope {
+    let Ok(output) = serde_json::from_str::<ClaudePreToolUseOutput>(&envelope.stdout) else {
+        return codex_noop_envelope();
+    };
+
+    let mut object = Map::new();
+    if !output.continue_ {
+        object.insert("continue".to_string(), Value::Bool(false));
+        if let Some(reason) = output.stop_reason {
+            object.insert("stopReason".to_string(), Value::String(reason));
+        }
+    }
+
+    if let Some(system_message) = output.system_message {
+        object.insert("systemMessage".to_string(), Value::String(system_message));
+    }
+
+    if let Some(HookSpecificOutput::PostToolUse { additional_context }) =
+        output.hook_specific_output
+    {
+        if let Some(additional_context) = additional_context {
+            object.insert(
+                "hookSpecificOutput".to_string(),
+                serde_json::json!({
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": additional_context
+                }),
+            );
+        }
+    }
+
+    codex_json_envelope(Value::Object(object))
+}
+
+fn format_codex_stop(envelope: HookEnvelope) -> HookEnvelope {
+    let Ok(output) = serde_json::from_str::<ClaudeStopHookOutput>(&envelope.stdout) else {
+        return codex_noop_envelope();
+    };
+
+    if output.continue_ {
+        return codex_noop_envelope();
+    }
+
+    let mut object = Map::new();
+    object.insert("decision".to_string(), Value::String("block".to_string()));
+    if let Some(reason) = output.stop_reason {
+        object.insert("reason".to_string(), Value::String(reason));
+    }
+    codex_json_envelope(Value::Object(object))
+}
+
+fn codex_deny_envelope(reason: String) -> HookEnvelope {
+    codex_json_envelope(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason
+        }
+    }))
+}
+
+fn codex_updated_input_envelope(updated_input: Value) -> HookEnvelope {
+    codex_json_envelope(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": updated_input
+        }
+    }))
+}
+
+fn codex_json_envelope(value: Value) -> HookEnvelope {
+    HookEnvelope {
+        stdout: serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()),
+        exit_code: 0,
+    }
 }
 
 // ============================================================================
@@ -598,6 +814,78 @@ mod tests {
         assert_eq!(json["continue"], true);
     }
 
+    #[test]
+    fn test_normalize_codex_hook_payload_maps_tool_fields() {
+        let input = serde_json::json!({
+            "session_id": "codex-session",
+            "event": "pre-tool-use",
+            "tool": "bash",
+            "args": {"command": "ls"}
+        });
+
+        let normalized = normalize_codex_hook_payload(HookEventType::PreToolUse, input);
+        assert_eq!(normalized["hook_event_name"], "PreToolUse");
+        assert_eq!(normalized["tool_name"], "bash");
+        assert_eq!(
+            normalized["tool_input"],
+            serde_json::json!({"command": "ls"})
+        );
+        assert_eq!(normalized["permission_mode"], "default");
+    }
+
+    #[test]
+    fn test_format_codex_pre_tool_use_deny() {
+        let output = ClaudePreToolUseOutput::pre_tool_use_deny("blocked".into());
+        let envelope = HookEnvelope {
+            stdout: serde_json::to_string(&output).unwrap(),
+            exit_code: 0,
+        };
+
+        let formatted = format_codex_hook_response(HookEventType::PreToolUse, envelope);
+        let json: Value = serde_json::from_str(&formatted.stdout).unwrap();
+        let specific = &json["hookSpecificOutput"];
+        assert_eq!(formatted.exit_code, 0);
+        assert_eq!(specific["hookEventName"], "PreToolUse");
+        assert_eq!(specific["permissionDecision"], "deny");
+        assert_eq!(specific["permissionDecisionReason"], "blocked");
+    }
+
+    #[test]
+    fn test_format_codex_stop_block() {
+        let output = ClaudeStopHookOutput {
+            continue_: false,
+            stop_reason: Some("run tests".into()),
+        };
+        let envelope = HookEnvelope {
+            stdout: serde_json::to_string(&output).unwrap(),
+            exit_code: 0,
+        };
+
+        let formatted = format_codex_hook_response(HookEventType::Stop, envelope);
+        let json: Value = serde_json::from_str(&formatted.stdout).unwrap();
+        assert_eq!(formatted.exit_code, 0);
+        assert_eq!(json["decision"], "block");
+        assert_eq!(json["reason"], "run tests");
+    }
+
+    #[test]
+    fn test_format_codex_stop_block_without_reason_stays_silent() {
+        let output = ClaudeStopHookOutput {
+            continue_: false,
+            stop_reason: None,
+        };
+        let envelope = HookEnvelope {
+            stdout: serde_json::to_string(&output).unwrap(),
+            exit_code: 0,
+        };
+
+        let formatted = format_codex_hook_response(HookEventType::Stop, envelope);
+        let json: Value = serde_json::from_str(&formatted.stdout).unwrap();
+        assert_eq!(formatted.exit_code, 0);
+        assert_eq!(json["decision"], "block");
+        assert!(json.get("reason").is_none());
+    }
+
     // =========================================================================
     // HookInput comprehensive parsing tests
     // =========================================================================
@@ -680,7 +968,11 @@ mod proptest_tests {
     }
 
     fn arb_runtime() -> impl Strategy<Value = Runtime> {
-        prop_oneof![Just(Runtime::Claude), Just(Runtime::Gemini)]
+        prop_oneof![
+            Just(Runtime::Claude),
+            Just(Runtime::Gemini),
+            Just(Runtime::OpenCode)
+        ]
     }
 
     fn arb_permission_mode() -> impl Strategy<Value = PermissionMode> {

@@ -45,6 +45,8 @@ pub mod ui_protocol;
 
 // === Framework (requires runtime feature) ===
 #[cfg(feature = "runtime")]
+pub mod codex_config;
+#[cfg(feature = "runtime")]
 pub mod common;
 #[cfg(feature = "runtime")]
 pub mod effects;
@@ -64,6 +66,8 @@ pub mod ffi;
 pub mod hooks;
 #[cfg(feature = "runtime")]
 pub mod logging;
+#[cfg(feature = "runtime")]
+pub mod opencode_plugin;
 #[cfg(feature = "runtime")]
 pub mod protocol;
 #[cfg(feature = "runtime")]
@@ -102,6 +106,7 @@ pub use hooks::HookConfig;
 pub use logging::{init_logging, init_logging_with_default};
 #[cfg(feature = "runtime")]
 pub use protocol::{
+    codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload,
     ClaudePreToolUseOutput, ClaudeStopHookOutput, GeminiStopHookOutput, HookEnvelope,
     HookEventType, HookInput, HookSpecificOutput, InternalAfterModelOutput,
     InternalBeforeModelOutput, InternalStopHookOutput, PermissionDecision,
@@ -115,8 +120,8 @@ pub use util::{build_prompt, find_exomonad_binary, shell_quote};
 pub use handlers::groups::{core_handlers, git_handlers, orchestration_handlers};
 #[cfg(feature = "runtime")]
 pub use handlers::{
-    AgentHandler, CopilotHandler, EventHandler, FilePRHandler, FsHandler, GitHandler,
-    GitHubHandler, KvHandler, LogHandler, MergePRHandler,
+    AgentHandler, EventHandler, FilePRHandler, FsHandler, GitHandler, GitHubHandler, KvHandler,
+    LogHandler, MergePRHandler,
 };
 #[cfg(feature = "runtime")]
 pub use services::{
@@ -250,7 +255,8 @@ impl RuntimeBuilder {
         let root_working_dir =
             crate::services::agent_control::resolve_working_dir(root_birth_branch.as_str());
         let root_ctx = EffectContext {
-            agent_name: AgentName::from("root"),
+            agent_name: AgentName::try_from_str("root")
+                .expect("literal validated string is non-empty"),
             birth_branch: root_birth_branch,
             working_dir: root_working_dir,
         };

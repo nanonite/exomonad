@@ -51,9 +51,10 @@ pub fn parse_github_url(url: &str) -> Option<(GithubOwner, GithubRepo)> {
     let parts: Vec<&str> = cleaned.split('/').collect();
 
     match parts.as_slice() {
-        [.., owner, repo] if !owner.is_empty() && !repo.is_empty() => {
-            Some((GithubOwner::from(*owner), GithubRepo::from(*repo)))
-        }
+        [.., owner, repo] if !owner.is_empty() && !repo.is_empty() => Some((
+            GithubOwner::try_from_str(*owner).expect("validated string input is non-empty"),
+            GithubRepo::try_from_str(*repo).expect("validated string input is non-empty"),
+        )),
         _ => None,
     }
 }

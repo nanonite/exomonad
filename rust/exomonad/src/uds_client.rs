@@ -8,14 +8,21 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// Walk up from CWD to find `.exo/server.sock`. Follows symlinks.
+/// Walk up from CWD to find `.exo/server.sock`. Returns the canonical
+/// (symlink-resolved) path so `connect()` sees the real socket location
+/// rather than a worktree symlink that may exceed `sun_path`'s 108-byte limit.
 pub fn find_server_socket() -> Result<PathBuf> {
     let start = std::env::current_dir()?;
     let mut current = start.as_path();
     loop {
         let sock = current.join(".exo/server.sock");
         if sock.exists() {
-            return Ok(sock);
+            return sock.canonicalize().with_context(|| {
+                format!(
+                    "Failed to canonicalize server socket path {}",
+                    sock.display()
+                )
+            });
         }
         match current.parent() {
             Some(parent) => current = parent,
@@ -42,6 +49,11 @@ struct ToolListResponse {
     tools: Vec<ToolDefinition>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HealthResponse {
+    pub wasm_hash: String,
+}
+
 /// Client for the exomonad UDS server.
 pub struct ServerClient {
     socket: PathBuf,
@@ -54,7 +66,26 @@ impl ServerClient {
 
     /// Check if the server is alive and responding.
     pub async fn is_healthy(&self) -> bool {
-        self.get("/health").await.is_ok()
+        self.health_check().await.is_ok()
+    }
+
+    /// Check if the server is alive and return the transport/HTTP error when it is not.
+    pub async fn health_check(&self) -> Result<()> {
+        self.health_info().await.map(|_| ())
+    }
+
+    pub async fn health_info(&self) -> Result<HealthResponse> {
+        match self.get_json("/health").await {
+            Ok(response) => {
+                tracing::debug!(socket = %self.socket.display(), "UDS health check succeeded via GET /health");
+                Ok(response)
+            }
+            Err(err) => {
+                tracing::debug!(socket = %self.socket.display(), error = %err, "UDS health check failed via GET /health");
+                Err(err)
+                    .with_context(|| format!("GET /health failed via {}", self.socket.display()))
+            }
+        }
     }
 
     /// List available tools for an agent.
@@ -92,12 +123,6 @@ impl ServerClient {
         let resp = self.raw_get(path).await?;
         serde_json::from_slice(&resp)
             .with_context(|| format!("Failed to deserialize response from {}", path))
-    }
-
-    /// GET request, returns Ok if 2xx.
-    async fn get(&self, path: &str) -> Result<()> {
-        let _ = self.raw_get(path).await?;
-        Ok(())
     }
 
     /// Low-level GET over UDS. Returns response body bytes.

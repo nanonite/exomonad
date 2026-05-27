@@ -58,6 +58,10 @@ Always prefer failure to an undocumented heuristic or fallback.
 
 Never maintain two code paths that do the same thing. Redundant paths cause bug risk — fixes applied to one path get missed on the other. If there's a "debug mode" or "legacy mode" that duplicates a primary path, cut it.
 
+### Chainlink Timers
+
+Chainlink timers are TL-owned and explicit per issue. Start timers with the assigned issue id, and stop timers with that same issue id. Do not rely on a global active timer: Chainlink supports concurrent timers across issues while enforcing one active timer per issue.
+
 ### All Tools and Hooks in Haskell WASM
 
 **Never add direct Rust MCP tools.** All MCP tools and hooks are defined in Haskell WASM — tool schemas, argument parsing, dispatch logic, everything. Rust is the I/O runtime: it executes effects that the Haskell DSL yields. If a new tool needs new I/O capabilities, add a new effect handler in Rust and a corresponding effect type in Haskell. The tool itself lives in `haskell/wasm-guest/src/ExoMonad/Guest/Tools/`.
@@ -131,6 +135,12 @@ claude                        # MCP tools available immediately
 
 Use `--recreate` to tear down and rebuild the session (e.g., after binary updates).
 
+Optional local Forgejo CI stack:
+```bash
+cd forgejo
+docker compose up -d
+```
+
 **Project setup:**
 ```bash
 exomonad new                     # Bootstrap new project (.exo/config.toml, WASM, rules)
@@ -199,7 +209,7 @@ cargo build -p exomonad
 
 ### Configuration
 
-**Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults) and `.gitignore` entries if missing. Works in any project directory. All fields are optional — auto-detection handles the common case. **Claude rules:** `exomonad new` copies `.exo/rules/exomonad.md` → `.claude/rules/exomonad.md` (if the template exists and the destination doesn't). Template resolution: project-local `.exo/rules/` → global `~/.exo/rules/`. This gives fresh Claude instances automatic knowledge of exomonad MCP tools.
+**Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults), `.gitignore` entries, and `.forgejo/workflows/ci.yml` if missing. Works in any project directory. All fields are optional — auto-detection handles the common case. The CI scaffold uses GitHub Actions syntax with language-specific defaults, and leaves workspace-specific build/test customization where needed. **Claude rules:** `exomonad new` copies `.exo/rules/exomonad.md` → `.claude/rules/exomonad.md` (if the template exists and the destination doesn't). Template resolution: project-local `.exo/rules/` → global `~/.exo/rules/`. This gives fresh Claude instances automatic knowledge of exomonad MCP tools.
 
 ```toml
 # All fields below are optional — shown with their auto-detected defaults
@@ -210,11 +220,18 @@ wasm_dir = ".exo/wasm"       # project-local (default), override for shared inst
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
 model = "sonnet"             # optional — passed as --model flag to root TL agent
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
+forgejo_url = "http://localhost:3000"           # optional — Forgejo base URL
+forgejo_token = "forgejo_pat"                      # optional — Forgejo API token
+forgejo_webhook_secret = "shared-secret"           # optional — webhook signature secret
 
 # Extra MCP servers (HTTP or stdio). Included in .mcp.json for all agents.
 [extra_mcp_servers.metacog]
 type = "http"
 url = "http://localhost:8080"
+
+# Opencode agent configuration.
+[opencode]
+use_embedded_key = true  # true = use embedded key in opencode binary, false = use OPENROUTER_API_KEY
 
 [extra_mcp_servers.notebooklm]
 type = "stdio"
@@ -229,11 +246,6 @@ role = "sleeptime"             # WASM role for MCP tools (default: "worker")
 command = "claude --dangerously-skip-permissions"
 task = "You are sleeptime"     # optional — omit for interactive session
 model = "haiku"                # optional — passed as --model flag to companion
-
-[[companions]]
-name = "mock-github"
-agent_type = "process"         # plain process: no MCP, no worktree, no agent identity
-command = "python3 tests/e2e/mock_github.py --port 9876"
 ```
 
 **Config hierarchy:**
@@ -251,6 +263,26 @@ The `SessionStart` hook is critical — it registers the Claude session UUID in 
 Gemini agents get settings via `GEMINI_CLI_SYSTEM_SETTINGS_PATH` env var (NOT `.gemini/settings.json`).
 
 **Claude Code settings help:** We have a Claude Code configuration specialist (preloaded with official documentation) available as an oracle for hook syntax, settings structure, MCP setup, and debugging.
+
+### Review Policy
+
+The reviewer convergence loop is configured via `.exo/review-policy.toml`:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `min_review_rounds` | 1 | Minimum review rounds before merge is permitted |
+| `reviewer_max_rounds` | 2 | Max rounds before Stuck — PR surfaced to human |
+| `reviewer_max_wait_seconds` | 1200 | Max wait for reviewer response (20 min) |
+| `reviewer_max_rate_limit_retries` | 2 | Max rate-limit retries for reviewer agents |
+| `review_freshness_window_secs` | 1200 | Window for a review to be considered "fresh" |
+| `external_review_threshold` | 300 | Lines changed to trigger mandatory second review |
+| `external_review_paths` | `["proto/**", "rust/../handlers/**"]` | Path globs always requiring second review |
+| `require_second_reviewer_complexity` | false | Require second reviewer for complex PRs |
+| `complexity_line_threshold` | 500 | Line threshold for complexity-based second review |
+
+**Reviewer identity discipline:** Each reviewer agent operates under a distinct git identity (`user.name=exomonad-reviewer-{name}`). The reviewer never commits to a branch it didn't author — the Authoring-Agent line in the PR body establishes traceability. An agent never reviews under the identity that authored the PR.
+
+**Stuck state:** When a PR exceeds `reviewer_max_rounds` without convergence, the watcher fires the `Stuck` event. The parent TL receives `[STUCK: leaf-id]` and must re-decompose or escalate to a human. The PR cannot be auto-merged from this state.
 
 ### Companion Agents
 
@@ -276,11 +308,12 @@ What you can do with exomonad right now, end-to-end.
 
 Spawn heterogeneous agent teams as a recursive tree:
 
-- **`fork_wave`** — Fork N parallel Claude agents, each in its own worktree. Context inherited by default (`fork_session` defaults to `true`); set `false` for fresh-start children. Requires clean git state (committed and pushed).
-- **`spawn_gemini`** — Spawn Gemini agent in own worktree+branch. Files PR when done. Structured spec fields (steps, verify, boundary, context, read_first).
-- **`spawn_worker`** — Spawn ephemeral Gemini worker in tmux pane. No branch, no PR. Just name + task.
+- **`fork_wave`** — Fork N parallel agents (Claude, Codex, or OpenCode), each in its own worktree. Agent type defaults to server config; set `agent_type` explicitly to override. Claude agents inherit context via `--fork-session`; Codex and OpenCode agents require context injected via the task spec (no team messaging support). Requires clean git state (committed and pushed).
+- **`spawn_leaf`** — Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields (steps, verify, boundary, context, read_first).
+- **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
+- **`spawn_codex`** — Spawn a Codex leaf agent in its own worktree+branch. Files PR when done.
 
-**Agent Types:** `Claude` (🤖), `Gemini` (💎), `Shoal` (🌊). Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
+**Agent Types:** `Claude` (🤖), `Gemini` (💎), `OpenCode` (💻), `Codex` (🤖), `Shoal` (🌊). Codex agents use per-agent `.codex/config.toml` for MCP/instructions and a shared ExoMonad-managed hook block in the Codex user config for shell-native hooks. Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
 
 **Multi-WASM:** The server loads multiple WASM modules from `.exo/wasm/`. Convention: if `wasm-guest-{role}.wasm` exists, it's used for that role; otherwise falls back to `wasm-guest-{wasm_name}.wasm` (default). Drop a WASM file, it's available.
 
@@ -303,6 +336,8 @@ Push-based parallel worker coordination via **Claude Code Teams inbox**:
 
 This is **native Claude Code Teams integration**. Messages from child agents arrive exactly like messages from Claude Code teammates — structured, attributed, and delivered through the official inbox mechanism. The TL doesn't poll, doesn't block, and doesn't parse raw text. It gets a proper teammate notification.
 
+Teams inbox registration and delivery are Claude Code-only. OpenCode, Codex, Gemini, and Shoal agents use their supported non-Teams delivery paths until those runtimes expose native team inbox support.
+
 **Pipeline:** `notify_parent` → server resolves parent via `TeamRegistry` → `teams_mailbox::write_to_inbox()` → CC InboxPoller → `<teammate-message>` delivered to parent conversation.
 
 **Bidirectional Messaging:** The `send_message` tool enables arbitrary bidirectional messaging between any exomonad-spawned agents, routing via Teams inbox, ACP, UDS, or tmux fallback depending on the target agent's type and connection status.
@@ -322,12 +357,14 @@ This is **native Claude Code Teams integration**. Messages from child agents arr
 | **ACP messaging** (Gemini agents) | **Built.** Structured JSON-RPC messaging via Agent Client Protocol. `AcpRegistry` manages connections, `connect_and_prompt()` establishes ACP sessions. Delivery priority: Teams inbox → ACP prompt → HTTP-over-UDS → tmux STDIN. Vendor SDK patched for Send safety. |
 | **HTTP-over-UDS delivery** (Shoal/custom agents) | **Built.** `notify_parent` → POST to `.exo/agents/{name}/notify.sock`. Fire-and-forget with 5s timeout. For custom binary agents that run their own HTTP server on a Unix socket. |
 | **Event router** (tmux STDIN fallback) | Built. Fallback path: `notify_parent` → `inject_input` into parent pane via tmux buffer pattern. |
-| **Event handlers** (WASM dispatch for world events) | **Built.** Third dispatch category alongside tools and hooks. GitHub poller calls `handle_event` on agent's PluginManager for PR review events (reviews, approvals, timeouts) and **sibling merge events**. Handlers return `EventAction` (InjectMessage, NotifyParent, NoAction). |
-| **GitHub poller** (PR status → events) | Built. Background service polls PR/CI status, fires WASM event handlers, and injects notifications into agent panes. Tracks `first_seen`, `last_review_state`, and `notified_parent_timeout` per PR. |
+| **Event handlers** (WASM dispatch for world events) | **Built.** Third dispatch category alongside tools and hooks. Worktree event watcher calls `handle_event` on agent's PluginManager for PR review events (reviews, approvals, timeouts) and **sibling merge events**. Handlers return `EventAction` (InjectMessage, NotifyParent, NoAction). |
+| **Worktree event watcher** (PR status → events) | Built. Background service watches local git worktree PRs, fires WASM event handlers, and injects notifications into agent panes. Tracks `first_seen`, `last_review_state`, and `notified_parent_timeout` per PR. |
 | **OTel observability** | **Built.** Axum middleware auto-attributes every agent request span with `agent_id`, `agent.role`, `agent.parent`, `swarm.run_id`. `swarm.run_id` persisted to `.exo/run_id`, set as OTel resource attribute, propagated to children via env. Query all spans in a run: `resource.swarm.run_id = '{id}'`. Reconstruct spawn tree: `groupBy agent.parent, agent_id`. |
 | **Coordination mutexes** | Built. In-memory `MutexRegistry` with FIFO wait queues, TTL auto-expiry, idempotent acquire. Effect-only (`coordination.acquire_mutex`, `coordination.release_mutex`) — no MCP tool exposed. |
 | **Tempo observability** | **Built.** Grafana Tempo for lightweight trace storage (~100-200MB RAM). Agents query traces via `curl` + TraceQL against Tempo's HTTP API (port 3200). Optional Grafana UI at `http://localhost:3000`. |
 | **NotebookLM MCP** (optional) | **Vendored.** `vendor/notebooklm-mcp/` — stdio MCP server that automates Google NotebookLM via browser automation. Source-grounded, citation-backed answers from uploaded documentation. Opt-in via `extra_mcp_servers` in `config.toml`. |
+| **OpenCode hooks** (TypeScript plugin bridge) | **Built.** OpenCode agents get `tool.execute.before` / `tool.execute.after` / `event` hooks via a Bun TypeScript plugin written to `.exo/opencode-plugin/` at spawn time. The plugin shells out to `exomonad hook <event> --runtime opencode`, routing to the same WASM dispatch path as Claude Code and Gemini hooks. Enables role-based tool filtering and MCP call context steering (e.g. enforcing `file_pr` body format, `notify_parent` vocabulary). See `docs/decisions/opencode-hooks.md`. |
+| **Codex hooks and config** | **Built.** Codex agents get `.codex/config.toml` with the ExoMonad MCP server, developer instructions, optional model, and extra MCP servers. ExoMonad installs shared Codex hook commands for `PreToolUse`, `PostToolUse`, and `Stop` into the active Codex user config so spawned worktrees do not create new hook trust prompts. Hook commands call `exomonad hook <event> --runtime codex` and use the same WASM dispatch path as the other runtimes. See `docs/decisions/codex-integration.md` and `docs/decisions/codex-hook-wire-format.md`. |
 
 ### Tempo Observability
 
@@ -375,7 +412,7 @@ Without Tempo running, spans still appear in stderr via the tracing fmt layer.
 ```
 Human in tmux session
     └── Claude Code + exomonad (Rust + Haskell WASM)
-            ├── MCP tools via WASM (fork_wave, spawn_gemini, spawn_worker, etc.)
+            ├── MCP tools via WASM (fork_wave, spawn_leaf, spawn_worker, etc.)
             └── Agent tree:
                 ├── worktree: dev.feature-a (TL role, can spawn children)
                 │   ├── worker: rust-impl (Gemini, in-place pane)
@@ -398,7 +435,7 @@ Human in tmux session
 
 **Worktrees + tmux = Isolation/Multiplexing**
 - Git worktrees for code isolation (no Docker containers)
-- tmux windows for Claude subtrees, panes for Gemini workers
+- tmux windows for Claude subtrees, panes for ephemeral workers
 - Each agent = worktree + window (or pane), managed by Rust runtime
 
 ### Data Flows
@@ -431,7 +468,7 @@ Claude Code starts → exomonad hook session-start
 
 **Event Handler Call:**
 ```
-GitHub poller detects world event (Copilot review, CI status, timeout)
+Worktree event watcher detects world event (reviewer agent review, CI status, timeout)
 → Poller resolves agent's PluginManager from plugins map
 → Calls WASM handle_event with { role, event_type, payload }
 → Haskell dispatches to EventHandlerConfig handler → returns EventAction
@@ -446,9 +483,11 @@ All tools implemented in Haskell WASM (`haskell/wasm-guest/src/ExoMonad/Guest/To
 
 | Tool | Role | Description |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree. Context inherited by default (`fork_session` defaults to `true`). |
-| `spawn_gemini` | root, tl | Spawn Gemini agent in own worktree+branch. Structured spec fields: steps, verify, boundary, context, read_first. |
-| `spawn_worker` | root, tl | Spawn ephemeral Gemini worker in tmux pane (no branch, no PR). Just name + task. |
+| `fork_wave` | root, tl | Fork N parallel agents, each in its own worktree. Agent type defaults to server config; supported explicit runtimes include Claude, OpenCode, and Codex. Context inheritance is runtime-specific. |
+| `spawn_leaf` | root, tl | Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields: steps, verify, boundary, context, read_first. |
+| `spawn_opencode` | root, tl | Spawn OpenCode agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
+| `spawn_codex` | root, tl | Spawn Codex agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
+| `spawn_worker` | root, tl | Spawn an ephemeral worker in a tmux pane (no branch, no PR). Just name + task. |
 | `file_pr` | tl, dev | Create/update PR (auto-detects base branch from naming) |
 | `merge_pr` | root, tl | Merge child PR (gh merge + git fetch) |
 | `notify_parent` | tl, dev, worker | Send message to parent agent. Auto-routed via Teams inbox (primary) or tmux STDIN (fallback) |
@@ -496,7 +535,7 @@ cabal test all             # Haskell tests
 
 # E2E tests (interactive — launches tmux session, you observe)
 just e2e-messaging         # Teams inbox delivery pipeline
-just e2e-hook-rewrite      # BeforeModel/AfterModel PII rewriting
+just e2e-oc-rewrite        # BeforeModel/AfterModel PII rewriting
 ```
 
 ### E2E Test Pattern
@@ -556,31 +595,34 @@ Use sub-TLs to keep each context window sharp. If a task decomposes into more th
 
 ### Intelligence Gradient
 
-Claude (Opus) decomposes and dispatches. Gemini implements. Copilot reviews. The TL never implements directly and never manually reviews intermediate output.
+Claude (Opus) decomposes and dispatches. Gemini implements. Reviewer agent reviews. The TL never implements directly and never manually reviews intermediate output.
 
-**Cost model:** Opus tokens are 10-30x Gemini tokens. Every line of code the TL writes is expensive code. Every review cycle the TL performs is an expensive review cycle. The TL's job is producing specs sharp enough that the leaf + Copilot convergence loop handles quality without TL involvement.
+**Cost model:** Opus tokens are 10-30x Gemini tokens. Every line of code the TL writes is expensive code. Every review cycle the TL performs is an expensive review cycle. The TL's job is producing specs sharp enough that the leaf + reviewer convergence loop handles quality without TL involvement.
 
 ### Fire-and-Forget Execution
 
 The TL's workflow is: **decompose → spec → spawn → move on**. The TL does not wait, poll, review intermediate output, or re-spec. It spawns all leaves it can, then idles until messages arrive.
 
-**Convergence is leaf + Copilot + event handlers, not TL:**
+**Convergence is leaf + reviewer + event handlers, not TL:**
 1. TL writes spec, spawns leaf (Gemini), returns immediately
 2. Leaf works → commits → files PR
-3. GitHub poller detects Copilot review comments → fires `handle_event(PRReview::ReviewReceived)` → handler injects comments into leaf's pane
-4. Leaf reads Copilot feedback, fixes, pushes
-5. Poller detects SHA change after `ChangesRequested` → fires `handle_event(PRReview::FixesPushed)` → handler sends `[FIXES PUSHED]` to TL
+3. Worktree event watcher detects reviewer agent review comments → fires `handle_event(PRReview::ReviewReceived)` → handler injects comments into leaf's pane
+4. Leaf reads reviewer feedback, fixes, pushes
+5. Watcher detects SHA change after `ChangesRequested` → fires `handle_event(PRReview::FixesPushed)` → handler sends `[FIXES PUSHED]` to TL
 6. TL sees `[from: leaf-id] [FIXES PUSHED] PR #N — CI passing. Ready to merge.` → merges the PR
 
-**Note:** Copilot's first review is automatic (triggered on PR creation). Subsequent reviews after pushing fixes are NOT — Copilot does not re-review. The `FixesPushed` event is the system's signal that the iteration loop completed.
+**Note:** The reviewer agent re-reviews after fixes are pushed. The `FixesPushed` event signals that the leaf has responded to all review comments and the reviewer should re-evaluate.
 
 **Alternative paths:**
-- **Copilot approves first time** → poller fires `handle_event(PRReview::Approved)` → handler sends `[PR READY]` to TL → TL merges
-- **No Copilot review after timeout** → poller fires `handle_event(PRReview::ReviewTimeout)` → handler sends `[REVIEW TIMEOUT]` to TL → TL merges if CI passes (15 min initial, 5 min after addressing changes)
+- **Reviewer approves** → watcher fires `handle_event(PRReview::ReviewerApproved)` → handler sends `[PR READY]` to TL → TL merges
+- **Reviewer requests changes** → watcher fires `handle_event(PRReview::ReviewerRequestedChanges)` → handler injects comments into leaf's pane → leaf fixes → pushes → reviewer re-checks
+- **No reviewer response after timeout** → watcher fires `handle_event(PRReview::ReviewTimeout)` → handler sends `[REVIEW TIMEOUT]` to TL → TL merges if CI passes
 - **Leaf sends status updates** → `notify_parent` delivers `[from: leaf-id] message` to TL → informational, TL reads but does not auto-merge
 - **Leaf fails** → `notify_parent` with `failure` status → delivers `[FAILED: leaf-id] message` to TL → TL re-decomposes
+- **Review is stuck** → after max rounds without convergence, watcher fires `handle_event(PRReview::Stuck)` → handler sends `[STUCK: leaf-id]` to TL → human intervention required
+- **Reviewer requests changes after one fix round** → dev state enters `DevNeedsHumanDirection` → handler sends `[STUCK: leaf-id]` to TL → human intervention required
 
-**Escalation, not iteration.** If a leaf fails after 3+ Copilot rounds, it calls `notify_parent` with `failure` status. The TL then decides: re-decompose, try a different approach, or flag for human intervention. The TL never manually fixes a leaf's code.
+**Escalation, not iteration.** If a leaf fails after reaching `reviewer_max_rounds` (see `.exo/review-policy.toml`), the watcher fires the `Stuck` event. The TL then decides: re-decompose, try a different approach, or flag for human intervention. The TL never manually fixes a leaf's code.
 
 ### Spec Quality (You Only Get One Shot)
 
@@ -624,9 +666,9 @@ The recursive execution pattern. Every TL at every level follows this protocol:
    - Commit and push. Children fork from this commit.
 
 2. **Fork** — Spawn wave N children. Zero deps between siblings in the same wave.
-   - Sub-TLs: `fork_wave` (Claude, context inherited by default) — they already know the plan
-   - Devs: `spawn_gemini` (Gemini, worktree+PR) — they get CLAUDE.md from scaffolding
-   - Workers: `spawn_worker` (Gemini, ephemeral pane) — research or non-conflicting edits
+   - Sub-TLs: `fork_wave` (Claude, Codex, or OpenCode — agent type from config or explicit `agent_type`). Claude agents inherit context via `--fork-session`; Codex and OpenCode require context injected in the task spec.
+   - Devs: `spawn_leaf` (worktree+PR, agent type from config) — they get CLAUDE.md from scaffolding
+   - Workers: `spawn_worker` (ephemeral pane) — research or non-conflicting edits
 
 3. **Converge** — Wait for child notifications. Merge their PRs. Write an integration commit:
    - Wire children's outputs together
@@ -647,14 +689,15 @@ Spawn multiple leaves when tasks are independent (no file conflicts, no ordering
 ### When TL Gets Notified
 
 The TL is idle between spawning and receiving notifications. It wakes up for:
-- **`[FIXES PUSHED]`** (event handler) — leaf addressed Copilot review comments and pushed fixes. Copilot does NOT re-review, so this is the actionable signal. TL merges if CI passes.
-- **`[PR READY]`** (event handler) — Copilot approved a leaf's PR on first review. TL merges and verifies the result builds cleanly. Multiple leaves landing in parallel may interact.
-- **`[REVIEW TIMEOUT]`** (event handler) — no Copilot review after timeout (15 min initial, 5 min after addressing changes). TL merges if CI passes.
+- **`[FIXES PUSHED]`** (event handler) — leaf addressed reviewer comments and pushed fixes. TL merges if CI passes.
+- **`[PR READY]`** (event handler) — reviewer approved a leaf's PR. TL merges and verifies the result builds cleanly. Multiple leaves landing in parallel may interact.
+- **`[REVIEW TIMEOUT]`** (event handler) — no reviewer response after timeout (configured in `.exo/review-policy.toml`). TL merges if CI passes.
+- **`[STUCK: agent-id]`** — review did not converge within `reviewer_max_rounds`, or the reviewer still requests changes after the single allowed fix round. Human intervention required — the PR cannot be auto-merged.
 - **`[from: agent-id]`** (agent message) — informational update from a leaf. Do not auto-merge; read the message.
 - **`[FAILED: agent-id]`** — leaf exhausted retries. TL re-decomposes or escalates.
-- GitHub poller notifications (CI status, PR merge conflicts).
+- Worktree event watcher notifications (CI status, PR merge conflicts).
 
-The TL does NOT wake up for intermediate progress, Copilot comments, or partial results. The convergence loop (leaf + Copilot) runs without TL involvement.
+The TL does NOT wake up for intermediate progress, reviewer comments, or partial results. The convergence loop (leaf + reviewer) runs without TL involvement.
 
 ---
 
@@ -673,6 +716,8 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 ├── tests/e2e/                 ← E2E tests (see § E2E Test Pattern)
 │   ├── messaging/             ← Teams inbox delivery test
 │   └── hook-rewrite/          ← PII rewriting hooks test
+├── docs/architecture/         ← Cross-cutting architecture references
+│   └── agent-system.md        ← Role × tool matrix, hook deny rules, per-role state machines, PR review flow (+ .html view)
 └── docs/decisions/            ← Architecture decision records (living docs)
 ```
 
@@ -688,6 +733,7 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 | Work on WASM guest (MCP tools) | `haskell/wasm-guest/CLAUDE.md` |
 | Add or modify E2E tests | `CLAUDE.md` § E2E Test Pattern + `tests/e2e/messaging/` as reference |
 | Understand architectural decisions | `docs/decisions/` |
+| See role tool matrix, hook rules, state machines, PR review flow | `docs/architecture/agent-system.md` |
 
 ---
 

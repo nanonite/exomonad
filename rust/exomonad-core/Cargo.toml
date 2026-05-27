@@ -32,6 +32,7 @@ runtime = [
     "dep:chrono",
     "dep:dirs",
     "dep:octocrab",
+    "dep:toml",
     "dep:ollama-rs",
     "dep:reqwest",
     "dep:url",
@@ -46,6 +47,7 @@ runtime = [
     "dep:agent-client-protocol-schema",
     "dep:tokio-util",
     "dep:futures",
+    "dep:tokio-tungstenite",
     "dep:claude-teams-bridge",
     "dep:opentelemetry",
     "dep:tracing-opentelemetry",
@@ -79,6 +81,7 @@ agent-client-protocol = { path = "../../vendor/acp-rust-sdk/src/agent-client-pro
 agent-client-protocol-schema = { version = "=0.10.8", optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 futures = { version = "0.3.31", optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 
 # Runtime feature: core framework
 extism = { version = "1.13", optional = true }
@@ -95,6 +98,7 @@ claude-teams-bridge = { path = "../claude-teams-bridge", optional = true }
 chrono = { version = "0.4", optional = true }
 dirs = { version = "5.0", optional = true }
 octocrab = { version = "0.38", optional = true }
+toml = { version = "0.8", optional = true }
 ollama-rs = { version = "0.2", optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 url = { version = "2", optional = true }

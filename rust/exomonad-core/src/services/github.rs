@@ -13,17 +13,17 @@ use tracing::info;
 
 const API_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Build an Octocrab client from GITHUB_TOKEN environment variable.
+/// Build an Octocrab client from FORGEJO_TOKEN environment variable.
 ///
 /// Returns actionable error messages if the token is missing.
 pub fn build_octocrab() -> Result<Octocrab> {
-    let token = std::env::var("GITHUB_TOKEN").map_err(|_| {
-        anyhow!("GitHub token required. Set the GITHUB_TOKEN environment variable.")
+    let token = std::env::var("FORGEJO_TOKEN").map_err(|_| {
+        anyhow!("Forgejo token required. Set the FORGEJO_TOKEN environment variable.")
     })?;
 
     if token.is_empty() {
         return Err(anyhow!(
-            "GitHub token is empty. Set the GITHUB_TOKEN environment variable."
+            "Forgejo token is empty. Set the FORGEJO_TOKEN environment variable."
         ));
     }
 
@@ -33,7 +33,7 @@ pub fn build_octocrab() -> Result<Octocrab> {
         &token[..token.len().min(4)]
     };
 
-    let base_url = std::env::var("GITHUB_API_URL").ok();
+    let base_url = std::env::var("FORGEJO_API_URL").ok();
 
     info!(
         token_prefix = token_prefix,
@@ -44,7 +44,7 @@ pub fn build_octocrab() -> Result<Octocrab> {
     let mut builder = OctocrabBuilder::new().personal_token(token);
 
     if let Some(ref url) = base_url {
-        builder = builder.base_uri(url).context("Invalid GITHUB_API_URL")?;
+        builder = builder.base_uri(url).context("Invalid FORGEJO_API_URL")?;
     }
 
     let client = builder.build().context("Failed to build Octocrab client")?;
@@ -56,8 +56,8 @@ pub fn build_octocrab() -> Result<Octocrab> {
 pub fn map_octo_err(e: octocrab::Error) -> String {
     match &e {
         octocrab::Error::GitHub { source, .. } => match source.status_code.as_u16() {
-            401 => return "GitHub authentication failed. Token may be expired or invalid. Set a valid GITHUB_TOKEN.".to_string(),
-            403 => return "GitHub token lacks required permissions. Ensure your token has `repo` scope.".to_string(),
+            401 => return "GitHub authentication failed. Token may be expired or invalid. Set a valid FORGEJO_TOKEN.".to_string(),
+            403 => return "Forgejo token lacks required permissions. Ensure your token has `repo` scope.".to_string(),
             _ => return format!("GitHub API error ({}): {}", source.status_code, source.message),
         },
         octocrab::Error::Service { source, .. } => {
@@ -74,7 +74,7 @@ pub fn map_octo_err(e: octocrab::Error) -> String {
             } else {
                 "unknown"
             };
-            let base_url = std::env::var("GITHUB_API_URL")
+            let base_url = std::env::var("FORGEJO_API_URL")
                 .unwrap_or_else(|_| "https://api.github.com".to_string());
             return format!(
                 "Service error (kind={}, target={}): {}",
@@ -102,7 +102,7 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-    /// Create a new client, building from `GITHUB_TOKEN` env var.
+    /// Create a new client, building from `FORGEJO_TOKEN` env var.
     pub fn new(rebuild_threshold: u32) -> Arc<Self> {
         Arc::new(Self {
             client: RwLock::new(build_octocrab().ok()),
@@ -123,11 +123,9 @@ impl GitHubClient {
 
     /// Get a clone of the inner `Octocrab`. Returns error if no token was configured.
     pub async fn get(&self) -> Result<Octocrab> {
-        self.client
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("GitHub client not available (GITHUB_TOKEN not set or invalid)"))
+        self.client.read().await.clone().ok_or_else(|| {
+            anyhow!("Forgejo-compatible client not available (FORGEJO_TOKEN not set or invalid)")
+        })
     }
 
     /// Reset failure counter on successful API call.
@@ -277,7 +275,7 @@ impl TryFrom<models::issues::Issue> for Issue {
 
 /// A GitHub pull request with metadata.
 ///
-/// Returned by [`GitHubService::list_prs()`] and [`GitHubService::get_pr_for_branch()`].
+/// Returned by [`GitHubService::list_prs()`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PullRequest {
     /// PR number (unique within repository).
@@ -418,14 +416,6 @@ pub struct GithubListPRsInput {
 impl FFIBoundary for GithubListPRsInput {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GithubGetPRForBranchInput {
-    pub repo: Repo,
-    pub head: BranchName,
-}
-
-impl FFIBoundary for GithubGetPRForBranchInput {}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GithubGetPRReviewCommentsInput {
     pub repo: Repo,
     pub pr_number: PRNumber,
@@ -444,7 +434,7 @@ impl FFIBoundary for GithubGetPRReviewCommentsInput {}
 ///
 /// # Authentication
 ///
-/// Requires a GitHub personal access token with appropriate scopes:
+/// Requires a Forgejo access token with appropriate scopes:
 /// - `repo` - Required for private repositories
 /// - `public_repo` - Sufficient for public repositories
 ///
@@ -459,8 +449,8 @@ impl FFIBoundary for GithubGetPRReviewCommentsInput {}
 /// let github = GitHubService::new(client);
 ///
 /// let repo = Repo {
-///     owner: GithubOwner::from("anthropics"),
-///     name: GithubRepo::from("exomonad"),
+///     owner: GithubOwner::try_from_str("anthropics").expect("literal validated string is non-empty"),
+///     name: GithubRepo::try_from_str("exomonad").expect("literal validated string is non-empty"),
 /// };
 ///
 /// let issues = github.list_issues(&repo, None).await?;
@@ -784,9 +774,11 @@ impl GitHubService {
                         state,
                         body: v["body"].as_str().unwrap_or("").to_string(),
                         commit_id: if commit_str.is_empty() {
-                            CommitSha::from("unknown")
+                            CommitSha::try_from_str("unknown")
+                                .expect("literal validated string is non-empty")
                         } else {
-                            CommitSha::from(commit_str)
+                            CommitSha::try_from_str(commit_str)
+                                .expect("validated string input is non-empty")
                         },
                     }
                 })
@@ -797,52 +789,6 @@ impl GitHubService {
                 "GitHub API: Get PR reviews successful"
             );
             Ok(reviews)
-        })
-        .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn get_pr_for_branch(
-        &self,
-        repo: &Repo,
-        head: &BranchName,
-    ) -> Result<Option<PullRequest>> {
-        let owner = repo.owner.clone();
-        let name = repo.name.clone();
-        let head = head.clone();
-
-        self.tracked(|client| async move {
-            let pulls_handler = client.pulls(owner.as_str(), name.as_str());
-            let page = timeout(
-                API_TIMEOUT,
-                pulls_handler
-                    .list()
-                    .state(params::State::Open)
-                    .head(format!("{}:{}", owner, head.as_str()))
-                    .send(),
-            )
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "GitHub API get_pr_for_branch timed out after {}s",
-                    API_TIMEOUT.as_secs()
-                )
-            })??;
-
-            let pr = page.into_iter().next();
-
-            match &pr {
-                Some(p) => {
-                    tracing::info!(
-                        number = p.number,
-                        head = head.as_str(),
-                        "Found PR for branch"
-                    )
-                }
-                None => tracing::info!(head = head.as_str(), "No PR found for branch"),
-            }
-
-            pr.map(PullRequest::try_from).transpose()
         })
         .await
     }
@@ -904,18 +850,18 @@ mod tests {
 
     #[test]
     fn test_build_octocrab_missing_token() {
-        // Ensure GITHUB_TOKEN is not set for this test
-        let old_token = std::env::var("GITHUB_TOKEN").ok();
-        std::env::remove_var("GITHUB_TOKEN");
+        // Ensure FORGEJO_TOKEN is not set for this test
+        let old_token = std::env::var("FORGEJO_TOKEN").ok();
+        std::env::remove_var("FORGEJO_TOKEN");
 
         let result = build_octocrab();
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("GitHub token required"));
+        assert!(err_msg.contains("Forgejo token required"));
 
         // Restore token if it was set
         if let Some(t) = old_token {
-            std::env::set_var("GITHUB_TOKEN", t);
+            std::env::set_var("FORGEJO_TOKEN", t);
         }
     }
 
@@ -967,8 +913,8 @@ mod tests {
             .await;
 
         let repo = Repo {
-            owner: "owner".into(),
-            name: "repo".into(),
+            owner: GithubOwner::try_from_str("owner").expect("literal GitHub owner is non-empty"),
+            name: GithubRepo::try_from_str("repo").expect("literal GitHub repo is non-empty"),
         };
 
         let issues = service.list_issues(&repo, None).await.unwrap();
@@ -1011,8 +957,8 @@ mod tests {
             .await;
 
         let repo = Repo {
-            owner: "owner".into(),
-            name: "repo".into(),
+            owner: GithubOwner::try_from_str("owner").expect("literal GitHub owner is non-empty"),
+            name: GithubRepo::try_from_str("repo").expect("literal GitHub repo is non-empty"),
         };
 
         let issue = service
@@ -1059,15 +1005,16 @@ mod tests {
             .await;
 
         let repo = Repo {
-            owner: "owner".into(),
-            name: "repo".into(),
+            owner: GithubOwner::try_from_str("owner").expect("literal GitHub owner is non-empty"),
+            name: GithubRepo::try_from_str("repo").expect("literal GitHub repo is non-empty"),
         };
 
         let spec = CreatePRSpec {
             title: "New PR".to_string(),
             body: "PR Body".to_string(),
-            head: BranchName::from("feature"),
-            base: BranchName::from("main"),
+            head: BranchName::try_from_str("feature")
+                .expect("literal validated string is non-empty"),
+            base: BranchName::try_from_str("main").expect("literal validated string is non-empty"),
         };
 
         let pr = service.create_pr(&repo, spec).await.unwrap();
@@ -1113,8 +1060,8 @@ mod tests {
             .await;
 
         let repo = Repo {
-            owner: "owner".into(),
-            name: "repo".into(),
+            owner: GithubOwner::try_from_str("owner").expect("literal GitHub owner is non-empty"),
+            name: GithubRepo::try_from_str("repo").expect("literal GitHub repo is non-empty"),
         };
 
         let prs = service.list_prs(&repo, None).await.unwrap();

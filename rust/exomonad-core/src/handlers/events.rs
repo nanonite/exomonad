@@ -14,6 +14,27 @@ use crate::services::{
     HasSupervisorRegistry, HasTeamRegistry,
 };
 
+fn structural_parent_session_id(
+    agent_name: &crate::domain::AgentName,
+    birth_branch: &crate::domain::BirthBranch,
+    identity: Option<&crate::services::agent_resolver::AgentIdentityRecord>,
+) -> String {
+    if let Some(identity) = identity {
+        if identity.topology == crate::services::agent_control::Topology::SharedDir {
+            return identity.parent_branch.to_string();
+        }
+    }
+
+    if agent_name.is_gemini_worker() {
+        birth_branch.to_string()
+    } else {
+        birth_branch
+            .parent()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "root".to_string())
+    }
+}
+
 /// Events effect handler.
 ///
 /// Handles all effects in the `events.*` namespace.
@@ -30,6 +51,53 @@ impl<C: HasEventQueue> EventHandler<C> {
             ctx,
             event_queue_scope: event_queue_scope.unwrap_or_else(|| "default".to_string()),
         }
+    }
+}
+
+fn message_summary(content: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        content.chars().take(50).collect::<String>()
+    } else {
+        summary.to_string()
+    }
+}
+
+fn explicit_message_address(
+    recipient: Option<exomonad_proto::effects::events::Address>,
+    effect_name: &str,
+) -> EffectResult<Address> {
+    let address = Address::from_proto(recipient);
+    if matches!(address, Address::Supervisor) {
+        return Err(crate::effects::EffectError::custom(
+            "events.invalid_input",
+            format!(
+                "{} requires an explicit recipient (agent name or team); got empty/missing recipient",
+                effect_name
+            ),
+        ));
+    }
+    Ok(address)
+}
+
+impl<C: HasSupervisorRegistry> EventHandler<C> {
+    async fn lookup_supervisor(
+        &self,
+        agent_id: &crate::domain::AgentName,
+        birth_branch: &crate::domain::BirthBranch,
+    ) -> Option<crate::services::supervisor_registry::SupervisorInfo> {
+        if let Some(info) = self
+            .ctx
+            .supervisor_registry()
+            .lookup(agent_id.as_str())
+            .await
+        {
+            return Some(info);
+        }
+
+        self.ctx
+            .supervisor_registry()
+            .lookup(birth_branch.as_str())
+            .await
     }
 }
 
@@ -143,7 +211,8 @@ impl<
             (agent_name.clone(), "ctx")
         } else {
             (
-                crate::domain::AgentName::from(req.agent_id.as_str()),
+                crate::domain::AgentName::try_from_str(req.agent_id.as_str())
+                    .expect("validated string input is non-empty"),
                 "request",
             )
         };
@@ -184,7 +253,8 @@ impl<
                 Address::Team { team, member: None } => {
                     let lead = self.ctx.team_registry().resolve_lead(team.as_str()).await;
                     let id = lead.unwrap_or_else(|| "root".to_string());
-                    let lead_name = crate::domain::AgentName::from(id.as_str());
+                    let lead_name = crate::domain::AgentName::try_from_str(id.as_str())
+                        .expect("validated string input is non-empty");
                     let tab = crate::services::delivery::resolve_tab_name_for_agent(
                         &lead_name,
                         resolver_ref,
@@ -209,20 +279,16 @@ impl<
             return Ok(NotifyParentResponse { ack: true });
         }
 
-        // Check SupervisorRegistry for this agent's birth-branch
-        if let Some(info) = self
-            .ctx
-            .supervisor_registry()
-            .lookup(birth_branch.as_str())
-            .await
-        {
+        // Check SupervisorRegistry by concrete agent ID first, then legacy birth-branch key.
+        if let Some(info) = self.lookup_supervisor(&agent_id, birth_branch).await {
             tracing::info!(
                 supervisor = %info.supervisor,
                 team = %info.team,
                 "notify_parent: resolved supervisor from registry"
             );
             let parent_session_id = info.supervisor.as_str();
-            let supervisor_name = crate::domain::AgentName::from(parent_session_id);
+            let supervisor_name = crate::domain::AgentName::try_from_str(parent_session_id)
+                .expect("validated string input is non-empty");
             let tab_name = crate::services::delivery::resolve_tab_name_for_agent(
                 &supervisor_name,
                 Some(self.ctx.agent_resolver()),
@@ -243,15 +309,11 @@ impl<
             return Ok(NotifyParentResponse { ack: true });
         }
 
-        // Structural fallback: birth-branch parent
-        let parent_session_id = if agent_name.is_gemini_worker() {
-            birth_branch.to_string()
-        } else {
-            birth_branch
-                .parent()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "root".to_string())
-        };
+        // Structural fallback: worktree agents notify the parent branch;
+        // shared-dir workers notify the exact parent branch recorded at spawn.
+        let identity = self.ctx.agent_resolver().get(&agent_id).await;
+        let parent_session_id =
+            structural_parent_session_id(agent_name, birth_branch, identity.as_ref());
 
         tracing::info!(
             birth_branch = %birth_branch,
@@ -260,7 +322,8 @@ impl<
             "notify_parent: routing via structural identity"
         );
 
-        let parent_agent = crate::domain::AgentName::from(parent_session_id.as_str());
+        let parent_agent = crate::domain::AgentName::try_from_str(parent_session_id.as_str())
+            .expect("validated string input is non-empty");
         let tab_name = crate::services::delivery::resolve_tab_name_for_agent(
             &parent_agent,
             Some(self.ctx.agent_resolver()),
@@ -287,21 +350,8 @@ impl<
         req: SendMessageRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SendMessageResponse> {
-        let summary = if req.summary.is_empty() {
-            req.content.chars().take(50).collect::<String>()
-        } else {
-            req.summary.clone()
-        };
-
-        let address = Address::from_proto(req.recipient.clone());
-
-        // Validate: send_message requires an explicit recipient, not Supervisor
-        if matches!(address, Address::Supervisor) {
-            return Err(crate::effects::EffectError::custom(
-                "events.invalid_input",
-                "send_message requires an explicit recipient (agent name or team); got empty/missing recipient".to_string(),
-            ));
-        }
+        let summary = message_summary(&req.content, &req.summary);
+        let address = explicit_message_address(req.recipient.clone(), "send_message")?;
 
         tracing::info!(
             address = %address,
@@ -334,16 +384,127 @@ impl<
             delivery_method: method_string.to_string(),
         })
     }
+
+    async fn send_tmux_message(
+        &self,
+        req: SendTmuxMessageRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SendTmuxMessageResponse> {
+        let summary = message_summary(&req.content, &req.summary);
+        let address = explicit_message_address(req.recipient.clone(), "send_tmux_message")?;
+
+        tracing::info!(
+            address = %address,
+            sender = %ctx.agent_name,
+            "send_tmux_message: routing via tmux stdin"
+        );
+
+        let outcome = crate::services::delivery::route_tmux_message(
+            &*self.ctx,
+            &address,
+            &ctx.agent_name,
+            &req.content,
+            &summary,
+        )
+        .await;
+        let method_string = outcome.method_string();
+        let success = outcome.is_success();
+
+        Ok(SendTmuxMessageResponse {
+            success,
+            delivery_method: method_string.to_string(),
+        })
+    }
+
+    async fn send_mailbox_message(
+        &self,
+        req: SendMailboxMessageRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SendMailboxMessageResponse> {
+        if !crate::services::delivery::mailbox_protocol_available() {
+            return Err(crate::effects::EffectError::custom(
+                "events.mailbox_unavailable",
+                crate::services::delivery::MAILBOX_PROTOCOL_UNAVAILABLE_MESSAGE.to_string(),
+            ));
+        }
+
+        let summary = message_summary(&req.content, &req.summary);
+        let address = explicit_message_address(req.recipient.clone(), "send_mailbox_message")?;
+
+        tracing::info!(
+            address = %address,
+            sender = %ctx.agent_name,
+            "send_mailbox_message: routing via Teams inbox"
+        );
+
+        let outcome = crate::services::delivery::route_mailbox_message(
+            &*self.ctx,
+            &address,
+            &ctx.agent_name,
+            &req.content,
+            &summary,
+        )
+        .await;
+        let method_string = outcome.method_string();
+        let success = outcome.is_success();
+
+        Ok(SendMailboxMessageResponse {
+            success,
+            delivery_method: method_string.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{AgentName, BirthBranch, Slug};
+    use crate::services::agent_control::{AgentType, Topology};
+    use crate::services::agent_resolver::AgentIdentityRecord;
+    use std::path::PathBuf;
 
     #[test]
     fn test_event_handler_namespace() {
         let services = Arc::new(crate::services::Services::test());
         let handler = EventHandler::new(services, None);
         assert_eq!(handler.namespace(), "events");
+    }
+
+    #[test]
+    fn shared_dir_worker_notifies_recorded_parent_branch() {
+        let agent_name = AgentName::try_from_str("chainlink-codex-worker-codex")
+            .expect("literal validated string is non-empty");
+        let birth_branch = BirthBranch::try_from_str("main.chainlink-codex-tl-codex")
+            .expect("literal validated string is non-empty");
+        let identity = AgentIdentityRecord {
+            agent_name: agent_name.clone(),
+            slug: Slug::try_from_str("chainlink-codex-worker")
+                .expect("literal validated string is non-empty"),
+            agent_type: AgentType::Codex,
+            birth_branch: birth_branch.clone(),
+            parent_branch: BirthBranch::try_from_str("main.chainlink-codex-tl-codex")
+                .expect("literal validated string is non-empty"),
+            working_dir: PathBuf::from(".exo/worktrees/chainlink-codex-tl-codex"),
+            display_name: "🤖 chainlink-codex-worker-codex".to_string(),
+            topology: Topology::SharedDir,
+        };
+
+        assert_eq!(
+            structural_parent_session_id(&agent_name, &birth_branch, Some(&identity)),
+            "main.chainlink-codex-tl-codex"
+        );
+    }
+
+    #[test]
+    fn worktree_agent_notifies_birth_branch_parent() {
+        let agent_name = AgentName::try_from_str("codex-leaf-codex")
+            .expect("literal validated string is non-empty");
+        let birth_branch = BirthBranch::try_from_str("main.codex-tl-codex.codex-leaf-codex")
+            .expect("literal validated string is non-empty");
+
+        assert_eq!(
+            structural_parent_session_id(&agent_name, &birth_branch, None),
+            "main.codex-tl-codex"
+        );
     }
 }

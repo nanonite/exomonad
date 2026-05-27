@@ -66,8 +66,18 @@ library wasm-guest-internal
         ExoMonad.Guest.Tools.FilePR
         ExoMonad.Guest.Tools.MergePR
         ExoMonad.Guest.Tools.Spawn
+        ExoMonad.Guest.Tools.SpawnCodex
+        ExoMonad.Guest.Tools.SpawnReviewer
+        ExoMonad.Guest.Tools.CleanupReviewerLeaf
+        ExoMonad.Guest.Tools.WatcherPrState
+        ExoMonad.Guest.Tools.SessionStatus
         ExoMonad.Guest.Tools.Events
         ExoMonad.Guest.Tools.Tasks
+        ExoMonad.Guest.Tools.Chainlink
+        ExoMonad.Guest.Tools.CloseIssueAndCleanup
+        ExoMonad.Guest.Tools.CleanupOrphan
+        ExoMonad.Guest.Tools.DisposeLeaf
+        ExoMonad.Guest.Tools.DiscardWorkerOutput
         ExoMonad.Guest.Tools.TestRunner
         ExoMonad.Guest.Prompt
         ExoMonad.Guest.Events
@@ -112,9 +122,25 @@ library wasm-guest-internal
         ExoMonad.Types
         -- Permissions
         ExoMonad.Permissions
+        -- Chainlink pure utilities
+        ExoMonad.Guest.Tools.Chainlink.Pure
     -- Additional dependencies (shared stanza provides common deps)
     build-depends:
         exomonad-pdk,
         exomonad-proto,
         proto3-runtime,
         vector
+
+test-suite wasm-guest-tests
+    import:           shared
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Main.hs
+    other-modules:
+        ExoMonad.Guest.Tools.Chainlink.PureTest
+    build-depends:
+        wasm-guest:wasm-guest-internal,
+        tasty,
+        tasty-hunit,
+        text,
+        containers

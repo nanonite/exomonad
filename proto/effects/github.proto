@@ -161,22 +161,6 @@ message GetPullRequestResponse {
 }
 
 // ============================================================================
-// GetPullRequestForBranch - Find PR for a branch
-// ============================================================================
-
-message GetPullRequestForBranchRequest {
-  string owner = 1;
-  string repo = 2;
-  string branch = 3;
-}
-
-message GetPullRequestForBranchResponse {
-  // Null if no PR exists for the branch.
-  PullRequest pull_request = 1;
-  bool found = 2;
-}
-
-// ============================================================================
 // CreatePullRequest - Create a new PR
 // ============================================================================
 
@@ -234,7 +218,6 @@ service GitHubEffects {
   rpc GetIssue(GetIssueRequest) returns (GetIssueResponse);
   rpc ListPullRequests(ListPullRequestsRequest) returns (ListPullRequestsResponse);
   rpc GetPullRequest(GetPullRequestRequest) returns (GetPullRequestResponse);
-  rpc GetPullRequestForBranch(GetPullRequestForBranchRequest) returns (GetPullRequestForBranchResponse);
   rpc CreatePullRequest(CreatePullRequestRequest) returns (CreatePullRequestResponse);
   rpc GetPullRequestReviewComments(GetPullRequestReviewCommentsRequest) returns (GetPullRequestReviewCommentsResponse);
 }

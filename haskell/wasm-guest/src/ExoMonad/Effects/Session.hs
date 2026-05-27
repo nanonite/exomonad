@@ -6,6 +6,7 @@ module ExoMonad.Effects.Session
   ( SessionRegisterClaudeId,
     SessionRegisterTeam,
     SessionDeregisterTeam,
+    SessionListAgents,
 
     -- * Proto types
     module Effects.Session,
@@ -37,3 +38,10 @@ instance Effect SessionDeregisterTeam where
   type Input SessionDeregisterTeam = DeregisterTeamRequest
   type Output SessionDeregisterTeam = DeregisterTeamResponse
   effectId = "session.deregister_team"
+
+data SessionListAgents
+
+instance Effect SessionListAgents where
+  type Input SessionListAgents = ListAgentsRequest
+  type Output SessionListAgents = ListAgentsResponse
+  effectId = "session.list_agents"

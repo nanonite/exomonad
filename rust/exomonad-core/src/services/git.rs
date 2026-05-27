@@ -21,7 +21,7 @@ pub fn get_current_branch() -> Result<BranchName> {
         anyhow::bail!("Not on a branch (detached HEAD?)");
     }
 
-    Ok(BranchName::from(branch))
+    BranchName::try_from_str(branch).context("current git branch name was empty")
 }
 
 /// Extract agent ID from a branch name following gh-{number}/{slug} convention.
@@ -71,8 +71,8 @@ pub struct WorktreeInfo {
     /// Absolute path to the worktree directory.
     pub path: String,
 
-    /// Current branch name (or "HEAD" if detached).
-    pub branch: BranchName,
+    /// Current branch name, or None when HEAD is detached.
+    pub branch: Option<BranchName>,
 }
 
 /// Git repository information.
@@ -132,9 +132,15 @@ impl GitService {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn get_branch(&self, dir: &str) -> Result<BranchName> {
+    pub async fn get_branch(&self, dir: &str) -> Result<Option<BranchName>> {
         let output = self.exec_git(dir, &["branch", "--show-current"]).await?;
-        Ok(BranchName::from(output.trim()))
+        let branch = output.trim();
+        if branch.is_empty() {
+            return Ok(None);
+        }
+        BranchName::try_from_str(branch)
+            .map(Some)
+            .context("current git branch name was invalid")
     }
 
     #[tracing::instrument(skip(self))]
@@ -215,7 +221,10 @@ impl GitService {
 
     #[tracing::instrument(skip(self))]
     pub async fn get_repo_info(&self, dir: &str) -> Result<RepoInfo> {
-        let branch = self.get_branch(dir).await?;
+        let branch = self
+            .get_branch(dir)
+            .await?
+            .context("HEAD is detached; repository info requires a branch")?;
         let remote_url = self.get_remote_url(dir).await.ok();
 
         let (owner, name) = remote_url
@@ -225,8 +234,8 @@ impl GitService {
 
         Ok(RepoInfo {
             branch,
-            owner: owner.as_ref().map(|s| GithubOwner::from(s.as_str())),
-            name: name.as_ref().map(|s| GithubRepo::from(s.as_str())),
+            owner,
+            name,
         })
     }
 }
@@ -266,7 +275,15 @@ mod tests {
         let mock = Arc::new(MockExecutor::new(vec![Ok("main\n".to_string())]));
         let git = GitService::new(mock);
         let branch = git.get_branch("/app").await.unwrap();
-        assert_eq!(branch.as_str(), "main");
+        assert_eq!(branch.unwrap().as_str(), "main");
+    }
+
+    #[tokio::test]
+    async fn test_get_branch_detached_head() {
+        let mock = Arc::new(MockExecutor::new(vec![Ok("\n".to_string())]));
+        let git = GitService::new(mock);
+        let branch = git.get_branch("/app").await.unwrap();
+        assert!(branch.is_none());
     }
 
     #[tokio::test]
@@ -278,7 +295,7 @@ mod tests {
         let git = GitService::new(mock);
         let wt = git.get_worktree("/app/src").await.unwrap();
         assert_eq!(wt.path, "/app");
-        assert_eq!(wt.branch.as_str(), "feature/123");
+        assert_eq!(wt.branch.unwrap().as_str(), "feature/123");
     }
 
     #[tokio::test]

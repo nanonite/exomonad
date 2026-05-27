@@ -1,32 +1,40 @@
 pub mod acp_client;
 pub mod acp_registry;
 pub mod agent_control;
+pub mod agent_inbox;
 pub mod agent_resolver;
+pub mod agent_resources;
 pub mod claude_session_registry;
 pub mod command;
-pub mod copilot_review;
+pub mod complexity_classifier;
 pub mod delivery;
 pub mod event_log;
 pub mod event_queue;
 pub mod external;
 pub mod file_pr;
 pub mod filesystem;
+pub mod forgejo;
+pub mod forgejo_ci;
 pub mod git;
 pub mod git_worktree;
 pub mod github;
-pub mod github_poller;
 pub mod inbox_watcher;
 pub mod local;
 pub mod log;
 pub mod merge_pr;
 pub mod mutex_registry;
+pub mod orphan_reconciler;
+pub mod pr_registry;
 pub mod repo;
 pub mod resilience;
+pub mod review_policy;
 pub mod secrets;
 pub mod supervisor_registry;
 pub mod synthetic_members;
 pub mod tmux_events;
 pub mod tmux_ipc;
+pub mod tui_consumption;
+pub mod worktree_event_watcher;
 
 pub use self::acp_registry::AcpRegistry;
 pub use self::agent_control::{
@@ -38,6 +46,7 @@ pub use self::claude_session_registry::ClaudeSessionRegistry;
 pub use self::event_log::EventLog;
 pub use self::event_queue::EventQueue;
 pub use self::filesystem::FileSystemService;
+pub use self::forgejo::ForgejoClient;
 pub use self::git_worktree::GitWorktreeService;
 pub use self::github::GitHubClient;
 pub use self::mutex_registry::MutexRegistry;
@@ -82,8 +91,32 @@ pub trait HasMutexRegistry: Send + Sync {
 pub trait HasGitHubClient: Send + Sync {
     fn github_client(&self) -> Option<&Arc<GitHubClient>>;
 }
+pub trait HasForgejoClient: Send + Sync {
+    fn forgejo_client(&self) -> Option<&Arc<ForgejoClient>>;
+}
+
+pub trait HasForgejoReviewerClient: Send + Sync {
+    fn forgejo_reviewer_client(&self) -> Option<&Arc<ForgejoClient>>;
+}
+pub type CiStatusKey = (crate::domain::BranchName, String);
+pub type CiStatusMap = std::collections::HashMap<CiStatusKey, crate::domain::CIStatus>;
+
 pub trait HasGitWorktreeService: Send + Sync {
     fn git_worktree_service(&self) -> &Arc<GitWorktreeService>;
+}
+pub trait HasCiStatusMap: Send + Sync {
+    fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<CiStatusMap>>;
+}
+/// Spawns a reviewer agent for a Forgejo PR. Implemented by `AgentControlService`.
+///
+/// Reviewer creation is owned by the Forgejo PR watcher for automatic review
+/// rounds. TL/root roles may request explicit reviewer-only recovery when a PR
+/// outlives its original author worktree.
+///
+/// Decouples `WorktreeEventWatcher` from the concrete `AgentControlService` type.
+#[async_trait::async_trait]
+pub trait ReviewerSpawner: Send + Sync {
+    async fn spawn_reviewer_for_pr(&self, pr: &pr_registry::PrEntry) -> anyhow::Result<()>;
 }
 
 // ============================================================================
@@ -98,6 +131,8 @@ pub trait HasGitWorktreeService: Send + Sync {
 pub struct Services {
     pub project_dir: PathBuf,
     pub github_client: Option<Arc<GitHubClient>>,
+    pub forgejo_client: Option<Arc<ForgejoClient>>,
+    pub forgejo_reviewer_client: Option<Arc<ForgejoClient>>,
     pub event_log: Option<Arc<EventLog>>,
     pub team_registry: Arc<TeamRegistry>,
     pub acp_registry: Arc<AcpRegistry>,
@@ -107,6 +142,20 @@ pub struct Services {
     pub event_queue: Arc<EventQueue>,
     pub mutex_registry: Arc<MutexRegistry>,
     pub git_wt: Arc<GitWorktreeService>,
+    /// Model for spawned OpenCode workers (passed to `opencode run --model`).
+    /// `None` means let opencode pick.
+    pub opencode_worker_model: Option<String>,
+    /// Shared CI status map updated by CI integrations.
+    /// Keyed by `(branch, sha)` so stale CI from an older push cannot satisfy a newer PR head.
+    /// Shared with `WorktreeEventWatcher` so both the watcher and merge gate read from the same map.
+    pub ci_status_map: Arc<tokio::sync::RwLock<CiStatusMap>>,
+}
+
+impl Services {
+    /// Read the configured model for spawned OpenCode workers.
+    pub fn opencode_worker_model(&self) -> Option<&str> {
+        self.opencode_worker_model.as_deref()
+    }
 }
 
 impl HasTeamRegistry for Services {
@@ -159,9 +208,24 @@ impl HasGitHubClient for Services {
         self.github_client.as_ref()
     }
 }
+impl HasForgejoClient for Services {
+    fn forgejo_client(&self) -> Option<&Arc<ForgejoClient>> {
+        self.forgejo_client.as_ref()
+    }
+}
+impl HasForgejoReviewerClient for Services {
+    fn forgejo_reviewer_client(&self) -> Option<&Arc<ForgejoClient>> {
+        self.forgejo_reviewer_client.as_ref()
+    }
+}
 impl HasGitWorktreeService for Services {
     fn git_worktree_service(&self) -> &Arc<GitWorktreeService> {
         &self.git_wt
+    }
+}
+impl HasCiStatusMap for Services {
+    fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<CiStatusMap>> {
+        &self.ci_status_map
     }
 }
 
@@ -172,6 +236,8 @@ impl Services {
         Self {
             project_dir: PathBuf::from("."),
             github_client: None,
+            forgejo_client: None,
+            forgejo_reviewer_client: None,
             event_log: None,
             team_registry: Arc::new(TeamRegistry::new()),
             acp_registry: Arc::new(AcpRegistry::new()),
@@ -181,7 +247,27 @@ impl Services {
             event_queue: Arc::new(EventQueue::new()),
             mutex_registry: Arc::new(MutexRegistry::new()),
             git_wt: Arc::new(GitWorktreeService::new(PathBuf::from("."))),
+            opencode_worker_model: None,
+            ci_status_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
+    }
+}
+
+#[cfg(test)]
+mod opencode_worker_model_tests {
+    use super::*;
+
+    #[test]
+    fn accessor_returns_configured_model() {
+        let mut s = Services::test();
+        s.opencode_worker_model = Some("opencode-go/qwen3.6-plus".to_string());
+        assert_eq!(s.opencode_worker_model(), Some("opencode-go/qwen3.6-plus"));
+    }
+
+    #[test]
+    fn accessor_returns_none_when_unset() {
+        let s = Services::test();
+        assert_eq!(s.opencode_worker_model(), None);
     }
 }
 

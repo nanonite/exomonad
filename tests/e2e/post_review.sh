@@ -9,7 +9,7 @@ set -euo pipefail
 #   state:     CHANGES_REQUESTED | APPROVED | COMMENTED
 #   body:      review body text
 #
-# Requires: GITHUB_API_URL or MOCK_PORT env var
+# Requires: FORGEJO_API_URL or MOCK_PORT env var
 
 if [[ $# -lt 3 ]]; then
     echo "Usage: post_review.sh <pr_number> <state> <body>" >&2
@@ -21,12 +21,12 @@ STATE="$2"
 BODY="$3"
 
 # Resolve mock API URL
-if [[ -n "${GITHUB_API_URL:-}" ]]; then
-    BASE_URL="$GITHUB_API_URL"
+if [[ -n "${FORGEJO_API_URL:-}" ]]; then
+    BASE_URL="$FORGEJO_API_URL"
 elif [[ -n "${MOCK_PORT:-}" ]]; then
     BASE_URL="http://127.0.0.1:$MOCK_PORT"
 else
-    echo "ERROR: Neither GITHUB_API_URL nor MOCK_PORT is set" >&2
+    echo "ERROR: Neither FORGEJO_API_URL nor MOCK_PORT is set" >&2
     exit 1
 fi
 

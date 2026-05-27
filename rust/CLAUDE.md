@@ -42,7 +42,7 @@ Human in tmux session
     └── Claude Code (main window, role=tl)
             ├── MCP server: exomonad mcp-stdio
             ├── WASM: loaded from .exo/wasm/ at runtime
-            └── fork_wave / spawn_gemini creates:
+            └── fork_wave / spawn_leaf creates:
                 ├── Window subtree-1 (Claude, worktree off current branch, role=tl)
                 ├── Window leaf-1 (Gemini, worktree off current branch, role=dev)
                 ├── Pane worker-a (Gemini, in parent dir, ephemeral, role=worker)
@@ -58,12 +58,12 @@ Each subtree agent (`spawn_subtree`):
 - PRs target parent branch, not main — merged via recursive fold
 - Runs in tmux window with `claude 'task'` (positional arg), auto-closes on exit
 
-Each leaf agent (`spawn_gemini` with worktree/standalone isolation):
+Each leaf agent (`spawn_leaf` with worktree/standalone isolation):
 - Same worktree isolation as `spawn_subtree` (own branch, own directory)
 - Gemini — dev role (no spawn tools)
 - Runs in tmux window, files PR against parent branch
 
-Each worker agent (`spawn_gemini` with inline isolation):
+Each worker agent (`spawn_leaf` with inline isolation):
 - Runs in a tmux pane in the parent's directory (no branch, no worktree, ephemeral)
 - Always Gemini — lightweight, focused execution
 - MCP config in `.exo/agents/{name}/settings.json`, pointed via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`
@@ -135,7 +135,7 @@ echo '{"hook_event_name":"PreToolUse",...}' | exomonad hook pre-tool-use
 ### Environment Variables
 | Variable | Used By | Purpose |
 |----------|---------|---------|
-| `GITHUB_TOKEN` | services | GitHub API access |
+| `FORGEJO_TOKEN` | services | Forgejo API access |
 | `RUST_LOG` | all | Tracing log level |
 | `EXOMONAD_AGENT_ID` | agent spawn | Agent identity for spawned agents (read at spawn time) |
 | `EXOMONAD_SESSION_ID` | agent spawn | Parent's birth-branch, used for routing `notify_parent` |
@@ -151,7 +151,7 @@ In `mcp-stdio` mode, the agent's identity is passed via command-line flags: `--r
 
 Roles are defined in Haskell WASM (`AllRoles.hs`). Adding a role is a Haskell-only change — Rust uses a lazy cache that creates a `PluginManager` per role on first request.
 
-At spawn time, `fork_wave`/`spawn_gemini` writes per-agent MCP config with the agent's identity flags. Identity is unforgeable and visible in logs.
+At spawn time, `fork_wave`/`spawn_leaf` writes per-agent MCP config with the agent's identity flags. Identity is unforgeable and visible in logs.
 
 ## MCP Tools
 
@@ -160,7 +160,7 @@ All tools are defined in Haskell WASM and executed via host functions.
 | Tool | Role | Description |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree |
-| `spawn_gemini` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
+| `spawn_leaf` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
 | `file_pr` | tl, dev | Create/update PR for current branch (auto-detects base branch from naming) |
 | `merge_pr` | tl | Merge child PR (gh pr merge + git fetch) |
 | `notify_parent` | all | Send message to parent agent (auto-routed via Teams inbox, ACP, or tmux) |

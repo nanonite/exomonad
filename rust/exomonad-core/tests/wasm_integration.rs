@@ -17,6 +17,11 @@ use exomonad_core::{EffectError, EffectHandler, EffectResult, RuntimeBuilder};
 use prost::Message;
 use serde_json::{json, Value};
 use serial_test::serial;
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static MOCK_AGENT_CLOSE_SELF_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MOCK_EVENTS_NOTIFY_PARENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 // ============================================================================
 // Test Infrastructure
@@ -85,6 +90,142 @@ fn assert_tool_error(output: &Value, tool_name: &str) {
         output["success"], false,
         "{tool_name} should fail: {output:#}"
     );
+}
+
+async fn list_tool_names(runtime: &exomonad_core::Runtime, role: &str) -> BTreeSet<String> {
+    let tools: Vec<Value> = runtime
+        .plugin_manager()
+        .call("handle_list_tools", &json!({"role": role}))
+        .await
+        .unwrap_or_else(|e| panic!("handle_list_tools failed for {role}: {e}"));
+
+    tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn assert_tools_present(role: &str, names: &BTreeSet<String>, expected: &[&str]) {
+    for tool in expected {
+        assert!(
+            names.contains(*tool),
+            "{role} role missing tool '{tool}'. Got: {names:?}"
+        );
+    }
+}
+
+fn expand_matrix_tool_cell(cell: &str) -> BTreeSet<String> {
+    let mut tools = BTreeSet::new();
+    let mut prefix = String::new();
+
+    for raw_part in cell.split('/') {
+        let tool = raw_part.trim().trim_matches('`');
+        if tool.is_empty() {
+            continue;
+        }
+
+        if let Some(suffix) = tool.strip_prefix('_') {
+            if !prefix.is_empty() {
+                tools.insert(format!("{prefix}_{suffix}"));
+            }
+            continue;
+        }
+
+        if let Some((base_prefix, _)) = tool.rsplit_once('_') {
+            prefix = base_prefix.to_string();
+        } else {
+            prefix.clear();
+        }
+        tools.insert(tool.to_string());
+    }
+
+    tools
+}
+
+fn expected_tool_matrix_from_architecture_doc(
+) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    let doc = include_str!("../../../docs/architecture/agent-system.md");
+    let mut matrix = std::collections::BTreeMap::from([
+        ("root".to_string(), BTreeSet::new()),
+        ("tl".to_string(), BTreeSet::new()),
+        ("dev".to_string(), BTreeSet::new()),
+        ("reviewer".to_string(), BTreeSet::new()),
+        ("worker".to_string(), BTreeSet::new()),
+    ]);
+    let roles = ["root", "tl", "dev", "reviewer", "worker"];
+    let mut in_tool_table = false;
+
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("| Tool |") || trimmed.starts_with("| Chainlink tool |") {
+            in_tool_table = true;
+            continue;
+        }
+        if in_tool_table && !trimmed.starts_with('|') {
+            in_tool_table = false;
+            continue;
+        }
+        if !in_tool_table
+            || trimmed.starts_with("|------")
+            || trimmed.starts_with("|---------------")
+        {
+            continue;
+        }
+
+        let cells: Vec<&str> = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        if cells.len() != 6 {
+            continue;
+        }
+
+        let expanded_tools = expand_matrix_tool_cell(cells[0]);
+        for (idx, role) in roles.iter().enumerate() {
+            if cells[idx + 1] == "x" {
+                matrix
+                    .get_mut(*role)
+                    .expect("role initialized")
+                    .extend(expanded_tools.iter().cloned());
+            }
+        }
+    }
+
+    matrix
+}
+
+fn markdown_tool_visibility_diff(
+    rows: &[(String, String, BTreeSet<String>, BTreeSet<String>)],
+) -> String {
+    let mut output = String::from(
+        "\n| Runtime | Role | Missing | Unexpected |\n|---------|------|---------|------------|\n",
+    );
+    for (runtime, role, missing, unexpected) in rows {
+        let missing = if missing.is_empty() {
+            "-".to_string()
+        } else {
+            missing.iter().cloned().collect::<Vec<_>>().join(", ")
+        };
+        let unexpected = if unexpected.is_empty() {
+            "-".to_string()
+        } else {
+            unexpected.iter().cloned().collect::<Vec<_>>().join(", ")
+        };
+        output.push_str(&format!(
+            "| {runtime} | {role} | {missing} | {unexpected} |\n"
+        ));
+    }
+    output
+}
+
+fn assert_tools_absent(role: &str, names: &BTreeSet<String>, forbidden: &[&str]) {
+    for tool in forbidden {
+        assert!(
+            !names.contains(*tool),
+            "{role} role should not expose tool '{tool}'. Got: {names:?}"
+        );
+    }
 }
 
 // ============================================================================
@@ -204,7 +345,7 @@ impl EffectHandler for MockAgentHandler {
     async fn handle(
         &self,
         effect_type: &str,
-        _payload: &[u8],
+        payload: &[u8],
         _ctx: &exomonad_core::effects::EffectContext,
     ) -> EffectResult<Vec<u8>> {
         use exomonad_proto::effects::agent::*;
@@ -224,16 +365,19 @@ impl EffectHandler for MockAgentHandler {
                     pr_number: 0,
                     pr_url: String::new(),
                     topology: 1,
+                    pane_id: String::new(),
                 };
                 Ok(SpawnSubtreeResponse { agent: Some(agent) }.encode_to_vec())
             }
             "agent.spawn_leaf_subtree" => {
+                let req = SpawnLeafSubtreeRequest::decode(payload)
+                    .expect("mock agent handler should decode spawn_leaf_subtree request");
                 let agent = AgentInfo {
                     id: "test-leaf-gemini".into(),
                     issue: String::new(),
                     worktree_path: "/tmp/test-leaf-worktree".into(),
                     branch_name: "main.test-leaf".into(),
-                    agent_type: 2,
+                    agent_type: req.agent_type,
                     role: 2,
                     alive: true,
                     mux_window: "test-leaf".into(),
@@ -241,16 +385,19 @@ impl EffectHandler for MockAgentHandler {
                     pr_number: 0,
                     pr_url: String::new(),
                     topology: 1,
+                    pane_id: String::new(),
                 };
                 Ok(SpawnLeafSubtreeResponse { agent: Some(agent) }.encode_to_vec())
             }
             "agent.spawn_worker" => {
+                let req = SpawnWorkerRequest::decode(payload)
+                    .map_err(|e| EffectError::invalid_input(format!("decode: {e}")))?;
                 let agent = AgentInfo {
                     id: "test-worker-gemini".into(),
                     issue: String::new(),
                     worktree_path: String::new(),
                     branch_name: String::new(),
-                    agent_type: 2,
+                    agent_type: req.agent_type,
                     role: 0,
                     alive: true,
                     mux_window: "test-worker".into(),
@@ -258,13 +405,39 @@ impl EffectHandler for MockAgentHandler {
                     pr_number: 0,
                     pr_url: String::new(),
                     topology: 2,
+                    pane_id: "%42".into(),
                 };
                 Ok(SpawnWorkerResponse { agent: Some(agent) }.encode_to_vec())
+            }
+            "agent.close_self" => {
+                MOCK_AGENT_CLOSE_SELF_CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(CloseSelfResponse {
+                    success: true,
+                    error: String::new(),
+                }
+                .encode_to_vec())
             }
             "agent.cleanup_merged" => Ok(CleanupMergedResponse {
                 cleaned: vec![],
                 skipped: vec![],
                 errors: vec![],
+            }
+            .encode_to_vec()),
+            "agent.watcher_pr_state" => Ok(WatcherPrStateResponse {
+                success: true,
+                error: String::new(),
+                pr_number: 42,
+                found: true,
+                merge_ready: true,
+                blocker: String::new(),
+                review_state: "approved".into(),
+                ci_status: "success".into(),
+                head_sha: "abc123".into(),
+                head_branch: "main.test-leaf".into(),
+                base_branch: "main".into(),
+                pr_state: "open".into(),
+                merged: false,
+                review_count: 1,
             }
             .encode_to_vec()),
             _ => Err(EffectError::not_found(format!("mock_agent/{effect_type}"))),
@@ -381,7 +554,10 @@ impl EffectHandler for MockEventsHandler {
         use exomonad_proto::effects::events::*;
 
         match effect_type {
-            "events.notify_parent" => Ok(NotifyParentResponse { ack: true }.encode_to_vec()),
+            "events.notify_parent" => {
+                MOCK_EVENTS_NOTIFY_PARENT_CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(NotifyParentResponse { ack: true }.encode_to_vec())
+            }
             "events.notify_event" => Ok(NotifyEventResponse { success: true }.encode_to_vec()),
             _ => Err(EffectError::not_found(format!("mock_events/{effect_type}"))),
         }
@@ -476,11 +652,6 @@ impl EffectHandler for MockGitHubHandler {
                 reviews: vec![],
             }
             .encode_to_vec()),
-            "github.get_pull_request_for_branch" => Ok(GetPullRequestForBranchResponse {
-                pull_request: None,
-                found: false,
-            }
-            .encode_to_vec()),
             "github.create_pull_request" => Ok(CreatePullRequestResponse {
                 pull_request: None,
                 url: "https://github.com/test/test/pull/99".into(),
@@ -529,6 +700,35 @@ impl EffectHandler for MockCopilotHandler {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn mcp_tool_visibility_matrix_matches_live_wasm_tools() {
+    let runtime = build_test_runtime().await;
+    let expected = expected_tool_matrix_from_architecture_doc();
+    let runtimes = ["claude", "codex", "opencode", "gemini"];
+    let mut failures = Vec::new();
+
+    for runtime_name in runtimes {
+        for (role, expected_tools) in &expected {
+            let actual_tools = list_tool_names(&runtime, role).await;
+            let missing: BTreeSet<String> =
+                expected_tools.difference(&actual_tools).cloned().collect();
+            let unexpected: BTreeSet<String> =
+                actual_tools.difference(expected_tools).cloned().collect();
+
+            if !missing.is_empty() || !unexpected.is_empty() {
+                failures.push((runtime_name.to_string(), role.clone(), missing, unexpected));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Live MCP tool visibility differs from docs/architecture/agent-system.md:{}",
+        markdown_tool_visibility_diff(&failures)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn wasm_tl_tools_include_spawn_and_merge() {
     let runtime = build_test_runtime().await;
 
@@ -542,11 +742,13 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
 
     for expected in [
         "fork_wave",
-        "spawn_leaf_subtree",
-        "spawn_workers",
+        "spawn_leaf",
+        "spawn_worker",
         "merge_pr",
         "file_pr",
         "notify_parent",
+        "cleanup_reviewer_leaf",
+        "watcher_pr_state",
     ] {
         assert!(
             names.contains(&expected),
@@ -617,6 +819,195 @@ async fn wasm_worker_tools_include_notify_parent() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_reviewer_tools_include_review_commands() {
+    let runtime = build_test_runtime().await;
+
+    let tools: Vec<Value> = runtime
+        .plugin_manager()
+        .call("handle_list_tools", &json!({"role": "reviewer"}))
+        .await
+        .expect("handle_list_tools failed for reviewer");
+
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+
+    for expected in ["approve_pr", "request_changes", "post_review_comment"] {
+        assert!(
+            names.contains(&expected),
+            "Reviewer role missing tool '{expected}'. Got: {names:?}"
+        );
+    }
+
+    assert!(
+        !names.contains(&"notify_parent"),
+        "Reviewer should not have notify_parent (#268: ephemeral reviewer, no parent messaging)"
+    );
+    assert!(
+        !names.contains(&"fork_wave"),
+        "Reviewer should not have fork_wave"
+    );
+    assert!(
+        !names.contains(&"file_pr"),
+        "Reviewer should not have file_pr"
+    );
+    assert!(
+        !names.contains(&"merge_pr"),
+        "Reviewer should not have merge_pr"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_chainlink_tools_are_scoped_by_role() {
+    let runtime = build_test_runtime().await;
+
+    let all_chainlink_tools = [
+        "chainlink_issue_create",
+        "chainlink_session_start",
+        "chainlink_session_status",
+        "chainlink_issue_show",
+        "chainlink_issue_comment",
+        "chainlink_subissue_create",
+        "chainlink_session_work",
+        "chainlink_session_end",
+        "chainlink_issue_close",
+        "chainlink_subissue_close",
+        "chainlink_timer_start",
+        "chainlink_timer_stop",
+        "chainlink_timer_status",
+        "chainlink_issue_list",
+        "chainlink_issue_update",
+        "chainlink_issue_block",
+        "chainlink_issue_relate",
+        "chainlink_issue_cascade",
+        "chainlink_milestone_create",
+        "chainlink_milestone_list",
+    ];
+    let dropped_chainlink_tools = [
+        "chainlink_agent_init",
+        "chainlink_sync",
+        "chainlink_worker_status",
+    ];
+
+    let coordinator_cleanup_tools = [
+        "close_issue_and_cleanup",
+        "cleanup_reviewer_leaf",
+        "watcher_pr_state",
+    ];
+
+    let coordinator_chainlink_tools = [
+        "chainlink_issue_create",
+        "chainlink_session_start",
+        "chainlink_session_status",
+        "chainlink_issue_show",
+        "chainlink_issue_comment",
+        "chainlink_subissue_create",
+        "chainlink_session_work",
+        "chainlink_session_end",
+        "chainlink_issue_close",
+        "chainlink_timer_start",
+        "chainlink_timer_stop",
+        "chainlink_timer_status",
+        "chainlink_issue_list",
+        "chainlink_issue_update",
+        "chainlink_issue_block",
+        "chainlink_issue_relate",
+        "chainlink_issue_cascade",
+        "chainlink_milestone_create",
+        "chainlink_milestone_list",
+    ];
+
+    let tl_tools = list_tool_names(&runtime, "tl").await;
+    assert_tools_present("tl", &tl_tools, &coordinator_chainlink_tools);
+    assert_tools_present("tl", &tl_tools, &coordinator_cleanup_tools);
+    assert_tools_absent("tl", &tl_tools, &dropped_chainlink_tools);
+
+    let root_tools = list_tool_names(&runtime, "root").await;
+    assert_tools_present("root", &root_tools, &coordinator_chainlink_tools);
+    assert_tools_present("root", &root_tools, &coordinator_cleanup_tools);
+    assert_tools_absent("root", &root_tools, &dropped_chainlink_tools);
+
+    let dev_tools = list_tool_names(&runtime, "dev").await;
+    assert_tools_present(
+        "dev",
+        &dev_tools,
+        &[
+            "chainlink_session_start",
+            "chainlink_session_status",
+            "chainlink_issue_show",
+            "chainlink_issue_comment",
+            "chainlink_subissue_create",
+            "chainlink_session_work",
+            "chainlink_session_end",
+            "chainlink_subissue_close",
+        ],
+    );
+    assert_tools_absent("dev", &dev_tools, &coordinator_cleanup_tools);
+    assert_tools_absent("dev", &dev_tools, &dropped_chainlink_tools);
+    assert_tools_absent(
+        "dev",
+        &dev_tools,
+        &[
+            "chainlink_issue_create",
+            "chainlink_issue_close",
+            "chainlink_timer_start",
+            "chainlink_timer_stop",
+            "chainlink_timer_status",
+            "chainlink_issue_list",
+            "chainlink_issue_update",
+            "chainlink_issue_block",
+            "chainlink_issue_relate",
+            "chainlink_issue_cascade",
+            "chainlink_milestone_create",
+            "chainlink_milestone_list",
+        ],
+    );
+
+    let worker_tools = list_tool_names(&runtime, "worker").await;
+    assert_tools_present(
+        "worker",
+        &worker_tools,
+        &[
+            "chainlink_issue_show",
+            "chainlink_session_start",
+            "chainlink_issue_comment",
+            "chainlink_session_work",
+            "chainlink_session_end",
+        ],
+    );
+    assert_tools_absent(
+        "worker",
+        &worker_tools,
+        &[
+            "chainlink_issue_create",
+            "chainlink_session_status",
+            "chainlink_subissue_create",
+            "chainlink_subissue_close",
+            "chainlink_issue_close",
+            "chainlink_timer_start",
+            "chainlink_timer_stop",
+            "chainlink_timer_status",
+            "chainlink_issue_list",
+            "chainlink_issue_update",
+            "chainlink_issue_block",
+            "chainlink_issue_relate",
+            "chainlink_issue_cascade",
+            "chainlink_milestone_create",
+            "chainlink_milestone_list",
+        ],
+    );
+    assert_tools_absent("worker", &worker_tools, &coordinator_cleanup_tools);
+    assert_tools_absent("worker", &worker_tools, &dropped_chainlink_tools);
+
+    for role in ["reviewer", "testrunner"] {
+        let names = list_tool_names(&runtime, role).await;
+        assert_tools_absent(role, &names, &all_chainlink_tools);
+        assert_tools_absent(role, &names, &coordinator_cleanup_tools);
+        assert_tools_absent(role, &names, &dropped_chainlink_tools);
+    }
+}
+
 // ============================================================================
 // Tool Roundtrip Tests (multi-effect trampoline)
 // ============================================================================
@@ -643,42 +1034,144 @@ async fn wasm_fork_wave_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn wasm_spawn_leaf_subtree_roundtrip() {
+async fn wasm_spawn_leaf_roundtrip() {
     let runtime = build_test_runtime().await;
 
     let output = call_tool(
         &runtime,
         "tl",
-        "spawn_leaf_subtree",
+        "spawn_leaf",
         json!({
+            "name": "rust-handler",
             "task": "Implement the Rust handler",
-            "branch_name": "rust-handler"
         }),
     )
     .await;
 
-    assert_tool_success(&output, "spawn_leaf_subtree");
+    assert_tool_success(&output, "spawn_leaf");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn wasm_spawn_workers_roundtrip() {
+async fn wasm_spawn_leaf_passes_agent_type() {
     let runtime = build_test_runtime().await;
 
     let output = call_tool(
         &runtime,
         "tl",
-        "spawn_workers",
+        "spawn_leaf",
         json!({
-            "specs": [{
-                "name": "rust-impl",
-                "task": "Implement the Rust side"
-            }]
+            "name": "rust-handler",
+            "task": "Implement the Rust handler",
+            "agent_type": "opencode"
         }),
     )
     .await;
 
-    assert_tool_success(&output, "spawn_workers");
+    assert_tool_success(&output, "spawn_leaf");
+    assert_eq!(output["result"]["agent_type"], "opencode");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_leaf_passes_codex_agent_type() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_leaf",
+        json!({
+            "name": "rust-handler",
+            "task": "Implement the Rust handler",
+            "agent_type": "codex"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_leaf");
+    assert_eq!(output["result"]["agent_type"], "codex");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_codex_roundtrip() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_codex",
+        json!({
+            "branch_name": "rust-codex",
+            "task": "Implement the Rust handler"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_codex");
+    assert_eq!(output["result"]["agent_type"], "codex");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_worker_roundtrip() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_worker",
+        json!({
+            "name": "rust-impl",
+            "task": "Implement the Rust side"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_worker_passes_agent_type() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_worker",
+        json!({
+            "name": "rust-impl",
+            "task": "Implement the Rust side",
+            "agent_type": "opencode"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_worker");
+    assert_eq!(output["result"]["spawned"][0]["agent_type"], "opencode");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_worker_passes_codex_agent_type() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_worker",
+        json!({
+            "name": "rust-impl",
+            "task": "Implement the Rust side",
+            "agent_type": "codex"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_worker");
+    assert_eq!(output["result"]["spawned"][0]["agent_type"], "codex");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -902,6 +1395,40 @@ async fn wasm_hook_session_start() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn wasm_hook_worker_exit_notifies_parent_and_closes_self() {
+    MOCK_AGENT_CLOSE_SELF_CALLS.store(0, Ordering::SeqCst);
+    MOCK_EVENTS_NOTIFY_PARENT_CALLS.store(0, Ordering::SeqCst);
+
+    let runtime = build_test_runtime().await;
+
+    let hook_input = json!({
+        "role": "worker",
+        "session_id": "test-session",
+        "hook_event_name": "WorkerExit",
+        "agent_id": "test-worker-gemini",
+        "exit_status": "success"
+    });
+
+    let _output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &hook_input)
+        .await
+        .expect("WorkerExit hook failed");
+
+    assert_eq!(
+        MOCK_EVENTS_NOTIFY_PARENT_CALLS.load(Ordering::SeqCst),
+        1,
+        "WorkerExit should notify the parent once"
+    );
+    assert_eq!(
+        MOCK_AGENT_CLOSE_SELF_CALLS.load(Ordering::SeqCst),
+        1,
+        "WorkerExit should reuse agent.close_self once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn wasm_hook_pre_tool_use_allow() {
     let runtime = build_test_runtime().await;
 
@@ -922,6 +1449,132 @@ async fn wasm_hook_pre_tool_use_allow() {
     assert!(
         output.is_object(),
         "PreToolUse should return an object: {output:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_pre_tool_use_blocks_gh_commands_for_dev() {
+    let runtime = build_test_runtime().await;
+
+    let hook_input = json!({
+        "role": "dev",
+        "session_id": "test-session",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "bash",
+        "tool_input": {"command": "gh auth status"}
+    });
+
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &hook_input)
+        .await
+        .expect("PreToolUse hook failed");
+
+    assert_eq!(
+        output["continue"], false,
+        "gh command should be blocked: {output:#}"
+    );
+    assert!(
+        output["stopReason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Do not run gh commands"),
+        "gh command denial should explain the policy: {output:#}"
+    );
+    assert_eq!(
+        output["hookSpecificOutput"]["permissionDecision"], "deny",
+        "gh command should return a deny permission decision: {output:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_pre_tool_use_blocks_chainlink_sqlite_for_all_agent_roles() {
+    let runtime = build_test_runtime().await;
+
+    for role in ["root", "tl", "dev", "worker", "reviewer"] {
+        let hook_input = json!({
+            "role": role,
+            "session_id": "test-session",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "bash",
+            "tool_input": {
+                "command": "sqlite3 .chainlink/issues.db 'select * from issues'"
+            }
+        });
+
+        let output: Value = runtime
+            .plugin_manager()
+            .call("handle_pre_tool_use", &hook_input)
+            .await
+            .unwrap_or_else(|e| panic!("PreToolUse hook failed for {role}: {e}"));
+
+        assert_eq!(
+            output["continue"], false,
+            "{role} should block direct Chainlink sqlite access: {output:#}"
+        );
+        assert!(
+            output["stopReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Do not access Chainlink sqlite databases directly"),
+            "{role} sqlite denial should explain the policy: {output:#}"
+        );
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{role} sqlite command should return a deny permission decision: {output:#}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_pre_tool_use_allows_chainlink_cli_commands() {
+    let runtime = build_test_runtime().await;
+
+    let hook_input = json!({
+        "role": "tl",
+        "session_id": "test-session",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "bash",
+        "tool_input": {"command": "chainlink issue list --json"}
+    });
+
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &hook_input)
+        .await
+        .expect("PreToolUse hook failed");
+
+    assert_eq!(
+        output["continue"], true,
+        "chainlink CLI command should be allowed: {output:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_pre_tool_use_allows_words_containing_gh() {
+    let runtime = build_test_runtime().await;
+
+    let hook_input = json!({
+        "role": "dev",
+        "session_id": "test-session",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "bash",
+        "tool_input": {"command": "printf '%s\\n' ghost"}
+    });
+
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &hook_input)
+        .await
+        .expect("PreToolUse hook failed");
+
+    assert_eq!(
+        output["continue"], true,
+        "non-gh command should be allowed: {output:#}"
     );
 }
 
@@ -1013,11 +1666,11 @@ async fn wasm_fork_wave_multiline_text() {
     }
 }
 
-/// Diagnostic: spawn_leaf_subtree with timeout to observe trampoline logs.
-/// Calls fork_wave first to warm up the WASM runtime, then tries spawn_leaf_subtree.
+/// Diagnostic: spawn_leaf with timeout to observe trampoline logs.
+/// Calls fork_wave first to warm up the WASM runtime, then tries spawn_leaf.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn wasm_spawn_leaf_subtree_timeout_diagnostic() {
+async fn wasm_spawn_leaf_timeout_diagnostic() {
     let runtime = build_test_runtime().await;
 
     // Warm up: call fork_wave first (this works)
@@ -1031,17 +1684,17 @@ async fn wasm_spawn_leaf_subtree_timeout_diagnostic() {
     .await;
     eprintln!("=== Warmup completed: success={} ===", warmup["success"]);
 
-    eprintln!("=== DIAGNOSTIC: Starting spawn_leaf_subtree call ===");
+    eprintln!("=== DIAGNOSTIC: Starting spawn_leaf call ===");
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         call_tool(
             &runtime,
             "tl",
-            "spawn_leaf_subtree",
+            "spawn_leaf",
             json!({
+                "name": "test-leaf",
                 "task": "Test task",
-                "branch_name": "test-leaf"
             }),
         ),
     )
@@ -1049,35 +1702,33 @@ async fn wasm_spawn_leaf_subtree_timeout_diagnostic() {
 
     match result {
         Ok(output) => {
-            eprintln!("=== DIAGNOSTIC: spawn_leaf_subtree completed: {output:#} ===");
-            assert_tool_success(&output, "spawn_leaf_subtree (diagnostic)");
+            eprintln!("=== DIAGNOSTIC: spawn_leaf completed: {output:#} ===");
+            assert_tool_success(&output, "spawn_leaf (diagnostic)");
         }
         Err(_) => {
-            eprintln!("=== DIAGNOSTIC: spawn_leaf_subtree TIMED OUT after 30s ===");
-            panic!("spawn_leaf_subtree hung — check trampoline logs above");
+            eprintln!("=== DIAGNOSTIC: spawn_leaf TIMED OUT after 30s ===");
+            panic!("spawn_leaf hung — check trampoline logs above");
         }
     }
 }
 
-/// Diagnostic: spawn_workers with timeout.
+/// Diagnostic: spawn_worker with timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn wasm_spawn_workers_timeout_diagnostic() {
+async fn wasm_spawn_worker_timeout_diagnostic() {
     let runtime = build_test_runtime().await;
 
-    eprintln!("=== DIAGNOSTIC: Starting spawn_workers call ===");
+    eprintln!("=== DIAGNOSTIC: Starting spawn_worker call ===");
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         call_tool(
             &runtime,
             "tl",
-            "spawn_workers",
+            "spawn_worker",
             json!({
-                "specs": [{
-                    "name": "diag-worker",
-                    "task": "Test task"
-                }]
+                "name": "diag-worker",
+                "task": "Test task"
             }),
         ),
     )
@@ -1085,12 +1736,12 @@ async fn wasm_spawn_workers_timeout_diagnostic() {
 
     match result {
         Ok(output) => {
-            eprintln!("=== DIAGNOSTIC: spawn_workers completed: {output:#} ===");
-            assert_tool_success(&output, "spawn_workers (diagnostic)");
+            eprintln!("=== DIAGNOSTIC: spawn_worker completed: {output:#} ===");
+            assert_tool_success(&output, "spawn_worker (diagnostic)");
         }
         Err(_) => {
-            eprintln!("=== DIAGNOSTIC: spawn_workers TIMED OUT after 30s ===");
-            panic!("spawn_workers hung — check trampoline logs above");
+            eprintln!("=== DIAGNOSTIC: spawn_worker TIMED OUT after 30s ===");
+            panic!("spawn_worker hung — check trampoline logs above");
         }
     }
 }

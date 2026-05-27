@@ -1,9 +1,9 @@
 //! Integration tests: octocrab against the Python mock_github.py server.
 //!
 //! These tests start mock_github.py on an ephemeral port, point octocrab at it
-//! via GITHUB_API_URL, and verify the PR lifecycle (list, create, list-with-filter).
+//! via FORGEJO_API_URL, and verify the PR lifecycle (list, create, list-with-filter).
 
-use octocrab::{params, OctocrabBuilder};
+use octocrab::{params, params::repos::Commitish, OctocrabBuilder};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -248,4 +248,48 @@ async fn mock_github_control_api_posts_review() {
     assert_eq!(reviews[0]["user"]["login"], "copilot[bot]");
     assert_eq!(reviews[0]["state"], "APPROVED");
     assert_eq!(reviews[0]["body"], "Looks good!");
+}
+
+#[tokio::test]
+async fn mock_github_update_pr_body() {
+    let server = MockServer::start();
+    let octo = server.octocrab();
+
+    let pr = octo
+        .pulls("owner", "repo")
+        .create("Initial title", "branch", "main")
+        .body("Initial body")
+        .send()
+        .await
+        .expect("create PR should succeed");
+
+    assert_eq!(pr.body, Some("Initial body".to_string()));
+
+    let updated = octo
+        .pulls("owner", "repo")
+        .update(pr.number as u64)
+        .body("Updated body")
+        .send()
+        .await
+        .expect("update PR body should succeed");
+
+    assert_eq!(updated.body, Some("Updated body".to_string()));
+}
+
+#[tokio::test]
+async fn mock_github_list_check_runs() {
+    let server = MockServer::start();
+    let octo = server.octocrab();
+
+    let runs = octo
+        .checks("owner", "repo")
+        .list_check_runs_for_git_ref(Commitish("abc123".to_string()))
+        .send()
+        .await
+        .expect("list check runs should succeed");
+
+    assert_eq!(runs.total_count, 1);
+    assert_eq!(runs.check_runs.len(), 1);
+    assert_eq!(runs.check_runs[0].name, "build");
+    assert_eq!(runs.check_runs[0].conclusion, Some("success".to_string()));
 }

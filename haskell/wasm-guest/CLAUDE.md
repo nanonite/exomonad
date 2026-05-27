@@ -23,14 +23,15 @@ The guest exports MCP tools that agents can call. These are defined in `ExoMonad
 ### Events Tools (`ExoMonad.Guest.Tools.Events`)
 
 - **`notify_parent`**: Used by worker/subtree agents to send messages to their parent. Routes to parent via server — delivers as a native `<teammate-message>` through Claude Code's Teams inbox when a team is active, falls back to tmux STDIN injection otherwise. Agent messages get `[from: id]` prefix; failure messages get `[FAILED: id]` prefix. Available as a bare field in both TL and dev roles.
-- **`send_message`**: Tool for sending arbitrary messages between exomonad-spawned agents.
+- **`send_tmux_message` / `send_mailbox_message`**: Tool for sending arbitrary messages between exomonad-spawned agents.
 
 ### Spawn Tools (`ExoMonad.Guest.Tools.Spawn`)
 
-- **`fork_wave`**: Fork N parallel Claude agents, each in its own worktree. Context inherited by default (`fork_session` defaults to `true`). Requires clean git state.
-- **`spawn_gemini`**: Spawn Gemini agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first.
-- **`spawn_worker`**: Spawn ephemeral Gemini worker in tmux pane. No branch, no PR. Just name + task.
-- **`spawn_leaf_subtree`** (SDK core): Lower-level worktree/standalone spawn used by `spawn_gemini`.
+- **`fork_wave`**: Fork N parallel agents in isolated worktrees (branch + PR). Agent type defaults to the server's `--worker` setting; omit `agent_type` to use the default. Claude agents get context inheritance via `--fork-session`; OpenCode agents use headless ACP mode. Requires clean git state.
+- **`spawn_leaf`**: Spawn a leaf agent in its own worktree+branch. Files PR when done. Agent type defaults to the server's worker setting; pass `agent_type` only for a specific supported runtime. Structured spec fields: steps, verify, boundary, context, read_first.
+- **`spawn_codex`**: Spawn a Codex leaf agent in its own worktree+branch. Files PR when done. Uses the same structured fields as `spawn_leaf` but forces `agent_type = codex`.
+- **`spawn_worker`**: Spawn an ephemeral worker in a tmux pane. No branch, no PR. Agent type defaults to the server's worker setting; pass `agent_type` only for a specific supported runtime.
+- **`spawn_leaf_subtree`** (SDK core): Lower-level worktree/standalone spawn used by `spawn_leaf`.
 - **`spawn_workers`** (SDK core): Lower-level batch inline pane spawn used by `spawn_worker`.
 
 ### Task Tools (`ExoMonad.Guest.Tools.Tasks`)
@@ -79,21 +80,22 @@ The SDK (`wasm-guest`) exports **core I/O functions** and **shared descriptions/
 | SDK Module | Exports | Used by |
 |-----------|---------|---------|
 | `Tools.FilePR` | `filePRCore`, `filePRDescription`, `filePRSchema`, `FilePRArgs`, `FilePROutput` | `DevFilePR`, `TLFilePR` |
-| `Tools.Events` | `notifyParentCore`, `shutdownCore`, descriptions/schemas, `MCPTool SendMessage` | `DevNotifyParent`, `TLNotifyParent`, `WorkerNotifyParent` |
+| `Tools.Events` | `notifyParentCore`, `shutdownCore`, descriptions/schemas, `MCPTool SendTmuxMessage / SendMailboxMessage` | `DevNotifyParent`, `TLNotifyParent`, `WorkerNotifyParent` |
 | `Tools.MergePR` | `mergePRCore`, `mergePRRender`, description/schema, `extractAgentName` | `TLMergePR` |
-| `Tools.Spawn` | `forkWaveCore`, `spawnGeminiCore`, `spawnWorkerToolCore`, `spawnLeafSubtreeCore`, `spawnWorkersCore`, descriptions/schemas, render functions | `TLForkWave`, `TLSpawnGemini`, `TLSpawnWorker`, `RootForkWave`, `RootSpawnGemini`, `RootSpawnWorker` |
+| `Tools.Spawn` | `forkWaveCore`, `spawnGeminiCore`, `spawnWorkerToolCore`, `spawnLeafSubtreeCore`, `spawnWorkersCore`, descriptions/schemas, render functions | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnWorker`, `RootForkWave`, `RootSpawnLeaf`, `RootSpawnWorker` |
+| `Tools.SpawnCodex` | `handleSpawnCodex`, `spawnCodexDescription`, `spawnCodexSchema`, `SpawnCodex` | `TLSpawnCodex`, `RootSpawnCodex` |
 | `Tools.Tasks` | `taskListCore`, `taskGetCore`, `taskUpdateCore`, descriptions/schemas | `DevTaskList`, `DevTaskGet`, `DevTaskUpdate`, `WorkerTaskList`, `WorkerTaskGet`, `WorkerTaskUpdate` |
 
-`SendMessage` is the only tool with an `MCPTool` instance in the SDK (no state transitions needed).
+`SendTmuxMessage / SendMailboxMessage` is the only tool with an `MCPTool` instance in the SDK (no state transitions needed).
 
 ### Roles
 
 | Role | Tools | State Machine | Spawned by |
 |------|-------|---------------|------------|
-| **root** | `RootForkWave`, `RootSpawnGemini`, `RootSpawnWorker`, `RootMergePR`, `SendMessage` | `TLPhase` (tracks children via `ChildSpawned`/`ChildCompleted`) | `exomonad init` (human-facing TL) |
-| **tl** | `TLForkWave`, `TLSpawnGemini`, `TLSpawnWorker`, `TLMergePR`, `TLFilePR`, `TLNotifyParent`, `SendMessage` | `TLPhase` | `fork_wave` |
-| **dev** | `DevFilePR`, `DevNotifyParent`, `SendMessage`, `DevTaskList`, `DevTaskGet`, `DevTaskUpdate` | `DevPhase` (tracks PR lifecycle, parent controls agent exit) | `spawn_gemini` (worktree) |
-| **worker** | `WorkerNotifyParent`, `SendMessage`, `WorkerTaskList`, `WorkerTaskGet`, `WorkerTaskUpdate` | None (ephemeral, parent controls exit) | `spawn_worker` |
+| **root** | `RootForkWave`, `RootSpawnLeaf`, `RootSpawnCodex`, `RootSpawnWorker`, `RootMergePR`, `SendTmuxMessage / SendMailboxMessage` | `TLPhase` (tracks children via `ChildSpawned`/`ChildCompleted`) | `exomonad init` (human-facing TL) |
+| **tl** | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnCodex`, `TLSpawnWorker`, `TLMergePR`, `TLFilePR`, `TLNotifyParent`, `SendTmuxMessage / SendMailboxMessage` | `TLPhase` | `fork_wave` |
+| **dev** | `DevFilePR`, `DevNotifyParent`, `SendTmuxMessage / SendMailboxMessage`, `DevTaskList`, `DevTaskGet`, `DevTaskUpdate` | `DevPhase` (tracks PR lifecycle, parent controls agent exit) | `spawn_leaf` (worktree) |
+| **worker** | `WorkerNotifyParent`, `SendTmuxMessage / SendMailboxMessage`, `WorkerTaskList`, `WorkerTaskGet`, `WorkerTaskUpdate` | None (ephemeral, parent controls exit) | `spawn_worker` |
 | **testrunner** | `Instruct`, `TestrunnerNotifyParent` | None (allow-all hooks) | Companion config |
 
 ## Hooks

@@ -171,10 +171,15 @@ impl EffectRegistry {
 
         tracing::Span::current().record("namespace", namespace);
 
-        let handler = self
-            .handlers
-            .get(namespace)
-            .ok_or_else(|| EffectError::not_found(format!("handler/{}", namespace)))?;
+        let handler = self.handlers.get(namespace).ok_or_else(|| {
+            if namespace == "github" {
+                EffectError::not_found(
+                    "handler/github unavailable: hosted PR effect handler is not registered",
+                )
+            } else {
+                EffectError::not_found(format!("handler/{}", namespace))
+            }
+        })?;
 
         tracing::debug!(
             effect_type = %effect_type,
@@ -236,8 +241,10 @@ mod tests {
 
     fn test_ctx() -> EffectContext {
         EffectContext {
-            agent_name: crate::domain::AgentName::from("test"),
-            birth_branch: crate::domain::BirthBranch::from("test-branch"),
+            agent_name: crate::domain::AgentName::try_from_str("test")
+                .expect("literal validated string is non-empty"),
+            birth_branch: crate::domain::BirthBranch::try_from_str("test-branch")
+                .expect("literal validated string is non-empty"),
             working_dir: std::path::PathBuf::from("."),
         }
     }

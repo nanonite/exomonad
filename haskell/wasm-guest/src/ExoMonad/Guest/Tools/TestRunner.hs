@@ -63,7 +63,7 @@ instructSchema =
   genericToolSchemaWith @InstructArgs
     [("content", "The instruction or message to send to the root agent")]
 
--- | Core instruct I/O: send message to root via events.send_message effect.
+-- | Core instruct I/O: send message to root via events.send_mailbox_message effect.
 instructCore :: InstructArgs -> Eff Effects (Either Text Value)
 instructCore args = do
   let address =
@@ -71,11 +71,11 @@ instructCore args = do
           { ProtoEvents.addressKind = Just (ProtoEvents.AddressKindAgent "root")
           }
   result <-
-    suspendEffect @ProtoEvents.EventsSendMessage
-      ( ProtoEvents.SendMessageRequest
-          { ProtoEvents.sendMessageRequestRecipient = Just address,
-            ProtoEvents.sendMessageRequestContent = TL.fromStrict (iaContent args),
-            ProtoEvents.sendMessageRequestSummary = "test instruction"
+    suspendEffect @ProtoEvents.EventsSendMailboxMessage
+      ( ProtoEvents.SendMailboxMessageRequest
+          { ProtoEvents.sendMailboxMessageRequestRecipient = Just address,
+            ProtoEvents.sendMailboxMessageRequestContent = TL.fromStrict (iaContent args),
+            ProtoEvents.sendMailboxMessageRequestSummary = "test instruction"
           }
       )
   case result of
@@ -84,8 +84,8 @@ instructCore args = do
       pure $
         Right $
           object
-            [ "success" .= ProtoEvents.sendMessageResponseSuccess resp,
-              "delivery_method" .= ProtoEvents.sendMessageResponseDeliveryMethod resp
+            [ "success" .= ProtoEvents.sendMailboxMessageResponseSuccess resp,
+              "delivery_method" .= ProtoEvents.sendMailboxMessageResponseDeliveryMethod resp
             ]
 
 --------------------------------------------------------------------------------

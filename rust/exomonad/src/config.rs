@@ -3,6 +3,17 @@
 use anyhow::{Context, Result};
 use exomonad_core::services::AgentType;
 use exomonad_core::Role;
+
+fn parse_agent_type_env(s: &str) -> Option<AgentType> {
+    match s.to_lowercase().as_str() {
+        "claude" | "claude-code" => Some(AgentType::Claude),
+        "gemini" => Some(AgentType::Gemini),
+        "opencode" | "opencode-cli" => Some(AgentType::OpenCode),
+        "codex" => Some(AgentType::Codex),
+        "shoal" => Some(AgentType::Shoal),
+        _ => None,
+    }
+}
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -48,6 +59,70 @@ fn default_companion_role() -> String {
     "worker".to_string()
 }
 
+/// Configuration for routing LLM calls through OpenRouter.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OpenRouterConfig {
+    /// When false (default), all calls go direct to Anthropic/Google.
+    #[serde(default)]
+    pub enabled: bool,
+    /// API key. Falls back to OPENROUTER_API_KEY env var if absent.
+    pub api_key: Option<String>,
+}
+
+impl OpenRouterConfig {
+    /// Resolve the API key: config field first, then OPENROUTER_API_KEY env var.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        self.api_key
+            .clone()
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+    }
+}
+
+/// Configuration for the PR reviewer agent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewerConfig {
+    /// Agent type for the reviewer. Accepts "claude" or "opencode". Default: claude.
+    #[serde(default = "default_reviewer_agent_type")]
+    pub agent_type: AgentType,
+    /// Model string passed to the reviewer agent
+    /// (e.g. "claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5").
+    /// `None` means the agent picks its own default.
+    pub model: Option<String>,
+    /// Context file paths injected into the reviewer's session.
+    #[serde(default)]
+    pub context: Vec<String>,
+}
+
+fn default_reviewer_agent_type() -> AgentType {
+    AgentType::Claude
+}
+
+impl Default for ReviewerConfig {
+    fn default() -> Self {
+        Self {
+            agent_type: AgentType::Claude,
+            model: None,
+            context: vec![],
+        }
+    }
+}
+
+/// Opencode agent configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OpencodeConfig {
+    /// When true, use the embedded API key in the opencode binary.
+    /// When false, redirect opencode to use the OpenRouter API key
+    /// (from openrouter config or OPENROUTER_API_KEY env var).
+    #[serde(default)]
+    pub use_embedded_key: bool,
+    /// Model for the root TL when running OpenCode (e.g. "anthropic/claude-sonnet-4-5").
+    /// `None` means let opencode pick its default.
+    pub tl_model: Option<String>,
+    /// Model for spawned workers when running OpenCode.
+    /// `None` means let opencode pick its default.
+    pub worker_model: Option<String>,
+}
+
 /// Raw configuration from file (supports both config.toml and config.local.toml fields).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RawConfig {
@@ -63,6 +138,9 @@ pub struct RawConfig {
     /// Canonical tmux session name for this project.
     pub tmux_session: Option<String>,
 
+    /// TCP port for public webhook and health endpoints.
+    pub port: Option<u16>,
+
     /// Base directory for worktrees (default: .exo/worktrees).
     pub worktree_base: Option<PathBuf>,
 
@@ -74,6 +152,9 @@ pub struct RawConfig {
 
     /// Agent type for the root (TL) tab.
     pub root_agent_type: Option<AgentType>,
+
+    /// Agent type for spawned workers/teammates.
+    pub spawn_agent_type: Option<AgentType>,
 
     /// Optional flake reference to use when building WASM plugin via nix.
     pub flake_ref: Option<String>,
@@ -109,6 +190,41 @@ pub struct RawConfig {
 
     /// GitHub poller interval in seconds (default: 60).
     pub poll_interval: Option<u64>,
+
+    /// Orphan reconciler interval in seconds (default: 60).
+    pub orphan_reconciler_interval_secs: Option<u64>,
+
+    /// OpenRouter routing configuration.
+    #[serde(default)]
+    pub openrouter: Option<OpenRouterConfig>,
+
+    /// Opencode agent configuration.
+    #[serde(default)]
+    pub opencode: Option<OpencodeConfig>,
+
+    /// Use OpenCode as the root TL agent instead of Claude.
+    /// Can be set via CLI flag --opencode-as-tl.
+    #[serde(default)]
+    pub opencode_as_tl: Option<bool>,
+
+    /// Forgejo base URL (e.g. "http://localhost:3000").
+    pub forgejo_url: Option<String>,
+
+    /// Forgejo token for API/webhook setup.
+    pub forgejo_token: Option<String>,
+
+    /// Forgejo token for reviewer API calls. Must belong to a different user from the PR author token.
+    pub forgejo_reviewer_token: Option<String>,
+
+    /// Shared secret used to verify Forgejo webhook signatures.
+    pub forgejo_webhook_secret: Option<String>,
+
+    /// SSH port for Forgejo git remotes. Defaults to 2222 for localhost, otherwise 22.
+    pub forgejo_ssh_port: Option<u16>,
+
+    /// PR reviewer agent configuration.
+    #[serde(default)]
+    pub reviewer: Option<ReviewerConfig>,
 }
 
 /// Final resolved configuration.
@@ -118,6 +234,8 @@ pub struct Config {
     pub role: Role,
     /// Canonical tmux session name (required after discovery).
     pub tmux_session: String,
+    /// TCP port for public webhook and health endpoints.
+    pub port: u16,
     /// Base directory for worktrees.
     pub worktree_base: PathBuf,
     /// Shell command to wrap environment (e.g. "nix develop").
@@ -126,6 +244,8 @@ pub struct Config {
     pub wasm_dir: PathBuf,
     /// Agent type for the root (TL) tab.
     pub root_agent_type: AgentType,
+    /// Agent type for spawned workers/teammates.
+    pub spawn_agent_type: AgentType,
     /// Flake reference to use when building WASM plugin via nix.
     pub flake_ref: Option<String>,
     /// Name of the WASM module (default: "devswarm").
@@ -148,6 +268,36 @@ pub struct Config {
 
     /// GitHub poller interval in seconds (default: 60).
     pub poll_interval: Option<u64>,
+
+    /// Orphan reconciler interval in seconds (default: 60).
+    pub orphan_reconciler_interval_secs: Option<u64>,
+
+    /// OpenRouter routing configuration.
+    pub openrouter: OpenRouterConfig,
+
+    /// Opencode agent configuration.
+    pub opencode: OpencodeConfig,
+
+    /// Use OpenCode as the root TL agent instead of Claude.
+    pub opencode_as_tl: bool,
+
+    /// Forgejo base URL (e.g. "http://localhost:3000").
+    pub forgejo_url: Option<String>,
+
+    /// Forgejo token for API/webhook setup.
+    pub forgejo_token: Option<String>,
+
+    /// Forgejo token for reviewer API calls. Must belong to a different user from the PR author token.
+    pub forgejo_reviewer_token: Option<String>,
+
+    /// Shared secret used to verify Forgejo webhook signatures.
+    pub forgejo_webhook_secret: Option<String>,
+
+    /// SSH port for Forgejo git remotes. Defaults to 2222 for localhost, otherwise 22.
+    pub forgejo_ssh_port: Option<u16>,
+
+    /// PR reviewer agent configuration.
+    pub reviewer: ReviewerConfig,
 }
 
 impl Config {
@@ -211,6 +361,9 @@ impl Config {
             });
         let tmux_session = sanitize_session_name(tmux_session);
 
+        // Resolve TCP port: local > global > default.
+        let port = local_raw.port.or(global_raw.port).unwrap_or(7433);
+
         // Resolve worktree_base: global > local > default (.exo/worktrees)
         let worktree_base = global_raw
             .worktree_base
@@ -240,11 +393,21 @@ impl Config {
             })
             .unwrap_or_else(|| project_root.join(".exo/wasm"));
 
-        // Resolve root_agent_type: global > local > default (Claude)
-        let root_agent_type = global_raw
-            .root_agent_type
+        // Resolve root_agent_type: env > global > local > default (Claude)
+        let root_agent_type = std::env::var("EXOMONAD_ROOT_AGENT_TYPE")
+            .ok()
+            .and_then(|s| parse_agent_type_env(&s))
+            .or(global_raw.root_agent_type)
             .or(local_raw.root_agent_type)
             .unwrap_or(AgentType::Claude);
+
+        // Resolve spawn_agent_type: env > local > global > default (Gemini)
+        let spawn_agent_type = std::env::var("EXOMONAD_SPAWN_AGENT_TYPE")
+            .ok()
+            .and_then(|s| parse_agent_type_env(&s))
+            .or(local_raw.spawn_agent_type)
+            .or(global_raw.spawn_agent_type)
+            .unwrap_or(AgentType::Gemini);
 
         // Resolve flake_ref: local > global > fallback to None
         let flake_ref = local_raw.flake_ref.or(global_raw.flake_ref);
@@ -281,15 +444,69 @@ impl Config {
 
         // Resolve poll_interval: local > global
         let poll_interval = local_raw.poll_interval.or(global_raw.poll_interval);
+        let orphan_reconciler_interval_secs = local_raw
+            .orphan_reconciler_interval_secs
+            .or(global_raw.orphan_reconciler_interval_secs);
+
+        // Resolve openrouter: local > global > default
+        let openrouter = local_raw
+            .openrouter
+            .or(global_raw.openrouter)
+            .unwrap_or_default();
+
+        // Resolve opencode: env > local > global > default
+        let mut opencode = local_raw
+            .opencode
+            .or(global_raw.opencode)
+            .unwrap_or_default();
+        if let Ok(m) = std::env::var("EXOMONAD_TL_MODEL") {
+            if !m.is_empty() {
+                opencode.tl_model = Some(m);
+            }
+        }
+        if let Ok(m) = std::env::var("EXOMONAD_WORKER_MODEL") {
+            if !m.is_empty() {
+                opencode.worker_model = Some(m);
+            }
+        }
+
+        // Resolve opencode_as_tl: local > global > false
+        let opencode_as_tl = local_raw
+            .opencode_as_tl
+            .or(global_raw.opencode_as_tl)
+            .unwrap_or(false);
+
+        let forgejo_url = local_raw.forgejo_url.or(global_raw.forgejo_url);
+        let forgejo_token = local_raw.forgejo_token.or(global_raw.forgejo_token);
+        let forgejo_reviewer_token = local_raw
+            .forgejo_reviewer_token
+            .or(global_raw.forgejo_reviewer_token);
+        let forgejo_webhook_secret = local_raw
+            .forgejo_webhook_secret
+            .or(global_raw.forgejo_webhook_secret);
+        let forgejo_ssh_port = local_raw.forgejo_ssh_port.or(global_raw.forgejo_ssh_port);
+
+        // Resolve reviewer: env > local > global > default
+        let mut reviewer = local_raw
+            .reviewer
+            .or(global_raw.reviewer)
+            .unwrap_or_default();
+        if let Ok(s) = std::env::var("EXOMONAD_REVIEWER_AGENT_TYPE") {
+            if let Some(agent_type) = parse_agent_type_env(&s) {
+                reviewer.agent_type = agent_type;
+            }
+        }
 
         Ok(Self {
             project_dir,
             role,
             tmux_session,
+            port,
             worktree_base,
             shell_command,
             wasm_dir,
             root_agent_type,
+            spawn_agent_type,
             flake_ref,
             wasm_name,
             extra_mcp_servers,
@@ -300,6 +517,16 @@ impl Config {
             otlp_endpoint,
             model,
             poll_interval,
+            orphan_reconciler_interval_secs,
+            openrouter,
+            opencode,
+            opencode_as_tl,
+            forgejo_url,
+            forgejo_token,
+            forgejo_reviewer_token,
+            forgejo_webhook_secret,
+            forgejo_ssh_port,
+            reviewer,
         })
     }
 
@@ -321,10 +548,12 @@ impl Default for Config {
             project_dir: PathBuf::from("."),
             role: Role::tl(),
             tmux_session: "default".to_string(),
+            port: 7433,
             worktree_base: PathBuf::from(".exo/worktrees"),
             shell_command: None,
             wasm_dir: PathBuf::from(".exo/wasm"),
             root_agent_type: AgentType::Claude,
+            spawn_agent_type: AgentType::Gemini,
             flake_ref: None,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: std::collections::HashMap::new(),
@@ -335,6 +564,16 @@ impl Default for Config {
             otlp_endpoint: None,
             model: None,
             poll_interval: None,
+            orphan_reconciler_interval_secs: None,
+            openrouter: OpenRouterConfig::default(),
+            opencode: OpencodeConfig::default(),
+            opencode_as_tl: false,
+            forgejo_url: None,
+            forgejo_token: None,
+            forgejo_reviewer_token: None,
+            forgejo_webhook_secret: None,
+            forgejo_ssh_port: None,
+            reviewer: ReviewerConfig::default(),
         }
     }
 }
@@ -408,6 +647,21 @@ mod tests {
     }
 
     #[test]
+    fn test_raw_config_parse_forgejo_reviewer_token() {
+        let content = r#"
+            forgejo_url = "http://localhost:3000"
+            forgejo_token = "author-token"
+            forgejo_reviewer_token = "reviewer-token"
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.forgejo_token.as_deref(), Some("author-token"));
+        assert_eq!(
+            raw.forgejo_reviewer_token.as_deref(),
+            Some("reviewer-token")
+        );
+    }
+
+    #[test]
     fn test_raw_config_empty() {
         let raw: RawConfig = toml::from_str("").unwrap();
         assert!(raw.role.is_none());
@@ -421,6 +675,16 @@ mod tests {
         assert_eq!(config.project_dir, PathBuf::from("."));
         assert_eq!(config.role, Role::tl());
         assert_eq!(config.root_agent_type, AgentType::Claude);
+        assert_eq!(config.port, 7433);
+    }
+
+    #[test]
+    fn test_raw_config_parse_port() {
+        let content = r#"
+            port = 9001
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.port, Some(9001));
     }
 
     #[test]
@@ -563,5 +827,113 @@ mod tests {
         assert_eq!(raw.companions.len(), 1);
         assert_eq!(raw.companions[0].name, "sleeptime");
         assert!(raw.companions[0].task.is_none());
+    }
+
+    #[test]
+    fn test_raw_config_parse_opencode_section() {
+        let content = r#"
+            [opencode]
+            tl_model = "anthropic/claude-sonnet-4-5"
+            worker_model = "anthropic/claude-haiku-4-5"
+            use_embedded_key = true
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        let oc = raw.opencode.expect("opencode section should parse");
+        assert_eq!(oc.tl_model, Some("anthropic/claude-sonnet-4-5".to_string()));
+        assert_eq!(
+            oc.worker_model,
+            Some("anthropic/claude-haiku-4-5".to_string())
+        );
+        assert!(oc.use_embedded_key);
+    }
+
+    #[test]
+    fn test_raw_config_parse_opencode_as_tl() {
+        let content = r#"
+            opencode_as_tl = true
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.opencode_as_tl, Some(true));
+    }
+
+    #[test]
+    fn test_raw_config_parse_root_agent_type_opencode() {
+        let content = r#"
+            root_agent_type = "opencode"
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.root_agent_type, Some(AgentType::OpenCode));
+    }
+
+    #[test]
+    fn test_raw_config_parse_spawn_agent_type_opencode() {
+        let content = r#"
+            spawn_agent_type = "opencode"
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.spawn_agent_type, Some(AgentType::OpenCode));
+    }
+
+    // ── Reviewer config tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_reviewer_config_absent_means_none() {
+        let raw: RawConfig = toml::from_str("default_role = \"tl\"").unwrap();
+        assert!(raw.reviewer.is_none());
+    }
+
+    #[test]
+    fn test_reviewer_config_empty_section_uses_defaults() {
+        let raw: RawConfig = toml::from_str("[reviewer]").unwrap();
+        let rc = raw.reviewer.unwrap();
+        assert_eq!(rc.agent_type, AgentType::Claude);
+        assert!(rc.model.is_none());
+        assert!(rc.context.is_empty());
+    }
+
+    #[test]
+    fn test_reviewer_config_claude_with_model() {
+        let content = r#"
+[reviewer]
+agent_type = "claude"
+model = "claude-haiku-4-5-20251001"
+"#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        let rc = raw.reviewer.unwrap();
+        assert_eq!(rc.agent_type, AgentType::Claude);
+        assert_eq!(rc.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn test_reviewer_config_opencode_with_model_and_context() {
+        let content = r#"
+[reviewer]
+agent_type = "opencode"
+model = "anthropic/claude-haiku-4-5"
+context = ["CLAUDE.md", ".exo/rules/reviewer.md"]
+"#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        let rc = raw.reviewer.unwrap();
+        assert_eq!(rc.agent_type, AgentType::OpenCode);
+        assert_eq!(rc.model.as_deref(), Some("anthropic/claude-haiku-4-5"));
+        assert_eq!(rc.context, vec!["CLAUDE.md", ".exo/rules/reviewer.md"]);
+    }
+
+    #[test]
+    fn test_reviewer_config_invalid_agent_type_rejected() {
+        let content = "[reviewer]\nagent_type = \"invalid\"\n";
+        let result: Result<RawConfig, _> = toml::from_str(content);
+        assert!(
+            result.is_err(),
+            "Unknown agent_type should fail to deserialize"
+        );
+    }
+
+    #[test]
+    fn test_reviewer_config_default_is_claude() {
+        let config = Config::default();
+        assert_eq!(config.reviewer.agent_type, AgentType::Claude);
+        assert!(config.reviewer.model.is_none());
+        assert!(config.reviewer.context.is_empty());
     }
 }

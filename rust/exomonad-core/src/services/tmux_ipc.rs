@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
@@ -110,6 +111,31 @@ pub struct WindowInfo {
 #[derive(Debug, Clone)]
 pub struct TmuxIpc {
     session_name: String,
+}
+
+fn settle_delay_for_payload(payload: &str) -> Duration {
+    let extra_ms = (payload.len() as u64 / 256).min(4) * 100;
+    Duration::from_millis(250 + extra_ms)
+}
+
+fn payload_still_visible(capture: &str, payload: &str) -> bool {
+    let probe = payload_visibility_probe(payload);
+    !probe.is_empty() && normalize_for_capture(capture).contains(&probe)
+}
+
+fn payload_visibility_probe(payload: &str) -> String {
+    let normalized = normalize_for_capture(payload);
+    let line = normalized
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    line.chars().take(120).collect()
+}
+
+fn normalize_for_capture(text: &str) -> String {
+    text.replace('\r', "")
 }
 
 impl TmuxIpc {
@@ -409,7 +435,7 @@ impl TmuxIpc {
     /// commands resolve to the same pane. Without qualification, tmux resolves
     /// display-name targets against the "most recently used" session, which is
     /// nondeterministic for subprocess calls.
-    pub async fn inject_input(&self, target: &str, text: &str) -> Result<()> {
+    pub async fn inject_input(&self, target: &str, text: &str, submit: bool) -> Result<()> {
         // Session-qualify the target so paste-buffer and send-keys resolve
         // to the same pane deterministically.
         let qualified_target = format!("{}:{}", self.session_name, target);
@@ -483,11 +509,13 @@ impl TmuxIpc {
         // No -p flag: bracketed paste (\e[200~...\e[201~) crashes Claude Code's
         // Ink TUI and breaks Gemini CLI's readline. Plain paste streams bytes
         // as standard keyboard input.
+        let paste_started = Instant::now();
         let paste_output = Command::new("tmux")
             .args(["paste-buffer", "-b", &buf_name, "-t", &qualified_target])
             .output()
             .await
             .context("Failed to run tmux paste-buffer")?;
+        let paste_elapsed = paste_started.elapsed();
 
         // Delete the named buffer
         match Command::new("tmux")
@@ -514,44 +542,105 @@ impl TmuxIpc {
             );
         }
 
-        // Debounce: allow TUI (Claude Code Ink, Gemini CLI readline) to process
-        // the pasted text before sending Enter.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        // Submit with retry — TUIs may drop the first Enter keystroke
-        // if still processing pasted text.
-        let enter_policy = crate::services::resilience::RetryPolicy::new(
-            3,
-            crate::services::resilience::Backoff::Linear {
-                initial: std::time::Duration::from_millis(200),
-            },
+        debug!(
+            target = %qualified_target,
+            bytes = payload.len(),
+            paste_ms = paste_elapsed.as_millis(),
+            "tmux paste-buffer completed"
         );
-        let qt = &qualified_target;
-        crate::services::resilience::retry(&enter_policy, || async {
-            let output = Command::new("tmux")
-                .args(["send-keys", "-t", qt, "Enter"])
-                .output()
-                .await
-                .context("Failed to run tmux send-keys")?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                warn!(target = %qt, "send-keys Enter failed: {}", stderr);
-                anyhow::bail!("send-keys Enter failed: {}", stderr)
-            }
-        })
-        .await
-        .context("send-keys Enter failed after 3 attempts")?;
 
-        // Wake the target pane's TUI event loop via SIGWINCH so it processes
-        // the injected input. Non-fatal — input was already delivered.
+        // Wake before optional Enter so parked TUI event loops are listening when
+        // the submit key arrives. Non-fatal because pane resize can fail on stale
+        // targets while direct input still has a chance to land.
         if let Err(e) = self.wake_pane(target).await {
-            warn!(target = %qualified_target, error = %e, "SIGWINCH wake failed (non-fatal)");
+            warn!(target = %qualified_target, error = %e, "pre-submit SIGWINCH wake failed (non-fatal)");
         }
 
-        debug!(target = %qualified_target, chars = text.len(), "Injected input via tmux buffer");
-        Ok(())
+        let settle_delay = settle_delay_for_payload(payload);
+        tokio::time::sleep(settle_delay).await;
+
+        if !submit {
+            debug!(
+                target = %qualified_target,
+                bytes = payload.len(),
+                paste_ms = paste_elapsed.as_millis(),
+                delay_ms = settle_delay.as_millis(),
+                "tmux paste completed without submit"
+            );
+            return Ok(());
+        }
+
+        for attempt in 1..=3 {
+            let enter_started = Instant::now();
+            Self::send_enter_key(&qualified_target)
+                .await
+                .with_context(|| format!("send-keys Enter failed on attempt {attempt}"))?;
+            let enter_elapsed = enter_started.elapsed();
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let consumed = Self::verify_input_consumed(&qualified_target, payload).await?;
+            if consumed {
+                debug!(
+                    target = %qualified_target,
+                    bytes = payload.len(),
+                    attempt,
+                    paste_ms = paste_elapsed.as_millis(),
+                    delay_ms = settle_delay.as_millis(),
+                    enter_ms = enter_elapsed.as_millis(),
+                    "tmux Enter consumed after paste"
+                );
+                return Ok(());
+            }
+
+            warn!(
+                target = %qualified_target,
+                bytes = payload.len(),
+                attempt,
+                "tmux Enter sent but pasted input still appears visible; retrying submit"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        anyhow::bail!(
+            "tmux Enter was sent 3 times but pasted input still appears visible in {}",
+            qualified_target
+        );
+    }
+
+    async fn send_enter_key(qualified_target: &str) -> Result<()> {
+        let output = Command::new("tmux")
+            .args(["send-keys", "-t", qualified_target, "Enter"])
+            .output()
+            .await
+            .context("Failed to run tmux send-keys")?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            warn!(target = %qualified_target, "send-keys Enter failed: {}", stderr);
+            anyhow::bail!("send-keys Enter failed: {}", stderr)
+        }
+    }
+
+    async fn verify_input_consumed(qualified_target: &str, payload: &str) -> Result<bool> {
+        if payload.trim().is_empty() {
+            return Ok(true);
+        }
+
+        let output = Command::new("tmux")
+            .args(["capture-pane", "-p", "-t", qualified_target])
+            .output()
+            .await
+            .context("Failed to run tmux capture-pane")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux capture-pane failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let capture = String::from_utf8_lossy(&output.stdout);
+        Ok(!payload_still_visible(&capture, payload))
     }
 
     /// Trigger SIGWINCH in the target pane by briefly resizing its window.
@@ -626,6 +715,15 @@ impl TmuxIpc {
     }
 
     // -- Query --
+
+    pub async fn window_exists(&self, window_id: &WindowId) -> Result<bool> {
+        let status = Command::new("tmux")
+            .args(["display-message", "-t", window_id.as_str(), "-p", ""])
+            .status()
+            .await
+            .context("Failed to run tmux display-message")?;
+        Ok(status.success())
+    }
 
     pub async fn pane_exists(&self, pane_id: &PaneId) -> Result<bool> {
         let status = Command::new("tmux")
@@ -801,6 +899,34 @@ mod tests {
             both_reached_barrier.load(Ordering::SeqCst),
             "Both threads should hold independent locks concurrently"
         );
+    }
+
+    #[test]
+    fn test_payload_visibility_probe_uses_last_nonempty_line() {
+        assert_eq!(
+            payload_visibility_probe("first\n\nfinal line"),
+            "final line"
+        );
+    }
+
+    #[test]
+    fn test_payload_still_visible_detects_unsubmitted_input() {
+        let capture = "history\n> please handle this request";
+        assert!(payload_still_visible(capture, "please handle this request"));
+    }
+
+    #[test]
+    fn test_payload_still_visible_treats_missing_probe_as_consumed() {
+        let capture = "history\nmodel is processing";
+        assert!(!payload_still_visible(
+            capture,
+            "please handle this request"
+        ));
+    }
+
+    #[test]
+    fn test_settle_delay_scales_with_payload_size() {
+        assert!(settle_delay_for_payload("short") < settle_delay_for_payload(&"x".repeat(900)));
     }
 
     #[tokio::test]

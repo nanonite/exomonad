@@ -23,6 +23,10 @@ module ExoMonad.Guest.Records.Spawn
     spawnWorkersCore,
     spawnWorkersDescription,
     spawnWorkersSchema,
+    CloseWorkerPaneArgs (..),
+    closeWorkerPaneCore,
+    closeWorkerPaneDescription,
+    closeWorkerPaneSchema,
 
     -- * SpawnAcp
     SpawnAcpArgs (..),

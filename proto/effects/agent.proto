@@ -15,6 +15,8 @@ enum AgentType {
   AGENT_TYPE_CLAUDE = 1;
   AGENT_TYPE_GEMINI = 2;
   AGENT_TYPE_SHOAL = 3;
+  AGENT_TYPE_OPENCODE = 4;
+  AGENT_TYPE_CODEX = 5;
 }
 
 // Topology of the workspace.
@@ -50,6 +52,8 @@ message AgentInfo {
   string pr_url = 11;
   // Workspace topology.
   WorkspaceTopology topology = 12;
+  // Stable tmux pane id for ephemeral worker panes (e.g. "%42").
+  string pane_id = 13;
 }
 
 // ============================================================================
@@ -161,6 +165,20 @@ message CleanupResponse {
 }
 
 // ============================================================================
+// DisposeOrphan - Remove stale resources for a dead orphan agent
+// ============================================================================
+
+message DisposeOrphanRequest {
+  string agent_slug = 1;
+}
+
+message DisposeOrphanResponse {
+  bool removed_worktree = 1;
+  bool removed_agent_dir = 2;
+  string message = 3;
+}
+
+// ============================================================================
 // CleanupBatch - Clean up multiple agents
 // ============================================================================
 
@@ -234,6 +252,8 @@ message SpawnWorkerRequest {
   repeated string allowed_tools = 4;
   // Tool patterns to disallow. Empty = no restriction.
   repeated string disallowed_tools = 5;
+  // Optional agent type override (default: Gemini).
+  AgentType agent_type = 6;
 }
 
 message SpawnWorkerResponse {
@@ -280,6 +300,65 @@ message SpawnSubtreeRequest {
 
 message SpawnSubtreeResponse {
   AgentInfo agent = 1;
+}
+
+// ============================================================================
+// SpawnReviewer - Spawn only a reviewer for an existing PR
+// ============================================================================
+
+message SpawnReviewerRequest {
+  // Existing PR number to review.
+  uint64 pr_number = 1;
+  // Spawn even if a reviewer for this PR is already active.
+  bool force = 2;
+}
+
+message SpawnReviewerResponse {
+  AgentInfo agent = 1;
+  string reviewer_name = 2;
+  bool already_active = 3;
+}
+
+// ============================================================================
+// CleanupReviewerLeaf - Clean stuck reviewer resources for a PR
+// ============================================================================
+
+message CleanupReviewerLeafRequest {
+  // Existing PR number whose reviewer resources should be cleaned.
+  uint64 pr_number = 1;
+}
+
+message CleanupReviewerLeafResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 pr_number = 3;
+  repeated string cleaned_reviewers = 4;
+}
+
+// ============================================================================
+// WatcherPrState - Query live Forgejo PR review/CI state for TL diagnostics
+// ============================================================================
+
+message WatcherPrStateRequest {
+  // Existing PR number to inspect.
+  uint64 pr_number = 1;
+}
+
+message WatcherPrStateResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 pr_number = 3;
+  bool found = 4;
+  bool merge_ready = 5;
+  string blocker = 6;
+  string review_state = 7;
+  string ci_status = 8;
+  string head_sha = 9;
+  string head_branch = 10;
+  string base_branch = 11;
+  string pr_state = 12;
+  bool merged = 13;
+  uint32 review_count = 14;
 }
 
 // ============================================================================
@@ -347,6 +426,39 @@ message CloseSelfResponse {
 }
 
 // ============================================================================
+// CloseWorkerPane - Close an explicit worker pane from the supervising TL/root
+// ============================================================================
+
+message CloseWorkerPaneRequest {
+  // Stable tmux pane id returned by spawn_worker (e.g. "%42").
+  string pane_id = 1;
+}
+
+message CloseWorkerPaneResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+
+// ============================================================================
+// CloseIssueAndCleanup - Close a Chainlink issue after merged PR cleanup is safe
+// ============================================================================
+
+message CloseIssueAndCleanupRequest {
+  // Chainlink issue id to close.
+  uint64 issue_id = 1;
+  // Leaf agent name / worktree slug to dispose.
+  string leaf_name = 2;
+}
+
+message CloseIssueAndCleanupResponse {
+  bool success = 1;
+  string error = 2;
+  string leaf_name = 3;
+  repeated uint64 cleaned_pr_numbers = 4;
+}
+
+// ============================================================================
 // Service definition
 // ============================================================================
 
@@ -356,11 +468,17 @@ service AgentEffects {
   rpc SpawnGeminiTeammate(SpawnGeminiTeammateRequest) returns (SpawnGeminiTeammateResponse);
   rpc SpawnWorker(SpawnWorkerRequest) returns (SpawnWorkerResponse);
   rpc SpawnSubtree(SpawnSubtreeRequest) returns (SpawnSubtreeResponse);
+  rpc SpawnReviewer(SpawnReviewerRequest) returns (SpawnReviewerResponse);
+  rpc CleanupReviewerLeaf(CleanupReviewerLeafRequest) returns (CleanupReviewerLeafResponse);
+  rpc WatcherPrState(WatcherPrStateRequest) returns (WatcherPrStateResponse);
   rpc SpawnLeafSubtree(SpawnLeafSubtreeRequest) returns (SpawnLeafSubtreeResponse);
   rpc SpawnAcp(SpawnAcpRequest) returns (SpawnAcpResponse);
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);
+  rpc DisposeOrphan(DisposeOrphanRequest) returns (DisposeOrphanResponse);
   rpc CleanupBatch(CleanupBatchRequest) returns (CleanupBatchResponse);
   rpc CleanupMerged(CleanupMergedRequest) returns (CleanupMergedResponse);
   rpc List(ListRequest) returns (ListResponse);
   rpc CloseSelf(CloseSelfRequest) returns (CloseSelfResponse);
+  rpc CloseWorkerPane(CloseWorkerPaneRequest) returns (CloseWorkerPaneResponse);
+  rpc CloseIssueAndCleanup(CloseIssueAndCleanupRequest) returns (CloseIssueAndCleanupResponse);
 }

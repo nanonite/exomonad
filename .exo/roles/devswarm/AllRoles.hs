@@ -36,6 +36,7 @@ import qualified DevRole
 import qualified RootRole
 import qualified TLRole
 import qualified TestrunnerRole
+import qualified ReviewerRole
 import qualified WorkerRole
 
 -- | Captured role capabilities (avoids existential field name restriction).
@@ -96,7 +97,8 @@ allConfigs =
       ("tl", mkSomeRoleConfig TLRole.config),
       ("dev", mkSomeRoleConfig DevRole.config),
       ("worker", mkSomeRoleConfig WorkerRole.config),
-      ("testrunner", mkSomeRoleConfig TestrunnerRole.config)
+      ("testrunner", mkSomeRoleConfig TestrunnerRole.config),
+      ("reviewer", mkSomeRoleConfig ReviewerRole.config)
     ]
 
 -- | Look up a role config by name.
