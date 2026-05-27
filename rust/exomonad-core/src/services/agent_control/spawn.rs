@@ -19,6 +19,59 @@ fn parse_git_status_paths(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+fn reviewer_harness_denied_tools() -> Vec<String> {
+    [
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+        "fork_wave",
+        "spawn_leaf",
+        "spawn_worker",
+        "merge_pr",
+        "file_pr",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+async fn preflight_reviewer_hook_environment(project_dir: &Path) -> Result<()> {
+    let binary_path = crate::util::find_exomonad_binary();
+    if binary_path.components().count() > 1 && !binary_path.exists() {
+        anyhow::bail!(
+            "Reviewer hook preflight failed: exomonad hook binary not found at {}",
+            binary_path.display()
+        );
+    }
+
+    let socket_path = project_dir.join(".exo/server.sock");
+    if !socket_path.exists() {
+        anyhow::bail!(
+            "Reviewer hook preflight failed: parent server socket missing at {}",
+            socket_path.display()
+        );
+    }
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::UnixStream::connect(&socket_path),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => Ok(()),
+        Ok(Err(error)) => anyhow::bail!(
+            "Reviewer hook preflight failed: parent server socket unreachable at {}: {}",
+            socket_path.display(),
+            error
+        ),
+        Err(_) => anyhow::bail!(
+            "Reviewer hook preflight failed: timed out connecting to parent server socket at {}",
+            socket_path.display()
+        ),
+    }
+}
+
 fn dirty_spawn_error(files: &[String]) -> anyhow::Error {
     let mut message = format!(
         "BLOCKED: cannot spawn agent into a dirty TL worktree. {} file(s) have uncommitted changes:",
@@ -1598,6 +1651,10 @@ impl<
         let identity = AgentIdentity::new(slugify(branch_name), agent_type);
         let reviewer_path = self.worktree_base.join(identity.internal_name().as_str());
 
+        if agent_type == AgentType::Claude {
+            preflight_reviewer_hook_environment(self.project_dir()).await?;
+        }
+
         // Create a detached-HEAD worktree at the PR branch tip unless it already exists.
         // Detached so we don't compete with the worker's branch; the reviewer never commits.
         // This prevents clobbering the worker's opencode.json/MCP config while both run.
@@ -1624,13 +1681,7 @@ impl<
             working_dir: Some(reviewer_path),
             permissions: Some(AgentPermissions {
                 allow: vec![],
-                deny: vec![
-                    "fork_wave".into(),
-                    "spawn_leaf".into(),
-                    "spawn_worker".into(),
-                    "merge_pr".into(),
-                    "file_pr".into(),
-                ],
+                deny: reviewer_harness_denied_tools(),
                 default_mode: None,
             }),
             standalone_repo: false,
@@ -1818,6 +1869,44 @@ mod tests {
         assert!(message.contains("Wait for the active worker's handoff"));
         assert!(message.contains("Use `spawn_leaf` for parallel work"));
         assert!(message.contains("Per-worker attribution"));
+    }
+
+    #[tokio::test]
+    async fn test_reviewer_hook_preflight_reports_missing_socket() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = preflight_reviewer_hook_environment(dir.path())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("Reviewer hook preflight failed: parent server socket missing"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains(".exo/server.sock"));
+    }
+
+    #[test]
+    fn test_reviewer_harness_denies_builtin_edit_tools() {
+        let denied = reviewer_harness_denied_tools();
+
+        for tool in [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit",
+            "fork_wave",
+            "spawn_leaf",
+            "spawn_worker",
+            "merge_pr",
+            "file_pr",
+        ] {
+            assert!(
+                denied.contains(&tool.to_string()),
+                "reviewer harness permissions must deny {tool}"
+            );
+        }
     }
 
     #[test]

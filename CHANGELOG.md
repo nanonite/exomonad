@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Reviewer spawned without Edit/Write deny in AgentPermissions — WASM hook alone is insufficient guard (#430)
 - exomonad models: add codex harness, make opencode failure non-fatal, fix NixOS WAL checkpoint error (#427)
 - merge_pr gates on stale local registry review_state instead of live Forgejo state (#418)
 - combine_commit_statuses uses /statuses list endpoint causing false Pending from historical entries (#419)
