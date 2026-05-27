@@ -155,7 +155,7 @@ enum Commands {
 
     /// List available models per agent harness.
     Models {
-        /// Harness: opencode, gemini, or claude. Omit for all.
+        /// Harness: opencode, gemini, claude, or codex. Omit for all.
         #[arg(value_name = "HARNESS")]
         harness: Option<String>,
         /// Provider filter (opencode only). E.g. "anthropic", "openai".
