@@ -12,8 +12,30 @@ You are an E2E test runner companion. This test validates that `fork_wave` with 
 ## Allowed Bash (Read-Only Observation)
 
 ```bash
-# Repo root (your CWD is .exo/companions/test-runner/ inside the repo)
-REPO_ROOT=$(git rev-parse --show-toplevel)
+# Find the ExoMonad session repo root. Your CWD is a companion git worktree under .exo/companions/test-runner.
+find_session_root() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.exo/config.toml" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+REPO_ROOT=$(find_session_root)
+
+new_e2e_teams() {
+  local baseline="$REPO_ROOT/.exo/e2e-team-baseline.txt"
+  local current
+  current=$(mktemp)
+  find "$HOME/.claude/teams" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort > "$current"
+  comm -13 "$baseline" "$current" 2>/dev/null
+  rm -f "$current"
+}
+
+ACTIVE_TEAM=$(new_e2e_teams | head -n 1)
 
 # Check for OpenCode worker window/pane
 tmux list-windows -t "$EXOMONAD_TMUX_SESSION"
@@ -24,8 +46,8 @@ ls "$REPO_ROOT/.exo/worktrees/" 2>/dev/null
 # Find the output file in any worktree
 find "$REPO_ROOT/.exo/worktrees" -name 'oc-worker-output.txt' 2>/dev/null
 
-# Check Teams inbox for worker completion
-cat ~/.claude/teams/*/inboxes/*.json 2>/dev/null | grep OC-WORKER-DONE
+# Check the active test team's inbox for worker completion
+cat "$HOME/.claude/teams/$ACTIVE_TEAM"/inboxes/*.json 2>/dev/null | grep OC-WORKER-DONE
 
 # Peek at worker window output (may show --model flag)
 tmux capture-pane -p -t "${EXOMONAD_TMUX_SESSION}:oc-worker" 2>/dev/null || true
@@ -48,10 +70,26 @@ Test Runner (you)
 
 Poll every 5 seconds, max 60 seconds:
 ```bash
-ls ~/.claude/teams/ 2>/dev/null
+find_session_root() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.exo/config.toml" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+REPO_ROOT=$(find_session_root)
+BASELINE="$REPO_ROOT/.exo/e2e-team-baseline.txt"
+CURRENT=$(mktemp)
+find "$HOME/.claude/teams" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort > "$CURRENT"
+comm -13 "$BASELINE" "$CURRENT" 2>/dev/null
+rm -f "$CURRENT"
 ```
 
-Wait for a team directory to appear — this confirms the root TL has started and created a team.
+Wait for a team directory that was not present in `.exo/e2e-team-baseline.txt` — this confirms the current root TL, not a stale previous test, has started and created a team. Record the first new team name as `ACTIVE_TEAM` for later inbox checks.
 
 ---
 
@@ -70,17 +108,17 @@ A window named after the worker should appear once `fork_wave` spawns it. Record
 
 Poll every 5 seconds, max 120 seconds:
 ```bash
-cat ~/.claude/teams/*/inboxes/*.json 2>/dev/null | grep -c OC-WORKER-DONE
+cat "$HOME/.claude/teams/$ACTIVE_TEAM"/inboxes/*.json 2>/dev/null | grep -c OC-WORKER-DONE
 ```
 
-Wait until count > 0. Record: arrived? yes/no, elapsed time.
+Wait until count > 0 in the active test team's inbox. Record: arrived? yes/no, elapsed time.
 
 ---
 
 ### Phase 4: Assert oc-worker-output.txt
 
 ```bash
-REPO_ROOT=$(git rev-parse --show-toplevel)
+REPO_ROOT=$(find_session_root)
 find "$REPO_ROOT/.exo/worktrees" -name 'oc-worker-output.txt' 2>/dev/null
 ```
 

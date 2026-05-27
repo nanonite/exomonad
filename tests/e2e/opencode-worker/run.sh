@@ -135,6 +135,18 @@ PY
 trust_claude_project "$REPO_DIR"
 trust_claude_project "$REPO_DIR/.exo/companions/test-runner"
 
+record_team_baseline() {
+    local baseline_file="$REPO_DIR/.exo/e2e-team-baseline.txt"
+    if [[ -d "$HOME/.claude/teams" ]]; then
+        find "$HOME/.claude/teams" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort > "$baseline_file"
+    else
+        : > "$baseline_file"
+    fi
+}
+
+# Scope testrunner team assertions to teams created by this test invocation.
+record_team_baseline
+
 # Write config: Claude haiku root TL + OpenCode workers + testrunner companion
 cat > .exo/config.toml <<'EOF'
 default_role = "devswarm"
