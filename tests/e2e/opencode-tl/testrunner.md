@@ -13,8 +13,19 @@ You are an E2E test runner companion. This test validates the full ACP delivery 
 ## Allowed Bash (Read-Only Observation)
 
 ```bash
-# Find the repo root (your CWD is .exo/companions/test-runner/ inside the repo)
-REPO_ROOT=$(git rev-parse --show-toplevel)
+# Find the ExoMonad session repo root. Your CWD is a companion git worktree under .exo/companions/test-runner.
+find_session_root() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.exo/config.toml" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+REPO_ROOT=$(find_session_root)
 
 # Check for the output file
 ls "$REPO_ROOT/opencode-tl-test.txt"
@@ -44,11 +55,22 @@ Test Runner (you)
 Poll every 5 seconds, max 90 seconds:
 
 ```bash
-REPO_ROOT=$(git rev-parse --show-toplevel)
+find_session_root() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.exo/config.toml" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+REPO_ROOT=$(find_session_root)
 ls "$REPO_ROOT/opencode-tl-test.txt" 2>/dev/null
 ```
 
-The OpenCode root TL receives its task via ACP (`initial_prompt` in config). It should create this file shortly after startup. If not found within 90 seconds, record TIMEOUT.
+The OpenCode root TL receives its task via ACP (`initial_prompt` in config). It should create this file in the session repo root shortly after startup. If not found within 90 seconds, record TIMEOUT and include the resolved `REPO_ROOT` path.
 
 ---
 
@@ -67,7 +89,7 @@ Record: content matches? yes/no.
 
 ### Phase 3: Assert [OC-TL-DONE] in Your Own Inbox
 
-OpenCode uses `send_message` targeting you (`test-runner`) directly, since it is the root and has no parent to `notify_parent` to. The message arrives in your own Teams inbox.
+OpenCode uses `send_message` with `recipient="test-runner"` and `content` containing `[OC-TL-DONE]`, since it is the root and has no parent to `notify_parent` to. The message arrives in your own Teams inbox.
 
 ```bash
 cat ~/.claude/teams/*/inboxes/*.json 2>/dev/null | grep OC-TL-DONE

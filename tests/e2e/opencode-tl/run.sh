@@ -100,7 +100,7 @@ shell_command = "bash"
 tmux_session = "e2e-opencode-tl"
 root_agent_type = "opencode"
 yolo = true
-initial_prompt = "You are an E2E test subject. Do exactly these two steps and nothing else: (1) Write a file named opencode-tl-test.txt in the current directory containing the single line: OpenCode TL test passed (2) Call the send_message MCP tool with target_name='test-runner' and message='[OC-TL-DONE] OpenCode root TL test complete. File written successfully.' Then stop."
+initial_prompt = "You are an E2E test subject. Do exactly these two steps and nothing else: (1) Write a file named opencode-tl-test.txt in the current directory containing the single line: OpenCode TL test passed (2) Call the send_message MCP tool with recipient='test-runner' and content='[OC-TL-DONE] OpenCode root TL test complete. File written successfully.' Then stop."
 
 [opencode]
 tl_model = "opencode-go/deepseek-v4-flash"
