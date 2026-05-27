@@ -222,6 +222,14 @@ test-mcp *args:
 e2e-messaging:
     ./tests/e2e/messaging/run.sh
 
+# Run bounded Claude-only smoke test (root SessionStart + TeamCreate, no children)
+e2e-claude-only:
+    ./tests/e2e/claude-only/run.sh
+
+# Check bounded Claude-only smoke harness without launching Claude/tmux
+check-e2e-claude-only:
+    bash -n tests/e2e/claude-only/run.sh
+
 # Run E2E OpenCode hook rewrite test (BeforeModel/AfterModel PII term rewriting)
 e2e-oc-rewrite:
     ./tests/e2e/hook-rewrite/run.sh
