@@ -666,7 +666,7 @@ mod tests {
         let result = service.push_to_remote(temp.path(), &branch, "origin");
         assert!(result.is_err());
 
-        let result = service.push_to_remote(temp.path(), &branch, "tangled");
+        let result = service.push_to_remote(temp.path(), &branch, "forgejo");
         assert!(result.is_err());
     }
 
@@ -686,7 +686,7 @@ mod tests {
         };
         run_bare(&["init", "--bare"]);
 
-        // Create working repo with tangled remote pointing at the bare repo
+        // Create working repo with a forge remote pointing at the bare repo
         let run = |args: &[&str]| {
             let status = Command::new("git")
                 .args(args)
@@ -699,14 +699,14 @@ mod tests {
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test User"]);
         run(&["commit", "--allow-empty", "-m", "Initial commit"]);
-        run(&["remote", "add", "tangled", bare.path().to_str().unwrap()]);
+        run(&["remote", "add", "forgejo", bare.path().to_str().unwrap()]);
 
         let service = GitWorktreeService::new(work_dir.to_path_buf());
         let default_branch = get_default_branch(work_dir);
         let branch = BranchName::try_from_str(default_branch.as_str())
             .expect("validated string input is non-empty");
 
-        let result = service.push_to_remote(work_dir, &branch, "tangled");
+        let result = service.push_to_remote(work_dir, &branch, "forgejo");
         assert!(result.is_ok(), "push_to_remote failed: {:?}", result);
     }
 

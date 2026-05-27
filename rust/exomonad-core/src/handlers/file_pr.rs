@@ -538,9 +538,9 @@ Reviewer-Agent: review-pr-7-codex"
         let response = handler
             .local_pr_get_for_branch(
                 LocalPrGetForBranchRequest {
-                    branch: "main.fix-appview-codex".to_string(),
+                    branch: "main.fix-ui-codex".to_string(),
                 },
-                &test_ctx("main.fix-appview-codex"),
+                &test_ctx("main.fix-ui-codex"),
             )
             .await
             .unwrap();

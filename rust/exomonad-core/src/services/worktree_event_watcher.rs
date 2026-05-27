@@ -2496,7 +2496,7 @@ fn format_observations(observations: &HashMap<u64, Observation>) -> String {
     entries.join(", ")
 }
 
-/// Extracts the branch name and head SHA from a `sh.tangled.pipeline` event payload.
+/// Extracts the branch name and head SHA from a pipeline event payload.
 /// Returns `None` if the trigger is not a push or is missing the ref/SHA fields.
 #[allow(dead_code)]
 fn extract_pipeline_branch_and_sha(event: &serde_json::Value) -> Option<(BranchName, String)> {
@@ -2515,7 +2515,7 @@ fn extract_pipeline_branch_and_sha(event: &serde_json::Value) -> Option<(BranchN
     }
 }
 
-/// Extracts the pipeline rkey and status string from a `sh.tangled.pipeline.status` event payload.
+/// Extracts the pipeline rkey and status string from a pipeline status event payload.
 /// The pipeline field is an AT-URI; the rkey is the last path segment.
 #[allow(dead_code)]
 fn extract_pipeline_status(event: &serde_json::Value) -> Option<(String, String)> {

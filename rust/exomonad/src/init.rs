@@ -799,8 +799,6 @@ pub async fn run(
         .await;
     }
 
-    // Register repo with local Tangled knot (idempotent — no-op if already registered)
-
     // Validate tmux is available
     let tmux_check = std::process::Command::new("tmux").arg("-V").output();
     match tmux_check {
@@ -1689,65 +1687,6 @@ async fn report_orphaned_agent_windows(session: &str, cwd: &Path) {
     }
 }
 
-pub(crate) fn tangled_repo_name(cwd: &Path) -> String {
-    let directory_name = cwd
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-
-    let remote_name = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .and_then(|url| {
-            url.trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .map(|s| s.trim_end_matches(".git").to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .filter(|name| !name.starts_with('.'));
-
-    remote_name
-        .or(directory_name)
-        .unwrap_or_else(|| "repo".to_string())
-}
-
-pub(crate) fn normalize_knot_hostname(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let without_scheme = trimmed
-        .strip_prefix("http://")
-        .or_else(|| trimmed.strip_prefix("https://"))
-        .or_else(|| trimmed.strip_prefix("ws://"))
-        .or_else(|| trimmed.strip_prefix("wss://"))
-        .unwrap_or(trimmed);
-    without_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
-}
-
-pub(crate) fn tangled_dev_repo_did(knot_hostname: &str, repo_name: &str) -> String {
-    let host = normalize_knot_hostname(knot_hostname).replace(':', "%3A");
-    let repo = repo_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    format!("did:web:{host}:repo:{repo}")
-}
-
 pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
     let gitignore_path = project_dir.join(".gitignore");
     let content = if gitignore_path.exists() {
@@ -1764,8 +1703,6 @@ pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
         "!.exo/lib/",
         "!.exo/rules/",
         ".codex/",
-        ".tangled/*",
-        "!.tangled/workflows/",
         ".claude/settings.local.json",
         ".opencode/",
         "opencode.json",
@@ -1973,9 +1910,9 @@ mod tests {
     #[test]
     fn parse_remote_repo_parts_uses_last_two_path_segments() {
         let parts =
-            parse_remote_repo_parts("git@local-tangled:repositories/owner/exomonad.git").unwrap();
+            parse_remote_repo_parts("git@forge.example:repositories/owner/exomonad.git").unwrap();
 
-        assert_eq!(parts.host, "local-tangled");
+        assert_eq!(parts.host, "forge.example");
         assert_eq!(parts.owner, "owner");
         assert_eq!(parts.repo, "exomonad");
     }
@@ -2046,66 +1983,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_knot_hostname_accepts_supported_url_forms() {
-        for (raw, expected) in [
-            ("localhost", "localhost"),
-            ("localhost:5555", "localhost:5555"),
-            ("ws://localhost", "localhost"),
-            ("ws://localhost:5555", "localhost:5555"),
-            ("ws://localhost:5555/", "localhost:5555"),
-            ("ws://localhost:5555/events", "localhost:5555"),
-            ("wss://localhost:5555", "localhost:5555"),
-            ("http://localhost:5555", "localhost:5555"),
-            ("https://localhost:5555", "localhost:5555"),
-            ("HTTPS://LOCALHOST:5555/events?cursor=1", "localhost:5555"),
-            ("  http://LocalHost:5555/  ", "localhost:5555"),
-            ("http://knot.example.com", "knot.example.com"),
-        ] {
-            assert_eq!(normalize_knot_hostname(raw), expected, "{raw}");
-        }
-    }
-
-    #[test]
-    fn tangled_dev_repo_did_uses_normalized_knot_hostname() {
-        assert_eq!(
-            tangled_dev_repo_did("http://LocalHost:5555/events", "repo name"),
-            "did:web:localhost%3A5555:repo:repo-name"
-        );
-    }
-
-    #[test]
-    fn tangled_repo_name_ignores_hidden_local_origin_remote() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("backrooms-workspace");
-        std::fs::create_dir(&repo).unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "/tmp/backrooms-workspace/.git-remote",
-            ])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-
-        assert_eq!(tangled_repo_name(&repo), "backrooms-workspace");
-    }
-
-    #[test]
-    fn tangled_dev_repo_did_uses_did_web_repo_path() {
-        assert_eq!(
-            tangled_dev_repo_did("ws://localhost:5555", "backrooms workspace"),
-            "did:web:localhost%3A5555:repo:backrooms-workspace"
-        );
-    }
-
-    #[test]
     fn ensure_gitignore_writes_runtime_scaffold_paths_on_fresh_repo() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -2119,8 +1996,6 @@ mod tests {
             "!.exo/lib/",
             "!.exo/rules/",
             ".codex/",
-            ".tangled/*",
-            "!.tangled/workflows/",
             ".claude/settings.local.json",
             ".opencode/",
             "opencode.json",
