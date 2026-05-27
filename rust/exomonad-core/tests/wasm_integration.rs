@@ -423,6 +423,16 @@ impl EffectHandler for MockAgentHandler {
                 errors: vec![],
             }
             .encode_to_vec()),
+            "agent.restart_review" => Ok(RestartReviewResponse {
+                success: true,
+                error: String::new(),
+                pr_number: 42,
+                cleaned_reviewers: vec!["review-pr-42-codex".into()],
+                runtime_state_found: true,
+                watcher_state_found: true,
+                legacy_review_file_removed: true,
+            }
+            .encode_to_vec()),
             "agent.watcher_pr_state" => Ok(WatcherPrStateResponse {
                 success: true,
                 error: String::new(),
@@ -748,6 +758,7 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
         "file_pr",
         "notify_parent",
         "cleanup_reviewer_leaf",
+        "restart_review",
         "watcher_pr_state",
     ] {
         assert!(
@@ -893,6 +904,7 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
     let coordinator_cleanup_tools = [
         "close_issue_and_cleanup",
         "cleanup_reviewer_leaf",
+        "restart_review",
         "watcher_pr_state",
     ];
 

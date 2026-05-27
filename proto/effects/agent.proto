@@ -336,6 +336,25 @@ message CleanupReviewerLeafResponse {
 }
 
 // ============================================================================
+// RestartReview - Reset stuck reviewer state and trigger a fresh review cycle
+// ============================================================================
+
+message RestartReviewRequest {
+  // Existing PR number whose review cycle should be reset.
+  uint64 pr_number = 1;
+}
+
+message RestartReviewResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 pr_number = 3;
+  repeated string cleaned_reviewers = 4;
+  bool runtime_state_found = 5;
+  bool watcher_state_found = 6;
+  bool legacy_review_file_removed = 7;
+}
+
+// ============================================================================
 // WatcherPrState - Query live Forgejo PR review/CI state for TL diagnostics
 // ============================================================================
 
@@ -470,6 +489,7 @@ service AgentEffects {
   rpc SpawnSubtree(SpawnSubtreeRequest) returns (SpawnSubtreeResponse);
   rpc SpawnReviewer(SpawnReviewerRequest) returns (SpawnReviewerResponse);
   rpc CleanupReviewerLeaf(CleanupReviewerLeafRequest) returns (CleanupReviewerLeafResponse);
+  rpc RestartReview(RestartReviewRequest) returns (RestartReviewResponse);
   rpc WatcherPrState(WatcherPrStateRequest) returns (WatcherPrStateResponse);
   rpc SpawnLeafSubtree(SpawnLeafSubtreeRequest) returns (SpawnLeafSubtreeResponse);
   rpc SpawnAcp(SpawnAcpRequest) returns (SpawnAcpResponse);

@@ -371,6 +371,42 @@ impl WatchState {
             ci_blocked_notified: false,
         }
     }
+
+    fn reset_review_cycle(&mut self) {
+        self.notified_parent_timeout = false;
+        self.notified_parent_approved = false;
+        self.merge_ready_notified = false;
+        self.addressed_changes = false;
+        self.rounds = 0;
+        self.stuck = false;
+        self.reviewer_spawned = false;
+        self.reviewer_disposed = false;
+        self.review_approved_at = None;
+        self.ci_mergeable_at = None;
+        self.ci_triggered_sha = None;
+        self.ci_blocked_notified = false;
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct WatcherRuntimeState {
+    prs: Mutex<HashMap<u64, WatchState>>,
+}
+
+impl WatcherRuntimeState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn reset_review_cycle(&self, pr_number: u64) -> bool {
+        let mut state = self.prs.lock().await;
+        let Some(pr_state) = state.get_mut(&pr_number) else {
+            return false;
+        };
+
+        pr_state.reset_review_cycle();
+        true
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -557,7 +593,7 @@ struct Observation {
 pub struct WorktreeEventWatcher<C> {
     ctx: Arc<C>,
     poll_interval: Duration,
-    state: Arc<Mutex<HashMap<u64, WatchState>>>,
+    state: Arc<WatcherRuntimeState>,
     watcher_state_path: std::path::PathBuf,
     plugins: Option<PluginMap>,
     policy: ReviewPolicy,
@@ -586,7 +622,7 @@ where
         Self {
             ctx,
             poll_interval: Duration::from_secs(60),
-            state: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(WatcherRuntimeState::new()),
             watcher_state_path,
             plugins: None,
             policy: ReviewPolicy::default(),
@@ -614,6 +650,11 @@ where
 
     pub fn with_reviewer_spawner(mut self, spawner: Arc<dyn ReviewerSpawner>) -> Self {
         self.reviewer_spawner = Some(spawner);
+        self
+    }
+
+    pub fn with_runtime_state(mut self, state: Arc<WatcherRuntimeState>) -> Self {
+        self.state = state;
         self
     }
 
@@ -939,7 +980,7 @@ where
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
 
         {
-            let mut state_guard = self.state.lock().await;
+            let mut state_guard = self.state.prs.lock().await;
 
             for (pr_number, obs) in observations {
                 let pr = match registry.prs.get(pr_number) {
@@ -1318,7 +1359,7 @@ where
             return Ok(());
         }
 
-        let state_guard = self.state.lock().await;
+        let state_guard = self.state.prs.lock().await;
 
         for pr_num in removed {
             let branch = match state_guard.get(pr_num) {
@@ -1550,7 +1591,7 @@ where
     }
 
     async fn mark_merge_ready_notified(&self, pr_number: u64) {
-        let mut state_guard = self.state.lock().await;
+        let mut state_guard = self.state.prs.lock().await;
         if let Some(state) = state_guard.get_mut(&pr_number) {
             state.merge_ready_notified = true;
         } else {
@@ -4326,6 +4367,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watcher_runtime_state_resets_review_cycle_flags() {
+        let runtime_state = WatcherRuntimeState::new();
+        let branch = BranchName::try_from_str("main.feature").unwrap();
+        let mut watch_state =
+            WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Failure, 2);
+        watch_state.notified_parent_timeout = true;
+        watch_state.notified_parent_approved = true;
+        watch_state.merge_ready_notified = true;
+        watch_state.addressed_changes = true;
+        watch_state.rounds = 3;
+        watch_state.stuck = true;
+        watch_state.reviewer_spawned = true;
+        watch_state.reviewer_disposed = true;
+        watch_state.review_approved_at = Some(Instant::now());
+        watch_state.ci_mergeable_at = Some(Instant::now());
+        watch_state.ci_triggered_sha = Some("abc123".to_string());
+        watch_state.ci_blocked_notified = true;
+        runtime_state.prs.lock().await.insert(7, watch_state);
+
+        assert!(runtime_state.reset_review_cycle(7).await);
+        assert!(!runtime_state.reset_review_cycle(8).await);
+
+        let state = runtime_state.prs.lock().await;
+        let reset = state.get(&7).unwrap();
+        assert!(!reset.notified_parent_timeout);
+        assert!(!reset.notified_parent_approved);
+        assert!(!reset.merge_ready_notified);
+        assert!(!reset.addressed_changes);
+        assert_eq!(reset.rounds, 0);
+        assert!(!reset.stuck);
+        assert!(!reset.reviewer_spawned);
+        assert!(!reset.reviewer_disposed);
+        assert!(reset.review_approved_at.is_none());
+        assert!(reset.ci_mergeable_at.is_none());
+        assert!(reset.ci_triggered_sha.is_none());
+        assert!(!reset.ci_blocked_notified);
+    }
+
+    #[tokio::test]
     async fn test_process_observations_does_not_persist_review_state_on_approval() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
@@ -4438,7 +4518,7 @@ mod tests {
             !reviewer_agent_dir.exists(),
             "already-approved PRs observed after restart should dispose reviewer agent resources"
         );
-        let state = watcher.state.lock().await;
+        let state = watcher.state.prs.lock().await;
         assert!(state.get(&1).is_some_and(|state| state.reviewer_disposed));
         drop(state);
         let watcher_log = tokio::fs::read_to_string(temp_dir.path().join(".exo/logs/watcher.log"))
@@ -4540,7 +4620,7 @@ mod tests {
             "spawner should be called for first sighting of new PR"
         );
 
-        let state = watcher.state.lock().await;
+        let state = watcher.state.prs.lock().await;
         assert!(
             state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(false),
             "reviewer_spawned should be true after first sighting"
@@ -4577,7 +4657,7 @@ mod tests {
         let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
         let branch = BranchName::try_from_str("main.feature-codex")
             .expect("literal validated string is non-empty");
-        watcher.state.lock().await.insert(
+        watcher.state.prs.lock().await.insert(
             1,
             WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0),
         );

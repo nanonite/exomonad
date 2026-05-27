@@ -38,6 +38,7 @@ import ExoMonad.Guest.Tools.Chainlink
   )
 import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
 import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
+import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
 import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.DiscardWorkerOutput (DiscardWorkerOutput (..))
@@ -244,6 +245,7 @@ data Tools mode = Tools
     spawnWorker :: mode :- TLSpawnWorker,
     spawnReviewer :: mode :- SpawnReviewer,
     cleanupReviewerLeaf :: mode :- CleanupReviewerLeaf,
+    restartReview :: mode :- RestartReview,
     watcherPrState :: mode :- WatcherPrState,
     closeWorkerPane :: mode :- TLCloseWorkerPane,
     spawnCodex :: mode :- TLSpawnCodex,
@@ -288,6 +290,7 @@ config =
             spawnWorker = mkHandler @TLSpawnWorker,
             spawnReviewer = mkHandler @SpawnReviewer,
             cleanupReviewerLeaf = mkHandler @CleanupReviewerLeaf,
+            restartReview = mkHandler @RestartReview,
             watcherPrState = mkHandler @WatcherPrState,
             closeWorkerPane = mkHandler @TLCloseWorkerPane,
             spawnCodex = mkHandler @TLSpawnCodex,

@@ -4311,6 +4311,273 @@ instance (HsJSONPB.ToJSON CleanupReviewerLeafResponse) where
 instance (HsJSONPB.FromJSON CleanupReviewerLeafResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
+newtype RestartReviewRequest
+  = RestartReviewRequest {restartReviewRequestPrNumber :: Hs.Word64}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData RestartReviewRequest)
+
+instance (HsProtobuf.Named RestartReviewRequest) where
+  nameOf _ = Hs.fromString "RestartReviewRequest"
+
+instance (HsProtobuf.HasDefault RestartReviewRequest)
+
+instance (HsProtobuf.Message RestartReviewRequest) where
+  encodeMessage _ RestartReviewRequest {restartReviewRequestPrNumber} =
+    ( HsProtobuf.encodeMessageField
+        (HsProtobuf.FieldNumber 1)
+        restartReviewRequestPrNumber
+    )
+  decodeMessage _ =
+    Hs.pure RestartReviewRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB RestartReviewRequest) where
+  toJSONPB (RestartReviewRequest f1) =
+    HsJSONPB.object ["pr_number" .= f1]
+  toEncodingPB (RestartReviewRequest f1) =
+    HsJSONPB.pairs ["pr_number" .= f1]
+
+instance (HsJSONPB.FromJSONPB RestartReviewRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "RestartReviewRequest"
+      (\obj -> Hs.pure RestartReviewRequest <*> obj .: "pr_number")
+
+instance (HsJSONPB.ToJSON RestartReviewRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON RestartReviewRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data RestartReviewResponse
+  = RestartReviewResponse
+  { restartReviewResponseSuccess :: Hs.Bool,
+    restartReviewResponseError :: Hs.Text,
+    restartReviewResponsePrNumber :: Hs.Word64,
+    restartReviewResponseCleanedReviewers :: (Hs.Vector Hs.Text),
+    restartReviewResponseRuntimeStateFound :: Hs.Bool,
+    restartReviewResponseWatcherStateFound :: Hs.Bool,
+    restartReviewResponseLegacyReviewFileRemoved :: Hs.Bool
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData RestartReviewResponse)
+
+instance (HsProtobuf.Named RestartReviewResponse) where
+  nameOf _ = Hs.fromString "RestartReviewResponse"
+
+instance (HsProtobuf.HasDefault RestartReviewResponse)
+
+instance (HsProtobuf.Message RestartReviewResponse) where
+  encodeMessage
+    _
+    RestartReviewResponse
+      { restartReviewResponseSuccess,
+        restartReviewResponseError,
+        restartReviewResponsePrNumber,
+        restartReviewResponseCleanedReviewers,
+        restartReviewResponseRuntimeStateFound,
+        restartReviewResponseWatcherStateFound,
+        restartReviewResponseLegacyReviewFileRemoved
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 1)
+                                restartReviewResponseSuccess
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 2)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    restartReviewResponseError
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 3)
+                            restartReviewResponsePrNumber
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 4)
+                        ( ( Hs.coerce
+                              @(Hs.Vector Hs.Text)
+                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                          )
+                            restartReviewResponseCleanedReviewers
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 5)
+                    restartReviewResponseRuntimeStateFound
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 6)
+                restartReviewResponseWatcherStateFound
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 7)
+            restartReviewResponseLegacyReviewFileRemoved
+        )
+  decodeMessage _ =
+    Hs.pure RestartReviewResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 3)
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 5)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 6)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 7)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "cleaned_reviewers")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "runtime_state_found")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "watcher_state_found")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "legacy_review_file_removed")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB RestartReviewResponse) where
+  toJSONPB (RestartReviewResponse f1 f2 f3 f4 f5 f6 f7) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "pr_number" .= f3,
+        "cleaned_reviewers"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f4
+             ),
+        "runtime_state_found" .= f5,
+        "watcher_state_found" .= f6,
+        "legacy_review_file_removed" .= f7
+      ]
+  toEncodingPB (RestartReviewResponse f1 f2 f3 f4 f5 f6 f7) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "pr_number" .= f3,
+        "cleaned_reviewers"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f4
+             ),
+        "runtime_state_found" .= f5,
+        "watcher_state_found" .= f6,
+        "legacy_review_file_removed" .= f7
+      ]
+
+instance (HsJSONPB.FromJSONPB RestartReviewResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "RestartReviewResponse"
+      ( \obj ->
+          Hs.pure RestartReviewResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+            <*> obj .: "pr_number"
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "cleaned_reviewers")
+                )
+            <*> obj .: "runtime_state_found"
+            <*> obj .: "watcher_state_found"
+            <*> obj .: "legacy_review_file_removed"
+      )
+
+instance (HsJSONPB.ToJSON RestartReviewResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON RestartReviewResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
 newtype WatcherPrStateRequest
   = WatcherPrStateRequest {watcherPrStateRequestPrNumber :: Hs.Word64}
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)

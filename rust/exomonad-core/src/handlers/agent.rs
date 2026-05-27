@@ -37,6 +37,7 @@ use tracing::{info, warn};
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient,
     HasGitHubClient, HasGitWorktreeService, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
+    HasWatcherRuntimeState,
 };
 
 /// Agent effect handler.
@@ -59,6 +60,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasWatcherRuntimeState
             + 'static,
     > AgentHandler<C>
 {
@@ -265,6 +267,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasWatcherRuntimeState
             + 'static,
     > EffectHandler for AgentHandler<C>
 {
@@ -470,6 +473,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasWatcherRuntimeState
             + 'static,
     > AgentEffects for AgentHandler<C>
 {
@@ -838,6 +842,45 @@ impl<
                 error: error.to_string(),
                 pr_number: req.pr_number,
                 cleaned_reviewers,
+            }),
+        }
+    }
+
+    async fn restart_review(
+        &self,
+        req: RestartReviewRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<RestartReviewResponse> {
+        if req.pr_number == 0 {
+            return Err(EffectError::invalid_input("pr_number is required"));
+        }
+
+        let cleaned_reviewers =
+            cleanup_force_reviewer_resources(&self.service, req.pr_number).await;
+        let runtime_state_found = self
+            .ctx
+            .watcher_runtime_state()
+            .reset_review_cycle(req.pr_number)
+            .await;
+
+        match reset_reviewer_restart_artifacts(self.ctx.project_dir(), req.pr_number).await {
+            Ok(reset) => Ok(RestartReviewResponse {
+                success: true,
+                error: String::new(),
+                pr_number: req.pr_number,
+                cleaned_reviewers,
+                runtime_state_found,
+                watcher_state_found: reset.watcher_state_found,
+                legacy_review_file_removed: reset.legacy_review_file_removed,
+            }),
+            Err(error) => Ok(RestartReviewResponse {
+                success: false,
+                error: error.to_string(),
+                pr_number: req.pr_number,
+                cleaned_reviewers,
+                runtime_state_found,
+                watcher_state_found: false,
+                legacy_review_file_removed: false,
             }),
         }
     }
@@ -1426,6 +1469,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasWatcherRuntimeState
             + 'static,
     > AgentHandler<C>
 {
@@ -1574,13 +1618,31 @@ async fn clear_reviewer_review_artifacts(project_dir: &Path, pr_number: u64) -> 
     clear_watcher_pr_state(project_dir, pr_number).await
 }
 
-async fn remove_legacy_review_file(project_dir: &Path, pr_number: u64) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestartReviewArtifactReset {
+    watcher_state_found: bool,
+    legacy_review_file_removed: bool,
+}
+
+async fn reset_reviewer_restart_artifacts(
+    project_dir: &Path,
+    pr_number: u64,
+) -> anyhow::Result<RestartReviewArtifactReset> {
+    let legacy_review_file_removed = remove_legacy_review_file(project_dir, pr_number).await?;
+    let watcher_state_found = reset_watcher_pr_state_file(project_dir, pr_number).await?;
+    Ok(RestartReviewArtifactReset {
+        watcher_state_found,
+        legacy_review_file_removed,
+    })
+}
+
+async fn remove_legacy_review_file(project_dir: &Path, pr_number: u64) -> anyhow::Result<bool> {
     let review_path = project_dir
         .join(".exo/reviews")
         .join(format!("pr_{pr_number}.json"));
     match tokio::fs::remove_file(&review_path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -1601,6 +1663,32 @@ async fn clear_watcher_pr_state(project_dir: &Path, pr_number: u64) -> anyhow::R
     }
     tokio::fs::write(&state_path, serde_json::to_vec_pretty(&value)?).await?;
     Ok(())
+}
+
+async fn reset_watcher_pr_state_file(project_dir: &Path, pr_number: u64) -> anyhow::Result<bool> {
+    let state_path = project_dir.join(".exo/watcher-state.json");
+    let state = match tokio::fs::read_to_string(&state_path).await {
+        Ok(state) => state,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&state)?;
+    let found = value
+        .get_mut("prs")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|prs| prs.get_mut(&pr_number.to_string()))
+        .and_then(serde_json::Value::as_object_mut)
+        .map(|entry| {
+            entry.insert("rounds".to_string(), serde_json::json!(0));
+            entry.insert("stuck".to_string(), serde_json::json!(false));
+            entry.insert("needs_human_review".to_string(), serde_json::json!(false));
+        })
+        .is_some();
+
+    if found {
+        tokio::fs::write(&state_path, serde_json::to_vec_pretty(&value)?).await?;
+    }
+    Ok(found)
 }
 
 async fn cleanup_force_reviewer_resources<C>(
@@ -2011,6 +2099,40 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
         assert!(state["prs"].get("7").is_none());
         assert!(state["prs"].get("8").is_some());
+    }
+
+    #[tokio::test]
+    async fn reset_reviewer_restart_artifacts_resets_persisted_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let reviews = dir.path().join(".exo/reviews");
+        std::fs::create_dir_all(&reviews).unwrap();
+        std::fs::write(reviews.join("pr_7.json"), "{}").unwrap();
+
+        let state_path = dir.path().join(".exo/watcher-state.json");
+        std::fs::write(
+            &state_path,
+            r#"{"prs":{"7":{"rounds":3,"stuck":true,"needs_human_review":true},"8":{"rounds":2,"stuck":true,"needs_human_review":true}}}"#,
+        )
+        .unwrap();
+
+        let reset = reset_reviewer_restart_artifacts(dir.path(), 7)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reset,
+            RestartReviewArtifactReset {
+                watcher_state_found: true,
+                legacy_review_file_removed: true,
+            }
+        );
+        assert!(!reviews.join("pr_7.json").exists());
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state["prs"]["7"]["rounds"], 0);
+        assert_eq!(state["prs"]["7"]["stuck"], false);
+        assert_eq!(state["prs"]["7"]["needs_human_review"], false);
+        assert_eq!(state["prs"]["8"]["rounds"], 2);
     }
 
     #[test]

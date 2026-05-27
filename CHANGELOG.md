@@ -56,6 +56,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- TL needs restart_review tool to re-trigger the review cycle when a PR is stuck on CI or reviewer failure (#431)
 - Add cleanup_reviewer_leaf MCP tool to kill, clean, and reset a stuck reviewer before respawn (#396)
 - Add cleanup_reviewer_leaf MCP tool to kill, clean, and reset a stuck reviewer before respawn (#396)
 - Add Ratatui dashboard for the watcher pane (#384)

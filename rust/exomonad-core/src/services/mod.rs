@@ -52,6 +52,7 @@ pub use self::github::GitHubClient;
 pub use self::mutex_registry::MutexRegistry;
 pub use self::secrets::Secrets;
 pub use self::supervisor_registry::SupervisorRegistry;
+pub use self::worktree_event_watcher::WatcherRuntimeState;
 use claude_teams_bridge::TeamRegistry;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -107,6 +108,9 @@ pub trait HasGitWorktreeService: Send + Sync {
 pub trait HasCiStatusMap: Send + Sync {
     fn ci_status_map(&self) -> &Arc<tokio::sync::RwLock<CiStatusMap>>;
 }
+pub trait HasWatcherRuntimeState: Send + Sync {
+    fn watcher_runtime_state(&self) -> &Arc<WatcherRuntimeState>;
+}
 /// Spawns a reviewer agent for a Forgejo PR. Implemented by `AgentControlService`.
 ///
 /// Reviewer creation is owned by the Forgejo PR watcher for automatic review
@@ -149,6 +153,7 @@ pub struct Services {
     /// Keyed by `(branch, sha)` so stale CI from an older push cannot satisfy a newer PR head.
     /// Shared with `WorktreeEventWatcher` so both the watcher and merge gate read from the same map.
     pub ci_status_map: Arc<tokio::sync::RwLock<CiStatusMap>>,
+    pub watcher_runtime_state: Arc<WatcherRuntimeState>,
 }
 
 impl Services {
@@ -228,6 +233,11 @@ impl HasCiStatusMap for Services {
         &self.ci_status_map
     }
 }
+impl HasWatcherRuntimeState for Services {
+    fn watcher_runtime_state(&self) -> &Arc<WatcherRuntimeState> {
+        &self.watcher_runtime_state
+    }
+}
 
 #[cfg(test)]
 impl Services {
@@ -249,6 +259,7 @@ impl Services {
             git_wt: Arc::new(GitWorktreeService::new(PathBuf::from("."))),
             opencode_worker_model: None,
             ci_status_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            watcher_runtime_state: Arc::new(WatcherRuntimeState::new()),
         }
     }
 }

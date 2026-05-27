@@ -1011,6 +1011,7 @@ Run `exomonad recompile` first to build it.",
     let ci_status_map = Arc::new(tokio::sync::RwLock::new(
         exomonad_core::services::CiStatusMap::new(),
     ));
+    let watcher_runtime_state = Arc::new(exomonad_core::services::WatcherRuntimeState::new());
 
     // Build Services once — all shared registries in one struct
     let services = Arc::new(exomonad_core::services::Services {
@@ -1029,6 +1030,7 @@ Run `exomonad recompile` first to build it.",
         git_wt,
         opencode_worker_model: config.opencode.worker_model.clone(),
         ci_status_map: ci_status_map.clone(),
+        watcher_runtime_state: watcher_runtime_state.clone(),
     });
 
     let mut agent_control =
@@ -1155,6 +1157,7 @@ Run `exomonad recompile` first to build it.",
     )
     .with_plugins(plugins.clone())
     .with_reviewer_spawner(agent_control.clone())
+    .with_runtime_state(watcher_runtime_state.clone())
     .with_ci_status_map(ci_status_map.clone())
     .with_policy(review_policy);
     if let Some(interval) = config.poll_interval {
