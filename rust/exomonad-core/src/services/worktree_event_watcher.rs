@@ -485,13 +485,17 @@ fn codex_dev_fallback_pr_review_action(payload: &serde_json::Value) -> Option<Ev
                 value_u64(payload, "rounds")?
             ),
         }),
-        "merge_ready" => Some(EventActionResponse::InjectMessage {
-            message: merge_ready_message(
-                value_u64(payload, "pr_number")?,
-                value_str(payload, "ci_status")?,
-                value_str(payload, "branch")?,
-            ),
-        }),
+        "merge_ready" => {
+            let pr_number = value_u64(payload, "pr_number")?;
+            Some(EventActionResponse::NotifyParent {
+                message: merge_ready_message(
+                    pr_number,
+                    value_str(payload, "ci_status")?,
+                    value_str(payload, "branch")?,
+                ),
+                pr_number: pr_number as i64,
+            })
+        }
         "approved"
         | "reviewer_approved"
         | "timeout"
@@ -520,8 +524,9 @@ fn codex_dev_fallback_ci_status_action(payload: &serde_json::Value) -> Option<Ev
         .unwrap_or(false);
 
     if (merge_blocked_on_ci || merge_ready) && matches!(status, "success" | "neutral") {
-        return Some(EventActionResponse::InjectMessage {
+        return Some(EventActionResponse::NotifyParent {
             message: merge_ready_message(pr_number, status, branch),
+            pr_number: pr_number as i64,
         });
     }
 
