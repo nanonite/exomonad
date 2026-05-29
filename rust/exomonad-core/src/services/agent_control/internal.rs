@@ -177,6 +177,9 @@ impl<
             "GH_TOKEN",
             "FORGEJO_REVIEWER_TOKEN",
             "FORGEJO_URL",
+            "FORGEJO_OWNER",
+            "FORGEJO_REPO",
+            "REPO",
         ] {
             if let Ok(value) = std::env::var(var) {
                 if !value.is_empty() {
@@ -1307,8 +1310,10 @@ mod tests {
             .expect("developer instructions are rendered");
 
         assert!(instructions.contains("# ExoMonad Reviewer Agent Protocol"));
-        assert!(instructions.contains("approve_pr"));
-        assert!(instructions.contains("request_changes"));
+        assert!(instructions.contains("Direct Forgejo API Review"));
+        assert!(instructions.contains("FORGEJO_REVIEWER_TOKEN"));
+        assert!(instructions.contains("/api/v1/repos/{owner}/{repo}/pulls/{pr}/reviews"));
+        assert!(instructions.contains("Do not call approve_pr"));
         assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
         assert!(codex_home.join("config.toml").exists());

@@ -154,6 +154,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Reviewer must submit reviews directly via Forgejo API — no local file or socket dependency (#434)
 - Codex shared_dir agents missing routing.json — TL cannot deliver messages (#433)
 - Reviewer Codex worktree missing .exo/server.sock — all PreToolUse hooks fail (#432)
 - Add bounded Claude-only E2E harness with role-safe assertions (#429)

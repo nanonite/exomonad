@@ -328,17 +328,17 @@ You are a Codex reviewer agent in an ExoMonad agent tree. You review a sibling a
 ## Your Job
 Review the PR assigned in your task prompt. Approve correct changes or request specific fixes. Do not implement the fix yourself.
 
-## MCP Tools Available
-- approve_pr: Submit an approved Forgejo PR review.
-- request_changes: Submit a request-changes Forgejo PR review.
-- post_review_comment: Submit a comment-only Forgejo PR review.
+## Direct Forgejo API Review
+Submit the final verdict with curl against Forgejo, not through MCP review tools. This keeps reviews working even if the reviewer worktree has no local .exo/server.sock.
+
+Required environment: FORGEJO_URL plus FORGEJO_REVIEWER_TOKEN, falling back to FORGEJO_TOKEN only if the reviewer token is unavailable. The task prompt gives the PR number and repo slug.
 
 ## Workflow
 1. Read the task prompt for the PR number, PR branch, base branch, and author.
-2. Run `git diff {base_branch}..HEAD` using the base branch from the prompt.
+2. Read the PR diff through Forgejo API: GET /api/v1/repos/{owner}/{repo}/pulls/{pr}/files. Use raw file API endpoints for changed file content.
 3. Review for correctness, edge cases, security issues, missing tests, and broken contracts.
-4. If issues are found, call request_changes with specific, actionable feedback that references files and functions or lines.
-5. If the code is correct, call approve_pr with a concise approving comment.
+4. If issues are found, POST a REQUEST_CHANGES review directly to /api/v1/repos/{owner}/{repo}/pulls/{pr}/reviews.
+5. If the code is correct, POST an APPROVED review directly to the same endpoint with a concise approving comment.
 6. Call notify_parent with status='success' after submitting the review, then stop. The ExoMonad watcher reads Forgejo reviews and routes the review result.
 
 ## Key Rules
@@ -346,7 +346,8 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 - Never merge a PR; only the TL merges.
 - Never spawn agents; reviewer is a leaf role.
 - Never review your own PR. If the PR author is you, report failure with notify_parent.
-- Do not use `codex exec review`; it emits Codex-native review text and does not write ExoMonad review files.
+- Do not use `codex exec review`; it emits Codex-native review text and does not submit Forgejo reviews.
+- Do not call approve_pr, request_changes, or post_review_comment for your final verdict; use direct Forgejo API curl.
 - Prefer 3-5 high-impact comments over exhaustive style feedback.
 ";
 
@@ -357,6 +358,52 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 /// not the project root, and the context files live outside the worktree's tracked
 /// tree). Absolute paths pass through unchanged. Empty `reviewer_context` returns
 /// "" — no "Read first:" header emitted in that case (production default).
+pub(crate) fn render_reviewer_direct_api_section(
+    pr_number: u64,
+    repo_owner: Option<&str>,
+    repo_name: Option<&str>,
+) -> String {
+    let repo_exports = match (repo_owner, repo_name) {
+        (Some(owner), Some(repo)) => format!(
+            "FORGEJO_OWNER={}\nFORGEJO_REPO={}\n",
+            shell_escape::escape(owner.into()),
+            shell_escape::escape(repo.into())
+        ),
+        _ => "# Set FORGEJO_OWNER and FORGEJO_REPO before running these commands.\n".to_string(),
+    };
+
+    format!(
+        r#"
+
+Direct Forgejo API review path:
+Use this path for the final verdict. Do not depend on local review files, approve_pr, request_changes, post_review_comment, or an ExoMonad socket.
+
+```bash
+PR_NUMBER={pr_number}
+{repo_exports}REVIEW_TOKEN="${{FORGEJO_REVIEWER_TOKEN:-$FORGEJO_TOKEN}}"
+test -n "$FORGEJO_URL" && test -n "$REVIEW_TOKEN" && test -n "$FORGEJO_OWNER" && test -n "$FORGEJO_REPO"
+
+# PR metadata, including head SHA.
+curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER"
+
+# Changed files.
+curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/files"
+
+# Changed file content once HEAD_SHA and FILE_PATH are known.
+curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/raw/$HEAD_SHA/$FILE_PATH"
+
+# Final verdict. Use REQUEST_CHANGES instead of APPROVED when blocking issues exist.
+curl -fsS -X POST -H "Authorization: token $REVIEW_TOKEN" -H "Content-Type: application/json" \
+  --data '{{"event":"APPROVED","body":"LGTM. Verified: <what you checked>."}}' \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/reviews"
+```
+"#
+    )
+}
+
 pub(crate) fn render_reviewer_context_section(
     reviewer_context: &[String],
     project_dir: &std::path::Path,
@@ -1635,14 +1682,32 @@ impl<
     ) -> Result<SpawnResult> {
         let context_section =
             render_reviewer_context_section(&self.reviewer_context, self.project_dir());
+        let repo_info = match crate::services::repo::get_repo_info(self.project_dir()).await {
+            Ok(info) => Some(info),
+            Err(err) => {
+                warn!(error = %err, "Failed to resolve repo slug for reviewer direct API prompt");
+                None
+            }
+        };
+        let direct_api_section = render_reviewer_direct_api_section(
+            pr_entry.number,
+            repo_info.as_ref().map(|info| info.owner.as_str()),
+            repo_info.as_ref().map(|info| info.repo.as_str()),
+        );
+        let repo_slug = repo_info
+            .as_ref()
+            .map(|info| format!("{}/{}", info.owner, info.repo))
+            .unwrap_or_else(|| "unknown".to_string());
         let task = format!(
-            "Review PR #{}: {}\n\nBranch: {}\nBase: {}\nAuthor: {}{}",
+            "Review PR #{}: {}\n\nRepo: {}\nBranch: {}\nBase: {}\nAuthor: {}{}{}",
             pr_entry.number,
             pr_entry.title,
+            repo_slug,
             pr_entry.head_branch,
             pr_entry.base_branch,
             pr_entry.author_agent,
             context_section,
+            direct_api_section,
         );
 
         // Compute the reviewer's own identity and path — same derivation spawn_subtree uses
@@ -1907,6 +1972,20 @@ mod tests {
                 "reviewer harness permissions must deny {tool}"
             );
         }
+    }
+
+    #[test]
+    fn test_render_reviewer_direct_api_section_includes_repo_and_review_endpoint() {
+        let section = render_reviewer_direct_api_section(17, Some("owner"), Some("repo"));
+        assert!(section.contains("PR_NUMBER=17"));
+        assert!(section.contains("FORGEJO_OWNER=owner"));
+        assert!(section.contains("FORGEJO_REPO=repo"));
+        assert!(
+            section.contains("/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/files")
+        );
+        assert!(section.contains("/pulls/$PR_NUMBER/reviews"));
+        assert!(section.contains("FORGEJO_REVIEWER_TOKEN"));
+        assert!(section.contains("Do not depend on local review files"));
     }
 
     #[test]
