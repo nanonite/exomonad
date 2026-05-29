@@ -264,6 +264,20 @@ check-e2e-subtl-worker-notify:
     bash -n tests/e2e/subtl-worker-notify/run.sh
     bash -n tests/e2e/subtl-worker-notify/validate.sh
 
+# Run recursive sub-TL fork_wave E2E for one runtime: claude, codex, or opencode
+e2e-subtl-recursive-fork-wave runtime="codex":
+    ./tests/e2e/subtl-recursive-fork-wave/run.sh {{runtime}}
+
+# Run recursive sub-TL fork_wave E2E across Claude, Codex, and OpenCode
+e2e-subtl-recursive-fork-wave-all:
+    ./tests/e2e/subtl-recursive-fork-wave/run-all.sh
+
+# Check recursive sub-TL fork_wave harness scripts without launching agents/tmux
+check-e2e-subtl-recursive-fork-wave:
+    bash -n tests/e2e/subtl-recursive-fork-wave/run.sh
+    bash -n tests/e2e/subtl-recursive-fork-wave/run-all.sh
+    bash -n tests/e2e/subtl-recursive-fork-wave/validate.sh
+
 # Run E2E chainlink issue create test (chainlink_issue_create MCP tool via ProcessRun)
 e2e-chainlink:
     ./tests/e2e/chainlink/run.sh
