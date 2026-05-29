@@ -27,6 +27,7 @@ exomonad serve                    # UDS MCP server (multi-agent, hot reload)
 exomonad recompile [--role ROLE]  # Build WASM from Haskell source
 exomonad new                      # Initialize new project (.exo/config.toml, WASM, rules)
 exomonad init [--session NAME]    # Initialize tmux session (Server window + TL window)
+exomonad revert [--kill-session]  # Remove files/worktrees created by init
 exomonad reload                   # Clear WASM plugin cache (hot reload)
 exomonad shutdown                 # Gracefully shut down the running server
 ```
@@ -52,6 +53,10 @@ Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is
 Claude MCP is auto-registered during init. For Gemini, register manually (`gemini mcp add ...`).
 
 Use `--recreate` to delete an existing session and create fresh (e.g., after binary updates).
+
+### Revert Command
+
+`exomonad revert` removes workspace files created by `exomonad init` so the repository can be used without ExoMonad role enforcement or hook interception. It removes root MCP/hook configs, root agent runtime configs, companion worktrees/config files, and stale sockets when the server is not running. It leaves `.exo/config.toml`, `.exo/wasm/`, `.chainlink/`, `.exo/logs/`, and `.gitignore` intact. Use `--kill-session` to also kill the configured tmux session.
 
 **Example `.exo/config.toml`:**
 ```toml

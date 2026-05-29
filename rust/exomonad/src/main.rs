@@ -13,6 +13,7 @@ mod logging;
 mod mcp_stdio;
 mod models;
 mod new;
+mod revert;
 mod serve;
 mod uds_client;
 
@@ -161,6 +162,13 @@ enum Commands {
         /// Provider filter (opencode only). E.g. "anthropic", "openai".
         #[arg(value_name = "PROVIDER")]
         provider: Option<String>,
+    },
+
+    /// Undo workspace files created by exomonad init
+    Revert {
+        /// Also kill the configured tmux session
+        #[arg(long)]
+        kill_session: bool,
     },
 
     /// Reload WASM plugins (clears plugin cache, next call loads fresh from disk)
@@ -360,6 +368,10 @@ async fn main() -> Result<()> {
             let mut json = serde_json::to_vec(&request)?;
             json.push(b'\n');
             stream.write_all(&json).await?;
+        }
+
+        Commands::Revert { kill_session } => {
+            return revert::run(&config, kill_session).await;
         }
 
         Commands::Reload => {
