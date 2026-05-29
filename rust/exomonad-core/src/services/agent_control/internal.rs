@@ -840,7 +840,7 @@ impl<
 
     /// Symlink server socket into worktree so agents find it without walk-up.
     pub(crate) async fn create_socket_symlink(&self, worktree_path: &Path) {
-        let source = self.project_dir().join(".exo/server.sock");
+        let source = self.server_socket_source();
         let target_dir = worktree_path.join(".exo");
         let target = target_dir.join("server.sock");
 
@@ -853,11 +853,22 @@ impl<
         // untracked file warnings (which force `git worktree remove --force`).
         let gitignore = target_dir.join(".gitignore");
         if !gitignore.exists() {
-            if let Err(e) =
-                tokio::fs::write(&gitignore, "# Runtime artifacts\nserver.sock\nserver.pid\n").await
+            if let Err(e) = tokio::fs::write(
+                &gitignore,
+                "# Runtime artifacts\nserver.sock\nserver.pid\ntmp/\n",
+            )
+            .await
             {
                 tracing::warn!(path = %gitignore.display(), error = %e, "Failed to write .gitignore");
             }
+        }
+
+        if let Err(e) = tokio::fs::create_dir_all(target_dir.join("tmp")).await {
+            warn!(
+                path = %target_dir.join("tmp").display(),
+                error = %e,
+                "Failed to create .exo/tmp in worktree"
+            );
         }
 
         if let Err(e) = tokio::fs::remove_file(&target).await {
@@ -877,6 +888,20 @@ impl<
                 "Failed to symlink server socket"
             ),
         }
+    }
+
+    fn server_socket_source(&self) -> PathBuf {
+        let project_dir = self.project_dir();
+        let absolute_project_dir = project_dir.canonicalize().unwrap_or_else(|_| {
+            if project_dir.is_absolute() {
+                project_dir.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(project_dir)
+            }
+        });
+        absolute_project_dir.join(".exo/server.sock")
     }
 
     /// Resolve role context file with two-tier fallback: project-local > global.
@@ -1354,7 +1379,15 @@ mod tests {
         let link = worktree.join(".exo/server.sock");
         assert!(link.exists(), "Symlink should exist");
         let target = tokio::fs::read_link(&link).await.unwrap();
+        assert!(
+            target.is_absolute(),
+            "socket symlink target should be absolute"
+        );
         assert_eq!(target, project_dir.join(".exo/server.sock"));
+        assert!(
+            worktree.join(".exo/tmp").is_dir(),
+            "file-indirect injection dir should exist"
+        );
     }
 
     #[test]
