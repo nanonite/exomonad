@@ -255,6 +255,15 @@ check-e2e-codex-messaging:
     bash -n tests/e2e/codex-messaging/run.sh
     bash -n tests/e2e/codex-messaging/validate.sh
 
+# Run E2E sub-TL worker notify_parent pane-pinning test
+e2e-subtl-worker-notify:
+    ./tests/e2e/subtl-worker-notify/run.sh
+
+# Check E2E sub-TL worker notify harness scripts without launching Codex/tmux
+check-e2e-subtl-worker-notify:
+    bash -n tests/e2e/subtl-worker-notify/run.sh
+    bash -n tests/e2e/subtl-worker-notify/validate.sh
+
 # Run E2E chainlink issue create test (chainlink_issue_create MCP tool via ProcessRun)
 e2e-chainlink:
     ./tests/e2e/chainlink/run.sh
