@@ -17,7 +17,7 @@ import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
 import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
-import ExoMonad.Types (HookConfig (..), RoleConfig (..))
+import ExoMonad.Types (ChainlinkDbPathState (..), HookConfig (..), RoleConfig (..), validateChainlinkDbEnv)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
 import ReviewerRole qualified
 import RootRole qualified
@@ -37,6 +37,7 @@ main = do
   assertReviewerDenyImplementationTools
   assertRuntimeImplementationPolicy
   assertChainlinkCLIBlockPolicy
+  assertChainlinkDbSessionStartFailsafe
   assertReviewerGitAuthorMutationPolicy
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
@@ -73,6 +74,22 @@ assertRoleAllow role cfg =
     assertBool (label role toolName "allows") (continue_ output)
     assertEqual (label role toolName "decision") (Just "allow") (permissionDecisionOf output)
     assertBool (label role toolName "does not emit deny") (not (messageContains "TL agents cannot use" output))
+
+assertChainlinkDbSessionStartFailsafe :: IO ()
+assertChainlinkDbSessionStartFailsafe = do
+  assertValidationFails "unset CHAINLINK_DB" Nothing ChainlinkDbPathMissing ChainlinkDbPathMissing "CHAINLINK_DB not set"
+  assertValidationFails "missing CHAINLINK_DB directory" (Just "/tmp/missing-chainlink") ChainlinkDbPathMissing ChainlinkDbPathMissing "missing path"
+  assertValidationFails "phantom CHAINLINK_DB directory" (Just "/tmp/empty-chainlink") ChainlinkDbPathDirectory ChainlinkDbPathMissing "phantom DB directory without issues.db"
+  assertEqual
+    "valid CHAINLINK_DB directory"
+    (Right ())
+    (validateChainlinkDbEnv (Just "/tmp/project/.chainlink") ChainlinkDbPathDirectory ChainlinkDbPathFile)
+
+assertValidationFails :: String -> Maybe Text -> ChainlinkDbPathState -> ChainlinkDbPathState -> Text -> IO ()
+assertValidationFails labelText maybeDb dbState issuesState expected =
+  case validateChainlinkDbEnv maybeDb dbState issuesState of
+    Left message -> assertBool labelText (expected `T.isInfixOf` message)
+    Right () -> fail (labelText <> ": expected validation failure")
 
 assertReviewerDenyImplementationTools :: IO ()
 assertReviewerDenyImplementationTools =
@@ -243,6 +260,7 @@ hookInputFor eventName toolName =
       hiRuntime = Just Claude,
       hiCwd = Nothing,
       hiTranscriptPath = Nothing,
+      hiChainlinkDb = Nothing,
       hiLlmRequest = Nothing,
       hiLlmResponse = Nothing
     }

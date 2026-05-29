@@ -243,6 +243,9 @@ async fn main() -> Result<()> {
             if let Ok(role) = std::env::var("EXOMONAD_ROLE") {
                 path.push_str(&format!("&role={}", encode(&role)));
             }
+            if let Ok(chainlink_db) = std::env::var("CHAINLINK_DB") {
+                path.push_str(&format!("&chainlink_db={}", encode(&chainlink_db)));
+            }
 
             let mut body = String::new();
             use std::io::Read;

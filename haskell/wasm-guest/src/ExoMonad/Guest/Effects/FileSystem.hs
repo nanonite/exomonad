@@ -17,6 +17,7 @@ module ExoMonad.Guest.Effects.FileSystem
     -- * Smart constructors
     readFile,
     writeFile,
+    fileExists,
 
     -- * Interpreters
     runFileSystemSuspend,
@@ -26,6 +27,7 @@ module ExoMonad.Guest.Effects.FileSystem
     ReadFileOutput (..),
     WriteFileInput (..),
     WriteFileOutput (..),
+    FileExistsOutput (..),
   )
 where
 
@@ -74,6 +76,14 @@ data WriteFileOutput = WriteFileOutput
   }
   deriving (Show, Eq, Generic)
 
+-- | Result of checking a filesystem path.
+data FileExistsOutput = FileExistsOutput
+  { feoExists :: Bool,
+    feoIsFile :: Bool,
+    feoIsDirectory :: Bool
+  }
+  deriving (Show, Eq, Generic)
+
 -- ============================================================================
 -- Effect type
 -- ============================================================================
@@ -84,6 +94,8 @@ data FileSystem a where
   ReadFileOp :: Text -> Int -> FileSystem (Either Text ReadFileOutput)
   -- | Write a file.
   WriteFileOp :: Text -> Text -> Bool -> FileSystem (Either Text WriteFileOutput)
+  -- | Check whether a path exists.
+  FileExistsOp :: Text -> FileSystem (Either Text FileExistsOutput)
 
 -- Smart constructors (manually written - makeSem doesn't work with WASM cross-compilation)
 readFile :: (Member FileSystem r) => Text -> Int -> Eff r (Either Text ReadFileOutput)
@@ -91,6 +103,9 @@ readFile path maxBytes = send (ReadFileOp path maxBytes)
 
 writeFile :: (Member FileSystem r) => Text -> Text -> Bool -> Eff r (Either Text WriteFileOutput)
 writeFile path content createParents = send (WriteFileOp path content createParents)
+
+fileExists :: (Member FileSystem r) => Text -> Eff r (Either Text FileExistsOutput)
+fileExists path = send (FileExistsOp path)
 
 -- ============================================================================
 -- Interpreter (uses yield_effect via Effect typeclass)
@@ -133,6 +148,21 @@ runFileSystemSuspend = interpret $ \case
           WriteFileOutput
             { wfoBytesWritten = fromIntegral (Fs.writeFileResponseBytesWritten resp),
               wfoPath = toText (Fs.writeFileResponsePath resp)
+            }
+  FileExistsOp path -> do
+    let req =
+          Fs.FileExistsRequest
+            { Fs.fileExistsRequestPath = fromText path
+            }
+    result <- suspendEffect @Fs.FsFileExists req
+    pure $ case result of
+      Left err -> Left (effectErrorToText err)
+      Right resp ->
+        Right
+          FileExistsOutput
+            { feoExists = Fs.fileExistsResponseExists resp,
+              feoIsFile = Fs.fileExistsResponseIsFile resp,
+              feoIsDirectory = Fs.fileExistsResponseIsDirectory resp
             }
 
 -- | Convert EffectError to Text for backward compatibility.

@@ -299,6 +299,14 @@ e2e-chainlink-sqlite-block:
 check-e2e-chainlink-sqlite-block:
     bash -n tests/e2e/chainlink-sqlite-block/run.sh
 
+# Run E2E Chainlink SessionStart env failsafe test
+e2e-chainlink-env-failsafe:
+    ./tests/e2e/chainlink-env-failsafe/run.sh
+
+# Check E2E Chainlink SessionStart env failsafe harness script without launching the server
+check-e2e-chainlink-env-failsafe:
+    bash -n tests/e2e/chainlink-env-failsafe/run.sh
+
 # Check Chainlink timer/session role scoping without launching agents
 check-e2e-chainlink-timer-role-scope:
     bash -n tests/e2e/chainlink-timer-role-scope/validate.sh

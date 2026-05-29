@@ -77,6 +77,8 @@ pub struct HookQueryParams {
     pub agent_id: Option<String>,
     /// TL session ID for event routing (forwarded from caller's env).
     pub session_id: Option<String>,
+    /// CHAINLINK_DB value from the agent-side hook process.
+    pub chainlink_db: Option<String>,
 }
 
 /// Server-side hook handler state, shared across requests.
@@ -489,6 +491,9 @@ pub async fn handle_hook_inner(
             "exomonad_session_id".to_string(),
             serde_json::json!(birth_branch_for_hook.to_string()),
         );
+        if let Some(ref chainlink_db) = params.chainlink_db {
+            map.insert("chainlink_db".to_string(), serde_json::json!(chainlink_db));
+        }
     }
 
     debug!(
