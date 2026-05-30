@@ -210,6 +210,14 @@ async fn reconcile_session_timeouts(
         if !routing_path.exists() {
             continue;
         }
+        if agent_dir.join("exited_at").exists() {
+            if let Some(session) = tmux_session {
+                let _ = kill_agent_window(session, &agent_dir, &slug).await;
+            }
+            let _ = tokio::fs::remove_file(&routing_path).await;
+            info!(agent = %slug, "Cleaned routing for exited agent");
+            continue;
+        }
         let spawned_at = match tokio::fs::read_to_string(agent_dir.join("spawned_at")).await {
             Ok(s) => match s.trim().parse::<u64>() {
                 Ok(t) => t,
@@ -369,7 +377,9 @@ fn timeout_issue_hint(active_issue: &Option<String>, was_alive: bool) -> String 
             format!(" Issue #{id} — call chainlink_timer_stop {id} then re-spec or escalate.")
         }
         (Some(id), false) => {
-            format!(" Issue #{id} — verify status with chainlink show {id} and re-spec or close if done.")
+            format!(
+                " Issue #{id} — verify status with chainlink show {id} and re-spec or close if done."
+            )
         }
         (None, _) => String::new(),
     }

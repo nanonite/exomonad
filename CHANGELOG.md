@@ -56,6 +56,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Fix stale worker pane routing cleanup and OpenCode worker exit handling (#438)
 - Ignore local Chainlink and OpenCode notes (#185)
 - Add exomonad revert command (#435)
 - TL needs restart_review tool to re-trigger the review cycle when a PR is stuck on CI or reviewer failure (#431)

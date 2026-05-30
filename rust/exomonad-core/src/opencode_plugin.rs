@@ -133,7 +133,8 @@ export const server: Plugin = async (input) => ({
 
   event: async ({ event }) => {
     if (event.type === "session.stopped") {
-      await callHook(input.$, "stop", event);
+      const hook = process.env.EXOMONAD_ROLE === "worker" ? "worker-exit" : "stop";
+      await callHook(input.$, hook, event);
     }
   },
 });
@@ -149,3 +150,14 @@ pub const OPENCODE_PLUGIN_PKG_JSON: &str = r#"{
   "main": "index.ts"
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opencode_worker_stop_routes_to_worker_exit_hook() {
+        assert!(OPENCODE_PLUGIN_TS.contains("EXOMONAD_ROLE === \"worker\""));
+        assert!(OPENCODE_PLUGIN_TS.contains("? \"worker-exit\" : \"stop\""));
+    }
+}

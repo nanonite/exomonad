@@ -8,8 +8,8 @@ use crate::domain::{
     AgentName, AgentPermissions, BirthBranch, CIStatus, ClaudeSessionUuid, RoutingInfo, TeamName,
 };
 use crate::effects::{
-    dispatch_agent_effect, AgentEffects, EffectError, EffectHandler, EffectResult, ResultExt,
-    ResultExtPreserve,
+    AgentEffects, EffectError, EffectHandler, EffectResult, ResultExt, ResultExtPreserve,
+    dispatch_agent_effect,
 };
 
 use super::non_empty;
@@ -50,19 +50,19 @@ pub struct AgentHandler<C> {
 }
 
 impl<
-        C: HasTeamRegistry
-            + HasAcpRegistry
-            + HasAgentResolver
-            + HasGitHubClient
-            + HasProjectDir
-            + HasGitWorktreeService
-            + HasSupervisorRegistry
-            + HasClaudeSessionRegistry
-            + HasEventLog
-            + HasForgejoClient
-            + HasWatcherRuntimeState
-            + 'static,
-    > AgentHandler<C>
+    C: HasTeamRegistry
+        + HasAcpRegistry
+        + HasAgentResolver
+        + HasGitHubClient
+        + HasProjectDir
+        + HasGitWorktreeService
+        + HasSupervisorRegistry
+        + HasClaudeSessionRegistry
+        + HasEventLog
+        + HasForgejoClient
+        + HasWatcherRuntimeState
+        + 'static,
+> AgentHandler<C>
 {
     pub fn new(service: Arc<AgentControlService<C>>, ctx: Arc<C>) -> Self {
         Self { service, ctx }
@@ -257,19 +257,19 @@ impl<
 
 #[async_trait]
 impl<
-        C: HasTeamRegistry
-            + HasAcpRegistry
-            + HasAgentResolver
-            + HasGitHubClient
-            + HasProjectDir
-            + HasGitWorktreeService
-            + HasSupervisorRegistry
-            + HasClaudeSessionRegistry
-            + HasEventLog
-            + HasForgejoClient
-            + HasWatcherRuntimeState
-            + 'static,
-    > EffectHandler for AgentHandler<C>
+    C: HasTeamRegistry
+        + HasAcpRegistry
+        + HasAgentResolver
+        + HasGitHubClient
+        + HasProjectDir
+        + HasGitWorktreeService
+        + HasSupervisorRegistry
+        + HasClaudeSessionRegistry
+        + HasEventLog
+        + HasForgejoClient
+        + HasWatcherRuntimeState
+        + 'static,
+> EffectHandler for AgentHandler<C>
 {
     fn namespace(&self) -> &str {
         "agent"
@@ -463,19 +463,19 @@ fn watcher_pr_merge_diagnosis(
 
 #[async_trait]
 impl<
-        C: HasTeamRegistry
-            + HasAcpRegistry
-            + HasAgentResolver
-            + HasGitHubClient
-            + HasProjectDir
-            + HasGitWorktreeService
-            + HasSupervisorRegistry
-            + HasClaudeSessionRegistry
-            + HasEventLog
-            + HasForgejoClient
-            + HasWatcherRuntimeState
-            + 'static,
-    > AgentEffects for AgentHandler<C>
+    C: HasTeamRegistry
+        + HasAcpRegistry
+        + HasAgentResolver
+        + HasGitHubClient
+        + HasProjectDir
+        + HasGitWorktreeService
+        + HasSupervisorRegistry
+        + HasClaudeSessionRegistry
+        + HasEventLog
+        + HasForgejoClient
+        + HasWatcherRuntimeState
+        + 'static,
+> AgentEffects for AgentHandler<C>
 {
     async fn spawn(
         &self,
@@ -1253,14 +1253,14 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<CloseSelfResponse> {
         let agent_key = ctx.agent_name.to_string();
-        let agents_dir = std::path::Path::new(".exo/agents");
+        let agents_dir = self.ctx.project_dir().join(".exo/agents");
 
         // FIXME: Routing is written under internal_name (slug-suffix, e.g. "beta-gemini")
         // but MCP config passes bare slug as --name (e.g. "beta"). This suffix probing
         // is a band-aid — the real fix is making agent_name consistent between MCP config
         // and routing.json (either always include the suffix, or never).
         let candidates = std::iter::once(agent_key.clone()).chain(
-            ["gemini", "claude", "shoal", "opencode"]
+            ["gemini", "claude", "shoal", "opencode", "codex"]
                 .iter()
                 .map(|suffix| format!("{}-{}", agent_key, suffix)),
         );
@@ -1282,6 +1282,11 @@ impl<
         let mut closed = false;
 
         if let Some(ref r) = routing {
+            let agent_dir = agents_dir.join(&resolved_internal_name);
+            // Tombstone before killing the tmux target so future TL messages cannot route
+            // through a stale routing.json if the pane/window disappears immediately.
+            tombstone_agent_dir(&agent_dir).await;
+
             // Try pane_id first (ephemeral workers)
             if let Some(pane_id) = r["pane_id"].as_str() {
                 info!(agent = %ctx.agent_name, pane_id = %pane_id, "Closing worker pane");
@@ -1380,14 +1385,24 @@ impl<
         }
 
         match crate::services::tmux_events::close_worker_pane(&req.pane_id).await {
-            Ok(()) => Ok(CloseWorkerPaneResponse {
-                success: true,
-                error: String::new(),
-            }),
-            Err(e) => Ok(CloseWorkerPaneResponse {
-                success: false,
-                error: e.to_string(),
-            }),
+            Ok(()) => {
+                tombstone_agent_by_pane(self.ctx.project_dir(), &req.pane_id).await;
+                Ok(CloseWorkerPaneResponse {
+                    success: true,
+                    error: String::new(),
+                })
+            }
+            Err(e) => {
+                let cleaned = tombstone_agent_by_pane(self.ctx.project_dir(), &req.pane_id).await;
+                Ok(CloseWorkerPaneResponse {
+                    success: cleaned,
+                    error: if cleaned {
+                        String::new()
+                    } else {
+                        e.to_string()
+                    },
+                })
+            }
         }
     }
 
@@ -1459,19 +1474,19 @@ struct PrBodyMetadata {
 }
 
 impl<
-        C: HasTeamRegistry
-            + HasAcpRegistry
-            + HasAgentResolver
-            + HasGitHubClient
-            + HasProjectDir
-            + HasGitWorktreeService
-            + HasSupervisorRegistry
-            + HasClaudeSessionRegistry
-            + HasEventLog
-            + HasForgejoClient
-            + HasWatcherRuntimeState
-            + 'static,
-    > AgentHandler<C>
+    C: HasTeamRegistry
+        + HasAcpRegistry
+        + HasAgentResolver
+        + HasGitHubClient
+        + HasProjectDir
+        + HasGitWorktreeService
+        + HasSupervisorRegistry
+        + HasClaudeSessionRegistry
+        + HasEventLog
+        + HasForgejoClient
+        + HasWatcherRuntimeState
+        + 'static,
+> AgentHandler<C>
 {
     async fn matching_open_forgejo_prs_for_cleanup(
         &self,
@@ -1736,6 +1751,49 @@ where
 
 fn reviewer_window_matches_pr(window_name: &str, pr_number: u64) -> bool {
     window_name.contains(&format!("review-pr-{pr_number}-"))
+}
+
+async fn tombstone_agent_dir(agent_dir: &Path) {
+    let exited_at = Utc::now().timestamp().max(0).to_string();
+    if let Err(error) = tokio::fs::write(agent_dir.join("exited_at"), exited_at).await {
+        warn!(path = %agent_dir.display(), %error, "failed to write agent exited_at tombstone");
+    }
+    match tokio::fs::remove_file(agent_dir.join("routing.json")).await {
+        Ok(()) => info!(path = %agent_dir.display(), "removed agent routing after exit"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(path = %agent_dir.display(), %error, "failed to remove agent routing after exit")
+        }
+    }
+}
+
+async fn tombstone_agent_by_pane(project_dir: &Path, pane_id: &str) -> bool {
+    let agents_dir = project_dir.join(".exo/agents");
+    let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await else {
+        return false;
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let agent_dir = entry.path();
+        let Ok(routing) = RoutingInfo::read_from_dir(&agent_dir).await else {
+            continue;
+        };
+        if routing
+            .pane_id
+            .as_ref()
+            .is_some_and(|candidate| candidate.as_str() == pane_id)
+        {
+            tombstone_agent_dir(&agent_dir).await;
+            return true;
+        }
+    }
+    false
 }
 
 async fn orphan_agent_window_alive(project_dir: &Path, agent_slug: &str) -> Result<bool, String> {
@@ -2019,6 +2077,23 @@ mod tests {
             ServiceAgentType::Codex
         );
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_agent_by_pane_removes_routing_and_writes_exited_at() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path();
+        let agent_dir = project_dir.join(".exo/agents/worker-opencode");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let pane_id = crate::services::tmux_ipc::PaneId::parse("%42").unwrap();
+        RoutingInfo::pane(pane_id, "TL")
+            .write_to_dir(&agent_dir)
+            .await
+            .unwrap();
+
+        assert!(tombstone_agent_by_pane(project_dir, "%42").await);
+        assert!(agent_dir.join("exited_at").exists());
+        assert!(!agent_dir.join("routing.json").exists());
     }
 
     fn test_forgejo_pr() -> ForgejoPullRequest {
