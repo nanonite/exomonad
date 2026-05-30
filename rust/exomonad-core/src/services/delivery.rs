@@ -1,10 +1,10 @@
 use crate::domain::Address;
-use crate::services::agent_inbox::{GLOBAL_AGENT_INBOX, InboxMessage};
+use crate::services::agent_inbox::{InboxMessage, GLOBAL_AGENT_INBOX};
 use crate::services::tmux_events;
 use agent_client_protocol::{Agent, PromptRequest};
 use claude_teams_bridge as teams_mailbox;
 use claude_teams_bridge::TeamRegistry;
-use exomonad_proto::effects::events::{AgentMessage, Event, event};
+use exomonad_proto::effects::events::{event, AgentMessage, Event};
 use tokio::process::Command;
 use tracing::{debug, info, instrument, warn};
 
@@ -85,7 +85,7 @@ async fn tmux_target_alive(target: &str) -> Result<bool, String> {
     if session.trim().is_empty() {
         return Err("EXOMONAD_TMUX_SESSION is empty".to_string());
     }
-    let qualified_target = format!("{}:{}", session, target);
+    let qualified_target = crate::services::tmux_ipc::qualify_tmux_target(&session, target);
     let output = Command::new("tmux")
         .args([
             "display-message",
@@ -291,12 +291,10 @@ pub fn mailbox_protocol_available() -> bool {
 /// team lead from the TeamRegistry.
 #[instrument(skip_all, fields(address = %address, from = %from))]
 pub async fn route_message(
-    ctx: &(
-         impl super::HasTeamRegistry
-         + super::HasAcpRegistry
-         + super::HasAgentResolver
-         + super::HasProjectDir
-     ),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
     address: &Address,
     from: &crate::domain::AgentName,
     content: &str,
@@ -316,12 +314,10 @@ pub async fn route_message(
 /// Route a message only through tmux STDIN injection.
 #[instrument(skip_all, fields(address = %address, from = %from))]
 pub async fn route_tmux_message(
-    ctx: &(
-         impl super::HasTeamRegistry
-         + super::HasAcpRegistry
-         + super::HasAgentResolver
-         + super::HasProjectDir
-     ),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
     address: &Address,
     from: &crate::domain::AgentName,
     content: &str,
@@ -341,12 +337,10 @@ pub async fn route_tmux_message(
 /// Route a message only through the Claude Teams inbox mailbox protocol.
 #[instrument(skip_all, fields(address = %address, from = %from))]
 pub async fn route_mailbox_message(
-    ctx: &(
-         impl super::HasTeamRegistry
-         + super::HasAcpRegistry
-         + super::HasAgentResolver
-         + super::HasProjectDir
-     ),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
     address: &Address,
     from: &crate::domain::AgentName,
     content: &str,
@@ -364,12 +358,10 @@ pub async fn route_mailbox_message(
 }
 
 async fn route_message_with(
-    ctx: &(
-         impl super::HasTeamRegistry
-         + super::HasAcpRegistry
-         + super::HasAgentResolver
-         + super::HasProjectDir
-     ),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
     address: &Address,
     from: &crate::domain::AgentName,
     content: &str,
@@ -405,12 +397,10 @@ async fn route_message_with(
 }
 
 async fn deliver_to_agent_for(
-    ctx: &(
-         impl super::HasTeamRegistry
-         + super::HasAcpRegistry
-         + super::HasAgentResolver
-         + super::HasProjectDir
-     ),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
     agent_key: &str,
     tmux_target: &str,
     from: &crate::domain::AgentName,
@@ -434,12 +424,10 @@ async fn deliver_to_agent_for(
 /// Resolve team lead and deliver. Uses `config.json`'s `leadAgentId` to find
 /// the lead, falls back to first in-memory entry, then to "root".
 async fn resolve_and_deliver_to_lead(
-    ctx: &(
-         impl super::HasTeamRegistry
-         + super::HasAcpRegistry
-         + super::HasAgentResolver
-         + super::HasProjectDir
-     ),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
     team_name: &str,
     from: &crate::domain::AgentName,
     content: &str,
@@ -542,14 +530,12 @@ pub fn resolve_tab_name_for_agent(
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(agent_id = %agent_id, parent_session_id = %parent_session_id, status = %status))]
 pub async fn notify_parent_delivery(
-    ctx: &(
-         impl super::HasTeamRegistry
-         + super::HasAcpRegistry
-         + super::HasAgentResolver
-         + super::HasEventLog
-         + super::HasEventQueue
-         + super::HasProjectDir
-     ),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasEventLog
+          + super::HasEventQueue
+          + super::HasProjectDir),
     agent_id: &crate::domain::AgentName,
     parent_session_id: &str,
     parent_tab_name: &str,
@@ -885,12 +871,10 @@ async fn deliver_via_tmux(
 }
 
 async fn deliver_to_agent_mailbox(
-    ctx: &(
-         impl super::HasTeamRegistry
-         + super::HasAcpRegistry
-         + super::HasAgentResolver
-         + super::HasProjectDir
-     ),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
     agent_key: &str,
     from: &crate::domain::AgentName,
     message: &str,
@@ -999,12 +983,10 @@ async fn deliver_to_agent_mailbox(
 /// Falls back to tmux input injection if other delivery methods fail or are not available.
 #[instrument(skip_all, fields(agent_key = %agent_key, from = %from, delivery_method = tracing::field::Empty))]
 pub async fn deliver_to_agent(
-    ctx: &(
-         impl super::HasTeamRegistry
-         + super::HasAcpRegistry
-         + super::HasAgentResolver
-         + super::HasProjectDir
-     ),
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAcpRegistry
+          + super::HasAgentResolver
+          + super::HasProjectDir),
     agent_key: &str,
     tmux_target: &str,
     from: &crate::domain::AgentName,

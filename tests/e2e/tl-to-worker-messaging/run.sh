@@ -121,13 +121,22 @@ print(value.replace('"""', '\"\"\"'))
 PY
 )"
 
+VALIDATOR_WRAPPER="$WORK_DIR/run-validator.sh"
+cat > "$VALIDATOR_WRAPPER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$SCRIPT_DIR/validate.sh" "$REPO_DIR" "$SESSION" "$RESULT_FILE"
+EOF
+chmod +x "$VALIDATOR_WRAPPER"
+
 cat > .exo/config.toml <<EOF
 default_role = "devswarm"
 wasm_name = "devswarm"
 shell_command = "bash"
 tmux_session = "$SESSION"
 root_agent_type = "codex"
-spawn_agent_type = "opencode"
+spawn_agent_type = "codex"
+model = "gpt-5.4-mini"
 yolo = true
 poll_interval = 5
 initial_prompt = """
@@ -141,8 +150,12 @@ use_embedded_key = true
 [[companions]]
 name = "tl-to-worker-validator"
 agent_type = "process"
-command = "$SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE'"
+command = "$VALIDATOR_WRAPPER"
 EOF
+
+git add .gitignore .forgejo .exo
+git commit -m "initialize exomonad fixture" -q
+git push -q
 
 if [[ -f "$HOME/.codex/auth.json" ]]; then
     cp -p "$HOME/.codex/auth.json" "$CODEX_HOME_DIR/auth.json"

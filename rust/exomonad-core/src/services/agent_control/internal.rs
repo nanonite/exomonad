@@ -1,14 +1,14 @@
 use super::*;
 
 impl<
-    C: super::super::HasGitHubClient
-        + super::super::HasAcpRegistry
-        + super::super::HasTeamRegistry
-        + super::super::HasAgentResolver
-        + super::super::HasProjectDir
-        + super::super::HasGitWorktreeService
-        + 'static,
-> AgentControlService<C>
+        C: super::super::HasGitHubClient
+            + super::super::HasAcpRegistry
+            + super::super::HasTeamRegistry
+            + super::super::HasAgentResolver
+            + super::super::HasProjectDir
+            + super::super::HasGitWorktreeService
+            + 'static,
+    > AgentControlService<C>
 {
     pub(crate) fn resolve_tmux_session(&self) -> Result<String> {
         self.tmux_session
@@ -334,7 +334,13 @@ impl<
                 }
             }
             AgentType::Codex => String::new(),
-            AgentType::OpenCode => String::new(),
+            AgentType::OpenCode => {
+                if yolo {
+                    " --dangerously-skip-permissions".to_string()
+                } else {
+                    String::new()
+                }
+            }
             AgentType::Shoal | AgentType::Process => String::new(),
         };
 
@@ -352,7 +358,7 @@ impl<
                     }
                     AgentType::OpenCode => {
                         format!(
-                            "{} run{} --session {} --fork \"$(cat {})\"{}",
+                            "{} run --interactive{} --session {} --fork \"$(cat {})\"{}",
                             cmd, perms_flags, escaped_session, escaped_path, model_flag
                         )
                     }
@@ -370,7 +376,7 @@ impl<
                     AgentType::Codex => Self::build_codex_command(cwd, Some(pf), model, None),
                     AgentType::OpenCode => {
                         format!(
-                            "{} run{} \"$(cat {})\"{}",
+                            "{} run --interactive{} \"$(cat {})\"{}",
                             cmd, perms_flags, escaped_path, model_flag
                         )
                     }
@@ -503,7 +509,10 @@ impl<
             None => None,
         };
 
-        let model = model_override.or_else(|| self.spawn_agent_model());
+        let model = model_override.or_else(|| match agent_type {
+            AgentType::OpenCode => self.spawn_agent_model(),
+            _ => None,
+        });
         let full_command = Self::build_agent_command(
             agent_type,
             prompt_file.as_deref(),
@@ -614,6 +623,10 @@ impl<
             None => None,
         };
 
+        let model = match agent_type {
+            AgentType::OpenCode => self.spawn_agent_model(),
+            _ => None,
+        };
         let full_command = Self::build_agent_command(
             agent_type,
             prompt_file.as_deref(),
@@ -622,7 +635,7 @@ impl<
             cwd,
             claude_flags,
             self.yolo,
-            self.spawn_agent_model(),
+            model,
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let tmux = self.tmux()?;
@@ -733,7 +746,7 @@ impl<
                     role,
                     &AgentName::try_from_str(agent_name)
                         .expect("validated string input is non-empty"),
-                    self.spawn_agent_model(),
+                    None,
                     &self.extra_mcp_servers,
                 )
                 .await?;
@@ -1672,7 +1685,10 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(cmd, "opencode run \"$(cat '/tmp/test-prompt.txt')\"");
+        assert_eq!(
+            cmd,
+            "opencode run --interactive \"$(cat '/tmp/test-prompt.txt')\""
+        );
     }
 
     #[test]
@@ -1690,7 +1706,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-sonnet-4-5"
+            "opencode run --interactive \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-sonnet-4-5"
         );
     }
 
@@ -1709,7 +1725,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run --session 'main.feature-a-opencode' --fork \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-haiku-4-5"
+            "opencode run --interactive --session 'main.feature-a-opencode' --fork \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-haiku-4-5"
         );
     }
 

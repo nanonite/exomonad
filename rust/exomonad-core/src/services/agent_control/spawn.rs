@@ -461,15 +461,15 @@ pub(crate) fn render_reviewer_context_section(
 }
 
 impl<
-    C: super::super::HasGitHubClient
-        + super::super::HasForgejoClient
-        + super::super::HasAcpRegistry
-        + super::super::HasTeamRegistry
-        + super::super::HasAgentResolver
-        + super::super::HasProjectDir
-        + super::super::HasGitWorktreeService
-        + 'static,
-> AgentControlService<C>
+        C: super::super::HasGitHubClient
+            + super::super::HasForgejoClient
+            + super::super::HasAcpRegistry
+            + super::super::HasTeamRegistry
+            + super::super::HasAgentResolver
+            + super::super::HasProjectDir
+            + super::super::HasGitWorktreeService
+            + 'static,
+    > AgentControlService<C>
 {
     /// Spawn an agent for a GitHub issue.
     ///
@@ -1130,7 +1130,7 @@ impl<
                         &agent_config_dir,
                         &role,
                         &agent_name,
-                        self.spawn_agent_model(),
+                        None,
                         &self.extra_mcp_servers,
                     )
                     .await?;
@@ -1877,15 +1877,15 @@ impl<
 
 #[async_trait::async_trait]
 impl<
-    C: crate::services::HasGitHubClient
-        + crate::services::HasForgejoClient
-        + crate::services::HasAcpRegistry
-        + crate::services::HasTeamRegistry
-        + crate::services::HasAgentResolver
-        + crate::services::HasProjectDir
-        + crate::services::HasGitWorktreeService
-        + 'static,
-> crate::services::ReviewerSpawner for AgentControlService<C>
+        C: crate::services::HasGitHubClient
+            + crate::services::HasForgejoClient
+            + crate::services::HasAcpRegistry
+            + crate::services::HasTeamRegistry
+            + crate::services::HasAgentResolver
+            + crate::services::HasProjectDir
+            + crate::services::HasGitWorktreeService
+            + 'static,
+    > crate::services::ReviewerSpawner for AgentControlService<C>
 {
     async fn spawn_reviewer_for_pr(
         &self,
@@ -2096,11 +2096,9 @@ mod tests {
             .copy_allowed_dirs(&agent_wt, &["shared-context".to_string()])
             .await
             .unwrap();
-        assert!(
-            agent_wt
-                .join(".exo/context/shared-context/ref.txt")
-                .exists()
-        );
+        assert!(agent_wt
+            .join(".exo/context/shared-context/ref.txt")
+            .exists());
 
         // Test invalid paths (should skip but not fail)
         service

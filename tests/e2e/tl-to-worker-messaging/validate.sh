@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="${1:?repo dir required}"
-SESSION="${2:?tmux session required}"
-RESULT_FILE="${3:?result file required}"
+REPO_DIR="${1:-}"
+SESSION="${2:-}"
+RESULT_FILE="${3:-}"
 
 TIMEOUT_SECONDS="${TL_TO_WORKER_E2E_TIMEOUT_SECONDS:-420}"
 POLL_SECONDS=5
@@ -121,6 +121,10 @@ pane_contains_injected_message() {
 }
 
 main() {
+    : "${REPO_DIR:?repo dir required}"
+    : "${SESSION:?tmux session required}"
+    : "${RESULT_FILE:?result file required}"
+
     wait_for "root Codex config exists" "bash '$0' --root-config '$REPO_DIR'"
     wait_for "Codex TL worktree config exists" "bash '$0' --has-tl-config '$REPO_DIR'"
     wait_for "OpenCode worker config exists" "bash '$0' --has-worker-config '$REPO_DIR'"
@@ -191,7 +195,7 @@ case "${1:-}" in
         ;;
     --worker-delivery-success)
         REPO_DIR="${2:?repo dir required}"
-        grep -R 'message.delivery' "$REPO_DIR/.exo/logs" 2>/dev/null | grep 'tl-to-worker-oc-worker-opencode' | grep 'tmux_routing' | grep 'outcome="success"' | grep -q .
+        grep -R 'message.delivery' "$REPO_DIR/.exo/logs" 2>/dev/null | grep 'recipient=tl-to-worker-oc-worker-opencode' | grep 'method="agent_inbox_tmux"' | grep 'outcome="success"' | grep -q .
         exit 0
         ;;
     --worker-ack-log)
@@ -201,7 +205,7 @@ case "${1:-}" in
         ;;
     --worker-notify-delivery-success)
         REPO_DIR="${2:?repo dir required}"
-        grep -R 'message.delivery' "$REPO_DIR/.exo/logs" 2>/dev/null | grep 'tl-to-worker-oc-worker-opencode' | grep 'main.tl-to-worker-messaging-tl-codex' | grep 'tmux_routing' | grep 'outcome="success"' | grep -q .
+        grep -R 'message.delivery' "$REPO_DIR/.exo/logs" 2>/dev/null | grep 'agent_id=tl-to-worker-oc-worker-opencode' | grep 'recipient=tl-to-worker-messaging-tl-codex' | grep 'method="agent_inbox_tmux"' | grep 'outcome="success"' | grep -q .
         exit 0
         ;;
     --tl-done-log)

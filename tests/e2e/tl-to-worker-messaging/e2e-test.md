@@ -29,11 +29,12 @@ You are a Codex TL in the TL-to-worker messaging E2E test. Do exactly these step
      You are an OpenCode worker in the TL-to-worker messaging E2E test. Do exactly these steps:
      1. Wait for a later tmux-injected message containing [TL2WORKER-INJECTED].
      2. When you see it, call the ExoMonad notify_parent MCP tool with status='success' and message='[TL2WORKER-WORKER-ACK] OpenCode worker received the TL tmux pane message.'
-     3. Stay alive and idle after notifying. Do not close your pane yourself.
+     3. Do not inspect files, run shell commands, search the repository, or ask for permission.
+     4. Stay alive and idle after notifying. Do not close your pane yourself.
 
 2. After spawn_worker returns, use the ExoMonad send_tmux_message MCP tool with:
    - recipient: tl-to-worker-oc-worker-opencode
-   - content: [TL2WORKER-INJECTED] Codex TL to OpenCode worker pane message delivery test.
+   - content: [TL2WORKER-INJECTED] Codex TL to OpenCode worker pane message delivery test. You are now seeing the injected message. Immediately call the ExoMonad notify_parent MCP tool with status='success' and message='[TL2WORKER-WORKER-ACK] OpenCode worker received the TL tmux pane message.' Do not inspect files, run shell commands, search the repository, or ask for permission.
    - summary: TL-to-worker pane messaging E2E send_tmux_message test
 3. Use the ExoMonad notify_parent MCP tool with status='success' and message='[TL2WORKER-TL-DONE] Codex TL sent the worker pane message.'
 4. Stop.
