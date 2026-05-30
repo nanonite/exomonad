@@ -1,6 +1,6 @@
 # E2E Status
 
-Last updated: 2026-05-14
+Last updated: 2026-05-30
 
 This document tracks the high-signal E2E coverage needed before continuing the Codex and runtime-role test work. Use `just` targets as the test entrypoint unless a row explicitly says it is a planning-only release gate.
 
@@ -14,7 +14,7 @@ This document tracks the high-signal E2E coverage needed before continuing the C
 | Chainlink Codex flow | `just e2e-chainlink-codex` | Codex root -> Codex TL -> Codex worker. TL uses `chainlink_issue_create`, `chainlink_session_status`, and coordinator-side `chainlink_issue_close`; worker uses `chainlink_session_start`, `chainlink_session_work`, `chainlink_issue_comment`, `chainlink_session_end`, and `notify_parent`. | Static preflight `just check-e2e-chainlink-codex` passed after the Chainlink timer/role-scope refactor. `just test-wasm-integration` also passed with `32 passed` and covers the updated role contract. | Green | Uses `/tmp`, isolated `CODEX_HOME`, local Chainlink DB, and no `gh` or external PR state. Chainlink agent/sync/lock tools are intentionally out of the role workflow. |
 | Chainlink timer role scope | `just check-e2e-chainlink-timer-role-scope` | Static role-scope assertions for TL-only timer tools, coordinator close semantics, dev subissue close, worker telemetry-only tools, and no lock/agent/sync role exposure. | Passed after the Chainlink timer/role-scope refactor. Final preflight also paired this with `just check-e2e-chainlink-codex`, `bash -n tests/e2e/chainlink/run.sh`, and `bash -n tests/e2e/chainlink-close/run.sh`. | Green | Added under Chainlink #196. Keep this cheap preflight paired with `just test-wasm-integration` for Chainlink MCP surface changes. |
 | Claude-only bounded smoke | `just e2e-claude-only` / `just check-e2e-claude-only` | Claude Code root TL on Haiku with explicit role-safe `initial_prompt`; validates server startup, root SessionStart registration, TeamCreate, and Teams metadata registration without spawning children | Passed on 2026-05-27. Harness used `port = 0`, pretrusted the temp workspace, observed root Claude session registration, TeamCreate, new Teams directory, and `Registered team: exomonad-smoke-test`. | Green | This is intentionally bounded to root TL startup/Teams registration. Full Claude TL/worker/dev-leaf/reviewer matrix remains tracked by #421 to avoid unbounded token use. |
-| Runtime-role matrix | Planning-only release gate for now | Important TL/dev/reviewer role combinations across Claude Code, Codex, and OpenCode | Not run. | Next | Keep decomposable: Codex-only subset for regular work; full matrix only before production release. |
+| Runtime-role matrix | `docs/architecture/runtime-role-e2e-matrix.md` | Release-gate matrix for TL/dev/reviewer/worker coverage across Claude Code, Codex, and OpenCode | Defined under Chainlink #171. | Planned | Regular development gates cover static contracts and local Codex/OpenCode paths; release-only gates cover Claude credit-burning and Forgejo reviewer provenance flows. |
 
 ## Codex Hooks Feedback
 
