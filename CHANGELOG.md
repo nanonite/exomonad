@@ -155,6 +155,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Verify Claude-only ExoMonad session flow when credits are available (#421)
 - Define release-gate runtime role matrix for E2E coverage (#171)
 - investigate: should close_self / shutdown tool exist? narrow or remove unsafe self-teardown (#414)
 - Session-start failsafe: fail loudly when CHAINLINK_DB is unset or points at a phantom DB (#246)
