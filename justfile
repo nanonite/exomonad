@@ -309,6 +309,16 @@ check-e2e-authorship:
     bash -n tests/e2e/authorship/validate.sh
 
 
+# Run E2E agent lifecycle invariants test
+e2e-lifecycle:
+    ./tests/e2e/lifecycle/run.sh
+
+# Check E2E agent lifecycle scripts without launching the server
+check-e2e-lifecycle:
+    bash -n tests/e2e/lifecycle/run.sh
+    bash -n tests/e2e/lifecycle/validate.sh
+
+
 # Run E2E Chainlink SessionStart env failsafe test
 e2e-chainlink-env-failsafe:
     ./tests/e2e/chainlink-env-failsafe/run.sh

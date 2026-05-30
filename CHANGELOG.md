@@ -155,6 +155,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E2E test: agent lifecycle invariants (deferred) (#305)
 - E2E test: reviewer hardening + authorship preservation (deferred) (#301)
 - Verify Claude-only ExoMonad session flow when credits are available (#421)
 - Define release-gate runtime role matrix for E2E coverage (#171)
