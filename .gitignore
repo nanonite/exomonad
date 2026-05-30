@@ -128,4 +128,12 @@ vendor/notebooklm-mcp/.exo/
 # Working notes (not committed)
 archive/
 notes-knot-atproto-push.md
+chainlink-*.md
+chainlink-notes.md
+CHAINLINK_NOTES.md
+.opencode/
+opencode/
+opencode-notes/
+opencode-notes.md
+OPENCODE_NOTES.md
 opencode-*.md
