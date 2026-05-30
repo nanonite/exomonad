@@ -156,6 +156,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Inject spawned OpenCode worker context (#331)
 - Design a real E2E test harness (replace per-test run.sh duplicates) (#281)
 - E2E test: agent lifecycle invariants (deferred) (#305)
 - E2E test: reviewer hardening + authorship preservation (deferred) (#301)

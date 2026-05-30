@@ -230,6 +230,39 @@ Implement the spec in your task. File a PR when done. Call notify_parent to repo
 - If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
 ";
 
+pub const OPENCODE_WORKER_INSTRUCTIONS: &str = "\
+# ExoMonad Worker Agent Protocol
+
+You are an OpenCode worker in an ExoMonad agent tree. You run in a shared workspace pane and do not have your own branch.
+
+## Your Job
+Complete the narrow task assigned by your parent TL. Report completion through the provided MCP tools.
+
+## MCP Tools Available
+- chainlink_session_start: Start the Chainlink session before marking work active.
+- chainlink_session_work: Mark the assigned Chainlink issue as the active work item.
+- chainlink_issue_comment: Post progress on the assigned Chainlink issue.
+- chainlink_session_end: End the Chainlink session with handoff notes.
+- notify_parent: Send a direct message to your parent TL when needed.
+- send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
+- send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
+
+## Workflow
+1. Read the prompt carefully and use the issue ID provided by the TL.
+2. Call chainlink_session_start.
+3. Call chainlink_session_work before doing the requested work.
+4. Call chainlink_issue_comment for the required progress marker.
+5. Call chainlink_session_end with concise handoff notes when done.
+6. Call notify_parent with status='success' and include the issue ID.
+
+## Key Rules
+- Never spawn agents; workers are leaf executors.
+- Never create Chainlink issues; only the parent TL creates issues.
+- Never initialize Chainlink agent identity; ExoMonad branch/session identity is authoritative.
+- Never close Chainlink issues; your parent coordinator reviews the handoff and closes.
+- Never create branches, commits, or PRs unless explicitly instructed.
+";
+
 pub const CODEX_DEV_INSTRUCTIONS: &str = "\
 # ExoMonad Dev Agent Protocol
 
@@ -428,15 +461,15 @@ pub(crate) fn render_reviewer_context_section(
 }
 
 impl<
-        C: super::super::HasGitHubClient
-            + super::super::HasForgejoClient
-            + super::super::HasAcpRegistry
-            + super::super::HasTeamRegistry
-            + super::super::HasAgentResolver
-            + super::super::HasProjectDir
-            + super::super::HasGitWorktreeService
-            + 'static,
-    > AgentControlService<C>
+    C: super::super::HasGitHubClient
+        + super::super::HasForgejoClient
+        + super::super::HasAcpRegistry
+        + super::super::HasTeamRegistry
+        + super::super::HasAgentResolver
+        + super::super::HasProjectDir
+        + super::super::HasGitWorktreeService
+        + 'static,
+> AgentControlService<C>
 {
     /// Spawn an agent for a GitHub issue.
     ///
@@ -894,9 +927,9 @@ impl<
         }
 
         // instructions must be an array per OpenCode's schema.
-        // Only inject TL instructions for root/tl roles; dev/worker roles get no override.
         let instructions = match role {
             "root" | "tl" => serde_json::json!([OPENCODE_TL_INSTRUCTIONS]),
+            "worker" => serde_json::json!([OPENCODE_WORKER_INSTRUCTIONS]),
             _ => serde_json::json!([OPENCODE_DEV_INSTRUCTIONS]),
         };
         serde_json::json!({
@@ -1844,15 +1877,15 @@ impl<
 
 #[async_trait::async_trait]
 impl<
-        C: crate::services::HasGitHubClient
-            + crate::services::HasForgejoClient
-            + crate::services::HasAcpRegistry
-            + crate::services::HasTeamRegistry
-            + crate::services::HasAgentResolver
-            + crate::services::HasProjectDir
-            + crate::services::HasGitWorktreeService
-            + 'static,
-    > crate::services::ReviewerSpawner for AgentControlService<C>
+    C: crate::services::HasGitHubClient
+        + crate::services::HasForgejoClient
+        + crate::services::HasAcpRegistry
+        + crate::services::HasTeamRegistry
+        + crate::services::HasAgentResolver
+        + crate::services::HasProjectDir
+        + crate::services::HasGitWorktreeService
+        + 'static,
+> crate::services::ReviewerSpawner for AgentControlService<C>
 {
     async fn spawn_reviewer_for_pr(
         &self,
@@ -2063,9 +2096,11 @@ mod tests {
             .copy_allowed_dirs(&agent_wt, &["shared-context".to_string()])
             .await
             .unwrap();
-        assert!(agent_wt
-            .join(".exo/context/shared-context/ref.txt")
-            .exists());
+        assert!(
+            agent_wt
+                .join(".exo/context/shared-context/ref.txt")
+                .exists()
+        );
 
         // Test invalid paths (should skip but not fail)
         service

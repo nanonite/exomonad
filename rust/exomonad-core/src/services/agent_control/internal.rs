@@ -1,14 +1,14 @@
 use super::*;
 
 impl<
-        C: super::super::HasGitHubClient
-            + super::super::HasAcpRegistry
-            + super::super::HasTeamRegistry
-            + super::super::HasAgentResolver
-            + super::super::HasProjectDir
-            + super::super::HasGitWorktreeService
-            + 'static,
-    > AgentControlService<C>
+    C: super::super::HasGitHubClient
+        + super::super::HasAcpRegistry
+        + super::super::HasTeamRegistry
+        + super::super::HasAgentResolver
+        + super::super::HasProjectDir
+        + super::super::HasGitWorktreeService
+        + 'static,
+> AgentControlService<C>
 {
     pub(crate) fn resolve_tmux_session(&self) -> Result<String> {
         self.tmux_session
@@ -73,7 +73,7 @@ impl<
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 return Err(anyhow::Error::from(EffectError::from(e)))
-                    .context("Failed to create git worktree")
+                    .context("Failed to create git worktree");
             }
             Err(panic_val) => {
                 let msg = panic_val
@@ -1211,6 +1211,68 @@ mod tests {
             hooks_list[0]["command"],
             "exomonad hook after-agent --runtime gemini"
         );
+    }
+
+    #[test]
+    fn test_gemini_worker_settings_injects_context_path() {
+        let context_path = PathBuf::from("/tmp/exomonad-context/worker.md");
+        let settings = ACS::generate_gemini_worker_settings(
+            "test-worker",
+            Some(&context_path),
+            &HashMap::new(),
+        );
+        let context_files = settings["context"]["fileName"]
+            .as_array()
+            .expect("context.fileName must be an array");
+        let filenames: Vec<&str> = context_files
+            .iter()
+            .map(|value| value.as_str().expect("context filename must be a string"))
+            .collect();
+
+        assert_eq!(
+            filenames,
+            vec!["GEMINI.md", "/tmp/exomonad-context/worker.md"]
+        );
+    }
+
+    #[test]
+    fn test_opencode_worker_settings_use_worker_instructions() {
+        let settings = ACS::generate_opencode_tl_settings("test-worker", "worker", &HashMap::new());
+        let command = settings["mcp"]["exomonad"]["command"]
+            .as_array()
+            .expect("OpenCode MCP command must be an array");
+        assert_eq!(command[2], "--role");
+        assert_eq!(command[3], "worker");
+        assert_eq!(command[4], "--name");
+        assert_eq!(command[5], "test-worker");
+
+        let instructions = settings["instructions"]
+            .as_array()
+            .expect("instructions must be an array")[0]
+            .as_str()
+            .expect("first instruction entry must be a string");
+
+        assert!(instructions.contains("# ExoMonad Worker Agent Protocol"));
+        assert!(instructions.contains("chainlink_session_work"));
+        assert!(instructions.contains("chainlink_session_end"));
+        assert!(instructions.contains("notify_parent"));
+        assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
+        assert!(!instructions.contains("file_pr"));
+    }
+
+    #[test]
+    fn test_opencode_dev_settings_keep_dev_instructions() {
+        let settings = ACS::generate_opencode_tl_settings("test-dev", "dev", &HashMap::new());
+        let instructions = settings["instructions"]
+            .as_array()
+            .expect("instructions must be an array")[0]
+            .as_str()
+            .expect("first instruction entry must be a string");
+
+        assert!(instructions.contains("# ExoMonad Dev Agent Protocol"));
+        assert!(instructions.contains("file_pr"));
+        assert!(!instructions.contains("# ExoMonad Worker Agent Protocol"));
+        assert!(!instructions.contains("chainlink_session_work"));
     }
 
     #[test]
