@@ -299,6 +299,16 @@ e2e-chainlink-sqlite-block:
 check-e2e-chainlink-sqlite-block:
     bash -n tests/e2e/chainlink-sqlite-block/run.sh
 
+# Run E2E reviewer hardening and authorship preservation test
+e2e-authorship:
+    ./tests/e2e/authorship/run.sh
+
+# Check E2E reviewer hardening and authorship scripts without launching the server
+check-e2e-authorship:
+    bash -n tests/e2e/authorship/run.sh
+    bash -n tests/e2e/authorship/validate.sh
+
+
 # Run E2E Chainlink SessionStart env failsafe test
 e2e-chainlink-env-failsafe:
     ./tests/e2e/chainlink-env-failsafe/run.sh
