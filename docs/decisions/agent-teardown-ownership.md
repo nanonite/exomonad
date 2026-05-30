@@ -1,10 +1,10 @@
 # Agent Teardown Ownership (`close_self` vs orchestration-owned disposal)
 
-**Status:** Proposed
+**Status:** Accepted
 
 **Date:** 2026-05-25
 
-**Chainlink:** (none yet — documents existing behavior and records an open question)
+**Chainlink:** #414
 
 ## Context
 
@@ -62,12 +62,12 @@ itself down.
    `WorkerExit` is harmless and convenient. This is the one niche where
    agent-owned teardown is appropriate.
 
-3. **The `shutdown` MCP tool should be narrowed or removed.** It is currently
-   dead (wired to no role) and dangerous if revived for a leaf, because it
-   notifies-and-closes without consulting `canExit` — exactly the gating that
-   protects an in-review PR. If a graceful self-shutdown is ever wanted, it must
-   route through the stop-hook `canExit` check and be scoped to roles with no
-   lifecycle to protect (workers), never dev/reviewer leaves.
+3. **The dormant `shutdown` MCP tool is removed.** It was wired to no role and
+   dangerous if revived for a leaf, because it notified-and-closed without
+   consulting `canExit` — exactly the gating that protects an in-review PR. If a
+   graceful self-shutdown is ever wanted later, it must be designed as a new
+   worker-only path that routes through lifecycle checks instead of reusing a
+   dormant escape hatch.
 
 ## Consequences
 
@@ -77,9 +77,8 @@ itself down.
   has moved on.
 - The reconciler remains the safety net for leaves the TL forgets to dispose;
   it reaps externally and informs the TL, never the leaf.
-- Follow-up (not yet scheduled): delete the dormant `shutdown` tool, or re-scope
-  it worker-only behind a `canExit` check, so the "should `close_self` exist"
-  question is resolved in code rather than left as latent surface area.
+- There is no general-purpose `shutdown` MCP tool. `close_self` remains an
+  internal effect for WorkerExit cleanup only.
 
 ## Related
 

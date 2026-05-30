@@ -155,6 +155,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- investigate: should close_self / shutdown tool exist? narrow or remove unsafe self-teardown (#414)
 - Session-start failsafe: fail loudly when CHAINLINK_DB is unset or points at a phantom DB (#246)
 - E2E test: sub-TL recursive fork_wave flow (Claude/Codex/OpenCode) (#211)
 - Test sub-TL worker notify_parent delivery (pane-pinning fix verification) (#210)

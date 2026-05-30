@@ -42,6 +42,7 @@ main = do
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
   assertReviewerToolList
+  assertNoRoleExposesShutdown
   assertReviewerPostToolUseEventName
   assertReviewerCanExitDecisions
   assertReviewerVerdictsAreTerminal
@@ -293,6 +294,15 @@ assertReviewerToolList =
       assertBool "reviewer must not expose send_tmux_message" ("send_tmux_message" `notElem` names)
       assertBool "reviewer must not expose send_mailbox_message" ("send_mailbox_message" `notElem` names)
       assertBool "reviewer must not expose notify_parent" ("notify_parent" `notElem` names)
+
+assertNoRoleExposesShutdown :: IO ()
+assertNoRoleExposesShutdown =
+  forM_ ["root", "tl", "dev", "worker", "testrunner", "reviewer"] $ \roleName ->
+    case lookupRole roleName of
+      Nothing -> fail $ "role missing from registry: " <> T.unpack roleName
+      Just roleCfg -> do
+        let names = map tdName (roleListTools roleCfg)
+        assertBool ("role must not expose shutdown: " <> T.unpack roleName) ("shutdown" `notElem` names)
 
 assertReviewerCanExitDecisions :: IO ()
 assertReviewerCanExitDecisions = do
