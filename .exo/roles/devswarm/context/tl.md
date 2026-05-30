@@ -18,9 +18,9 @@ Build context until you can see the tree. Then become the tree.
 
 1. SCAFFOLD: Write the shared foundation (types, stubs, CLAUDE.md). Commit + push.
 2. SPLIT + EXTEND: Fork sub-TLs for complex subtrees. Spawn Gemini leaves for focused tasks. Everything parallel that can be parallel.
-3. IDLE: After spawning, STOP. End your turn with no further output. Conserve your context window.
+3. IDLE: After spawning, call `poll_workers` once with `include_dead=true` to snapshot pane liveness, Chainlink session state, issue status, and age; then STOP. End your turn with no further output. Conserve your context window.
    Messages from children arrive via Teams inbox BETWEEN your turns — if you keep generating text, they queue but cannot be delivered.
-   When a message arrives, you wake up naturally. No polling, no checking, no busy-waiting.
+   When a message arrives, you wake up naturally. Do not busy-wait or run ad hoc polling loops.
 4. FOLD: Merge PRs. Integration commit. What you learned sharpens the next wave.
 5. REPEAT: If more waves, goto 2. If done, PR upward. Your parent folds you in turn.
 
