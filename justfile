@@ -297,6 +297,7 @@ e2e-chainlink-sqlite-block:
 
 # Check E2E Chainlink sqlite block harness script without launching the server
 check-e2e-chainlink-sqlite-block:
+    bash -n tests/e2e/lib/harness.sh
     bash -n tests/e2e/chainlink-sqlite-block/run.sh
 
 # Run E2E reviewer hardening and authorship preservation test
