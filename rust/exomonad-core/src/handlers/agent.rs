@@ -8,8 +8,8 @@ use crate::domain::{
     AgentName, AgentPermissions, BirthBranch, CIStatus, ClaudeSessionUuid, RoutingInfo, TeamName,
 };
 use crate::effects::{
-    AgentEffects, EffectError, EffectHandler, EffectResult, ResultExt, ResultExtPreserve,
-    dispatch_agent_effect,
+    dispatch_agent_effect, AgentEffects, EffectError, EffectHandler, EffectResult, ResultExt,
+    ResultExtPreserve,
 };
 
 use super::non_empty;
@@ -50,19 +50,19 @@ pub struct AgentHandler<C> {
 }
 
 impl<
-    C: HasTeamRegistry
-        + HasAcpRegistry
-        + HasAgentResolver
-        + HasGitHubClient
-        + HasProjectDir
-        + HasGitWorktreeService
-        + HasSupervisorRegistry
-        + HasClaudeSessionRegistry
-        + HasEventLog
-        + HasForgejoClient
-        + HasWatcherRuntimeState
-        + 'static,
-> AgentHandler<C>
+        C: HasTeamRegistry
+            + HasAcpRegistry
+            + HasAgentResolver
+            + HasGitHubClient
+            + HasProjectDir
+            + HasGitWorktreeService
+            + HasSupervisorRegistry
+            + HasClaudeSessionRegistry
+            + HasEventLog
+            + HasForgejoClient
+            + HasWatcherRuntimeState
+            + 'static,
+    > AgentHandler<C>
 {
     pub fn new(service: Arc<AgentControlService<C>>, ctx: Arc<C>) -> Self {
         Self { service, ctx }
@@ -257,19 +257,19 @@ impl<
 
 #[async_trait]
 impl<
-    C: HasTeamRegistry
-        + HasAcpRegistry
-        + HasAgentResolver
-        + HasGitHubClient
-        + HasProjectDir
-        + HasGitWorktreeService
-        + HasSupervisorRegistry
-        + HasClaudeSessionRegistry
-        + HasEventLog
-        + HasForgejoClient
-        + HasWatcherRuntimeState
-        + 'static,
-> EffectHandler for AgentHandler<C>
+        C: HasTeamRegistry
+            + HasAcpRegistry
+            + HasAgentResolver
+            + HasGitHubClient
+            + HasProjectDir
+            + HasGitWorktreeService
+            + HasSupervisorRegistry
+            + HasClaudeSessionRegistry
+            + HasEventLog
+            + HasForgejoClient
+            + HasWatcherRuntimeState
+            + 'static,
+    > EffectHandler for AgentHandler<C>
 {
     fn namespace(&self) -> &str {
         "agent"
@@ -463,19 +463,19 @@ fn watcher_pr_merge_diagnosis(
 
 #[async_trait]
 impl<
-    C: HasTeamRegistry
-        + HasAcpRegistry
-        + HasAgentResolver
-        + HasGitHubClient
-        + HasProjectDir
-        + HasGitWorktreeService
-        + HasSupervisorRegistry
-        + HasClaudeSessionRegistry
-        + HasEventLog
-        + HasForgejoClient
-        + HasWatcherRuntimeState
-        + 'static,
-> AgentEffects for AgentHandler<C>
+        C: HasTeamRegistry
+            + HasAcpRegistry
+            + HasAgentResolver
+            + HasGitHubClient
+            + HasProjectDir
+            + HasGitWorktreeService
+            + HasSupervisorRegistry
+            + HasClaudeSessionRegistry
+            + HasEventLog
+            + HasForgejoClient
+            + HasWatcherRuntimeState
+            + 'static,
+    > AgentEffects for AgentHandler<C>
 {
     async fn spawn(
         &self,
@@ -1474,19 +1474,19 @@ struct PrBodyMetadata {
 }
 
 impl<
-    C: HasTeamRegistry
-        + HasAcpRegistry
-        + HasAgentResolver
-        + HasGitHubClient
-        + HasProjectDir
-        + HasGitWorktreeService
-        + HasSupervisorRegistry
-        + HasClaudeSessionRegistry
-        + HasEventLog
-        + HasForgejoClient
-        + HasWatcherRuntimeState
-        + 'static,
-> AgentHandler<C>
+        C: HasTeamRegistry
+            + HasAcpRegistry
+            + HasAgentResolver
+            + HasGitHubClient
+            + HasProjectDir
+            + HasGitWorktreeService
+            + HasSupervisorRegistry
+            + HasClaudeSessionRegistry
+            + HasEventLog
+            + HasForgejoClient
+            + HasWatcherRuntimeState
+            + 'static,
+    > AgentHandler<C>
 {
     async fn matching_open_forgejo_prs_for_cleanup(
         &self,

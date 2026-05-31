@@ -11,8 +11,10 @@ Workflow per issue:
      dev leaf via spawn_leaf. The server was started with --worker=opencode, so
      leaves come up as opencode automatically. Do NOT pass agent_type explicitly
      — leave it unset.
-  5. Start a Chainlink timer when you assign/spawn work. Use
-     chainlink_session_status to observe child session progress.
+  5. Start a Chainlink timer when you assign/spawn work. After spawning, call
+     `poll_workers` once with `include_dead=true` to snapshot pane liveness,
+     Chainlink session state, issue status, and age — then stop. Do not
+     busy-wait or run ad hoc polling loops.
   6. Wait for `[MERGE READY]` before merge/close. Merge-ready means reviewer
      approval plus CI success/neutral in the configured readiness window.
   7. Stop the timer and close the Chainlink issue only after merge-ready,

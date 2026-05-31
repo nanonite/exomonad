@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use exomonad_core::{EffectError, EffectHandler, EffectResult, RuntimeBuilder};
 use prost::Message;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use serial_test::serial;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -143,8 +143,8 @@ fn expand_matrix_tool_cell(cell: &str) -> BTreeSet<String> {
     tools
 }
 
-fn expected_tool_matrix_from_architecture_doc()
--> std::collections::BTreeMap<String, BTreeSet<String>> {
+fn expected_tool_matrix_from_architecture_doc(
+) -> std::collections::BTreeMap<String, BTreeSet<String>> {
     let doc = include_str!("../../../docs/architecture/agent-system.md");
     let mut matrix = std::collections::BTreeMap::from([
         ("root".to_string(), BTreeSet::new()),
