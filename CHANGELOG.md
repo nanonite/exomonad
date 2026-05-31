@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix OpenCode dev-leaf review loop fallback dispatch (#443)
 - Fix OpenCode worker config discovery: write .git stub to agent_config_dir (#441)
 - Fix OpenCode worker settle delay cap for large tmux paste payloads (#440)
 - Reviewer spawned without Edit/Write deny in AgentPermissions — WASM hook alone is insufficient guard (#430)

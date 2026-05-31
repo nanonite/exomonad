@@ -1474,7 +1474,7 @@ where
         let plugin = match plugins_guard.get(&agent_name) {
             Some(p) => p.clone(),
             None => {
-                if agent_type == AgentType::Codex && role == "dev" {
+                if (agent_type == AgentType::Codex || agent_type == AgentType::OpenCode) && role == "dev" {
                     if let Some(action) = codex_dev_fallback_event_action(event_type, &payload) {
                         tracing::info!(
                             branch,
