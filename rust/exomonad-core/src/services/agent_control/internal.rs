@@ -1,5 +1,46 @@
 use super::*;
 
+fn generate_opencode_agent_settings(
+    agent_name: &str,
+    role: &str,
+    extra_mcp_servers: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut mcp_servers = serde_json::Map::new();
+    mcp_servers.insert(
+        "exomonad".to_string(),
+        serde_json::json!({
+            "type": "local",
+            "command": ["exomonad", "mcp-stdio", "--role", role, "--name", agent_name]
+        }),
+    );
+    for (name, config) in extra_mcp_servers {
+        mcp_servers.insert(name.clone(), config.clone());
+    }
+
+    let instructions = match role {
+        "root" | "tl" => serde_json::json!([super::spawn::OPENCODE_TL_INSTRUCTIONS]),
+        "worker" => serde_json::json!([super::spawn::OPENCODE_WORKER_INSTRUCTIONS]),
+        _ => serde_json::json!([super::spawn::OPENCODE_DEV_INSTRUCTIONS]),
+    };
+
+    serde_json::json!({
+        "mcp": mcp_servers,
+        "instructions": instructions,
+        "plugin": ["./.exo/opencode-plugin"],
+    })
+}
+
+async fn write_opencode_agent_plugin_files(dir: &Path) -> Result<()> {
+    use crate::opencode_plugin::{OPENCODE_PLUGIN_PKG_JSON, OPENCODE_PLUGIN_TS};
+
+    let plugin_dir = dir.join(".exo/opencode-plugin");
+    fs::create_dir_all(&plugin_dir).await?;
+    fs::write(plugin_dir.join("index.ts"), OPENCODE_PLUGIN_TS).await?;
+    fs::write(plugin_dir.join("package.json"), OPENCODE_PLUGIN_PKG_JSON).await?;
+    info!(path = %plugin_dir.display(), "Wrote OpenCode plugin files");
+    Ok(())
+}
+
 impl<
         C: super::super::HasGitHubClient
             + super::super::HasAcpRegistry
@@ -737,8 +778,18 @@ impl<
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote .exo/mcp.json for Shoal agent");
             }
             AgentType::OpenCode => {
-                fs::write(agent_dir.join("opencode.json"), mcp_content).await?;
-                info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json for OpenCode agent");
+                let opencode_config = generate_opencode_agent_settings(
+                    agent_name,
+                    role.as_str(),
+                    &self.extra_mcp_servers,
+                );
+                fs::write(
+                    agent_dir.join("opencode.json"),
+                    serde_json::to_string_pretty(&opencode_config)?,
+                )
+                .await?;
+                write_opencode_agent_plugin_files(agent_dir).await?;
+                info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json and plugin for OpenCode agent");
             }
             AgentType::Codex => {
                 self.write_codex_config_files(
@@ -1286,6 +1337,36 @@ mod tests {
         assert!(instructions.contains("file_pr"));
         assert!(!instructions.contains("# ExoMonad Worker Agent Protocol"));
         assert!(!instructions.contains("chainlink_session_work"));
+    }
+
+    #[tokio::test]
+    async fn test_write_agent_mcp_config_opencode_writes_full_config_and_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("test-opencode-dev");
+        fs::create_dir_all(&agent_dir).await.unwrap();
+
+        let service = ACS::new(std::sync::Arc::new(crate::services::Services::test()));
+        service
+            .write_agent_mcp_config(
+                dir.path(),
+                &agent_dir,
+                AgentType::OpenCode,
+                &crate::domain::Role::dev(),
+            )
+            .await
+            .unwrap();
+
+        let opencode_json = fs::read_to_string(agent_dir.join("opencode.json"))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&opencode_json).unwrap();
+        assert_eq!(parsed["plugin"][0], "./.exo/opencode-plugin");
+        assert!(parsed["instructions"][0]
+            .as_str()
+            .unwrap()
+            .contains("# ExoMonad Dev Agent Protocol"));
+        assert!(agent_dir.join(".exo/opencode-plugin/index.ts").exists());
+        assert!(agent_dir.join(".exo/opencode-plugin/package.json").exists());
     }
 
     #[test]
