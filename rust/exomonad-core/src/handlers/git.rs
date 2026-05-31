@@ -178,7 +178,7 @@ impl GitEffects for GitHandler {
 
         let url = self
             .service
-            .get_remote_url(&working_dir)
+            .get_remote_url(&working_dir, &req.remote)
             .await
             .effect_err("git")?;
 

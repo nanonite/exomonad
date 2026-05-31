@@ -6,6 +6,8 @@ use duct::cmd;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+const DEFAULT_REMOTE: &str = "origin";
+
 /// Get current branch name from local git repository.
 ///
 /// This is a standalone helper function that calls git directly without
@@ -214,8 +216,11 @@ impl GitService {
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn get_remote_url(&self, dir: &str) -> Result<String> {
-        let output = self.exec_git(dir, &["remote", "get-url", "origin"]).await?;
+    pub async fn get_remote_url(&self, dir: &str, remote: &str) -> Result<String> {
+        let remote = self.resolve_remote_name(dir, remote).await?;
+        let output = self
+            .exec_git(dir, &["remote", "get-url", remote.as_str()])
+            .await?;
         Ok(output.trim().to_string())
     }
 
@@ -225,7 +230,7 @@ impl GitService {
             .get_branch(dir)
             .await?
             .context("HEAD is detached; repository info requires a branch")?;
-        let remote_url = self.get_remote_url(dir).await.ok();
+        let remote_url = self.get_remote_url(dir, "").await.ok();
 
         let (owner, name) = remote_url
             .as_ref()
@@ -238,6 +243,38 @@ impl GitService {
             name,
         })
     }
+
+    async fn resolve_remote_name(&self, dir: &str, remote: &str) -> Result<String> {
+        let remote = remote.trim();
+        if !remote.is_empty() {
+            return Ok(remote.to_string());
+        }
+
+        self.detect_first_remote(dir).await
+    }
+
+    async fn detect_first_remote(&self, dir: &str) -> Result<String> {
+        let output = self.exec_git(dir, &["remote"]).await?;
+        select_remote(&output).context("No git remotes configured")
+    }
+}
+
+fn select_remote(output: &str) -> Option<String> {
+    let mut first_remote = None;
+
+    for remote in output
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+    {
+        if remote == DEFAULT_REMOTE {
+            return Some(DEFAULT_REMOTE.to_string());
+        }
+
+        first_remote.get_or_insert_with(|| remote.to_string());
+    }
+
+    first_remote
 }
 
 #[cfg(test)]
@@ -249,13 +286,19 @@ mod tests {
 
     struct MockExecutor {
         responses: Mutex<Vec<Result<String>>>,
+        commands: Mutex<Vec<Vec<String>>>,
     }
 
     impl MockExecutor {
         fn new(responses: Vec<Result<String>>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                commands: Mutex::new(Vec::new()),
             }
+        }
+
+        fn commands(&self) -> Vec<Vec<String>> {
+            self.commands.lock().unwrap().clone()
         }
     }
 
@@ -263,8 +306,12 @@ mod tests {
         fn exec<'a>(
             &'a self,
             _dir: &'a str,
-            _cmd: &'a [&'a str],
+            cmd: &'a [&'a str],
         ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            self.commands
+                .lock()
+                .unwrap()
+                .push(cmd.iter().map(|arg| arg.to_string()).collect());
             let response = self.responses.lock().unwrap().remove(0);
             Box::pin(async move { response })
         }
@@ -308,6 +355,77 @@ mod tests {
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0].hash, "hash1");
         assert_eq!(commits[1].message, "Message 2");
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_url_uses_requested_remote() {
+        let mock = Arc::new(MockExecutor::new(vec![Ok(
+            "https://example.test/owner/repo.git\n".to_string(),
+        )]));
+        let git = GitService::new(mock.clone());
+
+        let url = git.get_remote_url("/app", "forgejo").await.unwrap();
+
+        assert_eq!(url, "https://example.test/owner/repo.git");
+        assert_eq!(
+            mock.commands(),
+            vec![vec![
+                "git".to_string(),
+                "remote".to_string(),
+                "get-url".to_string(),
+                "forgejo".to_string(),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_url_prefers_origin_when_remote_empty() {
+        let mock = Arc::new(MockExecutor::new(vec![
+            Ok("forgejo\norigin\n".to_string()),
+            Ok("https://github.com/owner/repo.git\n".to_string()),
+        ]));
+        let git = GitService::new(mock.clone());
+
+        let url = git.get_remote_url("/app", "").await.unwrap();
+
+        assert_eq!(url, "https://github.com/owner/repo.git");
+        assert_eq!(
+            mock.commands(),
+            vec![
+                vec!["git".to_string(), "remote".to_string()],
+                vec![
+                    "git".to_string(),
+                    "remote".to_string(),
+                    "get-url".to_string(),
+                    "origin".to_string(),
+                ],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_url_falls_back_to_first_remote() {
+        let mock = Arc::new(MockExecutor::new(vec![
+            Ok("forgejo\nupstream\n".to_string()),
+            Ok("https://forgejo.test/owner/repo.git\n".to_string()),
+        ]));
+        let git = GitService::new(mock.clone());
+
+        let url = git.get_remote_url("/app", "").await.unwrap();
+
+        assert_eq!(url, "https://forgejo.test/owner/repo.git");
+        assert_eq!(
+            mock.commands(),
+            vec![
+                vec!["git".to_string(), "remote".to_string()],
+                vec![
+                    "git".to_string(),
+                    "remote".to_string(),
+                    "get-url".to_string(),
+                    "forgejo".to_string(),
+                ],
+            ]
+        );
     }
 
     #[test]
