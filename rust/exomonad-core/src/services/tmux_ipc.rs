@@ -122,7 +122,7 @@ pub struct TmuxIpc {
 }
 
 fn settle_delay_for_payload(payload: &str) -> Duration {
-    let extra_ms = (payload.len() as u64 / 256).min(4) * 100;
+    let extra_ms = (payload.len() as u64 / 256).min(200) * 100;
     Duration::from_millis(250 + extra_ms)
 }
 
