@@ -953,6 +953,15 @@ impl<
         Ok(())
     }
 
+    pub async fn write_opencode_git_stub(
+        agent_config_dir: &Path,
+        project_dir: &Path,
+    ) -> Result<()> {
+        let git_content = format!("gitdir: {}\n", project_dir.join(".git").display());
+        fs::write(agent_config_dir.join(".git"), git_content).await?;
+        Ok(())
+    }
+
     async fn active_worker_for_parent_tab(
         &self,
         agents_dir: &Path,
@@ -1123,6 +1132,7 @@ impl<
                     let opencode_json_path = agent_config_dir.join("opencode.json");
                     fs::write(&opencode_json_path, serde_json::to_string_pretty(&worker_config)?).await?;
                     Self::write_opencode_plugin_files(&agent_config_dir).await?;
+                    Self::write_opencode_git_stub(&agent_config_dir, self.project_dir()).await?;
                     info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json and plugin to agent config dir");
                 }
                 AgentType::Codex => {
@@ -1983,6 +1993,29 @@ mod tests {
             "unexpected error: {message}"
         );
         assert!(message.contains(".exo/server.sock"));
+    }
+
+    #[tokio::test]
+    async fn test_write_opencode_git_stub_points_to_project_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        let agent_config_dir = dir.path().join("agent-config");
+        fs::create_dir_all(&agent_config_dir).await.unwrap();
+
+        AgentControlService::<crate::services::Services>::write_opencode_git_stub(
+            &agent_config_dir,
+            &project_dir,
+        )
+        .await
+        .unwrap();
+
+        let content = fs::read_to_string(agent_config_dir.join(".git"))
+            .await
+            .unwrap();
+        assert_eq!(
+            content,
+            format!("gitdir: {}\n", project_dir.join(".git").display())
+        );
     }
 
     #[test]
