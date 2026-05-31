@@ -953,35 +953,68 @@ Run `exomonad recompile` first to build it.",
     let git_wt = Arc::new(
         exomonad_core::services::git_worktree::GitWorktreeService::new(project_dir.clone()),
     );
+    let http_forgejo_configured = matches!(
+        (
+            config.forgejo_url.as_deref(),
+            config.forgejo_token.as_deref()
+        ),
+        (Some(_), Some(_))
+    );
+    let fj_backend_selected = !http_forgejo_configured
+        && config.forgejo_url.is_none()
+        && config.forgejo_token.is_none()
+        && exomonad_core::services::ForgejoClient::fj_binary_in_path();
+
     let forgejo_client = match (
         config.forgejo_url.as_deref(),
         config.forgejo_token.as_deref(),
     ) {
         (Some(url), Some(token)) => Some(exomonad_core::services::ForgejoClient::new(url, token)?),
         (Some(_), None) => {
-            warn!("forgejo_url configured without forgejo_token; file_pr will use local PR flow");
+            warn!("forgejo_url configured without forgejo_token; Forgejo integration disabled");
             None
         }
         (None, Some(_)) => {
-            warn!("forgejo_token configured without forgejo_url; file_pr will use local PR flow");
+            warn!("forgejo_token configured without forgejo_url; Forgejo integration disabled");
             None
         }
-        (None, None) => None,
+        (None, None) if fj_backend_selected => {
+            info!("[Forgejo] Using fj CLI backend (forgejo_url/forgejo_token not configured)");
+            Some(exomonad_core::services::ForgejoClient::new_fj(
+                project_dir.clone(),
+            ))
+        }
+        (None, None) => {
+            warn!(
+                "[Forgejo] Not configured - spawn_reviewer, watcher_pr_state, file_pr will be unavailable"
+            );
+            None
+        }
     };
-    let forgejo_reviewer_client = match (
-        config.forgejo_url.as_deref(),
-        config.forgejo_reviewer_token.as_deref(),
-    ) {
-        (Some(url), Some(token)) => Some(exomonad_core::services::ForgejoClient::new(url, token)?),
-        (Some(_), None) => {
-            warn!("forgejo_reviewer_token not configured; reviewer MCP tools cannot submit Forgejo PR reviews");
-            None
+    let forgejo_reviewer_client = if fj_backend_selected {
+        forgejo_client.clone()
+    } else {
+        match (
+            config.forgejo_url.as_deref(),
+            config.forgejo_reviewer_token.as_deref(),
+        ) {
+            (Some(url), Some(token)) => {
+                Some(exomonad_core::services::ForgejoClient::new(url, token)?)
+            }
+            (Some(_), None) => {
+                warn!(
+                    "forgejo_reviewer_token not configured; reviewer MCP tools cannot submit Forgejo PR reviews"
+                );
+                None
+            }
+            (None, Some(_)) => {
+                warn!(
+                    "forgejo_reviewer_token configured without forgejo_url; reviewer MCP tools cannot submit Forgejo PR reviews"
+                );
+                None
+            }
+            (None, None) => None,
         }
-        (None, Some(_)) => {
-            warn!("forgejo_reviewer_token configured without forgejo_url; reviewer MCP tools cannot submit Forgejo PR reviews");
-            None
-        }
-        (None, None) => None,
     };
 
     let team_registry = Arc::new(claude_teams_bridge::TeamRegistry::new());

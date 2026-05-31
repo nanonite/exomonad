@@ -234,6 +234,40 @@ fn redact_remote_token(url: &str, token: &str) -> String {
     }
 }
 
+fn check_fj_cli_configuration(cwd: &Path) {
+    if !exomonad_core::services::ForgejoClient::fj_binary_in_path() {
+        warn!(
+            "[Forgejo] Not configured - forgejo_url/forgejo_token are absent and fj was not found in PATH"
+        );
+        return;
+    }
+
+    info!(
+        "[Forgejo] fj found in PATH; exomonad serve will use the fj CLI backend when HTTP config is absent"
+    );
+    match std::process::Command::new("fj")
+        .args(["auth", "status"])
+        .current_dir(cwd)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            info!("[Forgejo] fj auth status succeeded");
+        }
+        Ok(status) => {
+            warn!(
+                status = %status,
+                "[Forgejo] fj is in PATH but `fj auth status` failed; file_pr, watcher_pr_state, and spawn_reviewer may fail until fj is authenticated"
+            );
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "[Forgejo] failed to run `fj auth status`; file_pr, watcher_pr_state, and spawn_reviewer may fail until fj is authenticated"
+            );
+        }
+    }
+}
+
 fn mailbox_protocol_available_for_config(config: &Config) -> bool {
     config.root_agent_type == AgentType::Claude && config.spawn_agent_type == AgentType::Claude
 }
@@ -557,7 +591,9 @@ pub async fn run(
                 .await
                 .unwrap_or_default();
                 if !input.trim().eq_ignore_ascii_case("y") {
-                    anyhow::bail!("OTel endpoint unreachable. Start it with:\n  docker compose -f ~/.exo/otel/docker-compose.yml up -d");
+                    anyhow::bail!(
+                        "OTel endpoint unreachable. Start it with:\n  docker compose -f ~/.exo/otel/docker-compose.yml up -d"
+                    );
                 }
             }
         }
@@ -674,6 +710,8 @@ pub async fn run(
         if let Err(e) = configure_forgejo_remote(&cwd, forgejo_url, forgejo_token) {
             warn!(error = %e, "Failed to auto-configure Forgejo remote URL (non-fatal)");
         }
+    } else if config.forgejo_url.is_none() && config.forgejo_token.is_none() {
+        check_fj_cli_configuration(&cwd);
     }
 
     // Write root runtime configuration.
