@@ -127,6 +127,16 @@ impl AgentResolver {
         self.records.read().await.get(name).cloned()
     }
 
+    /// Look up an agent's identity by bare slug. Returns `None` if not registered.
+    pub async fn lookup_by_slug(&self, slug: &Slug) -> Option<AgentIdentityRecord> {
+        self.records
+            .read()
+            .await
+            .values()
+            .find(|record| &record.slug == slug)
+            .cloned()
+    }
+
     /// Non-async access to the records map for synchronous callers (e.g., delivery).
     /// Returns a reference to the inner RwLock for `try_read()` usage.
     pub fn records_ref(&self) -> &RwLock<HashMap<AgentName, AgentIdentityRecord>> {
@@ -359,6 +369,22 @@ mod tests {
             .get(
                 &AgentName::try_from_str("feature-a-claude")
                     .expect("literal validated string is non-empty"),
+            )
+            .await;
+        assert_eq!(got, Some(record));
+    }
+
+    #[tokio::test]
+    async fn lookup_by_slug_returns_matching_record() {
+        let tmp = TempDir::new().unwrap();
+        let resolver = AgentResolver::load(tmp.path().to_path_buf()).await;
+
+        let record = test_record("feature-a-opencode", "feature-a", "main.feature-a-opencode");
+        resolver.register(record.clone()).await.unwrap();
+
+        let got = resolver
+            .lookup_by_slug(
+                &Slug::try_from_str("feature-a").expect("literal validated string is non-empty"),
             )
             .await;
         assert_eq!(got, Some(record));

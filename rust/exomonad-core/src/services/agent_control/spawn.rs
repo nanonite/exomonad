@@ -19,6 +19,46 @@ fn parse_git_status_paths(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+fn resolve_identity_working_dir(project_dir: &Path, working_dir: &Path) -> PathBuf {
+    if working_dir.is_absolute() {
+        working_dir.to_path_buf()
+    } else {
+        project_dir.join(working_dir)
+    }
+}
+
+async fn find_existing_leaf_worktree_by_slug(
+    worktree_base: &Path,
+    slug: &str,
+) -> Result<Option<(AgentIdentity, PathBuf)>> {
+    let mut entries = match fs::read_dir(worktree_base).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut candidates = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        candidates.push((name, entry.path()));
+    }
+
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, path) in candidates {
+        let identity = AgentIdentity::from_internal_name(&name);
+        if identity.slug() == slug {
+            return Ok(Some((identity, path)));
+        }
+    }
+
+    Ok(None)
+}
+
 fn reviewer_harness_denied_tools() -> Vec<String> {
     [
         "Edit",
@@ -1578,22 +1618,55 @@ impl<
                 .context("effective birth branch was empty")?;
 
             // Sanitize branch name and construct typed identity
-            let agent_type = options.agent_type;
-            let identity = AgentIdentity::new(slugify(&options.branch_name), agent_type);
-            let agent_name = identity.internal_name();
-            let display_name = identity.display_name();
+            let slug = slugify(&options.branch_name);
+            let slug_key = Slug::try_from_str(&slug).context("generated agent slug was empty")?;
+            let mut agent_type = options.agent_type;
+            let mut identity = AgentIdentity::new(slug.clone(), agent_type);
+            let mut agent_name = identity.internal_name();
+            let mut display_name = identity.display_name();
+            let mut worktree_path = self.worktree_base.join(agent_name.as_str());
+            let mut existing_identity_record = None;
+
+            if !options.standalone_repo && !worktree_path.exists() {
+                if let Some(record) = self.agent_resolver().lookup_by_slug(&slug_key).await {
+                    if record.topology == Topology::WorktreePerAgent {
+                        let record_worktree =
+                            resolve_identity_working_dir(effective_project_dir, &record.working_dir);
+                        if record_worktree.exists() {
+                            agent_name = record.agent_name.clone();
+                            agent_type = record.agent_type;
+                            identity = AgentIdentity::from_internal_name(agent_name.as_str());
+                            display_name = record.display_name.clone();
+                            worktree_path = record_worktree;
+                            existing_identity_record = Some(record);
+                        }
+                    }
+                }
+
+                if existing_identity_record.is_none() {
+                    if let Some((found_identity, found_path)) =
+                        find_existing_leaf_worktree_by_slug(&self.worktree_base, &slug).await?
+                    {
+                        identity = found_identity;
+                        agent_type = identity.agent_type();
+                        agent_name = identity.internal_name();
+                        display_name = identity.display_name();
+                        worktree_path = found_path;
+                    }
+                }
+            }
 
             // Idempotency check
             let tab_alive = self.is_tmux_window_alive(&display_name).await;
             if tab_alive {
                 info!(slug = %identity.slug(), "Leaf subtree already running, returning existing");
                 return Ok(SpawnResult {
-                    agent_dir: self.worktree_base.join(agent_name.as_str()),
-                      agent_name,
-                      issue_title: options.branch_name.clone(),
-                      agent_type,
-                      pane_id: None,
-                  });
+                    agent_dir: worktree_path,
+                    agent_name,
+                    issue_title: options.branch_name.clone(),
+                    agent_type,
+                    pane_id: None,
+                });
             }
 
             // Ensure a remote exists for local-only workflows
@@ -1602,10 +1675,13 @@ impl<
             // Push parent branch so child PRs can reference it as base
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
-            let child_birth = effective_birth.child(agent_name.as_str());
-            let branch_name = BranchName::try_from_str(child_birth.to_string().as_str()).expect("validated string input is non-empty");
+            let child_birth = existing_identity_record
+                .as_ref()
+                .map(|record| record.birth_branch.clone())
+                .unwrap_or_else(|| effective_birth.child(agent_name.as_str()));
+            let branch_name = BranchName::try_from_str(child_birth.to_string().as_str())
+                .expect("validated string input is non-empty");
 
-            let worktree_path = self.worktree_base.join(agent_name.as_str());
             let mut remove_worktree_on_spawn_failure = false;
 
             if options.standalone_repo {
@@ -1936,6 +2012,39 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_find_existing_leaf_worktree_by_slug_uses_recorded_agent_type_suffix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree_base = temp_dir.path().join("worktrees");
+        fs::create_dir_all(worktree_base.join("resume-leaf-opencode"))
+            .await
+            .unwrap();
+
+        let (identity, path) = find_existing_leaf_worktree_by_slug(&worktree_base, "resume-leaf")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(identity.slug(), "resume-leaf");
+        assert_eq!(identity.agent_type(), AgentType::OpenCode);
+        assert_eq!(path, worktree_base.join("resume-leaf-opencode"));
+    }
+
+    #[tokio::test]
+    async fn test_find_existing_leaf_worktree_by_slug_rejects_prefix_collision() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree_base = temp_dir.path().join("worktrees");
+        fs::create_dir_all(worktree_base.join("resume-leaf-extra-opencode"))
+            .await
+            .unwrap();
+
+        let found = find_existing_leaf_worktree_by_slug(&worktree_base, "resume-leaf")
+            .await
+            .unwrap();
+
+        assert!(found.is_none());
+    }
 
     #[test]
     fn test_parse_git_status_paths_lists_status_entries() {
