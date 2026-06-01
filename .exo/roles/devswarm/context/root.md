@@ -37,6 +37,7 @@ TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `Mul
 
 ### Dev-leaf signals (PR review loop)
 - `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Call `merge_pr` with `chainlink_issue_id` so it closes the Chainlink issue and commits `CHANGELOG.md` before merging, then verify.
+- After `merge_pr` completes successfully and verification passes, call `dispose_leaf` for the dev leaf and call `dispose_leaf` for the reviewer leaf for that issue. Use a reason like `merged PR #<number>` and keep `force=false` unless the leaf is a genuine orphan. `merge_pr` does not perform cleanup side effects.
 
 The review-loop watcher routes all non-merge-ready outcomes (`dev_not_pushing`,
 `reviewer_not_responding`, `reviewer_never_started`, and `dev_failed`) to the
