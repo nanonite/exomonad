@@ -3,21 +3,24 @@
 
 module Main where
 
+import AllRoles (lookupRole, roleListTools)
 import Control.Monad (forM_, unless)
 import Control.Monad.Freer (runM)
 import Control.Monad.Freer.Coroutine (runC)
 import Control.Monad.Freer.Coroutine qualified as C
 import Data.Aeson qualified as Aeson
+import Data.ByteString.Lazy.Char8 qualified as BSL
 import Data.Text (Text)
 import Data.Text qualified as T
-import AllRoles (lookupRole, roleListTools)
 import DevPhase (DevEvent (..), DevPhase (..))
 import DevRole qualified
 import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
 import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), PRReviewEvent (..))
+import ExoMonad.Guest.Events.Templates qualified as Tpl
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
 import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
+import ExoMonad.Guest.Tools.MergePR (mergePRDescription, mergePRSchema)
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (ChainlinkDbPathState (..), HookConfig (..), RoleConfig (..), validateChainlinkDbEnv)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
@@ -61,6 +64,7 @@ main = do
   assertCIFailureBlocksAfterTrigger
   assertMergeReadyReviewNotifiesParent
   assertMergeReadyCIStatusNotifiesParent
+  assertReviewerFacingTextDoesNotMentionCopilot
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -324,7 +328,6 @@ assertReviewerVerdictsAreTerminal = do
     Transitioned ReviewerDone -> pure ()
     _ -> fail "expected ReviewerDone after requested-changes verdict"
 
-
 assertAppendVerdictLocksPerHeadSha :: IO ()
 assertAppendVerdictLocksPerHeadSha = do
   first <- either (fail . T.unpack) pure $ ReviewerRole.appendVerdict 7 "abc123" "approved" "ok" (Just "main.review-pr-7-codex") [] ReviewerRole.emptyReviewFile
@@ -355,7 +358,7 @@ assertDevNeedsHumanDirectionAfterOneFixRound = do
   assertBlocks "needs human direction" (canExit @DevPhase @DevEvent (DevNeedsHumanDirection 9 "still wrong"))
 
 -- Intended semantics: after the dev has pushed a fix (round_ >= 1), an
--- *approval* must transition to DevApproved, NOT DevNeedsHumanDirection.
+-- approval verdict must transition to DevApproved, NOT DevNeedsHumanDirection.
 -- The watcher is responsible for firing ReviewApprovedEv (not
 -- ReviewReceivedEv) when the reviewer's verdict is "approved".
 assertReviewApprovedAfterFixRoundTransitionsToApproved :: IO ()
@@ -449,6 +452,24 @@ assertNotifyParent label_ expectedPr action =
       assertEqual (label_ <> " pr_number") expectedPr prNumber
       assertBool (label_ <> " message") ("[MERGE READY]" `T.isInfixOf` message)
     other -> fail $ label_ <> ": expected NotifyParentAction, got " <> show other
+
+assertReviewerFacingTextDoesNotMentionCopilot :: IO ()
+assertReviewerFacingTextDoesNotMentionCopilot = do
+  assertNoCopilot "merge_pr description" mergePRDescription
+  assertNoCopilot "merge_pr schema" (T.pack (BSL.unpack (Aeson.encode mergePRSchema)))
+  assertNoCopilot "prReady" (Tpl.prReady 42)
+  assertNoCopilot "reviewTimeout" (Tpl.reviewTimeout 42 15)
+  assertContains "merge_pr description" "Forgejo reviewer" mergePRDescription
+  assertContains "prReady" "Forgejo reviewer" (Tpl.prReady 42)
+  assertContains "reviewTimeout" "Forgejo reviewer" (Tpl.reviewTimeout 42 15)
+
+assertNoCopilot :: String -> Text -> IO ()
+assertNoCopilot label_ value =
+  assertBool (label_ <> " should not mention Copilot") (not ("Copilot" `T.isInfixOf` value))
+
+assertContains :: String -> Text -> Text -> IO ()
+assertContains label_ expected value =
+  assertBool (label_ <> " should mention " <> T.unpack expected) (expected `T.isInfixOf` value)
 
 showDevTransition :: TransitionResult DevPhase -> String
 showDevTransition (Transitioned phase) = "Transitioned " <> show phase
