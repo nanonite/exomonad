@@ -89,6 +89,40 @@ def resolve_sha(branch):
     return None
 
 
+def git_output(*args):
+    """Run a read-only git command against the bare remote."""
+    remote_dir = os.environ.get("REMOTE_DIR")
+    if not remote_dir:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", remote_dir, *args],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return result.stdout
+    except Exception:
+        pass
+    return None
+
+
+def pr_files(pr):
+    """Return a small Forgejo-compatible changed-file list for a PR."""
+    output = git_output("diff", "--name-only", pr["base"]["ref"], pr["head"]["sha"])
+    names = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    files = []
+    for name in names:
+        patch = git_output("diff", pr["base"]["ref"], pr["head"]["sha"], "--", name) or ""
+        files.append({
+            "filename": name,
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "patch": patch,
+        })
+    return files
+
+
 class GitHubState:
     def __init__(self):
         self.prs = {}
@@ -213,6 +247,11 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         """Strip query string from self.path for route matching."""
         return self.path.split("?")[0]
 
+    def _api_path(self):
+        """Normalize Forgejo's /api/v1 prefix to the GitHub-style mock routes."""
+        path = self._path_only()
+        return path.removeprefix("/api/v1")
+
     def _query_params(self):
         """Parse query string into dict."""
         from urllib.parse import parse_qs, urlparse
@@ -225,7 +264,7 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         return json.loads(body) if body else {}
 
     def do_GET(self):
-        path = self._path_only()
+        path = self._api_path()
 
         # GET /repos/{owner}/{repo}/pulls
         m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls$", path)
@@ -262,6 +301,30 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
                 return self._send_json([])
             return self._send_error(404, "PR not found")
 
+        # GET /repos/{owner}/{repo}/pulls/{n}/files
+        m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls/(\d+)/files$", path)
+        if m:
+            pr_number = int(m.group(3))
+            if pr_number in state.prs:
+                state.update_pr_sha(pr_number)
+                return self._send_json(pr_files(state.prs[pr_number]))
+            return self._send_error(404, "PR not found")
+
+        # GET /repos/{owner}/{repo}/raw/{sha}/{path}
+        m = re.match(r"^/repos/([^/]+)/([^/]+)/raw/([^/]+)/(.+)$", path)
+        if m:
+            sha = m.group(3)
+            file_path = m.group(4)
+            content = git_output("show", f"{sha}:{file_path}")
+            if content is None:
+                return self._send_error(404, "File not found")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(content.encode("utf-8"))
+            self._log_request(200)
+            return
+
         # GET /repos/{owner}/{repo}/pulls/{n}
         m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls/(\d+)$", path)
         if m:
@@ -270,6 +333,56 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
                 state.update_pr_sha(pr_number)
                 return self._send_json(state.prs[pr_number])
             return self._send_error(404, "PR not found")
+
+        # GET /repos/{owner}/{repo}/commits/{sha}/status
+        m = re.match(r"^/repos/([^/]+)/([^/]+)/commits/([^/]+)/status$", path)
+        if m:
+            owner, repo, sha = m.groups()
+            return self._send_json({
+                "state": "success",
+                "sha": sha,
+                "context": "mock-ci",
+            })
+
+        # GET /repos/{owner}/{repo}/commits/{sha}/statuses
+        m = re.match(r"^/repos/([^/]+)/([^/]+)/commits/([^/]+)/statuses$", path)
+        if m:
+            owner, repo, sha = m.groups()
+            return self._send_json([{
+                "status": "success",
+                "sha": sha,
+                "context": "mock-ci",
+            }])
+
+        # GET /repos/{owner}/{repo}/actions/runs
+        m = re.match(r"^/repos/([^/]+)/([^/]+)/actions/runs$", path)
+        if m:
+            branch = self._query_params().get("branch", ["main"])[0]
+            head_sha = resolve_sha(branch) or resolve_sha("main") or "mock-sha"
+            return self._send_json({
+                "workflow_runs": [{
+                    "name": "mock-ci",
+                    "display_title": "mock-ci",
+                    "prettyref": f"refs/heads/{branch}",
+                    "commit_sha": head_sha,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                }]
+            })
+
+        # GET /admin/actions/runners
+        if path == "/admin/actions/runners":
+            return self._send_json({
+                "runners": [{
+                    "name": "mock-runner",
+                    "status": "online",
+                    "busy": False,
+                    "disabled": False,
+                    "last_online": "2026-01-01T00:00:00Z",
+                }]
+            })
 
         # GET /repos/{owner}/{repo}/commits/{sha}/check-runs
         m = re.match(r"^/repos/([^/]+)/([^/]+)/commits/([^/]+)/check-runs$", path)
@@ -305,10 +418,11 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         return self._send_error(404, "Not Found")
 
     def do_POST(self):
-        path = self._path_only()
+        raw_path = self._path_only()
+        path = self._api_path()
 
         # POST /_control/reviews — test driver adds a review to a PR
-        if path == "/_control/reviews":
+        if raw_path == "/_control/reviews":
             try:
                 data = self._read_body()
                 pr_number = data.get("pr_number")
@@ -320,6 +434,29 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
                 return self._send_json(review, 201)
             except (json.JSONDecodeError, KeyError) as e:
                 return self._send_error(400, f"Invalid request: {e}")
+
+        # POST /repos/{owner}/{repo}/pulls/{n}/reviews
+        m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls/(\d+)/reviews$", path)
+        if m:
+            pr_number = int(m.group(3))
+            if pr_number not in state.prs:
+                return self._send_error(404, "PR not found")
+            try:
+                data = self._read_body()
+                event = data.get("event", "APPROVED")
+                body = data.get("body", "")
+                review = state.add_review(pr_number, event, body)
+                return self._send_json(review, 200)
+            except json.JSONDecodeError:
+                return self._send_error(400, "Invalid JSON")
+
+        # POST /repos/{owner}/{repo}/pulls/{n}/merge
+        m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls/(\d+)/merge$", path)
+        if m:
+            pr_number = int(m.group(3))
+            if state.merge_pr(pr_number):
+                return self._send_json({"merged": True, "sha": "abc123"})
+            return self._send_error(404, "PR not found")
 
         # POST /repos/{owner}/{repo}/pulls
         m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls$", path)
@@ -339,7 +476,7 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         return self._send_error(404, "Not Found")
 
     def do_PUT(self):
-        path = self._path_only()
+        path = self._api_path()
 
         # PUT /repos/{owner}/{repo}/pulls/{n}/merge
         m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls/(\d+)/merge$", path)
@@ -352,7 +489,7 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         return self._send_error(404, "Not Found")
 
     def do_PATCH(self):
-        path = self._path_only()
+        path = self._api_path()
 
         # PATCH /repos/{owner}/{repo}/pulls/{n} — update PR body/title
         m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls/(\d+)$", path)

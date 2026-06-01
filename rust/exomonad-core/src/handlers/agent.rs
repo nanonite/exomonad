@@ -158,6 +158,26 @@ impl<
     ) {
         self.register_synthetic_member(member_name, member_type, ctx)
             .await;
+
+        let team_reg = self.ctx.team_registry();
+        let agent_key = ctx.agent_name.to_string();
+        let parent_team = match team_reg.get(&agent_key).await {
+            Some(info) => Some(info),
+            None => team_reg.get(ctx.birth_branch.as_ref()).await,
+        };
+        if let Some(parent_team) = parent_team {
+            let team_info = claude_teams_bridge::TeamInfo {
+                team_name: parent_team.team_name.clone(),
+                inbox_name: member_name.to_string(),
+            };
+            let child_birth_branch = format!("{}.{}", ctx.birth_branch, member_name);
+            team_reg
+                .register(member_name.as_ref(), team_info.clone())
+                .await;
+            team_reg.register(supervisor_key, team_info.clone()).await;
+            team_reg.register(&child_birth_branch, team_info).await;
+        }
+
         self.register_child_supervisor(supervisor_key, ctx).await;
     }
 

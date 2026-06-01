@@ -230,6 +230,15 @@ e2e-claude-only:
 check-e2e-claude-only:
     bash -n tests/e2e/claude-only/run.sh
 
+# Run E2E Claude Teams inbox review chain (Claude TL -> Claude dev leaf -> Claude reviewer)
+e2e-claude-teams-inbox:
+    ./tests/e2e/claude-teams-inbox/run.sh
+
+# Check Claude Teams inbox review-chain harness scripts without launching Claude/tmux
+check-e2e-claude-teams-inbox:
+    bash -n tests/e2e/claude-teams-inbox/run.sh
+    bash -n tests/e2e/claude-teams-inbox/validate.sh
+
 # Run E2E OpenCode hook rewrite test (BeforeModel/AfterModel PII term rewriting)
 e2e-oc-rewrite:
     ./tests/e2e/hook-rewrite/run.sh

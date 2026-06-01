@@ -11,13 +11,13 @@ use exomonad_proto::effects::github::{
     CreatePullRequestRequest, CreatePullRequestResponse, GetIssueRequest, GetIssueResponse,
     GetPullRequestRequest, GetPullRequestResponse, GetPullRequestReviewCommentsRequest,
     GetPullRequestReviewCommentsResponse, IssueState, ListIssuesRequest, ListIssuesResponse,
-    ListPullRequestsRequest, ListPullRequestsResponse, PullRequest,
+    ListPullRequestsRequest, ListPullRequestsResponse, PullRequest, Review, ReviewState, User,
 };
 use prost::Message;
 
 use crate::domain::{BranchName, GithubOwner, GithubRepo, PRNumber};
 use crate::effects::{EffectContext, EffectError, EffectHandler, EffectResult};
-use crate::services::forgejo::ForgejoPullRequest;
+use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
 use crate::services::{repo, HasForgejoClient, HasProjectDir};
 
 pub struct ForgejoAsGitHubHandler<C> {
@@ -43,9 +43,20 @@ where
             .get_pull_request(&owner, &repo, number)
             .await
             .map_err(|e| EffectError::network_error(e.to_string()))?;
+        let reviews = if req.include_reviews {
+            forgejo
+                .list_pull_request_reviews(&owner, &repo, number)
+                .await
+                .map_err(|e| EffectError::network_error(e.to_string()))?
+                .into_iter()
+                .map(forgejo_review_to_proto)
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(GetPullRequestResponse {
             pull_request: Some(forgejo_pr_to_proto(pull_request)),
-            reviews: Vec::new(),
+            reviews,
         }
         .encode_to_vec())
     }
@@ -184,6 +195,31 @@ fn branch_name(value: &str) -> EffectResult<BranchName> {
     BranchName::try_from_str(value).map_err(|e| EffectError::invalid_input(e.to_string()))
 }
 
+fn forgejo_review_state_to_proto(state: &str) -> i32 {
+    match state.trim().to_ascii_uppercase().as_str() {
+        "APPROVED" => ReviewState::Approved as i32,
+        "CHANGES_REQUESTED" => ReviewState::ChangesRequested as i32,
+        "COMMENTED" => ReviewState::Commented as i32,
+        "PENDING" => ReviewState::Pending as i32,
+        _ => ReviewState::Unspecified as i32,
+    }
+}
+
+fn forgejo_review_to_proto(review: ForgejoPullRequestReview) -> Review {
+    Review {
+        id: 0,
+        author: Some(User {
+            login: "forgejo-reviewer".to_string(),
+            id: 0,
+            avatar_url: String::new(),
+        }),
+        state: forgejo_review_state_to_proto(&review.state),
+        body: review.body,
+        submitted_at: 0,
+        commit_id: review.commit_id.unwrap_or_default(),
+    }
+}
+
 pub fn forgejo_pr_to_proto(pr: ForgejoPullRequest) -> PullRequest {
     let state = if pr.state == "closed" || pr.merged {
         IssueState::Closed
@@ -243,5 +279,30 @@ mod tests {
 
         assert_eq!(proto.state, IssueState::Closed as i32);
         assert_eq!(proto.head_sha, "");
+    }
+
+    #[test]
+    fn forgejo_review_maps_approved_state_and_commit() {
+        let proto = forgejo_review_to_proto(ForgejoPullRequestReview {
+            state: "APPROVED".to_string(),
+            body: "looks good".to_string(),
+            commit_id: Some("abc123".to_string()),
+        });
+
+        assert_eq!(proto.state, ReviewState::Approved as i32);
+        assert_eq!(proto.body, "looks good");
+        assert_eq!(proto.commit_id, "abc123");
+    }
+
+    #[test]
+    fn forgejo_review_maps_unknown_state_to_unspecified() {
+        let proto = forgejo_review_to_proto(ForgejoPullRequestReview {
+            state: "STALE".to_string(),
+            body: String::new(),
+            commit_id: None,
+        });
+
+        assert_eq!(proto.state, ReviewState::Unspecified as i32);
+        assert_eq!(proto.commit_id, "");
     }
 }

@@ -1,6 +1,6 @@
 use crate::domain::{BranchName, CIStatus, GithubOwner, GithubRepo, PRNumber};
-use anyhow::{Context, Result, anyhow};
-use reqwest::{StatusCode, Url, header};
+use anyhow::{anyhow, Context, Result};
+use reqwest::{header, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1389,14 +1389,19 @@ mod tests {
     fn new_fj_selects_fj_backend() {
         let client = ForgejoClient::new_fj("/tmp/exomonad-project");
         match &client.backend {
-            ForgejoBackend::Fj(fj) => assert_eq!(fj.project_dir, PathBuf::from("/tmp/exomonad-project")),
+            ForgejoBackend::Fj(fj) => {
+                assert_eq!(fj.project_dir, PathBuf::from("/tmp/exomonad-project"))
+            }
             ForgejoBackend::Http(_) => panic!("expected fj backend"),
         }
     }
 
     #[test]
     fn combine_commit_statuses_prefers_failure_then_pending_then_success() {
-        let status = |status| ForgejoCommitStatus { status, context: None };
+        let status = |status| ForgejoCommitStatus {
+            status,
+            context: None,
+        };
         assert_eq!(
             combine_commit_statuses(vec![status(CIStatus::Success), status(CIStatus::Failure)]),
             CIStatus::Failure
