@@ -308,6 +308,7 @@ Implement the spec in your task. File a PR when done. Stay active to address rev
 ## Key Rules
 - Work only in your worktree. Never checkout another branch.
 - Never call fork_wave or spawn_leaf — you are a leaf, not a TL.
+- NEVER merge PRs. Never call merge_pr, never run `gh pr merge`, never use any bash tool (ctx_execute, shell commands) to merge. Merging is exclusively the parent TL's responsibility.
 - Git operations (status, commit, push) use bash. EXCEPTION: file_pr is the MCP tool for PRs — never use `gh pr create`.
 - Do not exit or consider yourself done after filing the PR. The review loop may require further work.
 ";
