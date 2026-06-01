@@ -12,8 +12,10 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import AllRoles (lookupRole, roleListTools)
 import DevPhase (DevEvent (..), DevPhase (..))
+import DevRole qualified
 import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
+import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), PRReviewEvent (..))
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
 import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
@@ -57,6 +59,8 @@ main = do
   assertApprovedCanExitOnWatcherMergeReady
   assertCITriggeredMergeReadyTransitionsToDoneAndExits
   assertCIFailureBlocksAfterTrigger
+  assertMergeReadyReviewNotifiesParent
+  assertMergeReadyCIStatusNotifiesParent
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -410,6 +414,41 @@ assertCIFailureBlocksAfterTrigger = do
     Transitioned (DevCIBlocked 9 "failure") -> pure ()
     other -> fail $ "expected DevCIBlocked after failed CI, got " <> showDevTransition other
   assertBlocks "ci blocked terminal" (canExit @DevPhase @DevEvent (DevCIBlocked 9 "failure"))
+
+assertMergeReadyReviewNotifiesParent :: IO ()
+assertMergeReadyReviewNotifiesParent = do
+  action <- runPRReviewEvent DevRole.config (MergeReady 9 "success" "main.feature")
+  assertNotifyParent "merge-ready pr_review" 9 action
+
+assertMergeReadyCIStatusNotifiesParent :: IO ()
+assertMergeReadyCIStatusNotifiesParent = do
+  action <-
+    runCIStatusEvent
+      DevRole.config
+      (CIStatusEvent 9 "success" "main.feature" False True True)
+  assertNotifyParent "merge-ready ci_status" 9 action
+
+runPRReviewEvent :: RoleConfig tools -> PRReviewEvent -> IO EventAction
+runPRReviewEvent cfg event = do
+  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (onPRReview (eventHandlers cfg) event)
+  case status of
+    C.Done output -> pure output
+    C.Continue {} -> fail "PR review event unexpectedly suspended"
+
+runCIStatusEvent :: RoleConfig tools -> CIStatusEvent -> IO EventAction
+runCIStatusEvent cfg event = do
+  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (onCIStatus (eventHandlers cfg) event)
+  case status of
+    C.Done output -> pure output
+    C.Continue {} -> fail "CI status event unexpectedly suspended"
+
+assertNotifyParent :: String -> Int -> EventAction -> IO ()
+assertNotifyParent label_ expectedPr action =
+  case action of
+    NotifyParentAction message prNumber -> do
+      assertEqual (label_ <> " pr_number") expectedPr prNumber
+      assertBool (label_ <> " message") ("[MERGE READY]" `T.isInfixOf` message)
+    other -> fail $ label_ <> ": expected NotifyParentAction, got " <> show other
 
 showDevTransition :: TransitionResult DevPhase -> String
 showDevTransition (Transitioned phase) = "Transitioned " <> show phase
