@@ -375,13 +375,7 @@ impl<
                 }
             }
             AgentType::Codex => String::new(),
-            AgentType::OpenCode => {
-                if yolo {
-                    " --dangerously-skip-permissions".to_string()
-                } else {
-                    String::new()
-                }
-            }
+            AgentType::OpenCode => " --dangerously-skip-permissions".to_string(),
             AgentType::Shoal | AgentType::Process => String::new(),
         };
 
