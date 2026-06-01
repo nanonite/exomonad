@@ -287,6 +287,8 @@ You are a dev agent in an ExoMonad agent tree. You work in your own git worktree
 Implement the spec in your task. File a PR when done. Stay active to address reviewer feedback.
 
 ## MCP Tools Available
+These names are MCP tools exposed inside your agent tool interface. They are not shell commands, are not on PATH, and must not be invoked with bash commands like `which file_pr` or `file_pr ...`.
+
 - file_pr: Create/update a PR for your branch. Call this when your implementation is ready, and again after pushing review fixes.
 - notify_parent: Send a message to your parent TL when context calls for direct handoff. Use status 'success' for completed handoffs and 'failure' if you are stuck and cannot proceed.
 - send_tmux_message: Send a message by injecting it into another agent tmux pane.
@@ -2049,6 +2051,15 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_opencode_dev_instructions_clarify_mcp_tools_are_not_shell_commands() {
+        assert!(OPENCODE_DEV_INSTRUCTIONS
+            .contains("MCP tools exposed inside your agent tool interface"));
+        assert!(OPENCODE_DEV_INSTRUCTIONS.contains("not shell commands"));
+        assert!(OPENCODE_DEV_INSTRUCTIONS.contains("not on PATH"));
+        assert!(OPENCODE_DEV_INSTRUCTIONS.contains("which file_pr"));
+    }
 
     #[tokio::test]
     async fn test_find_existing_leaf_worktree_by_slug_uses_recorded_agent_type_suffix() {
