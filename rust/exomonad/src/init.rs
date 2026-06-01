@@ -551,13 +551,16 @@ pub async fn run(
         config.spawn_agent_type = parse_agent_type(worker_type)?;
     }
     if let Some(m) = tl_model {
-        if config.root_agent_type == AgentType::Codex {
-            config.model = Some(m.clone());
+        if config.root_agent_type == AgentType::OpenCode {
+            config.opencode.tl_model = Some(m);
+        } else {
+            config.model = Some(m);
         }
-        config.opencode.tl_model = Some(m);
     }
     if let Some(m) = worker_model {
-        config.opencode.worker_model = Some(m);
+        if config.spawn_agent_type == AgentType::OpenCode {
+            config.opencode.worker_model = Some(m);
+        }
     }
     if let Some(ref reviewer_type) = reviewer {
         config.reviewer.agent_type = parse_agent_type(reviewer_type)?;
