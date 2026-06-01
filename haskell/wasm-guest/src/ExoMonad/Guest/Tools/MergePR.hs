@@ -23,6 +23,7 @@ import Control.Monad (void, when)
 import Control.Monad.Freer (Eff)
 import Data.Aeson (FromJSON, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
+import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
 import Data.Map qualified as Map
 import Data.Maybe (fromMaybe)
@@ -58,7 +59,8 @@ data MergePRArgs = MergePRArgs
   { mprPrNumber :: Int,
     mprStrategy :: Maybe Text,
     mprWorkingDir :: Maybe Text,
-    mprForce :: Maybe Bool
+    mprForce :: Maybe Bool,
+    mprChainlinkIssueId :: Maybe Int
   }
   deriving (Show, Eq, Generic)
 
@@ -69,6 +71,7 @@ instance FromJSON MergePRArgs where
       <*> v .:? "strategy"
       <*> v .:? "working_dir"
       <*> v .:? "force"
+      <*> v .:? "chainlink_issue_id"
 
 data MergePROutput = MergePROutput
   { mpoSuccess :: Bool,
@@ -93,7 +96,7 @@ instance Aeson.ToJSON MergePROutput where
 
 -- | Shared tool description for merge_pr.
 mergePRDescription :: Text
-mergePRDescription = "Merge a GitHub pull request and fetch changes. Checks Forgejo reviewer status before merging: requires either a clean review (no change requests) or commits pushed after the latest review. Use force=true to bypass (e.g., after [REVIEW TIMEOUT]). After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact."
+mergePRDescription = "Merge a GitHub pull request and fetch changes. Checks Forgejo reviewer status before merging: requires either a clean review (no change requests) or commits pushed after the latest review. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. Use force=true to bypass reviewer readiness (e.g., after [REVIEW TIMEOUT]). After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact."
 
 -- | Shared tool schema for merge_pr.
 mergePRSchema :: Aeson.Object
@@ -102,7 +105,8 @@ mergePRSchema =
     [ ("pr_number", "PR number to merge"),
       ("strategy", "Merge strategy: squash (default), merge, or rebase"),
       ("working_dir", "Working directory for git operations"),
-      ("force", "Skip Forgejo reviewer check and merge immediately (use after [REVIEW TIMEOUT])")
+      ("force", "Skip Forgejo reviewer check and merge immediately (use after [REVIEW TIMEOUT])"),
+      ("chainlink_issue_id", "Optional Chainlink issue ID to close and commit CHANGELOG.md before merging")
     ]
 
 -- | Core merge_pr I/O: self-merge guard + readiness check + merge + cleanup + git pull.
@@ -172,7 +176,12 @@ pullFailureNext output =
 
 pullFailureSummary :: Int -> Text -> Text -> Text
 pullFailureSummary exitCode stdout stderr =
-  "git pull failed (exit code "
+  commandFailureSummary "git pull" exitCode stdout stderr
+
+commandFailureSummary :: Text -> Int -> Text -> Text -> Text
+commandFailureSummary label exitCode stdout stderr =
+  label
+    <> " failed (exit code "
     <> T.pack (show exitCode)
     <> "): "
     <> firstDiagnosticLine stderr stdout
@@ -313,9 +322,105 @@ extractAgentName branch
       [] -> Nothing
       (slug : _) -> Just slug
 
+chainlinkChangelogCommitMessage :: Int -> Text
+chainlinkChangelogCommitMessage issueId =
+  "Update changelog for Chainlink issue #" <> T.pack (show issueId)
+
+mergePRWorkingDir :: MergePRArgs -> Text
+mergePRWorkingDir args =
+  fromMaybe "." (mprWorkingDir args)
+
+closeIssueAndCommitChangelog :: MergePRArgs -> Eff Effects (Either Text ())
+closeIssueAndCommitChangelog args =
+  case mprChainlinkIssueId args of
+    Nothing -> pure $ Right ()
+    Just issueId -> do
+      let workingDir = mergePRWorkingDir args
+      closeResult <-
+        runPreMergeCommand
+          workingDir
+          "close Chainlink issue"
+          "chainlink"
+          ["close", T.pack (show issueId), "-q"]
+      case closeResult of
+        Left err -> pure $ Left err
+        Right () -> do
+          addResult <-
+            runPreMergeCommand
+              workingDir
+              "stage CHANGELOG.md"
+              "git"
+              ["add", "CHANGELOG.md"]
+          case addResult of
+            Left err -> pure $ Left err
+            Right () ->
+              runPreMergeCommand
+                workingDir
+                "commit CHANGELOG.md"
+                "git"
+                ["commit", "-m", chainlinkChangelogCommitMessage issueId]
+
+runPreMergeCommand :: Text -> Text -> Text -> [Text] -> Eff Effects (Either Text ())
+runPreMergeCommand workingDir label command args = do
+  void $
+    suspendEffect_ @LogInfo
+      ( Log.InfoRequest
+          { Log.infoRequestMessage = TL.fromStrict $ "MergePR: " <> label,
+            Log.infoRequestFields = ""
+          }
+      )
+  result <-
+    suspendEffect @ProcessRun
+      Proc.RunRequest
+        { Proc.runRequestCommand = TL.fromStrict command,
+          Proc.runRequestArgs = V.fromList (map TL.fromStrict args),
+          Proc.runRequestWorkingDir = TL.fromStrict workingDir,
+          Proc.runRequestEnv = Map.empty,
+          Proc.runRequestTimeoutMs = 30000
+        }
+  case result of
+    Left err -> do
+      let message = label <> " failed before exit code was captured: " <> T.pack (show err)
+      logPreMergeFailure message ""
+      pure $ Left message
+    Right resp
+      | Proc.runResponseExitCode resp == 0 -> pure $ Right ()
+      | otherwise -> do
+          let exitCode = fromIntegral (Proc.runResponseExitCode resp)
+              stdoutText = TL.toStrict (Proc.runResponseStdout resp)
+              stderrText = TL.toStrict (Proc.runResponseStderr resp)
+              message = commandFailureSummary label exitCode stdoutText stderrText
+              fields =
+                TE.encodeUtf8 $
+                  "exit_code="
+                    <> T.pack (show exitCode)
+                    <> "\nstdout:\n"
+                    <> stdoutText
+                    <> "\nstderr:\n"
+                    <> stderrText
+          logPreMergeFailure message fields
+          pure $ Left message
+
+logPreMergeFailure :: Text -> BS.ByteString -> Eff Effects ()
+logPreMergeFailure message fields =
+  void $
+    suspendEffect_ @LogError
+      ( Log.ErrorRequest
+          { Log.errorRequestMessage = TL.fromStrict $ "MergePR: " <> message,
+            Log.errorRequestFields = fields
+          }
+      )
+
 -- | Execute the actual merge after readiness check passes.
 doMerge :: MergePRArgs -> Eff Effects (Either Text MergePROutput)
 doMerge args = do
+  preMergeResult <- closeIssueAndCommitChangelog args
+  case preMergeResult of
+    Left err -> pure $ Left err
+    Right () -> runMerge args
+
+runMerge :: MergePRArgs -> Eff Effects (Either Text MergePROutput)
+runMerge args = do
   let req =
         MP.MergePrRequest
           { MP.mergePrRequestPrNumber = fromIntegral (mprPrNumber args),

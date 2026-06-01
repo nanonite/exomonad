@@ -68,8 +68,8 @@ Use `chainlink_issue_list` to inspect open work when a blocker is resolved.
 When a child sends `notify_parent` with success:
 1. Confirm the child ended its Chainlink session with handoff notes
 2. Verify CI passes on the child's PR
-3. Merge the child's PR
-4. Close the child's Chainlink issue with `chainlink_issue_close`
+3. Merge the child's PR. For dev-leaf PRs, pass `chainlink_issue_id` to `merge_pr` so it closes the issue and commits `CHANGELOG.md` before merging
+4. Close any worker-owned Chainlink issue with `chainlink_issue_close`, then immediately stage and commit `CHANGELOG.md` before spawning the next wave or calling `merge_pr`
 5. If all children are done and no more waves remain, file PR upward and `notify_parent` with success
 
 ## Available MCP Tools

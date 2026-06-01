@@ -36,7 +36,7 @@ When calling `fork_wave`, set `agent_type` on each child to `{{spawn_agent_type}
 
 ## Notification Vocabulary
 
-- `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Merge, verify, then close the child issue.
+- `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Call `merge_pr` with `chainlink_issue_id` so it closes the child issue and commits `CHANGELOG.md` before merging, then verify.
 
 The review-loop watcher routes all non-merge-ready outcomes (`dev_not_pushing`,
 `reviewer_not_responding`, `reviewer_never_started`, and `dev_failed`) to the

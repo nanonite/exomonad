@@ -20,7 +20,7 @@ import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandler
 import ExoMonad.Guest.Events.Templates qualified as Tpl
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
 import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
-import ExoMonad.Guest.Tools.MergePR (mergePRDescription, mergePRSchema)
+import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), mergePRDescription, mergePRSchema)
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (ChainlinkDbPathState (..), HookConfig (..), RoleConfig (..), validateChainlinkDbEnv)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
@@ -456,12 +456,18 @@ assertNotifyParent label_ expectedPr action =
 assertReviewerFacingTextDoesNotMentionCopilot :: IO ()
 assertReviewerFacingTextDoesNotMentionCopilot = do
   assertNoCopilot "merge_pr description" mergePRDescription
-  assertNoCopilot "merge_pr schema" (T.pack (BSL.unpack (Aeson.encode mergePRSchema)))
+  let mergePrSchemaText = T.pack (BSL.unpack (Aeson.encode mergePRSchema))
+  assertNoCopilot "merge_pr schema" mergePrSchemaText
+  assertContains "merge_pr schema" "chainlink_issue_id" mergePrSchemaText
   assertNoCopilot "prReady" (Tpl.prReady 42)
   assertNoCopilot "reviewTimeout" (Tpl.reviewTimeout 42 15)
   assertContains "merge_pr description" "Forgejo reviewer" mergePRDescription
+  assertContains "merge_pr description issue id" "chainlink_issue_id" mergePRDescription
   assertContains "prReady" "Forgejo reviewer" (Tpl.prReady 42)
   assertContains "reviewTimeout" "Forgejo reviewer" (Tpl.reviewTimeout 42 15)
+  case Aeson.fromJSON (Aeson.object ["pr_number" Aeson..= (7 :: Int), "chainlink_issue_id" Aeson..= (42 :: Int)]) of
+    Aeson.Success args -> assertEqual "merge_pr parses chainlink_issue_id" (Just 42) (mprChainlinkIssueId args)
+    Aeson.Error err -> fail $ "merge_pr args parse failed: " <> err
 
 assertNoCopilot :: String -> Text -> IO ()
 assertNoCopilot label_ value =
