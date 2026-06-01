@@ -125,6 +125,41 @@ fn dirty_spawn_error(files: &[String]) -> anyhow::Error {
     anyhow!(message)
 }
 
+async fn is_gitignored_path(worktree: &Path, file: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["check-ignore", "--no-index", "-q", "--", file])
+        .current_dir(worktree)
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect gitignore rules in {}",
+                worktree.display()
+            )
+        })?;
+
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "failed to inspect gitignore rules for {} in {}: {}",
+            file,
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+async fn filter_gitignored_paths(worktree: &Path, files: Vec<String>) -> Result<Vec<String>> {
+    let mut visible_files = Vec::new();
+    for file in files {
+        if !is_gitignored_path(worktree, &file).await? {
+            visible_files.push(file);
+        }
+    }
+    Ok(visible_files)
+}
+
 async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
@@ -142,6 +177,7 @@ async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
     }
 
     let files = parse_git_status_paths(&String::from_utf8_lossy(&output.stdout));
+    let files = filter_gitignored_paths(worktree, files).await?;
     if files.is_empty() {
         Ok(())
     } else {
@@ -2060,6 +2096,77 @@ mod tests {
                 "scratch.txt".to_string(),
             ]
         );
+    }
+
+    async fn run_git_test_command(worktree: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(worktree)
+            .output()
+            .await
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn init_test_repo(worktree: &Path) {
+        run_git_test_command(worktree, &["init", "-q"]).await;
+        run_git_test_command(worktree, &["config", "user.email", "test@example.com"]).await;
+        run_git_test_command(worktree, &["config", "user.name", "Test User"]).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clean_spawn_worktree_ignores_gitignored_tracked_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree = temp_dir.path();
+        init_test_repo(worktree).await;
+
+        fs::write(worktree.join(".gitignore"), "*.db\n")
+            .await
+            .unwrap();
+        fs::create_dir_all(worktree.join(".chainlink"))
+            .await
+            .unwrap();
+        fs::write(worktree.join(".chainlink/issues.db"), "before")
+            .await
+            .unwrap();
+        run_git_test_command(worktree, &["add", ".gitignore"]).await;
+        run_git_test_command(worktree, &["add", "-f", ".chainlink/issues.db"]).await;
+        run_git_test_command(worktree, &["commit", "-q", "-m", "init"]).await;
+
+        fs::write(worktree.join(".chainlink/issues.db"), "after")
+            .await
+            .unwrap();
+
+        ensure_clean_spawn_worktree(worktree).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clean_spawn_worktree_blocks_nonignored_dirty_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree = temp_dir.path();
+        init_test_repo(worktree).await;
+
+        fs::create_dir_all(worktree.join("src")).await.unwrap();
+        fs::write(worktree.join("src/lib.rs"), "before")
+            .await
+            .unwrap();
+        run_git_test_command(worktree, &["add", "src/lib.rs"]).await;
+        run_git_test_command(worktree, &["commit", "-q", "-m", "init"]).await;
+
+        fs::write(worktree.join("src/lib.rs"), "after")
+            .await
+            .unwrap();
+
+        let message = ensure_clean_spawn_worktree(worktree)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("src/lib.rs"));
+        assert!(message.contains("dirty TL worktree"));
     }
 
     #[test]
