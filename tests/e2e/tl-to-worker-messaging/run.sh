@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# E2E TL-to-Worker Messaging Test
-# Validates Codex TL -> OpenCode spawn_worker pane tmux messaging round-trip.
+# E2E mixed agent chain test.
+# Validates Claude TL -> OpenCode spawn_worker pane messaging, with Codex
+# configured as the reviewer runtime for PR review paths.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -22,12 +23,13 @@ else
 fi
 echo "  exomonad: $EXOMONAD_BIN"
 
-for cmd in codex opencode tmux git python3; do
+for cmd in claude codex opencode tmux git python3; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: $cmd not found in PATH."
         exit 1
     fi
 done
+echo "  claude: $(command -v claude)"
 echo "  codex: $(command -v codex)"
 echo "  opencode: $(command -v opencode)"
 echo "  tmux, git, python3: OK"
@@ -38,7 +40,7 @@ if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-g
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
 
-for tool in spawn_worker send_tmux_message notify_parent fork_wave; do
+for tool in spawn_worker send_tmux_message notify_parent; do
     if grep -q "$tool" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
         echo "  MCP tool '$tool': FOUND"
     else
@@ -50,8 +52,8 @@ done
 echo ">>> [Phase 1] Creating temp environment..."
 
 mkdir -p "$HOME/.cache/exomonad-e2e"
-WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/tl-to-worker-messaging.XXXXXXXX")"
-SESSION="e2e-tl-to-worker-messaging"
+WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/mixed-agent-chain.XXXXXXXX")"
+SESSION="e2e-mixed-agent-chain"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
@@ -90,7 +92,7 @@ git config user.name "Exomonad E2E"
 git config user.email "e2e@example.com"
 
 cat > README.md <<'EOF'
-# TL-to-Worker Messaging E2E Fixture
+# Mixed Agent Chain E2E Fixture
 
 This repository is created by tests/e2e/tl-to-worker-messaging/run.sh.
 EOF
@@ -111,6 +113,47 @@ if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
     rm -rf .exo/roles
     cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
 fi
+
+trust_claude_project() {
+    local project_path="$1"
+    python3 - "$project_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+project = str(Path(sys.argv[1]).resolve())
+claude_json = Path.home() / ".claude.json"
+
+if claude_json.exists():
+    try:
+        data = json.loads(claude_json.read_text())
+    except json.JSONDecodeError:
+        data = {}
+else:
+    data = {}
+
+projects = data.setdefault("projects", {})
+entry = projects.setdefault(project, {})
+entry.setdefault("allowedTools", [])
+entry.setdefault("disabledMcpjsonServers", [])
+entry.setdefault("enabledMcpjsonServers", [])
+entry.setdefault("exampleFiles", [])
+entry["hasClaudeMdExternalIncludesApproved"] = False
+entry["hasClaudeMdExternalIncludesWarningShown"] = False
+entry["hasTrustDialogAccepted"] = True
+entry.setdefault("mcpContextUris", [])
+entry.setdefault("mcpServers", {})
+entry.setdefault("projectOnboardingSeenCount", 0)
+entry["hasCompletedProjectOnboarding"] = True
+
+claude_json.parent.mkdir(parents=True, exist_ok=True)
+tmp_path = claude_json.with_suffix(claude_json.suffix + ".tmp")
+tmp_path.write_text(json.dumps(data, indent=2) + "\n")
+tmp_path.replace(claude_json)
+PY
+}
+
+trust_claude_project "$REPO_DIR"
 
 ROOT_PROMPT="$(python3 - "$SCRIPT_DIR/e2e-test.md" <<'PY'
 import pathlib
@@ -134,9 +177,9 @@ default_role = "devswarm"
 wasm_name = "devswarm"
 shell_command = "bash"
 tmux_session = "$SESSION"
-root_agent_type = "codex"
-spawn_agent_type = "codex"
-model = "gpt-5.4-mini"
+root_agent_type = "claude"
+spawn_agent_type = "opencode"
+model = "haiku"
 yolo = true
 poll_interval = 5
 initial_prompt = """
@@ -146,6 +189,10 @@ $ROOT_PROMPT
 [opencode]
 worker_model = "opencode-go/deepseek-v4-flash"
 use_embedded_key = true
+
+[reviewer]
+agent_type = "codex"
+model = "gpt-5.4-mini"
 
 [[companions]]
 name = "tl-to-worker-validator"
@@ -168,7 +215,7 @@ cat > "$CODEX_HOME_DIR/config.toml" <<EOF
 [projects."$REPO_DIR"]
 trust_level = "trusted"
 
-[projects."$REPO_DIR/.exo/worktrees/tl-to-worker-messaging-tl-codex"]
+[projects."$REPO_DIR/.exo/worktrees/review-pr-1-codex"]
 trust_level = "trusted"
 EOF
 
@@ -188,15 +235,16 @@ echo "  Codex config isolated to $CODEX_HOME"
 echo ">>> [Phase 3] Launching exomonad init..."
 echo ""
 echo "============================================"
-echo "  E2E TL-to-Worker Messaging Test Ready"
+echo "  E2E Mixed Agent Chain Test Ready"
 echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
 echo ""
 echo "  Chain under test:"
-echo "    Codex root -> Codex TL"
-echo "    Codex TL -> spawn_worker(agent_type=opencode)"
-echo "    Codex TL -> send_tmux_message -> OpenCode worker pane"
-echo "    OpenCode worker -> notify_parent -> Codex TL"
+echo "    Claude root TL"
+echo "    Claude TL -> spawn_worker(agent_type=opencode)"
+echo "    Claude TL -> send_tmux_message -> OpenCode worker pane"
+echo "    OpenCode worker -> notify_parent -> Claude TL"
+echo "    Reviewer runtime configured as Codex"
 echo "============================================"
 echo ""
 

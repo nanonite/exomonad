@@ -255,11 +255,11 @@ check-e2e-codex-messaging:
     bash -n tests/e2e/codex-messaging/run.sh
     bash -n tests/e2e/codex-messaging/validate.sh
 
-# Run E2E TL-to-worker pane messaging test (Codex TL -> OpenCode worker pane)
+# Run E2E mixed agent chain test (Claude TL -> OpenCode worker, Codex reviewer config)
 e2e-tl-to-worker-messaging:
     ./tests/e2e/tl-to-worker-messaging/run.sh
 
-# Check E2E TL-to-worker pane messaging scripts without launching Codex/OpenCode/tmux
+# Check E2E mixed agent chain scripts without launching Claude/OpenCode/Codex/tmux
 check-e2e-tl-to-worker-messaging:
     bash -n tests/e2e/tl-to-worker-messaging/run.sh
     bash -n tests/e2e/tl-to-worker-messaging/validate.sh

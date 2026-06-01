@@ -1,17 +1,18 @@
-# TL-to-Worker Messaging E2E Validator
+# Mixed Agent Chain E2E Validator
 
-This test validates the pane-based tmux delivery path from a Codex TL to an OpenCode worker spawned with `spawn_worker`.
+This test validates the pane-based tmux delivery path from a Claude TL to an OpenCode worker spawned with `spawn_worker`, with Codex configured as the reviewer runtime.
 
 The automated validator in `validate.sh` checks:
 
-1. Codex root config exists.
-2. Codex TL worktree config exists with role `tl`.
-3. OpenCode worker agent config exists with role `worker`.
-4. Worker `routing.json` contains a pane id.
-5. The worker pane capture contains `[TL2WORKER-INJECTED]`.
-6. Logs record successful `send_tmux_message` delivery to the OpenCode worker.
-7. Logs record the worker `notify_parent` acknowledgement back to the Codex TL.
-8. Logs record the Codex TL completion notification back to root.
+1. Fixture config sets `root_agent_type = "claude"`.
+2. Fixture config sets `spawn_agent_type = "opencode"`.
+3. Fixture config sets `reviewer.agent_type = "codex"`.
+4. OpenCode worker agent config exists with role `worker`.
+5. Worker `routing.json` contains a pane id.
+6. The worker pane capture contains `[TL2WORKER-INJECTED]`.
+7. Logs record successful `send_tmux_message` delivery to the OpenCode worker.
+8. Logs record the worker `notify_parent` acknowledgement back to the Claude TL.
+9. Logs record the Claude TL completion notification.
 
 Run manually with:
 
