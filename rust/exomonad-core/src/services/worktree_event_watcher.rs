@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
+#[cfg(test)]
 const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Overall verdict derived from Forgejo reviews for a single open PR.
