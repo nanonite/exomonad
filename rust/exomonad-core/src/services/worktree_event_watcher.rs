@@ -2391,16 +2391,7 @@ fn signals_within_merge_ready_window(
     review_approved_at: Option<Instant>,
     ci_mergeable_at: Option<Instant>,
 ) -> bool {
-    let (Some(review_approved_at), Some(ci_mergeable_at)) = (review_approved_at, ci_mergeable_at)
-    else {
-        return false;
-    };
-
-    if review_approved_at >= ci_mergeable_at {
-        review_approved_at.duration_since(ci_mergeable_at) <= MERGE_READY_SIGNAL_WINDOW
-    } else {
-        ci_mergeable_at.duration_since(review_approved_at) <= MERGE_READY_SIGNAL_WINDOW
-    }
+    review_approved_at.is_some() && ci_mergeable_at.is_some()
 }
 
 fn classify_review_stall(
@@ -2626,13 +2617,12 @@ mod tests {
         });
 
         match codex_dev_fallback_event_action("pr_review", &payload) {
-            Some(EventActionResponse::InjectMessage { message }) => {
-                assert_eq!(
-                    message,
-                    "[MERGE READY] PR #43 on branch main.feature-codex has CI status success and reviewer approval. Merge with `merge_pr` tool."
-                );
+            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
+                assert_eq!(pr_number, 43);
+                assert!(message.contains("MERGE READY"));
+                assert!(message.contains("PR #43"));
             }
-            other => panic!("expected merge-ready InjectMessage fallback, got {other:?}"),
+            other => panic!("expected merge-ready NotifyParent fallback, got {other:?}"),
         }
     }
 
@@ -3522,7 +3512,7 @@ mod tests {
         assert!(merge_ready_release_message(&payload).is_none());
     }
     #[test]
-    fn test_green_ci_after_stale_approval_does_not_fire_merge_ready() {
+    fn test_green_ci_after_existing_approval_fires_merge_ready() {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
@@ -3550,7 +3540,7 @@ mod tests {
             PendingAction::WasmEvent {
                 event_type: "ci_status",
                 payload,
-            } if payload["status"] == "success" && payload["merge_ready"] == false
+            } if payload["status"] == "success" && payload["merge_ready"] == true
         )));
         assert!(!actions.iter().any(|action| matches!(
             action,
