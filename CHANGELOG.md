@@ -163,6 +163,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- fix-tl-model-routing: tl_model and worker_model must route to agent-type-specific config fields (#463)
+- merge_pr and event templates reference Copilot instead of Forgejo reviewer (#456)
+- Watcher not routing merge_ready event to TL when reviewer approves + CI passes (#455)
+- ensure_gitignore missing .chainlink/ entry blocks second spawn_leaf (#454)
 - Inject spawned OpenCode worker context (#331)
 - Design a real E2E test harness (replace per-test run.sh duplicates) (#281)
 - E2E test: agent lifecycle invariants (deferred) (#305)
