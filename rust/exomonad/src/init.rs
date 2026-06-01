@@ -1744,6 +1744,7 @@ pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
         ".claude/settings.local.json",
         ".opencode/",
         "opencode.json",
+        ".chainlink/",
     ]
     .into_iter()
     .filter(|line| !has_line(line))
@@ -2037,6 +2038,7 @@ mod tests {
             ".claude/settings.local.json",
             ".opencode/",
             "opencode.json",
+            ".chainlink/",
         ] {
             assert!(
                 content.lines().any(|line| line.trim() == expected),
