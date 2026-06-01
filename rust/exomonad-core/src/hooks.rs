@@ -327,7 +327,7 @@ fn generate_hook_config(exomonad_path: &Path) -> Value {
     let mut hooks = serde_json::Map::new();
 
     for (event_name, subcommand, needs_matcher) in HOOK_EVENTS {
-        let command = format!("{} hook {}", exomonad_path.display(), subcommand);
+        let command = render_hook_command(exomonad_path, subcommand);
 
         let hook_entry = json!({
             "type": "command",
@@ -351,6 +351,22 @@ fn generate_hook_config(exomonad_path: &Path) -> Value {
     }
 
     Value::Object(hooks)
+}
+
+fn render_hook_command(exomonad_path: &Path, subcommand: &str) -> String {
+    if exomonad_path.components().count() <= 1 {
+        return format!("exomonad hook {subcommand}");
+    }
+
+    let binary = shell_escape::escape(exomonad_path.display().to_string().into());
+    let fallback = shell_escape::escape("exomonad".into());
+
+    format!(
+        "sh -lc 'if [ -x \"$1\" ]; then exec \"$1\" hook \"$2\"; else exec {} hook \"$2\"; fi' sh {} {}",
+        fallback,
+        binary,
+        shell_escape::escape(subcommand.into())
+    )
 }
 
 /// Check if a hook entry looks like one we generated.
@@ -386,10 +402,10 @@ mod tests {
         assert!(pre_tool.is_array());
         let first = &pre_tool[0];
         assert_eq!(first["matcher"], "*");
-        assert!(first["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("hook pre-tool-use"));
+        let command = first["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.contains("sh -lc"));
+        assert!(command.contains("pre-tool-use"));
+        assert!(command.contains("exec exomonad hook"));
 
         // Check Stop doesn't have matcher at top level
         let stop = &config["Stop"];
@@ -399,7 +415,7 @@ mod tests {
         assert!(first["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("hook stop"));
+            .contains("stop"));
     }
 
     #[test]
@@ -417,7 +433,7 @@ mod tests {
         // Verify content
         let content = fs::read_to_string(config.settings_path()).unwrap();
         assert!(content.contains("PreToolUse"));
-        assert!(content.contains("exomonad hook pre-tool-use"));
+        assert!(content.contains("pre-tool-use"));
         assert!(content.contains(EXOMONAD_MARKER));
 
         // Drop config (triggers cleanup)
