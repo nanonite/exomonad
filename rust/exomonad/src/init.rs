@@ -462,6 +462,57 @@ async fn validate_opencode_model(model: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_codex_model(model: &str) -> Result<()> {
+    if !model.starts_with("gpt-") {
+        anyhow::bail!(
+            "Unknown Codex model `{model}`. Use a Codex/OpenAI model ID starting with `gpt-` \
+             (for example `gpt-5.2-codex`)."
+        );
+    }
+    Ok(())
+}
+
+fn validate_gemini_model(model: &str) -> Result<()> {
+    if !model.starts_with("gemini-") {
+        anyhow::bail!(
+            "Unknown Gemini model `{model}`. Use a Gemini model ID starting with `gemini-` \
+             (for example `gemini-2.5-pro`)."
+        );
+    }
+    Ok(())
+}
+
+fn validate_opencode_model_owner(
+    agent_type: AgentType,
+    model: Option<&str>,
+    model_field: &str,
+    harness_field: &str,
+) -> Result<()> {
+    if agent_type == AgentType::OpenCode || model.is_none() {
+        return Ok(());
+    }
+
+    let model = model.expect("checked above");
+    anyhow::bail!(
+        "{model_field} is set to `{model}`, but {harness_field} is `{}`. \
+         OpenCode model fields only apply when the matching harness is `opencode`.",
+        agent_type_str(agent_type)
+    );
+}
+
+fn validate_reviewer_model_for_harness(agent_type: AgentType, model: Option<&str>) -> Result<()> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+
+    match agent_type {
+        AgentType::Claude => validate_claude_model(model),
+        AgentType::Codex => validate_codex_model(model),
+        AgentType::Gemini => validate_gemini_model(model),
+        AgentType::OpenCode | AgentType::Shoal | AgentType::Process => Ok(()),
+    }
+}
+
 /// Run the init command: create or attach to tmux session.
 pub async fn run(
     session_override: Option<String>,
@@ -518,6 +569,19 @@ pub async fn run(
         config.openrouter.enabled = true;
     }
 
+    validate_opencode_model_owner(
+        config.root_agent_type,
+        config.opencode.tl_model.as_deref(),
+        "[opencode].tl_model",
+        "root_agent_type",
+    )?;
+    validate_opencode_model_owner(
+        config.spawn_agent_type,
+        config.opencode.worker_model.as_deref(),
+        "[opencode].worker_model",
+        "spawn_agent_type",
+    )?;
+
     if config.root_agent_type == AgentType::OpenCode {
         if let Some(m) = config.opencode.tl_model.as_deref() {
             validate_opencode_model(m).await?;
@@ -528,19 +592,15 @@ pub async fn run(
             validate_opencode_model(m).await?;
         }
     }
-    match config.reviewer.agent_type {
-        AgentType::OpenCode => {
-            if let Some(m) = config.reviewer.model.as_deref() {
-                validate_opencode_model(m).await?;
-            }
+    if config.reviewer.agent_type == AgentType::OpenCode {
+        if let Some(m) = config.reviewer.model.as_deref() {
+            validate_opencode_model(m).await?;
         }
-        AgentType::Claude => {
-            if let Some(m) = config.reviewer.model.as_deref() {
-                validate_claude_model(m)?;
-            }
-        }
-
-        _ => {}
+    } else {
+        validate_reviewer_model_for_harness(
+            config.reviewer.agent_type,
+            config.reviewer.model.as_deref(),
+        )?;
     }
 
     // Check OTel endpoint reachability if configured
@@ -2095,6 +2155,61 @@ mod tests {
         assert!(validate_claude_model("").is_err());
         assert!(validate_claude_model("haiku").is_err());
         assert!(validate_claude_model("haiku-model").is_err());
+    }
+
+    #[test]
+    fn test_validate_codex_model_rejects_non_codex_prefixes() {
+        assert!(validate_codex_model("gpt-5.2-codex").is_ok());
+        assert!(validate_codex_model("opencode-go/deepseek-v4-flash").is_err());
+        assert!(validate_codex_model("claude-sonnet-4-6").is_err());
+    }
+
+    #[test]
+    fn test_validate_gemini_model_rejects_non_gemini_prefixes() {
+        assert!(validate_gemini_model("gemini-2.5-pro").is_ok());
+        assert!(validate_gemini_model("gpt-5.2-codex").is_err());
+        assert!(validate_gemini_model("opencode-go/deepseek-v4-flash").is_err());
+    }
+
+    #[test]
+    fn test_opencode_tl_model_requires_opencode_root_harness() {
+        let error = validate_opencode_model_owner(
+            AgentType::Claude,
+            Some("opencode-go/deepseek-v4-flash"),
+            "[opencode].tl_model",
+            "root_agent_type",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("[opencode].tl_model"));
+        assert!(error.contains("root_agent_type is `claude`"));
+    }
+
+    #[test]
+    fn test_opencode_worker_model_requires_opencode_worker_harness() {
+        let error = validate_opencode_model_owner(
+            AgentType::Codex,
+            Some("opencode-go/deepseek-v4-flash"),
+            "[opencode].worker_model",
+            "spawn_agent_type",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("[opencode].worker_model"));
+        assert!(error.contains("spawn_agent_type is `codex`"));
+    }
+
+    #[test]
+    fn test_opencode_model_owner_allows_matching_harness() {
+        assert!(validate_opencode_model_owner(
+            AgentType::OpenCode,
+            Some("opencode-go/deepseek-v4-flash"),
+            "[opencode].worker_model",
+            "spawn_agent_type",
+        )
+        .is_ok());
     }
 
     #[test]
