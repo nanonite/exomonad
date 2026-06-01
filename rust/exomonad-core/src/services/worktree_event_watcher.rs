@@ -209,6 +209,38 @@ fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
     }
 }
 
+fn event_target_has_wasm_runtime(agent_type: AgentType) -> bool {
+    matches!(agent_type, AgentType::Claude | AgentType::Gemini)
+}
+
+fn log_missing_event_plugin(
+    branch: &str,
+    agent_name: &AgentName,
+    agent_type: AgentType,
+    role: &str,
+    event_type: &str,
+) {
+    if event_target_has_wasm_runtime(agent_type) {
+        tracing::error!(
+            branch,
+            lookup_key = %agent_name,
+            ?agent_type,
+            role,
+            event_type,
+            "No plugin found for event target; skipping event dispatch"
+        );
+    } else {
+        tracing::debug!(
+            branch,
+            lookup_key = %agent_name,
+            ?agent_type,
+            role,
+            event_type,
+            "No plugin found for non-WASM event target; skipping event dispatch"
+        );
+    }
+}
+
 /// Per-PR state tracked across poll cycles.
 #[derive(Debug, Clone)]
 struct WatchState {
@@ -1489,14 +1521,7 @@ where
                         return Ok(Some(action));
                     }
                 }
-                tracing::error!(
-                    branch,
-                    lookup_key = %agent_name,
-                    ?agent_type,
-                    role,
-                    event_type,
-                    "No plugin found for event target; skipping event dispatch"
-                );
+                log_missing_event_plugin(branch, &agent_name, agent_type, role, event_type);
                 return Ok(None);
             }
         };
@@ -3070,6 +3095,16 @@ mod tests {
             }
             other => panic!("expected DispatchTo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_only_wasm_event_targets_keep_missing_plugin_at_error_level() {
+        assert!(event_target_has_wasm_runtime(AgentType::Claude));
+        assert!(event_target_has_wasm_runtime(AgentType::Gemini));
+        assert!(!event_target_has_wasm_runtime(AgentType::Codex));
+        assert!(!event_target_has_wasm_runtime(AgentType::OpenCode));
+        assert!(!event_target_has_wasm_runtime(AgentType::Shoal));
+        assert!(!event_target_has_wasm_runtime(AgentType::Process));
     }
 
     #[test]
