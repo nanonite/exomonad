@@ -850,20 +850,11 @@ impl<
 
         let cleaned_reviewers =
             cleanup_force_reviewer_resources(&self.service, req.pr_number).await;
-        match clear_reviewer_review_artifacts(self.ctx.project_dir(), req.pr_number).await {
-            Ok(()) => Ok(CleanupReviewerLeafResponse {
-                success: true,
-                error: String::new(),
-                pr_number: req.pr_number,
-                cleaned_reviewers,
-            }),
-            Err(error) => Ok(CleanupReviewerLeafResponse {
-                success: false,
-                error: error.to_string(),
-                pr_number: req.pr_number,
-                cleaned_reviewers,
-            }),
-        }
+        Ok(cleanup_reviewer_leaf_response(
+            req.pr_number,
+            cleaned_reviewers,
+            clear_reviewer_review_artifacts(self.ctx.project_dir(), req.pr_number).await,
+        ))
     }
 
     async fn restart_review(
@@ -1688,6 +1679,33 @@ async fn clear_reviewer_review_artifacts(project_dir: &Path, pr_number: u64) -> 
     clear_watcher_pr_state(project_dir, pr_number).await
 }
 
+fn cleanup_reviewer_leaf_response(
+    pr_number: u64,
+    cleaned_reviewers: Vec<String>,
+    artifacts_result: anyhow::Result<()>,
+) -> CleanupReviewerLeafResponse {
+    match artifacts_result {
+        Err(error) => CleanupReviewerLeafResponse {
+            success: false,
+            error: error.to_string(),
+            pr_number,
+            cleaned_reviewers,
+        },
+        Ok(()) if cleaned_reviewers.is_empty() => CleanupReviewerLeafResponse {
+            success: false,
+            error: format!("No reviewer tmux windows matched pattern review-pr-{pr_number}-"),
+            pr_number,
+            cleaned_reviewers,
+        },
+        Ok(()) => CleanupReviewerLeafResponse {
+            success: true,
+            error: String::new(),
+            pr_number,
+            cleaned_reviewers,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RestartReviewArtifactReset {
     watcher_state_found: bool,
@@ -2239,6 +2257,29 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
         assert!(state["prs"].get("7").is_none());
         assert!(state["prs"].get("8").is_some());
+    }
+
+    #[test]
+    fn cleanup_reviewer_leaf_response_fails_when_no_reviewer_window_was_killed() {
+        let response = cleanup_reviewer_leaf_response(7, Vec::new(), Ok(()));
+
+        assert!(!response.success);
+        assert_eq!(response.pr_number, 7);
+        assert!(response.cleaned_reviewers.is_empty());
+        assert_eq!(
+            response.error,
+            "No reviewer tmux windows matched pattern review-pr-7-"
+        );
+    }
+
+    #[test]
+    fn cleanup_reviewer_leaf_response_succeeds_when_reviewer_window_was_killed() {
+        let response =
+            cleanup_reviewer_leaf_response(7, vec!["review-pr-7-codex".to_string()], Ok(()));
+
+        assert!(response.success);
+        assert_eq!(response.error, "");
+        assert_eq!(response.cleaned_reviewers, vec!["review-pr-7-codex"]);
     }
 
     #[tokio::test]
