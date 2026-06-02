@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- OpenCode dev-leafs and workers ask for permissions after regression in 92071935 (#466)
 - Add close_reviewer_window MCP tool for manual reviewer window cleanup (#472)
 - file_pr push_bookmark doesn't inject Forgejo token for HTTP remote auth (#470)
 - parse_github_url fails on local bare path remotes and non-GitHub SSH URLs (#468)
