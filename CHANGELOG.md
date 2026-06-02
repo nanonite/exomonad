@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- parse_github_url fails on local bare path remotes and non-GitHub SSH URLs (#468)
 - Fix OpenCode permission handling regression (#467)
 - Reviewer not spawned for OpenCode dev-leaf PRs: wrong Authoring-Agent in PR body (#442)
 - Fix OpenCode dev-leaf review loop fallback dispatch (#443)
@@ -164,6 +165,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Remove local bare path remote support from get_repo_info — Forgejo HTTP/SSH only (#469)
 - fix-tl-model-routing: tl_model and worker_model must route to agent-type-specific config fields (#463)
 - merge_pr and event templates reference Copilot instead of Forgejo reviewer (#456)
 - Watcher not routing merge_ready event to TL when reviewer approves + CI passes (#455)

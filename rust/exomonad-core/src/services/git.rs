@@ -234,7 +234,7 @@ impl GitService {
 
         let (owner, name) = remote_url
             .as_ref()
-            .and_then(|url| repo::parse_github_url(url))
+            .and_then(|url| repo::parse_github_url(url).ok())
             .unzip();
 
         Ok(RepoInfo {
