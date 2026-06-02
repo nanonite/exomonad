@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- cleanup_reviewer_leaf doesn't tombstone reviewer agent dir — other sessions see reviewer as live (#473)
 - cleanup_reviewer_leaf returns success:true even when no reviewer window was killed (#471)
 - OpenCode dev-leafs and workers ask for permissions after regression in 92071935 (#466)
 - Add close_reviewer_window MCP tool for manual reviewer window cleanup (#472)

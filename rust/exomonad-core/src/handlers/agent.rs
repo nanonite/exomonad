@@ -1793,10 +1793,35 @@ where
         + 'static,
 {
     match close_reviewer_windows_by_pr(service, pr_number).await {
-        Ok(killed) => killed,
+        Ok(killed) => {
+            if !killed.is_empty() {
+                tombstone_reviewer_agent_dirs(service.project_dir(), pr_number).await;
+            }
+            killed
+        }
         Err(error) => {
             warn!(%error, "failed to clean reviewer resources");
             Vec::new()
+        }
+    }
+}
+
+async fn tombstone_reviewer_agent_dirs(project_dir: &Path, pr_number: u64) {
+    let agents_dir = project_dir.join(".exo/agents");
+    let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await else {
+        return;
+    };
+    let prefix = format!("review-pr-{pr_number}-");
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            tombstone_agent_dir(&entry.path()).await;
         }
     }
 }
@@ -2280,6 +2305,39 @@ mod tests {
         assert!(response.success);
         assert_eq!(response.error, "");
         assert_eq!(response.cleaned_reviewers, vec!["review-pr-7-codex"]);
+    }
+
+    #[tokio::test]
+    async fn tombstone_reviewer_agent_dirs_matches_only_requested_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join(".exo/agents");
+        let matching_agent = agents_dir.join("review-pr-7-codex");
+        let forced_matching_agent = agents_dir.join("review-pr-7-123-opencode");
+        let other_pr_agent = agents_dir.join("review-pr-70-codex");
+        let other_agent = agents_dir.join("feature-codex");
+
+        for agent_dir in [
+            &matching_agent,
+            &forced_matching_agent,
+            &other_pr_agent,
+            &other_agent,
+        ] {
+            tokio::fs::create_dir_all(agent_dir).await.unwrap();
+            tokio::fs::write(agent_dir.join("routing.json"), "{}")
+                .await
+                .unwrap();
+        }
+
+        tombstone_reviewer_agent_dirs(dir.path(), 7).await;
+
+        assert!(matching_agent.join("exited_at").exists());
+        assert!(!matching_agent.join("routing.json").exists());
+        assert!(forced_matching_agent.join("exited_at").exists());
+        assert!(!forced_matching_agent.join("routing.json").exists());
+        assert!(!other_pr_agent.join("exited_at").exists());
+        assert!(other_pr_agent.join("routing.json").exists());
+        assert!(!other_agent.join("exited_at").exists());
+        assert!(other_agent.join("routing.json").exists());
     }
 
     #[tokio::test]
