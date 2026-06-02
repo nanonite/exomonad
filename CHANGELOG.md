@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- file_pr push_bookmark doesn't inject Forgejo token for HTTP remote auth (#470)
 - parse_github_url fails on local bare path remotes and non-GitHub SSH URLs (#468)
 - Fix OpenCode permission handling regression (#467)
 - Reviewer not spawned for OpenCode dev-leaf PRs: wrong Authoring-Agent in PR body (#442)

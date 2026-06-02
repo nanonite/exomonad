@@ -88,6 +88,20 @@ fn headless_git_ssh_command() -> String {
     }
 }
 
+fn push_origin_command(branch: &BranchName, forgejo_token: Option<&str>) -> std::process::Command {
+    let mut command = headless_git_command();
+    if let Some(token) = forgejo_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        command
+            .arg("-c")
+            .arg(format!("http.extraheader=Authorization: token {token}"));
+    }
+    command.args(["push", "origin", branch.as_str()]);
+    command
+}
+
 impl GitWorktreeService {
     pub fn new(project_dir: PathBuf) -> Self {
         Self { project_dir }
@@ -259,10 +273,19 @@ impl GitWorktreeService {
         workspace_path: &Path,
         branch: &BranchName,
     ) -> Result<(), WorktreeError> {
+        self.push_bookmark_with_token(workspace_path, branch, None)
+    }
+
+    /// Push a branch to origin, using the Forgejo token for HTTP remote auth when provided.
+    pub fn push_bookmark_with_token(
+        &self,
+        workspace_path: &Path,
+        branch: &BranchName,
+        forgejo_token: Option<&str>,
+    ) -> Result<(), WorktreeError> {
         info!(branch = %branch, path = %workspace_path.display(), "Pushing branch");
 
-        let output = headless_git_command()
-            .args(["push", "origin", branch.as_str()])
+        let output = push_origin_command(branch, forgejo_token)
             .current_dir(workspace_path)
             .output()
             .map_err(|e| WorktreeError::GitError {
@@ -483,6 +506,41 @@ mod tests {
         assert!(envs
             .get("GIT_SSH_COMMAND")
             .is_some_and(|value| value.contains("BatchMode=yes")));
+    }
+
+    #[test]
+    fn push_origin_command_injects_forgejo_token_extraheader() {
+        let branch = BranchName::try_from_str("feature-auth")
+            .expect("literal validated string is non-empty");
+        let command = push_origin_command(&branch, Some("secret-token"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "http.extraheader=Authorization: token secret-token",
+                "push",
+                "origin",
+                "feature-auth",
+            ]
+        );
+    }
+
+    #[test]
+    fn push_origin_command_omits_empty_forgejo_token_extraheader() {
+        let branch = BranchName::try_from_str("feature-auth")
+            .expect("literal validated string is non-empty");
+        let command = push_origin_command(&branch, Some("   "));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args, vec!["push", "origin", "feature-auth"]);
     }
 
     fn init_test_repo() -> (TempDir, GitWorktreeService) {

@@ -209,6 +209,13 @@ impl ForgejoClient {
         binary_in_path("fj")
     }
 
+    pub fn git_auth_token(&self) -> Option<&str> {
+        match &self.backend {
+            ForgejoBackend::Http(client) => Some(client.token.as_str()),
+            ForgejoBackend::Fj(_) => None,
+        }
+    }
+
     pub async fn find_open_pull_request(
         &self,
         owner: &GithubOwner,
@@ -1364,6 +1371,21 @@ impl From<RunnerResponse> for ForgejoRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_client_exposes_git_auth_token() {
+        let client = ForgejoClient::new("http://forgejo.local", "secret-token")
+            .expect("literal Forgejo config is valid");
+
+        assert_eq!(client.git_auth_token(), Some("secret-token"));
+    }
+
+    #[test]
+    fn fj_client_has_no_git_auth_token() {
+        let client = ForgejoClient::new_fj("/tmp/project");
+
+        assert_eq!(client.git_auth_token(), None);
+    }
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
