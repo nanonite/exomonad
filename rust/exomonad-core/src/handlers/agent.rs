@@ -1426,6 +1426,41 @@ impl<
         }
     }
 
+    async fn close_reviewer_window(
+        &self,
+        req: CloseReviewerWindowRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<CloseReviewerWindowResponse> {
+        if req.pr_number == 0 {
+            return Err(EffectError::invalid_input("pr_number is required"));
+        }
+
+        match close_reviewer_windows_by_pr(&self.service, req.pr_number).await {
+            Ok(closed_windows) => {
+                let success = !closed_windows.is_empty();
+                Ok(CloseReviewerWindowResponse {
+                    success,
+                    error: if success {
+                        String::new()
+                    } else {
+                        format!(
+                            "No reviewer tmux windows matched pattern review-pr-{}-",
+                            req.pr_number
+                        )
+                    },
+                    pr_number: req.pr_number,
+                    closed_windows,
+                })
+            }
+            Err(error) => Ok(CloseReviewerWindowResponse {
+                success: false,
+                error: error.to_string(),
+                pr_number: req.pr_number,
+                closed_windows: Vec::new(),
+            }),
+        }
+    }
+
     async fn close_issue_and_cleanup(
         &self,
         req: CloseIssueAndCleanupRequest,
@@ -1739,20 +1774,30 @@ where
         + HasGitWorktreeService
         + 'static,
 {
-    let tmux = match service.tmux() {
-        Ok(tmux) => tmux,
+    match close_reviewer_windows_by_pr(service, pr_number).await {
+        Ok(killed) => killed,
         Err(error) => {
-            warn!(%error, "failed to create tmux client while cleaning reviewer resources");
-            return Vec::new();
+            warn!(%error, "failed to clean reviewer resources");
+            Vec::new()
         }
-    };
-    let windows = match tmux.list_windows().await {
-        Ok(windows) => windows,
-        Err(error) => {
-            warn!(%error, "failed to list tmux windows while cleaning reviewer resources");
-            return Vec::new();
-        }
-    };
+    }
+}
+
+async fn close_reviewer_windows_by_pr<C>(
+    service: &AgentControlService<C>,
+    pr_number: u64,
+) -> anyhow::Result<Vec<String>>
+where
+    C: HasTeamRegistry
+        + HasAcpRegistry
+        + HasAgentResolver
+        + HasGitHubClient
+        + HasProjectDir
+        + HasGitWorktreeService
+        + 'static,
+{
+    let tmux = service.tmux()?;
+    let windows = tmux.list_windows().await?;
 
     let mut killed = Vec::new();
     for window in windows {
@@ -1766,7 +1811,7 @@ where
             killed.push(window.window_name);
         }
     }
-    killed
+    Ok(killed)
 }
 
 fn reviewer_window_matches_pr(window_name: &str, pr_number: u64) -> bool {

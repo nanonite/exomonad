@@ -37,6 +37,7 @@ import ExoMonad.Guest.Tools.Chainlink
   )
 import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
 import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
+import ExoMonad.Guest.Tools.CloseReviewerWindow (CloseReviewerWindow (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
 import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
@@ -180,6 +181,7 @@ data Tools mode = Tools
     spawnWorker :: mode :- RootSpawnWorker,
     spawnReviewer :: mode :- SpawnReviewer,
     cleanupReviewerLeaf :: mode :- CleanupReviewerLeaf,
+      closeReviewerWindow :: mode :- CloseReviewerWindow,
     restartReview :: mode :- RestartReview,
     watcherPrState :: mode :- WatcherPrState,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
@@ -224,6 +226,7 @@ config =
             spawnWorker = mkHandler @RootSpawnWorker,
             spawnReviewer = mkHandler @SpawnReviewer,
             cleanupReviewerLeaf = mkHandler @CleanupReviewerLeaf,
+              closeReviewerWindow = mkHandler @CloseReviewerWindow,
             restartReview = mkHandler @RestartReview,
             watcherPrState = mkHandler @WatcherPrState,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,

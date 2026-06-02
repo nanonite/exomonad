@@ -458,6 +458,21 @@ message CloseWorkerPaneResponse {
   string error = 2;
 }
 
+// ============================================================================
+// CloseReviewerWindow - Close reviewer tmux windows for a PR by window name
+// ============================================================================
+
+message CloseReviewerWindowRequest {
+  // Existing PR number whose reviewer window(s) should be closed.
+  uint64 pr_number = 1;
+}
+
+message CloseReviewerWindowResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 pr_number = 3;
+  repeated string closed_windows = 4;
+}
 
 // ============================================================================
 // CloseIssueAndCleanup - Close a Chainlink issue after merged PR cleanup is safe
@@ -500,5 +515,6 @@ service AgentEffects {
   rpc List(ListRequest) returns (ListResponse);
   rpc CloseSelf(CloseSelfRequest) returns (CloseSelfResponse);
   rpc CloseWorkerPane(CloseWorkerPaneRequest) returns (CloseWorkerPaneResponse);
+  rpc CloseReviewerWindow(CloseReviewerWindowRequest) returns (CloseReviewerWindowResponse);
   rpc CloseIssueAndCleanup(CloseIssueAndCleanupRequest) returns (CloseIssueAndCleanupResponse);
 }

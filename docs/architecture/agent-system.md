@@ -43,6 +43,7 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 | `close_worker_pane` | x | x | | | |
 | `close_issue_and_cleanup` | x | x | | | |
 | `cleanup_reviewer_leaf` | x | x | | | |
+| `close_reviewer_window` | x | x | | | |
 | `restart_review` | x | x | | | |
 | `cleanup_orphan` | x | x | | | |
 | `watcher_pr_state` | x | x | | | |

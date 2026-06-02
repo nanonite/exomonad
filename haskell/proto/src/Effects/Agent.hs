@@ -6103,6 +6103,217 @@ instance (HsJSONPB.ToJSON CloseWorkerPaneResponse) where
 instance (HsJSONPB.FromJSON CloseWorkerPaneResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
+newtype CloseReviewerWindowRequest
+  = CloseReviewerWindowRequest {closeReviewerWindowRequestPrNumber :: Hs.Word64}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData CloseReviewerWindowRequest)
+
+instance (HsProtobuf.Named CloseReviewerWindowRequest) where
+  nameOf _ = Hs.fromString "CloseReviewerWindowRequest"
+
+instance (HsProtobuf.HasDefault CloseReviewerWindowRequest)
+
+instance (HsProtobuf.Message CloseReviewerWindowRequest) where
+  encodeMessage
+    _
+    CloseReviewerWindowRequest {closeReviewerWindowRequestPrNumber} =
+      ( HsProtobuf.encodeMessageField
+          (HsProtobuf.FieldNumber 1)
+          closeReviewerWindowRequestPrNumber
+      )
+  decodeMessage _ =
+    Hs.pure CloseReviewerWindowRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB CloseReviewerWindowRequest) where
+  toJSONPB (CloseReviewerWindowRequest f1) =
+    HsJSONPB.object ["pr_number" .= f1]
+  toEncodingPB (CloseReviewerWindowRequest f1) =
+    HsJSONPB.pairs ["pr_number" .= f1]
+
+instance (HsJSONPB.FromJSONPB CloseReviewerWindowRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "CloseReviewerWindowRequest"
+      ( \obj ->
+          Hs.pure CloseReviewerWindowRequest <*> obj .: "pr_number"
+      )
+
+instance (HsJSONPB.ToJSON CloseReviewerWindowRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON CloseReviewerWindowRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data CloseReviewerWindowResponse
+  = CloseReviewerWindowResponse
+  { closeReviewerWindowResponseSuccess :: Hs.Bool,
+    closeReviewerWindowResponseError :: Hs.Text,
+    closeReviewerWindowResponsePrNumber :: Hs.Word64,
+    closeReviewerWindowResponseClosedWindows :: (Hs.Vector Hs.Text)
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData CloseReviewerWindowResponse)
+
+instance (HsProtobuf.Named CloseReviewerWindowResponse) where
+  nameOf _ = Hs.fromString "CloseReviewerWindowResponse"
+
+instance (HsProtobuf.HasDefault CloseReviewerWindowResponse)
+
+instance (HsProtobuf.Message CloseReviewerWindowResponse) where
+  encodeMessage
+    _
+    CloseReviewerWindowResponse
+      { closeReviewerWindowResponseSuccess,
+        closeReviewerWindowResponseError,
+        closeReviewerWindowResponsePrNumber,
+        closeReviewerWindowResponseClosedWindows
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 1)
+                    closeReviewerWindowResponseSuccess
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 2)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        closeReviewerWindowResponseError
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 3)
+                closeReviewerWindowResponsePrNumber
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 4)
+            ( ( Hs.coerce
+                  @(Hs.Vector Hs.Text)
+                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+              )
+                closeReviewerWindowResponseClosedWindows
+            )
+        )
+  decodeMessage _ =
+    Hs.pure CloseReviewerWindowResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 3)
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "closed_windows")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB CloseReviewerWindowResponse) where
+  toJSONPB (CloseReviewerWindowResponse f1 f2 f3 f4) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "pr_number" .= f3,
+        "closed_windows"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f4
+             )
+      ]
+  toEncodingPB (CloseReviewerWindowResponse f1 f2 f3 f4) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "pr_number" .= f3,
+        "closed_windows"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f4
+             )
+      ]
+
+instance (HsJSONPB.FromJSONPB CloseReviewerWindowResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "CloseReviewerWindowResponse"
+      ( \obj ->
+          Hs.pure CloseReviewerWindowResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+            <*> obj .: "pr_number"
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "closed_windows")
+                )
+      )
+
+instance (HsJSONPB.ToJSON CloseReviewerWindowResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON CloseReviewerWindowResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
 data CloseIssueAndCleanupRequest
   = CloseIssueAndCleanupRequest
   { closeIssueAndCleanupRequestIssueId :: Hs.Word64,
