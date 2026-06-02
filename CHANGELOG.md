@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix OpenCode permission handling regression (#467)
 - Reviewer not spawned for OpenCode dev-leaf PRs: wrong Authoring-Agent in PR body (#442)
 - Fix OpenCode dev-leaf review loop fallback dispatch (#443)
 - Fix OpenCode worker config discovery: write .git stub to agent_config_dir (#441)

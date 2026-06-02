@@ -375,7 +375,7 @@ impl<
                 }
             }
             AgentType::Codex => String::new(),
-            AgentType::OpenCode => " --dangerously-skip-permissions".to_string(),
+            AgentType::OpenCode => String::new(),
             AgentType::Shoal | AgentType::Process => String::new(),
         };
 
@@ -1744,7 +1744,7 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(cmd, "opencode --dangerously-skip-permissions");
+        assert_eq!(cmd, "opencode");
     }
 
     #[test]
@@ -1762,7 +1762,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run --interactive --dangerously-skip-permissions \"$(cat '/tmp/test-prompt.txt')\""
+            "opencode run --interactive \"$(cat '/tmp/test-prompt.txt')\""
         );
     }
 
@@ -1781,7 +1781,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run --interactive --dangerously-skip-permissions \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-sonnet-4-5"
+            "opencode run --interactive \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-sonnet-4-5"
         );
     }
 
@@ -1800,7 +1800,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run --interactive --dangerously-skip-permissions --session 'main.feature-a-opencode' --fork \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-haiku-4-5"
+            "opencode run --interactive --session 'main.feature-a-opencode' --fork \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-haiku-4-5"
         );
     }
 
@@ -1817,10 +1817,7 @@ mod tests {
             Some("anthropic/claude's-model"),
         );
         // Single quote in model name must be shell-escaped
-        assert_eq!(
-            cmd,
-            "opencode --dangerously-skip-permissions --model 'anthropic/claude'\\''s-model'"
-        );
+        assert_eq!(cmd, "opencode --model 'anthropic/claude'\\''s-model'");
     }
 
     #[test]
