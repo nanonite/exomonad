@@ -201,6 +201,10 @@ fn review_state_disposes_reviewer(review_state: &ForgejoReviewState) -> bool {
     )
 }
 
+fn should_spawn_reviewer_for_new_head(state: &WatchState, max_rounds: u32) -> bool {
+    !state.reviewer_spawned && state.rounds < max_rounds
+}
+
 fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
     match agent_type {
         AgentType::Claude => "tl",
@@ -1026,9 +1030,18 @@ where
                 let agent_role = pr.author_role.clone();
                 let branch = BranchName::try_from_str(pr.head_branch.as_str())
                     .expect("validated string input is non-empty");
-                let terminal_review_observed = review_state_disposes_reviewer(&obs.review_state);
-                let (local_reviews, _local_review_state) = obs_to_review_parts(obs);
                 let head_sha_changed = pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str());
+                let stale_terminal_review_after_head_change = head_sha_changed
+                    && review_state_disposes_reviewer(&obs.review_state)
+                    && !obs.forgejo_review_present;
+                let terminal_review_observed = review_state_disposes_reviewer(&obs.review_state)
+                    && !stale_terminal_review_after_head_change;
+                let (local_reviews, _local_review_state) =
+                    if stale_terminal_review_after_head_change {
+                        (Vec::new(), ForgejoReviewVerdict::None)
+                    } else {
+                        obs_to_review_parts(obs)
+                    };
                 if head_sha_changed {
                     head_sha_updates.push((*pr_number, obs.head_sha.clone()));
                 }
@@ -1036,7 +1049,10 @@ where
                     if head_sha_changed {
                         old_state.reviewer_spawned = false;
                         old_state.reviewer_disposed = false;
-                        if !terminal_review_observed {
+                        if should_spawn_reviewer_for_new_head(
+                            old_state,
+                            self.policy.reviewer_max_rounds,
+                        ) {
                             if let Some(spawner) = &self.reviewer_spawner {
                                 let spawner = spawner.clone();
                                 let pr_clone = pr.clone();
@@ -2239,7 +2255,7 @@ fn compute_pr_actions_with_context(
         old_state.first_seen = now;
         old_state.rounds = next_review_round;
 
-        if old_state.rounds > max_rounds {
+        if old_state.rounds >= max_rounds {
             old_state.stuck = true;
             pending_actions.push(PendingAction::WriteRegistryStuck {
                 pr_number: pr_number.as_u64(),
@@ -3641,7 +3657,7 @@ mod tests {
             false,
             branch.as_str(),
             &|_, _| "Still needs work".to_string(),
-            1,
+            2,
         );
 
         assert!(state.stuck);
@@ -4703,6 +4719,75 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reviewer_spawner_called_for_new_head_after_changes_requested() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSpawner {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for CountingSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                _pr: &crate::services::pr_registry::PrEntry,
+            ) -> anyhow::Result<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let spawner = Arc::new(CountingSpawner {
+            count: call_count.clone(),
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
+        let branch = BranchName::try_from_str("main.feature-codex")
+            .expect("literal validated string is non-empty");
+        let mut watch_state =
+            WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0);
+        watch_state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
+        watch_state.rounds = 1;
+        watch_state.reviewer_spawned = true;
+        watch_state.reviewer_disposed = true;
+        watcher.state.prs.lock().await.insert(1, watch_state);
+
+        let mut pr = test_pr_entry();
+        pr.last_head_sha = Some("abc123".to_string());
+        let registry = test_registry(pr);
+        let mut observations = HashMap::new();
+        observations.insert(
+            1u64,
+            Observation {
+                head_sha: "def456".to_string(),
+                review_state: ForgejoReviewState::ChangesRequested,
+                comments: vec![],
+                reviews: vec![],
+                ci_status: CIStatus::Unknown,
+                forgejo_review_present: false,
+            },
+        );
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let state = watcher.state.prs.lock().await;
+        let pr_state = state.get(&1).unwrap();
+        assert!(pr_state.reviewer_spawned);
+        assert!(!pr_state.reviewer_disposed);
+        assert_eq!(pr_state.last_review_state, ForgejoReviewVerdict::None);
+        assert_eq!(pr_state.rounds, 1);
     }
 
     #[tokio::test]
