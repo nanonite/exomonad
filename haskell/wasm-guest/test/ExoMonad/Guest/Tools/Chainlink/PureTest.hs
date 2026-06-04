@@ -160,8 +160,8 @@ pureTests =
           @=? ["block", "5", "10"],
       -- buildRelateArgs
       testCase "buildRelateArgs: basic" $
-        buildRelateArgs (ChainlinkRelateArgs 1 2 "duplicates")
-          @=? ["relate", "1", "2", "duplicates"],
+        buildRelateArgs (ChainlinkRelateArgs 1 2)
+          @=? ["relate", "1", "2"],
       -- buildCascadeArgs
       testCase "buildCascadeArgs: basic" $
         buildCascadeArgs (ChainlinkCascadeArgs 42)
