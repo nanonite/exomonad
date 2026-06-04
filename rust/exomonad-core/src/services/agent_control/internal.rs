@@ -27,6 +27,7 @@ fn generate_opencode_agent_settings(
         "mcp": mcp_servers,
         "instructions": instructions,
         "plugin": ["./.exo/opencode-plugin"],
+        "permission": "allow",
     })
 }
 
