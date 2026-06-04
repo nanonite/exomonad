@@ -9,26 +9,35 @@ use crate::effects::{
 };
 use async_trait::async_trait;
 use exomonad_proto::effects::process::*;
-use std::path::Component;
+use std::path::{Component, PathBuf};
 use std::time::Duration;
 
+const CHAINLINK_DB_ENV: &str = "CHAINLINK_DB";
 const CHAINLINK_TRACE_ENV: &str = "EXOMONAD_CHAINLINK_TRACE";
 
 /// Process execution effect handler.
 ///
 /// Executes commands within the agent's worktree. No command allowlist —
 /// trusts WASM author. Working dir is confined to the agent's worktree root.
-pub struct ProcessHandler;
+pub struct ProcessHandler {
+    project_dir: PathBuf,
+}
 
 impl Default for ProcessHandler {
     fn default() -> Self {
-        Self
+        Self::new()
     }
 }
 
 impl ProcessHandler {
     pub fn new() -> Self {
-        Self
+        Self {
+            project_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    }
+
+    pub fn with_project_dir(project_dir: PathBuf) -> Self {
+        Self { project_dir }
     }
 
     /// Validate that working_dir contains no absolute paths or parent traversal.
@@ -54,6 +63,14 @@ impl ProcessHandler {
 
     fn should_trace_chainlink(req: &RunRequest) -> bool {
         req.command == "chainlink" && std::env::var_os(CHAINLINK_TRACE_ENV).is_some()
+    }
+
+    fn chainlink_db_env(&self, req: &RunRequest) -> Option<PathBuf> {
+        if req.command != "chainlink" || req.env.contains_key(CHAINLINK_DB_ENV) {
+            return None;
+        }
+
+        Some(self.project_dir.join(".chainlink").join("issues.db"))
     }
 
     fn format_command_line(command: &str, args: &[String]) -> String {
@@ -113,6 +130,9 @@ impl ProcessEffects for ProcessHandler {
 
         if !req.env.is_empty() {
             cmd.envs(&req.env);
+        }
+        if let Some(chainlink_db) = self.chainlink_db_env(&req) {
+            cmd.env(CHAINLINK_DB_ENV, chainlink_db);
         }
 
         let output_result = if req.timeout_ms > 0 {
@@ -314,6 +334,48 @@ mod tests {
         assert!(ProcessHandler::validate_working_dir("..").is_err());
         assert!(ProcessHandler::validate_working_dir("../foo").is_err());
         assert!(ProcessHandler::validate_working_dir("foo/../../bar").is_err());
+    }
+
+    fn process_request(command: &str) -> RunRequest {
+        RunRequest {
+            command: command.into(),
+            args: vec![],
+            working_dir: ".".into(),
+            env: std::collections::HashMap::new(),
+            timeout_ms: 0,
+        }
+    }
+
+    #[test]
+    fn test_chainlink_db_env_points_to_project_db() {
+        let project_dir = std::path::PathBuf::from("/repo");
+        let handler = ProcessHandler::with_project_dir(project_dir.clone());
+        let req = process_request("chainlink");
+
+        assert_eq!(
+            handler.chainlink_db_env(&req),
+            Some(project_dir.join(".chainlink").join("issues.db"))
+        );
+    }
+
+    #[test]
+    fn test_chainlink_db_env_ignores_non_chainlink_commands() {
+        let handler = ProcessHandler::with_project_dir(std::path::PathBuf::from("/repo"));
+        let req = process_request("echo");
+
+        assert_eq!(handler.chainlink_db_env(&req), None);
+    }
+
+    #[test]
+    fn test_chainlink_db_env_preserves_explicit_env() {
+        let handler = ProcessHandler::with_project_dir(std::path::PathBuf::from("/repo"));
+        let mut req = process_request("chainlink");
+        req.env.insert(
+            CHAINLINK_DB_ENV.to_string(),
+            "/custom/issues.db".to_string(),
+        );
+
+        assert_eq!(handler.chainlink_db_env(&req), None);
     }
 
     #[test]

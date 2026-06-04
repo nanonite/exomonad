@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix Chainlink database selection for leaf agents (#475)
 - Reviewer not re-spawned after leaf pushes fixes following ChangesRequested (#474)
 - cleanup_reviewer_leaf doesn't tombstone reviewer agent dir — other sessions see reviewer as live (#473)
 - cleanup_reviewer_leaf returns success:true even when no reviewer window was killed (#471)
