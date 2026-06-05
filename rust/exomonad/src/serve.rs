@@ -745,6 +745,70 @@ pub async fn list_tools(
     }
 }
 
+fn append_unread_mail_block(
+    output: &mut exomonad_core::mcp::tools::MCPCallOutput,
+    messages: &[exomonad_core::services::InboxMessageRecord],
+) {
+    if !output.success || messages.is_empty() {
+        return;
+    }
+
+    let block = format_unread_mail_block(messages);
+    let Some(result) = output.result.as_mut() else {
+        output.result = Some(serde_json::json!({
+            "content": [{"type": "text", "text": block}],
+            "isError": false
+        }));
+        return;
+    };
+
+    if append_to_mcp_text_content(result, &block) {
+        return;
+    }
+
+    let original = serde_json::to_string_pretty(result).unwrap_or_default();
+    *result = serde_json::json!({
+        "content": [{"type": "text", "text": format!("{original}\n\n{block}")}],
+        "isError": false
+    });
+}
+
+fn append_to_mcp_text_content(result: &mut serde_json::Value, block: &str) -> bool {
+    let Some(content) = result
+        .get_mut("content")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let Some(first) = content.first_mut() else {
+        return false;
+    };
+    let Some(text) = first
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    first["text"] = serde_json::Value::String(format!("{text}\n\n{block}"));
+    true
+}
+
+fn format_unread_mail_block(messages: &[exomonad_core::services::InboxMessageRecord]) -> String {
+    let lines = messages
+        .iter()
+        .map(|message| {
+            let summary = message.summary.as_deref().unwrap_or("No summary");
+            format!(
+                "[from: {}] Summary: {}. Full message: {}",
+                message.from_agent, summary, message.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("<unread-mail>\n{lines}\n</unread-mail>")
+}
+
 pub async fn call_tool(
     Path((role, name)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -764,7 +828,7 @@ pub async fn call_tool(
         plugin.call("handle_mcp_call", &input).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let output = match result {
+    let mut output = match result {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(tool = %body.name, error = %e, "WASM call failed");
@@ -818,6 +882,15 @@ pub async fn call_tool(
                 "error": output.error,
             }),
         );
+    }
+
+    if output.success {
+        match state.inbox_store.peek_unnotified(&name) {
+            Ok(messages) => append_unread_mail_block(&mut output, &messages),
+            Err(error) => {
+                tracing::warn!(agent = %name, error = %error, "Failed to peek unread inbox messages")
+            }
+        }
     }
 
     Json(serde_json::json!({
@@ -1381,4 +1454,75 @@ Run `exomonad recompile` first to build it.",
 
     info!("MCP server shut down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exomonad_core::mcp::tools::MCPCallOutput;
+    use exomonad_core::services::InboxMessageRecord;
+
+    fn message() -> InboxMessageRecord {
+        InboxMessageRecord {
+            id: 1,
+            from_agent: "root".to_string(),
+            to_agent: "worker-1".to_string(),
+            content: "Please review the latest patch".to_string(),
+            summary: Some("review patch".to_string()),
+            created_at: 123,
+            notified_at: None,
+            read_at: None,
+        }
+    }
+
+    #[test]
+    fn piggyback_appends_unread_mail_to_existing_text_content() {
+        let mut output = MCPCallOutput {
+            success: true,
+            result: Some(serde_json::json!({
+                "content": [{"type": "text", "text": "tool result"}],
+                "isError": false
+            })),
+            error: None,
+        };
+
+        append_unread_mail_block(&mut output, &[message()]);
+
+        let text = output.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.starts_with("tool result\n\n<unread-mail>"));
+        assert!(text.contains("[from: root] Summary: review patch. Full message: Please review"));
+    }
+
+    #[test]
+    fn piggyback_wraps_plain_success_result_as_text_content() {
+        let mut output = MCPCallOutput {
+            success: true,
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+        };
+
+        append_unread_mail_block(&mut output, &[message()]);
+
+        let result = output.result.unwrap();
+        assert_eq!(result["isError"], serde_json::Value::Bool(false));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("{\n  \"ok\": true\n}"));
+        assert!(text.contains("<unread-mail>"));
+    }
+
+    #[test]
+    fn piggyback_skips_failed_outputs() {
+        let mut output = MCPCallOutput {
+            success: false,
+            result: None,
+            error: Some("boom".to_string()),
+        };
+
+        append_unread_mail_block(&mut output, &[message()]);
+
+        assert!(output.result.is_none());
+    }
 }
