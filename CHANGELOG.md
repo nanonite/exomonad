@@ -172,6 +172,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Fix --tl, --reviewer, and --tl-model help text (#477)
 - Fix chainlink_relate invalid relation argument for CLI (#476)
 - Remove local bare path remote support from get_repo_info — Forgejo HTTP/SSH only (#469)
 - fix-tl-model-routing: tl_model and worker_model must route to agent-type-specific config fields (#463)

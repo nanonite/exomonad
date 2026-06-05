@@ -76,21 +76,25 @@ enum Commands {
         /// Enable OpenRouter for LLM routing
         #[arg(long)]
         openrouter: bool,
-        /// Set root agent type (overrides --opencode-as-tl)
+        /// Set root agent type (valid: claude|gemini|opencode|codex|shoal;
+        /// overrides --opencode-as-tl)
         #[arg(long)]
         tl: Option<String>,
         /// Set spawn agent type for workers/teammates
         #[arg(long)]
         worker: Option<String>,
-        /// Model for the root TL when --tl=opencode (e.g. anthropic/claude-sonnet-4-5).
-        /// Default: opencode picks (uses its built-in default model).
+        /// Model for the root TL agent.
+        /// With --tl=opencode, stores [opencode].tl_model and validates via
+        /// opencode models.
+        /// With other TL agents, stores the root agent model.
         #[arg(long)]
         tl_model: Option<String>,
         /// Model for spawned workers when --worker=opencode.
         /// Default: opencode picks (uses its built-in default model).
         #[arg(long)]
         worker_model: Option<String>,
-        /// Set reviewer agent type (claude|opencode). Overrides [reviewer] in config.toml.
+        /// Set reviewer agent type (valid: claude|gemini|opencode|codex|shoal).
+        /// Overrides [reviewer] in config.toml.
         #[arg(long)]
         reviewer: Option<String>,
         /// Model for the reviewer agent. Validated against the agent type.
