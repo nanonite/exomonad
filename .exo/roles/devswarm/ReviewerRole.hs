@@ -31,6 +31,8 @@ import ExoMonad.Guest.Events
 import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
+import ExoMonad.Guest.Tools.Agents (ListAgents (..))
+import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, HookInput (..), HookOutput, StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse, postToolUseResponse)
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
 import HookPolicy (preToolUseWithGitAuthorAndImplementationBlock)
@@ -331,7 +333,9 @@ instance MCPTool ReviewerPostReviewComment where
 data Tools mode = Tools
   { approvePr :: mode :- ReviewerApprovePR,
     requestChanges :: mode :- ReviewerRequestChanges,
-    postReviewComment :: mode :- ReviewerPostReviewComment
+    postReviewComment :: mode :- ReviewerPostReviewComment,
+    checkInbox :: mode :- CheckInbox,
+    listAgents :: mode :- ListAgents
   }
   deriving (Generic)
 
@@ -343,7 +347,9 @@ config =
         Tools
           { approvePr = mkHandler @ReviewerApprovePR,
             requestChanges = mkHandler @ReviewerRequestChanges,
-            postReviewComment = mkHandler @ReviewerPostReviewComment
+            postReviewComment = mkHandler @ReviewerPostReviewComment,
+            checkInbox = mkHandler @CheckInbox,
+            listAgents = mkHandler @ListAgents
           },
       hooks =
         HookConfig

@@ -14,6 +14,7 @@ import ExoMonad
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.StateMachine (applyEvent)
+import ExoMonad.Guest.Tools.Agents (ListAgents (..))
 import ExoMonad.Guest.Tools.Chainlink
   ( ChainlinkBlock (..),
     ChainlinkCascade (..),
@@ -37,14 +38,14 @@ import ExoMonad.Guest.Tools.Chainlink
   )
 import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
 import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
-import ExoMonad.Guest.Tools.CloseReviewerWindow (CloseReviewerWindow (..))
-import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
-import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
+import ExoMonad.Guest.Tools.CloseReviewerWindow (CloseReviewerWindow (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
+import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
-import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
+import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
+import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
     ForkWaveArgs (..),
@@ -67,8 +68,9 @@ import ExoMonad.Guest.Tools.Spawn
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
   )
-import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
 import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
+import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
+import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
 import ExoMonad.Types (Effects, HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
 import HookPolicy (preToolUseWithImplementationBlock)
@@ -181,13 +183,15 @@ data Tools mode = Tools
     spawnWorker :: mode :- RootSpawnWorker,
     spawnReviewer :: mode :- SpawnReviewer,
     cleanupReviewerLeaf :: mode :- CleanupReviewerLeaf,
-      closeReviewerWindow :: mode :- CloseReviewerWindow,
+    closeReviewerWindow :: mode :- CloseReviewerWindow,
     restartReview :: mode :- RestartReview,
     watcherPrState :: mode :- WatcherPrState,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
     pollWorkers :: mode :- PollWorkers,
+    checkInbox :: mode :- CheckInbox,
+    listAgents :: mode :- ListAgents,
     mergePr :: mode :- RootMergePR,
     sendTmuxMessage :: mode :- SendTmuxMessage,
     sendMailboxMessage :: mode :- SendMailboxMessage,
@@ -226,13 +230,15 @@ config =
             spawnWorker = mkHandler @RootSpawnWorker,
             spawnReviewer = mkHandler @SpawnReviewer,
             cleanupReviewerLeaf = mkHandler @CleanupReviewerLeaf,
-              closeReviewerWindow = mkHandler @CloseReviewerWindow,
+            closeReviewerWindow = mkHandler @CloseReviewerWindow,
             restartReview = mkHandler @RestartReview,
             watcherPrState = mkHandler @WatcherPrState,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,
             pollWorkers = mkHandler @PollWorkers,
+            checkInbox = mkHandler @CheckInbox,
+            listAgents = mkHandler @ListAgents,
             mergePr = mkHandler @RootMergePR,
             sendTmuxMessage = mkHandler @SendTmuxMessage,
             sendMailboxMessage = mkHandler @SendMailboxMessage,

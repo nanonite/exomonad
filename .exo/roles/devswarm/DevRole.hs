@@ -10,29 +10,43 @@ module DevRole (config, Tools) where
 import Control.Monad (void)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as Aeson
+import DevPhase (DevEvent (..), DevPhase (..))
 import ExoMonad
-import ExoMonad.Guest.Tools.Chainlink
-  ( ChainlinkSessionStart (..),
-    ChainlinkSessionStatus (..),
-    ChainlinkIssueShow (..),
-    ChainlinkIssueComment (..),
-    ChainlinkSubissueCreate (..),
-    ChainlinkSessionWork (..),
-    ChainlinkSessionEnd (..),
-    ChainlinkSubissueClose (..)
-  )
-import ExoMonad.Guest.Tools.FilePR (filePRCore, filePRDescription, filePRSchema, FilePRArgs, FilePROutput (..))
-import ExoMonad.Guest.Tools.Events
-  ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs (..), NotifyStatus (..)
-  )
-import ExoMonad.Guest.Tools.Tasks
-  ( taskListCore, taskListDescription, taskListSchema, TaskListArgs,
-    taskGetCore, taskGetDescription, taskGetSchema, TaskGetArgs,
-    taskUpdateCore, taskUpdateDescription, taskUpdateSchema, TaskUpdateArgs
-  )
-import ExoMonad.Guest.StateMachine (applyEvent)
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
-import DevPhase (DevPhase (..), DevEvent (..))
+import ExoMonad.Guest.StateMachine (applyEvent)
+import ExoMonad.Guest.Tools.Chainlink
+  ( ChainlinkIssueComment (..),
+    ChainlinkIssueShow (..),
+    ChainlinkSessionEnd (..),
+    ChainlinkSessionStart (..),
+    ChainlinkSessionStatus (..),
+    ChainlinkSessionWork (..),
+    ChainlinkSubissueClose (..),
+    ChainlinkSubissueCreate (..),
+  )
+import ExoMonad.Guest.Tools.Events
+  ( NotifyParentArgs (..),
+    NotifyStatus (..),
+    notifyParentCore,
+    notifyParentDescription,
+    notifyParentSchema,
+  )
+import ExoMonad.Guest.Tools.FilePR (FilePRArgs, FilePROutput (..), filePRCore, filePRDescription, filePRSchema)
+import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
+import ExoMonad.Guest.Tools.Tasks
+  ( TaskGetArgs,
+    TaskListArgs,
+    TaskUpdateArgs,
+    taskGetCore,
+    taskGetDescription,
+    taskGetSchema,
+    taskListCore,
+    taskListDescription,
+    taskListSchema,
+    taskUpdateCore,
+    taskUpdateDescription,
+    taskUpdateSchema,
+  )
 import HttpDevHooks (httpDevHooks)
 import PRReviewHandler (prReviewEventHandlers)
 
@@ -50,8 +64,11 @@ instance MCPTool DevFilePR where
       Left err -> pure $ errorResult err
       Right output -> do
         branch <- getCurrentBranch
-        void $ applyEvent @DevPhase @DevEvent branch DevSpawned
-          (PRCreated (fpoNumber output) (fpoUrl output) (fpoHeadBranch output))
+        void $
+          applyEvent @DevPhase @DevEvent
+            branch
+            DevSpawned
+            (PRCreated (fpoNumber output) (fpoUrl output) (fpoHeadBranch output))
         pure $ successResult (Aeson.toJSON output)
 
 -- | Dev-specific notify_parent: notifies parent, then transitions to DevDone/DevFailed.
@@ -117,6 +134,7 @@ data Tools mode = Tools
     notifyParent :: mode :- DevNotifyParent,
     sendTmuxMessage :: mode :- SendTmuxMessage,
     sendMailboxMessage :: mode :- SendMailboxMessage,
+    checkInbox :: mode :- CheckInbox,
     taskList :: mode :- DevTaskList,
     taskGet :: mode :- DevTaskGet,
     taskUpdate :: mode :- DevTaskUpdate,
@@ -141,6 +159,7 @@ config =
             notifyParent = mkHandler @DevNotifyParent,
             sendTmuxMessage = mkHandler @SendTmuxMessage,
             sendMailboxMessage = mkHandler @SendMailboxMessage,
+            checkInbox = mkHandler @CheckInbox,
             taskList = mkHandler @DevTaskList,
             taskGet = mkHandler @DevTaskGet,
             taskUpdate = mkHandler @DevTaskUpdate,

@@ -10,21 +10,34 @@ module WorkerRole (config, Tools) where
 import Data.Aeson (object, (.=))
 import ExoMonad
 import ExoMonad.Guest.Tools.Chainlink
-  ( ChainlinkSessionStart (..),
+  ( ChainlinkIssueComment (..),
     ChainlinkIssueShow (..),
-    ChainlinkIssueComment (..),
+    ChainlinkSessionEnd (..),
+    ChainlinkSessionStart (..),
     ChainlinkSessionWork (..),
-    ChainlinkSessionEnd (..)
   )
 import ExoMonad.Guest.Tools.Events
-  ( notifyParentCore, notifyParentDescription, notifyParentSchema, NotifyParentArgs
+  ( NotifyParentArgs,
+    notifyParentCore,
+    notifyParentDescription,
+    notifyParentSchema,
   )
+import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
 import ExoMonad.Guest.Tools.Tasks
-  ( taskListCore, taskListDescription, taskListSchema, TaskListArgs,
-    taskGetCore, taskGetDescription, taskGetSchema, TaskGetArgs,
-    taskUpdateCore, taskUpdateDescription, taskUpdateSchema, TaskUpdateArgs
+  ( TaskGetArgs,
+    TaskListArgs,
+    TaskUpdateArgs,
+    taskGetCore,
+    taskGetDescription,
+    taskGetSchema,
+    taskListCore,
+    taskListDescription,
+    taskListSchema,
+    taskUpdateCore,
+    taskUpdateDescription,
+    taskUpdateSchema,
   )
-import ExoMonad.Guest.Types (allowResponse, allowStopResponse, postToolUseResponse, BeforeModelOutput (..), AfterModelOutput (..))
+import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse, postToolUseResponse)
 import ExoMonad.Types (HookConfig (..), defaultSessionStartHook)
 import HookPolicy (preToolUseWithGhBlock)
 import WorkerStopCheck (workerStopCheck)
@@ -86,6 +99,7 @@ data Tools mode = Tools
   { notifyParent :: mode :- WorkerNotifyParent,
     sendTmuxMessage :: mode :- SendTmuxMessage,
     sendMailboxMessage :: mode :- SendMailboxMessage,
+    checkInbox :: mode :- CheckInbox,
     taskList :: mode :- WorkerTaskList,
     taskGet :: mode :- WorkerTaskGet,
     taskUpdate :: mode :- WorkerTaskUpdate,
@@ -106,6 +120,7 @@ config =
           { notifyParent = mkHandler @WorkerNotifyParent,
             sendTmuxMessage = mkHandler @SendTmuxMessage,
             sendMailboxMessage = mkHandler @SendMailboxMessage,
+            checkInbox = mkHandler @CheckInbox,
             taskList = mkHandler @WorkerTaskList,
             taskGet = mkHandler @WorkerTaskGet,
             taskUpdate = mkHandler @WorkerTaskUpdate,
