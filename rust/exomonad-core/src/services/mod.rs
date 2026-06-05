@@ -18,6 +18,7 @@ pub mod forgejo_ci;
 pub mod git;
 pub mod git_worktree;
 pub mod github;
+pub mod inbox_store;
 pub mod inbox_watcher;
 pub mod local;
 pub mod log;
@@ -49,6 +50,7 @@ pub use self::filesystem::FileSystemService;
 pub use self::forgejo::ForgejoClient;
 pub use self::git_worktree::GitWorktreeService;
 pub use self::github::GitHubClient;
+pub use self::inbox_store::{InboxMessageRecord, InboxPokeCandidate, InboxStore};
 pub use self::mutex_registry::MutexRegistry;
 pub use self::secrets::Secrets;
 pub use self::supervisor_registry::SupervisorRegistry;
@@ -70,6 +72,9 @@ pub trait HasAcpRegistry: Send + Sync {
 }
 pub trait HasAgentResolver: Send + Sync {
     fn agent_resolver(&self) -> &AgentResolver;
+}
+pub trait HasInboxStore: Send + Sync {
+    fn inbox_store(&self) -> &Arc<InboxStore>;
 }
 pub trait HasEventQueue: Send + Sync {
     fn event_queue(&self) -> &EventQueue;
@@ -143,6 +148,7 @@ pub struct Services {
     pub supervisor_registry: Arc<SupervisorRegistry>,
     pub claude_session_registry: Arc<ClaudeSessionRegistry>,
     pub agent_resolver: Arc<AgentResolver>,
+    pub inbox_store: Arc<InboxStore>,
     pub event_queue: Arc<EventQueue>,
     pub mutex_registry: Arc<MutexRegistry>,
     pub git_wt: Arc<GitWorktreeService>,
@@ -176,6 +182,11 @@ impl HasAcpRegistry for Services {
 impl HasAgentResolver for Services {
     fn agent_resolver(&self) -> &AgentResolver {
         &self.agent_resolver
+    }
+}
+impl HasInboxStore for Services {
+    fn inbox_store(&self) -> &Arc<InboxStore> {
+        &self.inbox_store
     }
 }
 impl HasEventQueue for Services {
@@ -254,6 +265,7 @@ impl Services {
             supervisor_registry: Arc::new(SupervisorRegistry::new()),
             claude_session_registry: Arc::new(ClaudeSessionRegistry::new()),
             agent_resolver: Arc::new(AgentResolver::empty()),
+            inbox_store: Arc::new(InboxStore::open_in_memory().unwrap()),
             event_queue: Arc::new(EventQueue::new()),
             mutex_registry: Arc::new(MutexRegistry::new()),
             git_wt: Arc::new(GitWorktreeService::new(PathBuf::from("."))),

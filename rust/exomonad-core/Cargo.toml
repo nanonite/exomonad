@@ -51,6 +51,7 @@ runtime = [
     "dep:claude-teams-bridge",
     "dep:opentelemetry",
     "dep:tracing-opentelemetry",
+    "dep:rusqlite",
 ]
 
 [dependencies]
@@ -102,6 +103,7 @@ toml = { version = "0.8", optional = true }
 ollama-rs = { version = "0.2", optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 url = { version = "2", optional = true }
+rusqlite = { workspace = true, optional = true }
 
 # Runtime feature: HTTP transport
 axum = { version = "0.8", optional = true }
