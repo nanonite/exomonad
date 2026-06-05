@@ -323,6 +323,14 @@ fn extra_mcp_server_to_json(server: &crate::config::McpServerConfig) -> Result<V
     })
 }
 
+fn exomonad_mcp_server(binary_path: &Path, role: &str, name: &str) -> Value {
+    serde_json::json!({
+        "type": "stdio",
+        "command": binary_path.display().to_string(),
+        "args": ["mcp-stdio", "--role", role, "--name", name]
+    })
+}
+
 fn extra_mcp_servers_to_json(
     servers: &std::collections::HashMap<String, crate::config::McpServerConfig>,
 ) -> Result<std::collections::HashMap<String, Value>> {
@@ -378,11 +386,7 @@ fn build_claude_root_command(model: Option<&str>, initial_prompt: Option<&str>) 
                 shell_escape::escape(prompt.into())
             )
         })
-        .unwrap_or_else(|| {
-            format!(
-                "claude --dangerously-skip-permissions{model_flag} -c || claude --dangerously-skip-permissions{model_flag}"
-            )
-        });
+        .unwrap_or_else(|| format!("claude --dangerously-skip-permissions{model_flag}"));
 
     format!("{launch}; echo; echo [Claude Code exited]; exec bash -l")
 }
@@ -868,11 +872,7 @@ pub async fn run(
         let mut mcp_servers = serde_json::Map::new();
         mcp_servers.insert(
             "exomonad".to_string(),
-            serde_json::json!({
-                "type": "stdio",
-                "command": "exomonad",
-                "args": ["mcp-stdio", "--role", "root", "--name", "root"]
-            }),
+            exomonad_mcp_server(&binary_path, "root", "root"),
         );
         for (name, server) in &config.extra_mcp_servers {
             let entry = match server {
@@ -963,11 +963,7 @@ pub async fn run(
         let mut mcp_servers = serde_json::Map::new();
         mcp_servers.insert(
             "exomonad".to_string(),
-            serde_json::json!({
-                "type": "stdio",
-                "command": "exomonad",
-                "args": ["mcp-stdio", "--role", "root", "--name", "root"]
-            }),
+            exomonad_mcp_server(&binary_path, "root", "root"),
         );
 
         // Add extra MCP servers from config
@@ -1458,11 +1454,7 @@ pub async fn run(
             let mut companion_mcp_servers = serde_json::Map::new();
             companion_mcp_servers.insert(
                 "exomonad".to_string(),
-                serde_json::json!({
-                    "type": "stdio",
-                    "command": "exomonad",
-                    "args": ["mcp-stdio", "--role", &companion.role, "--name", &companion.name]
-                }),
+                exomonad_mcp_server(&binary_path, &companion.role, &companion.name),
             );
             // Include extra MCP servers from config
             for (name, server) in &config.extra_mcp_servers {
@@ -1536,11 +1528,7 @@ pub async fn run(
             // Gemini/Shoal companions use project root CWD
             let companion_mcp = serde_json::json!({
                 "mcpServers": {
-                    "exomonad": {
-                        "type": "stdio",
-                        "command": "exomonad",
-                        "args": ["mcp-stdio", "--role", &companion.role, "--name", &companion.name]
-                    }
+                    "exomonad": exomonad_mcp_server(&binary_path, &companion.role, &companion.name)
                 }
             });
 
@@ -2216,6 +2204,26 @@ mod tests {
     }
 
     #[test]
+    fn exomonad_mcp_server_uses_resolved_binary_path() {
+        let server = exomonad_mcp_server(Path::new("/tmp/bin/exomonad"), "worker", "agent-1");
+
+        assert_eq!(
+            server.get("command").and_then(Value::as_str),
+            Some("/tmp/bin/exomonad")
+        );
+        assert_eq!(
+            server.get("args"),
+            Some(&serde_json::json!([
+                "mcp-stdio",
+                "--role",
+                "worker",
+                "--name",
+                "agent-1"
+            ]))
+        );
+    }
+
+    #[test]
     fn claude_root_command_uses_initial_prompt() {
         let command = build_claude_root_command(Some("sonnet"), Some("Spawn the worker"));
 
@@ -2228,13 +2236,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_root_command_without_prompt_preserves_resume_fallback() {
+    fn claude_root_command_without_prompt_starts_fresh_session() {
         let command = build_claude_root_command(Some("sonnet"), None);
 
         assert_eq!(
             command,
-            "claude --dangerously-skip-permissions --model sonnet -c || claude --dangerously-skip-permissions --model sonnet; echo; echo [Claude Code exited]; exec bash -l"
+            "claude --dangerously-skip-permissions --model sonnet; echo; echo [Claude Code exited]; exec bash -l"
         );
+        assert!(!command.contains(" -c"));
     }
 
     #[test]

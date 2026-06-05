@@ -172,6 +172,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Fix Claude TL session MCP connection on init (#478)
 - Fix --tl, --reviewer, and --tl-model help text (#477)
 - Fix chainlink_relate invalid relation argument for CLI (#476)
 - Remove local bare path remote support from get_repo_info — Forgejo HTTP/SSH only (#469)
