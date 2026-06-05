@@ -3,9 +3,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 
--- | Event tools: notify_parent, send_tmux_message, send_mailbox_message, shutdown.
+-- | Event tools: notify_parent, send_tmux_message, send_mailbox_message.
 --
--- Core I/O functions ('notifyParentCore', 'shutdownCore') are role-agnostic.
+-- Core I/O functions are role-agnostic.
 -- Role-specific MCPTool wrappers apply their own state transitions.
 -- Message tools stay in the SDK (no state transitions needed).
 module ExoMonad.Guest.Tools.Events
@@ -13,24 +13,19 @@ module ExoMonad.Guest.Tools.Events
     NotifyParent (..),
     SendTmuxMessage (..),
     SendMailboxMessage (..),
-    Shutdown,
 
     -- * Core functions (role wrappers call these)
     notifyParentCore,
-    shutdownCore,
 
     -- * Shared descriptions/schemas (role wrappers reuse these)
     notifyParentDescription,
     notifyParentSchema,
-    shutdownDescription,
-    shutdownSchema,
 
     -- * Args types (role wrappers need these)
     NotifyParentArgs (..),
     NotifyStatus (..),
     TaskReport (..),
     SendMessageArgs (..),
-    ShutdownArgs (..),
 
     -- * Helpers
     composeNotifyMessage,
@@ -45,12 +40,10 @@ import Data.ByteString.Lazy qualified as BSL
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
-import Effects.Agent qualified as AgentProto
 import Effects.Log qualified as Log
-import ExoMonad.Effects.Agent qualified as ProtoAgent
 import ExoMonad.Effects.Events qualified as ProtoEvents
 import ExoMonad.Effects.Log (LogEmitEvent)
-import ExoMonad.Guest.Tool.Class (MCPCallOutput, MCPTool (..), errorResult, successResult)
+import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (JsonSchema (..), genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
 import ExoMonad.Guest.Types (Effects)
@@ -282,50 +275,3 @@ instance MCPTool SendMailboxMessage where
               [ "success" .= ProtoEvents.sendMailboxMessageResponseSuccess resp,
                 "delivery_method" .= ProtoEvents.sendMailboxMessageResponseDeliveryMethod resp
               ]
-
--- | Shutdown tool for cooperative agent exit
-data Shutdown = Shutdown
-
-data ShutdownArgs = ShutdownArgs
-  { sdMessage :: Maybe Text
-  }
-  deriving (Generic, Show)
-
-instance FromJSON ShutdownArgs where
-  parseJSON = withObject "ShutdownArgs" $ \v ->
-    ShutdownArgs <$> v .:? "message"
-
-instance ToJSON ShutdownArgs where
-  toJSON args = object ["message" .= sdMessage args]
-
--- | Shared tool description for shutdown.
-shutdownDescription :: Text
-shutdownDescription = "Gracefully shut down this agent. Sends a final message to your parent, then exits. Call this when instructed to shut down or when your work is complete."
-
--- | Shared tool schema for shutdown.
-shutdownSchema :: Aeson.Object
-shutdownSchema =
-  genericToolSchemaWith @ShutdownArgs
-    [("message", "Optional final message to send to parent before shutting down")]
-
--- | Core shutdown I/O: notify parent + close self.
-shutdownCore :: ShutdownArgs -> Eff Effects MCPCallOutput
-shutdownCore args = do
-  let msg = maybe "Shutting down." id (sdMessage args)
-  let statusText = "success" :: Text
-  void $
-    suspendEffect @ProtoEvents.EventsNotifyParent
-      ( ProtoEvents.NotifyParentRequest
-          { ProtoEvents.notifyParentRequestAgentId = "",
-            ProtoEvents.notifyParentRequestStatus = TL.fromStrict statusText,
-            ProtoEvents.notifyParentRequestMessage = TL.fromStrict msg,
-            ProtoEvents.notifyParentRequestOverrideRecipient = Nothing
-          }
-      )
-  void $
-    suspendEffect @ProtoAgent.AgentCloseSelf
-      ( AgentProto.CloseSelfRequest
-          { AgentProto.closeSelfRequestReason = TL.fromStrict msg
-          }
-      )
-  pure $ successResult $ object ["shutdown" .= True]

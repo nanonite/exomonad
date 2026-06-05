@@ -31,7 +31,7 @@ Two independent code paths already exist — route them to different targets:
 | Agent calls `notify_parent` tool | `EventHandler::notify_parent()` | TL inbox | **TL inbox** (unchanged) |
 | Future GitHub Actions poller `NotifyParent` action | `GitHubPoller::handle_event_action()` | TL inbox | **Reviewer inbox** (if registered) |
 
-The split is natural: these are separate call sites. The current active implementation is the local Tangled watcher; `github_poller.rs` is hibernated and should mirror watcher semantics until GitHub Actions integration is re-enabled. Poller `NotifyParent` actions are always PR-related (they come from PR review event handlers). Agent `notify_parent` calls are status/completion messages.
+The split is natural: these are separate call sites. The current active implementation is the worktree event watcher; `github_poller.rs` is hibernated and should mirror watcher semantics until GitHub Actions integration is re-enabled. Poller `NotifyParent` actions are always PR-related (they come from PR review event handlers). Agent `notify_parent` calls are status/completion messages.
 
 ### Sub-Agent Identity
 

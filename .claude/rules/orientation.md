@@ -10,7 +10,7 @@ paths:
 Building and extending ExoMonad itself: the TL-to-worker orchestration framework. Typical sessions involve:
 
 - Implementing new PR workflow methods or ideology (e.g., local PR registry, merge gates, reviewer agent lifecycle)
-- Integrating new CI infrastructure — Tangled knot + spindle as a fully local development environment, wired into exomonad's test suite
+- Integrating Forgejo Actions and local watcher paths into exomonad's review and merge test suite
 - Extending or onboarding new agent types (OpenCode) so they fit within the exomonad effects and messaging workflow
 - Closing gaps in the messaging protocol mismatch: Claude Code has native Teams inbox; Gemini and OpenCode do not — bridging that is active work
 - Using chainlink as the coordination layer: chainlink issues delegate work to worker agents, Claude Code reviews commits and writes markdown feedback, that feedback routes back through chainlink to the workers
@@ -21,10 +21,10 @@ The issue tracker is chainlink (`.chainlink/issues.db`).
 ## Where — the context
 
 - Claude Code instance running inside the exomonad workspace itself (`/home/goya/agent-workspace/exomonad`)
-- Primary tools: chainlink CLI (issue tracking and delegation), `just` + nix for builds and tests, `cargo` / `cabal` for the Rust and Haskell toolchains, `gh` for GitHub operations, Tangled + spindle for local CI
+- Primary tools: chainlink CLI (issue tracking and delegation), `just` + nix for builds and tests, `cargo` / `cabal` for the Rust and Haskell toolchains, `gh` for Forgejo/GitHub-compatible operations
 - Haskell WASM is the tool/hook/event DSL; Rust is the I/O runtime — all tool definitions live in Haskell, all effects executed in Rust
 - `just build` for Rust-only, `just install-all-dev` for full install (WASM + binary), `just wasm-all` for WASM only — never raw `cargo build` or `cp ~/.cargo/bin/exomonad` (nix shell required; atomic rename required)
-- Tangled+spindle integration is complete: `just e2e-tangled-ci` runs the full local CI pipeline end-to-end
+- Forgejo Actions is the active CI backend for local PR and merge-gate workflows
 
 ## Who — the user
 

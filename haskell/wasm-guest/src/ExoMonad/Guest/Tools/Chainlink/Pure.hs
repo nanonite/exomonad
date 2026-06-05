@@ -233,8 +233,7 @@ data ChainlinkBlockArgs = ChainlinkBlockArgs
 
 data ChainlinkRelateArgs = ChainlinkRelateArgs
   { crIssue1 :: Int,
-    crIssue2 :: Int,
-    crRelation :: Text
+    crIssue2 :: Int
   }
   deriving (Generic, Show)
 
@@ -506,7 +505,7 @@ buildBlockArgs args = ["block", show (cbChildId args), show (cbBlockerId args)]
 
 buildRelateArgs :: ChainlinkRelateArgs -> [String]
 buildRelateArgs args =
-  ["relate", show (crIssue1 args), show (crIssue2 args), T.unpack (crRelation args)]
+  ["relate", show (crIssue1 args), show (crIssue2 args)]
 
 buildCascadeArgs :: ChainlinkCascadeArgs -> [String]
 buildCascadeArgs args = ["cascade", show (ccIssueId args)]

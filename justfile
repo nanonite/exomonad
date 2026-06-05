@@ -222,6 +222,23 @@ test-mcp *args:
 e2e-messaging:
     ./tests/e2e/messaging/run.sh
 
+# Run bounded Claude-only smoke test (root SessionStart + TeamCreate, no children)
+e2e-claude-only:
+    ./tests/e2e/claude-only/run.sh
+
+# Check bounded Claude-only smoke harness without launching Claude/tmux
+check-e2e-claude-only:
+    bash -n tests/e2e/claude-only/run.sh
+
+# Run E2E Claude Teams inbox review chain (Claude TL -> Claude dev leaf -> Claude reviewer)
+e2e-claude-teams-inbox:
+    ./tests/e2e/claude-teams-inbox/run.sh
+
+# Check Claude Teams inbox review-chain harness scripts without launching Claude/tmux
+check-e2e-claude-teams-inbox:
+    bash -n tests/e2e/claude-teams-inbox/run.sh
+    bash -n tests/e2e/claude-teams-inbox/validate.sh
+
 # Run E2E OpenCode hook rewrite test (BeforeModel/AfterModel PII term rewriting)
 e2e-oc-rewrite:
     ./tests/e2e/hook-rewrite/run.sh
@@ -247,6 +264,38 @@ check-e2e-codex-messaging:
     bash -n tests/e2e/codex-messaging/run.sh
     bash -n tests/e2e/codex-messaging/validate.sh
 
+# Run E2E mixed agent chain test (Claude TL -> OpenCode worker, Codex reviewer config)
+e2e-tl-to-worker-messaging:
+    ./tests/e2e/tl-to-worker-messaging/run.sh
+
+# Check E2E mixed agent chain scripts without launching Claude/OpenCode/Codex/tmux
+check-e2e-tl-to-worker-messaging:
+    bash -n tests/e2e/tl-to-worker-messaging/run.sh
+    bash -n tests/e2e/tl-to-worker-messaging/validate.sh
+
+# Run E2E sub-TL worker notify_parent pane-pinning test
+e2e-subtl-worker-notify:
+    ./tests/e2e/subtl-worker-notify/run.sh
+
+# Check E2E sub-TL worker notify harness scripts without launching Codex/tmux
+check-e2e-subtl-worker-notify:
+    bash -n tests/e2e/subtl-worker-notify/run.sh
+    bash -n tests/e2e/subtl-worker-notify/validate.sh
+
+# Run recursive sub-TL fork_wave E2E for one runtime: claude, codex, or opencode
+e2e-subtl-recursive-fork-wave runtime="codex":
+    ./tests/e2e/subtl-recursive-fork-wave/run.sh {{runtime}}
+
+# Run recursive sub-TL fork_wave E2E across Claude, Codex, and OpenCode
+e2e-subtl-recursive-fork-wave-all:
+    ./tests/e2e/subtl-recursive-fork-wave/run-all.sh
+
+# Check recursive sub-TL fork_wave harness scripts without launching agents/tmux
+check-e2e-subtl-recursive-fork-wave:
+    bash -n tests/e2e/subtl-recursive-fork-wave/run.sh
+    bash -n tests/e2e/subtl-recursive-fork-wave/run-all.sh
+    bash -n tests/e2e/subtl-recursive-fork-wave/validate.sh
+
 # Run E2E chainlink issue create test (chainlink_issue_create MCP tool via ProcessRun)
 e2e-chainlink:
     ./tests/e2e/chainlink/run.sh
@@ -266,7 +315,36 @@ e2e-chainlink-sqlite-block:
 
 # Check E2E Chainlink sqlite block harness script without launching the server
 check-e2e-chainlink-sqlite-block:
+    bash -n tests/e2e/lib/harness.sh
     bash -n tests/e2e/chainlink-sqlite-block/run.sh
+
+# Run E2E reviewer hardening and authorship preservation test
+e2e-authorship:
+    ./tests/e2e/authorship/run.sh
+
+# Check E2E reviewer hardening and authorship scripts without launching the server
+check-e2e-authorship:
+    bash -n tests/e2e/authorship/run.sh
+    bash -n tests/e2e/authorship/validate.sh
+
+
+# Run E2E agent lifecycle invariants test
+e2e-lifecycle:
+    ./tests/e2e/lifecycle/run.sh
+
+# Check E2E agent lifecycle scripts without launching the server
+check-e2e-lifecycle:
+    bash -n tests/e2e/lifecycle/run.sh
+    bash -n tests/e2e/lifecycle/validate.sh
+
+
+# Run E2E Chainlink SessionStart env failsafe test
+e2e-chainlink-env-failsafe:
+    ./tests/e2e/chainlink-env-failsafe/run.sh
+
+# Check E2E Chainlink SessionStart env failsafe harness script without launching the server
+check-e2e-chainlink-env-failsafe:
+    bash -n tests/e2e/chainlink-env-failsafe/run.sh
 
 # Check Chainlink timer/session role scoping without launching agents
 check-e2e-chainlink-timer-role-scope:

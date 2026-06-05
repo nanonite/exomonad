@@ -1,7 +1,9 @@
+use crate::domain::RoutingInfo;
 use crate::services::git_worktree::GitWorktreeService;
-use std::path::Path;
+use crate::services::tmux_ipc::TmuxIpc;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub async fn dispose_reviewers_for_pr(
     project_dir: &Path,
@@ -52,6 +54,7 @@ pub async fn dispose_agent_resources(
     agent_slug: &str,
 ) {
     let worktree_path = project_dir.join(".exo/worktrees").join(agent_slug);
+    close_agent_tmux_window(project_dir, agent_slug, &worktree_path).await;
     cleanup_worker_agents_for_parent(project_dir, agent_slug, Some(&worktree_path)).await;
 
     if worktree_path.exists() {
@@ -72,6 +75,36 @@ pub async fn dispose_agent_resources(
             warn!(error = %e, path = %agent_dir.display(), "Failed to remove agent dir (non-fatal)");
         } else {
             info!(path = %agent_dir.display(), "Removed agent dir");
+        }
+    }
+}
+
+fn agent_routing_dirs(project_dir: &Path, agent_slug: &str, worktree_path: &Path) -> Vec<PathBuf> {
+    vec![
+        project_dir.join(".exo/agents").join(agent_slug),
+        worktree_path.to_path_buf(),
+    ]
+}
+
+async fn close_agent_tmux_window(project_dir: &Path, agent_slug: &str, worktree_path: &Path) {
+    for routing_dir in agent_routing_dirs(project_dir, agent_slug, worktree_path) {
+        let Ok(routing) = RoutingInfo::read_from_dir(&routing_dir).await else {
+            continue;
+        };
+        let Some(window_id) = routing.window_id else {
+            debug!(path = %routing_dir.display(), agent = agent_slug, "Agent routing has no tmux window id");
+            continue;
+        };
+
+        let tmux = TmuxIpc::new("");
+        match tmux.kill_window(&window_id).await {
+            Ok(()) => {
+                info!(agent = agent_slug, window = %window_id, path = %routing_dir.display(), "Closed agent tmux window before worktree removal");
+                return;
+            }
+            Err(error) => {
+                warn!(agent = agent_slug, window = %window_id, path = %routing_dir.display(), error = %error, "Failed to close agent tmux window before worktree removal");
+            }
         }
     }
 }
@@ -169,5 +202,19 @@ mod tests {
             "trivial-contributing-codex"
         ));
         assert!(!parent_tab_matches_slug(None, "trivial-contributing-codex"));
+    }
+
+    #[test]
+    fn test_agent_routing_dirs_check_root_config_before_worktree_root() {
+        let project_dir = Path::new("/repo");
+        let worktree_path = Path::new("/repo/.exo/worktrees/review-pr-11-codex");
+
+        assert_eq!(
+            agent_routing_dirs(project_dir, "review-pr-11-codex", worktree_path),
+            vec![
+                PathBuf::from("/repo/.exo/agents/review-pr-11-codex"),
+                PathBuf::from("/repo/.exo/worktrees/review-pr-11-codex"),
+            ]
+        );
     }
 }

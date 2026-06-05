@@ -37,11 +37,14 @@ import ExoMonad.Guest.Tools.Chainlink
   )
 import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
 import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
+import ExoMonad.Guest.Tools.CloseReviewerWindow (CloseReviewerWindow (..))
+import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
 import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
+import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
     ForkWaveArgs (..),
@@ -178,10 +181,13 @@ data Tools mode = Tools
     spawnWorker :: mode :- RootSpawnWorker,
     spawnReviewer :: mode :- SpawnReviewer,
     cleanupReviewerLeaf :: mode :- CleanupReviewerLeaf,
+      closeReviewerWindow :: mode :- CloseReviewerWindow,
+    restartReview :: mode :- RestartReview,
     watcherPrState :: mode :- WatcherPrState,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
+    pollWorkers :: mode :- PollWorkers,
     mergePr :: mode :- RootMergePR,
     sendTmuxMessage :: mode :- SendTmuxMessage,
     sendMailboxMessage :: mode :- SendMailboxMessage,
@@ -220,10 +226,13 @@ config =
             spawnWorker = mkHandler @RootSpawnWorker,
             spawnReviewer = mkHandler @SpawnReviewer,
             cleanupReviewerLeaf = mkHandler @CleanupReviewerLeaf,
+              closeReviewerWindow = mkHandler @CloseReviewerWindow,
+            restartReview = mkHandler @RestartReview,
             watcherPrState = mkHandler @WatcherPrState,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,
+            pollWorkers = mkHandler @PollWorkers,
             mergePr = mkHandler @RootMergePR,
             sendTmuxMessage = mkHandler @SendTmuxMessage,
             sendMailboxMessage = mkHandler @SendMailboxMessage,

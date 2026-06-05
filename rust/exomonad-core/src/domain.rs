@@ -874,6 +874,13 @@ impl RoutingInfo {
         }
     }
 
+    pub fn has_delivery_target(&self) -> bool {
+        self.window_id.is_some()
+            || self.pane_id.is_some()
+            || self.parent_tab.is_some()
+            || self.acp_url.is_some()
+    }
+
     #[cfg(feature = "runtime")]
     pub async fn write_to_dir(&self, dir: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;

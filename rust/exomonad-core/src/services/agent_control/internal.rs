@@ -1,5 +1,47 @@
 use super::*;
 
+fn generate_opencode_agent_settings(
+    agent_name: &str,
+    role: &str,
+    extra_mcp_servers: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut mcp_servers = serde_json::Map::new();
+    mcp_servers.insert(
+        "exomonad".to_string(),
+        serde_json::json!({
+            "type": "local",
+            "command": ["exomonad", "mcp-stdio", "--role", role, "--name", agent_name]
+        }),
+    );
+    for (name, config) in extra_mcp_servers {
+        mcp_servers.insert(name.clone(), config.clone());
+    }
+
+    let instructions = match role {
+        "root" | "tl" => serde_json::json!([super::spawn::OPENCODE_TL_INSTRUCTIONS]),
+        "worker" => serde_json::json!([super::spawn::OPENCODE_WORKER_INSTRUCTIONS]),
+        _ => serde_json::json!([super::spawn::OPENCODE_DEV_INSTRUCTIONS]),
+    };
+
+    serde_json::json!({
+        "mcp": mcp_servers,
+        "instructions": instructions,
+        "plugin": ["./.exo/opencode-plugin"],
+        "permission": "allow",
+    })
+}
+
+async fn write_opencode_agent_plugin_files(dir: &Path) -> Result<()> {
+    use crate::opencode_plugin::{OPENCODE_PLUGIN_PKG_JSON, OPENCODE_PLUGIN_TS};
+
+    let plugin_dir = dir.join(".exo/opencode-plugin");
+    fs::create_dir_all(&plugin_dir).await?;
+    fs::write(plugin_dir.join("index.ts"), OPENCODE_PLUGIN_TS).await?;
+    fs::write(plugin_dir.join("package.json"), OPENCODE_PLUGIN_PKG_JSON).await?;
+    info!(path = %plugin_dir.display(), "Wrote OpenCode plugin files");
+    Ok(())
+}
+
 impl<
         C: super::super::HasGitHubClient
             + super::super::HasAcpRegistry
@@ -73,7 +115,7 @@ impl<
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 return Err(anyhow::Error::from(EffectError::from(e)))
-                    .context("Failed to create git worktree")
+                    .context("Failed to create git worktree");
             }
             Err(panic_val) => {
                 let msg = panic_val
@@ -177,6 +219,9 @@ impl<
             "GH_TOKEN",
             "FORGEJO_REVIEWER_TOKEN",
             "FORGEJO_URL",
+            "FORGEJO_OWNER",
+            "FORGEJO_REPO",
+            "REPO",
         ] {
             if let Ok(value) = std::env::var(var) {
                 if !value.is_empty() {
@@ -349,7 +394,7 @@ impl<
                     }
                     AgentType::OpenCode => {
                         format!(
-                            "{} run{} --session {} --fork \"$(cat {})\"{}",
+                            "{} run --interactive{} --session {} --fork \"$(cat {})\"{}",
                             cmd, perms_flags, escaped_session, escaped_path, model_flag
                         )
                     }
@@ -367,7 +412,7 @@ impl<
                     AgentType::Codex => Self::build_codex_command(cwd, Some(pf), model, None),
                     AgentType::OpenCode => {
                         format!(
-                            "{} run{} \"$(cat {})\"{}",
+                            "{} run --interactive{} \"$(cat {})\"{}",
                             cmd, perms_flags, escaped_path, model_flag
                         )
                     }
@@ -500,7 +545,10 @@ impl<
             None => None,
         };
 
-        let model = model_override.or_else(|| self.spawn_agent_model());
+        let model = model_override.or_else(|| match agent_type {
+            AgentType::OpenCode => self.spawn_agent_model(),
+            _ => None,
+        });
         let full_command = Self::build_agent_command(
             agent_type,
             prompt_file.as_deref(),
@@ -611,6 +659,10 @@ impl<
             None => None,
         };
 
+        let model = match agent_type {
+            AgentType::OpenCode => self.spawn_agent_model(),
+            _ => None,
+        };
         let full_command = Self::build_agent_command(
             agent_type,
             prompt_file.as_deref(),
@@ -619,7 +671,7 @@ impl<
             cwd,
             claude_flags,
             self.yolo,
-            self.spawn_agent_model(),
+            model,
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let tmux = self.tmux()?;
@@ -721,8 +773,18 @@ impl<
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote .exo/mcp.json for Shoal agent");
             }
             AgentType::OpenCode => {
-                fs::write(agent_dir.join("opencode.json"), mcp_content).await?;
-                info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json for OpenCode agent");
+                let opencode_config = generate_opencode_agent_settings(
+                    agent_name,
+                    role.as_str(),
+                    &self.extra_mcp_servers,
+                );
+                fs::write(
+                    agent_dir.join("opencode.json"),
+                    serde_json::to_string_pretty(&opencode_config)?,
+                )
+                .await?;
+                write_opencode_agent_plugin_files(agent_dir).await?;
+                info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json and plugin for OpenCode agent");
             }
             AgentType::Codex => {
                 self.write_codex_config_files(
@@ -730,7 +792,7 @@ impl<
                     role,
                     &AgentName::try_from_str(agent_name)
                         .expect("validated string input is non-empty"),
-                    self.spawn_agent_model(),
+                    None,
                     &self.extra_mcp_servers,
                 )
                 .await?;
@@ -840,7 +902,7 @@ impl<
 
     /// Symlink server socket into worktree so agents find it without walk-up.
     pub(crate) async fn create_socket_symlink(&self, worktree_path: &Path) {
-        let source = self.project_dir().join(".exo/server.sock");
+        let source = self.server_socket_source();
         let target_dir = worktree_path.join(".exo");
         let target = target_dir.join("server.sock");
 
@@ -853,11 +915,22 @@ impl<
         // untracked file warnings (which force `git worktree remove --force`).
         let gitignore = target_dir.join(".gitignore");
         if !gitignore.exists() {
-            if let Err(e) =
-                tokio::fs::write(&gitignore, "# Runtime artifacts\nserver.sock\nserver.pid\n").await
+            if let Err(e) = tokio::fs::write(
+                &gitignore,
+                "# Runtime artifacts\nserver.sock\nserver.pid\ntmp/\n",
+            )
+            .await
             {
                 tracing::warn!(path = %gitignore.display(), error = %e, "Failed to write .gitignore");
             }
+        }
+
+        if let Err(e) = tokio::fs::create_dir_all(target_dir.join("tmp")).await {
+            warn!(
+                path = %target_dir.join("tmp").display(),
+                error = %e,
+                "Failed to create .exo/tmp in worktree"
+            );
         }
 
         if let Err(e) = tokio::fs::remove_file(&target).await {
@@ -877,6 +950,20 @@ impl<
                 "Failed to symlink server socket"
             ),
         }
+    }
+
+    fn server_socket_source(&self) -> PathBuf {
+        let project_dir = self.project_dir();
+        let absolute_project_dir = project_dir.canonicalize().unwrap_or_else(|_| {
+            if project_dir.is_absolute() {
+                project_dir.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(project_dir)
+            }
+        });
+        absolute_project_dir.join(".exo/server.sock")
     }
 
     /// Resolve role context file with two-tier fallback: project-local > global.
@@ -1186,6 +1273,98 @@ mod tests {
     }
 
     #[test]
+    fn test_gemini_worker_settings_injects_context_path() {
+        let context_path = PathBuf::from("/tmp/exomonad-context/worker.md");
+        let settings = ACS::generate_gemini_worker_settings(
+            "test-worker",
+            Some(&context_path),
+            &HashMap::new(),
+        );
+        let context_files = settings["context"]["fileName"]
+            .as_array()
+            .expect("context.fileName must be an array");
+        let filenames: Vec<&str> = context_files
+            .iter()
+            .map(|value| value.as_str().expect("context filename must be a string"))
+            .collect();
+
+        assert_eq!(
+            filenames,
+            vec!["GEMINI.md", "/tmp/exomonad-context/worker.md"]
+        );
+    }
+
+    #[test]
+    fn test_opencode_worker_settings_use_worker_instructions() {
+        let settings = ACS::generate_opencode_tl_settings("test-worker", "worker", &HashMap::new());
+        let command = settings["mcp"]["exomonad"]["command"]
+            .as_array()
+            .expect("OpenCode MCP command must be an array");
+        assert_eq!(command[2], "--role");
+        assert_eq!(command[3], "worker");
+        assert_eq!(command[4], "--name");
+        assert_eq!(command[5], "test-worker");
+
+        let instructions = settings["instructions"]
+            .as_array()
+            .expect("instructions must be an array")[0]
+            .as_str()
+            .expect("first instruction entry must be a string");
+
+        assert!(instructions.contains("# ExoMonad Worker Agent Protocol"));
+        assert!(instructions.contains("chainlink_session_work"));
+        assert!(instructions.contains("chainlink_session_end"));
+        assert!(instructions.contains("notify_parent"));
+        assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
+        assert!(!instructions.contains("file_pr"));
+    }
+
+    #[test]
+    fn test_opencode_dev_settings_keep_dev_instructions() {
+        let settings = ACS::generate_opencode_tl_settings("test-dev", "dev", &HashMap::new());
+        let instructions = settings["instructions"]
+            .as_array()
+            .expect("instructions must be an array")[0]
+            .as_str()
+            .expect("first instruction entry must be a string");
+
+        assert!(instructions.contains("# ExoMonad Dev Agent Protocol"));
+        assert!(instructions.contains("file_pr"));
+        assert!(!instructions.contains("# ExoMonad Worker Agent Protocol"));
+        assert!(!instructions.contains("chainlink_session_work"));
+    }
+
+    #[tokio::test]
+    async fn test_write_agent_mcp_config_opencode_writes_full_config_and_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("test-opencode-dev");
+        fs::create_dir_all(&agent_dir).await.unwrap();
+
+        let service = ACS::new(std::sync::Arc::new(crate::services::Services::test()));
+        service
+            .write_agent_mcp_config(
+                dir.path(),
+                &agent_dir,
+                AgentType::OpenCode,
+                &crate::domain::Role::dev(),
+            )
+            .await
+            .unwrap();
+
+        let opencode_json = fs::read_to_string(agent_dir.join("opencode.json"))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&opencode_json).unwrap();
+        assert_eq!(parsed["plugin"][0], "./.exo/opencode-plugin");
+        assert!(parsed["instructions"][0]
+            .as_str()
+            .unwrap()
+            .contains("# ExoMonad Dev Agent Protocol"));
+        assert!(agent_dir.join(".exo/opencode-plugin/index.ts").exists());
+        assert!(agent_dir.join(".exo/opencode-plugin/package.json").exists());
+    }
+
+    #[test]
     fn test_gemini_worker_settings_schema_compliance() {
         let settings = ACS::generate_gemini_worker_settings("test-worker", None, &HashMap::new());
 
@@ -1282,8 +1461,10 @@ mod tests {
             .expect("developer instructions are rendered");
 
         assert!(instructions.contains("# ExoMonad Reviewer Agent Protocol"));
-        assert!(instructions.contains("approve_pr"));
-        assert!(instructions.contains("request_changes"));
+        assert!(instructions.contains("Direct Forgejo API Review"));
+        assert!(instructions.contains("FORGEJO_REVIEWER_TOKEN"));
+        assert!(instructions.contains("/api/v1/repos/{owner}/{repo}/pulls/{pr}/reviews"));
+        assert!(instructions.contains("Do not call approve_pr"));
         assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
         assert!(codex_home.join("config.toml").exists());
@@ -1354,7 +1535,15 @@ mod tests {
         let link = worktree.join(".exo/server.sock");
         assert!(link.exists(), "Symlink should exist");
         let target = tokio::fs::read_link(&link).await.unwrap();
+        assert!(
+            target.is_absolute(),
+            "socket symlink target should be absolute"
+        );
         assert_eq!(target, project_dir.join(".exo/server.sock"));
+        assert!(
+            worktree.join(".exo/tmp").is_dir(),
+            "file-indirect injection dir should exist"
+        );
     }
 
     #[test]
@@ -1572,7 +1761,10 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(cmd, "opencode run \"$(cat '/tmp/test-prompt.txt')\"");
+        assert_eq!(
+            cmd,
+            "opencode run --interactive \"$(cat '/tmp/test-prompt.txt')\""
+        );
     }
 
     #[test]
@@ -1590,7 +1782,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-sonnet-4-5"
+            "opencode run --interactive \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-sonnet-4-5"
         );
     }
 
@@ -1609,7 +1801,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run --session 'main.feature-a-opencode' --fork \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-haiku-4-5"
+            "opencode run --interactive --session 'main.feature-a-opencode' --fork \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-haiku-4-5"
         );
     }
 

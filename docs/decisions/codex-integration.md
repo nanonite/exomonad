@@ -92,7 +92,7 @@ Codex reviewers run as ordinary ExoMonad reviewer agents in tmux with `role=revi
 codex exec --dangerously-bypass-approvals-and-sandbox --cd <worktree_dir> "$(cat <prompt_file>)"
 ```
 
-Do not use `codex exec review` for ExoMonad reviewer agents. That subcommand emits Codex-native review output, but it does not submit ExoMonad Forgejo reviews. ExoMonad reviewer convergence depends on the reviewer agent calling the MCP review tools (`approve_pr`, `request_changes`, or `post_review_comment`) from the `role=reviewer` configuration.
+Do not use `codex exec review` for ExoMonad reviewer agents. That subcommand emits Codex-native review output, but it does not submit ExoMonad Forgejo reviews. Codex reviewers submit final verdicts directly to the Forgejo reviews API with `curl`, using `FORGEJO_URL` and `FORGEJO_REVIEWER_TOKEN`/`FORGEJO_TOKEN`; this avoids any dependency on local `.exo/server.sock` or MCP review tools.
 
 The reviewer identity discipline still applies: reviewer agents use distinct git identities and never review under the identity that authored the PR.
 

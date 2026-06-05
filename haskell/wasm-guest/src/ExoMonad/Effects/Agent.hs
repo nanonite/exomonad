@@ -14,6 +14,7 @@ module ExoMonad.Effects.Agent
     AgentSpawnSubtree,
     AgentSpawnReviewer,
     AgentCleanupReviewerLeaf,
+    AgentRestartReview,
     AgentWatcherPrState,
     AgentSpawnLeafSubtree,
     AgentSpawnAcp,
@@ -24,6 +25,7 @@ module ExoMonad.Effects.Agent
     AgentList,
     AgentCloseSelf,
     AgentCloseWorkerPane,
+    AgentCloseReviewerWindow,
     AgentCloseIssueAndCleanup,
 
     -- * Re-exported proto types
@@ -87,6 +89,13 @@ instance Effect AgentCleanupReviewerLeaf where
   type Input AgentCleanupReviewerLeaf = CleanupReviewerLeafRequest
   type Output AgentCleanupReviewerLeaf = CleanupReviewerLeafResponse
   effectId = "agent.cleanup_reviewer_leaf"
+
+data AgentRestartReview
+
+instance Effect AgentRestartReview where
+  type Input AgentRestartReview = RestartReviewRequest
+  type Output AgentRestartReview = RestartReviewResponse
+  effectId = "agent.restart_review"
 
 data AgentWatcherPrState
 
@@ -157,6 +166,13 @@ instance Effect AgentCloseWorkerPane where
   type Input AgentCloseWorkerPane = CloseWorkerPaneRequest
   type Output AgentCloseWorkerPane = CloseWorkerPaneResponse
   effectId = "agent.close_worker_pane"
+
+data AgentCloseReviewerWindow
+
+instance Effect AgentCloseReviewerWindow where
+  type Input AgentCloseReviewerWindow = CloseReviewerWindowRequest
+  type Output AgentCloseReviewerWindow = CloseReviewerWindowResponse
+  effectId = "agent.close_reviewer_window"
 
 data AgentCloseIssueAndCleanup
 

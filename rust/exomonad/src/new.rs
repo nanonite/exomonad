@@ -1,13 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use exomonad::config::Config;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tracing::{info, warn};
-
-const DEFAULT_TANGLED_KNOT_URL: &str = "http://localhost:5555";
-const DEFAULT_TANGLED_APPVIEW_URL: &str = "http://localhost:3000";
 
 /// Initialize a new exomonad project in the current directory.
 /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
@@ -21,8 +17,7 @@ pub async fn run(_name: Option<String>) -> Result<()> {
 
     info!("Initializing new ExoMonad project");
     std::fs::create_dir_all(cwd.join(".exo"))?;
-    let tangled_integration = discover_tangled_integration(&cwd).await;
-    std::fs::write(&config_path, config_content(tangled_integration.as_ref()))?;
+    std::fs::write(&config_path, config_content())?;
 
     let policy_path = cwd.join(".exo/review-policy.toml");
     if !policy_path.exists() {
@@ -153,66 +148,16 @@ gate = \"auto\"
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct TangledNewIntegration {
-    knot_url: String,
-    appview_url: String,
-    owner_did: String,
-    knot_container: String,
-}
+fn config_content() -> String {
+    r#"# ExoMonad project config
+# All fields are optional - see CLAUDE.md for full reference.
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RepoCreateRequest {
-    rkey: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    default_branch: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RepoCreateResponse {
-    repo_did: Option<String>,
-}
-
-fn config_content(tangled: Option<&TangledNewIntegration>) -> String {
-    let tangled_block = match tangled {
-        Some(tangled) => format!(
-            "# Tangled integration (auto-detected by exomonad new)\n\
-             tangled_knot_url = {}\n\
-             tangled_appview_url = {}\n\
-             tangled_owner_did = {}\n\
-             tangled_knot_container = {}\n",
-            toml_string(&tangled.knot_url),
-            toml_string(&tangled.appview_url),
-            toml_string(&tangled.owner_did),
-            toml_string(&tangled.knot_container),
-        ),
-        None => "# Tangled integration (auto-detected when a local knot is reachable)\n\
-                 # tangled_knot_url = \"http://localhost:5555\"\n\
-                 # tangled_appview_url = \"http://localhost:3000\"\n\
-                 # tangled_owner_did = \"did:plc:yourDID\"\n\
-                 # tangled_knot_container = \"tangled-knot-knot-1\"\n"
-            .to_string(),
-    };
-
-    format!(
-        "# ExoMonad project config\n\
-         # All fields are optional - see CLAUDE.md for full reference.\n\n\
-         {}\n\
-         # Forgejo integration\n\
-         # forgejo_url = \"http://localhost:3000\"\n\
-         # forgejo_token = \"...\"\n\
-         # forgejo_reviewer_token = \"...\"  # must belong to a different Forgejo user than forgejo_token\n",
-        tangled_block
-    )
-}
-
-fn toml_string(value: &str) -> String {
-    serde_json::to_string(value).expect("serializing a string cannot fail")
+# Forgejo integration
+# forgejo_url = "http://localhost:3000"
+# forgejo_token = "..."
+# forgejo_reviewer_token = "..."  # must belong to a different Forgejo user than forgejo_token
+"#
+    .to_string()
 }
 
 fn forgejo_ssh_remote_url(
@@ -247,160 +192,6 @@ fn ssh_remote_host(host: &str) -> String {
     }
 }
 
-async fn discover_tangled_integration(project_dir: &Path) -> Option<TangledNewIntegration> {
-    let knot_url = std::env::var("EXOMONAD_TANGLED_KNOT_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_TANGLED_KNOT_URL.to_string());
-    let knot_url = normalize_http_url(&knot_url);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .ok()?;
-
-    if let Err(error) = probe_tangled_knot(&client, &knot_url).await {
-        warn!(
-            url = %knot_url,
-            error = %error,
-            "Local Tangled knot probe failed; leaving config template commented"
-        );
-        return None;
-    }
-
-    let knot_container = match discover_tangled_knot_container() {
-        Some(container) => container,
-        None => {
-            warn!("Local Tangled knot is reachable but no knot Docker container was discovered; leaving config template commented");
-            return None;
-        }
-    };
-    let owner_did = match discover_knot_container_env(&knot_container, "KNOT_SERVER_OWNER") {
-        Some(owner) => owner,
-        None => {
-            warn!(
-                container = %knot_container,
-                "Local Tangled knot container has no KNOT_SERVER_OWNER; leaving config template commented"
-            );
-            return None;
-        }
-    };
-    let knot_hostname = discover_knot_container_env(&knot_container, "KNOT_SERVER_HOSTNAME")
-        .map(|value| crate::init::normalize_knot_hostname(&value))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| crate::init::normalize_knot_hostname(&knot_url));
-
-    let repo_name = crate::init::tangled_repo_name(project_dir);
-    let repo_did = crate::init::tangled_dev_repo_did(&knot_hostname, &repo_name);
-    if let Err(error) = register_tangled_repo(&client, &knot_url, &repo_name).await {
-        warn!(
-            repo_name,
-            repo_did,
-            error = %error,
-            "Tangled repo.create failed; exomonad init will still use local container registration"
-        );
-    }
-
-    Some(TangledNewIntegration {
-        knot_url,
-        appview_url: std::env::var("EXOMONAD_TANGLED_APPVIEW_URL")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_TANGLED_APPVIEW_URL.to_string()),
-        owner_did,
-        knot_container: knot_container.clone(),
-    })
-}
-
-async fn probe_tangled_knot(client: &reqwest::Client, knot_url: &str) -> Result<()> {
-    client
-        .get(knot_url)
-        .send()
-        .await
-        .map(|_| ())
-        .with_context(|| format!("failed to reach {knot_url}"))
-}
-
-async fn register_tangled_repo(
-    client: &reqwest::Client,
-    knot_url: &str,
-    repo_name: &str,
-) -> Result<Option<String>> {
-    let mut request = client
-        .post(xrpc_url(knot_url, "sh.tangled.repo.create"))
-        .json(&repo_create_request(repo_name));
-    if let Some(token) = tangled_service_auth_token() {
-        request = request.bearer_auth(token);
-    }
-
-    let response = request.send().await.context("repo.create request failed")?;
-    if !response.status().is_success() {
-        return Err(anyhow!("repo.create returned {}", response.status()));
-    }
-
-    let body = response
-        .bytes()
-        .await
-        .context("failed to read repo.create response")?;
-    if body.is_empty() {
-        return Ok(None);
-    }
-
-    serde_json::from_slice::<RepoCreateResponse>(&body)
-        .map(|body| body.repo_did)
-        .context("failed to decode repo.create response")
-}
-
-fn tangled_service_auth_token() -> Option<String> {
-    std::env::var("EXOMONAD_TANGLED_SERVICE_AUTH")
-        .ok()
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-}
-
-fn repo_create_request(repo_name: &str) -> RepoCreateRequest {
-    RepoCreateRequest {
-        rkey: repo_name.to_string(),
-        name: Some(repo_name.to_string()),
-        default_branch: "main".to_string(),
-        source: None,
-    }
-}
-
-fn discover_tangled_knot_container() -> Option<String> {
-    if let Ok(container) = std::env::var("EXOMONAD_TANGLED_KNOT_CONTAINER") {
-        if !container.is_empty() {
-            return Some(container);
-        }
-    }
-
-    let output = std::process::Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let names = String::from_utf8_lossy(&output.stdout);
-    names
-        .lines()
-        .find(|name| name.trim() == "tangled-knot-knot-1")
-        .or_else(|| names.lines().find(|name| name.contains("knot")))
-        .map(|name| name.trim().to_string())
-}
-
-fn discover_knot_container_env(container: &str, key: &str) -> Option<String> {
-    let script = format!("printf '%s' \"${{{key}:-}}\"");
-    let output = std::process::Command::new("docker")
-        .args(["exec", container, "sh", "-c", &script])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
-}
-
 fn normalize_http_url(raw: &str) -> String {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -408,10 +199,6 @@ fn normalize_http_url(raw: &str) -> String {
     } else {
         format!("http://{trimmed}")
     }
-}
-
-fn xrpc_url(base: &str, method: &str) -> String {
-    format!("{}/xrpc/{method}", base.trim_end_matches('/'))
 }
 
 pub(crate) fn scaffold_forgejo_workflow(project_dir: &Path) -> std::io::Result<()> {
@@ -625,32 +412,6 @@ mod tests {
     }
 
     #[test]
-    fn config_template_leaves_tangled_fields_commented_without_detection() {
-        let content = config_content(None);
-
-        assert!(content.contains("# tangled_knot_url = \"http://localhost:5555\""));
-        assert!(content.contains("# tangled_owner_did = \"did:plc:yourDID\""));
-        assert!(content.contains("# forgejo_reviewer_token = \"...\""));
-        assert!(!content.contains("\ntangled_owner_did ="));
-    }
-
-    #[test]
-    fn config_template_writes_active_tangled_fields_when_detected() {
-        let content = config_content(Some(&TangledNewIntegration {
-            knot_url: "http://localhost:5555".to_string(),
-            appview_url: "http://localhost:3000".to_string(),
-            owner_did: "did:plc:owner".to_string(),
-            knot_container: "tangled-knot-knot-1".to_string(),
-        }));
-
-        assert!(content.contains("tangled_knot_url = \"http://localhost:5555\""));
-        assert!(content.contains("tangled_appview_url = \"http://localhost:3000\""));
-        assert!(content.contains("tangled_owner_did = \"did:plc:owner\""));
-        assert!(content.contains("tangled_knot_container = \"tangled-knot-knot-1\""));
-        toml::from_str::<toml::Value>(&content).unwrap();
-    }
-
-    #[test]
     fn forgejo_ssh_remote_url_defaults_localhost_to_dev_ssh_port() {
         assert_eq!(
             forgejo_ssh_remote_url("http://localhost:3000", None, "exomonad", "demo").unwrap(),
@@ -664,37 +425,6 @@ mod tests {
             forgejo_ssh_remote_url("https://forge.example", Some(2223), "exomonad", "demo")
                 .unwrap(),
             "ssh://git@forge.example:2223/exomonad/demo.git"
-        );
-    }
-
-    #[test]
-    fn repo_create_request_matches_current_tangled_lexicon() {
-        let request = repo_create_request("example");
-        let json = serde_json::to_value(request).unwrap();
-
-        assert_eq!(json["rkey"], "example");
-        assert_eq!(json["name"], "example");
-        assert_eq!(json["defaultBranch"], "main");
-        assert!(json.get("repoDid").is_none());
-        assert!(json.get("source").is_none());
-    }
-
-    #[test]
-    fn service_auth_env_ignores_empty_tokens() {
-        std::env::set_var("EXOMONAD_TANGLED_SERVICE_AUTH", "  ");
-        assert!(tangled_service_auth_token().is_none());
-        std::env::remove_var("EXOMONAD_TANGLED_SERVICE_AUTH");
-    }
-
-    #[test]
-    fn normalizes_tangled_urls() {
-        assert_eq!(
-            normalize_http_url("localhost:5555/"),
-            "http://localhost:5555"
-        );
-        assert_eq!(
-            xrpc_url("http://localhost:5555/", "sh.tangled.repo.create"),
-            "http://localhost:5555/xrpc/sh.tangled.repo.create"
         );
     }
 

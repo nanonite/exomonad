@@ -137,6 +137,8 @@ data HookInput = HookInput
     -- | Absolute path to the active .jsonl transcript file.
     -- The basename (minus .jsonl) is the true conversation UUID for --resume --fork-session.
     hiTranscriptPath :: Maybe Text,
+    -- | CHAINLINK_DB value forwarded by the agent-side hook process.
+    hiChainlinkDb :: Maybe Text,
     -- | LLM request payload (BeforeModel hook).
     hiLlmRequest :: Maybe Value,
     -- | LLM response chunk (AfterModel hook).
@@ -162,6 +164,7 @@ instance FromJSON HookInput where
       <*> v .:? "runtime"
       <*> v .:? "cwd"
       <*> v .:? "transcript_path"
+      <*> v .:? "chainlink_db"
       <*> v .:? "llm_request"
       <*> v .:? "llm_response"
 

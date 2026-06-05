@@ -5,6 +5,7 @@ use agent_client_protocol::{Agent, PromptRequest};
 use claude_teams_bridge as teams_mailbox;
 use claude_teams_bridge::TeamRegistry;
 use exomonad_proto::effects::events::{event, AgentMessage, Event};
+use tokio::process::Command;
 use tracing::{debug, info, instrument, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,80 @@ fn tmux_injection_options(agent_type: crate::services::AgentType) -> tmux_events
         tmux_events::InjectionOptions::claude_default()
     } else {
         tmux_events::InjectionOptions::inline_submit()
+    }
+}
+
+fn worker_gone_detail(agent_key: &str, target: &str) -> String {
+    format!("[WORKER GONE: {agent_key}] routing target {target} is not alive")
+}
+
+async fn mark_agent_exited(agent_dir: &std::path::Path) {
+    let exited_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+        .to_string();
+    if let Err(error) = tokio::fs::write(agent_dir.join("exited_at"), exited_at).await {
+        warn!(path = %agent_dir.display(), %error, "failed to write agent exited_at tombstone");
+    }
+    match tokio::fs::remove_file(agent_dir.join("routing.json")).await {
+        Ok(()) => info!(path = %agent_dir.display(), "removed stale agent routing"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(path = %agent_dir.display(), %error, "failed to remove stale agent routing")
+        }
+    }
+}
+
+async fn tmux_target_alive(target: &str) -> Result<bool, String> {
+    let session = std::env::var("EXOMONAD_TMUX_SESSION")
+        .map_err(|_| "EXOMONAD_TMUX_SESSION is not set".to_string())?;
+    if session.trim().is_empty() {
+        return Err("EXOMONAD_TMUX_SESSION is empty".to_string());
+    }
+    let qualified_target = crate::services::tmux_ipc::qualify_tmux_target(&session, target);
+    let output = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &qualified_target,
+            "#{pane_id}",
+        ])
+        .output()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+async fn routing_target_alive_or_cleanup(
+    project_dir: &std::path::Path,
+    agent_dir_name: &str,
+    target: &str,
+    agent_key: &str,
+    from: &crate::domain::AgentName,
+) -> bool {
+    match tmux_target_alive(target).await {
+        Ok(true) => true,
+        Ok(false) => {
+            let agent_dir = project_dir.join(".exo/agents").join(agent_dir_name);
+            mark_agent_exited(&agent_dir).await;
+            let detail = worker_gone_detail(agent_key, target);
+            tracing::info!(
+                otel.name = "message.delivery",
+                agent_id = %from,
+                recipient = %agent_key,
+                method = "tmux_routing",
+                outcome = "failed",
+                detail = %detail,
+                "[event] message.delivery"
+            );
+            false
+        }
+        Err(error) => {
+            warn!(agent = %agent_key, target, %error, "could not verify tmux routing target liveness");
+            false
+        }
     }
 }
 
@@ -726,6 +801,13 @@ async fn deliver_via_tmux(
     }
 
     if let Some(target) = routing_target {
+        let Some(ref dir_name) = matched_dir_name else {
+            return DeliveryResult::Failed;
+        };
+        if !routing_target_alive_or_cleanup(project_dir, dir_name, &target, agent_key, from).await {
+            return DeliveryResult::Failed;
+        }
+
         tracing::Span::current().record("delivery_method", "tmux");
         info!(
             agent = %agent_key,
@@ -1239,6 +1321,14 @@ mod tests {
         assert_ne!(DeliveryResult::Teams, DeliveryResult::Tmux);
         assert_ne!(DeliveryResult::Teams, DeliveryResult::Failed);
         assert_ne!(DeliveryResult::Tmux, DeliveryResult::Failed);
+    }
+
+    #[test]
+    fn test_worker_gone_detail_is_tl_visible() {
+        assert_eq!(
+            worker_gone_detail("worker-opencode", "%42"),
+            "[WORKER GONE: worker-opencode] routing target %42 is not alive"
+        );
     }
 
     #[test]

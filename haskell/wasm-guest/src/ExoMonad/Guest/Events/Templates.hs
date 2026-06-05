@@ -25,29 +25,29 @@ where
 import Data.Text (Text)
 import Data.Text qualified as T
 
--- | PR approved by Copilot — signals TL to merge.
+-- | PR approved by a Forgejo reviewer — signals TL to merge.
 --
 -- >>> prReady 42
--- "[PR READY] PR #42 approved by Copilot review. Merge with `merge_pr` tool."
+-- "[PR READY] PR #42 approved by Forgejo reviewer. Merge with `merge_pr` tool."
 prReady :: Int -> Text
 prReady n =
   "[PR READY] PR #"
     <> T.pack (show n)
-    <> " approved by Copilot review. Merge with `merge_pr` tool."
+    <> " approved by Forgejo reviewer. Merge with `merge_pr` tool."
 
--- | No Copilot review within timeout — signals TL to merge if CI passes.
+-- | No Forgejo reviewer response within timeout — signals TL to merge if CI passes.
 --
 -- >>> reviewTimeout 42 15
--- "[REVIEW TIMEOUT] PR #42 \x2014 no Copilot review after 15 minutes. Merge with `merge_pr` using `force: true`."
+-- "[REVIEW TIMEOUT] PR #42 \x2014 no Forgejo reviewer response after 15 minutes. Merge with `merge_pr` using `force: true`."
 reviewTimeout :: Int -> Int -> Text
 reviewTimeout n mins =
   "[REVIEW TIMEOUT] PR #"
     <> T.pack (show n)
-    <> " \x2014 no Copilot review after "
+    <> " \x2014 no Forgejo reviewer response after "
     <> T.pack (show mins)
     <> " minutes. Merge with `merge_pr` using `force: true`."
 
--- | Fixes pushed after Copilot review — Copilot does NOT re-review,
+-- | Fixes pushed after Forgejo reviewer feedback; the reviewer may not re-review automatically,
 -- so this is the actionable signal for the TL.
 --
 -- >>> fixesPushed 42 "success"

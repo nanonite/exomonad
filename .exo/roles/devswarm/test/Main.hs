@@ -3,21 +3,26 @@
 
 module Main where
 
+import AllRoles (lookupRole, roleListTools)
 import Control.Monad (forM_, unless)
 import Control.Monad.Freer (runM)
 import Control.Monad.Freer.Coroutine (runC)
 import Control.Monad.Freer.Coroutine qualified as C
 import Data.Aeson qualified as Aeson
+import Data.ByteString.Lazy.Char8 qualified as BSL
 import Data.Text (Text)
 import Data.Text qualified as T
-import AllRoles (lookupRole, roleListTools)
 import DevPhase (DevEvent (..), DevPhase (..))
+import DevRole qualified
 import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
+import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), PRReviewEvent (..))
+import ExoMonad.Guest.Events.Templates qualified as Tpl
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
 import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
+import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), mergePRDescription, mergePRSchema)
 import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
-import ExoMonad.Types (HookConfig (..), RoleConfig (..))
+import ExoMonad.Types (ChainlinkDbPathState (..), HookConfig (..), RoleConfig (..), validateChainlinkDbEnv)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
 import ReviewerRole qualified
 import RootRole qualified
@@ -37,10 +42,12 @@ main = do
   assertReviewerDenyImplementationTools
   assertRuntimeImplementationPolicy
   assertChainlinkCLIBlockPolicy
+  assertChainlinkDbSessionStartFailsafe
   assertReviewerGitAuthorMutationPolicy
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
   assertReviewerToolList
+  assertNoRoleExposesShutdown
   assertReviewerPostToolUseEventName
   assertReviewerCanExitDecisions
   assertReviewerVerdictsAreTerminal
@@ -55,6 +62,9 @@ main = do
   assertApprovedCanExitOnWatcherMergeReady
   assertCITriggeredMergeReadyTransitionsToDoneAndExits
   assertCIFailureBlocksAfterTrigger
+  assertMergeReadyReviewNotifiesParent
+  assertMergeReadyCIStatusNotifiesParent
+  assertReviewerFacingTextDoesNotMentionCopilot
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -73,6 +83,22 @@ assertRoleAllow role cfg =
     assertBool (label role toolName "allows") (continue_ output)
     assertEqual (label role toolName "decision") (Just "allow") (permissionDecisionOf output)
     assertBool (label role toolName "does not emit deny") (not (messageContains "TL agents cannot use" output))
+
+assertChainlinkDbSessionStartFailsafe :: IO ()
+assertChainlinkDbSessionStartFailsafe = do
+  assertValidationFails "unset CHAINLINK_DB" Nothing ChainlinkDbPathMissing ChainlinkDbPathMissing "CHAINLINK_DB not set"
+  assertValidationFails "missing CHAINLINK_DB directory" (Just "/tmp/missing-chainlink") ChainlinkDbPathMissing ChainlinkDbPathMissing "missing path"
+  assertValidationFails "phantom CHAINLINK_DB directory" (Just "/tmp/empty-chainlink") ChainlinkDbPathDirectory ChainlinkDbPathMissing "phantom DB directory without issues.db"
+  assertEqual
+    "valid CHAINLINK_DB directory"
+    (Right ())
+    (validateChainlinkDbEnv (Just "/tmp/project/.chainlink") ChainlinkDbPathDirectory ChainlinkDbPathFile)
+
+assertValidationFails :: String -> Maybe Text -> ChainlinkDbPathState -> ChainlinkDbPathState -> Text -> IO ()
+assertValidationFails labelText maybeDb dbState issuesState expected =
+  case validateChainlinkDbEnv maybeDb dbState issuesState of
+    Left message -> assertBool labelText (expected `T.isInfixOf` message)
+    Right () -> fail (labelText <> ": expected validation failure")
 
 assertReviewerDenyImplementationTools :: IO ()
 assertReviewerDenyImplementationTools =
@@ -243,6 +269,7 @@ hookInputFor eventName toolName =
       hiRuntime = Just Claude,
       hiCwd = Nothing,
       hiTranscriptPath = Nothing,
+      hiChainlinkDb = Nothing,
       hiLlmRequest = Nothing,
       hiLlmResponse = Nothing
     }
@@ -276,6 +303,15 @@ assertReviewerToolList =
       assertBool "reviewer must not expose send_mailbox_message" ("send_mailbox_message" `notElem` names)
       assertBool "reviewer must not expose notify_parent" ("notify_parent" `notElem` names)
 
+assertNoRoleExposesShutdown :: IO ()
+assertNoRoleExposesShutdown =
+  forM_ ["root", "tl", "dev", "worker", "testrunner", "reviewer"] $ \roleName ->
+    case lookupRole roleName of
+      Nothing -> fail $ "role missing from registry: " <> T.unpack roleName
+      Just roleCfg -> do
+        let names = map tdName (roleListTools roleCfg)
+        assertBool ("role must not expose shutdown: " <> T.unpack roleName) ("shutdown" `notElem` names)
+
 assertReviewerCanExitDecisions :: IO ()
 assertReviewerCanExitDecisions = do
   assertBlocks "reviewing" (canExit @ReviewerPhase @ReviewerEvent (ReviewerReviewing 7))
@@ -291,7 +327,6 @@ assertReviewerVerdictsAreTerminal = do
   case transition ReviewerSpawned (ReviewerRequestedChangesEv 7 "needs fix") of
     Transitioned ReviewerDone -> pure ()
     _ -> fail "expected ReviewerDone after requested-changes verdict"
-
 
 assertAppendVerdictLocksPerHeadSha :: IO ()
 assertAppendVerdictLocksPerHeadSha = do
@@ -323,7 +358,7 @@ assertDevNeedsHumanDirectionAfterOneFixRound = do
   assertBlocks "needs human direction" (canExit @DevPhase @DevEvent (DevNeedsHumanDirection 9 "still wrong"))
 
 -- Intended semantics: after the dev has pushed a fix (round_ >= 1), an
--- *approval* must transition to DevApproved, NOT DevNeedsHumanDirection.
+-- approval verdict must transition to DevApproved, NOT DevNeedsHumanDirection.
 -- The watcher is responsible for firing ReviewApprovedEv (not
 -- ReviewReceivedEv) when the reviewer's verdict is "approved".
 assertReviewApprovedAfterFixRoundTransitionsToApproved :: IO ()
@@ -382,6 +417,65 @@ assertCIFailureBlocksAfterTrigger = do
     Transitioned (DevCIBlocked 9 "failure") -> pure ()
     other -> fail $ "expected DevCIBlocked after failed CI, got " <> showDevTransition other
   assertBlocks "ci blocked terminal" (canExit @DevPhase @DevEvent (DevCIBlocked 9 "failure"))
+
+assertMergeReadyReviewNotifiesParent :: IO ()
+assertMergeReadyReviewNotifiesParent = do
+  action <- runPRReviewEvent DevRole.config (MergeReady 9 "success" "main.feature")
+  assertNotifyParent "merge-ready pr_review" 9 action
+
+assertMergeReadyCIStatusNotifiesParent :: IO ()
+assertMergeReadyCIStatusNotifiesParent = do
+  action <-
+    runCIStatusEvent
+      DevRole.config
+      (CIStatusEvent 9 "success" "main.feature" False True True)
+  assertNotifyParent "merge-ready ci_status" 9 action
+
+runPRReviewEvent :: RoleConfig tools -> PRReviewEvent -> IO EventAction
+runPRReviewEvent cfg event = do
+  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (onPRReview (eventHandlers cfg) event)
+  case status of
+    C.Done output -> pure output
+    C.Continue {} -> fail "PR review event unexpectedly suspended"
+
+runCIStatusEvent :: RoleConfig tools -> CIStatusEvent -> IO EventAction
+runCIStatusEvent cfg event = do
+  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (onCIStatus (eventHandlers cfg) event)
+  case status of
+    C.Done output -> pure output
+    C.Continue {} -> fail "CI status event unexpectedly suspended"
+
+assertNotifyParent :: String -> Int -> EventAction -> IO ()
+assertNotifyParent label_ expectedPr action =
+  case action of
+    NotifyParentAction message prNumber -> do
+      assertEqual (label_ <> " pr_number") expectedPr prNumber
+      assertBool (label_ <> " message") ("[MERGE READY]" `T.isInfixOf` message)
+    other -> fail $ label_ <> ": expected NotifyParentAction, got " <> show other
+
+assertReviewerFacingTextDoesNotMentionCopilot :: IO ()
+assertReviewerFacingTextDoesNotMentionCopilot = do
+  assertNoCopilot "merge_pr description" mergePRDescription
+  let mergePrSchemaText = T.pack (BSL.unpack (Aeson.encode mergePRSchema))
+  assertNoCopilot "merge_pr schema" mergePrSchemaText
+  assertContains "merge_pr schema" "chainlink_issue_id" mergePrSchemaText
+  assertNoCopilot "prReady" (Tpl.prReady 42)
+  assertNoCopilot "reviewTimeout" (Tpl.reviewTimeout 42 15)
+  assertContains "merge_pr description" "Forgejo reviewer" mergePRDescription
+  assertContains "merge_pr description issue id" "chainlink_issue_id" mergePRDescription
+  assertContains "prReady" "Forgejo reviewer" (Tpl.prReady 42)
+  assertContains "reviewTimeout" "Forgejo reviewer" (Tpl.reviewTimeout 42 15)
+  case Aeson.fromJSON (Aeson.object ["pr_number" Aeson..= (7 :: Int), "chainlink_issue_id" Aeson..= (42 :: Int)]) of
+    Aeson.Success args -> assertEqual "merge_pr parses chainlink_issue_id" (Just 42) (mprChainlinkIssueId args)
+    Aeson.Error err -> fail $ "merge_pr args parse failed: " <> err
+
+assertNoCopilot :: String -> Text -> IO ()
+assertNoCopilot label_ value =
+  assertBool (label_ <> " should not mention Copilot") (not ("Copilot" `T.isInfixOf` value))
+
+assertContains :: String -> Text -> Text -> IO ()
+assertContains label_ expected value =
+  assertBool (label_ <> " should mention " <> T.unpack expected) (expected `T.isInfixOf` value)
 
 showDevTransition :: TransitionResult DevPhase -> String
 showDevTransition (Transitioned phase) = "Transitioned " <> show phase

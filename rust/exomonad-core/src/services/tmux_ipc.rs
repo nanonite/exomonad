@@ -20,6 +20,14 @@ static INJECTION_LOCKS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+pub(crate) fn qualify_tmux_target(session_name: &str, target: &str) -> String {
+    if target.starts_with('%') {
+        target.to_string()
+    } else {
+        format!("{session_name}:{target}")
+    }
+}
+
 /// Stable tmux window identifier (@N format, base-index immune).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WindowId(String);
@@ -114,7 +122,7 @@ pub struct TmuxIpc {
 }
 
 fn settle_delay_for_payload(payload: &str) -> Duration {
-    let extra_ms = (payload.len() as u64 / 256).min(4) * 100;
+    let extra_ms = (payload.len() as u64 / 256).min(200) * 100;
     Duration::from_millis(250 + extra_ms)
 }
 
@@ -435,10 +443,16 @@ impl TmuxIpc {
     /// commands resolve to the same pane. Without qualification, tmux resolves
     /// display-name targets against the "most recently used" session, which is
     /// nondeterministic for subprocess calls.
-    pub async fn inject_input(&self, target: &str, text: &str, submit: bool) -> Result<()> {
+    pub async fn inject_input(
+        &self,
+        target: &str,
+        text: &str,
+        submit: bool,
+        skip_verify: bool,
+    ) -> Result<()> {
         // Session-qualify the target so paste-buffer and send-keys resolve
         // to the same pane deterministically.
-        let qualified_target = format!("{}:{}", self.session_name, target);
+        let qualified_target = qualify_tmux_target(&self.session_name, target);
 
         // Serialize injections to the same target to prevent interleaving.
         // Uses Weak refs so lock entries are reclaimed when not in use.
@@ -570,6 +584,21 @@ impl TmuxIpc {
             return Ok(());
         }
 
+        // For terminal CLIs (Codex, Gemini, OpenCode), submitted input stays in
+        // terminal scrollback history, so capture-pane always shows the probe text
+        // after Enter. Skip verification for those runtimes and trust paste+Enter.
+        if skip_verify {
+            Self::send_enter_key(&qualified_target).await?;
+            debug!(
+                target = %qualified_target,
+                bytes = payload.len(),
+                paste_ms = paste_elapsed.as_millis(),
+                delay_ms = settle_delay.as_millis(),
+                "tmux Enter sent (skip_verify=true)"
+            );
+            return Ok(());
+        }
+
         for attempt in 1..=3 {
             let enter_started = Instant::now();
             Self::send_enter_key(&qualified_target)
@@ -649,7 +678,7 @@ impl TmuxIpc {
     /// until a terminal event arrives. A +1/-1 column resize triggers SIGWINCH,
     /// which wakes the event loop to process buffered input.
     pub async fn wake_pane(&self, target: &str) -> Result<()> {
-        let qualified = format!("{}:{}", self.session_name, target);
+        let qualified = qualify_tmux_target(&self.session_name, target);
 
         // Read current window dimensions
         let output = Command::new("tmux")
@@ -738,6 +767,13 @@ impl TmuxIpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_qualify_tmux_target_keeps_pane_ids_unqualified() {
+        assert_eq!(qualify_tmux_target("session-a", "%5"), "%5");
+        assert_eq!(qualify_tmux_target("session-a", "@4"), "session-a:@4");
+        assert_eq!(qualify_tmux_target("session-a", "TL.0"), "session-a:TL.0");
+    }
 
     #[test]
     fn test_session_name() {

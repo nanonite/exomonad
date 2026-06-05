@@ -19,6 +19,7 @@ Use exomonad MCP tools for orchestration. Git operations use `git` CLI. **Never 
 | `merge_pr` | root, tl | Merge a child's PR |
 | `notify_parent` | tl, dev, worker | Send message to parent agent |
 | `send_tmux_message` / `send_mailbox_message` | all | Send message to any exomonad-spawned agent |
+| `poll_workers` | root, tl | Snapshot spawned agent pane liveness, Chainlink session state, issue status, and age before idling |
 | `task_list` | dev, worker | List tasks from the shared task list |
 | `task_get` | dev, worker | Get a task by ID |
 | `task_update` | dev, worker | Update task status, owner, or activeForm |

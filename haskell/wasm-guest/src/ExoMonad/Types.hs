@@ -10,6 +10,8 @@ module ExoMonad.Types
     EventHandlerConfig,
     defaultEventHandlers,
     defaultHooks,
+    ChainlinkDbPathState (..),
+    validateChainlinkDbEnv,
     defaultSessionStartHook,
     teamRegistrationPostToolUse,
     andThenPostToolUse,
@@ -28,10 +30,12 @@ import ExoMonad.Effects.KV (CleanupStalePhasesRequest (..), KVCleanupStalePhases
 import ExoMonad.Effects.Log (LogError, LogInfo)
 import ExoMonad.Effects.Log qualified as Log
 import ExoMonad.Effects.Session qualified as Session
+import ExoMonad.Guest.Effects.FileSystem qualified as FS
 import ExoMonad.Guest.Events (EventHandlerConfig, defaultEventHandlers)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), Effects, HookInput (..), HookOutput (..), HookSpecificOutput (..), StopHookOutput, allowResponse, allowStopResponse, postToolUseResponse)
 import GHC.Generics (Generic)
+import System.FilePath ((</>))
 
 -- | Role configuration.
 -- Defines the role name, available tools, and lifecycle hooks.
@@ -84,8 +88,83 @@ extractUuidFromTranscriptPath path =
         Just uuid | not (T.null uuid) -> Just uuid
         _ -> Nothing
 
--- | Default SessionStart hook: registers Claude conversation UUID,
--- then instructs Claude to create a team via TeamCreate.
+data ChainlinkDbPathState
+  = ChainlinkDbPathMissing
+  | ChainlinkDbPathFile
+  | ChainlinkDbPathDirectory
+  deriving (Show, Eq)
+
+validateChainlinkDbEnv :: Maybe Text -> ChainlinkDbPathState -> ChainlinkDbPathState -> Either Text ()
+validateChainlinkDbEnv maybeDb dbState issuesState = do
+  dbPath <- case T.strip <$> maybeDb of
+    Nothing -> Left chainlinkDbUnsetMessage
+    Just "" -> Left chainlinkDbUnsetMessage
+    Just path -> Right path
+  case dbState of
+    ChainlinkDbPathMissing -> Left $ chainlinkDbMissingMessage dbPath
+    ChainlinkDbPathFile -> Left $ chainlinkDbNotDirectoryMessage dbPath
+    ChainlinkDbPathDirectory ->
+      case issuesState of
+        ChainlinkDbPathFile -> Right ()
+        _ -> Left $ chainlinkDbPhantomMessage dbPath
+
+chainlinkDbUnsetMessage :: Text
+chainlinkDbUnsetMessage =
+  "CHAINLINK_DB not set. ExoMonad spawn env is broken; refusing to start agent. Investigate build_agent_command in services/agent_control/internal.rs."
+
+chainlinkDbMissingMessage :: Text -> Text
+chainlinkDbMissingMessage path =
+  "CHAINLINK_DB points at a missing path: "
+    <> path
+    <> ". ExoMonad spawn env is broken; refusing to start agent. Investigate build_agent_command in services/agent_control/internal.rs."
+
+chainlinkDbNotDirectoryMessage :: Text -> Text
+chainlinkDbNotDirectoryMessage path =
+  "CHAINLINK_DB must point at a directory containing issues.db, got: "
+    <> path
+    <> ". Refusing to start agent."
+
+chainlinkDbPhantomMessage :: Text -> Text
+chainlinkDbPhantomMessage path =
+  "CHAINLINK_DB points at a phantom DB directory without issues.db: "
+    <> path
+    <> ". Refusing to start agent before Chainlink can create a divergent tracker."
+
+sessionStartDenyResponse :: Text -> HookOutput
+sessionStartDenyResponse message =
+  HookOutput
+    { continue_ = False,
+      stopReason = Just message,
+      suppressOutput = Nothing,
+      systemMessage = Just message,
+      hookSpecificOutput = Just $ SessionStartOutput {ssAdditionalContext = Just message}
+    }
+
+pathStateFromExists :: FS.FileExistsOutput -> ChainlinkDbPathState
+pathStateFromExists output
+  | not (FS.feoExists output) = ChainlinkDbPathMissing
+  | FS.feoIsDirectory output = ChainlinkDbPathDirectory
+  | otherwise = ChainlinkDbPathFile
+
+readPathState :: Text -> Eff Effects ChainlinkDbPathState
+readPathState path = do
+  result <- FS.fileExists path
+  pure $ case result of
+    Left _ -> ChainlinkDbPathMissing
+    Right output -> pathStateFromExists output
+
+checkChainlinkDbEnv :: HookInput -> Eff Effects (Either Text ())
+checkChainlinkDbEnv hookInput =
+  case T.strip <$> hiChainlinkDb hookInput of
+    Nothing -> pure $ validateChainlinkDbEnv Nothing ChainlinkDbPathMissing ChainlinkDbPathMissing
+    Just "" -> pure $ validateChainlinkDbEnv (hiChainlinkDb hookInput) ChainlinkDbPathMissing ChainlinkDbPathMissing
+    Just dbPath -> do
+      dbState <- readPathState dbPath
+      issuesState <- readPathState (T.pack (T.unpack dbPath </> "issues.db"))
+      pure $ validateChainlinkDbEnv (Just dbPath) dbState issuesState
+
+-- | Default SessionStart hook: first validates the Chainlink DB anchor, then
+-- registers Claude conversation UUID and instructs Claude to create a team.
 -- Team name registration happens in PostToolUse (teamRegistrationPostToolUse)
 -- after TeamCreate returns the actual auto-generated name.
 --
@@ -94,22 +173,26 @@ extractUuidFromTranscriptPath path =
 -- to the .jsonl file needed for --resume --fork-session.
 defaultSessionStartHook :: HookInput -> Eff Effects HookOutput
 defaultSessionStartHook hookInput = do
-  let claudeUuid = case hiTranscriptPath hookInput >>= extractUuidFromTranscriptPath of
-        Just uuid -> uuid
-        Nothing -> hiSessionId hookInput
-  void $
-    suspendEffect_ @Session.SessionRegisterClaudeId
-      (Session.RegisterClaudeSessionRequest {Session.registerClaudeSessionRequestClaudeSessionId = TL.fromStrict claudeUuid})
-  void $ suspendEffect_ @KVCleanupStalePhases (CleanupStalePhasesRequest {})
-  let instruction = "Create a team using TeamCreate before proceeding."
-  pure $
-    HookOutput
-      { continue_ = True,
-        stopReason = Nothing,
-        suppressOutput = Nothing,
-        systemMessage = Nothing,
-        hookSpecificOutput = Just $ SessionStartOutput {ssAdditionalContext = Just instruction}
-      }
+  chainlinkDbCheck <- checkChainlinkDbEnv hookInput
+  case chainlinkDbCheck of
+    Left message -> pure $ sessionStartDenyResponse message
+    Right () -> do
+      let claudeUuid = case hiTranscriptPath hookInput >>= extractUuidFromTranscriptPath of
+            Just uuid -> uuid
+            Nothing -> hiSessionId hookInput
+      void $
+        suspendEffect_ @Session.SessionRegisterClaudeId
+          (Session.RegisterClaudeSessionRequest {Session.registerClaudeSessionRequestClaudeSessionId = TL.fromStrict claudeUuid})
+      void $ suspendEffect_ @KVCleanupStalePhases (CleanupStalePhasesRequest {})
+      let instruction = "Create a team using TeamCreate before proceeding."
+      pure $
+        HookOutput
+          { continue_ = True,
+            stopReason = Nothing,
+            suppressOutput = Nothing,
+            systemMessage = Nothing,
+            hookSpecificOutput = Just $ SessionStartOutput {ssAdditionalContext = Just instruction}
+          }
 
 -- | PostToolUse hook that registers the team after TeamCreate completes.
 -- Extracts the auto-generated team name from TeamCreate's tool_response

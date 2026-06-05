@@ -791,6 +791,12 @@ impl<
             .join(".exo/agents")
             .join(agent_name.as_str());
         fs::create_dir_all(&agent_config_dir).await?;
+        if !routing.has_delivery_target() {
+            return Err(anyhow!(
+                "refusing to finalize spawn for {} without routing target",
+                agent_name
+            ));
+        }
         routing.write_to_dir(&agent_config_dir).await?;
 
         let now_secs = std::time::SystemTime::now()
@@ -1144,6 +1150,61 @@ mod tests {
         assert!(parse_agent_dir_name("123-test-claude").is_none());
         assert!(parse_agent_dir_name("gh-nohyphens").is_none());
         assert!(parse_agent_dir_name("gh-123").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_finalize_spawn_writes_codex_shared_dir_routing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.clone(),
+        ));
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.git_wt = git_wt;
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let service = AgentControlService::new(Arc::new(services));
+
+        let agent_name = AgentName::try_from_str("issue-65-divergence-investigation-codex")
+            .expect("literal validated string is non-empty");
+        let parent_branch = BirthBranch::try_from_str("opencode-e2e")
+            .expect("literal validated string is non-empty");
+        let identity = AgentIdentityRecord {
+            agent_name: agent_name.clone(),
+            slug: Slug::try_from_str("issue-65-divergence-investigation")
+                .expect("literal validated string is non-empty"),
+            agent_type: AgentType::Codex,
+            birth_branch: parent_branch.clone(),
+            parent_branch,
+            working_dir: PathBuf::from("."),
+            display_name: AgentType::Codex.tab_display_name("issue-65-divergence-investigation"),
+            topology: Topology::SharedDir,
+        };
+        let pane_id = tmux_ipc::PaneId::parse("%42").unwrap();
+        let agent_dir = service
+            .finalize_spawn(
+                &agent_name,
+                RoutingInfo::pane(pane_id, "TL"),
+                Some(identity),
+            )
+            .await
+            .unwrap();
+
+        let routing: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(agent_dir.join("routing.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(routing["pane_id"], "%42");
+        assert_eq!(routing["parent_tab"], "TL");
+        assert!(agent_dir.join("identity.json").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(agent_dir.join("active_issue"))
+                .await
+                .unwrap(),
+            "65"
+        );
     }
 
     // =========================================================================

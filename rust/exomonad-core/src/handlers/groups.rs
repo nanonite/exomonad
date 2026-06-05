@@ -20,9 +20,9 @@ pub fn core_handlers(project_dir: PathBuf, services: Arc<Services>) -> Vec<Box<d
         Box::new(LogHandler::new(services)),
         Box::new(KvHandler::new(project_dir.clone())),
         Box::new(FsHandler::new(Arc::new(FileSystemService::new(
-            project_dir,
+            project_dir.clone(),
         )))),
-        Box::new(ProcessHandler::new()),
+        Box::new(ProcessHandler::with_project_dir(project_dir)),
     ]
 }
 

@@ -169,11 +169,16 @@ struct EventRow {
 }
 
 fn forgejo_client(config: &Config) -> Option<Arc<ForgejoClient>> {
-    ForgejoClient::new(
-        config.forgejo_url.as_deref()?,
-        config.forgejo_token.as_deref()?,
-    )
-    .ok()
+    match (
+        config.forgejo_url.as_deref(),
+        config.forgejo_token.as_deref(),
+    ) {
+        (Some(url), Some(token)) => ForgejoClient::new(url, token).ok(),
+        (None, None) if ForgejoClient::fj_binary_in_path() => {
+            Some(ForgejoClient::new_fj(config.project_dir.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn should_quit(timeout: Duration) -> Result<bool> {

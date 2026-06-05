@@ -77,6 +77,8 @@ pub struct HookQueryParams {
     pub agent_id: Option<String>,
     /// TL session ID for event routing (forwarded from caller's env).
     pub session_id: Option<String>,
+    /// CHAINLINK_DB value from the agent-side hook process.
+    pub chainlink_db: Option<String>,
 }
 
 /// Server-side hook handler state, shared across requests.
@@ -489,6 +491,9 @@ pub async fn handle_hook_inner(
             "exomonad_session_id".to_string(),
             serde_json::json!(birth_branch_for_hook.to_string()),
         );
+        if let Some(ref chainlink_db) = params.chainlink_db {
+            map.insert("chainlink_db".to_string(), serde_json::json!(chainlink_db));
+        }
     }
 
     debug!(
@@ -948,35 +953,68 @@ Run `exomonad recompile` first to build it.",
     let git_wt = Arc::new(
         exomonad_core::services::git_worktree::GitWorktreeService::new(project_dir.clone()),
     );
+    let http_forgejo_configured = matches!(
+        (
+            config.forgejo_url.as_deref(),
+            config.forgejo_token.as_deref()
+        ),
+        (Some(_), Some(_))
+    );
+    let fj_backend_selected = !http_forgejo_configured
+        && config.forgejo_url.is_none()
+        && config.forgejo_token.is_none()
+        && exomonad_core::services::ForgejoClient::fj_binary_in_path();
+
     let forgejo_client = match (
         config.forgejo_url.as_deref(),
         config.forgejo_token.as_deref(),
     ) {
         (Some(url), Some(token)) => Some(exomonad_core::services::ForgejoClient::new(url, token)?),
         (Some(_), None) => {
-            warn!("forgejo_url configured without forgejo_token; file_pr will use local PR flow");
+            warn!("forgejo_url configured without forgejo_token; Forgejo integration disabled");
             None
         }
         (None, Some(_)) => {
-            warn!("forgejo_token configured without forgejo_url; file_pr will use local PR flow");
+            warn!("forgejo_token configured without forgejo_url; Forgejo integration disabled");
             None
         }
-        (None, None) => None,
+        (None, None) if fj_backend_selected => {
+            info!("[Forgejo] Using fj CLI backend (forgejo_url/forgejo_token not configured)");
+            Some(exomonad_core::services::ForgejoClient::new_fj(
+                project_dir.clone(),
+            ))
+        }
+        (None, None) => {
+            warn!(
+                "[Forgejo] Not configured - spawn_reviewer, watcher_pr_state, file_pr will be unavailable"
+            );
+            None
+        }
     };
-    let forgejo_reviewer_client = match (
-        config.forgejo_url.as_deref(),
-        config.forgejo_reviewer_token.as_deref(),
-    ) {
-        (Some(url), Some(token)) => Some(exomonad_core::services::ForgejoClient::new(url, token)?),
-        (Some(_), None) => {
-            warn!("forgejo_reviewer_token not configured; reviewer MCP tools cannot submit Forgejo PR reviews");
-            None
+    let forgejo_reviewer_client = if fj_backend_selected {
+        forgejo_client.clone()
+    } else {
+        match (
+            config.forgejo_url.as_deref(),
+            config.forgejo_reviewer_token.as_deref(),
+        ) {
+            (Some(url), Some(token)) => {
+                Some(exomonad_core::services::ForgejoClient::new(url, token)?)
+            }
+            (Some(_), None) => {
+                warn!(
+                    "forgejo_reviewer_token not configured; reviewer MCP tools cannot submit Forgejo PR reviews"
+                );
+                None
+            }
+            (None, Some(_)) => {
+                warn!(
+                    "forgejo_reviewer_token configured without forgejo_url; reviewer MCP tools cannot submit Forgejo PR reviews"
+                );
+                None
+            }
+            (None, None) => None,
         }
-        (None, Some(_)) => {
-            warn!("forgejo_reviewer_token configured without forgejo_url; reviewer MCP tools cannot submit Forgejo PR reviews");
-            None
-        }
-        (None, None) => None,
     };
 
     let team_registry = Arc::new(claude_teams_bridge::TeamRegistry::new());
@@ -1011,6 +1049,7 @@ Run `exomonad recompile` first to build it.",
     let ci_status_map = Arc::new(tokio::sync::RwLock::new(
         exomonad_core::services::CiStatusMap::new(),
     ));
+    let watcher_runtime_state = Arc::new(exomonad_core::services::WatcherRuntimeState::new());
 
     // Build Services once — all shared registries in one struct
     let services = Arc::new(exomonad_core::services::Services {
@@ -1029,6 +1068,7 @@ Run `exomonad recompile` first to build it.",
         git_wt,
         opencode_worker_model: config.opencode.worker_model.clone(),
         ci_status_map: ci_status_map.clone(),
+        watcher_runtime_state: watcher_runtime_state.clone(),
     });
 
     let mut agent_control =
@@ -1155,6 +1195,7 @@ Run `exomonad recompile` first to build it.",
     )
     .with_plugins(plugins.clone())
     .with_reviewer_spawner(agent_control.clone())
+    .with_runtime_state(watcher_runtime_state.clone())
     .with_ci_status_map(ci_status_map.clone())
     .with_policy(review_policy);
     if let Some(interval) = config.poll_interval {

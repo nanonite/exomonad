@@ -1,6 +1,6 @@
 //! Hibernated GitHub Actions poller.
 //!
-//! This module currently has zero active call sites; the local Tangled path uses
+//! This module currently has zero active call sites; the worktree watcher path uses
 //! `worktree_event_watcher` instead. Keep this implementation in design parity
 //! with `worktree_event_watcher` so future GitHub Actions integration can wire it
 //! back in as a thin transport shim instead of a second review-loop design.

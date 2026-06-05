@@ -186,10 +186,13 @@ pub async fn file_pr_async(
         let dir_path = std::path::PathBuf::from(dir);
         let bookmark = head.clone();
         let git_wt_clone = git_wt.clone();
-        tokio::task::spawn_blocking(move || git_wt_clone.push_bookmark(&dir_path, &bookmark))
-            .await
-            .context("spawn_blocking failed")?
-            .map_err(|e| FilePrError::Push(e.to_string()))?;
+        let forgejo_token = forgejo.git_auth_token().map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            git_wt_clone.push_bookmark_with_token(&dir_path, &bookmark, forgejo_token.as_deref())
+        })
+        .await
+        .context("spawn_blocking failed")?
+        .map_err(|e| FilePrError::Push(e.to_string()))?;
         info!("[FilePR] Pushed bookmark: {}", head);
     }
 

@@ -19,6 +19,99 @@ fn parse_git_status_paths(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+fn resolve_identity_working_dir(project_dir: &Path, working_dir: &Path) -> PathBuf {
+    if working_dir.is_absolute() {
+        working_dir.to_path_buf()
+    } else {
+        project_dir.join(working_dir)
+    }
+}
+
+async fn find_existing_leaf_worktree_by_slug(
+    worktree_base: &Path,
+    slug: &str,
+) -> Result<Option<(AgentIdentity, PathBuf)>> {
+    let mut entries = match fs::read_dir(worktree_base).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut candidates = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        candidates.push((name, entry.path()));
+    }
+
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, path) in candidates {
+        let identity = AgentIdentity::from_internal_name(&name);
+        if identity.slug() == slug {
+            return Ok(Some((identity, path)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn reviewer_harness_denied_tools() -> Vec<String> {
+    [
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+        "fork_wave",
+        "spawn_leaf",
+        "spawn_worker",
+        "merge_pr",
+        "file_pr",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+async fn preflight_reviewer_hook_environment(project_dir: &Path) -> Result<()> {
+    let binary_path = crate::util::find_exomonad_binary();
+    if binary_path.components().count() > 1 && !binary_path.exists() {
+        anyhow::bail!(
+            "Reviewer hook preflight failed: exomonad hook binary not found at {}",
+            binary_path.display()
+        );
+    }
+
+    let socket_path = project_dir.join(".exo/server.sock");
+    if !socket_path.exists() {
+        anyhow::bail!(
+            "Reviewer hook preflight failed: parent server socket missing at {}",
+            socket_path.display()
+        );
+    }
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::UnixStream::connect(&socket_path),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => Ok(()),
+        Ok(Err(error)) => anyhow::bail!(
+            "Reviewer hook preflight failed: parent server socket unreachable at {}: {}",
+            socket_path.display(),
+            error
+        ),
+        Err(_) => anyhow::bail!(
+            "Reviewer hook preflight failed: timed out connecting to parent server socket at {}",
+            socket_path.display()
+        ),
+    }
+}
+
 fn dirty_spawn_error(files: &[String]) -> anyhow::Error {
     let mut message = format!(
         "BLOCKED: cannot spawn agent into a dirty TL worktree. {} file(s) have uncommitted changes:",
@@ -30,6 +123,41 @@ fn dirty_spawn_error(files: &[String]) -> anyhow::Error {
     }
     message.push_str("\nCommit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` if throwaway, then retry. Workers spawn in-place and would inherit this state; dev-leaves fork from your branch HEAD and would not see your uncommitted work.");
     anyhow!(message)
+}
+
+async fn is_gitignored_path(worktree: &Path, file: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["check-ignore", "--no-index", "-q", "--", file])
+        .current_dir(worktree)
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect gitignore rules in {}",
+                worktree.display()
+            )
+        })?;
+
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "failed to inspect gitignore rules for {} in {}: {}",
+            file,
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+async fn filter_gitignored_paths(worktree: &Path, files: Vec<String>) -> Result<Vec<String>> {
+    let mut visible_files = Vec::new();
+    for file in files {
+        if !is_gitignored_path(worktree, &file).await? {
+            visible_files.push(file);
+        }
+    }
+    Ok(visible_files)
 }
 
 async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
@@ -49,6 +177,7 @@ async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
     }
 
     let files = parse_git_status_paths(&String::from_utf8_lossy(&output.stdout));
+    let files = filter_gitignored_paths(worktree, files).await?;
     if files.is_empty() {
         Ok(())
     } else {
@@ -155,11 +284,13 @@ pub const OPENCODE_DEV_INSTRUCTIONS: &str = "\
 You are a dev agent in an ExoMonad agent tree. You work in your own git worktree on your own branch.
 
 ## Your Job
-Implement the spec in your task. File a PR when done. Call notify_parent to report completion or failure.
+Implement the spec in your task. File a PR when done. Stay active to address reviewer feedback.
 
 ## MCP Tools Available
-- file_pr: Create/update a PR for your branch. Call this when your implementation is ready.
-- notify_parent: Send a message to your parent TL. Use status 'success' when done, 'failure' if stuck.
+These names are MCP tools exposed inside your agent tool interface. They are not shell commands, are not on PATH, and must not be invoked with bash commands like `which file_pr` or `file_pr ...`.
+
+- file_pr: Create/update a PR for your branch. Call this when your implementation is ready, and again after pushing review fixes.
+- notify_parent: Send a message to your parent TL when context calls for direct handoff. Use status 'success' for completed handoffs and 'failure' if you are stuck and cannot proceed.
 - send_tmux_message: Send a message by injecting it into another agent tmux pane.
 - send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 
@@ -168,13 +299,53 @@ Implement the spec in your task. File a PR when done. Call notify_parent to repo
 2. Implement the changes on your branch.
 3. Build and verify (exact commands in your spec).
 4. Call file_pr to create the PR.
-5. Call notify_parent with status='success' and a summary of what you did.
+5. Stay active. A reviewer agent will examine the PR and may post comments back into this
+   conversation. Read them carefully and address every point raised.
+6. After addressing review comments: commit, push, then call file_pr again to update the PR.
+   The system normally notifies your parent TL automatically when review is complete.
+7. Use notify_parent with status='success' or status='failure' when direct handoff is
+   appropriate for the context, including completion outside the normal review loop or being
+   truly stuck after multiple attempts.
 
 ## Key Rules
 - Work only in your worktree. Never checkout another branch.
 - Never call fork_wave or spawn_leaf — you are a leaf, not a TL.
+- NEVER merge PRs. Never call merge_pr, never run `gh pr merge`, never use any bash tool (ctx_execute, shell commands) to merge. Merging is exclusively the parent TL's responsibility.
 - Git operations (status, commit, push) use bash. EXCEPTION: file_pr is the MCP tool for PRs — never use `gh pr create`.
-- If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
+- Do not exit or consider yourself done after filing the PR. The review loop may require further work.
+";
+
+pub const OPENCODE_WORKER_INSTRUCTIONS: &str = "\
+# ExoMonad Worker Agent Protocol
+
+You are an OpenCode worker in an ExoMonad agent tree. You run in a shared workspace pane and do not have your own branch.
+
+## Your Job
+Complete the narrow task assigned by your parent TL. Report completion through the provided MCP tools.
+
+## MCP Tools Available
+- chainlink_session_start: Start the Chainlink session before marking work active.
+- chainlink_session_work: Mark the assigned Chainlink issue as the active work item.
+- chainlink_issue_comment: Post progress on the assigned Chainlink issue.
+- chainlink_session_end: End the Chainlink session with handoff notes.
+- notify_parent: Send a direct message to your parent TL when needed.
+- send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
+- send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
+
+## Workflow
+1. Read the prompt carefully and use the issue ID provided by the TL.
+2. Call chainlink_session_start.
+3. Call chainlink_session_work before doing the requested work.
+4. Call chainlink_issue_comment for the required progress marker.
+5. Call chainlink_session_end with concise handoff notes when done.
+6. Call notify_parent with status='success' and include the issue ID.
+
+## Key Rules
+- Never spawn agents; workers are leaf executors.
+- Never create Chainlink issues; only the parent TL creates issues.
+- Never initialize Chainlink agent identity; ExoMonad branch/session identity is authoritative.
+- Never close Chainlink issues; your parent coordinator reviews the handoff and closes.
+- Never create branches, commits, or PRs unless explicitly instructed.
 ";
 
 pub const CODEX_DEV_INSTRUCTIONS: &str = "\
@@ -183,11 +354,11 @@ pub const CODEX_DEV_INSTRUCTIONS: &str = "\
 You are a Codex dev agent in an ExoMonad agent tree. You work in your own git worktree on your own branch.
 
 ## Your Job
-Implement the spec in your task. File a PR when done. Call notify_parent to report completion or failure.
+Implement the spec in your task. File a PR when done. Stay active to address reviewer feedback.
 
 ## MCP Tools Available
-- file_pr: Create/update a PR for your branch. Call this when your implementation is ready.
-- notify_parent: Send a message to your parent TL. Use status 'success' when done, 'failure' if stuck.
+- file_pr: Create/update a PR for your branch. Call this when your implementation is ready, and again after pushing review fixes.
+- notify_parent: Send a message to your parent TL when context calls for direct handoff. Use status 'success' for completed handoffs and 'failure' if you are stuck and cannot proceed.
 - send_tmux_message: Send a message by injecting it into another agent tmux pane.
 - send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 
@@ -196,13 +367,19 @@ Implement the spec in your task. File a PR when done. Call notify_parent to repo
 2. Implement the changes on your branch.
 3. Build and verify using the exact commands in your spec.
 4. Call file_pr to create the PR.
-5. Call notify_parent with status='success' and a summary of what you did.
+5. Stay active. A reviewer agent will examine the PR and may post comments back into this
+   conversation. Read them carefully and address every point raised.
+6. After addressing review comments: commit, push, then call file_pr again to update the PR.
+   The system normally notifies your parent TL automatically when review is complete.
+7. Use notify_parent with status='success' or status='failure' when direct handoff is
+   appropriate for the context, including completion outside the normal review loop or being
+   truly stuck after multiple attempts.
 
 ## Key Rules
 - Work only in your worktree. Never checkout another branch.
 - Never call fork_wave or spawn_leaf; you are a leaf, not a TL.
 - Git operations use shell commands. Use file_pr for PR creation.
-- If you cannot complete the task after multiple attempts, call notify_parent with status='failure'.
+- Do not exit or consider yourself done after filing the PR. The review loop may require further work.
 ";
 
 pub const CODEX_WORKER_INSTRUCTIONS: &str = "\
@@ -275,17 +452,17 @@ You are a Codex reviewer agent in an ExoMonad agent tree. You review a sibling a
 ## Your Job
 Review the PR assigned in your task prompt. Approve correct changes or request specific fixes. Do not implement the fix yourself.
 
-## MCP Tools Available
-- approve_pr: Submit an approved Forgejo PR review.
-- request_changes: Submit a request-changes Forgejo PR review.
-- post_review_comment: Submit a comment-only Forgejo PR review.
+## Direct Forgejo API Review
+Submit the final verdict with curl against Forgejo, not through MCP review tools. This keeps reviews working even if the reviewer worktree has no local .exo/server.sock.
+
+Required environment: FORGEJO_URL plus FORGEJO_REVIEWER_TOKEN, falling back to FORGEJO_TOKEN only if the reviewer token is unavailable. The task prompt gives the PR number and repo slug.
 
 ## Workflow
 1. Read the task prompt for the PR number, PR branch, base branch, and author.
-2. Run `git diff {base_branch}..HEAD` using the base branch from the prompt.
+2. Read the PR diff through Forgejo API: GET /api/v1/repos/{owner}/{repo}/pulls/{pr}/files. Use raw file API endpoints for changed file content.
 3. Review for correctness, edge cases, security issues, missing tests, and broken contracts.
-4. If issues are found, call request_changes with specific, actionable feedback that references files and functions or lines.
-5. If the code is correct, call approve_pr with a concise approving comment.
+4. If issues are found, POST a REQUEST_CHANGES review directly to /api/v1/repos/{owner}/{repo}/pulls/{pr}/reviews.
+5. If the code is correct, POST an APPROVED review directly to the same endpoint with a concise approving comment.
 6. Call notify_parent with status='success' after submitting the review, then stop. The ExoMonad watcher reads Forgejo reviews and routes the review result.
 
 ## Key Rules
@@ -293,7 +470,8 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 - Never merge a PR; only the TL merges.
 - Never spawn agents; reviewer is a leaf role.
 - Never review your own PR. If the PR author is you, report failure with notify_parent.
-- Do not use `codex exec review`; it emits Codex-native review text and does not write ExoMonad review files.
+- Do not use `codex exec review`; it emits Codex-native review text and does not submit Forgejo reviews.
+- Do not call approve_pr, request_changes, or post_review_comment for your final verdict; use direct Forgejo API curl.
 - Prefer 3-5 high-impact comments over exhaustive style feedback.
 ";
 
@@ -304,6 +482,52 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 /// not the project root, and the context files live outside the worktree's tracked
 /// tree). Absolute paths pass through unchanged. Empty `reviewer_context` returns
 /// "" — no "Read first:" header emitted in that case (production default).
+pub(crate) fn render_reviewer_direct_api_section(
+    pr_number: u64,
+    repo_owner: Option<&str>,
+    repo_name: Option<&str>,
+) -> String {
+    let repo_exports = match (repo_owner, repo_name) {
+        (Some(owner), Some(repo)) => format!(
+            "FORGEJO_OWNER={}\nFORGEJO_REPO={}\n",
+            shell_escape::escape(owner.into()),
+            shell_escape::escape(repo.into())
+        ),
+        _ => "# Set FORGEJO_OWNER and FORGEJO_REPO before running these commands.\n".to_string(),
+    };
+
+    format!(
+        r#"
+
+Direct Forgejo API review path:
+Use this path for the final verdict. Do not depend on local review files, approve_pr, request_changes, post_review_comment, or an ExoMonad socket.
+
+```bash
+PR_NUMBER={pr_number}
+{repo_exports}REVIEW_TOKEN="${{FORGEJO_REVIEWER_TOKEN:-$FORGEJO_TOKEN}}"
+test -n "$FORGEJO_URL" && test -n "$REVIEW_TOKEN" && test -n "$FORGEJO_OWNER" && test -n "$FORGEJO_REPO"
+
+# PR metadata, including head SHA.
+curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER"
+
+# Changed files.
+curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/files"
+
+# Changed file content once HEAD_SHA and FILE_PATH are known.
+curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/raw/$HEAD_SHA/$FILE_PATH"
+
+# Final verdict. Use REQUEST_CHANGES instead of APPROVED when blocking issues exist.
+curl -fsS -X POST -H "Authorization: token $REVIEW_TOKEN" -H "Content-Type: application/json" \
+  --data '{{"event":"APPROVED","body":"LGTM. Verified: <what you checked>."}}' \
+  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/reviews"
+```
+"#
+    )
+}
+
 pub(crate) fn render_reviewer_context_section(
     reviewer_context: &[String],
     project_dir: &std::path::Path,
@@ -794,9 +1018,9 @@ impl<
         }
 
         // instructions must be an array per OpenCode's schema.
-        // Only inject TL instructions for root/tl roles; dev/worker roles get no override.
         let instructions = match role {
             "root" | "tl" => serde_json::json!([OPENCODE_TL_INSTRUCTIONS]),
+            "worker" => serde_json::json!([OPENCODE_WORKER_INSTRUCTIONS]),
             _ => serde_json::json!([OPENCODE_DEV_INSTRUCTIONS]),
         };
         serde_json::json!({
@@ -817,6 +1041,15 @@ impl<
         fs::write(plugin_dir.join("index.ts"), OPENCODE_PLUGIN_TS).await?;
         fs::write(plugin_dir.join("package.json"), OPENCODE_PLUGIN_PKG_JSON).await?;
         info!(path = %plugin_dir.display(), "Wrote OpenCode plugin files");
+        Ok(())
+    }
+
+    pub async fn write_opencode_git_stub(
+        agent_config_dir: &Path,
+        project_dir: &Path,
+    ) -> Result<()> {
+        let git_content = format!("gitdir: {}\n", project_dir.join(".git").display());
+        fs::write(agent_config_dir.join(".git"), git_content).await?;
         Ok(())
     }
 
@@ -990,6 +1223,7 @@ impl<
                     let opencode_json_path = agent_config_dir.join("opencode.json");
                     fs::write(&opencode_json_path, serde_json::to_string_pretty(&worker_config)?).await?;
                     Self::write_opencode_plugin_files(&agent_config_dir).await?;
+                    Self::write_opencode_git_stub(&agent_config_dir, self.project_dir()).await?;
                     info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json and plugin to agent config dir");
                 }
                 AgentType::Codex => {
@@ -997,7 +1231,7 @@ impl<
                         &agent_config_dir,
                         &role,
                         &agent_name,
-                        self.spawn_agent_model(),
+                        None,
                         &self.extra_mcp_servers,
                     )
                     .await?;
@@ -1423,22 +1657,55 @@ impl<
                 .context("effective birth branch was empty")?;
 
             // Sanitize branch name and construct typed identity
-            let agent_type = options.agent_type;
-            let identity = AgentIdentity::new(slugify(&options.branch_name), agent_type);
-            let agent_name = identity.internal_name();
-            let display_name = identity.display_name();
+            let slug = slugify(&options.branch_name);
+            let slug_key = Slug::try_from_str(&slug).context("generated agent slug was empty")?;
+            let mut agent_type = options.agent_type;
+            let mut identity = AgentIdentity::new(slug.clone(), agent_type);
+            let mut agent_name = identity.internal_name();
+            let mut display_name = identity.display_name();
+            let mut worktree_path = self.worktree_base.join(agent_name.as_str());
+            let mut existing_identity_record = None;
+
+            if !options.standalone_repo && !worktree_path.exists() {
+                if let Some(record) = self.agent_resolver().lookup_by_slug(&slug_key).await {
+                    if record.topology == Topology::WorktreePerAgent {
+                        let record_worktree =
+                            resolve_identity_working_dir(effective_project_dir, &record.working_dir);
+                        if record_worktree.exists() {
+                            agent_name = record.agent_name.clone();
+                            agent_type = record.agent_type;
+                            identity = AgentIdentity::from_internal_name(agent_name.as_str());
+                            display_name = record.display_name.clone();
+                            worktree_path = record_worktree;
+                            existing_identity_record = Some(record);
+                        }
+                    }
+                }
+
+                if existing_identity_record.is_none() {
+                    if let Some((found_identity, found_path)) =
+                        find_existing_leaf_worktree_by_slug(&self.worktree_base, &slug).await?
+                    {
+                        identity = found_identity;
+                        agent_type = identity.agent_type();
+                        agent_name = identity.internal_name();
+                        display_name = identity.display_name();
+                        worktree_path = found_path;
+                    }
+                }
+            }
 
             // Idempotency check
             let tab_alive = self.is_tmux_window_alive(&display_name).await;
             if tab_alive {
                 info!(slug = %identity.slug(), "Leaf subtree already running, returning existing");
                 return Ok(SpawnResult {
-                    agent_dir: self.worktree_base.join(agent_name.as_str()),
-                      agent_name,
-                      issue_title: options.branch_name.clone(),
-                      agent_type,
-                      pane_id: None,
-                  });
+                    agent_dir: worktree_path,
+                    agent_name,
+                    issue_title: options.branch_name.clone(),
+                    agent_type,
+                    pane_id: None,
+                });
             }
 
             // Ensure a remote exists for local-only workflows
@@ -1447,10 +1714,13 @@ impl<
             // Push parent branch so child PRs can reference it as base
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
-            let child_birth = effective_birth.child(agent_name.as_str());
-            let branch_name = BranchName::try_from_str(child_birth.to_string().as_str()).expect("validated string input is non-empty");
+            let child_birth = existing_identity_record
+                .as_ref()
+                .map(|record| record.birth_branch.clone())
+                .unwrap_or_else(|| effective_birth.child(agent_name.as_str()));
+            let branch_name = BranchName::try_from_str(child_birth.to_string().as_str())
+                .expect("validated string input is non-empty");
 
-            let worktree_path = self.worktree_base.join(agent_name.as_str());
             let mut remove_worktree_on_spawn_failure = false;
 
             if options.standalone_repo {
@@ -1582,14 +1852,32 @@ impl<
     ) -> Result<SpawnResult> {
         let context_section =
             render_reviewer_context_section(&self.reviewer_context, self.project_dir());
+        let repo_info = match crate::services::repo::get_repo_info(self.project_dir()).await {
+            Ok(info) => Some(info),
+            Err(err) => {
+                warn!(error = %err, "Failed to resolve repo slug for reviewer direct API prompt");
+                None
+            }
+        };
+        let direct_api_section = render_reviewer_direct_api_section(
+            pr_entry.number,
+            repo_info.as_ref().map(|info| info.owner.as_str()),
+            repo_info.as_ref().map(|info| info.repo.as_str()),
+        );
+        let repo_slug = repo_info
+            .as_ref()
+            .map(|info| format!("{}/{}", info.owner, info.repo))
+            .unwrap_or_else(|| "unknown".to_string());
         let task = format!(
-            "Review PR #{}: {}\n\nBranch: {}\nBase: {}\nAuthor: {}{}",
+            "Review PR #{}: {}\n\nRepo: {}\nBranch: {}\nBase: {}\nAuthor: {}{}{}",
             pr_entry.number,
             pr_entry.title,
+            repo_slug,
             pr_entry.head_branch,
             pr_entry.base_branch,
             pr_entry.author_agent,
             context_section,
+            direct_api_section,
         );
 
         // Compute the reviewer's own identity and path — same derivation spawn_subtree uses
@@ -1597,6 +1885,10 @@ impl<
         let agent_type = self.reviewer_agent_type;
         let identity = AgentIdentity::new(slugify(branch_name), agent_type);
         let reviewer_path = self.worktree_base.join(identity.internal_name().as_str());
+
+        if agent_type == AgentType::Claude {
+            preflight_reviewer_hook_environment(self.project_dir()).await?;
+        }
 
         // Create a detached-HEAD worktree at the PR branch tip unless it already exists.
         // Detached so we don't compete with the worker's branch; the reviewer never commits.
@@ -1624,13 +1916,7 @@ impl<
             working_dir: Some(reviewer_path),
             permissions: Some(AgentPermissions {
                 allow: vec![],
-                deny: vec![
-                    "fork_wave".into(),
-                    "spawn_leaf".into(),
-                    "spawn_worker".into(),
-                    "merge_pr".into(),
-                    "file_pr".into(),
-                ],
+                deny: reviewer_harness_denied_tools(),
                 default_mode: None,
             }),
             standalone_repo: false,
@@ -1767,6 +2053,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_opencode_dev_instructions_clarify_mcp_tools_are_not_shell_commands() {
+        assert!(OPENCODE_DEV_INSTRUCTIONS
+            .contains("MCP tools exposed inside your agent tool interface"));
+        assert!(OPENCODE_DEV_INSTRUCTIONS.contains("not shell commands"));
+        assert!(OPENCODE_DEV_INSTRUCTIONS.contains("not on PATH"));
+        assert!(OPENCODE_DEV_INSTRUCTIONS.contains("which file_pr"));
+    }
+
+    #[tokio::test]
+    async fn test_find_existing_leaf_worktree_by_slug_uses_recorded_agent_type_suffix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree_base = temp_dir.path().join("worktrees");
+        fs::create_dir_all(worktree_base.join("resume-leaf-opencode"))
+            .await
+            .unwrap();
+
+        let (identity, path) = find_existing_leaf_worktree_by_slug(&worktree_base, "resume-leaf")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(identity.slug(), "resume-leaf");
+        assert_eq!(identity.agent_type(), AgentType::OpenCode);
+        assert_eq!(path, worktree_base.join("resume-leaf-opencode"));
+    }
+
+    #[tokio::test]
+    async fn test_find_existing_leaf_worktree_by_slug_rejects_prefix_collision() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree_base = temp_dir.path().join("worktrees");
+        fs::create_dir_all(worktree_base.join("resume-leaf-extra-opencode"))
+            .await
+            .unwrap();
+
+        let found = find_existing_leaf_worktree_by_slug(&worktree_base, "resume-leaf")
+            .await
+            .unwrap();
+
+        assert!(found.is_none());
+    }
+
+    #[test]
     fn test_parse_git_status_paths_lists_status_entries() {
         let paths = parse_git_status_paths(
             " M src/lib.rs\nA  docs/new.md\nR  old.rs -> new.rs\n?? scratch.txt\n",
@@ -1780,6 +2108,77 @@ mod tests {
                 "scratch.txt".to_string(),
             ]
         );
+    }
+
+    async fn run_git_test_command(worktree: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(worktree)
+            .output()
+            .await
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn init_test_repo(worktree: &Path) {
+        run_git_test_command(worktree, &["init", "-q"]).await;
+        run_git_test_command(worktree, &["config", "user.email", "test@example.com"]).await;
+        run_git_test_command(worktree, &["config", "user.name", "Test User"]).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clean_spawn_worktree_ignores_gitignored_tracked_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree = temp_dir.path();
+        init_test_repo(worktree).await;
+
+        fs::write(worktree.join(".gitignore"), "*.db\n")
+            .await
+            .unwrap();
+        fs::create_dir_all(worktree.join(".chainlink"))
+            .await
+            .unwrap();
+        fs::write(worktree.join(".chainlink/issues.db"), "before")
+            .await
+            .unwrap();
+        run_git_test_command(worktree, &["add", ".gitignore"]).await;
+        run_git_test_command(worktree, &["add", "-f", ".chainlink/issues.db"]).await;
+        run_git_test_command(worktree, &["commit", "-q", "-m", "init"]).await;
+
+        fs::write(worktree.join(".chainlink/issues.db"), "after")
+            .await
+            .unwrap();
+
+        ensure_clean_spawn_worktree(worktree).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clean_spawn_worktree_blocks_nonignored_dirty_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree = temp_dir.path();
+        init_test_repo(worktree).await;
+
+        fs::create_dir_all(worktree.join("src")).await.unwrap();
+        fs::write(worktree.join("src/lib.rs"), "before")
+            .await
+            .unwrap();
+        run_git_test_command(worktree, &["add", "src/lib.rs"]).await;
+        run_git_test_command(worktree, &["commit", "-q", "-m", "init"]).await;
+
+        fs::write(worktree.join("src/lib.rs"), "after")
+            .await
+            .unwrap();
+
+        let message = ensure_clean_spawn_worktree(worktree)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("src/lib.rs"));
+        assert!(message.contains("dirty TL worktree"));
     }
 
     #[test]
@@ -1818,6 +2217,81 @@ mod tests {
         assert!(message.contains("Wait for the active worker's handoff"));
         assert!(message.contains("Use `spawn_leaf` for parallel work"));
         assert!(message.contains("Per-worker attribution"));
+    }
+
+    #[tokio::test]
+    async fn test_reviewer_hook_preflight_reports_missing_socket() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = preflight_reviewer_hook_environment(dir.path())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("Reviewer hook preflight failed: parent server socket missing"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains(".exo/server.sock"));
+    }
+
+    #[tokio::test]
+    async fn test_write_opencode_git_stub_points_to_project_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        let agent_config_dir = dir.path().join("agent-config");
+        fs::create_dir_all(&agent_config_dir).await.unwrap();
+
+        AgentControlService::<crate::services::Services>::write_opencode_git_stub(
+            &agent_config_dir,
+            &project_dir,
+        )
+        .await
+        .unwrap();
+
+        let content = fs::read_to_string(agent_config_dir.join(".git"))
+            .await
+            .unwrap();
+        assert_eq!(
+            content,
+            format!("gitdir: {}\n", project_dir.join(".git").display())
+        );
+    }
+
+    #[test]
+    fn test_reviewer_harness_denies_builtin_edit_tools() {
+        let denied = reviewer_harness_denied_tools();
+
+        for tool in [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit",
+            "fork_wave",
+            "spawn_leaf",
+            "spawn_worker",
+            "merge_pr",
+            "file_pr",
+        ] {
+            assert!(
+                denied.contains(&tool.to_string()),
+                "reviewer harness permissions must deny {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_reviewer_direct_api_section_includes_repo_and_review_endpoint() {
+        let section = render_reviewer_direct_api_section(17, Some("owner"), Some("repo"));
+        assert!(section.contains("PR_NUMBER=17"));
+        assert!(section.contains("FORGEJO_OWNER=owner"));
+        assert!(section.contains("FORGEJO_REPO=repo"));
+        assert!(
+            section.contains("/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/files")
+        );
+        assert!(section.contains("/pulls/$PR_NUMBER/reviews"));
+        assert!(section.contains("FORGEJO_REVIEWER_TOKEN"));
+        assert!(section.contains("Do not depend on local review files"));
     }
 
     #[test]

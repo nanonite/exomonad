@@ -108,7 +108,7 @@ prReviewHandler (MergeReady n ci branch_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (MergeReadyEv n ci branch_)
-  pure (InjectMessage (Tpl.mergeReady n ci branch_))
+  pure (NotifyParentAction (Tpl.mergeReady n ci branch_) n)
 prReviewHandler (DevNotPushing n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " dev leaf stopped pushing fixes"
   pure NoAction
@@ -216,7 +216,7 @@ ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerAppro
     then do
       branch <- getCurrentBranch
       void $ applyEvent @DevPhase @DevEvent branch DevSpawned (MergeReadyEv n status_ branch_)
-      pure (InjectMessage (Tpl.mergeReady n status_ branch_))
+      pure (NotifyParentAction (Tpl.mergeReady n status_ branch_) n)
     else
       if mergeBlockedOnCI && status_ == "failure"
         then do

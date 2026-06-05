@@ -234,6 +234,40 @@ fn redact_remote_token(url: &str, token: &str) -> String {
     }
 }
 
+fn check_fj_cli_configuration(cwd: &Path) {
+    if !exomonad_core::services::ForgejoClient::fj_binary_in_path() {
+        warn!(
+            "[Forgejo] Not configured - forgejo_url/forgejo_token are absent and fj was not found in PATH"
+        );
+        return;
+    }
+
+    info!(
+        "[Forgejo] fj found in PATH; exomonad serve will use the fj CLI backend when HTTP config is absent"
+    );
+    match std::process::Command::new("fj")
+        .args(["auth", "status"])
+        .current_dir(cwd)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            info!("[Forgejo] fj auth status succeeded");
+        }
+        Ok(status) => {
+            warn!(
+                status = %status,
+                "[Forgejo] fj is in PATH but `fj auth status` failed; file_pr, watcher_pr_state, and spawn_reviewer may fail until fj is authenticated"
+            );
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "[Forgejo] failed to run `fj auth status`; file_pr, watcher_pr_state, and spawn_reviewer may fail until fj is authenticated"
+            );
+        }
+    }
+}
+
 fn mailbox_protocol_available_for_config(config: &Config) -> bool {
     config.root_agent_type == AgentType::Claude && config.spawn_agent_type == AgentType::Claude
 }
@@ -330,6 +364,29 @@ fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+fn build_claude_root_command(model: Option<&str>, initial_prompt: Option<&str>) -> String {
+    let model_flag = model
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" --model {}", shell_escape::escape(value.into())))
+        .unwrap_or_default();
+
+    let launch = initial_prompt
+        .filter(|value| !value.is_empty())
+        .map(|prompt| {
+            format!(
+                "claude --dangerously-skip-permissions{model_flag} {}",
+                shell_escape::escape(prompt.into())
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "claude --dangerously-skip-permissions{model_flag} -c || claude --dangerously-skip-permissions{model_flag}"
+            )
+        });
+
+    format!("{launch}; echo; echo [Claude Code exited]; exec bash -l")
+}
+
 fn build_codex_root_command(
     cwd: &Path,
     model: Option<&str>,
@@ -405,6 +462,57 @@ async fn validate_opencode_model(model: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_codex_model(model: &str) -> Result<()> {
+    if !model.starts_with("gpt-") {
+        anyhow::bail!(
+            "Unknown Codex model `{model}`. Use a Codex/OpenAI model ID starting with `gpt-` \
+             (for example `gpt-5.2-codex`)."
+        );
+    }
+    Ok(())
+}
+
+fn validate_gemini_model(model: &str) -> Result<()> {
+    if !model.starts_with("gemini-") {
+        anyhow::bail!(
+            "Unknown Gemini model `{model}`. Use a Gemini model ID starting with `gemini-` \
+             (for example `gemini-2.5-pro`)."
+        );
+    }
+    Ok(())
+}
+
+fn validate_opencode_model_owner(
+    agent_type: AgentType,
+    model: Option<&str>,
+    model_field: &str,
+    harness_field: &str,
+) -> Result<()> {
+    if agent_type == AgentType::OpenCode || model.is_none() {
+        return Ok(());
+    }
+
+    let model = model.expect("checked above");
+    anyhow::bail!(
+        "{model_field} is set to `{model}`, but {harness_field} is `{}`. \
+         OpenCode model fields only apply when the matching harness is `opencode`.",
+        agent_type_str(agent_type)
+    );
+}
+
+fn validate_reviewer_model_for_harness(agent_type: AgentType, model: Option<&str>) -> Result<()> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+
+    match agent_type {
+        AgentType::Claude => validate_claude_model(model),
+        AgentType::Codex => validate_codex_model(model),
+        AgentType::Gemini => validate_gemini_model(model),
+        AgentType::OpenCode | AgentType::Shoal | AgentType::Process => Ok(()),
+    }
+}
+
 /// Run the init command: create or attach to tmux session.
 pub async fn run(
     session_override: Option<String>,
@@ -443,13 +551,16 @@ pub async fn run(
         config.spawn_agent_type = parse_agent_type(worker_type)?;
     }
     if let Some(m) = tl_model {
-        if config.root_agent_type == AgentType::Codex {
-            config.model = Some(m.clone());
+        if config.root_agent_type == AgentType::OpenCode {
+            config.opencode.tl_model = Some(m);
+        } else {
+            config.model = Some(m);
         }
-        config.opencode.tl_model = Some(m);
     }
     if let Some(m) = worker_model {
-        config.opencode.worker_model = Some(m);
+        if config.spawn_agent_type == AgentType::OpenCode {
+            config.opencode.worker_model = Some(m);
+        }
     }
     if let Some(ref reviewer_type) = reviewer {
         config.reviewer.agent_type = parse_agent_type(reviewer_type)?;
@@ -461,6 +572,19 @@ pub async fn run(
         config.openrouter.enabled = true;
     }
 
+    validate_opencode_model_owner(
+        config.root_agent_type,
+        config.opencode.tl_model.as_deref(),
+        "[opencode].tl_model",
+        "root_agent_type",
+    )?;
+    validate_opencode_model_owner(
+        config.spawn_agent_type,
+        config.opencode.worker_model.as_deref(),
+        "[opencode].worker_model",
+        "spawn_agent_type",
+    )?;
+
     if config.root_agent_type == AgentType::OpenCode {
         if let Some(m) = config.opencode.tl_model.as_deref() {
             validate_opencode_model(m).await?;
@@ -471,19 +595,15 @@ pub async fn run(
             validate_opencode_model(m).await?;
         }
     }
-    match config.reviewer.agent_type {
-        AgentType::OpenCode => {
-            if let Some(m) = config.reviewer.model.as_deref() {
-                validate_opencode_model(m).await?;
-            }
+    if config.reviewer.agent_type == AgentType::OpenCode {
+        if let Some(m) = config.reviewer.model.as_deref() {
+            validate_opencode_model(m).await?;
         }
-        AgentType::Claude => {
-            if let Some(m) = config.reviewer.model.as_deref() {
-                validate_claude_model(m)?;
-            }
-        }
-
-        _ => {}
+    } else {
+        validate_reviewer_model_for_harness(
+            config.reviewer.agent_type,
+            config.reviewer.model.as_deref(),
+        )?;
     }
 
     // Check OTel endpoint reachability if configured
@@ -534,7 +654,9 @@ pub async fn run(
                 .await
                 .unwrap_or_default();
                 if !input.trim().eq_ignore_ascii_case("y") {
-                    anyhow::bail!("OTel endpoint unreachable. Start it with:\n  docker compose -f ~/.exo/otel/docker-compose.yml up -d");
+                    anyhow::bail!(
+                        "OTel endpoint unreachable. Start it with:\n  docker compose -f ~/.exo/otel/docker-compose.yml up -d"
+                    );
                 }
             }
         }
@@ -651,6 +773,8 @@ pub async fn run(
         if let Err(e) = configure_forgejo_remote(&cwd, forgejo_url, forgejo_token) {
             warn!(error = %e, "Failed to auto-configure Forgejo remote URL (non-fatal)");
         }
+    } else if config.forgejo_url.is_none() && config.forgejo_token.is_none() {
+        check_fj_cli_configuration(&cwd);
     }
 
     // Write root runtime configuration.
@@ -775,8 +899,6 @@ pub async fn run(
         >::gemini_trust_folder(&cwd)
         .await;
     }
-
-    // Register repo with local Tangled knot (idempotent — no-op if already registered)
 
     // Validate tmux is available
     let tmux_check = std::process::Command::new("tmux").arg("-V").output();
@@ -1128,34 +1250,55 @@ pub async fn run(
             .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
             .unwrap_or_default();
         match (config.root_agent_type, config.initial_prompt.as_deref()) {
-            (AgentType::Claude, _) => format!("claude --dangerously-skip-permissions{model_flag} -c || claude --dangerously-skip-permissions{model_flag}; echo; echo [Claude Code exited]; exec bash -l"),
+            (AgentType::Claude, prompt) => {
+                build_claude_root_command(config.model.as_deref(), prompt)
+            }
             (AgentType::Gemini, Some(prompt)) => {
                 let yolo_flag = if config.yolo { " --yolo" } else { "" };
-                format!("gemini{model_flag}{yolo_flag} --prompt-interactive '{}'", prompt.replace('\'', "'\\''"))
+                format!(
+                    "gemini{model_flag}{yolo_flag} --prompt-interactive '{}'",
+                    prompt.replace('\'', "'\\''")
+                )
             }
             (AgentType::Gemini, None) => {
                 let yolo_flag = if config.yolo { " --yolo" } else { "" };
                 format!("gemini{model_flag}{yolo_flag}")
             }
-            (AgentType::Shoal, Some(prompt)) => format!("shoal-agent --exo root --prompt '{}'", prompt.replace('\'', "'\\''")),
+            (AgentType::Shoal, Some(prompt)) => format!(
+                "shoal-agent --exo root --prompt '{}'",
+                prompt.replace('\'', "'\\''")
+            ),
             (AgentType::Shoal, None) => "shoal-agent --exo root".to_string(),
             (AgentType::OpenCode, Some(prompt)) => {
-                let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
+                let yolo = if config.yolo {
+                    " --dangerously-skip-permissions"
+                } else {
+                    ""
+                };
                 let chainlink_protocol = read_chainlink_tl_protocol(&cwd);
                 let augmented = match chainlink_protocol {
                     Some(ref protocol) => format!("{}\n\n---\n\n{}", protocol, prompt),
                     None => prompt.to_string(),
                 };
-                format!("opencode run{yolo}{opencode_model_flag} '{}'", augmented.replace('\'', "'\\''"))
+                format!(
+                    "opencode run{yolo}{opencode_model_flag} '{}'",
+                    augmented.replace('\'', "'\\''")
+                )
             }
             (AgentType::OpenCode, None) => {
-                let yolo = if config.yolo { " --dangerously-skip-permissions" } else { "" };
+                let yolo = if config.yolo {
+                    " --dangerously-skip-permissions"
+                } else {
+                    ""
+                };
                 format!("opencode{opencode_model_flag}{yolo}")
             }
             (AgentType::Codex, prompt) => {
                 build_codex_root_command(&cwd, config.model.as_deref(), prompt)
             }
-            (AgentType::Process, _) => unreachable!("Process is for companions only, not root agent"),
+            (AgentType::Process, _) => {
+                unreachable!("Process is for companions only, not root agent")
+            }
         }
     };
 
@@ -1645,65 +1788,6 @@ async fn report_orphaned_agent_windows(session: &str, cwd: &Path) {
     }
 }
 
-pub(crate) fn tangled_repo_name(cwd: &Path) -> String {
-    let directory_name = cwd
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-
-    let remote_name = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .and_then(|url| {
-            url.trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .map(|s| s.trim_end_matches(".git").to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .filter(|name| !name.starts_with('.'));
-
-    remote_name
-        .or(directory_name)
-        .unwrap_or_else(|| "repo".to_string())
-}
-
-pub(crate) fn normalize_knot_hostname(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let without_scheme = trimmed
-        .strip_prefix("http://")
-        .or_else(|| trimmed.strip_prefix("https://"))
-        .or_else(|| trimmed.strip_prefix("ws://"))
-        .or_else(|| trimmed.strip_prefix("wss://"))
-        .unwrap_or(trimmed);
-    without_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
-}
-
-pub(crate) fn tangled_dev_repo_did(knot_hostname: &str, repo_name: &str) -> String {
-    let host = normalize_knot_hostname(knot_hostname).replace(':', "%3A");
-    let repo = repo_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    format!("did:web:{host}:repo:{repo}")
-}
-
 pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
     let gitignore_path = project_dir.join(".gitignore");
     let content = if gitignore_path.exists() {
@@ -1720,11 +1804,10 @@ pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
         "!.exo/lib/",
         "!.exo/rules/",
         ".codex/",
-        ".tangled/*",
-        "!.tangled/workflows/",
         ".claude/settings.local.json",
         ".opencode/",
         "opencode.json",
+        ".chainlink/",
     ]
     .into_iter()
     .filter(|line| !has_line(line))
@@ -1929,9 +2012,9 @@ mod tests {
     #[test]
     fn parse_remote_repo_parts_uses_last_two_path_segments() {
         let parts =
-            parse_remote_repo_parts("git@local-tangled:repositories/owner/exomonad.git").unwrap();
+            parse_remote_repo_parts("git@forge.example:repositories/owner/exomonad.git").unwrap();
 
-        assert_eq!(parts.host, "local-tangled");
+        assert_eq!(parts.host, "forge.example");
         assert_eq!(parts.owner, "owner");
         assert_eq!(parts.repo, "exomonad");
     }
@@ -2002,66 +2085,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_knot_hostname_accepts_supported_url_forms() {
-        for (raw, expected) in [
-            ("localhost", "localhost"),
-            ("localhost:5555", "localhost:5555"),
-            ("ws://localhost", "localhost"),
-            ("ws://localhost:5555", "localhost:5555"),
-            ("ws://localhost:5555/", "localhost:5555"),
-            ("ws://localhost:5555/events", "localhost:5555"),
-            ("wss://localhost:5555", "localhost:5555"),
-            ("http://localhost:5555", "localhost:5555"),
-            ("https://localhost:5555", "localhost:5555"),
-            ("HTTPS://LOCALHOST:5555/events?cursor=1", "localhost:5555"),
-            ("  http://LocalHost:5555/  ", "localhost:5555"),
-            ("http://knot.example.com", "knot.example.com"),
-        ] {
-            assert_eq!(normalize_knot_hostname(raw), expected, "{raw}");
-        }
-    }
-
-    #[test]
-    fn tangled_dev_repo_did_uses_normalized_knot_hostname() {
-        assert_eq!(
-            tangled_dev_repo_did("http://LocalHost:5555/events", "repo name"),
-            "did:web:localhost%3A5555:repo:repo-name"
-        );
-    }
-
-    #[test]
-    fn tangled_repo_name_ignores_hidden_local_origin_remote() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("backrooms-workspace");
-        std::fs::create_dir(&repo).unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "remote",
-                "add",
-                "origin",
-                "/tmp/backrooms-workspace/.git-remote",
-            ])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-
-        assert_eq!(tangled_repo_name(&repo), "backrooms-workspace");
-    }
-
-    #[test]
-    fn tangled_dev_repo_did_uses_did_web_repo_path() {
-        assert_eq!(
-            tangled_dev_repo_did("ws://localhost:5555", "backrooms workspace"),
-            "did:web:localhost%3A5555:repo:backrooms-workspace"
-        );
-    }
-
-    #[test]
     fn ensure_gitignore_writes_runtime_scaffold_paths_on_fresh_repo() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -2075,11 +2098,10 @@ mod tests {
             "!.exo/lib/",
             "!.exo/rules/",
             ".codex/",
-            ".tangled/*",
-            "!.tangled/workflows/",
             ".claude/settings.local.json",
             ".opencode/",
             "opencode.json",
+            ".chainlink/",
         ] {
             assert!(
                 content.lines().any(|line| line.trim() == expected),
@@ -2136,6 +2158,83 @@ mod tests {
         assert!(validate_claude_model("").is_err());
         assert!(validate_claude_model("haiku").is_err());
         assert!(validate_claude_model("haiku-model").is_err());
+    }
+
+    #[test]
+    fn test_validate_codex_model_rejects_non_codex_prefixes() {
+        assert!(validate_codex_model("gpt-5.2-codex").is_ok());
+        assert!(validate_codex_model("opencode-go/deepseek-v4-flash").is_err());
+        assert!(validate_codex_model("claude-sonnet-4-6").is_err());
+    }
+
+    #[test]
+    fn test_validate_gemini_model_rejects_non_gemini_prefixes() {
+        assert!(validate_gemini_model("gemini-2.5-pro").is_ok());
+        assert!(validate_gemini_model("gpt-5.2-codex").is_err());
+        assert!(validate_gemini_model("opencode-go/deepseek-v4-flash").is_err());
+    }
+
+    #[test]
+    fn test_opencode_tl_model_requires_opencode_root_harness() {
+        let error = validate_opencode_model_owner(
+            AgentType::Claude,
+            Some("opencode-go/deepseek-v4-flash"),
+            "[opencode].tl_model",
+            "root_agent_type",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("[opencode].tl_model"));
+        assert!(error.contains("root_agent_type is `claude`"));
+    }
+
+    #[test]
+    fn test_opencode_worker_model_requires_opencode_worker_harness() {
+        let error = validate_opencode_model_owner(
+            AgentType::Codex,
+            Some("opencode-go/deepseek-v4-flash"),
+            "[opencode].worker_model",
+            "spawn_agent_type",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("[opencode].worker_model"));
+        assert!(error.contains("spawn_agent_type is `codex`"));
+    }
+
+    #[test]
+    fn test_opencode_model_owner_allows_matching_harness() {
+        assert!(validate_opencode_model_owner(
+            AgentType::OpenCode,
+            Some("opencode-go/deepseek-v4-flash"),
+            "[opencode].worker_model",
+            "spawn_agent_type",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn claude_root_command_uses_initial_prompt() {
+        let command = build_claude_root_command(Some("sonnet"), Some("Spawn the worker"));
+
+        assert_eq!(
+            command,
+            "claude --dangerously-skip-permissions --model sonnet 'Spawn the worker'; echo; echo [Claude Code exited]; exec bash -l"
+        );
+        assert!(!command.contains(" -c"));
+        assert!(command.ends_with("exec bash -l"));
+    }
+
+    #[test]
+    fn claude_root_command_without_prompt_preserves_resume_fallback() {
+        let command = build_claude_root_command(Some("sonnet"), None);
+
+        assert_eq!(
+            command,
+            "claude --dangerously-skip-permissions --model sonnet -c || claude --dangerously-skip-permissions --model sonnet; echo; echo [Claude Code exited]; exec bash -l"
+        );
     }
 
     #[test]

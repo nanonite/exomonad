@@ -14,6 +14,14 @@ use super::tmux_ipc::{PaneId, TmuxIpc};
 pub struct InjectionOptions {
     pub file_indirect: bool,
     pub submit: bool,
+    /// Skip the post-Enter `verify_input_consumed` check.
+    ///
+    /// Claude Code's Ink TUI clears the input line immediately on submission,
+    /// so `capture-pane` no longer shows the probe text → verification works.
+    /// Terminal CLIs (Codex, Gemini, OpenCode) keep submitted input in
+    /// terminal scrollback history, so the probe is always visible and
+    /// verification always fails. Set `skip_verify = true` for those runtimes.
+    pub skip_verify: bool,
 }
 
 impl InjectionOptions {
@@ -21,6 +29,7 @@ impl InjectionOptions {
         Self {
             file_indirect: true,
             submit: true,
+            skip_verify: false,
         }
     }
 
@@ -28,6 +37,7 @@ impl InjectionOptions {
         Self {
             file_indirect: false,
             submit: true,
+            skip_verify: true,
         }
     }
 }
@@ -143,7 +153,8 @@ pub async fn inject_input_with_options(
         );
 
         let target = target.to_string();
-        ipc.inject_input(&target, &pointer, options.submit).await
+        ipc.inject_input(&target, &pointer, options.submit, options.skip_verify)
+            .await
     } else {
         info!(
             "[TmuxEvents] Injecting input to target '{}': {} chars",
@@ -153,7 +164,8 @@ pub async fn inject_input_with_options(
 
         let target = target.to_string();
         let text = text.to_string();
-        ipc.inject_input(&target, &text, options.submit).await
+        ipc.inject_input(&target, &text, options.submit, options.skip_verify)
+            .await
     }
 }
 

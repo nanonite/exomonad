@@ -37,6 +37,7 @@ use tracing::{info, warn};
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient,
     HasGitHubClient, HasGitWorktreeService, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
+    HasWatcherRuntimeState,
 };
 
 /// Agent effect handler.
@@ -59,6 +60,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasWatcherRuntimeState
             + 'static,
     > AgentHandler<C>
 {
@@ -156,6 +158,26 @@ impl<
     ) {
         self.register_synthetic_member(member_name, member_type, ctx)
             .await;
+
+        let team_reg = self.ctx.team_registry();
+        let agent_key = ctx.agent_name.to_string();
+        let parent_team = match team_reg.get(&agent_key).await {
+            Some(info) => Some(info),
+            None => team_reg.get(ctx.birth_branch.as_ref()).await,
+        };
+        if let Some(parent_team) = parent_team {
+            let team_info = claude_teams_bridge::TeamInfo {
+                team_name: parent_team.team_name.clone(),
+                inbox_name: member_name.to_string(),
+            };
+            let child_birth_branch = format!("{}.{}", ctx.birth_branch, member_name);
+            team_reg
+                .register(member_name.as_ref(), team_info.clone())
+                .await;
+            team_reg.register(supervisor_key, team_info.clone()).await;
+            team_reg.register(&child_birth_branch, team_info).await;
+        }
+
         self.register_child_supervisor(supervisor_key, ctx).await;
     }
 
@@ -265,6 +287,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasWatcherRuntimeState
             + 'static,
     > EffectHandler for AgentHandler<C>
 {
@@ -470,6 +493,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasWatcherRuntimeState
             + 'static,
     > AgentEffects for AgentHandler<C>
 {
@@ -826,18 +850,48 @@ impl<
 
         let cleaned_reviewers =
             cleanup_force_reviewer_resources(&self.service, req.pr_number).await;
-        match clear_reviewer_review_artifacts(self.ctx.project_dir(), req.pr_number).await {
-            Ok(()) => Ok(CleanupReviewerLeafResponse {
+        Ok(cleanup_reviewer_leaf_response(
+            req.pr_number,
+            cleaned_reviewers,
+            clear_reviewer_review_artifacts(self.ctx.project_dir(), req.pr_number).await,
+        ))
+    }
+
+    async fn restart_review(
+        &self,
+        req: RestartReviewRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<RestartReviewResponse> {
+        if req.pr_number == 0 {
+            return Err(EffectError::invalid_input("pr_number is required"));
+        }
+
+        let cleaned_reviewers =
+            cleanup_force_reviewer_resources(&self.service, req.pr_number).await;
+        let runtime_state_found = self
+            .ctx
+            .watcher_runtime_state()
+            .reset_review_cycle(req.pr_number)
+            .await;
+
+        match reset_reviewer_restart_artifacts(self.ctx.project_dir(), req.pr_number).await {
+            Ok(reset) => Ok(RestartReviewResponse {
                 success: true,
                 error: String::new(),
                 pr_number: req.pr_number,
                 cleaned_reviewers,
+                runtime_state_found,
+                watcher_state_found: reset.watcher_state_found,
+                legacy_review_file_removed: reset.legacy_review_file_removed,
             }),
-            Err(error) => Ok(CleanupReviewerLeafResponse {
+            Err(error) => Ok(RestartReviewResponse {
                 success: false,
                 error: error.to_string(),
                 pr_number: req.pr_number,
                 cleaned_reviewers,
+                runtime_state_found,
+                watcher_state_found: false,
+                legacy_review_file_removed: false,
             }),
         }
     }
@@ -1210,14 +1264,14 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<CloseSelfResponse> {
         let agent_key = ctx.agent_name.to_string();
-        let agents_dir = std::path::Path::new(".exo/agents");
+        let agents_dir = self.ctx.project_dir().join(".exo/agents");
 
         // FIXME: Routing is written under internal_name (slug-suffix, e.g. "beta-gemini")
         // but MCP config passes bare slug as --name (e.g. "beta"). This suffix probing
         // is a band-aid — the real fix is making agent_name consistent between MCP config
         // and routing.json (either always include the suffix, or never).
         let candidates = std::iter::once(agent_key.clone()).chain(
-            ["gemini", "claude", "shoal", "opencode"]
+            ["gemini", "claude", "shoal", "opencode", "codex"]
                 .iter()
                 .map(|suffix| format!("{}-{}", agent_key, suffix)),
         );
@@ -1239,6 +1293,11 @@ impl<
         let mut closed = false;
 
         if let Some(ref r) = routing {
+            let agent_dir = agents_dir.join(&resolved_internal_name);
+            // Tombstone before killing the tmux target so future TL messages cannot route
+            // through a stale routing.json if the pane/window disappears immediately.
+            tombstone_agent_dir(&agent_dir).await;
+
             // Try pane_id first (ephemeral workers)
             if let Some(pane_id) = r["pane_id"].as_str() {
                 info!(agent = %ctx.agent_name, pane_id = %pane_id, "Closing worker pane");
@@ -1337,13 +1396,58 @@ impl<
         }
 
         match crate::services::tmux_events::close_worker_pane(&req.pane_id).await {
-            Ok(()) => Ok(CloseWorkerPaneResponse {
-                success: true,
-                error: String::new(),
-            }),
-            Err(e) => Ok(CloseWorkerPaneResponse {
+            Ok(()) => {
+                tombstone_agent_by_pane(self.ctx.project_dir(), &req.pane_id).await;
+                Ok(CloseWorkerPaneResponse {
+                    success: true,
+                    error: String::new(),
+                })
+            }
+            Err(e) => {
+                let cleaned = tombstone_agent_by_pane(self.ctx.project_dir(), &req.pane_id).await;
+                Ok(CloseWorkerPaneResponse {
+                    success: cleaned,
+                    error: if cleaned {
+                        String::new()
+                    } else {
+                        e.to_string()
+                    },
+                })
+            }
+        }
+    }
+
+    async fn close_reviewer_window(
+        &self,
+        req: CloseReviewerWindowRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<CloseReviewerWindowResponse> {
+        if req.pr_number == 0 {
+            return Err(EffectError::invalid_input("pr_number is required"));
+        }
+
+        match close_reviewer_windows_by_pr(&self.service, req.pr_number).await {
+            Ok(closed_windows) => {
+                let success = !closed_windows.is_empty();
+                Ok(CloseReviewerWindowResponse {
+                    success,
+                    error: if success {
+                        String::new()
+                    } else {
+                        format!(
+                            "No reviewer tmux windows matched pattern review-pr-{}-",
+                            req.pr_number
+                        )
+                    },
+                    pr_number: req.pr_number,
+                    closed_windows,
+                })
+            }
+            Err(error) => Ok(CloseReviewerWindowResponse {
                 success: false,
-                error: e.to_string(),
+                error: error.to_string(),
+                pr_number: req.pr_number,
+                closed_windows: Vec::new(),
             }),
         }
     }
@@ -1426,6 +1530,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasWatcherRuntimeState
             + 'static,
     > AgentHandler<C>
 {
@@ -1574,13 +1679,58 @@ async fn clear_reviewer_review_artifacts(project_dir: &Path, pr_number: u64) -> 
     clear_watcher_pr_state(project_dir, pr_number).await
 }
 
-async fn remove_legacy_review_file(project_dir: &Path, pr_number: u64) -> anyhow::Result<()> {
+fn cleanup_reviewer_leaf_response(
+    pr_number: u64,
+    cleaned_reviewers: Vec<String>,
+    artifacts_result: anyhow::Result<()>,
+) -> CleanupReviewerLeafResponse {
+    match artifacts_result {
+        Err(error) => CleanupReviewerLeafResponse {
+            success: false,
+            error: error.to_string(),
+            pr_number,
+            cleaned_reviewers,
+        },
+        Ok(()) if cleaned_reviewers.is_empty() => CleanupReviewerLeafResponse {
+            success: false,
+            error: format!("No reviewer tmux windows matched pattern review-pr-{pr_number}-"),
+            pr_number,
+            cleaned_reviewers,
+        },
+        Ok(()) => CleanupReviewerLeafResponse {
+            success: true,
+            error: String::new(),
+            pr_number,
+            cleaned_reviewers,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestartReviewArtifactReset {
+    watcher_state_found: bool,
+    legacy_review_file_removed: bool,
+}
+
+async fn reset_reviewer_restart_artifacts(
+    project_dir: &Path,
+    pr_number: u64,
+) -> anyhow::Result<RestartReviewArtifactReset> {
+    let legacy_review_file_removed = remove_legacy_review_file(project_dir, pr_number).await?;
+    let watcher_state_found = reset_watcher_pr_state_file(project_dir, pr_number).await?;
+    Ok(RestartReviewArtifactReset {
+        watcher_state_found,
+        legacy_review_file_removed,
+    })
+}
+
+async fn remove_legacy_review_file(project_dir: &Path, pr_number: u64) -> anyhow::Result<bool> {
     let review_path = project_dir
         .join(".exo/reviews")
         .join(format!("pr_{pr_number}.json"));
     match tokio::fs::remove_file(&review_path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -1603,6 +1753,32 @@ async fn clear_watcher_pr_state(project_dir: &Path, pr_number: u64) -> anyhow::R
     Ok(())
 }
 
+async fn reset_watcher_pr_state_file(project_dir: &Path, pr_number: u64) -> anyhow::Result<bool> {
+    let state_path = project_dir.join(".exo/watcher-state.json");
+    let state = match tokio::fs::read_to_string(&state_path).await {
+        Ok(state) => state,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&state)?;
+    let found = value
+        .get_mut("prs")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|prs| prs.get_mut(&pr_number.to_string()))
+        .and_then(serde_json::Value::as_object_mut)
+        .map(|entry| {
+            entry.insert("rounds".to_string(), serde_json::json!(0));
+            entry.insert("stuck".to_string(), serde_json::json!(false));
+            entry.insert("needs_human_review".to_string(), serde_json::json!(false));
+        })
+        .is_some();
+
+    if found {
+        tokio::fs::write(&state_path, serde_json::to_vec_pretty(&value)?).await?;
+    }
+    Ok(found)
+}
+
 async fn cleanup_force_reviewer_resources<C>(
     service: &AgentControlService<C>,
     pr_number: u64,
@@ -1616,20 +1792,55 @@ where
         + HasGitWorktreeService
         + 'static,
 {
-    let tmux = match service.tmux() {
-        Ok(tmux) => tmux,
-        Err(error) => {
-            warn!(%error, "failed to create tmux client while cleaning reviewer resources");
-            return Vec::new();
+    match close_reviewer_windows_by_pr(service, pr_number).await {
+        Ok(killed) => {
+            if !killed.is_empty() {
+                tombstone_reviewer_agent_dirs(service.project_dir(), pr_number).await;
+            }
+            killed
         }
-    };
-    let windows = match tmux.list_windows().await {
-        Ok(windows) => windows,
         Err(error) => {
-            warn!(%error, "failed to list tmux windows while cleaning reviewer resources");
-            return Vec::new();
+            warn!(%error, "failed to clean reviewer resources");
+            Vec::new()
         }
+    }
+}
+
+async fn tombstone_reviewer_agent_dirs(project_dir: &Path, pr_number: u64) {
+    let agents_dir = project_dir.join(".exo/agents");
+    let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await else {
+        return;
     };
+    let prefix = format!("review-pr-{pr_number}-");
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            tombstone_agent_dir(&entry.path()).await;
+        }
+    }
+}
+
+async fn close_reviewer_windows_by_pr<C>(
+    service: &AgentControlService<C>,
+    pr_number: u64,
+) -> anyhow::Result<Vec<String>>
+where
+    C: HasTeamRegistry
+        + HasAcpRegistry
+        + HasAgentResolver
+        + HasGitHubClient
+        + HasProjectDir
+        + HasGitWorktreeService
+        + 'static,
+{
+    let tmux = service.tmux()?;
+    let windows = tmux.list_windows().await?;
 
     let mut killed = Vec::new();
     for window in windows {
@@ -1643,11 +1854,54 @@ where
             killed.push(window.window_name);
         }
     }
-    killed
+    Ok(killed)
 }
 
 fn reviewer_window_matches_pr(window_name: &str, pr_number: u64) -> bool {
     window_name.contains(&format!("review-pr-{pr_number}-"))
+}
+
+async fn tombstone_agent_dir(agent_dir: &Path) {
+    let exited_at = Utc::now().timestamp().max(0).to_string();
+    if let Err(error) = tokio::fs::write(agent_dir.join("exited_at"), exited_at).await {
+        warn!(path = %agent_dir.display(), %error, "failed to write agent exited_at tombstone");
+    }
+    match tokio::fs::remove_file(agent_dir.join("routing.json")).await {
+        Ok(()) => info!(path = %agent_dir.display(), "removed agent routing after exit"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(path = %agent_dir.display(), %error, "failed to remove agent routing after exit")
+        }
+    }
+}
+
+async fn tombstone_agent_by_pane(project_dir: &Path, pane_id: &str) -> bool {
+    let agents_dir = project_dir.join(".exo/agents");
+    let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await else {
+        return false;
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let agent_dir = entry.path();
+        let Ok(routing) = RoutingInfo::read_from_dir(&agent_dir).await else {
+            continue;
+        };
+        if routing
+            .pane_id
+            .as_ref()
+            .is_some_and(|candidate| candidate.as_str() == pane_id)
+        {
+            tombstone_agent_dir(&agent_dir).await;
+            return true;
+        }
+    }
+    false
 }
 
 async fn orphan_agent_window_alive(project_dir: &Path, agent_slug: &str) -> Result<bool, String> {
@@ -1933,6 +2187,23 @@ mod tests {
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
     }
 
+    #[tokio::test]
+    async fn test_tombstone_agent_by_pane_removes_routing_and_writes_exited_at() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path();
+        let agent_dir = project_dir.join(".exo/agents/worker-opencode");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let pane_id = crate::services::tmux_ipc::PaneId::parse("%42").unwrap();
+        RoutingInfo::pane(pane_id, "TL")
+            .write_to_dir(&agent_dir)
+            .await
+            .unwrap();
+
+        assert!(tombstone_agent_by_pane(project_dir, "%42").await);
+        assert!(agent_dir.join("exited_at").exists());
+        assert!(!agent_dir.join("routing.json").exists());
+    }
+
     fn test_forgejo_pr() -> ForgejoPullRequest {
         ForgejoPullRequest {
             number: PRNumber::new(7),
@@ -2011,6 +2282,96 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
         assert!(state["prs"].get("7").is_none());
         assert!(state["prs"].get("8").is_some());
+    }
+
+    #[test]
+    fn cleanup_reviewer_leaf_response_fails_when_no_reviewer_window_was_killed() {
+        let response = cleanup_reviewer_leaf_response(7, Vec::new(), Ok(()));
+
+        assert!(!response.success);
+        assert_eq!(response.pr_number, 7);
+        assert!(response.cleaned_reviewers.is_empty());
+        assert_eq!(
+            response.error,
+            "No reviewer tmux windows matched pattern review-pr-7-"
+        );
+    }
+
+    #[test]
+    fn cleanup_reviewer_leaf_response_succeeds_when_reviewer_window_was_killed() {
+        let response =
+            cleanup_reviewer_leaf_response(7, vec!["review-pr-7-codex".to_string()], Ok(()));
+
+        assert!(response.success);
+        assert_eq!(response.error, "");
+        assert_eq!(response.cleaned_reviewers, vec!["review-pr-7-codex"]);
+    }
+
+    #[tokio::test]
+    async fn tombstone_reviewer_agent_dirs_matches_only_requested_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join(".exo/agents");
+        let matching_agent = agents_dir.join("review-pr-7-codex");
+        let forced_matching_agent = agents_dir.join("review-pr-7-123-opencode");
+        let other_pr_agent = agents_dir.join("review-pr-70-codex");
+        let other_agent = agents_dir.join("feature-codex");
+
+        for agent_dir in [
+            &matching_agent,
+            &forced_matching_agent,
+            &other_pr_agent,
+            &other_agent,
+        ] {
+            tokio::fs::create_dir_all(agent_dir).await.unwrap();
+            tokio::fs::write(agent_dir.join("routing.json"), "{}")
+                .await
+                .unwrap();
+        }
+
+        tombstone_reviewer_agent_dirs(dir.path(), 7).await;
+
+        assert!(matching_agent.join("exited_at").exists());
+        assert!(!matching_agent.join("routing.json").exists());
+        assert!(forced_matching_agent.join("exited_at").exists());
+        assert!(!forced_matching_agent.join("routing.json").exists());
+        assert!(!other_pr_agent.join("exited_at").exists());
+        assert!(other_pr_agent.join("routing.json").exists());
+        assert!(!other_agent.join("exited_at").exists());
+        assert!(other_agent.join("routing.json").exists());
+    }
+
+    #[tokio::test]
+    async fn reset_reviewer_restart_artifacts_resets_persisted_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let reviews = dir.path().join(".exo/reviews");
+        std::fs::create_dir_all(&reviews).unwrap();
+        std::fs::write(reviews.join("pr_7.json"), "{}").unwrap();
+
+        let state_path = dir.path().join(".exo/watcher-state.json");
+        std::fs::write(
+            &state_path,
+            r#"{"prs":{"7":{"rounds":3,"stuck":true,"needs_human_review":true},"8":{"rounds":2,"stuck":true,"needs_human_review":true}}}"#,
+        )
+        .unwrap();
+
+        let reset = reset_reviewer_restart_artifacts(dir.path(), 7)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reset,
+            RestartReviewArtifactReset {
+                watcher_state_found: true,
+                legacy_review_file_removed: true,
+            }
+        );
+        assert!(!reviews.join("pr_7.json").exists());
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state["prs"]["7"]["rounds"], 0);
+        assert_eq!(state["prs"]["7"]["stuck"], false);
+        assert_eq!(state["prs"]["7"]["needs_human_review"], false);
+        assert_eq!(state["prs"]["8"]["rounds"], 2);
     }
 
     #[test]

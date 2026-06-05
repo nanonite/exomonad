@@ -1070,26 +1070,23 @@ instance FromJSON ChainlinkRelateArgs where
     ChainlinkRelateArgs
       <$> v .: "issue1"
       <*> v .: "issue2"
-      <*> v .: "relation"
 
 instance ToJSON ChainlinkRelateArgs where
   toJSON args =
     object
       [ "issue1" .= crIssue1 args,
-        "issue2" .= crIssue2 args,
-        "relation" .= crRelation args
+        "issue2" .= crIssue2 args
       ]
 
 chainlinkRelateDescription :: Text
 chainlinkRelateDescription =
-  "Relate two issues with a specified relationship type (e.g. duplicates, relates_to, blocks, is_blocked_by)."
+  "Relate two issues. Chainlink CLI does not support a positional relation type."
 
 chainlinkRelateSchema :: Aeson.Object
 chainlinkRelateSchema =
   genericToolSchemaWith @ChainlinkRelateArgs
     [ ("issue1", "The numeric ID of the first issue"),
-      ("issue2", "The numeric ID of the second issue"),
-      ("relation", "The relationship type: duplicates, relates_to, blocks, is_blocked_by")
+      ("issue2", "The numeric ID of the second issue")
     ]
 
 chainlinkRelateCore :: ChainlinkRelateArgs -> Eff Effects (Either Text ())

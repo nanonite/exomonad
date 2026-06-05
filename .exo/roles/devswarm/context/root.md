@@ -14,9 +14,9 @@ Build context until you can see the tree. Then become the tree.
 
 1. PLAN: Research and read until the decomposition is clear. Create a team (TeamCreate) before spawning.
 2. FORK: Split into parallel TLs (fork_wave) or leaf/worker agents (spawn_leaf/spawn_worker). Each TL runs scaffold-fork-converge independently.
-3. IDLE: After spawning, STOP. End your turn with no further output. Conserve your context window.
+3. IDLE: After spawning, call `poll_workers` once with `include_dead=true` to snapshot pane liveness, Chainlink session state, issue status, and age; then STOP. End your turn with no further output. Conserve your context window.
    Messages from children arrive via Teams inbox BETWEEN your turns — if you keep generating text, they queue but cannot be delivered.
-   When a message arrives, you wake up naturally. No polling, no checking, no busy-waiting.
+   When a message arrives, you wake up naturally. Do not busy-wait or run ad hoc polling loops.
 4. MERGE: Merge TL PRs. Verify the build after each merge — parallel TLs may interact.
    PRs are squash-merged by default — the PR title becomes the squash commit message on master.
    Write PR titles in conventional commit format: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`.
@@ -36,7 +36,8 @@ TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `Mul
 ## Notification Vocabulary
 
 ### Dev-leaf signals (PR review loop)
-- `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Merge, verify, then close the Chainlink issue.
+- `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Call `merge_pr` with `chainlink_issue_id` so it closes the Chainlink issue and commits `CHANGELOG.md` before merging, then verify.
+- After `merge_pr` completes successfully and verification passes, call `dispose_leaf` for the dev leaf and call `dispose_leaf` for the reviewer leaf for that issue. Use a reason like `merged PR #<number>` and keep `force=false` unless the leaf is a genuine orphan. `merge_pr` does not perform cleanup side effects.
 
 The review-loop watcher routes all non-merge-ready outcomes (`dev_not_pushing`,
 `reviewer_not_responding`, `reviewer_never_started`, and `dev_failed`) to the
@@ -61,7 +62,7 @@ If the review shows `APPROVED` and CI shows `success` or no statuses (neutral), 
 This is the correct escalation when the watcher event chain is broken (e.g. Codex agent has no WASM plugin).
 
 ### Worker signals (ephemeral pane, no PR)
-- `[from: worker-name]` with success content — worker completed. Acknowledge, no merge needed.
+- `[from: worker-name]` with success content — worker completed. Acknowledge, no merge needed. If you close the worker's Chainlink issue, commit `CHANGELOG.md` immediately after `chainlink_issue_close` before spawning another wave or calling `merge_pr`.
 - `[from: worker-name]` with blocker/partial content — worker hit an issue. See Worker Correction Loop below.
 
 ## Worker Correction Loop
@@ -96,6 +97,7 @@ You own issue decomposition, timer lifecycle, PR merge decisions, and final issu
 - Use `chainlink_timer_stop` with the same issue id after review, CI, and merge are complete. Timer stop is explicit per issue; do not infer a global active timer.
 - Use `chainlink_session_status` to observe whether child agents have started, attached to an issue, or ended with handoff notes.
 - Use `chainlink_issue_close` only as coordinator authority after merge-ready, merge, verification, and the implementing agent's session end are complete.
+- After closing a worker-owned Chainlink issue, stage and commit `CHANGELOG.md` in the TL/root worktree before spawning the next wave or calling `merge_pr`. Worker changes are already committed in-place; the issue close is what dirties the changelog.
 - Treat Chainlink `review-stuck` issues as human-clarification inputs. Do not automatically close, respawn, or replace the dev leaf that owns the PR worktree.
 
 Do not use Chainlink agent, sync, or lock commands. Do not ask workers or dev leaves to close their own assigned issue.

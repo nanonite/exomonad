@@ -92,6 +92,61 @@ for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
     ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
 done
 
+trust_claude_project() {
+    local project_path="$1"
+    python3 - "$project_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+project = str(Path(sys.argv[1]).resolve())
+claude_json = Path.home() / ".claude.json"
+
+if claude_json.exists():
+    try:
+        data = json.loads(claude_json.read_text())
+    except json.JSONDecodeError:
+        data = {}
+else:
+    data = {}
+
+projects = data.setdefault("projects", {})
+entry = projects.setdefault(project, {})
+entry.setdefault("allowedTools", [])
+entry.setdefault("disabledMcpjsonServers", [])
+entry.setdefault("enabledMcpjsonServers", [])
+entry.setdefault("exampleFiles", [])
+entry["hasClaudeMdExternalIncludesApproved"] = False
+entry["hasClaudeMdExternalIncludesWarningShown"] = False
+entry["hasTrustDialogAccepted"] = True
+entry.setdefault("mcpContextUris", [])
+entry.setdefault("mcpServers", {})
+entry.setdefault("projectOnboardingSeenCount", 0)
+entry["hasCompletedProjectOnboarding"] = True
+
+claude_json.parent.mkdir(parents=True, exist_ok=True)
+tmp_path = claude_json.with_suffix(claude_json.suffix + ".tmp")
+tmp_path.write_text(json.dumps(data, indent=2) + "\n")
+tmp_path.replace(claude_json)
+PY
+}
+
+# Claude Code prompts for workspace trust per project path, including companion worktrees.
+trust_claude_project "$REPO_DIR"
+trust_claude_project "$REPO_DIR/.exo/companions/test-runner"
+
+record_team_baseline() {
+    local baseline_file="$REPO_DIR/.exo/e2e-team-baseline.txt"
+    if [[ -d "$HOME/.claude/teams" ]]; then
+        find "$HOME/.claude/teams" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort > "$baseline_file"
+    else
+        : > "$baseline_file"
+    fi
+}
+
+# Scope testrunner team assertions to teams created by this test invocation.
+record_team_baseline
+
 # Write config: Claude haiku root TL + OpenCode workers + testrunner companion
 cat > .exo/config.toml <<'EOF'
 default_role = "devswarm"
@@ -102,6 +157,10 @@ root_agent_type = "claude"
 spawn_agent_type = "opencode"
 model = "sonnet"
 yolo = true
+initial_prompt = """You are in automated E2E OpenCode worker test mode. Do exactly these steps on your first turn and nothing else:
+1. Create a team via TeamCreate.
+2. Call fork_wave with exactly one agent named oc-worker, agent_type='opencode', fork_session=false, and this task: You are an E2E test subject. Write oc-worker-output.txt containing the single line OpenCode worker test passed. Stage and commit it with git add oc-worker-output.txt && git commit -m 'e2e: add oc-worker-output.txt'. Push to your branch. Call notify_parent with status='success' and message='[OC-WORKER-DONE] OpenCode worker test complete. File written and committed.' Then stop.
+3. Stop and idle. Do not edit files yourself, do not merge PRs, and wait for [OC-WORKER-DONE]."""
 
 [opencode]
 worker_model = "opencode-go/deepseek-v4-flash"

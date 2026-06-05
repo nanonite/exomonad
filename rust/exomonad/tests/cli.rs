@@ -46,6 +46,30 @@ fn test_hook_fails_open_when_server_unreachable() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+#[test]
+fn test_init_help_describes_agent_type_flags() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = cargo_bin_cmd!("exomonad");
+
+    let output = cmd
+        .args(["init", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(output)?;
+
+    assert_eq!(
+        help.matches("valid: claude|gemini|opencode|codex|shoal")
+            .count(),
+        2
+    );
+    assert!(help.contains("With --tl=opencode, stores [opencode].tl_model"));
+    assert!(help.contains("With other TL agents, stores the root agent model"));
+
+    Ok(())
+}
+
 /// Minimal input also fails open when server is unreachable.
 #[test]
 fn test_hook_minimal_input_fails_open() -> Result<(), Box<dyn std::error::Error>> {

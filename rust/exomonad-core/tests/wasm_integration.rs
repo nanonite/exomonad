@@ -51,6 +51,7 @@ async fn build_test_runtime() -> exomonad_core::Runtime {
         .with_effect_handler(MockKvHandler)
         .with_effect_handler(MockGitHubHandler)
         .with_effect_handler(MockCopilotHandler)
+        .with_effect_handler(MockProcessHandler)
         .with_wasm_bytes(wasm_bytes)
         .build()
         .await
@@ -423,6 +424,16 @@ impl EffectHandler for MockAgentHandler {
                 errors: vec![],
             }
             .encode_to_vec()),
+            "agent.restart_review" => Ok(RestartReviewResponse {
+                success: true,
+                error: String::new(),
+                pr_number: 42,
+                cleaned_reviewers: vec!["review-pr-42-codex".into()],
+                runtime_state_found: true,
+                watcher_state_found: true,
+                legacy_review_file_removed: true,
+            }
+            .encode_to_vec()),
             "agent.watcher_pr_state" => Ok(WatcherPrStateResponse {
                 success: true,
                 error: String::new(),
@@ -585,6 +596,20 @@ impl EffectHandler for MockSessionHandler {
                 Ok(RegisterClaudeSessionResponse { success: true }.encode_to_vec())
             }
             "session.register_team" => Ok(RegisterTeamResponse { success: true }.encode_to_vec()),
+            "session.list_agents" => Ok(ListAgentsResponse {
+                agents: vec![AgentStatus {
+                    name: "worker-a".into(),
+                    role: "worker".into(),
+                    issue: "7".into(),
+                    window_id: String::new(),
+                    pane_id: "%3".into(),
+                    window_alive: true,
+                    age_mins: 12,
+                    birth_branch: "main.worker-a".into(),
+                    lifecycle_status: "LIVE".into(),
+                }],
+            }
+            .encode_to_vec()),
             _ => Err(EffectError::not_found(format!(
                 "mock_session/{effect_type}"
             ))),
@@ -661,6 +686,57 @@ impl EffectHandler for MockGitHubHandler {
                 Ok(GetPullRequestReviewCommentsResponse { comments: vec![] }.encode_to_vec())
             }
             _ => Err(EffectError::not_found(format!("mock_github/{effect_type}"))),
+        }
+    }
+}
+
+struct MockProcessHandler;
+
+#[async_trait]
+impl EffectHandler for MockProcessHandler {
+    fn namespace(&self) -> &str {
+        "process"
+    }
+
+    async fn handle(
+        &self,
+        effect_type: &str,
+        payload: &[u8],
+        _ctx: &exomonad_core::effects::EffectContext,
+    ) -> EffectResult<Vec<u8>> {
+        use exomonad_proto::effects::process::*;
+
+        match effect_type {
+            "process.run" => {
+                let req = RunRequest::decode(payload).map_err(|error| {
+                    EffectError::custom("decode", format!("decode RunRequest: {error}"))
+                })?;
+                let stdout = match req.args.as_slice() {
+                    [session, status, json_flag]
+                        if session == "session" && status == "status" && json_flag == "--json" =>
+                    {
+                        r#"{"session_id":51,"duration_minutes":3,"active_issue":{"id":7,"title":"Worker issue"}}"#
+                    }
+                    [issue, show, id, json_flag]
+                        if issue == "issue"
+                            && show == "show"
+                            && id == "7"
+                            && json_flag == "--json" =>
+                    {
+                        r#"{"id":7,"title":"Worker issue","status":"open","priority":"high","labels":["feature"]}"#
+                    }
+                    _ => "{}",
+                };
+                Ok(RunResponse {
+                    exit_code: 0,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                }
+                .encode_to_vec())
+            }
+            _ => Err(EffectError::not_found(format!(
+                "mock_process/{effect_type}"
+            ))),
         }
     }
 }
@@ -748,6 +824,7 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
         "file_pr",
         "notify_parent",
         "cleanup_reviewer_leaf",
+        "restart_review",
         "watcher_pr_state",
     ] {
         assert!(
@@ -893,6 +970,7 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
     let coordinator_cleanup_tools = [
         "close_issue_and_cleanup",
         "cleanup_reviewer_leaf",
+        "restart_review",
         "watcher_pr_state",
     ];
 
@@ -1006,6 +1084,77 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
         assert_tools_absent(role, &names, &coordinator_cleanup_tools);
         assert_tools_absent(role, &names, &dropped_chainlink_tools);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_poll_workers_is_exposed_to_coordinators() {
+    let runtime = build_test_runtime().await;
+
+    for role in ["root", "tl"] {
+        let tools: Vec<Value> = runtime
+            .plugin_manager()
+            .call("handle_list_tools", &json!({"role": role}))
+            .await
+            .unwrap_or_else(|error| panic!("handle_list_tools failed for {role}: {error}"));
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"poll_workers"),
+            "{role} role missing poll_workers. Got: {names:?}"
+        );
+    }
+
+    for role in ["dev", "worker", "reviewer"] {
+        let tools: Vec<Value> = runtime
+            .plugin_manager()
+            .call("handle_list_tools", &json!({"role": role}))
+            .await
+            .unwrap_or_else(|error| panic!("handle_list_tools failed for {role}: {error}"));
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"poll_workers"),
+            "{role} role should not expose poll_workers"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_poll_workers_roundtrip_returns_worker_liveness_and_chainlink_state() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "poll_workers",
+        json!({ "include_dead": true }),
+    )
+    .await;
+
+    assert_tool_success(&output, "poll_workers");
+    let worker = &output["result"]["workers"][0];
+    assert_eq!(worker["name"], "worker-a");
+    assert_eq!(worker["pane_id"], "%3");
+    assert_eq!(worker["pane_alive"], true);
+    assert_eq!(worker["age_mins"], 12);
+    assert_eq!(worker["active_issue"], "7");
+    assert_eq!(worker["issue_status"], "open");
+    assert_eq!(
+        worker["chainlink_session_state"],
+        "active_in_current_session"
+    );
+    assert!(
+        output["result"]["table"]
+            .as_str()
+            .is_some_and(|table| table.contains("worker-a")),
+        "poll_workers table should include worker name: {output:#}"
+    );
 }
 
 // ============================================================================

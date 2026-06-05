@@ -521,6 +521,7 @@ fn codex_hook_event_name(event_type: HookEventType) -> &'static str {
         HookEventType::Stop => "Stop",
         HookEventType::SubagentStop => "Stop",
         HookEventType::SessionEnd => "Stop",
+        HookEventType::SessionStart => "SessionStart",
         _ => "PreToolUse",
     }
 }
@@ -831,6 +832,13 @@ mod tests {
             serde_json::json!({"command": "ls"})
         );
         assert_eq!(normalized["permission_mode"], "default");
+    }
+
+    #[test]
+    fn test_normalize_codex_session_start_keeps_session_start_event() {
+        let normalized =
+            normalize_codex_hook_payload(HookEventType::SessionStart, serde_json::json!({}));
+        assert_eq!(normalized["hook_event_name"], "SessionStart");
     }
 
     #[test]

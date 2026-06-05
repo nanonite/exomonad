@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
+#[cfg(test)]
 const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Overall verdict derived from Forgejo reviews for a single open PR.
@@ -200,11 +201,47 @@ fn review_state_disposes_reviewer(review_state: &ForgejoReviewState) -> bool {
     )
 }
 
+fn should_spawn_reviewer_for_new_head(state: &WatchState, max_rounds: u32) -> bool {
+    !state.reviewer_spawned && state.rounds < max_rounds
+}
+
 fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
     match agent_type {
         AgentType::Claude => "tl",
         AgentType::Gemini | AgentType::Shoal | AgentType::OpenCode | AgentType::Codex => "dev",
         AgentType::Process => "process",
+    }
+}
+
+fn event_target_has_wasm_runtime(agent_type: AgentType) -> bool {
+    matches!(agent_type, AgentType::Claude | AgentType::Gemini)
+}
+
+fn log_missing_event_plugin(
+    branch: &str,
+    agent_name: &AgentName,
+    agent_type: AgentType,
+    role: &str,
+    event_type: &str,
+) {
+    if event_target_has_wasm_runtime(agent_type) {
+        tracing::error!(
+            branch,
+            lookup_key = %agent_name,
+            ?agent_type,
+            role,
+            event_type,
+            "No plugin found for event target; skipping event dispatch"
+        );
+    } else {
+        tracing::debug!(
+            branch,
+            lookup_key = %agent_name,
+            ?agent_type,
+            role,
+            event_type,
+            "No plugin found for non-WASM event target; skipping event dispatch"
+        );
     }
 }
 
@@ -371,6 +408,42 @@ impl WatchState {
             ci_blocked_notified: false,
         }
     }
+
+    fn reset_review_cycle(&mut self) {
+        self.notified_parent_timeout = false;
+        self.notified_parent_approved = false;
+        self.merge_ready_notified = false;
+        self.addressed_changes = false;
+        self.rounds = 0;
+        self.stuck = false;
+        self.reviewer_spawned = false;
+        self.reviewer_disposed = false;
+        self.review_approved_at = None;
+        self.ci_mergeable_at = None;
+        self.ci_triggered_sha = None;
+        self.ci_blocked_notified = false;
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct WatcherRuntimeState {
+    prs: Mutex<HashMap<u64, WatchState>>,
+}
+
+impl WatcherRuntimeState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn reset_review_cycle(&self, pr_number: u64) -> bool {
+        let mut state = self.prs.lock().await;
+        let Some(pr_state) = state.get_mut(&pr_number) else {
+            return false;
+        };
+
+        pr_state.reset_review_cycle();
+        true
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -485,13 +558,17 @@ fn codex_dev_fallback_pr_review_action(payload: &serde_json::Value) -> Option<Ev
                 value_u64(payload, "rounds")?
             ),
         }),
-        "merge_ready" => Some(EventActionResponse::InjectMessage {
-            message: merge_ready_message(
-                value_u64(payload, "pr_number")?,
-                value_str(payload, "ci_status")?,
-                value_str(payload, "branch")?,
-            ),
-        }),
+        "merge_ready" => {
+            let pr_number = value_u64(payload, "pr_number")?;
+            Some(EventActionResponse::NotifyParent {
+                message: merge_ready_message(
+                    pr_number,
+                    value_str(payload, "ci_status")?,
+                    value_str(payload, "branch")?,
+                ),
+                pr_number: pr_number as i64,
+            })
+        }
         "approved"
         | "reviewer_approved"
         | "timeout"
@@ -520,8 +597,9 @@ fn codex_dev_fallback_ci_status_action(payload: &serde_json::Value) -> Option<Ev
         .unwrap_or(false);
 
     if (merge_blocked_on_ci || merge_ready) && matches!(status, "success" | "neutral") {
-        return Some(EventActionResponse::InjectMessage {
+        return Some(EventActionResponse::NotifyParent {
             message: merge_ready_message(pr_number, status, branch),
+            pr_number: pr_number as i64,
         });
     }
 
@@ -552,7 +630,7 @@ struct Observation {
 pub struct WorktreeEventWatcher<C> {
     ctx: Arc<C>,
     poll_interval: Duration,
-    state: Arc<Mutex<HashMap<u64, WatchState>>>,
+    state: Arc<WatcherRuntimeState>,
     watcher_state_path: std::path::PathBuf,
     plugins: Option<PluginMap>,
     policy: ReviewPolicy,
@@ -581,7 +659,7 @@ where
         Self {
             ctx,
             poll_interval: Duration::from_secs(60),
-            state: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(WatcherRuntimeState::new()),
             watcher_state_path,
             plugins: None,
             policy: ReviewPolicy::default(),
@@ -609,6 +687,11 @@ where
 
     pub fn with_reviewer_spawner(mut self, spawner: Arc<dyn ReviewerSpawner>) -> Self {
         self.reviewer_spawner = Some(spawner);
+        self
+    }
+
+    pub fn with_runtime_state(mut self, state: Arc<WatcherRuntimeState>) -> Self {
+        self.state = state;
         self
     }
 
@@ -934,7 +1017,7 @@ where
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
 
         {
-            let mut state_guard = self.state.lock().await;
+            let mut state_guard = self.state.prs.lock().await;
 
             for (pr_number, obs) in observations {
                 let pr = match registry.prs.get(pr_number) {
@@ -947,9 +1030,18 @@ where
                 let agent_role = pr.author_role.clone();
                 let branch = BranchName::try_from_str(pr.head_branch.as_str())
                     .expect("validated string input is non-empty");
-                let terminal_review_observed = review_state_disposes_reviewer(&obs.review_state);
-                let (local_reviews, _local_review_state) = obs_to_review_parts(obs);
                 let head_sha_changed = pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str());
+                let stale_terminal_review_after_head_change = head_sha_changed
+                    && review_state_disposes_reviewer(&obs.review_state)
+                    && !obs.forgejo_review_present;
+                let terminal_review_observed = review_state_disposes_reviewer(&obs.review_state)
+                    && !stale_terminal_review_after_head_change;
+                let (local_reviews, _local_review_state) =
+                    if stale_terminal_review_after_head_change {
+                        (Vec::new(), ForgejoReviewVerdict::None)
+                    } else {
+                        obs_to_review_parts(obs)
+                    };
                 if head_sha_changed {
                     head_sha_updates.push((*pr_number, obs.head_sha.clone()));
                 }
@@ -957,7 +1049,10 @@ where
                     if head_sha_changed {
                         old_state.reviewer_spawned = false;
                         old_state.reviewer_disposed = false;
-                        if !terminal_review_observed {
+                        if should_spawn_reviewer_for_new_head(
+                            old_state,
+                            self.policy.reviewer_max_rounds,
+                        ) {
                             if let Some(spawner) = &self.reviewer_spawner {
                                 let spawner = spawner.clone();
                                 let pr_clone = pr.clone();
@@ -1313,7 +1408,7 @@ where
             return Ok(());
         }
 
-        let state_guard = self.state.lock().await;
+        let state_guard = self.state.prs.lock().await;
 
         for pr_num in removed {
             let branch = match state_guard.get(pr_num) {
@@ -1428,7 +1523,9 @@ where
         let plugin = match plugins_guard.get(&agent_name) {
             Some(p) => p.clone(),
             None => {
-                if agent_type == AgentType::Codex && role == "dev" {
+                if (agent_type == AgentType::Codex || agent_type == AgentType::OpenCode)
+                    && role == "dev"
+                {
                     if let Some(action) = codex_dev_fallback_event_action(event_type, &payload) {
                         tracing::info!(
                             branch,
@@ -1440,14 +1537,7 @@ where
                         return Ok(Some(action));
                     }
                 }
-                tracing::error!(
-                    branch,
-                    lookup_key = %agent_name,
-                    ?agent_type,
-                    role,
-                    event_type,
-                    "No plugin found for event target; skipping event dispatch"
-                );
+                log_missing_event_plugin(branch, &agent_name, agent_type, role, event_type);
                 return Ok(None);
             }
         };
@@ -1545,7 +1635,7 @@ where
     }
 
     async fn mark_merge_ready_notified(&self, pr_number: u64) {
-        let mut state_guard = self.state.lock().await;
+        let mut state_guard = self.state.prs.lock().await;
         if let Some(state) = state_guard.get_mut(&pr_number) {
             state.merge_ready_notified = true;
         } else {
@@ -2165,7 +2255,7 @@ fn compute_pr_actions_with_context(
         old_state.first_seen = now;
         old_state.rounds = next_review_round;
 
-        if old_state.rounds > max_rounds {
+        if old_state.rounds >= max_rounds {
             old_state.stuck = true;
             pending_actions.push(PendingAction::WriteRegistryStuck {
                 pr_number: pr_number.as_u64(),
@@ -2345,16 +2435,7 @@ fn signals_within_merge_ready_window(
     review_approved_at: Option<Instant>,
     ci_mergeable_at: Option<Instant>,
 ) -> bool {
-    let (Some(review_approved_at), Some(ci_mergeable_at)) = (review_approved_at, ci_mergeable_at)
-    else {
-        return false;
-    };
-
-    if review_approved_at >= ci_mergeable_at {
-        review_approved_at.duration_since(ci_mergeable_at) <= MERGE_READY_SIGNAL_WINDOW
-    } else {
-        ci_mergeable_at.duration_since(review_approved_at) <= MERGE_READY_SIGNAL_WINDOW
-    }
+    review_approved_at.is_some() && ci_mergeable_at.is_some()
 }
 
 fn classify_review_stall(
@@ -2496,7 +2577,7 @@ fn format_observations(observations: &HashMap<u64, Observation>) -> String {
     entries.join(", ")
 }
 
-/// Extracts the branch name and head SHA from a `sh.tangled.pipeline` event payload.
+/// Extracts the branch name and head SHA from a pipeline event payload.
 /// Returns `None` if the trigger is not a push or is missing the ref/SHA fields.
 #[allow(dead_code)]
 fn extract_pipeline_branch_and_sha(event: &serde_json::Value) -> Option<(BranchName, String)> {
@@ -2515,7 +2596,7 @@ fn extract_pipeline_branch_and_sha(event: &serde_json::Value) -> Option<(BranchN
     }
 }
 
-/// Extracts the pipeline rkey and status string from a `sh.tangled.pipeline.status` event payload.
+/// Extracts the pipeline rkey and status string from a pipeline status event payload.
 /// The pipeline field is an AT-URI; the rkey is the last path segment.
 #[allow(dead_code)]
 fn extract_pipeline_status(event: &serde_json::Value) -> Option<(String, String)> {
@@ -2580,13 +2661,12 @@ mod tests {
         });
 
         match codex_dev_fallback_event_action("pr_review", &payload) {
-            Some(EventActionResponse::InjectMessage { message }) => {
-                assert_eq!(
-                    message,
-                    "[MERGE READY] PR #43 on branch main.feature-codex has CI status success and reviewer approval. Merge with `merge_pr` tool."
-                );
+            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
+                assert_eq!(pr_number, 43);
+                assert!(message.contains("MERGE READY"));
+                assert!(message.contains("PR #43"));
             }
-            other => panic!("expected merge-ready InjectMessage fallback, got {other:?}"),
+            other => panic!("expected merge-ready NotifyParent fallback, got {other:?}"),
         }
     }
 
@@ -3034,6 +3114,16 @@ mod tests {
     }
 
     #[test]
+    fn test_only_wasm_event_targets_keep_missing_plugin_at_error_level() {
+        assert!(event_target_has_wasm_runtime(AgentType::Claude));
+        assert!(event_target_has_wasm_runtime(AgentType::Gemini));
+        assert!(!event_target_has_wasm_runtime(AgentType::Codex));
+        assert!(!event_target_has_wasm_runtime(AgentType::OpenCode));
+        assert!(!event_target_has_wasm_runtime(AgentType::Shoal));
+        assert!(!event_target_has_wasm_runtime(AgentType::Process));
+    }
+
+    #[test]
     fn test_new_comments_update_comment_count_without_review_received() {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
@@ -3476,7 +3566,7 @@ mod tests {
         assert!(merge_ready_release_message(&payload).is_none());
     }
     #[test]
-    fn test_green_ci_after_stale_approval_does_not_fire_merge_ready() {
+    fn test_green_ci_after_existing_approval_fires_merge_ready() {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
@@ -3504,7 +3594,7 @@ mod tests {
             PendingAction::WasmEvent {
                 event_type: "ci_status",
                 payload,
-            } if payload["status"] == "success" && payload["merge_ready"] == false
+            } if payload["status"] == "success" && payload["merge_ready"] == true
         )));
         assert!(!actions.iter().any(|action| matches!(
             action,
@@ -3567,7 +3657,7 @@ mod tests {
             false,
             branch.as_str(),
             &|_, _| "Still needs work".to_string(),
-            1,
+            2,
         );
 
         assert!(state.stuck);
@@ -4321,6 +4411,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watcher_runtime_state_resets_review_cycle_flags() {
+        let runtime_state = WatcherRuntimeState::new();
+        let branch = BranchName::try_from_str("main.feature").unwrap();
+        let mut watch_state =
+            WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Failure, 2);
+        watch_state.notified_parent_timeout = true;
+        watch_state.notified_parent_approved = true;
+        watch_state.merge_ready_notified = true;
+        watch_state.addressed_changes = true;
+        watch_state.rounds = 3;
+        watch_state.stuck = true;
+        watch_state.reviewer_spawned = true;
+        watch_state.reviewer_disposed = true;
+        watch_state.review_approved_at = Some(Instant::now());
+        watch_state.ci_mergeable_at = Some(Instant::now());
+        watch_state.ci_triggered_sha = Some("abc123".to_string());
+        watch_state.ci_blocked_notified = true;
+        runtime_state.prs.lock().await.insert(7, watch_state);
+
+        assert!(runtime_state.reset_review_cycle(7).await);
+        assert!(!runtime_state.reset_review_cycle(8).await);
+
+        let state = runtime_state.prs.lock().await;
+        let reset = state.get(&7).unwrap();
+        assert!(!reset.notified_parent_timeout);
+        assert!(!reset.notified_parent_approved);
+        assert!(!reset.merge_ready_notified);
+        assert!(!reset.addressed_changes);
+        assert_eq!(reset.rounds, 0);
+        assert!(!reset.stuck);
+        assert!(!reset.reviewer_spawned);
+        assert!(!reset.reviewer_disposed);
+        assert!(reset.review_approved_at.is_none());
+        assert!(reset.ci_mergeable_at.is_none());
+        assert!(reset.ci_triggered_sha.is_none());
+        assert!(!reset.ci_blocked_notified);
+    }
+
+    #[tokio::test]
     async fn test_process_observations_does_not_persist_review_state_on_approval() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
@@ -4433,7 +4562,7 @@ mod tests {
             !reviewer_agent_dir.exists(),
             "already-approved PRs observed after restart should dispose reviewer agent resources"
         );
-        let state = watcher.state.lock().await;
+        let state = watcher.state.prs.lock().await;
         assert!(state.get(&1).is_some_and(|state| state.reviewer_disposed));
         drop(state);
         let watcher_log = tokio::fs::read_to_string(temp_dir.path().join(".exo/logs/watcher.log"))
@@ -4535,7 +4664,7 @@ mod tests {
             "spawner should be called for first sighting of new PR"
         );
 
-        let state = watcher.state.lock().await;
+        let state = watcher.state.prs.lock().await;
         assert!(
             state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(false),
             "reviewer_spawned should be true after first sighting"
@@ -4572,7 +4701,7 @@ mod tests {
         let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
         let branch = BranchName::try_from_str("main.feature-codex")
             .expect("literal validated string is non-empty");
-        watcher.state.lock().await.insert(
+        watcher.state.prs.lock().await.insert(
             1,
             WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0),
         );
@@ -4590,6 +4719,75 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reviewer_spawner_called_for_new_head_after_changes_requested() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSpawner {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for CountingSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                _pr: &crate::services::pr_registry::PrEntry,
+            ) -> anyhow::Result<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let spawner = Arc::new(CountingSpawner {
+            count: call_count.clone(),
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
+        let branch = BranchName::try_from_str("main.feature-codex")
+            .expect("literal validated string is non-empty");
+        let mut watch_state =
+            WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0);
+        watch_state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
+        watch_state.rounds = 1;
+        watch_state.reviewer_spawned = true;
+        watch_state.reviewer_disposed = true;
+        watcher.state.prs.lock().await.insert(1, watch_state);
+
+        let mut pr = test_pr_entry();
+        pr.last_head_sha = Some("abc123".to_string());
+        let registry = test_registry(pr);
+        let mut observations = HashMap::new();
+        observations.insert(
+            1u64,
+            Observation {
+                head_sha: "def456".to_string(),
+                review_state: ForgejoReviewState::ChangesRequested,
+                comments: vec![],
+                reviews: vec![],
+                ci_status: CIStatus::Unknown,
+                forgejo_review_present: false,
+            },
+        );
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let state = watcher.state.prs.lock().await;
+        let pr_state = state.get(&1).unwrap();
+        assert!(pr_state.reviewer_spawned);
+        assert!(!pr_state.reviewer_disposed);
+        assert_eq!(pr_state.last_review_state, ForgejoReviewVerdict::None);
+        assert_eq!(pr_state.rounds, 1);
     }
 
     #[tokio::test]
