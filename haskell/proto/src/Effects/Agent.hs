@@ -187,7 +187,11 @@ data AgentInfo
     agentInfoPrNumber :: Hs.Int32,
     agentInfoPrUrl :: Hs.Text,
     agentInfoTopology :: (HsProtobuf.Enumerated Effects.Agent.WorkspaceTopology),
-    agentInfoPaneId :: Hs.Text
+    agentInfoPaneId :: Hs.Text,
+    agentInfoBirthBranch :: Hs.Text,
+    agentInfoHasUnread :: Hs.Bool,
+    agentInfoLastCheckInboxAt :: Hs.Int64,
+    agentInfoIsAlive :: Hs.Bool
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -214,7 +218,11 @@ instance (HsProtobuf.Message AgentInfo) where
         agentInfoPrNumber,
         agentInfoPrUrl,
         agentInfoTopology,
-        agentInfoPaneId
+        agentInfoPaneId,
+        agentInfoBirthBranch,
+        agentInfoHasUnread,
+        agentInfoLastCheckInboxAt,
+        agentInfoIsAlive
       } =
       Hs.mappend
         ( Hs.mappend
@@ -228,84 +236,119 @@ instance (HsProtobuf.Message AgentInfo) where
                                         ( Hs.mappend
                                             ( Hs.mappend
                                                 ( Hs.mappend
-                                                    ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 1)
-                                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                            agentInfoId
+                                                    ( Hs.mappend
+                                                        ( Hs.mappend
+                                                            ( Hs.mappend
+                                                                ( Hs.mappend
+                                                                    ( HsProtobuf.encodeMessageField
+                                                                        (HsProtobuf.FieldNumber 1)
+                                                                        ( ( Hs.coerce
+                                                                              @Hs.Text
+                                                                              @(HsProtobuf.String Hs.Text)
+                                                                          )
+                                                                            agentInfoId
+                                                                        )
+                                                                    )
+                                                                    ( HsProtobuf.encodeMessageField
+                                                                        (HsProtobuf.FieldNumber 2)
+                                                                        ( ( Hs.coerce
+                                                                              @Hs.Text
+                                                                              @(HsProtobuf.String Hs.Text)
+                                                                          )
+                                                                            agentInfoIssue
+                                                                        )
+                                                                    )
+                                                                )
+                                                                ( HsProtobuf.encodeMessageField
+                                                                    (HsProtobuf.FieldNumber 3)
+                                                                    ( ( Hs.coerce
+                                                                          @Hs.Text
+                                                                          @(HsProtobuf.String Hs.Text)
+                                                                      )
+                                                                        agentInfoWorktreePath
+                                                                    )
+                                                                )
+                                                            )
+                                                            ( HsProtobuf.encodeMessageField
+                                                                (HsProtobuf.FieldNumber 4)
+                                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                                    agentInfoBranchName
+                                                                )
+                                                            )
+                                                        )
+                                                        ( HsProtobuf.encodeMessageField
+                                                            (HsProtobuf.FieldNumber 5)
+                                                            agentInfoAgentType
                                                         )
                                                     )
                                                     ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 2)
-                                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                            agentInfoIssue
-                                                        )
+                                                        (HsProtobuf.FieldNumber 6)
+                                                        agentInfoRole
                                                     )
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 3)
-                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                        agentInfoWorktreePath
-                                                    )
+                                                    (HsProtobuf.FieldNumber 7)
+                                                    agentInfoAlive
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 4)
+                                                (HsProtobuf.FieldNumber 8)
                                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                    agentInfoBranchName
+                                                    agentInfoMuxWindow
                                                 )
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 5)
-                                            agentInfoAgentType
+                                            (HsProtobuf.FieldNumber 9)
+                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                agentInfoError
+                                            )
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 6)
-                                        agentInfoRole
+                                        (HsProtobuf.FieldNumber 10)
+                                        agentInfoPrNumber
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 7)
-                                    agentInfoAlive
+                                    (HsProtobuf.FieldNumber 11)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        agentInfoPrUrl
+                                    )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 8)
-                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                    agentInfoMuxWindow
-                                )
+                                (HsProtobuf.FieldNumber 12)
+                                agentInfoTopology
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 9)
+                            (HsProtobuf.FieldNumber 13)
                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                agentInfoError
+                                agentInfoPaneId
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 10)
-                        agentInfoPrNumber
+                        (HsProtobuf.FieldNumber 14)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            agentInfoBirthBranch
+                        )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 11)
-                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        agentInfoPrUrl
-                    )
+                    (HsProtobuf.FieldNumber 15)
+                    agentInfoHasUnread
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 12)
-                agentInfoTopology
+                (HsProtobuf.FieldNumber 16)
+                agentInfoLastCheckInboxAt
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 13)
-            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                agentInfoPaneId
-            )
+            (HsProtobuf.FieldNumber 17)
+            agentInfoIsAlive
         )
   decodeMessage _ =
     Hs.pure AgentInfo
@@ -372,6 +415,21 @@ instance (HsProtobuf.Message AgentInfo) where
                   (HsProtobuf.FieldNumber 13)
               )
           )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 14)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 15)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 16)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 17)
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -460,52 +518,124 @@ instance (HsProtobuf.Message AgentInfo) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "pane_id")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 14)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "birth_branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 15)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "has_unread")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 16)
+        (HsProtobufAST.Prim HsProtobufAST.Int64)
+        (HsProtobufAST.Single "last_check_inbox_at")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 17)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "is_alive")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB AgentInfo) where
-  toJSONPB (AgentInfo f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13) =
-    HsJSONPB.object
-      [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
-        "issue" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
-        "worktree_path"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
-        "branch_name"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
-        "agent_type" .= f5,
-        "role" .= f6,
-        "alive" .= f7,
-        "mux_window"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
-        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
-        "pr_number" .= f10,
-        "pr_url"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11),
-        "topology" .= f12,
-        "pane_id"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13)
-      ]
-  toEncodingPB (AgentInfo f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12 f13) =
-    HsJSONPB.pairs
-      [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
-        "issue" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
-        "worktree_path"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
-        "branch_name"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
-        "agent_type" .= f5,
-        "role" .= f6,
-        "alive" .= f7,
-        "mux_window"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
-        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
-        "pr_number" .= f10,
-        "pr_url"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11),
-        "topology" .= f12,
-        "pane_id"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13)
-      ]
+  toJSONPB
+    ( AgentInfo
+        f1
+        f2
+        f3
+        f4
+        f5
+        f6
+        f7
+        f8
+        f9
+        f10
+        f11
+        f12
+        f13
+        f14
+        f15
+        f16
+        f17
+      ) =
+      HsJSONPB.object
+        [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+          "issue" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+          "worktree_path"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+          "branch_name"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+          "agent_type" .= f5,
+          "role" .= f6,
+          "alive" .= f7,
+          "mux_window"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+          "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+          "pr_number" .= f10,
+          "pr_url"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11),
+          "topology" .= f12,
+          "pane_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
+          "birth_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
+          "has_unread" .= f15,
+          "last_check_inbox_at" .= f16,
+          "is_alive" .= f17
+        ]
+  toEncodingPB
+    ( AgentInfo
+        f1
+        f2
+        f3
+        f4
+        f5
+        f6
+        f7
+        f8
+        f9
+        f10
+        f11
+        f12
+        f13
+        f14
+        f15
+        f16
+        f17
+      ) =
+      HsJSONPB.pairs
+        [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+          "issue" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+          "worktree_path"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+          "branch_name"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+          "agent_type" .= f5,
+          "role" .= f6,
+          "alive" .= f7,
+          "mux_window"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+          "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+          "pr_number" .= f10,
+          "pr_url"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11),
+          "topology" .= f12,
+          "pane_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
+          "birth_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
+          "has_unread" .= f15,
+          "last_check_inbox_at" .= f16,
+          "is_alive" .= f17
+        ]
 
 instance (HsJSONPB.FromJSONPB AgentInfo) where
   parseJSONPB =
@@ -542,6 +672,12 @@ instance (HsJSONPB.FromJSONPB AgentInfo) where
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "pane_id")
                 )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "birth_branch")
+                )
+            <*> obj .: "has_unread"
+            <*> obj .: "last_check_inbox_at"
+            <*> obj .: "is_alive"
       )
 
 instance (HsJSONPB.ToJSON AgentInfo) where
@@ -2663,7 +2799,8 @@ data ListRequest
   = ListRequest
   { listRequestFilterAliveOnly :: Hs.Bool,
     listRequestFilterRole :: (HsProtobuf.Enumerated ExoMonad.Common.Role),
-    listRequestSubrepo :: Hs.Text
+    listRequestSubrepo :: Hs.Text,
+    listRequestFilterType :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -2680,23 +2817,32 @@ instance (HsProtobuf.Message ListRequest) where
     ListRequest
       { listRequestFilterAliveOnly,
         listRequestFilterRole,
-        listRequestSubrepo
+        listRequestSubrepo,
+        listRequestFilterType
       } =
       Hs.mappend
         ( Hs.mappend
-            ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 1)
-                listRequestFilterAliveOnly
+            ( Hs.mappend
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 1)
+                    listRequestFilterAliveOnly
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 2)
+                    listRequestFilterRole
+                )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 2)
-                listRequestFilterRole
+                (HsProtobuf.FieldNumber 3)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    listRequestSubrepo
+                )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 3)
+            (HsProtobuf.FieldNumber 4)
             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                listRequestSubrepo
+                listRequestFilterType
             )
         )
   decodeMessage _ =
@@ -2711,6 +2857,12 @@ instance (HsProtobuf.Message ListRequest) where
               ( HsProtobuf.at
                   HsProtobuf.decodeMessageField
                   (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
               )
           )
   dotProto _ =
@@ -2737,23 +2889,33 @@ instance (HsProtobuf.Message ListRequest) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "subrepo")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "filter_type")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB ListRequest) where
-  toJSONPB (ListRequest f1 f2 f3) =
+  toJSONPB (ListRequest f1 f2 f3 f4) =
     HsJSONPB.object
       [ "filter_alive_only" .= f1,
         "filter_role" .= f2,
         "subrepo"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "filter_type"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4)
       ]
-  toEncodingPB (ListRequest f1 f2 f3) =
+  toEncodingPB (ListRequest f1 f2 f3 f4) =
     HsJSONPB.pairs
       [ "filter_alive_only" .= f1,
         "filter_role" .= f2,
         "subrepo"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "filter_type"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4)
       ]
 
 instance (HsJSONPB.FromJSONPB ListRequest) where
@@ -2766,6 +2928,9 @@ instance (HsJSONPB.FromJSONPB ListRequest) where
             <*> obj .: "filter_role"
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "subrepo")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "filter_type")
                 )
       )
 

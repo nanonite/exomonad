@@ -115,6 +115,7 @@ library wasm-guest-internal
         ExoMonad.Effects.Copilot
         ExoMonad.Effects.Coordination
         ExoMonad.Effects.Events
+        ExoMonad.Effects.Inbox
         ExoMonad.Effects.Session
         ExoMonad.Effects.Tasks
         ExoMonad.Effects.KV

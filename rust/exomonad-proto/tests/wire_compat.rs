@@ -258,6 +258,7 @@ mod binary {
                 pr_url: String::new(),
                 topology: 0,
                 pane_id: String::new(),
+                ..Default::default()
             }),
         };
 
@@ -298,6 +299,7 @@ mod binary {
                     pr_url: String::new(),
                     topology: 0,
                     pane_id: String::new(),
+                    ..Default::default()
                 },
                 AgentInfo {
                     id: "gh-2-gemini".into(),
@@ -313,6 +315,7 @@ mod binary {
                     pr_url: String::new(),
                     topology: 0,
                     pane_id: String::new(),
+                    ..Default::default()
                 },
             ],
             errors: vec!["issue 3: not found".into()],
@@ -346,6 +349,7 @@ mod binary {
                 pr_url: "https://github.com/org/repo/pull/42".into(),
                 topology: 0,
                 pane_id: String::new(),
+                ..Default::default()
             }],
         };
 
@@ -793,6 +797,7 @@ mod binary {
                 pr_url: String::new(),
                 topology: 0,
                 pane_id: String::new(),
+                ..Default::default()
             }),
         };
         let spawn_inner = spawn_resp.encode_to_vec();
@@ -853,6 +858,7 @@ mod binary {
                 pr_url: String::new(),
                 topology: 0,
                 pane_id: String::new(),
+                ..Default::default()
             }],
             errors: vec!["issue 2: failed".into()],
         };

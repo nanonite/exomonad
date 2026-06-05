@@ -1,0 +1,21 @@
+syntax = "proto3";
+package exomonad.effects.inbox;
+
+// Durable cross-harness inbox effects.
+
+message InboxCheckEffect {}
+
+message InboxMessage {
+  string from_agent = 1;
+  string content = 2;
+  string summary = 3;
+  int64 created_at = 4;
+}
+
+message InboxCheckResult {
+  repeated InboxMessage messages = 1;
+}
+
+service InboxEffects {
+  rpc Check(InboxCheckEffect) returns (InboxCheckResult);
+}

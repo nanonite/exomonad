@@ -258,6 +258,7 @@ mod tests {
             pr_url: String::new(),
             topology: 1, // WORKTREE_PER_AGENT
             pane_id: String::new(),
+            ..Default::default()
         };
 
         let spawn_resp = SpawnResponse {

@@ -367,6 +367,7 @@ impl EffectHandler for MockAgentHandler {
                     pr_url: String::new(),
                     topology: 1,
                     pane_id: String::new(),
+                    ..Default::default()
                 };
                 Ok(SpawnSubtreeResponse { agent: Some(agent) }.encode_to_vec())
             }
@@ -387,6 +388,7 @@ impl EffectHandler for MockAgentHandler {
                     pr_url: String::new(),
                     topology: 1,
                     pane_id: String::new(),
+                    ..Default::default()
                 };
                 Ok(SpawnLeafSubtreeResponse { agent: Some(agent) }.encode_to_vec())
             }
@@ -407,6 +409,7 @@ impl EffectHandler for MockAgentHandler {
                     pr_url: String::new(),
                     topology: 2,
                     pane_id: "%42".into(),
+                    ..Default::default()
                 };
                 Ok(SpawnWorkerResponse { agent: Some(agent) }.encode_to_vec())
             }

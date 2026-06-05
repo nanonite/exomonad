@@ -1111,6 +1111,7 @@ impl<
             pr_url: String::new(),
             topology: exomonad_proto::effects::agent::WorkspaceTopology::SharedDir as i32,
             pane_id: String::new(),
+            ..Default::default()
         };
 
         tracing::info!(
@@ -2016,6 +2017,7 @@ fn spawn_result_to_proto(
         pr_url: String::new(),
         topology: Topology::WorktreePerAgent.to_proto(),
         pane_id: String::new(),
+        ..Default::default()
     }
 }
 
@@ -2039,6 +2041,7 @@ fn teammate_result_to_proto(
         pr_url: String::new(),
         topology: Topology::WorktreePerAgent.to_proto(),
         pane_id: result.pane_id.clone().unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -2062,6 +2065,7 @@ fn worker_result_to_proto(
         pr_url: String::new(),
         topology: Topology::SharedDir.to_proto(),
         pane_id: result.pane_id.clone().unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -2085,6 +2089,7 @@ fn subtree_result_to_proto(
         pr_url: String::new(),
         topology: Topology::WorktreePerAgent.to_proto(),
         pane_id: result.pane_id.clone().unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -2108,6 +2113,7 @@ fn leaf_subtree_result_to_proto(
         pr_url: String::new(),
         topology: Topology::WorktreePerAgent.to_proto(),
         pane_id: result.pane_id.clone().unwrap_or_default(),
+        ..Default::default()
     }
 }
 
@@ -2151,6 +2157,7 @@ fn service_info_to_proto(info: &AgentInfo) -> exomonad_proto::effects::agent::Ag
         pr_url: info.pr.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
         topology: info.topology.to_proto(),
         pane_id: String::new(),
+        ..Default::default()
     }
 }
 

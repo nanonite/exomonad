@@ -54,6 +54,14 @@ message AgentInfo {
   WorkspaceTopology topology = 12;
   // Stable tmux pane id for ephemeral worker panes (e.g. "%42").
   string pane_id = 13;
+  // Branch the agent was spawned from.
+  string birth_branch = 14;
+  // Whether the agent has unread durable inbox mail.
+  bool has_unread = 15;
+  // Unix timestamp for the agent's last explicit inbox check.
+  int64 last_check_inbox_at = 16;
+  // Alias for alive used by agent-list tools.
+  bool is_alive = 17;
 }
 
 // ============================================================================
@@ -231,6 +239,8 @@ message ListRequest {
   exomonad.common.Role filter_role = 2;
   // Sub-repository path relative to project_dir.
   string subrepo = 3;
+  // Filter by agent type name (optional).
+  string filter_type = 4;
 }
 
 message ListResponse {
