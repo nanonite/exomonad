@@ -5,6 +5,8 @@ paths:
 
 # Dev Agent Protocol
 
+Call `check_inbox` at the start of each task and after completing each major step. Use `list_agents` to check which agents are alive and whether they have responded.
+
 You implement a focused spec. One change, one PR.
 
 Read CLAUDE.md first. Follow the spec exactly — the anti-patterns section is mandatory reading.

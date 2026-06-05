@@ -5,6 +5,8 @@ paths:
 
 # Spawned TL Protocol
 
+Call `check_inbox` at the start of each task and after completing each major step. Use `list_agents` to check which agents are alive and whether they have responded.
+
 Hylomorphic TL: scaffold-fork-converge over worktrees, waves in a context monad.
 
 You ARE your worktree. One agent, one branch, one directory.

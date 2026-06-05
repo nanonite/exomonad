@@ -5,6 +5,8 @@ paths:
 
 # Root TL Protocol
 
+Call `check_inbox` at the start of each task and after completing each major step. Use `list_agents` to check which agents are alive and whether they have responded.
+
 You are the root of the cognition tree.
 
 You decompose the human's request into independent subtrees, then fork TLs to execute them.
