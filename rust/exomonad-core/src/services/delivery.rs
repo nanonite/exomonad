@@ -294,6 +294,7 @@ pub async fn route_message(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
           + super::HasAgentResolver
+          + super::HasInboxStore
           + super::HasProjectDir),
     address: &Address,
     from: &crate::domain::AgentName,
@@ -317,6 +318,7 @@ pub async fn route_tmux_message(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
           + super::HasAgentResolver
+          + super::HasInboxStore
           + super::HasProjectDir),
     address: &Address,
     from: &crate::domain::AgentName,
@@ -340,6 +342,7 @@ pub async fn route_mailbox_message(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
           + super::HasAgentResolver
+          + super::HasInboxStore
           + super::HasProjectDir),
     address: &Address,
     from: &crate::domain::AgentName,
@@ -361,6 +364,7 @@ async fn route_message_with(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
           + super::HasAgentResolver
+          + super::HasInboxStore
           + super::HasProjectDir),
     address: &Address,
     from: &crate::domain::AgentName,
@@ -400,6 +404,7 @@ async fn deliver_to_agent_for(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
           + super::HasAgentResolver
+          + super::HasInboxStore
           + super::HasProjectDir),
     agent_key: &str,
     tmux_target: &str,
@@ -413,9 +418,15 @@ async fn deliver_to_agent_for(
             deliver_to_agent(ctx, agent_key, tmux_target, from, message, summary).await
         }
         MessageDeliveryPath::TmuxOnly => {
+            if !record_inbox_delivery(ctx, agent_key, from, message, summary) {
+                return DeliveryResult::Failed;
+            }
             deliver_via_tmux(ctx.project_dir(), agent_key, tmux_target, from, message).await
         }
         MessageDeliveryPath::MailboxOnly => {
+            if !record_inbox_delivery(ctx, agent_key, from, message, summary) {
+                return DeliveryResult::Failed;
+            }
             deliver_to_agent_mailbox(ctx, agent_key, from, message, summary).await
         }
     }
@@ -427,6 +438,7 @@ async fn resolve_and_deliver_to_lead(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
           + super::HasAgentResolver
+          + super::HasInboxStore
           + super::HasProjectDir),
     team_name: &str,
     from: &crate::domain::AgentName,
@@ -474,6 +486,38 @@ fn delivery_method_from_result(result: DeliveryResult) -> DeliveryMethod {
         DeliveryResult::Acp => DeliveryMethod::Acp,
         DeliveryResult::Uds => DeliveryMethod::Uds,
         DeliveryResult::Tmux | DeliveryResult::Failed => DeliveryMethod::Tmux,
+    }
+}
+
+fn record_inbox_delivery(
+    ctx: &impl super::HasInboxStore,
+    agent_key: &str,
+    from: &crate::domain::AgentName,
+    message: &str,
+    summary: &str,
+) -> bool {
+    match ctx
+        .inbox_store()
+        .write_message(from.as_str(), agent_key, message, Some(summary))
+    {
+        Ok(message_id) => {
+            debug!(
+                message_id,
+                from = %from,
+                to = %agent_key,
+                "Recorded message in durable inbox"
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                from = %from,
+                to = %agent_key,
+                error = %error,
+                "Failed to record message in durable inbox"
+            );
+            false
+        }
     }
 }
 
@@ -535,6 +579,7 @@ pub async fn notify_parent_delivery(
           + super::HasAgentResolver
           + super::HasEventLog
           + super::HasEventQueue
+          + super::HasInboxStore
           + super::HasProjectDir),
     agent_id: &crate::domain::AgentName,
     parent_session_id: &str,
@@ -874,6 +919,7 @@ async fn deliver_to_agent_mailbox(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
           + super::HasAgentResolver
+          + super::HasInboxStore
           + super::HasProjectDir),
     agent_key: &str,
     from: &crate::domain::AgentName,
@@ -986,6 +1032,7 @@ pub async fn deliver_to_agent(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAcpRegistry
           + super::HasAgentResolver
+          + super::HasInboxStore
           + super::HasProjectDir),
     agent_key: &str,
     tmux_target: &str,
@@ -998,7 +1045,9 @@ pub async fn deliver_to_agent(
     let _agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
     let agent_type = agent_type_from_key(agent_key);
-
+    if !record_inbox_delivery(ctx, agent_key, from, message, summary) {
+        return DeliveryResult::Failed;
+    }
     // Batch lookup: sender's team (for Tier 2 scoping) + recipient in-memory check.
     // Single lock acquisition instead of two separate get() calls.
     let (sender_info, recipient_info) = team_registry.get_pair(from.as_str(), agent_key).await;
@@ -1375,5 +1424,11 @@ mod tests {
         )
         .await;
         assert_eq!(result, DeliveryResult::Tmux);
+
+        let drained = services.inbox_store.drain_unread("agent-1").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].from_agent, "test");
+        assert_eq!(drained[0].content, "hello");
+        assert_eq!(drained[0].summary.as_deref(), Some("summary"));
     }
 }

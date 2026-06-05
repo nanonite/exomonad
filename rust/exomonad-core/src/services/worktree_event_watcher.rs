@@ -7,7 +7,7 @@ use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     CiStatusMap, HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasForgejoClient,
-    HasGitWorktreeService, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
+    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -651,6 +651,7 @@ where
         + HasEventQueue
         + HasForgejoClient
         + HasGitWorktreeService
+        + HasInboxStore
         + HasProjectDir
         + 'static,
 {

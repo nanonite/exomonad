@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::services::{
-    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasProjectDir,
+    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasInboxStore, HasProjectDir,
     HasSupervisorRegistry, HasTeamRegistry,
 };
 
@@ -108,6 +108,7 @@ impl<
             + HasAgentResolver
             + HasEventLog
             + HasEventQueue
+            + HasInboxStore
             + HasProjectDir
             + HasSupervisorRegistry
             + 'static,
@@ -134,6 +135,7 @@ impl<
             + HasAgentResolver
             + HasEventLog
             + HasEventQueue
+            + HasInboxStore
             + HasProjectDir
             + HasSupervisorRegistry
             + 'static,
