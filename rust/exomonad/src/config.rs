@@ -191,6 +191,9 @@ pub struct RawConfig {
     /// GitHub poller interval in seconds (default: 60).
     pub poll_interval: Option<u64>,
 
+    /// Unread inbox poke interval in seconds (default: 300).
+    pub inbox_poke_interval: Option<u64>,
+
     /// Orphan reconciler interval in seconds (default: 60).
     pub orphan_reconciler_interval_secs: Option<u64>,
 
@@ -268,6 +271,9 @@ pub struct Config {
 
     /// GitHub poller interval in seconds (default: 60).
     pub poll_interval: Option<u64>,
+
+    /// Unread inbox poke interval in seconds (default: 300).
+    pub inbox_poke_interval: Option<u64>,
 
     /// Orphan reconciler interval in seconds (default: 60).
     pub orphan_reconciler_interval_secs: Option<u64>,
@@ -444,6 +450,9 @@ impl Config {
 
         // Resolve poll_interval: local > global
         let poll_interval = local_raw.poll_interval.or(global_raw.poll_interval);
+        let inbox_poke_interval = local_raw
+            .inbox_poke_interval
+            .or(global_raw.inbox_poke_interval);
         let orphan_reconciler_interval_secs = local_raw
             .orphan_reconciler_interval_secs
             .or(global_raw.orphan_reconciler_interval_secs);
@@ -517,6 +526,7 @@ impl Config {
             otlp_endpoint,
             model,
             poll_interval,
+            inbox_poke_interval,
             orphan_reconciler_interval_secs,
             openrouter,
             opencode,
@@ -564,6 +574,7 @@ impl Default for Config {
             otlp_endpoint: None,
             model: None,
             poll_interval: None,
+            inbox_poke_interval: None,
             orphan_reconciler_interval_secs: None,
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
@@ -685,6 +696,15 @@ mod tests {
         "#;
         let raw: RawConfig = toml::from_str(content).unwrap();
         assert_eq!(raw.port, Some(9001));
+    }
+
+    #[test]
+    fn test_raw_config_parse_inbox_poke_interval() {
+        let content = r#"
+            inbox_poke_interval = 120
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.inbox_poke_interval, Some(120));
     }
 
     #[test]

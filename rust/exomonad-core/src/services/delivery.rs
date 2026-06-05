@@ -336,6 +336,46 @@ pub async fn route_tmux_message(
     .await
 }
 
+/// Route an operational notification through tmux without creating a durable inbox row.
+#[instrument(skip_all, fields(address = %address, from = %from))]
+pub async fn route_tmux_notification(
+    ctx: &(impl super::HasTeamRegistry + super::HasAgentResolver + super::HasProjectDir),
+    address: &Address,
+    from: &crate::domain::AgentName,
+    content: &str,
+    _summary: &str,
+) -> DeliveryOutcome {
+    match address {
+        Address::Agent(name) => {
+            let tab_name = resolve_tab_name_for_agent(name, Some(ctx.agent_resolver()));
+            let agent_key = name.as_str();
+            let result =
+                deliver_via_tmux(ctx.project_dir(), agent_key, &tab_name, from, content).await;
+            DeliveryOutcome::from_result(result, agent_key)
+        }
+        Address::Team { team, member } => {
+            let agent_key = match member {
+                Some(member_name) => member_name.as_str().to_string(),
+                None => ctx
+                    .team_registry()
+                    .resolve_lead(team.as_str())
+                    .await
+                    .unwrap_or_else(|| "root".to_string()),
+            };
+            let agent_name = crate::domain::AgentName::try_from_str(agent_key.as_str())
+                .expect("validated agent key is non-empty");
+            let tab_name = resolve_tab_name_for_agent(&agent_name, Some(ctx.agent_resolver()));
+            let result =
+                deliver_via_tmux(ctx.project_dir(), &agent_key, &tab_name, from, content).await;
+            DeliveryOutcome::from_result(result, &agent_key)
+        }
+        Address::Supervisor => {
+            let result = deliver_via_tmux(ctx.project_dir(), "root", "TL", from, content).await;
+            DeliveryOutcome::from_result(result, "root")
+        }
+    }
+}
+
 /// Route a message only through the Claude Teams inbox mailbox protocol.
 #[instrument(skip_all, fields(address = %address, from = %from))]
 pub async fn route_mailbox_message(

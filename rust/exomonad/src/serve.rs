@@ -1279,6 +1279,14 @@ Run `exomonad recompile` first to build it.",
         }
         watcher = watcher.with_poll_interval(Duration::from_secs(interval));
     }
+    if let Some(interval) = config.inbox_poke_interval {
+        if interval == 0 {
+            anyhow::bail!(
+                "Invalid configuration: `inbox_poke_interval` must be >= 1 second, got 0"
+            );
+        }
+        watcher = watcher.with_inbox_poke_interval(Duration::from_secs(interval));
+    }
     tokio::spawn(async move {
         watcher.run().await;
     });

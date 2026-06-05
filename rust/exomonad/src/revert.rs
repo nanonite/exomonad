@@ -212,6 +212,7 @@ mod tests {
             otlp_endpoint: None,
             model: None,
             poll_interval: None,
+            inbox_poke_interval: None,
             orphan_reconciler_interval_secs: None,
             openrouter: Default::default(),
             opencode: Default::default(),

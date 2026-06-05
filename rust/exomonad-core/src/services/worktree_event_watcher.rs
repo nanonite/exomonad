@@ -23,6 +23,14 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
+const DEFAULT_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(300);
+
+fn inbox_poke_message(unread_count: usize) -> String {
+    format!(
+        "You have {} unread message(s). Call check_inbox.",
+        unread_count
+    )
+}
 #[cfg(test)]
 const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
@@ -630,6 +638,7 @@ struct Observation {
 pub struct WorktreeEventWatcher<C> {
     ctx: Arc<C>,
     poll_interval: Duration,
+    inbox_poke_interval: Duration,
     state: Arc<WatcherRuntimeState>,
     watcher_state_path: std::path::PathBuf,
     plugins: Option<PluginMap>,
@@ -660,6 +669,7 @@ where
         Self {
             ctx,
             poll_interval: Duration::from_secs(60),
+            inbox_poke_interval: DEFAULT_INBOX_POKE_INTERVAL,
             state: Arc::new(WatcherRuntimeState::new()),
             watcher_state_path,
             plugins: None,
@@ -673,6 +683,11 @@ where
 
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    pub fn with_inbox_poke_interval(mut self, interval: Duration) -> Self {
+        self.inbox_poke_interval = interval;
         self
     }
 
@@ -940,27 +955,70 @@ where
         self.append_watcher_log(&format!("poll: {} open PR(s)", pr_count))
             .await;
         self.evict_closed_prs_from_watcher_state(&registry).await?;
-        if registry.prs.is_empty() {
+        if !registry.prs.is_empty() {
+            let observations = self.collect_observations(&registry).await?;
+            for (num, obs) in &observations {
+                tracing::debug!(
+                    pr = num,
+                    review_state = ?obs.review_state,
+                    ci_status = ?obs.ci_status,
+                    "[Watcher] PR observation"
+                );
+            }
+            self.append_watcher_log(&format!(
+                "observations: {}",
+                format_observations(&observations)
+            ))
+            .await;
+            let removed = self.process_observations(&registry, &observations).await?;
+            self.detect_merged(&registry, &removed).await?;
+        }
+
+        self.poke_unread_inbox_agents().await?;
+        Ok(())
+    }
+
+    async fn poke_unread_inbox_agents(&self) -> Result<()> {
+        let candidates = self
+            .ctx
+            .inbox_store()
+            .agents_needing_poke(self.inbox_poke_interval.as_secs())
+            .context("failed to query inbox poke candidates")?;
+        if candidates.is_empty() {
             return Ok(());
         }
 
-        let observations = self.collect_observations(&registry).await?;
-        for (num, obs) in &observations {
-            tracing::debug!(
-                pr = num,
-                review_state = ?obs.review_state,
-                ci_status = ?obs.ci_status,
-                "[Watcher] PR observation"
-            );
+        let from =
+            AgentName::try_from_str("watcher").expect("literal validated string is non-empty");
+        for candidate in candidates {
+            let Ok(agent_name) = AgentName::try_from_str(candidate.agent_id.as_str()) else {
+                warn!(agent = %candidate.agent_id, "Skipping inbox poke for invalid agent id");
+                continue;
+            };
+            let message = inbox_poke_message(candidate.unread_count);
+            let outcome = crate::services::delivery::route_tmux_notification(
+                &*self.ctx,
+                &crate::domain::Address::Agent(agent_name),
+                &from,
+                &message,
+                "Unread inbox poke",
+            )
+            .await;
+            if outcome.is_success() {
+                info!(
+                    agent = %candidate.agent_id,
+                    unread_count = candidate.unread_count,
+                    "Poked idle agent with unread inbox mail"
+                );
+            } else {
+                warn!(
+                    agent = %candidate.agent_id,
+                    unread_count = candidate.unread_count,
+                    method = %outcome.method_string(),
+                    "Failed to poke idle agent with unread inbox mail"
+                );
+            }
         }
-        self.append_watcher_log(&format!(
-            "observations: {}",
-            format_observations(&observations)
-        ))
-        .await;
-        let removed = self.process_observations(&registry, &observations).await?;
-        self.detect_merged(&registry, &removed).await?;
-
         Ok(())
     }
 
@@ -2633,6 +2691,14 @@ async fn git_head_sha(worktree_path: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_inbox_poke_message() {
+        assert_eq!(
+            inbox_poke_message(3),
+            "You have 3 unread message(s). Call check_inbox."
+        );
+    }
 
     #[test]
     fn test_codex_dev_fallback_injects_review_received() {
