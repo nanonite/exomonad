@@ -36,8 +36,8 @@ use tracing::{info, warn};
 
 use crate::services::{
     HasAcpRegistry, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient,
-    HasGitHubClient, HasGitWorktreeService, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
-    HasWatcherRuntimeState,
+    HasGitHubClient, HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSupervisorRegistry,
+    HasTeamRegistry, HasWatcherRuntimeState,
 };
 
 /// Agent effect handler.
@@ -56,6 +56,7 @@ impl<
             + HasGitHubClient
             + HasProjectDir
             + HasGitWorktreeService
+            + HasInboxStore
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
@@ -283,6 +284,7 @@ impl<
             + HasGitHubClient
             + HasProjectDir
             + HasGitWorktreeService
+            + HasInboxStore
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
@@ -489,6 +491,7 @@ impl<
             + HasGitHubClient
             + HasProjectDir
             + HasGitWorktreeService
+            + HasInboxStore
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
@@ -1250,12 +1253,52 @@ impl<
 
     async fn list(
         &self,
-        _req: ListRequest,
+        req: ListRequest,
         _ctx: &crate::effects::EffectContext,
     ) -> EffectResult<ListResponse> {
         let infos = self.service.list_agents().await.effect_err("agent")?;
+        let filter_type = non_empty(req.filter_type).map(|value| value.to_ascii_lowercase());
+        let mut agents = Vec::new();
 
-        let agents = infos.iter().map(service_info_to_proto).collect();
+        for info in infos
+            .iter()
+            .filter(|info| agent_matches_filter(info, filter_type.as_deref()))
+        {
+            let is_alive = agent_is_alive(info);
+            if req.filter_alive_only && !is_alive {
+                continue;
+            }
+            let agent_key = info.internal_name.as_str();
+            let birth_branch = self
+                .ctx
+                .agent_resolver()
+                .get(&info.internal_name)
+                .await
+                .map(|record| record.birth_branch.to_string())
+                .unwrap_or_default();
+            let has_unread = self
+                .ctx
+                .inbox_store()
+                .has_unread(agent_key)
+                .effect_err("agent")?;
+            let last_check_inbox_at = self
+                .ctx
+                .inbox_store()
+                .last_check_inbox_at(agent_key)
+                .effect_err("agent")?
+                .unwrap_or_default();
+
+            agents.push(service_info_to_proto(
+                info,
+                AgentListMetadata {
+                    birth_branch,
+                    has_unread,
+                    last_check_inbox_at,
+                    is_alive,
+                },
+            ));
+        }
+
         Ok(ListResponse { agents })
     }
 
@@ -1527,6 +1570,7 @@ impl<
             + HasGitHubClient
             + HasProjectDir
             + HasGitWorktreeService
+            + HasInboxStore
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
@@ -2128,7 +2172,17 @@ fn service_agent_type_to_proto(at: ServiceAgentType) -> i32 {
     }
 }
 
-fn service_info_to_proto(info: &AgentInfo) -> exomonad_proto::effects::agent::AgentInfo {
+struct AgentListMetadata {
+    birth_branch: String,
+    has_unread: bool,
+    last_check_inbox_at: i64,
+    is_alive: bool,
+}
+
+fn service_info_to_proto(
+    info: &AgentInfo,
+    metadata: AgentListMetadata,
+) -> exomonad_proto::effects::agent::AgentInfo {
     let agent_type = match info.agent_type {
         Some(ServiceAgentType::Claude) => AgentType::Claude as i32,
         Some(ServiceAgentType::Gemini) => AgentType::Gemini as i32,
@@ -2150,15 +2204,38 @@ fn service_info_to_proto(info: &AgentInfo) -> exomonad_proto::effects::agent::Ag
         branch_name: String::new(),
         agent_type,
         role: 0,
-        alive: info.has_tab,
+        alive: metadata.is_alive,
         mux_window: String::new(),
         error: String::new(),
         pr_number: info.pr.as_ref().map(|p| p.number as i32).unwrap_or(0),
         pr_url: info.pr.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
         topology: info.topology.to_proto(),
         pane_id: String::new(),
+        birth_branch: metadata.birth_branch,
+        has_unread: metadata.has_unread,
+        last_check_inbox_at: metadata.last_check_inbox_at,
+        is_alive: metadata.is_alive,
         ..Default::default()
     }
+}
+
+fn agent_matches_filter(info: &AgentInfo, filter_type: Option<&str>) -> bool {
+    let Some(filter_type) = filter_type else {
+        return true;
+    };
+
+    info.agent_type.is_some_and(|agent_type| {
+        agent_type.suffix().eq_ignore_ascii_case(filter_type)
+            || format!("{agent_type:?}").eq_ignore_ascii_case(filter_type)
+    })
+}
+
+fn agent_is_alive(info: &AgentInfo) -> bool {
+    let tombstoned = info
+        .agent_dir
+        .as_ref()
+        .is_some_and(|dir| dir.join("exited_at").exists());
+    info.has_tab && !tombstoned
 }
 
 #[cfg(test)]
