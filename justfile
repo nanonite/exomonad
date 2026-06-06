@@ -318,6 +318,15 @@ check-e2e-chainlink-sqlite-block:
     bash -n tests/e2e/lib/harness.sh
     bash -n tests/e2e/chainlink-sqlite-block/run.sh
 
+# Run E2E cross-harness SQLite inbox test
+e2e-cross-harness-inbox:
+    ./tests/e2e/cross-harness-inbox/run.sh
+
+# Check E2E cross-harness inbox harness script without launching the server
+check-e2e-cross-harness-inbox:
+    bash -n tests/e2e/lib/harness.sh
+    bash -n tests/e2e/cross-harness-inbox/run.sh
+
 # Run E2E reviewer hardening and authorship preservation test
 e2e-authorship:
     ./tests/e2e/authorship/run.sh
