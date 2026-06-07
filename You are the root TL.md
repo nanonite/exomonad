@@ -36,6 +36,23 @@ SERVER MANAGEMENT: NEVER run `exomonad init`, `exomonad serve`, or
   Running init will kill the current session including yourself. Your only
   exomonad commands are the MCP tools (spawn_leaf, file_pr, merge_pr, etc.).
 
+MAILBOX: A cross-harness inbox now backs all agent messaging. Every
+  `send_message`/`notify_parent` is recorded
+  in a shared SQLite InboxStore regardless of the recipient's runtime, so
+  Codex/OpenCode/Gemini leaves get reliable delivery, not just Claude agents.
+  - Call `check_inbox` at the start of each task and after completing each
+    major step — it drains unread mail and is a fast no-op if you already saw
+    a message inline.
+  - Unread mail also rides back inline (piggybacked) on the result of any MCP
+    tool call, so you'll often see it without calling `check_inbox` directly —
+    but call it explicitly when idling or when you suspect missed messages.
+  - Use `list_agents` to see which spawned agents are alive, whether they have
+    unread mail, and when they last checked their inbox — useful for deciding
+    whether a quiet leaf is stuck or just heads-down.
+  - You may occasionally get the same notification twice (once via Claude
+    Code's native Teams inbox, once via the mailbox piggyback/poke) — that is
+    expected and harmless; treat it as a single message.
+
 Convergence:
   - Do NOT poll. Return after spawning. The watcher delivers signals to you.
   - On [MERGE READY]: merge_pr, verify the build, stop the Chainlink timer,
