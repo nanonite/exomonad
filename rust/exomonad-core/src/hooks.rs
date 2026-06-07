@@ -33,6 +33,8 @@ use tracing::{debug, warn};
 /// Marker key we add to track our generated hooks.
 /// Used for cleanup to identify which hooks we added.
 const EXOMONAD_MARKER: &str = "_exomonad_generated";
+const EXOMONAD_MCP_SERVER: &str = "exomonad";
+const DISABLED_MCP_SERVERS_KEY: &str = "disabledMcpjsonServers";
 
 /// All hook event types we generate configuration for.
 const HOOK_EVENTS: &[(&str, &str, bool)] = &[
@@ -123,6 +125,7 @@ impl HookConfig {
         }
 
         settings[EXOMONAD_MARKER] = json!(true);
+        remove_self_from_disabled_mcp_servers(&mut settings);
 
         // Enable Claude Code Agent Teams feature for native inter-agent messaging
         if settings.get("env").is_none() {
@@ -231,6 +234,7 @@ impl HookConfig {
 
         // Add our marker
         settings[EXOMONAD_MARKER] = json!(true);
+        remove_self_from_disabled_mcp_servers(&mut settings);
 
         // Write settings
         let content =
@@ -369,6 +373,17 @@ fn render_hook_command(exomonad_path: &Path, subcommand: &str) -> String {
     )
 }
 
+fn remove_self_from_disabled_mcp_servers(settings: &mut Value) {
+    let Some(disabled_servers) = settings
+        .get_mut(DISABLED_MCP_SERVERS_KEY)
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    disabled_servers.retain(|server| server.as_str() != Some(EXOMONAD_MCP_SERVER));
+}
+
 /// Check if a hook entry looks like one we generated.
 fn is_exomonad_hook(entries: &Value) -> bool {
     if let Some(arr) = entries.as_array() {
@@ -491,6 +506,59 @@ mod tests {
             restored["hooks"]["PreToolUse"].is_null()
                 || !restored["hooks"]["PreToolUse"].is_array()
         );
+    }
+
+    #[test]
+    fn test_write_persistent_removes_self_from_disabled_mcp_servers() {
+        let temp_dir = TempDir::new().unwrap();
+        let cwd = temp_dir.path();
+        let claude_dir = cwd.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let existing = json!({
+            DISABLED_MCP_SERVERS_KEY: ["exomonad", "filesystem"],
+            "some_setting": true,
+        });
+        let settings_path = claude_dir.join("settings.local.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        let exomonad = PathBuf::from("/test/exomonad");
+        HookConfig::write_persistent(cwd, &exomonad, None, None).unwrap();
+
+        let content = fs::read_to_string(&settings_path).unwrap();
+        let settings: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(settings[DISABLED_MCP_SERVERS_KEY], json!(["filesystem"]));
+        assert_eq!(settings["some_setting"], true);
+        assert_eq!(settings[EXOMONAD_MARKER], true);
+    }
+
+    #[test]
+    fn test_generate_removes_self_from_disabled_mcp_servers_during_session() {
+        let temp_dir = TempDir::new().unwrap();
+        let cwd = temp_dir.path();
+        let claude_dir = cwd.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let existing = json!({
+            DISABLED_MCP_SERVERS_KEY: ["exomonad", "filesystem"],
+        });
+        let settings_path = claude_dir.join("settings.local.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        let exomonad = PathBuf::from("/test/exomonad");
+        let config = HookConfig::generate(cwd, &exomonad).unwrap();
+
+        let content = fs::read_to_string(config.settings_path()).unwrap();
+        let settings: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(settings[DISABLED_MCP_SERVERS_KEY], json!(["filesystem"]));
     }
 
     #[test]

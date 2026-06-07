@@ -109,6 +109,25 @@ new_teams() {
     rm -f "$current"
 }
 
+assert_exomonad_mcp_not_disabled() {
+    local settings_path="$REPO_DIR/.claude/settings.local.json"
+    [[ -f "$settings_path" ]] || fail "missing generated Claude settings at $settings_path"
+    python3 - "$settings_path" <<'INNER_PY' || fail "generated Claude settings disables exomonad MCP server"
+import json
+import sys
+from pathlib import Path
+
+settings = json.loads(Path(sys.argv[1]).read_text())
+if settings.get("_exomonad_generated") is not True:
+    print("settings.local.json is missing _exomonad_generated marker", file=sys.stderr)
+    sys.exit(1)
+disabled = settings.get("disabledMcpjsonServers", [])
+if isinstance(disabled, list) and "exomonad" in disabled:
+    print("disabledMcpjsonServers contains exomonad", file=sys.stderr)
+    sys.exit(1)
+INNER_PY
+}
+
 cleanup() {
     local code=$?
     log "cleanup: killing tmux session ${SESSION}"
@@ -187,6 +206,7 @@ INIT_PID=$!
 set -e
 
 wait_for "tmux session created" 30 "tmux has-session -t '$SESSION'"
+assert_exomonad_mcp_not_disabled
 wait_for "server accepted connections" 45 "tmux capture-pane -p -t '$SESSION:Server' | grep -q 'Plugins ready, accepting connections'"
 wait_for "Claude root session registered" 45 "tmux capture-pane -p -t '$SESSION:Server' | grep -q 'Registering Claude session'"
 wait_for "TeamCreate registered team" 90 "tmux capture-pane -p -t '$SESSION:Server' | grep -q 'Registered team:'"
