@@ -242,13 +242,13 @@ fn log_missing_event_plugin(
             "No plugin found for event target; skipping event dispatch"
         );
     } else {
-        tracing::debug!(
+        tracing::warn!(
             branch,
             lookup_key = %agent_name,
             ?agent_type,
             role,
             event_type,
-            "No plugin found for non-WASM event target; skipping event dispatch"
+            "No plugin found for non-WASM event target and no native handler matched; skipping event dispatch"
         );
     }
 }
@@ -343,6 +343,8 @@ struct WatcherPrState {
     stuck: bool,
     #[serde(default)]
     needs_human_review: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_head_sha: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -502,19 +504,69 @@ fn ci_blocked_message(pr_number: u64, status: &str, branch: &str) -> String {
     )
 }
 
+fn tl_ci_blocked_message(pr_number: u64, status: &str, branch: &str) -> String {
+    format!(
+        "[CI BLOCKED] PR #{pr_number} CI status {status} on {branch}. Human direction required."
+    )
+}
+
 fn sibling_merged_message(merged_branch: &str, parent_branch: &str) -> String {
     format!(
         "[Sibling Merged] PR on branch {merged_branch} was merged into {parent_branch}. Rebase your branch to pick up the changes: git fetch origin && git rebase origin/{parent_branch}"
     )
 }
 
-fn codex_dev_fallback_event_action(
+fn pr_ready_message(pr_number: u64) -> String {
+    format!("[PR READY] PR #{pr_number} approved by Forgejo reviewer. Merge with `merge_pr` tool.")
+}
+
+fn review_timeout_message(pr_number: u64, minutes: u64) -> String {
+    format!(
+        "[REVIEW TIMEOUT] PR #{pr_number} - no Forgejo reviewer response after {minutes} minutes. Merge with `merge_pr` using `force: true`."
+    )
+}
+
+fn fixes_pushed_message(pr_number: u64, status: &str) -> String {
+    let suffix = match status {
+        "success" => " CI passing. Ready to merge.",
+        "pending" => " CI running - merge when green.",
+        _ => {
+            return format!(
+                "[FIXES PUSHED] PR #{pr_number} - review comments addressed, fixes pushed. CI status: {status}."
+            )
+        }
+    };
+    format!("[FIXES PUSHED] PR #{pr_number} - review comments addressed, fixes pushed.{suffix}")
+}
+
+fn commits_pushed_message(pr_number: u64, status: &str) -> String {
+    let suffix = match status {
+        "success" => " CI passing.",
+        "pending" => " CI running.",
+        "failure" => " CI failing.",
+        _ => {
+            return format!(
+                "[COMMITS PUSHED] PR #{pr_number} - new commits pushed. CI status: {status}."
+            )
+        }
+    };
+    format!("[COMMITS PUSHED] PR #{pr_number} - new commits pushed.{suffix}")
+}
+
+fn stuck_message(pr_number: u64, rounds: u64) -> String {
+    format!(
+        "[STUCK: {pr_number}, rounds={rounds}] Review did not converge after {rounds} rounds. Dev leaf remains alive. Ask the human for clarification before continuing."
+    )
+}
+
+fn native_event_action(
     event_type: &str,
     payload: &serde_json::Value,
+    role: &str,
 ) -> Option<EventActionResponse> {
     match event_type {
-        "pr_review" => codex_dev_fallback_pr_review_action(payload),
-        "ci_status" => codex_dev_fallback_ci_status_action(payload),
+        "pr_review" => native_pr_review_action(payload, role),
+        "ci_status" => native_ci_status_action(payload, role),
         "sibling_merged" => Some(EventActionResponse::InjectMessage {
             message: sibling_merged_message(
                 value_str(payload, "merged_branch")?,
@@ -532,7 +584,82 @@ fn codex_dev_fallback_event_action(
     }
 }
 
-fn codex_dev_fallback_pr_review_action(payload: &serde_json::Value) -> Option<EventActionResponse> {
+fn native_pr_review_action(payload: &serde_json::Value, role: &str) -> Option<EventActionResponse> {
+    if role == "tl" {
+        return native_tl_pr_review_action(payload);
+    }
+
+    native_leaf_pr_review_action(payload)
+}
+
+fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventActionResponse> {
+    let kind = value_str(payload, "kind")?;
+    let pr_number = value_u64(payload, "pr_number")?;
+    match kind {
+        "review_received" | "reviewer_requested_changes" => {
+            Some(EventActionResponse::InjectMessage {
+                message: review_received_message(pr_number, value_str(payload, "comments")?),
+            })
+        }
+        "approved" | "reviewer_approved" => Some(EventActionResponse::InjectMessage {
+            message: pr_ready_message(pr_number),
+        }),
+        "timeout" => Some(EventActionResponse::InjectMessage {
+            message: review_timeout_message(pr_number, value_u64(payload, "minutes")?),
+        }),
+        "fixes_pushed" => Some(EventActionResponse::InjectMessage {
+            message: fixes_pushed_message(pr_number, value_str(payload, "ci_status")?),
+        }),
+        "commits_pushed" => Some(EventActionResponse::InjectMessage {
+            message: commits_pushed_message(pr_number, value_str(payload, "ci_status")?),
+        }),
+        "rate_limited" => Some(EventActionResponse::InjectMessage {
+            message: format!(
+                "[RATE LIMITED] Review polling has {} retries remaining; reset in {} seconds.",
+                value_u64(payload, "remaining")?,
+                value_u64(payload, "reset_seconds")?
+            ),
+        }),
+        "ci_triggered" => Some(EventActionResponse::InjectMessage {
+            message: format!(
+                "[CI TRIGGERED] PR #{pr_number} on {}.",
+                value_str(payload, "branch")?
+            ),
+        }),
+        "ci_blocked" => Some(EventActionResponse::InjectMessage {
+            message: tl_ci_blocked_message(
+                pr_number,
+                value_str(payload, "ci_status")?,
+                value_str(payload, "branch")?,
+            ),
+        }),
+        "stuck" => Some(EventActionResponse::InjectMessage {
+            message: stuck_message(pr_number, value_u64(payload, "rounds")?),
+        }),
+        "merge_ready" => Some(EventActionResponse::InjectMessage {
+            message: merge_ready_message(
+                pr_number,
+                value_str(payload, "ci_status")?,
+                value_str(payload, "branch")?,
+            ),
+        }),
+        "dev_not_pushing" => Some(EventActionResponse::InjectMessage {
+            message: format!("[DEV NOT PUSHING] PR #{pr_number} needs TL attention."),
+        }),
+        "reviewer_not_responding" => Some(EventActionResponse::InjectMessage {
+            message: format!("[REVIEWER NOT RESPONDING] PR #{pr_number} needs TL attention."),
+        }),
+        "reviewer_never_started" => Some(EventActionResponse::InjectMessage {
+            message: format!("[REVIEWER NEVER STARTED] PR #{pr_number} needs TL attention."),
+        }),
+        "dev_failed" => Some(EventActionResponse::InjectMessage {
+            message: format!("[DEV FAILED] PR #{pr_number} needs TL attention."),
+        }),
+        _ => None,
+    }
+}
+
+fn native_leaf_pr_review_action(payload: &serde_json::Value) -> Option<EventActionResponse> {
     let kind = value_str(payload, "kind")?;
     match kind {
         "review_received" | "reviewer_requested_changes" => Some(EventActionResponse::InjectMessage {
@@ -591,7 +718,7 @@ fn codex_dev_fallback_pr_review_action(payload: &serde_json::Value) -> Option<Ev
     }
 }
 
-fn codex_dev_fallback_ci_status_action(payload: &serde_json::Value) -> Option<EventActionResponse> {
+fn native_ci_status_action(payload: &serde_json::Value, role: &str) -> Option<EventActionResponse> {
     let pr_number = value_u64(payload, "pr_number")?;
     let status = value_str(payload, "status")?;
     let branch = value_str(payload, "branch")?;
@@ -603,6 +730,16 @@ fn codex_dev_fallback_ci_status_action(payload: &serde_json::Value) -> Option<Ev
         .get("merge_ready")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+
+    if role == "tl" {
+        let message =
+            if (merge_blocked_on_ci || merge_ready) && matches!(status, "success" | "neutral") {
+                merge_ready_message(pr_number, status, branch)
+            } else {
+                ci_status_message(pr_number, status, branch)
+            };
+        return Some(EventActionResponse::InjectMessage { message });
+    }
 
     if (merge_blocked_on_ci || merge_ready) && matches!(status, "success" | "neutral") {
         return Some(EventActionResponse::NotifyParent {
@@ -1074,6 +1211,7 @@ where
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
         let mut reviewer_disposals: Vec<u64> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
+        let watcher_state = self.read_watcher_state().await.unwrap_or_default();
 
         {
             let mut state_guard = self.state.prs.lock().await;
@@ -1089,7 +1227,18 @@ where
                 let agent_role = pr.author_role.clone();
                 let branch = BranchName::try_from_str(pr.head_branch.as_str())
                     .expect("validated string input is non-empty");
-                let head_sha_changed = pr.last_head_sha.as_deref() != Some(obs.head_sha.as_str());
+                let persisted_last_head_sha = watcher_state
+                    .prs
+                    .get(pr_number)
+                    .and_then(|state| state.last_head_sha.as_deref());
+                let runtime_last_head_sha = state_guard
+                    .get(pr_number)
+                    .map(|state| state.last_sha.as_str());
+                let last_observed_head_sha = persisted_last_head_sha
+                    .or(runtime_last_head_sha)
+                    .or(pr.last_head_sha.as_deref());
+                let head_sha_changed = last_observed_head_sha
+                    .is_some_and(|last_head_sha| last_head_sha != obs.head_sha.as_str());
                 let stale_terminal_review_after_head_change = head_sha_changed
                     && review_state_disposes_reviewer(&obs.review_state)
                     && !obs.forgejo_review_present;
@@ -1101,9 +1250,7 @@ where
                     } else {
                         obs_to_review_parts(obs)
                     };
-                if head_sha_changed {
-                    head_sha_updates.push((*pr_number, obs.head_sha.clone()));
-                }
+                head_sha_updates.push((*pr_number, obs.head_sha.clone()));
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
                     if head_sha_changed {
                         old_state.reviewer_spawned = false;
@@ -1231,9 +1378,7 @@ where
             }
         }
 
-        if !head_sha_updates.is_empty() {
-            self.persist_last_head_shas(&head_sha_updates).await?;
-        }
+        self.persist_last_head_shas(&head_sha_updates).await?;
         for pr_number in reviewer_disposals {
             let reviewer_slugs = dispose_reviewers_for_pr(
                 self.ctx.project_dir(),
@@ -1449,12 +1594,19 @@ where
     }
 
     async fn persist_last_head_shas(&self, updates: &[(u64, String)]) -> Result<()> {
-        if !updates.is_empty() {
-            debug!(
-                count = updates.len(),
-                "PR head SHAs are sourced from Forgejo; skipping local persistence"
-            );
+        if updates.is_empty() {
+            return Ok(());
         }
+
+        let mut state = self.read_watcher_state().await.unwrap_or_default();
+        for (pr_number, head_sha) in updates {
+            state.prs.entry(*pr_number).or_default().last_head_sha = Some(head_sha.clone());
+        }
+        self.write_watcher_state(&state).await?;
+        debug!(
+            count = updates.len(),
+            "Persisted last observed PR head SHAs"
+        );
         Ok(())
     }
 
@@ -1568,9 +1720,6 @@ where
         };
 
         let agent_name = self.resolve_event_agent_name(branch, agent_type).await;
-        if role == "process" {
-            return Ok(None);
-        }
 
         let event_input = serde_json::json!({
             "role": role,
@@ -1582,19 +1731,16 @@ where
         let plugin = match plugins_guard.get(&agent_name) {
             Some(p) => p.clone(),
             None => {
-                if (agent_type == AgentType::Codex || agent_type == AgentType::OpenCode)
-                    && role == "dev"
-                {
-                    if let Some(action) = codex_dev_fallback_event_action(event_type, &payload) {
-                        tracing::info!(
-                            branch,
-                            lookup_key = %agent_name,
-                            role,
-                            event_type,
-                            "No WASM plugin found for Codex dev event target; using tmux-first fallback dispatch"
-                        );
-                        return Ok(Some(action));
-                    }
+                if let Some(action) = native_event_action(event_type, &payload, role) {
+                    tracing::info!(
+                        branch,
+                        lookup_key = %agent_name,
+                        ?agent_type,
+                        role,
+                        event_type,
+                        "No WASM plugin for event target; using native Rust-side delivery"
+                    );
+                    return Ok(Some(action));
                 }
                 log_missing_event_plugin(branch, &agent_name, agent_type, role, event_type);
                 return Ok(None);
@@ -2701,14 +2847,14 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_dev_fallback_injects_review_received() {
+    fn test_native_leaf_fallback_injects_review_received() {
         let payload = serde_json::json!({
             "kind": "review_received",
             "pr_number": 42,
             "comments": "Fix the failing assertion",
         });
 
-        match codex_dev_fallback_event_action("pr_review", &payload) {
+        match native_event_action("pr_review", &payload, "dev") {
             Some(EventActionResponse::InjectMessage { message }) => {
                 assert!(message.contains("## Review on PR #42"));
                 assert!(message.contains("Fix the failing assertion"));
@@ -2719,7 +2865,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_dev_fallback_injects_merge_ready() {
+    fn test_native_leaf_fallback_notifies_parent_for_merge_ready() {
         let payload = serde_json::json!({
             "kind": "merge_ready",
             "pr_number": 43,
@@ -2727,7 +2873,7 @@ mod tests {
             "branch": "main.feature-codex",
         });
 
-        match codex_dev_fallback_event_action("pr_review", &payload) {
+        match native_event_action("pr_review", &payload, "dev") {
             Some(EventActionResponse::NotifyParent { message, pr_number }) => {
                 assert_eq!(pr_number, 43);
                 assert!(message.contains("MERGE READY"));
@@ -2738,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_dev_fallback_notifies_parent_for_ci_blocked() {
+    fn test_native_leaf_fallback_notifies_parent_for_ci_blocked() {
         let payload = serde_json::json!({
             "pr_number": 44,
             "status": "failure",
@@ -2746,7 +2892,7 @@ mod tests {
             "merge_blocked_on_ci": true,
         });
 
-        match codex_dev_fallback_event_action("ci_status", &payload) {
+        match native_event_action("ci_status", &payload, "dev") {
             Some(EventActionResponse::NotifyParent { message, pr_number }) => {
                 assert_eq!(pr_number, 44);
                 assert_eq!(
@@ -2759,15 +2905,171 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_dev_fallback_preserves_no_action_events() {
+    fn test_native_leaf_fallback_preserves_no_action_events() {
         let payload = serde_json::json!({
             "kind": "approved",
             "pr_number": 45,
         });
 
-        match codex_dev_fallback_event_action("pr_review", &payload) {
+        match native_event_action("pr_review", &payload, "dev") {
             Some(EventActionResponse::NoAction) => {}
             other => panic!("expected NoAction fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_native_tl_fallback_covers_pr_review_signals() {
+        let cases = [
+            (
+                serde_json::json!({ "kind": "approved", "pr_number": 46 }),
+                "[PR READY] PR #46",
+            ),
+            (
+                serde_json::json!({ "kind": "timeout", "pr_number": 47, "minutes": 15 }),
+                "[REVIEW TIMEOUT] PR #47",
+            ),
+            (
+                serde_json::json!({ "kind": "fixes_pushed", "pr_number": 48, "ci_status": "success" }),
+                "[FIXES PUSHED] PR #48",
+            ),
+            (
+                serde_json::json!({ "kind": "commits_pushed", "pr_number": 49, "ci_status": "pending" }),
+                "[COMMITS PUSHED] PR #49",
+            ),
+            (
+                serde_json::json!({ "kind": "stuck", "pr_number": 50, "rounds": 3 }),
+                "[STUCK: 50, rounds=3]",
+            ),
+            (
+                serde_json::json!({ "kind": "merge_ready", "pr_number": 51, "ci_status": "neutral", "branch": "main.subtl" }),
+                "[MERGE READY] PR #51",
+            ),
+        ];
+
+        for (payload, expected) in cases {
+            match native_event_action("pr_review", &payload, "tl") {
+                Some(EventActionResponse::InjectMessage { message }) => {
+                    assert!(
+                        message.contains(expected),
+                        "message {message:?} missing {expected}"
+                    );
+                }
+                other => panic!("expected TL InjectMessage fallback for {payload}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_native_tl_fallback_injects_merge_ready_ci_status() {
+        let payload = serde_json::json!({
+            "pr_number": 52,
+            "status": "success",
+            "branch": "main.subtl",
+            "merge_ready": true,
+        });
+
+        match native_event_action("ci_status", &payload, "tl") {
+            Some(EventActionResponse::InjectMessage { message }) => {
+                assert!(message.contains("[MERGE READY] PR #52"));
+            }
+            other => panic!("expected TL CI InjectMessage fallback, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_plugin_dispatch_uses_native_fallback_for_non_wasm_dev_leaf() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let plugins: PluginMap = Arc::new(RwLock::new(HashMap::new()));
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_plugins(plugins);
+        let payload = serde_json::json!({
+            "kind": "merge_ready",
+            "pr_number": 53,
+            "ci_status": "success",
+            "branch": "main.feature-shoal",
+        });
+
+        match watcher
+            .call_handle_event_for_role(
+                "main.feature-shoal",
+                AgentType::Shoal,
+                "dev",
+                "pr_review",
+                payload,
+            )
+            .await
+            .unwrap()
+        {
+            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
+                assert_eq!(pr_number, 53);
+                assert!(message.contains("[MERGE READY] PR #53"));
+            }
+            other => panic!("expected native NotifyParent fallback, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_plugin_dispatch_uses_native_fallback_for_process_agent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let plugins: PluginMap = Arc::new(RwLock::new(HashMap::new()));
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_plugins(plugins);
+        let payload = serde_json::json!({
+            "kind": "merge_ready",
+            "pr_number": 54,
+            "ci_status": "success",
+            "branch": "main.feature-process",
+        });
+
+        match watcher
+            .call_handle_event_for_role(
+                "main.feature-process",
+                AgentType::Process,
+                "process",
+                "pr_review",
+                payload,
+            )
+            .await
+            .unwrap()
+        {
+            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
+                assert_eq!(pr_number, 54);
+                assert!(message.contains("[MERGE READY] PR #54"));
+            }
+            other => panic!("expected native Process NotifyParent fallback, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_plugin_dispatch_uses_native_fallback_for_sub_tl() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let plugins: PluginMap = Arc::new(RwLock::new(HashMap::new()));
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_plugins(plugins);
+        let payload = serde_json::json!({
+            "kind": "fixes_pushed",
+            "pr_number": 55,
+            "ci_status": "pending",
+        });
+
+        match watcher
+            .call_handle_event_for_role(
+                "main.subtl-codex",
+                AgentType::Codex,
+                "tl",
+                "pr_review",
+                payload,
+            )
+            .await
+            .unwrap()
+        {
+            Some(EventActionResponse::InjectMessage { message }) => {
+                assert!(message.contains("[FIXES PUSHED] PR #55"));
+            }
+            other => panic!("expected native sub-TL InjectMessage fallback, got {other:?}"),
         }
     }
 
@@ -4448,6 +4750,7 @@ mod tests {
                 rounds: 1,
                 stuck: true,
                 needs_human_review: true,
+                last_head_sha: None,
             },
         );
         state.prs.insert(
@@ -4456,6 +4759,7 @@ mod tests {
                 rounds: 2,
                 stuck: false,
                 needs_human_review: false,
+                last_head_sha: None,
             },
         );
         state.prs.insert(
@@ -4464,6 +4768,7 @@ mod tests {
                 rounds: 3,
                 stuck: true,
                 needs_human_review: false,
+                last_head_sha: None,
             },
         );
         let mut registry = PrRegistry::default();
@@ -4530,6 +4835,7 @@ mod tests {
                 rounds: 2,
                 stuck: true,
                 needs_human_review: true,
+                last_head_sha: None,
             },
         );
         watcher.write_watcher_state(&state).await.unwrap();
@@ -4774,7 +5080,7 @@ mod tests {
         );
 
         let mut pr = test_pr_entry();
-        pr.last_head_sha = Some("abc123".to_string());
+        pr.last_head_sha = Some("def456".to_string());
         let registry = test_registry(pr);
         let mut observations = HashMap::new();
         observations.insert(1u64, test_observation("def456"));
@@ -4827,7 +5133,7 @@ mod tests {
         watcher.state.prs.lock().await.insert(1, watch_state);
 
         let mut pr = test_pr_entry();
-        pr.last_head_sha = Some("abc123".to_string());
+        pr.last_head_sha = Some("def456".to_string());
         let registry = test_registry(pr);
         let mut observations = HashMap::new();
         observations.insert(
@@ -4855,6 +5161,34 @@ mod tests {
         assert!(!pr_state.reviewer_disposed);
         assert_eq!(pr_state.last_review_state, ForgejoReviewVerdict::None);
         assert_eq!(pr_state.rounds, 1);
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_persists_last_observed_head_sha() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let mut pr = test_pr_entry();
+        pr.last_head_sha = Some("def456".to_string());
+        let registry = test_registry(pr);
+        let mut observations = HashMap::new();
+        observations.insert(1u64, test_observation("def456"));
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        let persisted = watcher.read_watcher_state().await.unwrap();
+        assert_eq!(
+            persisted
+                .prs
+                .get(&1)
+                .and_then(|state| state.last_head_sha.as_deref()),
+            Some("def456")
+        );
     }
 
     #[tokio::test]
