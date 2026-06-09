@@ -44,7 +44,6 @@ async fn write_opencode_agent_plugin_files(dir: &Path) -> Result<()> {
 
 impl<
         C: super::super::HasGitHubClient
-            + super::super::HasAcpRegistry
             + super::super::HasTeamRegistry
             + super::super::HasAgentResolver
             + super::super::HasProjectDir

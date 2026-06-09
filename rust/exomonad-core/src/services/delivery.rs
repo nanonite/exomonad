@@ -1,7 +1,6 @@
 use crate::domain::Address;
 use crate::services::agent_inbox::{InboxMessage, GLOBAL_AGENT_INBOX};
 use crate::services::tmux_events;
-use agent_client_protocol::{Agent, PromptRequest};
 use claude_teams_bridge as teams_mailbox;
 use claude_teams_bridge::TeamRegistry;
 use exomonad_proto::effects::events::{event, AgentMessage, Event};
@@ -11,7 +10,6 @@ use tracing::{debug, info, instrument, warn};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryResult {
     Teams,
-    Acp,
     Uds,
     Tmux,
     Failed,
@@ -43,10 +41,6 @@ fn agent_type_from_key(agent_key: &str) -> crate::services::AgentType {
 
 fn supports_teams_inbox(agent_type: crate::services::AgentType) -> bool {
     matches!(agent_type, crate::services::AgentType::Claude)
-}
-
-fn should_try_acp(agent_type: crate::services::AgentType) -> bool {
-    !matches!(agent_type, crate::services::AgentType::OpenCode)
 }
 
 fn tmux_injection_options(agent_type: crate::services::AgentType) -> tmux_events::InjectionOptions {
@@ -192,7 +186,6 @@ pub fn format_parent_notification(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryMethod {
     TeamsInbox,
-    Acp,
     Uds,
     Tmux,
 }
@@ -228,10 +221,6 @@ impl DeliveryOutcome {
                 method: DeliveryMethod::TeamsInbox,
                 recipient: agent,
             },
-            DeliveryResult::Acp => DeliveryOutcome::Delivered {
-                method: DeliveryMethod::Acp,
-                recipient: agent,
-            },
             DeliveryResult::Uds => DeliveryOutcome::Delivered {
                 method: DeliveryMethod::Uds,
                 recipient: agent,
@@ -257,7 +246,6 @@ impl DeliveryOutcome {
             DeliveryOutcome::Delivered { method, .. }
             | DeliveryOutcome::FallbackToLead { method, .. } => match method {
                 DeliveryMethod::TeamsInbox => "teams_inbox",
-                DeliveryMethod::Acp => "acp",
                 DeliveryMethod::Uds => "unix_socket",
                 DeliveryMethod::Tmux => "tmux_stdin",
             },
@@ -292,7 +280,6 @@ pub fn mailbox_protocol_available() -> bool {
 #[instrument(skip_all, fields(address = %address, from = %from))]
 pub async fn route_message(
     ctx: &(impl super::HasTeamRegistry
-          + super::HasAcpRegistry
           + super::HasAgentResolver
           + super::HasInboxStore
           + super::HasProjectDir),
@@ -316,7 +303,6 @@ pub async fn route_message(
 #[instrument(skip_all, fields(address = %address, from = %from))]
 pub async fn route_tmux_message(
     ctx: &(impl super::HasTeamRegistry
-          + super::HasAcpRegistry
           + super::HasAgentResolver
           + super::HasInboxStore
           + super::HasProjectDir),
@@ -380,7 +366,6 @@ pub async fn route_tmux_notification(
 #[instrument(skip_all, fields(address = %address, from = %from))]
 pub async fn route_mailbox_message(
     ctx: &(impl super::HasTeamRegistry
-          + super::HasAcpRegistry
           + super::HasAgentResolver
           + super::HasInboxStore
           + super::HasProjectDir),
@@ -402,7 +387,6 @@ pub async fn route_mailbox_message(
 
 async fn route_message_with(
     ctx: &(impl super::HasTeamRegistry
-          + super::HasAcpRegistry
           + super::HasAgentResolver
           + super::HasInboxStore
           + super::HasProjectDir),
@@ -442,7 +426,6 @@ async fn route_message_with(
 
 async fn deliver_to_agent_for(
     ctx: &(impl super::HasTeamRegistry
-          + super::HasAcpRegistry
           + super::HasAgentResolver
           + super::HasInboxStore
           + super::HasProjectDir),
@@ -476,7 +459,6 @@ async fn deliver_to_agent_for(
 /// the lead, falls back to first in-memory entry, then to "root".
 async fn resolve_and_deliver_to_lead(
     ctx: &(impl super::HasTeamRegistry
-          + super::HasAcpRegistry
           + super::HasAgentResolver
           + super::HasInboxStore
           + super::HasProjectDir),
@@ -523,7 +505,6 @@ async fn resolve_and_deliver_to_lead(
 fn delivery_method_from_result(result: DeliveryResult) -> DeliveryMethod {
     match result {
         DeliveryResult::Teams => DeliveryMethod::TeamsInbox,
-        DeliveryResult::Acp => DeliveryMethod::Acp,
         DeliveryResult::Uds => DeliveryMethod::Uds,
         DeliveryResult::Tmux | DeliveryResult::Failed => DeliveryMethod::Tmux,
     }
@@ -615,7 +596,6 @@ pub fn resolve_tab_name_for_agent(
 #[instrument(skip_all, fields(agent_id = %agent_id, parent_session_id = %parent_session_id, status = %status))]
 pub async fn notify_parent_delivery(
     ctx: &(impl super::HasTeamRegistry
-          + super::HasAcpRegistry
           + super::HasAgentResolver
           + super::HasEventLog
           + super::HasEventQueue
@@ -957,7 +937,6 @@ async fn deliver_via_tmux(
 
 async fn deliver_to_agent_mailbox(
     ctx: &(impl super::HasTeamRegistry
-          + super::HasAcpRegistry
           + super::HasAgentResolver
           + super::HasInboxStore
           + super::HasProjectDir),
@@ -1062,15 +1041,12 @@ async fn deliver_to_agent_mailbox(
 
 /// Deliver a message to an agent.
 ///
-/// For OpenCode agents with ACP: HTTP POST to ACP server.
 /// Tries Teams inbox delivery if a registry and agent key are provided.
-/// Attempts ACP prompt delivery if a registry is provided and agent is registered.
 /// Attempts HTTP-over-UDS delivery for custom binary agents (e.g., shoal-agent).
 /// Falls back to tmux input injection if other delivery methods fail or are not available.
 #[instrument(skip_all, fields(agent_key = %agent_key, from = %from, delivery_method = tracing::field::Empty))]
 pub async fn deliver_to_agent(
     ctx: &(impl super::HasTeamRegistry
-          + super::HasAcpRegistry
           + super::HasAgentResolver
           + super::HasInboxStore
           + super::HasProjectDir),
@@ -1081,7 +1057,6 @@ pub async fn deliver_to_agent(
     summary: &str,
 ) -> DeliveryResult {
     let team_registry = ctx.team_registry();
-    let acp_registry = ctx.acp_registry();
     let _agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
     let agent_type = agent_type_from_key(agent_key);
@@ -1128,7 +1103,7 @@ pub async fn deliver_to_agent(
                     warn!(
                         agent = %agent_key,
                         error = %e,
-                        "Teams inbox write failed after 3 attempts, falling back to ACP/tmux"
+                        "Teams inbox write failed after 3 attempts, falling back to tmux"
                     );
                     tracing::info!(
                         otel.name = "message.delivery",
@@ -1239,57 +1214,6 @@ pub async fn deliver_to_agent(
             agent = %agent_key,
             runtime = ?agent_type,
             "Skipping Teams inbox for non-Claude runtime; falling back gracefully"
-        );
-    }
-
-    if should_try_acp(agent_type) {
-        if let Some(conn) = acp_registry.get(agent_key).await {
-            match conn
-                .conn
-                .prompt(PromptRequest::new(
-                    conn.session_id.clone(),
-                    // ACP prompt content can be multiple messages, but we deliver one-at-a-time here.
-                    vec![message.into()],
-                ))
-                .await
-            {
-                Ok(_) => {
-                    tracing::Span::current().record("delivery_method", "acp");
-                    info!(agent = %agent_key, "Delivered message via ACP prompt");
-                    tracing::info!(
-                        otel.name = "message.delivery",
-                        agent_id = %from,
-                        recipient = %agent_key,
-                        method = "acp",
-                        outcome = "success",
-                        detail = %conn.session_id,
-                        "[event] message.delivery"
-                    );
-                    return DeliveryResult::Acp;
-                }
-                Err(e) => {
-                    warn!(
-                        agent = %agent_key,
-                        error = ?e,
-                        "ACP prompt failed, falling back to tmux"
-                    );
-                    tracing::info!(
-                        otel.name = "message.delivery",
-                        agent_id = %from,
-                        recipient = %agent_key,
-                        method = "acp",
-                        outcome = "failed",
-                        detail = ?e,
-                        "[event] message.delivery"
-                    );
-                }
-            }
-        }
-    } else {
-        debug!(
-            agent = %agent_key,
-            runtime = ?agent_type,
-            "Skipping ACP for runtime with unsupported prompt integration; falling back to inbox-backed tmux"
         );
     }
 

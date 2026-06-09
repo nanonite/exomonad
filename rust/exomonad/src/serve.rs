@@ -1091,7 +1091,6 @@ Run `exomonad recompile` first to build it.",
     };
 
     let team_registry = Arc::new(claude_teams_bridge::TeamRegistry::new());
-    let acp_registry = Arc::new(exomonad_core::services::acp_registry::AcpRegistry::new());
 
     // Load canonical agent identity resolver from disk
     let agent_resolver =
@@ -1133,7 +1132,6 @@ Run `exomonad recompile` first to build it.",
         forgejo_reviewer_client: forgejo_reviewer_client.clone(),
         event_log: event_log.clone(),
         team_registry: team_registry.clone(),
-        acp_registry: acp_registry.clone(),
         supervisor_registry,
         claude_session_registry,
         agent_resolver: agent_resolver.clone(),

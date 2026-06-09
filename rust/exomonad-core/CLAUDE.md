@@ -32,8 +32,6 @@ Without `runtime`: only `ui_protocol` module available (agent event types, telem
 | `EffectError` | Common error type for all effects with protobuf mapping |
 | `PluginManager` | Manages WASM guest calls and host function dispatch via Extism |
 | `RuntimeBuilder` | Fluent API for assembling handlers and loading WASM |
-| `AcpRegistry` | Registry of active ACP connections to Gemini agents |
-| `AcpConnection` | Wraps `ClientSideConnection` + agent_id + session_id |
 | `SpawnSubtreeOptions` | Options for spawning a Claude agent (permissions, etc.) |
 | `SpawnLeafOptions` | Options for spawning a Gemini agent |
 
@@ -46,7 +44,6 @@ Handlers and delivery functions are generic over a context `C` bounded by capabi
 | Trait | Provides |
 |-------|----------|
 | `HasTeamRegistry` | `&TeamRegistry` |
-| `HasAcpRegistry` | `&AcpRegistry` |
 | `HasAgentResolver` | `&AgentResolver` |
 | `HasEventQueue` | `&EventQueue` |
 | `HasEventLog` | `Option<&EventLog>` |
@@ -67,7 +64,7 @@ impl<C: HasClaudeSessionRegistry + HasTeamRegistry + HasSupervisorRegistry + 'st
 **Delivery functions** — `impl Trait` bounds:
 ```rust
 pub async fn route_message(
-    ctx: &(impl HasTeamRegistry + HasAcpRegistry + HasAgentResolver + HasProjectDir),
+    ctx: &(impl HasTeamRegistry + HasAgentResolver + HasInboxStore + HasProjectDir),
     address: &Address, from: &AgentName, content: &str, summary: &str,
 ) -> DeliveryOutcome
 ```
@@ -84,17 +81,11 @@ pub fn orchestration_handlers(
 
 **Handlers unchanged** (no `Services`/`ctx` dependency): `GitHandler`, `FsHandler`, `ProcessHandler`, `CopilotHandler`, `KvHandler`, `GitHubHandler`.
 
-## ACP Integration
+## Delivery Integration
 
-Agent Client Protocol (ACP) provides structured JSON-RPC messaging to Gemini agents, replacing fragile tmux STDIN injection.
+Message delivery is centralized in `services/delivery.rs`.
 
-**Key files:**
-- `services/acp_registry.rs` — `AcpRegistry` (connection store) + `connect_and_prompt()` (spawn + handshake + first prompt)
-- `services/acp_client.rs` — `ExoMonadAcpClient` (implements ACP `Client` trait: auto-approve permissions, log notifications)
-
-**Delivery priority** (in `services/delivery.rs`): Teams inbox → ACP prompt → HTTP-over-UDS (`.exo/agents/{name}/notify.sock`) → tmux STDIN injection.
-
-**Vendor patches:** `vendor/acp-rust-sdk/` has Send patches (Rc→Arc, LocalBoxFuture→BoxFuture, async_trait(?Send)→async_trait) to work with tokio's multi-threaded runtime.
+**Delivery priority**: Teams inbox for Claude Code agents, then HTTP-over-UDS (`.exo/agents/{name}/notify.sock`) for socket-backed agents, then tmux STDIN injection. Non-Claude runtimes record messages in the ExoMonad inbox before reaching tmux fallback.
 
 ## Delivery Pipeline (`services/delivery.rs`)
 
@@ -102,9 +93,9 @@ Delivery functions are generic over `C` via `impl Has*` bounds (no concrete `Ser
 
 | Function | Bounds | Used by |
 |----------|--------|---------|
-| `route_message()` | `HasTeamRegistry + HasAcpRegistry + HasAgentResolver + HasProjectDir` | `send_message` effect |
-| `deliver_to_agent()` | `HasTeamRegistry + HasAcpRegistry + HasProjectDir` | Peer messaging, event handler `InjectMessage` |
-| `notify_parent_delivery()` | `HasTeamRegistry + HasAcpRegistry + HasEventLog + HasEventQueue + HasProjectDir` | `notify_parent` effect, poller `NotifyParent` action |
+| `route_message()` | `HasTeamRegistry + HasAgentResolver + HasInboxStore + HasProjectDir` | `send_message` effect |
+| `deliver_to_agent()` | `HasTeamRegistry + HasAgentResolver + HasInboxStore + HasProjectDir` | Peer messaging, event handler `InjectMessage` |
+| `notify_parent_delivery()` | `HasTeamRegistry + HasEventLog + HasEventQueue + HasInboxStore + HasProjectDir` | `notify_parent` effect, poller `NotifyParent` action |
 
 **Worker pane delivery** (tmux fallback for workers): `routing.json` stores `pane_id` (e.g. `%42`) for direct tmux targeting. `inject_input` passes `pane_id` as the `target` argument.
 

@@ -624,7 +624,6 @@ pub struct AgentControlService<C> {
 
 impl<
         C: super::HasGitHubClient
-            + super::HasAcpRegistry
             + super::HasTeamRegistry
             + super::HasAgentResolver
             + super::HasProjectDir

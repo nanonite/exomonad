@@ -841,9 +841,6 @@ pub struct RoutingInfo {
     pub pane_id: Option<crate::services::tmux_ipc::PaneId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tab: Option<String>,
-    /// HTTP ACP endpoint for OpenCode agents (e.g., "http://127.0.0.1:54321").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acp_url: Option<String>,
 }
 
 impl RoutingInfo {
@@ -852,7 +849,6 @@ impl RoutingInfo {
             window_id: Some(window_id),
             pane_id: None,
             parent_tab: None,
-            acp_url: None,
         }
     }
 
@@ -861,24 +857,11 @@ impl RoutingInfo {
             window_id: None,
             pane_id: Some(pane_id),
             parent_tab: Some(parent_tab.to_string()),
-            acp_url: None,
-        }
-    }
-
-    pub fn acp(acp_url: String) -> Self {
-        Self {
-            window_id: None,
-            pane_id: None,
-            parent_tab: None,
-            acp_url: Some(acp_url),
         }
     }
 
     pub fn has_delivery_target(&self) -> bool {
-        self.window_id.is_some()
-            || self.pane_id.is_some()
-            || self.parent_tab.is_some()
-            || self.acp_url.is_some()
+        self.window_id.is_some() || self.pane_id.is_some() || self.parent_tab.is_some()
     }
 
     #[cfg(feature = "runtime")]

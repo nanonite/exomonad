@@ -3,7 +3,7 @@ set -euo pipefail
 
 # E2E OpenCode Worker Test
 # Validates fork_wave with agent_type="opencode": spawns OpenCode worker,
-# model forwarding (worker_model → --model flag), ACP spawn lifecycle,
+# model forwarding (worker_model → --model flag), OpenCode spawn lifecycle,
 # and notify_parent delivery back to the Claude root TL.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

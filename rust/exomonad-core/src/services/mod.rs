@@ -1,5 +1,3 @@
-pub mod acp_client;
-pub mod acp_registry;
 pub mod agent_control;
 pub mod agent_inbox;
 pub mod agent_resolver;
@@ -37,7 +35,6 @@ pub mod tmux_ipc;
 pub mod tui_consumption;
 pub mod worktree_event_watcher;
 
-pub use self::acp_registry::AcpRegistry;
 pub use self::agent_control::{
     resolve_role_context_path, resolve_working_dir, resolve_worktree_from_tab, AgentControlService,
     AgentInfo, AgentType, BatchCleanupResult, BatchSpawnResult, SpawnOptions, SpawnResult,
@@ -66,9 +63,6 @@ use thiserror::Error;
 
 pub trait HasTeamRegistry: Send + Sync {
     fn team_registry(&self) -> &TeamRegistry;
-}
-pub trait HasAcpRegistry: Send + Sync {
-    fn acp_registry(&self) -> &AcpRegistry;
 }
 pub trait HasAgentResolver: Send + Sync {
     fn agent_resolver(&self) -> &AgentResolver;
@@ -144,7 +138,6 @@ pub struct Services {
     pub forgejo_reviewer_client: Option<Arc<ForgejoClient>>,
     pub event_log: Option<Arc<EventLog>>,
     pub team_registry: Arc<TeamRegistry>,
-    pub acp_registry: Arc<AcpRegistry>,
     pub supervisor_registry: Arc<SupervisorRegistry>,
     pub claude_session_registry: Arc<ClaudeSessionRegistry>,
     pub agent_resolver: Arc<AgentResolver>,
@@ -172,11 +165,6 @@ impl Services {
 impl HasTeamRegistry for Services {
     fn team_registry(&self) -> &TeamRegistry {
         &self.team_registry
-    }
-}
-impl HasAcpRegistry for Services {
-    fn acp_registry(&self) -> &AcpRegistry {
-        &self.acp_registry
     }
 }
 impl HasAgentResolver for Services {
@@ -261,7 +249,6 @@ impl Services {
             forgejo_reviewer_client: None,
             event_log: None,
             team_registry: Arc::new(TeamRegistry::new()),
-            acp_registry: Arc::new(AcpRegistry::new()),
             supervisor_registry: Arc::new(SupervisorRegistry::new()),
             claude_session_registry: Arc::new(ClaudeSessionRegistry::new()),
             agent_resolver: Arc::new(AgentResolver::empty()),

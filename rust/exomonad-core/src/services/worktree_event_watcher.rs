@@ -6,7 +6,7 @@ use crate::services::pr_registry::{ForgejoReviewState, PrEntry, PrRegistry, PrSt
 use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
-    CiStatusMap, HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasForgejoClient,
+    CiStatusMap, HasAgentResolver, HasEventLog, HasEventQueue, HasForgejoClient,
     HasGitWorktreeService, HasInboxStore, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
 };
 use anyhow::{Context, Result};
@@ -791,7 +791,6 @@ pub struct WorktreeEventWatcher<C> {
 impl<C> WorktreeEventWatcher<C>
 where
     C: HasTeamRegistry
-        + HasAcpRegistry
         + HasAgentResolver
         + HasEventLog
         + HasEventQueue

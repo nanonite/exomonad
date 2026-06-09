@@ -12,7 +12,7 @@ rust/**/target/
 # Proto definitions (needed by exomonad-proto build.rs)
 !proto/
 
-# Vendored Rust dependencies (acp-rust-sdk)
+# Vendored Rust dependencies
 !vendor/
 
 # Haskell WASM guest sources

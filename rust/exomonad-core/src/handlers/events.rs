@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::services::{
-    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasInboxStore, HasProjectDir,
+    HasAgentResolver, HasEventLog, HasEventQueue, HasInboxStore, HasProjectDir,
     HasSupervisorRegistry, HasTeamRegistry,
 };
 
@@ -104,7 +104,6 @@ impl<C: HasSupervisorRegistry> EventHandler<C> {
 #[async_trait]
 impl<
         C: HasTeamRegistry
-            + HasAcpRegistry
             + HasAgentResolver
             + HasEventLog
             + HasEventQueue
@@ -131,7 +130,6 @@ impl<
 #[async_trait]
 impl<
         C: HasTeamRegistry
-            + HasAcpRegistry
             + HasAgentResolver
             + HasEventLog
             + HasEventQueue

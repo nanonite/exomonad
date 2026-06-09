@@ -22,7 +22,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 use crate::services::{
-    HasAcpRegistry, HasAgentResolver, HasEventLog, HasEventQueue, HasGitHubClient,
+    HasAgentResolver, HasEventLog, HasEventQueue, HasGitHubClient,
     HasProjectDir, HasTeamRegistry,
 };
 
@@ -268,7 +268,6 @@ enum EventActionResponse {
 
 impl<
         C: HasTeamRegistry
-            + HasAcpRegistry
             + HasAgentResolver
             + HasEventLog
             + HasEventQueue

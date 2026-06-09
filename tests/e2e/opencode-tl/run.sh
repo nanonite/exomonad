@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # E2E OpenCode TL Test
-# Validates full ACP delivery chain: exomonad init → opencode serve → port captured →
+# Validates OpenCode TL startup: exomonad init → opencode serve → port captured →
 # opencode run --attach delivers initial_prompt → OpenCode uses MCP →
 # notify_parent reaches testrunner via Teams inbox.
 
@@ -187,7 +187,7 @@ echo "  Work dir: $WORK_DIR/repo"
 echo ""
 echo "  Chain under test:"
 echo "    exomonad serve starts opencode"
-echo "    → ACP port captured"
+echo "    → OpenCode serve port captured"
 echo "    → initial_prompt delivered via opencode run --attach"
 echo "    → OpenCode writes opencode-tl-test.txt"
 echo "    → notify_parent → Teams inbox → testrunner"

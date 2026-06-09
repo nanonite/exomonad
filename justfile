@@ -243,7 +243,7 @@ check-e2e-claude-teams-inbox:
 e2e-oc-rewrite:
     ./tests/e2e/hook-rewrite/run.sh
 
-# Run E2E OpenCode TL test (ACP delivery chain: serve → port capture → run --attach → MCP → notify_parent)
+# Run E2E OpenCode TL test (OpenCode serve/attach delivery chain: serve → port capture → run --attach → MCP → notify_parent)
 e2e-opencode-tl:
     ./tests/e2e/opencode-tl/run.sh
 

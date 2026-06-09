@@ -18,7 +18,7 @@ This is a harness-agnosticism failure. Claude Code has a native Teams inbox and 
 
 ExoMonad provides per-runtime inbox parity. For every runtime that lacks a native inbox plus poller, ExoMonad routes addressed messages through a per-agent FIFO inbox with a single consumer task. Claude Code remains on the Teams inbox path because it already provides native serialized delivery.
 
-The inbox belongs to message delivery, not to agent phase state. Runtime-specific consumers may inject through tmux, ACP, or a future native API, but the ordering and in-flight guarantees are ExoMonad responsibilities for non-Claude runtimes.
+The inbox belongs to message delivery, not to agent phase state. Runtime-specific consumers may inject through tmux or a future native API, but the ordering and in-flight guarantees are ExoMonad responsibilities for non-Claude runtimes.
 
 ## Invariants
 
@@ -33,7 +33,7 @@ The inbox belongs to message delivery, not to agent phase state. Runtime-specifi
 |---------|--------------|----------|-------|
 | Claude Code | Teams inbox (`~/.claude/teams/{team}/inboxes/`) | InboxPoller (native) | Already serialized; ExoMonad path unchanged |
 | Codex | ExoMonad `AgentInbox` | ExoMonad consumer task | Tmux injection; multi-line input mode needs positive-signal verification |
-| Gemini | ExoMonad `AgentInbox` fallback, or ACP prompt when connection is live | ExoMonad consumer task | ACP delivery is preferred when available and is separate from tmux fallback |
+| Gemini | ExoMonad `AgentInbox` | ExoMonad consumer task | Tmux injection fallback until a runtime-native mailbox is available |
 | OpenCode | ExoMonad `AgentInbox` | ExoMonad consumer task | Stub until OpenCode integration matures |
 
 ## Out Of Scope

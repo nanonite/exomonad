@@ -27,10 +27,6 @@ module ExoMonad.Guest.Records.Spawn
     closeWorkerPaneCore,
     closeWorkerPaneDescription,
     closeWorkerPaneSchema,
-
-    -- * SpawnAcp
-    SpawnAcpArgs (..),
-    spawnAcpCore,
   )
 where
 

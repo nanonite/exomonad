@@ -35,9 +35,9 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::services::{
-    HasAcpRegistry, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient,
-    HasGitHubClient, HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSupervisorRegistry,
-    HasTeamRegistry, HasWatcherRuntimeState,
+    HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient, HasGitHubClient,
+    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
+    HasWatcherRuntimeState,
 };
 
 /// Agent effect handler.
@@ -51,7 +51,6 @@ pub struct AgentHandler<C> {
 
 impl<
         C: HasTeamRegistry
-            + HasAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir
@@ -279,7 +278,6 @@ impl<
 #[async_trait]
 impl<
         C: HasTeamRegistry
-            + HasAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir
@@ -486,7 +484,6 @@ fn watcher_pr_merge_diagnosis(
 #[async_trait]
 impl<
         C: HasTeamRegistry
-            + HasAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir
@@ -1037,110 +1034,6 @@ impl<
         })
     }
 
-    async fn spawn_acp(
-        &self,
-        req: SpawnAcpRequest,
-        ctx: &crate::effects::EffectContext,
-    ) -> EffectResult<SpawnAcpResponse> {
-        self.ensure_tl_spawn_preflight(ctx).await?;
-        let registry = self.ctx.acp_registry();
-
-        // Resolve working directory from context
-        let working_dir = ctx.working_dir.clone();
-
-        // Generate MCP settings for the agent using stdio transport
-        let agent_name = AgentName::try_from(req.name.clone()).effect_err("agent")?;
-        let context_path = self
-            .service
-            .resolve_role_context(&crate::domain::Role::worker());
-        let settings_json = AgentControlService::<C>::generate_gemini_worker_settings(
-            agent_name.as_str(),
-            context_path.as_deref(),
-            &self.service.extra_mcp_servers,
-        );
-
-        // Write settings to agent config dir
-        let agent_dir = working_dir.join(format!(".exo/agents/{}", agent_name));
-        tokio::fs::create_dir_all(&agent_dir)
-            .await
-            .effect_err("agent")?;
-        let settings_path = agent_dir.join("settings.json");
-        tokio::fs::write(
-            &settings_path,
-            serde_json::to_string_pretty(&settings_json).effect_err("agent")?,
-        )
-        .await
-        .effect_err("agent")?;
-
-        info!(
-            agent = %agent_name,
-            settings = %settings_path.display(),
-            "Wrote ACP agent settings"
-        );
-
-        let env_vars = vec![
-            (
-                "GEMINI_CLI_SYSTEM_SETTINGS_PATH".into(),
-                settings_path.to_string_lossy().into_owned(),
-            ),
-            ("EXOMONAD_AGENT_ID".into(), agent_name.to_string()),
-        ];
-
-        let conn = crate::services::acp_registry::connect_and_prompt(
-            agent_name.clone(),
-            "gemini",
-            &working_dir,
-            &req.prompt,
-            env_vars,
-        )
-        .await
-        .effect_err("agent")?;
-
-        registry.register(conn).await;
-
-        info!(agent = %agent_name, "ACP agent spawned and registered");
-
-        let agent_info = exomonad_proto::effects::agent::AgentInfo {
-            id: agent_name.to_string(),
-            issue: String::new(),
-            worktree_path: String::new(),
-            branch_name: String::new(),
-            agent_type: AgentType::Gemini as i32,
-            role: 0,
-            alive: true,
-            mux_window: String::new(),
-            error: String::new(),
-            pr_number: 0,
-            pr_url: String::new(),
-            topology: exomonad_proto::effects::agent::WorkspaceTopology::SharedDir as i32,
-            pane_id: String::new(),
-            ..Default::default()
-        };
-
-        tracing::info!(
-            otel.name = "agent.spawned",
-            child_agent = %agent_info.id,
-            agent_type = %AgentType::try_from(agent_info.agent_type).map(|t| format!("{:?}", t)).unwrap_or_else(|_| "unknown".to_string()),
-            branch = %agent_info.branch_name,
-            spawn_type = "acp",
-            "[event] agent.spawned"
-        );
-        if let Some(log) = self.ctx.event_log() {
-            let _ = log.append(
-                "agent.spawned",
-                ctx.agent_name.as_ref(),
-                &serde_json::json!({
-                    "child_agent": agent_info.id, "agent_type": "gemini", "spawn_type": "acp",
-                    "branch": agent_info.branch_name,
-                }),
-            );
-        }
-
-        Ok(SpawnAcpResponse {
-            agent: Some(agent_info),
-        })
-    }
-
     async fn cleanup(
         &self,
         req: CleanupRequest,
@@ -1565,7 +1458,6 @@ struct PrBodyMetadata {
 
 impl<
         C: HasTeamRegistry
-            + HasAcpRegistry
             + HasAgentResolver
             + HasGitHubClient
             + HasProjectDir
@@ -1691,7 +1583,6 @@ fn author_agent_from_branch(branch: &str) -> Option<String> {
 async fn live_reviewer_for_pr<C>(service: &AgentControlService<C>, pr_number: u64) -> Option<String>
 where
     C: HasTeamRegistry
-        + HasAcpRegistry
         + HasAgentResolver
         + HasGitHubClient
         + HasProjectDir
@@ -1830,7 +1721,6 @@ async fn cleanup_force_reviewer_resources<C>(
 ) -> Vec<String>
 where
     C: HasTeamRegistry
-        + HasAcpRegistry
         + HasAgentResolver
         + HasGitHubClient
         + HasProjectDir
@@ -1877,7 +1767,6 @@ async fn close_reviewer_windows_by_pr<C>(
 ) -> anyhow::Result<Vec<String>>
 where
     C: HasTeamRegistry
-        + HasAcpRegistry
         + HasAgentResolver
         + HasGitHubClient
         + HasProjectDir

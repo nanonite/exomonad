@@ -554,7 +554,6 @@ pub(crate) fn render_reviewer_context_section(
 impl<
         C: super::super::HasGitHubClient
             + super::super::HasForgejoClient
-            + super::super::HasAcpRegistry
             + super::super::HasTeamRegistry
             + super::super::HasAgentResolver
             + super::super::HasProjectDir
@@ -2016,7 +2015,6 @@ impl<
 impl<
         C: crate::services::HasGitHubClient
             + crate::services::HasForgejoClient
-            + crate::services::HasAcpRegistry
             + crate::services::HasTeamRegistry
             + crate::services::HasAgentResolver
             + crate::services::HasProjectDir

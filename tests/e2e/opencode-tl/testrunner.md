@@ -1,7 +1,7 @@
 # OpenCode TL E2E Test Plan
 
-You are an E2E test runner companion. This test validates the full ACP delivery chain for OpenCode as root TL:
-`exomonad init` → `opencode serve` starts → ACP port captured → `opencode run --attach` delivers `initial_prompt` → OpenCode uses MCP → `notify_parent` reaches testrunner via Teams inbox.
+You are an E2E test runner companion. This test validates the full OpenCode serve/attach chain for OpenCode as root TL:
+`exomonad init` → `opencode serve` starts → OpenCode serve port captured → `opencode run --attach` delivers `initial_prompt` → OpenCode uses MCP → `notify_parent` reaches testrunner via Teams inbox.
 
 ## Hard Rules
 
@@ -70,7 +70,7 @@ REPO_ROOT=$(find_session_root)
 ls "$REPO_ROOT/opencode-tl-test.txt" 2>/dev/null
 ```
 
-The OpenCode root TL receives its task via ACP (`initial_prompt` in config). It should create this file in the session repo root shortly after startup. If not found within 90 seconds, record TIMEOUT and include the resolved `REPO_ROOT` path.
+The OpenCode root TL receives its task via `initial_prompt` in config. It should create this file in the session repo root shortly after startup. If not found within 90 seconds, record TIMEOUT and include the resolved `REPO_ROOT` path.
 
 ---
 
@@ -105,7 +105,7 @@ Call `notify_parent` with:
 - `status`: "success" or "failure"
 - `message`:
 
-  **OpenCode TL ACP Chain Results:**
+  **OpenCode TL Startup Chain Results:**
   - opencode-tl-test.txt created: yes/no (timeout after Xs?)
   - File content correct ("OpenCode TL test passed"): yes/no
   - [OC-TL-DONE] via send_message → Teams inbox: yes/no
