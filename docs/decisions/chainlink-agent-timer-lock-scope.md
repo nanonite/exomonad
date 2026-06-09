@@ -200,9 +200,9 @@ Any future reconsideration of Chainlink agent support must avoid lock semantics,
 
 ## Related Code
 
-- Chainlink timer: `/home/goya/agent-workspace/chainlink/chainlink/src/commands/timer.rs`
-- Chainlink time entries: `/home/goya/agent-workspace/chainlink/chainlink/src/db/time_entries.rs`
-- Chainlink agent identity: `/home/goya/agent-workspace/chainlink/chainlink/src/identity.rs`
-- Chainlink agent status: `/home/goya/agent-workspace/chainlink/chainlink/src/commands/agent.rs`
-- Chainlink session work lock check: `/home/goya/agent-workspace/chainlink/chainlink/src/commands/session.rs`
+- Chainlink timer: `~/agent-workspace/chainlink/chainlink/src/commands/timer.rs`
+- Chainlink time entries: `~/agent-workspace/chainlink/chainlink/src/db/time_entries.rs`
+- Chainlink agent identity: `~/agent-workspace/chainlink/chainlink/src/identity.rs`
+- Chainlink agent status: `~/agent-workspace/chainlink/chainlink/src/commands/agent.rs`
+- Chainlink session work lock check: `~/agent-workspace/chainlink/chainlink/src/commands/session.rs`
 - ExoMonad worktree model: `docs/decisions/hylo-worktree-model.md`

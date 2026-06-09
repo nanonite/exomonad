@@ -13,7 +13,7 @@ The Codex side is command based: each configured hook command is executed with o
 JSON object written to stdin, and Codex interprets stdout, stderr, and the process
 exit code.
 
-Confirmed against local Codex sources in `/home/goya/agent-workspace/codex`:
+Confirmed against local Codex sources in `~/agent-workspace/codex`:
 
 - `codex-rs/hooks/src/events/pre_tool_use.rs`
 - `codex-rs/hooks/src/events/post_tool_use.rs`

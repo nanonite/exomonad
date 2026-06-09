@@ -20,7 +20,7 @@ The issue tracker is chainlink (`.chainlink/issues.db`).
 
 ## Where — the context
 
-- Claude Code instance running inside the exomonad workspace itself (`/home/goya/agent-workspace/exomonad`)
+- Claude Code instance running inside the exomonad workspace itself (`~/agent-workspace/exomonad`)
 - Primary tools: chainlink CLI (issue tracking and delegation), `just` + nix for builds and tests, `cargo` / `cabal` for the Rust and Haskell toolchains, `gh` for Forgejo/GitHub-compatible operations
 - Haskell WASM is the tool/hook/event DSL; Rust is the I/O runtime — all tool definitions live in Haskell, all effects executed in Rust
 - `just build` for Rust-only, `just install-all-dev` for full install (WASM + binary), `just wasm-all` for WASM only — never raw `cargo build` or `cp ~/.cargo/bin/exomonad` (nix shell required; atomic rename required)
@@ -28,7 +28,7 @@ The issue tracker is chainlink (`.chainlink/issues.db`).
 
 ## Who — the user
 
-Roger. More experienced in Rust than Haskell — has not had dedicated time to learn Haskell, but finds the patterns legible enough to extend. Strongest on orchestration and architecture; weakest on the Haskell WASM internals and the messaging protocol mismatches between agent runtimes.
+The maintainer. More experienced in Rust than Haskell — has not had dedicated time to learn Haskell, but finds the patterns legible enough to extend. Strongest on orchestration and architecture; weakest on the Haskell WASM internals and the messaging protocol mismatches between agent runtimes.
 
 The architecture is well-formed in his head but poorly externalized — design decisions and reasoning are not yet captured in documentation, which blocks new users and new agents from extending the system confidently. Closing that gap is a standing priority alongside feature work.
 

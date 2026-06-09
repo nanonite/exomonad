@@ -134,7 +134,7 @@ that could serve workspace context directly to agents. if chainlink has mcp supp
 
 research steps:
 1. run `chainlink --help` and check for a `serve`, `mcp`, or `server` subcommand
-2. check `/home/goya/agent-workspace/chainlink/` source for mcp-related code
+2. check `~/agent-workspace/chainlink/` source for mcp-related code
 3. check if chainlink has a config file that registers it as an mcp server
 4. if mcp support exists, evaluate: add chainlink to `extra_mcp_servers` in `config.toml`
    and write a role context instruction to use it instead of bash `chainlink` commands

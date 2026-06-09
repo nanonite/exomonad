@@ -6,6 +6,7 @@ dist-newstyle/
 .env # keys and etc
 .env
 .env.subagent
+CLAUDE.local.md
 
 .beads/
 training-data/
