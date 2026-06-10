@@ -177,7 +177,7 @@ class GitHubState:
             return True
         return False
 
-    def add_review(self, pr_number, review_state, body=""):
+    def add_review(self, pr_number, review_state, body="", commit_id=None, login="copilot[bot]"):
         """Add a review to a PR's review queue."""
         review_id = self.next_review_id
         self.next_review_id += 1
@@ -186,10 +186,11 @@ class GitHubState:
             "id": review_id,
             "node_id": f"PRR_{review_id}",
             "html_url": f"https://github.com/test/repo/pull/{pr_number}#pullrequestreview-{review_id}",
-            "user": mock_author("copilot[bot]", uid=2),
+            "user": mock_author(login, uid=2),
             "state": review_state,
             "body": body,
             "submitted_at": now,
+            "commit_id": commit_id,
         }
         if pr_number not in self.reviews:
             self.reviews[pr_number] = []
@@ -428,9 +429,11 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
                 pr_number = data.get("pr_number")
                 review_state = data.get("state", "APPROVED")
                 body = data.get("body", "")
+                commit_id = data.get("commit_id")
+                login = data.get("login", "copilot[bot]")
                 if pr_number is None or pr_number not in state.prs:
                     return self._send_error(400, f"PR {pr_number} not found")
-                review = state.add_review(pr_number, review_state, body)
+                review = state.add_review(pr_number, review_state, body, commit_id, login)
                 return self._send_json(review, 201)
             except (json.JSONDecodeError, KeyError) as e:
                 return self._send_error(400, f"Invalid request: {e}")
@@ -445,7 +448,8 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
                 data = self._read_body()
                 event = data.get("event", "APPROVED")
                 body = data.get("body", "")
-                review = state.add_review(pr_number, event, body)
+                commit_id = data.get("commit_id")
+                review = state.add_review(pr_number, event, body, commit_id)
                 return self._send_json(review, 200)
             except json.JSONDecodeError:
                 return self._send_error(400, "Invalid JSON")

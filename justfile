@@ -386,6 +386,16 @@ live-teams-e2e:
 validate-settings:
     nix-shell -p python3Packages.jsonschema --run "python3 scripts/validate_json.py .gemini/settings.json schema/gemini-cli/settings.schema.json"
 
+
+# Run E2E review-loop stuck human escalation test
+e2e-review-loop-stuck:
+    ./tests/e2e/review-loop-stuck/run.sh
+
+# Check E2E review-loop stuck harness without launching the server
+check-e2e-review-loop-stuck:
+    bash -n tests/e2e/review-loop-stuck/run.sh
+    python3 -m py_compile tests/e2e/mock_github.py
+
 # Forgejo CI migration E2E
 # Requires: forgejo/docker-compose.yml stack and EXOMONAD_FORGEJO_TOKEN
 # export EXOMONAD_FORGEJO_TOKEN=...
