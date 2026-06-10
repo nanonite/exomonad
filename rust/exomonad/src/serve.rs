@@ -1162,6 +1162,8 @@ Run `exomonad recompile` first to build it.",
         .with_extra_mcp_servers(serialize_extra_mcp_servers(&config.extra_mcp_servers));
     let event_session_id = uuid::Uuid::new_v4().to_string();
     let agent_control = Arc::new(agent_control);
+    // Shutdown signal shared by the /shutdown endpoint and shutdown_server effect.
+    let shutdown_signal = Arc::new(tokio::sync::Notify::new());
 
     info!(
         wasm_path = %wasm_path.display(),
@@ -1194,6 +1196,7 @@ Run `exomonad recompile` first to build it.",
         agent_control.clone(),
         services.clone(),
         Some(event_session_id),
+        shutdown_signal.clone(),
     ));
     let plugin_build_started_at = std::time::Instant::now();
     let rt = builder.build().await.context("Failed to build runtime")?;
@@ -1339,9 +1342,6 @@ Run `exomonad recompile` first to build it.",
         event_log: event_log.clone(),
         agent_resolver: agent_resolver.clone(),
     };
-
-    // Shutdown signal for graceful shutdown via /shutdown endpoint
-    let shutdown_signal = Arc::new(tokio::sync::Notify::new());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

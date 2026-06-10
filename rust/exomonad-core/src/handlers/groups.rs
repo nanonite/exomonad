@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 use crate::effects::EffectHandler;
 use crate::services::agent_control::AgentControlService;
@@ -57,13 +58,17 @@ pub fn orchestration_handlers(
     agent_control: Arc<AgentControlService<Services>>,
     services: Arc<Services>,
     event_queue_scope: Option<String>,
+    shutdown_signal: Arc<Notify>,
 ) -> Vec<Box<dyn EffectHandler>> {
     let tasks_dir = dirs::home_dir().unwrap_or_default().join(".claude/tasks");
 
     vec![
         Box::new(AgentHandler::new(agent_control, services.clone())),
         Box::new(InboxHandler::new(services.clone())),
-        Box::new(LifecycleHandler::new(services.clone())),
+        Box::new(LifecycleHandler::with_shutdown_signal(
+            services.clone(),
+            shutdown_signal,
+        )),
         Box::new(EventHandler::new(services.clone(), event_queue_scope)),
         Box::new(SessionHandler::new(services.clone())),
         Box::new(TasksHandler::new(tasks_dir, services.clone())),
