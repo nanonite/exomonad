@@ -53,6 +53,10 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 | `send_tmux_message` / `send_mailbox_message` | x | x | x | | x |
 | `session_status` | x | x | | | |
 | `poll_workers` | x | x | | | |
+| `check_inbox` | x | x | x | x | x |
+| `list_agents` | x | x | | x | |
+| `has_pending_work` | x | | | | |
+| `shutdown_server` | x | | | | |
 | `task_list` / `task_get` / `task_update` | | | x | | x |
 | `approve_pr` | | | | x | |
 | `request_changes` | | | | x | |
