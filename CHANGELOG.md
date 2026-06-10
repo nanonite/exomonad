@@ -173,6 +173,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Fix: watcher loses ChangesRequested review rounds when dev pushes multiple times between polls, never reaches reviewer_max_rounds (#502)
 - Fix reviewer respawn after PR head SHA changes (#491)
 - Fix watcher notification delivery for non-WASM agent runtimes (#492)
 - Fix generated Claude settings self-disabling exomonad MCP (#490)

@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -60,6 +60,7 @@ struct ForgejoReview {
     body: String,
     state: ForgejoReviewVerdict,
     author_branch: Option<String>,
+    commit_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -207,6 +208,32 @@ fn review_state_disposes_reviewer(review_state: &ForgejoReviewState) -> bool {
         review_state,
         ForgejoReviewState::Approved | ForgejoReviewState::ChangesRequested
     )
+}
+
+fn distinct_changes_requested_rounds(reviews: &[ForgejoReview]) -> u32 {
+    reviews
+        .iter()
+        .filter(|review| review.state == ForgejoReviewVerdict::ChangesRequested)
+        .map(|review| {
+            format!(
+                "{}\0{}\0{}",
+                review.commit_id.as_deref().unwrap_or_default(),
+                review.author_branch.as_deref().unwrap_or_default(),
+                review.body
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .len() as u32
+}
+
+fn approved_review_round(old_rounds: u32, changes_requested_rounds: u32) -> u32 {
+    if changes_requested_rounds > 0 {
+        changes_requested_rounds.max(old_rounds)
+    } else if old_rounds == 0 {
+        1
+    } else {
+        old_rounds + 1
+    }
 }
 
 fn should_spawn_reviewer_for_new_head(state: &WatchState, max_rounds: u32) -> bool {
@@ -766,6 +793,7 @@ struct Observation {
     review_state: ForgejoReviewState,
     comments: Vec<ForgejoReviewComment>,
     reviews: Vec<ForgejoReview>,
+    changes_requested_rounds: u32,
     ci_status: CIStatus,
     forgejo_review_present: bool,
 }
@@ -1178,7 +1206,7 @@ where
                 }
             };
 
-            let (review_state, comments, reviews, forgejo_review_present) =
+            let (review_state, comments, reviews, changes_requested_rounds, forgejo_review_present) =
                 self.forgejo_review_parts(*number, &head_sha).await;
 
             let branch = BranchName::try_from_str(pr.head_branch.as_str())
@@ -1192,6 +1220,7 @@ where
                     review_state,
                     comments,
                     reviews,
+                    changes_requested_rounds,
                     ci_status,
                     forgejo_review_present,
                 },
@@ -1286,6 +1315,7 @@ where
                         &obs.head_sha,
                         &obs.comments,
                         &local_reviews,
+                        obs.changes_requested_rounds,
                         obs.ci_status,
                         pr.merge_blocked_on_ci,
                         pr.reviewer_agent.is_some(),
@@ -1308,6 +1338,7 @@ where
                         &obs.head_sha,
                         &obs.comments,
                         &local_reviews,
+                        obs.changes_requested_rounds,
                         obs.ci_status,
                         pr.merge_blocked_on_ci,
                         pr.reviewer_agent.is_some(),
@@ -2090,13 +2121,14 @@ where
         ForgejoReviewState,
         Vec<ForgejoReviewComment>,
         Vec<ForgejoReview>,
+        u32,
         bool,
     ) {
         let Some(forgejo) = self.ctx.forgejo_client() else {
-            return (ForgejoReviewState::PendingReview, vec![], vec![], false);
+            return (ForgejoReviewState::PendingReview, vec![], vec![], 0, false);
         };
         let Ok(repo_info) = repo::get_repo_info(self.ctx.project_dir()).await else {
-            return (ForgejoReviewState::PendingReview, vec![], vec![], false);
+            return (ForgejoReviewState::PendingReview, vec![], vec![], 0, false);
         };
         let reviews = match forgejo
             .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
@@ -2105,13 +2137,26 @@ where
             Ok(reviews) => reviews,
             Err(error) => {
                 debug!(pr_number, error = %error, "Forgejo review lookup failed");
-                return (ForgejoReviewState::PendingReview, vec![], vec![], false);
+                return (ForgejoReviewState::PendingReview, vec![], vec![], 0, false);
             }
         };
 
         let mut local_reviews = Vec::new();
+        let mut all_reviews = Vec::new();
         for review in reviews {
-            if let Some(review_commit) = review
+            let state = review_state_from_str(&review.state);
+            if state == ForgejoReviewVerdict::None {
+                continue;
+            }
+            let local_review = ForgejoReview {
+                body: review.body,
+                state,
+                author_branch: None,
+                commit_id: review.commit_id,
+            };
+            all_reviews.push(local_review.clone());
+
+            if let Some(review_commit) = local_review
                 .commit_id
                 .as_deref()
                 .filter(|commit| !head_sha.is_empty() && *commit != head_sha)
@@ -2124,15 +2169,7 @@ where
                 .await;
                 continue;
             }
-            let state = review_state_from_str(&review.state);
-            if state == ForgejoReviewVerdict::None {
-                continue;
-            }
-            local_reviews.push(ForgejoReview {
-                body: review.body,
-                state,
-                author_branch: None,
-            });
+            local_reviews.push(local_review);
         }
 
         let review_state = if local_reviews
@@ -2149,8 +2186,15 @@ where
             ForgejoReviewState::PendingReview
         };
 
+        let changes_requested_rounds = distinct_changes_requested_rounds(&all_reviews);
         let forgejo_review_present = !local_reviews.is_empty();
-        (review_state, vec![], local_reviews, forgejo_review_present)
+        (
+            review_state,
+            vec![],
+            local_reviews,
+            changes_requested_rounds,
+            forgejo_review_present,
+        )
     }
 
     async fn advance_reviewer_worktree_for_fixes(
@@ -2253,6 +2297,7 @@ fn compute_pr_actions(
         pr_sha,
         comments,
         reviews,
+        distinct_changes_requested_rounds(reviews),
         ci_status,
         merge_blocked_on_ci,
         false,
@@ -2270,6 +2315,7 @@ fn compute_pr_actions_with_context(
     pr_sha: &str,
     comments: &[ForgejoReviewComment],
     reviews: &[ForgejoReview],
+    observed_request_change_rounds: u32,
     ci_status: CIStatus,
     merge_blocked_on_ci: bool,
     reviewer_registered: bool,
@@ -2378,23 +2424,16 @@ fn compute_pr_actions_with_context(
         old_state.pr_review_cycle_count = comment_count;
     }
 
-    let observed_request_change_rounds = reviews
-        .iter()
-        .filter(|r| r.state == ForgejoReviewVerdict::ChangesRequested)
-        .count() as u32;
+    let observed_request_change_rounds =
+        observed_request_change_rounds.max(distinct_changes_requested_rounds(reviews));
     let next_review_round = observed_request_change_rounds.max(old_state.rounds + 1);
 
     let approved = reviews.iter().any(|r| {
         r.state == ForgejoReviewVerdict::Approved || r.body.to_lowercase().contains("approved")
     });
     if approved && old_state.last_review_state != ForgejoReviewVerdict::Approved {
-        let approved_round = if old_state.rounds == 0 {
-            1
-        } else if observed_request_change_rounds >= old_state.rounds {
-            old_state.rounds
-        } else {
-            old_state.rounds + 1
-        };
+        let approved_round =
+            approved_review_round(old_state.rounds, observed_request_change_rounds);
         old_state.rounds = approved_round;
         pending_actions.push(PendingAction::WriteRegistryRounds {
             pr_number: pr_number.as_u64(),
@@ -2503,6 +2542,35 @@ fn compute_pr_actions_with_context(
         }
     }
 
+    if !approved && !changes_requested && observed_request_change_rounds > old_state.rounds {
+        old_state.rounds = observed_request_change_rounds;
+        if old_state.rounds >= max_rounds {
+            old_state.stuck = true;
+            pending_actions.push(PendingAction::WriteRegistryStuck {
+                pr_number: pr_number.as_u64(),
+                rounds: old_state.rounds,
+            });
+            pending_actions.push(PendingAction::FileHumanEscalation {
+                pr_number: pr_number.as_u64(),
+                classification: ReviewStallKind::DevNotPushing,
+                diagnostic: review_stall_diagnostic(
+                    old_state,
+                    pr_sha,
+                    branch,
+                    reviewer_registered,
+                    forgejo_review_present,
+                    max_wait_seconds,
+                    ci_status,
+                ),
+            });
+        } else {
+            pending_actions.push(PendingAction::WriteRegistryRounds {
+                pr_number: pr_number.as_u64(),
+                rounds: old_state.rounds,
+            });
+        }
+    }
+
     if ci_changed {
         let reviewer_approved = old_state.notified_parent_approved;
         let ci_completed_merge_ready = !old_state.merge_ready_notified
@@ -2607,6 +2675,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             body: c.body.clone(),
             state: state.clone(),
             author_branch: c.author_branch.clone(),
+            commit_id: None,
         })
         .collect();
 
@@ -2615,12 +2684,14 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             body: "Approved".to_string(),
             state: ForgejoReviewVerdict::Approved,
             author_branch: None,
+            commit_id: None,
         });
     } else if obs.review_state == ForgejoReviewState::ChangesRequested && reviews.is_empty() {
         reviews.push(ForgejoReview {
             body: "Changes requested".to_string(),
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: None,
+            commit_id: None,
         });
     }
 
@@ -3092,6 +3163,7 @@ mod tests {
             body: body.to_string(),
             state,
             author_branch: None,
+            commit_id: None,
         }
     }
     // ---------------------------------------------------------------------------
@@ -3570,6 +3642,7 @@ mod tests {
             body: "Please address comments".to_string(),
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: Some("review-pr-1".to_string()),
+            commit_id: None,
         }];
 
         let actions = compute_pr_actions(
@@ -4048,6 +4121,56 @@ mod tests {
     }
 
     #[test]
+    fn test_two_pushes_between_polls_counts_stale_changes_requested_rounds() {
+        let branch = BranchName::try_from_str("main.feat-codex")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Codex, "sha1");
+        state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
+        state.rounds = 1;
+
+        let actions = compute_pr_actions_with_context(
+            &mut state,
+            PRNumber::new(1),
+            "sha3",
+            &[],
+            &[],
+            2,
+            CIStatus::Unknown,
+            false,
+            true,
+            true,
+            branch.as_str(),
+            &|_, _| String::new(),
+            2,
+            15 * 60,
+        );
+
+        assert_eq!(state.last_sha, "sha3");
+        assert!(state.addressed_changes);
+        assert!(state.stuck);
+        assert_eq!(state.rounds, 2);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "fixes_pushed"
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WriteRegistryStuck {
+                pr_number: 1,
+                rounds: 2,
+            }
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::FileHumanEscalation {
+                pr_number: 1,
+                classification: ReviewStallKind::DevNotPushing,
+                diagnostic,
+            } if diagnostic.rounds == 2 && diagnostic.head_sha == "sha3"
+        )));
+    }
+
+    #[test]
     fn test_request_changes_then_approve_does_not_trip_stuck() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
@@ -4129,6 +4252,9 @@ mod tests {
             action,
             PendingAction::WasmEvent { payload, .. } if payload["kind"] == "stuck"
         )));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, PendingAction::FileHumanEscalation { .. })));
     }
 
     #[test]
@@ -4389,6 +4515,7 @@ mod tests {
             body: "I have reviewed this and it is APPROVED".to_string(),
             state: ForgejoReviewVerdict::None,
             author_branch: None,
+            commit_id: None,
         }];
         let actions = compute_pr_actions(
             &mut state,
@@ -4421,6 +4548,7 @@ mod tests {
             "abc123",
             &[],
             &[],
+            0,
             CIStatus::Unknown,
             false,
             true,
@@ -4499,6 +4627,7 @@ mod tests {
             review_state: ForgejoReviewState::PendingReview,
             comments: vec![],
             reviews: vec![],
+            changes_requested_rounds: 0,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
         };
@@ -4514,6 +4643,7 @@ mod tests {
             review_state: ForgejoReviewState::Approved,
             comments: vec![],
             reviews: vec![],
+            changes_requested_rounds: 0,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
         };
@@ -4531,6 +4661,7 @@ mod tests {
             review_state: ForgejoReviewState::ChangesRequested,
             comments: vec![],
             reviews: vec![],
+            changes_requested_rounds: 1,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
         };
@@ -4558,11 +4689,13 @@ mod tests {
                 body: "LGTM!".to_string(),
                 state: ForgejoReviewVerdict::Approved,
                 author_branch: None,
+                commit_id: None,
             },
             ForgejoReview {
                 body: "Good work.".to_string(),
                 state: ForgejoReviewVerdict::None,
                 author_branch: None,
+                commit_id: None,
             },
         ];
         let msg = format_review_message(&[], &reviews);
@@ -4681,6 +4814,7 @@ mod tests {
             review_state: crate::services::pr_registry::ForgejoReviewState::PendingReview,
             comments: vec![],
             reviews: vec![],
+            changes_requested_rounds: 0,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
         }
@@ -4848,6 +4982,7 @@ mod tests {
                 review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
                 comments: vec![],
                 reviews: vec![],
+                changes_requested_rounds: 0,
                 ci_status: CIStatus::Unknown,
                 forgejo_review_present: false,
             },
@@ -4915,6 +5050,7 @@ mod tests {
                 review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
                 comments: vec![],
                 reviews: vec![test_review("approved", ForgejoReviewVerdict::Approved)],
+                changes_requested_rounds: 0,
                 ci_status: CIStatus::Unknown,
                 forgejo_review_present: true,
             },
@@ -4963,6 +5099,7 @@ mod tests {
                 review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
                 comments: vec![],
                 reviews: vec![test_review("approved", ForgejoReviewVerdict::Approved)],
+                changes_requested_rounds: 0,
                 ci_status: CIStatus::Unknown,
                 forgejo_review_present: true,
             },
@@ -5142,6 +5279,7 @@ mod tests {
                 review_state: ForgejoReviewState::ChangesRequested,
                 comments: vec![],
                 reviews: vec![],
+                changes_requested_rounds: 1,
                 ci_status: CIStatus::Unknown,
                 forgejo_review_present: false,
             },
