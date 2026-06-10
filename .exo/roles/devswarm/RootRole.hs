@@ -4,7 +4,8 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 
--- | Root TL role: orchestration-only. No file_pr, notify_parent, or shutdown.
+-- | Root TL role: orchestration-only. Shutdown is exposed only through
+--   root-owned idle convergence after pending work is clear.
 --   Used for the root human-facing TL window (exomonad init).
 module RootRole (config, Tools) where
 
@@ -42,6 +43,7 @@ import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.CloseReviewerWindow (CloseReviewerWindow (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
+import ExoMonad.Guest.Tools.Lifecycle (HasPendingWork (..), ShutdownServer (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
@@ -192,6 +194,8 @@ data Tools mode = Tools
     pollWorkers :: mode :- PollWorkers,
     checkInbox :: mode :- CheckInbox,
     listAgents :: mode :- ListAgents,
+    hasPendingWork :: mode :- HasPendingWork,
+    shutdownServer :: mode :- ShutdownServer,
     mergePr :: mode :- RootMergePR,
     sendTmuxMessage :: mode :- SendTmuxMessage,
     sendMailboxMessage :: mode :- SendMailboxMessage,
@@ -239,6 +243,8 @@ config =
             pollWorkers = mkHandler @PollWorkers,
             checkInbox = mkHandler @CheckInbox,
             listAgents = mkHandler @ListAgents,
+            hasPendingWork = mkHandler @HasPendingWork,
+            shutdownServer = mkHandler @ShutdownServer,
             mergePr = mkHandler @RootMergePR,
             sendTmuxMessage = mkHandler @SendTmuxMessage,
             sendMailboxMessage = mkHandler @SendMailboxMessage,

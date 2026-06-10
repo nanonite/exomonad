@@ -52,6 +52,7 @@ library
 
     Effects.Events
     Effects.Inbox
+    Effects.Lifecycle
     Effects.MergePr
     Effects.Session
     Effects.Tasks
