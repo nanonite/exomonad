@@ -1,0 +1,28 @@
+syntax = "proto3";
+package exomonad.effects.lifecycle;
+
+import "effects/agent.proto";
+
+// Root-only lifecycle effects for idle convergence and graceful shutdown.
+
+message HasPendingWorkEffect {}
+
+message HasPendingWorkResult {
+  bool has_pending_work = 1;
+  int32 open_issue_count = 2;
+  int32 alive_agent_count = 3;
+  repeated exomonad.effects.agent.AgentInfo alive_agents = 4;
+}
+
+message ServerShutdownEffect {}
+
+message ServerShutdownResult {
+  bool success = 1;
+  string error = 2;
+  string message = 3;
+}
+
+service LifecycleEffects {
+  rpc HasPendingWork(HasPendingWorkEffect) returns (HasPendingWorkResult);
+  rpc ShutdownServer(ServerShutdownEffect) returns (ServerShutdownResult);
+}
