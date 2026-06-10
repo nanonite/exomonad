@@ -1,6 +1,6 @@
 //! Lifecycle effect handler for the `lifecycle.*` namespace.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,6 +21,7 @@ use crate::services::{HasAgentResolver, HasProjectDir};
 pub struct LifecycleHandler<C> {
     ctx: Arc<C>,
     shutdown_signal: Option<Arc<Notify>>,
+    chainlink_bin: PathBuf,
 }
 
 impl<C: HasAgentResolver + HasProjectDir + 'static> LifecycleHandler<C> {
@@ -28,6 +29,7 @@ impl<C: HasAgentResolver + HasProjectDir + 'static> LifecycleHandler<C> {
         Self {
             ctx,
             shutdown_signal: None,
+            chainlink_bin: PathBuf::from("chainlink"),
         }
     }
 
@@ -35,7 +37,14 @@ impl<C: HasAgentResolver + HasProjectDir + 'static> LifecycleHandler<C> {
         Self {
             ctx,
             shutdown_signal: Some(shutdown_signal),
+            chainlink_bin: PathBuf::from("chainlink"),
         }
+    }
+
+    #[cfg(test)]
+    fn with_chainlink_bin(mut self, chainlink_bin: PathBuf) -> Self {
+        self.chainlink_bin = chainlink_bin;
+        self
     }
 }
 
@@ -62,7 +71,8 @@ impl<C: HasAgentResolver + HasProjectDir + 'static> LifecycleEffects for Lifecyc
         _req: HasPendingWorkEffect,
         _ctx: &crate::effects::EffectContext,
     ) -> EffectResult<HasPendingWorkResult> {
-        let open_issue_count = open_chainlink_issue_count(self.ctx.project_dir()).await?;
+        let open_issue_count =
+            open_chainlink_issue_count(self.ctx.project_dir(), &self.chainlink_bin).await?;
         let alive_agents = live_non_root_agents(self.ctx.as_ref()).await;
 
         Ok(HasPendingWorkResult {
@@ -113,8 +123,8 @@ struct ChainlinkIssue {
     status: String,
 }
 
-async fn open_chainlink_issue_count(project_dir: &Path) -> EffectResult<i32> {
-    let output = Command::new("chainlink")
+async fn open_chainlink_issue_count(project_dir: &Path, chainlink_bin: &Path) -> EffectResult<i32> {
+    let output = Command::new(chainlink_bin)
         .args(["issue", "list", "--json"])
         .current_dir(project_dir)
         .output()
@@ -247,5 +257,184 @@ mod tests {
         assert_eq!(proto.topology, Topology::WorktreePerAgent.to_proto());
         assert!(proto.alive);
         assert!(proto.is_alive);
+    }
+
+    fn effect_context(project_dir: &Path) -> crate::effects::EffectContext {
+        crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root").expect("literal is non-empty"),
+            birth_branch: BirthBranch::try_from_str("main").expect("literal is non-empty"),
+            working_dir: project_dir.to_path_buf(),
+        }
+    }
+
+    async fn test_services(project_dir: &Path, agents: &[&str]) -> Arc<crate::services::Services> {
+        let resolver = Arc::new(
+            crate::services::agent_resolver::AgentResolver::load(project_dir.to_path_buf()).await,
+        );
+        for agent in agents {
+            resolver
+                .register(record(agent))
+                .await
+                .expect("test agent identity registers");
+        }
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.to_path_buf();
+        services.agent_resolver = resolver;
+        Arc::new(services)
+    }
+
+    async fn stub_chainlink(project_dir: &Path, issues_json: &str) -> PathBuf {
+        let bin = project_dir.join("chainlink");
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1 $2 $3" = "issue list --json" ]; then
+  cat <<'JSON'
+{}
+JSON
+  exit 0
+fi
+echo "unexpected chainlink args: $*" >&2
+exit 64
+"#,
+            issues_json
+        );
+        tokio::fs::write(&bin, script)
+            .await
+            .expect("stub chainlink written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = tokio::fs::metadata(&bin)
+                .await
+                .expect("stub chainlink metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&bin, permissions)
+                .await
+                .expect("stub chainlink executable");
+        }
+        bin
+    }
+
+    async fn handler_with_stub_chainlink(
+        issues_json: &str,
+        agents: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        LifecycleHandler<crate::services::Services>,
+        crate::effects::EffectContext,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("temp project dir");
+        let services = test_services(temp_dir.path(), agents).await;
+        let chainlink_bin = stub_chainlink(temp_dir.path(), issues_json).await;
+        let ctx = effect_context(temp_dir.path());
+        let handler = LifecycleHandler::new(services).with_chainlink_bin(chainlink_bin);
+        (temp_dir, handler, ctx)
+    }
+
+    #[tokio::test]
+    async fn has_pending_work_reports_open_chainlink_issues() {
+        let (_temp_dir, handler, ctx) =
+            handler_with_stub_chainlink(r#"[{"status":"open"},{"status":"closed"}]"#, &[]).await;
+
+        let result = handler
+            .has_pending_work(HasPendingWorkEffect {}, &ctx)
+            .await
+            .expect("handler succeeds");
+
+        assert!(result.has_pending_work);
+        assert_eq!(result.open_issue_count, 1);
+        assert_eq!(result.alive_agent_count, 0);
+        assert!(result.alive_agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn has_pending_work_reports_alive_non_root_agents() {
+        let (_temp_dir, handler, ctx) =
+            handler_with_stub_chainlink(r#"[]"#, &["root", "leaf-a"]).await;
+
+        let result = handler
+            .has_pending_work(HasPendingWorkEffect {}, &ctx)
+            .await
+            .expect("handler succeeds");
+
+        assert!(result.has_pending_work);
+        assert_eq!(result.open_issue_count, 0);
+        assert_eq!(result.alive_agent_count, 1);
+        assert_eq!(result.alive_agents[0].id, "leaf-a");
+    }
+
+    #[tokio::test]
+    async fn has_pending_work_is_false_when_backlog_and_agents_are_empty() {
+        let (_temp_dir, handler, ctx) = handler_with_stub_chainlink(r#"[]"#, &["root"]).await;
+
+        let result = handler
+            .has_pending_work(HasPendingWorkEffect {}, &ctx)
+            .await
+            .expect("handler succeeds");
+
+        assert!(!result.has_pending_work);
+        assert_eq!(result.open_issue_count, 0);
+        assert_eq!(result.alive_agent_count, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_server_rejects_alive_agents_without_notifying() {
+        let temp_dir = tempfile::tempdir().expect("temp project dir");
+        let services = test_services(temp_dir.path(), &["leaf-a"]).await;
+        let signal = Arc::new(Notify::new());
+        let handler = LifecycleHandler::with_shutdown_signal(services, Arc::clone(&signal));
+        let ctx = effect_context(temp_dir.path());
+
+        let result = handler
+            .shutdown_server(ServerShutdownEffect {}, &ctx)
+            .await
+            .expect("handler succeeds");
+
+        assert!(!result.success);
+        assert_eq!(result.error, "1 agent(s) still alive: [leaf-a]");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), signal.notified())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_server_notifies_when_no_non_root_agents_are_alive() {
+        let temp_dir = tempfile::tempdir().expect("temp project dir");
+        let services = test_services(temp_dir.path(), &["root"]).await;
+        let signal = Arc::new(Notify::new());
+        let first_waiter = tokio::spawn({
+            let signal = Arc::clone(&signal);
+            async move { signal.notified().await }
+        });
+        let second_waiter = tokio::spawn({
+            let signal = Arc::clone(&signal);
+            async move { signal.notified().await }
+        });
+        tokio::task::yield_now().await;
+
+        let handler = LifecycleHandler::with_shutdown_signal(services, Arc::clone(&signal));
+        let ctx = effect_context(temp_dir.path());
+
+        let result = handler
+            .shutdown_server(ServerShutdownEffect {}, &ctx)
+            .await
+            .expect("handler succeeds");
+
+        assert!(result.success);
+        assert_eq!(result.message, "Server shutting down");
+        let first_done = tokio::time::timeout(std::time::Duration::from_millis(100), first_waiter)
+            .await
+            .is_ok();
+        let second_done = tokio::time::timeout(std::time::Duration::from_millis(25), second_waiter)
+            .await
+            .is_ok();
+        assert_ne!(
+            first_done, second_done,
+            "exactly one shutdown waiter should be notified"
+        );
     }
 }
