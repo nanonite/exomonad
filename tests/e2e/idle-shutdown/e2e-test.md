@@ -4,6 +4,19 @@ You are the ROOT TECH LEAD in idle/shutdown convergence test mode.
 
 This harness verifies that root does not idle forever after all Chainlink work is gone. It must close the seeded backlog, observe empty inbox checks, call `has_pending_work`, and then call `shutdown_server`.
 
+
+## Tool Use Requirements
+
+You must perform this test flow yourself in this root conversation. Do not use Claude's internal `Agent` task tool. Do not use Bash for `check_inbox`, `has_pending_work`, `shutdown_server`, or Chainlink issue actions. Use the ExoMonad MCP tools directly:
+
+- `check_inbox`
+- `chainlink_issue_list`
+- `chainlink_issue_show`
+- `chainlink_issue_comment`
+- `chainlink_issue_close`
+- `has_pending_work`
+- `shutdown_server`
+
 ## E2E Threshold Override
 
 Production root guidance uses 20 consecutive empty `check_inbox` calls before convergence. In this E2E harness only, use **3 consecutive empty `check_inbox` calls** so the test stays bounded. Do not change source code or project prompts to lower the production threshold.
@@ -21,6 +34,8 @@ Production root guidance uses 20 consecutive empty `check_inbox` calls before co
 ## Hard Rules
 
 - Do not use `gh`.
+- Do not use Bash for this test flow.
+- Do not delegate to Claude internal Agent tasks.
 - Do not run `exomonad init`, `exomonad serve`, or `exomonad new`.
 - Do not use Chainlink agent, sync, or lock commands.
 - Do not modify repository files.

@@ -109,7 +109,7 @@ impl<C: HasAgentResolver + HasProjectDir + 'static> LifecycleEffects for Lifecyc
             });
         };
 
-        shutdown_signal.notify_one();
+        shutdown_signal.notify_waiters();
         Ok(ServerShutdownResult {
             success: true,
             error: String::new(),
@@ -402,7 +402,7 @@ exit 64
     }
 
     #[tokio::test]
-    async fn shutdown_server_notifies_when_no_non_root_agents_are_alive() {
+    async fn shutdown_server_notifies_all_waiters_when_no_non_root_agents_are_alive() {
         let temp_dir = tempfile::tempdir().expect("temp project dir");
         let services = test_services(temp_dir.path(), &["root"]).await;
         let signal = Arc::new(Notify::new());
@@ -426,15 +426,13 @@ exit 64
 
         assert!(result.success);
         assert_eq!(result.message, "Server shutting down");
-        let first_done = tokio::time::timeout(std::time::Duration::from_millis(100), first_waiter)
+        tokio::time::timeout(std::time::Duration::from_millis(100), first_waiter)
             .await
-            .is_ok();
-        let second_done = tokio::time::timeout(std::time::Duration::from_millis(25), second_waiter)
+            .expect("first shutdown waiter is notified")
+            .expect("first shutdown waiter task succeeds");
+        tokio::time::timeout(std::time::Duration::from_millis(100), second_waiter)
             .await
-            .is_ok();
-        assert_ne!(
-            first_done, second_done,
-            "exactly one shutdown waiter should be notified"
-        );
+            .expect("second shutdown waiter is notified")
+            .expect("second shutdown waiter task succeeds");
     }
 }

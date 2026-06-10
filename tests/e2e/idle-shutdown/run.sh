@@ -111,6 +111,49 @@ if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
     cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
 fi
 
+trust_claude_project() {
+    local project_path="$1"
+    python3 - "$project_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+project = str(Path(sys.argv[1]).resolve())
+claude_json = Path.home() / ".claude.json"
+
+if claude_json.exists():
+    try:
+        data = json.loads(claude_json.read_text())
+    except json.JSONDecodeError:
+        data = {}
+else:
+    data = {}
+
+projects = data.setdefault("projects", {})
+entry = projects.setdefault(project, {})
+entry.setdefault("allowedTools", [])
+entry.setdefault("disabledMcpjsonServers", [])
+entry.setdefault("enabledMcpjsonServers", [])
+entry.setdefault("exampleFiles", [])
+entry["hasClaudeMdExternalIncludesApproved"] = False
+entry["hasClaudeMdExternalIncludesWarningShown"] = False
+entry["hasTrustDialogAccepted"] = True
+entry.setdefault("mcpContextUris", [])
+entry.setdefault("mcpServers", {})
+entry.setdefault("projectOnboardingSeenCount", 0)
+entry["hasCompletedProjectOnboarding"] = True
+
+claude_json.parent.mkdir(parents=True, exist_ok=True)
+tmp_path = claude_json.with_suffix(claude_json.suffix + ".tmp")
+tmp_path.write_text(json.dumps(data, indent=2) + "\n")
+tmp_path.replace(claude_json)
+PY
+}
+
+# Claude Code prompts for workspace trust per project path, including companion worktrees.
+trust_claude_project "$REPO_DIR"
+trust_claude_project "$REPO_DIR/.exo/companions/idle-shutdown-observer"
+
 ROOT_PROMPT="$(python3 - "$SCRIPT_DIR/e2e-test.md" <<'PY'
 import pathlib
 import sys
@@ -123,7 +166,6 @@ PY
 cat > .exo/config.toml <<EOF
 default_role = "devswarm"
 wasm_name = "devswarm"
-shell_command = "bash"
 tmux_session = "$SESSION"
 root_agent_type = "claude"
 yolo = true
