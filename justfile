@@ -346,6 +346,15 @@ check-e2e-lifecycle:
     bash -n tests/e2e/lifecycle/run.sh
     bash -n tests/e2e/lifecycle/validate.sh
 
+# Run E2E root idle/shutdown convergence test
+e2e-idle-shutdown:
+    ./tests/e2e/idle-shutdown/run.sh
+
+# Check E2E root idle/shutdown scripts without launching the server
+check-e2e-idle-shutdown:
+    bash -n tests/e2e/idle-shutdown/run.sh
+    bash -n tests/e2e/idle-shutdown/validate.sh
+
 
 # Run E2E Chainlink SessionStart env failsafe test
 e2e-chainlink-env-failsafe:
