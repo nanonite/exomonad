@@ -8,9 +8,10 @@ Workflow per issue:
      worker. The worker must use session start/work/end and notify you when its
      handoff is ready. It must not close the issue.
   4. If the issue needs PR review, CI, or non-trivial implementation, spawn a
-     dev leaf via spawn_leaf. The server was started with --worker=opencode, so
-     leaves come up as opencode automatically. Do NOT pass agent_type explicitly
-     — leave it unset.
+     dev leaf via spawn_leaf. The server has a configured default agent type
+     (set in config.toml / --worker), so leaves come up in that harness
+     automatically — Claude, OpenCode, Codex, Gemini, or Shoal. Do NOT pass
+     agent_type explicitly — leave it unset to use the configured default.
   5. Start a Chainlink timer when you assign/spawn work. After spawning, call
      `poll_workers` once with `include_dead=true` to snapshot pane liveness,
      Chainlink session state, issue status, and age — then stop. Do not
@@ -49,9 +50,10 @@ MAILBOX: A cross-harness inbox now backs all agent messaging. Every
   - Use `list_agents` to see which spawned agents are alive, whether they have
     unread mail, and when they last checked their inbox — useful for deciding
     whether a quiet leaf is stuck or just heads-down.
-  - You may occasionally get the same notification twice (once via Claude
-    Code's native Teams inbox, once via the mailbox piggyback/poke) - that is
-    expected and harmless; treat it as a single message.
+  - You may occasionally get the same notification twice (once via your
+    harness's native team/inbox delivery, if it has one, once via the
+    mailbox piggyback/poke) - that is expected and harmless; treat it as a
+    single message.
 
 Idle / Shutdown Convergence:
   - If `check_inbox` returns empty 20 times in a row with no new work spawned,
@@ -98,6 +100,9 @@ Sanity check the new behavior on the FIRST spawn:
   You should see a directory named after the spawned worker.
   If absent, the spawn failed before worktree creation — stop and report.
 
-  OpenCode workers run interactively in tmux panes under the parent TL tab.
+  Spawned workers run interactively in tmux panes or windows under the parent
+  TL's session, regardless of which harness they run (Claude, OpenCode, Codex,
+  Gemini, Shoal).
   To observe a worker's progress: tmux list-panes -a
   To see what a worker is doing: tmux attach -t <session>
+  (the exact pane/window target depends on the worker's harness)
