@@ -5301,6 +5301,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reviewer_spawner_called_when_stale_changes_requested_review_was_missed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSpawner {
+            count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for CountingSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                _pr: &crate::services::pr_registry::PrEntry,
+            ) -> anyhow::Result<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let spawner = Arc::new(CountingSpawner {
+            count: call_count.clone(),
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
+        let branch = BranchName::try_from_str("main.feature-codex")
+            .expect("literal validated string is non-empty");
+        let mut watch_state =
+            WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0);
+        watch_state.reviewer_spawned = true;
+        watch_state.reviewer_disposed = true;
+        watcher.state.prs.lock().await.insert(1, watch_state);
+
+        let mut pr = test_pr_entry();
+        pr.last_head_sha = Some("def456".to_string());
+        let registry = test_registry(pr);
+        let mut observations = HashMap::new();
+        observations.insert(
+            1u64,
+            Observation {
+                head_sha: "def456".to_string(),
+                review_state: ForgejoReviewState::PendingReview,
+                comments: vec![],
+                reviews: vec![],
+                changes_requested_rounds: 1,
+                ci_status: CIStatus::Unknown,
+                forgejo_review_present: false,
+            },
+        );
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let state = watcher.state.prs.lock().await;
+        let pr_state = state.get(&1).unwrap();
+        assert!(pr_state.reviewer_spawned);
+        assert!(!pr_state.reviewer_disposed);
+        assert_eq!(pr_state.last_review_state, ForgejoReviewVerdict::None);
+        assert_eq!(pr_state.rounds, 1);
+        drop(state);
+
+        let persisted = watcher.read_watcher_state().await.unwrap();
+        let persisted_pr = persisted.prs.get(&1).unwrap();
+        assert_eq!(persisted_pr.rounds, 1);
+        assert_eq!(persisted_pr.last_head_sha.as_deref(), Some("def456"));
+    }
+
+    #[tokio::test]
     async fn test_process_observations_persists_last_observed_head_sha() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
