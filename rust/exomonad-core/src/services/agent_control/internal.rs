@@ -229,6 +229,10 @@ impl<
             }
         }
 
+        if let Some(config_env) = &self.forgejo_spawn_env {
+            config_env.apply_to(&mut env_vars);
+        }
+
         if role.as_str() == "reviewer" {
             if let Some(reviewer_token) = env_vars.get("FORGEJO_REVIEWER_TOKEN").cloned() {
                 env_vars.insert("FORGEJO_TOKEN".to_string(), reviewer_token.clone());
@@ -1683,6 +1687,73 @@ mod tests {
             env.get("FORGEJO_REVIEWER_TOKEN").map(String::as_str),
             Some("reviewer-token")
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_common_spawn_env_uses_config_forgejo_values_for_reviewer_role() {
+        let services = test_services(PathBuf::from("."));
+        let service = AgentControlService::new(services)
+            .with_birth_branch(
+                BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+            )
+            .with_forgejo_spawn_env(
+                ForgejoSpawnEnv::new(
+                    Some("http://forgejo.local:3000".to_string()),
+                    Some("config-author-token".to_string()),
+                    Some("config-reviewer-token".to_string()),
+                )
+                .with_repo("config-owner", "config-repo"),
+            );
+        let agent = AgentName::try_from_str("review-pr-7-codex")
+            .expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("review-pr-7").expect("literal validated string is non-empty");
+
+        std::env::set_var("FORGEJO_URL", "http://stale.local:3000");
+        std::env::set_var("FORGEJO_TOKEN", "stale-author-token");
+        std::env::set_var("GH_TOKEN", "stale-author-token");
+        std::env::set_var("FORGEJO_REVIEWER_TOKEN", "stale-reviewer-token");
+        let env = service.common_spawn_env(&agent, &session_id, &crate::domain::Role::reviewer());
+        std::env::remove_var("FORGEJO_URL");
+        std::env::remove_var("FORGEJO_TOKEN");
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("FORGEJO_REVIEWER_TOKEN");
+
+        assert_eq!(
+            env.get("FORGEJO_URL").map(String::as_str),
+            Some("http://forgejo.local:3000")
+        );
+        assert_eq!(
+            env.get("FORGEJO_HOST").map(String::as_str),
+            Some("forgejo.local:3000")
+        );
+        assert_eq!(
+            env.get("GH_HOST").map(String::as_str),
+            Some("forgejo.local:3000")
+        );
+        assert_eq!(
+            env.get("FORGEJO_REVIEWER_TOKEN").map(String::as_str),
+            Some("config-reviewer-token")
+        );
+        assert_eq!(
+            env.get("FORGEJO_TOKEN").map(String::as_str),
+            Some("config-reviewer-token"),
+            "reviewer role must use the reviewer token for Forgejo API writes"
+        );
+        assert_eq!(
+            env.get("GH_TOKEN").map(String::as_str),
+            Some("config-reviewer-token")
+        );
+        assert_eq!(
+            env.get("FORGEJO_OWNER").map(String::as_str),
+            Some("config-owner")
+        );
+        assert_eq!(
+            env.get("FORGEJO_REPO").map(String::as_str),
+            Some("config-repo")
+        );
+        assert_eq!(env.get("REPO").map(String::as_str), Some("config-repo"));
     }
 
     #[test]

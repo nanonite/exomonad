@@ -581,6 +581,85 @@ pub struct BatchCleanupResult {
 
 impl FFIBoundary for BatchCleanupResult {}
 
+#[derive(Clone, Debug, Default)]
+pub struct ForgejoSpawnEnv {
+    forgejo_url: Option<String>,
+    forgejo_token: Option<String>,
+    forgejo_reviewer_token: Option<String>,
+    repo_owner: Option<String>,
+    repo_name: Option<String>,
+}
+
+impl ForgejoSpawnEnv {
+    pub fn new(
+        forgejo_url: Option<String>,
+        forgejo_token: Option<String>,
+        forgejo_reviewer_token: Option<String>,
+    ) -> Self {
+        Self {
+            forgejo_url,
+            forgejo_token,
+            forgejo_reviewer_token,
+            repo_owner: None,
+            repo_name: None,
+        }
+    }
+
+    pub fn with_repo(mut self, owner: impl Into<String>, repo: impl Into<String>) -> Self {
+        self.repo_owner = Some(owner.into());
+        self.repo_name = Some(repo.into());
+        self
+    }
+
+    fn insert_non_empty(env_vars: &mut HashMap<String, String>, key: &str, value: &str) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            env_vars.insert(key.to_string(), trimmed.to_string());
+        }
+    }
+
+    fn apply_to(&self, env_vars: &mut HashMap<String, String>) {
+        if let Some(url) = self.forgejo_url.as_deref() {
+            Self::insert_non_empty(env_vars, "FORGEJO_URL", url);
+            if let Some(host) = forgejo_host_from_url(url) {
+                env_vars.insert("FORGEJO_HOST".to_string(), host.clone());
+                env_vars.insert("GH_HOST".to_string(), host);
+            }
+        }
+        if let Some(token) = self.forgejo_token.as_deref() {
+            Self::insert_non_empty(env_vars, "FORGEJO_TOKEN", token);
+            Self::insert_non_empty(env_vars, "GH_TOKEN", token);
+        }
+        if let Some(token) = self.forgejo_reviewer_token.as_deref() {
+            Self::insert_non_empty(env_vars, "FORGEJO_REVIEWER_TOKEN", token);
+        }
+        if let Some(owner) = self.repo_owner.as_deref() {
+            Self::insert_non_empty(env_vars, "FORGEJO_OWNER", owner);
+        }
+        if let Some(repo) = self.repo_name.as_deref() {
+            Self::insert_non_empty(env_vars, "FORGEJO_REPO", repo);
+            Self::insert_non_empty(env_vars, "REPO", repo);
+        }
+    }
+}
+
+fn forgejo_host_from_url(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let no_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let host = no_scheme.split('/').next().unwrap_or_default().trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 // ============================================================================
 // Service
 // ============================================================================
@@ -620,6 +699,8 @@ pub struct AgentControlService<C> {
     pub(crate) reviewer_model: Option<String>,
     /// Context file paths injected into the reviewer's task (e.g. CLAUDE.md, reviewer rules).
     pub(crate) reviewer_context: Vec<String>,
+    /// Forgejo environment sourced from loaded config, overriding stale parent process env.
+    pub(crate) forgejo_spawn_env: Option<ForgejoSpawnEnv>,
 }
 
 impl<
@@ -650,6 +731,7 @@ impl<
             reviewer_agent_type: AgentType::Claude,
             reviewer_model: None,
             reviewer_context: vec![],
+            forgejo_spawn_env: None,
         }
     }
 
@@ -721,6 +803,12 @@ impl<
     /// Set context file paths injected into the reviewer's task.
     pub fn with_reviewer_context(mut self, context: Vec<String>) -> Self {
         self.reviewer_context = context;
+        self
+    }
+
+    /// Set Forgejo env values from the loaded config for spawned agents.
+    pub fn with_forgejo_spawn_env(mut self, env: ForgejoSpawnEnv) -> Self {
+        self.forgejo_spawn_env = Some(env);
         self
     }
 

@@ -1160,6 +1160,16 @@ Run `exomonad recompile` first to build it.",
     agent_control = agent_control.with_reviewer_context(config.reviewer.context.clone());
     agent_control = agent_control
         .with_extra_mcp_servers(serialize_extra_mcp_servers(&config.extra_mcp_servers));
+    let mut forgejo_spawn_env = exomonad_core::services::agent_control::ForgejoSpawnEnv::new(
+        config.forgejo_url.clone(),
+        config.forgejo_token.clone(),
+        config.forgejo_reviewer_token.clone(),
+    );
+    if let Ok(repo_info) = exomonad_core::services::repo::get_repo_info(&project_dir).await {
+        forgejo_spawn_env =
+            forgejo_spawn_env.with_repo(repo_info.owner.to_string(), repo_info.repo.to_string());
+    }
+    agent_control = agent_control.with_forgejo_spawn_env(forgejo_spawn_env);
     let event_session_id = uuid::Uuid::new_v4().to_string();
     let agent_control = Arc::new(agent_control);
     // Shutdown signal shared by the /shutdown endpoint and shutdown_server effect.
