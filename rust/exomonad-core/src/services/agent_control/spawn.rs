@@ -499,14 +499,26 @@ pub(crate) fn render_reviewer_direct_api_section(
     format!(
         r#"
 
-Direct Forgejo API review path:
+Direct Forgejo review path:
 Use this path for the final verdict. Do not depend on local review files, approve_pr, request_changes, post_review_comment, or an ExoMonad socket.
+
+Prefer `fj` (Forgejo CLI, Rust binary) when available — fall back to `curl` if not.
 
 ```bash
 PR_NUMBER={pr_number}
 {repo_exports}REVIEW_TOKEN="${{FORGEJO_REVIEWER_TOKEN:-$FORGEJO_TOKEN}}"
 test -n "$FORGEJO_URL" && test -n "$REVIEW_TOKEN" && test -n "$FORGEJO_OWNER" && test -n "$FORGEJO_REPO"
 
+# --- fj CLI (preferred) ---
+# Inspect PR diff and metadata.
+fj pr view $PR_NUMBER
+# List changed files.
+fj pr files $PR_NUMBER
+# Submit verdict (replace --approve with --request-changes when blocking issues exist).
+fj pr review $PR_NUMBER --approve -c "LGTM. Verified: <what you checked>."
+# fj pr review $PR_NUMBER --request-changes -c "<blocking findings>"
+
+# --- curl fallback (if fj is unavailable) ---
 # PR metadata, including head SHA.
 curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
   "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER"
@@ -519,7 +531,7 @@ curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
 curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
   "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/raw/$HEAD_SHA/$FILE_PATH"
 
-# Final verdict. Use REQUEST_CHANGES instead of APPROVED when blocking issues exist.
+# Final verdict via curl.
 curl -fsS -X POST -H "Authorization: token $REVIEW_TOKEN" -H "Content-Type: application/json" \
   --data '{{"event":"APPROVED","body":"LGTM. Verified: <what you checked>."}}' \
   "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/reviews"

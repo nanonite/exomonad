@@ -55,6 +55,11 @@ review-loop timeout, stuck, or failed signals in this TL prompt.
 If `[MERGE READY]` never arrives but you believe the PR is ready, self-diagnose via Forgejo before escalating to human:
 
 ```bash
+# Prefer fj CLI (Forgejo Rust binary) if available:
+fj pr view $PR_NUMBER          # review state + metadata
+fj pr checks $PR_NUMBER        # CI status
+
+# Fallback: direct Forgejo API with curl
 # Check review state
 curl -s -H "Authorization: token $FORGEJO_REVIEWER_TOKEN" \
   "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$REPO/pulls/$PR_NUMBER/reviews"

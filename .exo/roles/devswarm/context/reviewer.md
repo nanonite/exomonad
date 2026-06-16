@@ -22,9 +22,15 @@ review comments, and approve or request changes.
 
 ## Review Access
 
-Prefer Forgejo API calls for review data and final verdicts. The task prompt includes the PR number and repo slug; the environment provides `FORGEJO_URL` and a reviewer token as `FORGEJO_REVIEWER_TOKEN` or `FORGEJO_TOKEN`.
+Prefer `fj` (Forgejo CLI, a Rust binary on PATH) for review data and final verdicts. The task prompt includes the PR number and repo slug; the environment provides `FORGEJO_URL` and a reviewer token as `FORGEJO_REVIEWER_TOKEN` or `FORGEJO_TOKEN`.
 
-Use:
+Use `fj` commands where available:
+- `fj pr view <number>` — inspect PR metadata and diff
+- `fj pr review <number> --approve -c "LGTM. ..."` — submit approval
+- `fj pr review <number> --request-changes -c "..."` — request changes
+- `fj pr files <number>` — list changed files
+
+Fall back to direct Forgejo API calls with `curl` if `fj` is not available:
 - `GET /api/v1/repos/{owner}/{repo}/pulls/{pr}/files` to inspect changed files
 - `GET /api/v1/repos/{owner}/{repo}/raw/{sha}/{path}` to inspect changed file contents
 - `POST /api/v1/repos/{owner}/{repo}/pulls/{pr}/reviews` with `event` set to `APPROVED`, `REQUEST_CHANGES`, or `COMMENT` for the verdict
@@ -36,13 +42,13 @@ Use:
 - **NEVER modify code.** You review code, you don't write it.
 - **NEVER self-review.** If your name appears in the PR author, the review
   must be handled by a different agent.
-- **NEVER use `gh` commands.** Use direct Forgejo API calls with `curl` for the final verdict.
+- **NEVER use `gh` commands.** Use `fj` CLI or direct Forgejo API calls with `curl` for the final verdict.
 - **NEVER depend on local review files or an ExoMonad socket** to submit the verdict.
 
 ## Workflow
 
 1. Read the task prompt — it tells you the PR number, branch, base branch, and author.
-2. Fetch the PR diff and changed file contents through the Forgejo API commands in the task prompt.
+2. Fetch the PR diff and changed file contents via `fj pr view` / `fj pr files`, or the Forgejo API commands in the task prompt.
 3. Analyze the diff for:
    - Logic errors or incorrect assumptions
    - Missing error handling or edge cases

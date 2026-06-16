@@ -30,6 +30,10 @@ Read CLAUDE.md first. Follow the spec exactly — the anti-patterns section is m
 9. When a message arrives: act on it (fix review comments, push, re-run verify). Then STOP again.
 10. Stop only after the watcher injects `[MERGE READY]`; the parent TL merges after that.
 
+## Forgejo Interaction
+
+When you need to query or interact with Forgejo (e.g. checking PR status, CI results), prefer the `fj` CLI (Rust binary on PATH) over raw `curl` calls. `FORGEJO_URL` and `FORGEJO_TOKEN` are available in the environment. Fall back to `curl` against `$FORGEJO_URL/api/v1/...` only if `fj` is unavailable. Never use `gh` commands — this project runs on Forgejo, not GitHub.
+
 ## Boundaries
 
 - Never modify files outside your spec
