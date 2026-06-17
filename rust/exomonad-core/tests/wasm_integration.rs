@@ -1205,6 +1205,29 @@ async fn wasm_spawn_leaf_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn wasm_spawn_leaf_omits_agent_type_for_server_default() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_leaf",
+        json!({
+            "name": "rust-handler",
+            "task": "Implement the Rust handler",
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_leaf");
+    assert_eq!(
+        output["result"]["agent_type"], "unknown",
+        "mock handler echoes the proto request; omitted agent_type must stay UNSPECIFIED so the real handler can use the configured worker default"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn wasm_spawn_leaf_passes_agent_type() {
     let runtime = build_test_runtime().await;
 

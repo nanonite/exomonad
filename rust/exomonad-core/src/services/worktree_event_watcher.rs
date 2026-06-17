@@ -23,7 +23,8 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
-const DEFAULT_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(300);
+const DEFAULT_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(600);
 
 fn inbox_poke_message(unread_count: usize) -> String {
     format!(
@@ -1169,6 +1170,15 @@ where
             )
             .await;
             if outcome.is_success() {
+                self.ctx
+                    .inbox_store()
+                    .record_poke(
+                        candidate.agent_id.as_str(),
+                        candidate.newest_message_id,
+                        self.inbox_poke_interval.as_secs(),
+                        MAX_INBOX_POKE_INTERVAL.as_secs(),
+                    )
+                    .context("failed to record inbox poke metadata")?;
                 info!(
                     agent = %candidate.agent_id,
                     unread_count = candidate.unread_count,

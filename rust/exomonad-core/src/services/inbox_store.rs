@@ -20,6 +20,7 @@ pub struct InboxMessageRecord {
 pub struct InboxPokeCandidate {
     pub agent_id: String,
     pub unread_count: usize,
+    pub newest_message_id: i64,
 }
 
 pub struct InboxStore {
@@ -78,10 +79,11 @@ impl InboxStore {
         summary: Option<&str>,
     ) -> Result<i64> {
         let created_at = now_epoch_secs();
+        let normalized_to_agent = normalize_agent_id(to_agent);
         let conn = self.connection()?;
         conn.execute(
             "INSERT INTO messages (from_agent, to_agent, content, summary, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![from_agent, to_agent, content, summary, created_at],
+            params![from_agent, normalized_to_agent, content, summary, created_at],
         )
         .context("failed to insert inbox message")?;
         Ok(conn.last_insert_rowid())
@@ -89,6 +91,7 @@ impl InboxStore {
 
     pub fn peek_unnotified(&self, agent_id: &str) -> Result<Vec<InboxMessageRecord>> {
         let now = now_epoch_secs();
+        let normalized_agent_id = normalize_agent_id(agent_id);
         let mut conn = self.connection()?;
         let tx = conn
             .transaction()
@@ -99,7 +102,7 @@ impl InboxStore {
              FROM messages
              WHERE to_agent = ?1 AND read_at IS NULL AND notified_at IS NULL
              ORDER BY created_at ASC, id ASC",
-            agent_id,
+            normalized_agent_id.as_ref(),
         )?;
         for message in &messages {
             tx.execute(
@@ -115,6 +118,7 @@ impl InboxStore {
 
     pub fn drain_unread(&self, agent_id: &str) -> Result<Vec<InboxMessageRecord>> {
         let now = now_epoch_secs();
+        let normalized_agent_id = normalize_agent_id(agent_id);
         let mut conn = self.connection()?;
         let tx = conn
             .transaction()
@@ -125,18 +129,18 @@ impl InboxStore {
              FROM messages
              WHERE to_agent = ?1 AND read_at IS NULL
              ORDER BY created_at ASC, id ASC",
-            agent_id,
+            normalized_agent_id.as_ref(),
         )?;
         tx.execute(
             "UPDATE messages SET read_at = ?1 WHERE to_agent = ?2 AND read_at IS NULL",
-            params![now, agent_id],
+            params![now, normalized_agent_id.as_ref()],
         )
         .context("failed to mark inbox messages as read")?;
         tx.execute(
-            "INSERT INTO agent_inbox_meta (agent_id, last_check_inbox_at)
-             VALUES (?1, ?2)
+            "INSERT INTO agent_inbox_meta (agent_id, last_check_inbox_at, last_poke_at, last_poke_message_id, poke_backoff_secs)
+             VALUES (?1, ?2, NULL, NULL, NULL)
              ON CONFLICT(agent_id) DO UPDATE SET last_check_inbox_at = excluded.last_check_inbox_at",
-            params![agent_id, now],
+            params![normalized_agent_id.as_ref(), now],
         )
         .context("failed to update inbox metadata")?;
         tx.commit()
@@ -144,39 +148,137 @@ impl InboxStore {
         Ok(messages)
     }
 
-    pub fn agents_needing_poke(&self, threshold_secs: u64) -> Result<Vec<InboxPokeCandidate>> {
-        let stale_before =
-            now_epoch_secs().saturating_sub(i64::try_from(threshold_secs).unwrap_or(i64::MAX));
+    pub fn agents_needing_poke(&self, base_interval_secs: u64) -> Result<Vec<InboxPokeCandidate>> {
+        let base_interval_secs = i64::try_from(base_interval_secs).unwrap_or(i64::MAX);
+        let now = now_epoch_secs();
         let conn = self.connection()?;
         let mut stmt = conn
             .prepare(
-                "SELECT m.to_agent, COUNT(*) AS unread_count
+                "SELECT m.to_agent,
+                        COUNT(*) AS unread_count,
+                        MAX(m.id) AS newest_message_id,
+                        MAX(m.created_at) AS newest_message_at,
+                        meta.last_check_inbox_at,
+                        meta.last_poke_at,
+                        meta.last_poke_message_id,
+                        meta.poke_backoff_secs
                  FROM messages m
                  LEFT JOIN agent_inbox_meta meta ON meta.agent_id = m.to_agent
                  WHERE m.read_at IS NULL
-                   AND (meta.last_check_inbox_at IS NULL OR meta.last_check_inbox_at <= ?1)
                  GROUP BY m.to_agent
                  ORDER BY m.to_agent ASC",
             )
             .context("failed to prepare inbox poke query")?;
         let rows = stmt
-            .query_map(params![stale_before], |row| {
-                let count: i64 = row.get(1)?;
-                Ok(InboxPokeCandidate {
-                    agent_id: row.get(0)?,
-                    unread_count: usize::try_from(count).unwrap_or(usize::MAX),
-                })
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
             })
             .context("failed to query inbox poke candidates")?;
-        collect_rows(rows)
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (
+                agent_id,
+                unread_count,
+                newest_message_id,
+                newest_message_at,
+                last_check_inbox_at,
+                last_poke_at,
+                last_poke_message_id,
+                poke_backoff_secs,
+            ) = row.context("failed to decode inbox poke candidate")?;
+
+            let has_new_mail_since_last_poke = last_poke_message_id != Some(newest_message_id);
+            let due_at = if has_new_mail_since_last_poke {
+                newest_message_at.saturating_add(base_interval_secs)
+            } else {
+                let backoff_secs = poke_backoff_secs.unwrap_or(base_interval_secs);
+                last_poke_at
+                    .unwrap_or(newest_message_at)
+                    .saturating_add(backoff_secs)
+            };
+            let checked_after_due =
+                last_check_inbox_at.is_some_and(|checked_at| checked_at >= due_at);
+            if checked_after_due || now < due_at {
+                continue;
+            }
+
+            candidates.push(InboxPokeCandidate {
+                agent_id,
+                unread_count: usize::try_from(unread_count).unwrap_or(usize::MAX),
+                newest_message_id,
+            });
+        }
+        Ok(candidates)
+    }
+
+    pub fn record_poke(
+        &self,
+        agent_id: &str,
+        newest_message_id: i64,
+        base_interval_secs: u64,
+        max_interval_secs: u64,
+    ) -> Result<()> {
+        let normalized_agent_id = normalize_agent_id(agent_id);
+        let now = now_epoch_secs();
+        let base_interval_secs = i64::try_from(base_interval_secs).unwrap_or(i64::MAX);
+        let max_interval_secs = i64::try_from(max_interval_secs).unwrap_or(i64::MAX);
+        let conn = self.connection()?;
+        let (last_poke_message_id, poke_backoff_secs): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT last_poke_message_id, poke_backoff_secs
+                 FROM agent_inbox_meta
+                 WHERE agent_id = ?1",
+                params![normalized_agent_id.as_ref()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((None, None));
+        let next_backoff_secs = if last_poke_message_id == Some(newest_message_id) {
+            poke_backoff_secs
+                .unwrap_or(base_interval_secs)
+                .saturating_mul(2)
+                .min(max_interval_secs)
+        } else {
+            base_interval_secs
+        };
+        conn.execute(
+            "INSERT INTO agent_inbox_meta (
+                 agent_id,
+                 last_check_inbox_at,
+                 last_poke_at,
+                 last_poke_message_id,
+                 poke_backoff_secs
+             ) VALUES (?1, NULL, ?2, ?3, ?4)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                 last_poke_at = excluded.last_poke_at,
+                 last_poke_message_id = excluded.last_poke_message_id,
+                 poke_backoff_secs = excluded.poke_backoff_secs",
+            params![
+                normalized_agent_id.as_ref(),
+                now,
+                newest_message_id,
+                next_backoff_secs
+            ],
+        )
+        .context("failed to record inbox poke metadata")?;
+        Ok(())
     }
 
     pub fn has_unread(&self, agent_id: &str) -> Result<bool> {
+        let normalized_agent_id = normalize_agent_id(agent_id);
         let conn = self.connection()?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM messages WHERE to_agent = ?1 AND read_at IS NULL",
-                params![agent_id],
+                params![normalized_agent_id.as_ref()],
                 |row| row.get(0),
             )
             .context("failed to query unread inbox count")?;
@@ -184,12 +286,13 @@ impl InboxStore {
     }
 
     pub fn last_check_inbox_at(&self, agent_id: &str) -> Result<Option<i64>> {
+        let normalized_agent_id = normalize_agent_id(agent_id);
         let conn = self.connection()?;
         let mut stmt = conn
             .prepare("SELECT last_check_inbox_at FROM agent_inbox_meta WHERE agent_id = ?1")
             .context("failed to prepare inbox metadata query")?;
         let mut rows = stmt
-            .query(params![agent_id])
+            .query(params![normalized_agent_id.as_ref()])
             .context("failed to query inbox metadata")?;
         match rows.next().context("failed to read inbox metadata row")? {
             Some(row) => row
@@ -200,7 +303,7 @@ impl InboxStore {
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.connection()?;
+        let mut conn = self.connection()?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS messages (
@@ -217,10 +320,17 @@ impl InboxStore {
                ON messages (to_agent, read_at, notified_at, created_at, id);
              CREATE TABLE IF NOT EXISTS agent_inbox_meta (
                agent_id            TEXT    PRIMARY KEY,
-               last_check_inbox_at INTEGER
+               last_check_inbox_at INTEGER,
+               last_poke_at        INTEGER,
+               last_poke_message_id INTEGER,
+               poke_backoff_secs   INTEGER
              );",
         )
         .context("failed to migrate inbox database")?;
+        ensure_column(&conn, "agent_inbox_meta", "last_poke_at", "INTEGER")?;
+        ensure_column(&conn, "agent_inbox_meta", "last_poke_message_id", "INTEGER")?;
+        ensure_column(&conn, "agent_inbox_meta", "poke_backoff_secs", "INTEGER")?;
+        normalize_existing_agent_ids(&mut conn)?;
         Ok(())
     }
 
@@ -228,6 +338,140 @@ impl InboxStore {
         self.conn
             .lock()
             .map_err(|_| anyhow::anyhow!("inbox database mutex poisoned"))
+    }
+}
+
+fn normalize_agent_id(agent_id: &str) -> std::borrow::Cow<'_, str> {
+    if agent_id == "main" {
+        return std::borrow::Cow::Borrowed("root");
+    }
+    match agent_id.rsplit_once('.') {
+        Some((_, bare)) if !bare.is_empty() => std::borrow::Cow::Borrowed(bare),
+        _ => std::borrow::Cow::Borrowed(agent_id),
+    }
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn
+        .prepare(&pragma)
+        .with_context(|| format!("failed to inspect schema for {table}"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("failed to read schema for {table}"))?;
+    for existing in columns {
+        if existing.context("failed to decode schema column name")? == column {
+            return Ok(());
+        }
+    }
+
+    let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}");
+    conn.execute(&alter, [])
+        .with_context(|| format!("failed to add {table}.{column}"))?;
+    Ok(())
+}
+
+fn normalize_existing_agent_ids(conn: &mut Connection) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .context("failed to start inbox normalization transaction")?;
+
+    let mut message_stmt = tx
+        .prepare("SELECT id, to_agent FROM messages")
+        .context("failed to prepare inbox message normalization query")?;
+    let message_rows = message_stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("failed to query inbox messages for normalization")?;
+    let mut message_updates = Vec::new();
+    for row in message_rows {
+        let (id, to_agent) = row.context("failed to decode inbox message normalization row")?;
+        let normalized = normalize_agent_id(&to_agent);
+        if normalized.as_ref() != to_agent {
+            message_updates.push((id, normalized.into_owned()));
+        }
+    }
+    drop(message_stmt);
+    for (id, normalized_to_agent) in message_updates {
+        tx.execute(
+            "UPDATE messages SET to_agent = ?1 WHERE id = ?2",
+            params![normalized_to_agent, id],
+        )
+        .context("failed to normalize inbox message recipient")?;
+    }
+
+    #[derive(Default)]
+    struct MetaAccumulator {
+        last_check_inbox_at: Option<i64>,
+        last_poke_at: Option<i64>,
+        last_poke_message_id: Option<i64>,
+        poke_backoff_secs: Option<i64>,
+    }
+
+    let mut meta_stmt = tx
+        .prepare(
+            "SELECT agent_id, last_check_inbox_at, last_poke_at, last_poke_message_id, poke_backoff_secs
+             FROM agent_inbox_meta",
+        )
+        .context("failed to prepare inbox metadata normalization query")?;
+    let meta_rows = meta_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })
+        .context("failed to query inbox metadata for normalization")?;
+    let mut merged = std::collections::BTreeMap::<String, MetaAccumulator>::new();
+    for row in meta_rows {
+        let (agent_id, last_check_inbox_at, last_poke_at, last_poke_message_id, poke_backoff_secs) =
+            row.context("failed to decode inbox metadata normalization row")?;
+        let normalized_agent_id = normalize_agent_id(&agent_id).into_owned();
+        let entry = merged.entry(normalized_agent_id).or_default();
+        entry.last_check_inbox_at = max_option(entry.last_check_inbox_at, last_check_inbox_at);
+        entry.last_poke_at = max_option(entry.last_poke_at, last_poke_at);
+        entry.last_poke_message_id = max_option(entry.last_poke_message_id, last_poke_message_id);
+        entry.poke_backoff_secs = max_option(entry.poke_backoff_secs, poke_backoff_secs);
+    }
+    drop(meta_stmt);
+
+    tx.execute("DELETE FROM agent_inbox_meta", [])
+        .context("failed to clear inbox metadata before normalization rewrite")?;
+    for (agent_id, meta) in merged {
+        tx.execute(
+            "INSERT INTO agent_inbox_meta (
+                 agent_id,
+                 last_check_inbox_at,
+                 last_poke_at,
+                 last_poke_message_id,
+                 poke_backoff_secs
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                agent_id,
+                meta.last_check_inbox_at,
+                meta.last_poke_at,
+                meta.last_poke_message_id,
+                meta.poke_backoff_secs
+            ],
+        )
+        .context("failed to rewrite normalized inbox metadata")?;
+    }
+
+    tx.commit()
+        .context("failed to commit inbox normalization transaction")?;
+    Ok(())
+}
+
+fn max_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
     }
 }
 
@@ -317,11 +561,170 @@ mod tests {
             .write_message("root", "worker-2", "three", None)
             .unwrap();
         store.drain_unread("worker-2").unwrap();
+        {
+            let conn = store.connection().unwrap();
+            conn.execute(
+                "UPDATE messages SET created_at = ?1 WHERE to_agent = 'worker-1'",
+                params![now_epoch_secs() - 301],
+            )
+            .unwrap();
+        }
 
         let candidates = store.agents_needing_poke(300).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].agent_id, "worker-1");
         assert_eq!(candidates[0].unread_count, 2);
+    }
+
+    #[test]
+    fn branch_qualified_recipients_drain_as_bare_agent_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InboxStore::open(dir.path()).unwrap();
+
+        let id = store
+            .write_message(
+                "root",
+                "main.worker-1",
+                "please check this",
+                Some("check this"),
+            )
+            .unwrap();
+
+        let drained = store.drain_unread("worker-1").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].id, id);
+        assert_eq!(drained[0].to_agent, "worker-1");
+        assert!(!store.has_unread("main.worker-1").unwrap());
+    }
+
+    #[test]
+    fn root_birth_branch_normalizes_to_root_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InboxStore::open(dir.path()).unwrap();
+
+        store
+            .write_message("worker-1", "main", "done", None)
+            .unwrap();
+
+        let drained = store.drain_unread("root").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].to_agent, "root");
+    }
+
+    #[test]
+    fn legacy_branch_qualified_rows_are_normalized_on_migrate() {
+        let store = InboxStore::open_in_memory().unwrap();
+        {
+            let conn = store.connection().unwrap();
+            conn.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, summary, created_at)
+                 VALUES ('root', 'main.worker-1', 'hello', NULL, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_inbox_meta (agent_id, last_check_inbox_at)
+                 VALUES ('main.worker-1', 5)",
+                [],
+            )
+            .unwrap();
+        }
+
+        store.migrate().unwrap();
+
+        let drained = store.drain_unread("worker-1").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].to_agent, "worker-1");
+        assert!(store
+            .last_check_inbox_at("main.worker-1")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn inbox_poke_backoff_doubles_without_new_mail_and_resets_on_new_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = InboxStore::open(dir.path()).unwrap();
+
+        let first_id = store
+            .write_message("root", "worker-1", "one", None)
+            .unwrap();
+        {
+            let conn = store.connection().unwrap();
+            conn.execute(
+                "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+                params![now_epoch_secs() - 31, first_id],
+            )
+            .unwrap();
+        }
+
+        let initial = store.agents_needing_poke(30).unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].newest_message_id, first_id);
+
+        store.record_poke("worker-1", first_id, 30, 600).unwrap();
+        let after_first_poke = store.agents_needing_poke(30).unwrap();
+        assert!(after_first_poke.is_empty());
+
+        {
+            let conn = store.connection().unwrap();
+            conn.execute(
+                "UPDATE agent_inbox_meta SET last_poke_at = ?1 WHERE agent_id = 'worker-1'",
+                params![now_epoch_secs() - 31],
+            )
+            .unwrap();
+        }
+
+        let same_mail = store.agents_needing_poke(30).unwrap();
+        assert_eq!(same_mail.len(), 1);
+        store.record_poke("worker-1", first_id, 30, 600).unwrap();
+
+        {
+            let conn = store.connection().unwrap();
+            let backoff: Option<i64> = conn
+                .query_row(
+                    "SELECT poke_backoff_secs FROM agent_inbox_meta WHERE agent_id = 'worker-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(backoff, Some(60));
+            conn.execute(
+                "UPDATE agent_inbox_meta SET last_poke_at = ?1 WHERE agent_id = 'worker-1'",
+                params![now_epoch_secs() - 61],
+            )
+            .unwrap();
+        }
+
+        let second_due = store.agents_needing_poke(30).unwrap();
+        assert_eq!(second_due.len(), 1);
+
+        let second_id = store
+            .write_message("root", "worker-1", "two", None)
+            .unwrap();
+        {
+            let conn = store.connection().unwrap();
+            conn.execute(
+                "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+                params![now_epoch_secs() - 31, second_id],
+            )
+            .unwrap();
+        }
+
+        let reset_due = store.agents_needing_poke(30).unwrap();
+        assert_eq!(reset_due.len(), 1);
+        assert_eq!(reset_due[0].newest_message_id, second_id);
+        store.record_poke("worker-1", second_id, 30, 600).unwrap();
+
+        let conn = store.connection().unwrap();
+        let backoff: Option<i64> = conn
+            .query_row(
+                "SELECT poke_backoff_secs FROM agent_inbox_meta WHERE agent_id = 'worker-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backoff, Some(30));
     }
 
     #[test]

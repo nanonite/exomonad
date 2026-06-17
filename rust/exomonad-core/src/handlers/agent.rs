@@ -379,6 +379,24 @@ fn convert_agent_type(t: AgentType) -> EffectResult<ServiceAgentType> {
     }
 }
 
+fn convert_agent_type_or_default(t: AgentType, default_type: ServiceAgentType) -> ServiceAgentType {
+    match t {
+        AgentType::Unspecified => default_type,
+        _ => convert_agent_type(t).unwrap_or(default_type),
+    }
+}
+
+fn proto_agent_type_label(t: AgentType) -> &'static str {
+    match t {
+        AgentType::Claude => "claude",
+        AgentType::Gemini => "gemini",
+        AgentType::Shoal => "shoal",
+        AgentType::Opencode => "opencode",
+        AgentType::Codex => "codex",
+        AgentType::Unspecified => "unspecified",
+    }
+}
+
 fn parse_issue_number(issue: &str) -> EffectResult<IssueNumber> {
     let n: u64 = issue
         .parse()
@@ -599,11 +617,21 @@ impl<
     ) -> EffectResult<SpawnWorkerResponse> {
         self.ensure_tl_spawn_preflight(ctx).await?;
         let default_type = self.service.default_spawn_agent_type();
+        let requested_agent_type = req.agent_type();
+        let effective_agent_type =
+            convert_agent_type_or_default(requested_agent_type, default_type);
+        info!(
+            requested_agent_type = proto_agent_type_label(requested_agent_type),
+            default_agent_type = default_type.suffix(),
+            effective_agent_type = effective_agent_type.suffix(),
+            name = %req.name,
+            "Resolved spawn_worker agent type"
+        );
         let options = SpawnWorkerOptions {
             name: AgentName::try_from_str(req.name.as_str())
                 .expect("validated string input is non-empty"),
             prompt: req.prompt.clone(),
-            agent_type: convert_agent_type(req.agent_type()).unwrap_or(default_type),
+            agent_type: effective_agent_type,
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -701,12 +729,22 @@ impl<
         };
 
         let default_type = self.service.default_spawn_agent_type();
+        let requested_agent_type = req.agent_type();
+        let effective_agent_type =
+            convert_agent_type_or_default(requested_agent_type, default_type);
+        info!(
+            requested_agent_type = proto_agent_type_label(requested_agent_type),
+            default_agent_type = default_type.suffix(),
+            effective_agent_type = effective_agent_type.suffix(),
+            branch_name = %req.branch_name,
+            "Resolved spawn_subtree agent type"
+        );
         let options = SpawnSubtreeOptions {
             task: req.task.clone(),
             branch_name: req.branch_name.clone(),
             parent_session_id,
             role: non_empty(req.role.clone()).map(crate::domain::Role::new),
-            agent_type: convert_agent_type(req.agent_type()).unwrap_or(default_type),
+            agent_type: effective_agent_type,
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -973,11 +1011,21 @@ impl<
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
         self.ensure_tl_spawn_preflight(ctx).await?;
         let default_type = self.service.default_spawn_agent_type();
+        let requested_agent_type = req.agent_type();
+        let effective_agent_type =
+            convert_agent_type_or_default(requested_agent_type, default_type);
+        info!(
+            requested_agent_type = proto_agent_type_label(requested_agent_type),
+            default_agent_type = default_type.suffix(),
+            effective_agent_type = effective_agent_type.suffix(),
+            branch_name = %req.branch_name,
+            "Resolved spawn_leaf_subtree agent type"
+        );
         let options = SpawnLeafOptions {
             task: req.task.clone(),
             branch_name: req.branch_name.clone(),
             role: non_empty(req.role.clone()).map(crate::domain::Role::new),
-            agent_type: convert_agent_type(req.agent_type()).unwrap_or(default_type),
+            agent_type: effective_agent_type,
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -2158,6 +2206,26 @@ mod tests {
             ServiceAgentType::Codex
         );
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
+    }
+
+    #[test]
+    fn unspecified_agent_type_uses_configured_spawn_default() {
+        assert_eq!(
+            convert_agent_type_or_default(AgentType::Unspecified, ServiceAgentType::OpenCode),
+            ServiceAgentType::OpenCode
+        );
+        assert_eq!(
+            convert_agent_type_or_default(AgentType::Unspecified, ServiceAgentType::Codex),
+            ServiceAgentType::Codex
+        );
+    }
+
+    #[test]
+    fn explicit_agent_type_overrides_configured_spawn_default() {
+        assert_eq!(
+            convert_agent_type_or_default(AgentType::Claude, ServiceAgentType::OpenCode),
+            ServiceAgentType::Claude
+        );
     }
 
     #[tokio::test]

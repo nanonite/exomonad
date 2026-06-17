@@ -104,4 +104,24 @@ mod tests {
         assert!(!services.inbox_store.has_unread("agent-a").unwrap());
         assert!(services.inbox_store.has_unread("agent-b").unwrap());
     }
+
+    #[tokio::test]
+    async fn check_drains_branch_qualified_mail_for_bare_agent_name() {
+        let services = Arc::new(Services::test());
+        services
+            .inbox_store
+            .write_message("sender", "main.agent-a", "hello", Some("summary"))
+            .unwrap();
+
+        let handler = InboxHandler::new(services.clone());
+        let result = handler
+            .check(InboxCheckEffect {}, &test_ctx("agent-a"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].from_agent, "sender");
+        assert_eq!(result.messages[0].content, "hello");
+        assert!(!services.inbox_store.has_unread("agent-a").unwrap());
+    }
 }

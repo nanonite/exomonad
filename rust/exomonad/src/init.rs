@@ -45,6 +45,60 @@ fn watcher_dashboard_command(cwd: &Path) -> Result<String> {
     Ok("exomonad watch".to_string())
 }
 
+fn redact_init_argv(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut redact_next = false;
+    args.into_iter()
+        .map(|arg| {
+            if redact_next {
+                redact_next = false;
+                return "<redacted>".to_string();
+            }
+            let lower = arg.to_ascii_lowercase();
+            let sensitive = ["token", "secret", "password", "api-key", "api_key"]
+                .iter()
+                .any(|needle| lower.contains(needle));
+            if sensitive && !arg.contains('=') {
+                redact_next = true;
+            }
+            if sensitive {
+                match arg.split_once('=') {
+                    Some((flag, _)) => format!("{flag}=<redacted>"),
+                    None => arg,
+                }
+            } else {
+                arg
+            }
+        })
+        .collect()
+}
+
+fn append_init_invocation_log(cwd: &Path, config: &Config, argv: &[String]) -> Result<()> {
+    let log_dir = cwd.join(".exo/logs");
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create init log directory {}", log_dir.display()))?;
+    let payload = serde_json::json!({
+        "timestamp_ms": current_time_millis(),
+        "argv": argv,
+        "session": config.tmux_session.as_str(),
+        "resolved": {
+            "root_agent_type": agent_type_str(config.root_agent_type),
+            "spawn_agent_type": agent_type_str(config.spawn_agent_type),
+            "reviewer_agent_type": agent_type_str(config.reviewer.agent_type),
+            "root_model": config.model.as_deref(),
+            "opencode_tl_model": config.opencode.tl_model.as_deref(),
+            "opencode_worker_model": config.opencode.worker_model.as_deref(),
+            "reviewer_model": config.reviewer.model.as_deref(),
+        }
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("init.jsonl"))?;
+    use std::io::Write as _;
+    writeln!(file, "{}", serde_json::to_string(&payload)?)?;
+    Ok(())
+}
+
 const WATCHER_WINDOW_NAME: &str = "Watcher";
 
 fn has_watcher_dashboard_window<'a>(window_names: impl IntoIterator<Item = &'a str>) -> bool {
@@ -608,6 +662,19 @@ pub async fn run(
             config.reviewer.agent_type,
             config.reviewer.model.as_deref(),
         )?;
+    }
+
+    let init_argv = redact_init_argv(std::env::args().collect::<Vec<_>>());
+    if let Err(e) = append_init_invocation_log(&cwd, &config, &init_argv) {
+        warn!(error = %e, "Failed to append init invocation log");
+    } else {
+        info!(
+            root_agent_type = agent_type_str(config.root_agent_type),
+            spawn_agent_type = agent_type_str(config.spawn_agent_type),
+            reviewer_agent_type = agent_type_str(config.reviewer.agent_type),
+            opencode_worker_model = ?config.opencode.worker_model,
+            "Resolved exomonad init agent configuration"
+        );
     }
 
     // Check OTel endpoint reachability if configured
@@ -1944,6 +2011,68 @@ mod tests {
 
         assert!(log_path.exists());
         assert_eq!(command, "exomonad watch");
+    }
+
+    #[test]
+    fn redact_init_argv_redacts_sensitive_flag_values() {
+        let redacted = redact_init_argv(vec![
+            "exomonad".to_string(),
+            "init".to_string(),
+            "--worker".to_string(),
+            "opencode".to_string(),
+            "--api-key".to_string(),
+            "secret-value".to_string(),
+            "--token=abc123".to_string(),
+        ]);
+
+        assert_eq!(
+            redacted,
+            vec![
+                "exomonad".to_string(),
+                "init".to_string(),
+                "--worker".to_string(),
+                "opencode".to_string(),
+                "--api-key".to_string(),
+                "<redacted>".to_string(),
+                "--token=<redacted>".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_init_invocation_log_records_resolved_worker_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.tmux_session = "RustDebuggerRepo".to_string();
+        config.root_agent_type = AgentType::Claude;
+        config.spawn_agent_type = AgentType::OpenCode;
+        config.reviewer.agent_type = AgentType::Codex;
+        config.model = Some("sonnet".to_string());
+        config.opencode.worker_model = Some("opencode-go/deepseek-v4-pro".to_string());
+
+        append_init_invocation_log(
+            tmp.path(),
+            &config,
+            &[
+                "exomonad".to_string(),
+                "init".to_string(),
+                "--worker".to_string(),
+                "opencode".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(tmp.path().join(".exo/logs/init.jsonl")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+
+        assert_eq!(value["resolved"]["root_agent_type"], "claude");
+        assert_eq!(value["resolved"]["spawn_agent_type"], "opencode");
+        assert_eq!(value["resolved"]["reviewer_agent_type"], "codex");
+        assert_eq!(
+            value["resolved"]["opencode_worker_model"],
+            "opencode-go/deepseek-v4-pro"
+        );
+        assert_eq!(value["argv"][2], "--worker");
     }
 
     #[test]

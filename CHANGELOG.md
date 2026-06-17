@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix worker agent selection during init (#507)
 - Reviewer/spawned-agent envs lack FORGEJO_URL/FORGEJO_TOKEN/FORGEJO_REVIEWER_TOKEN when config changes after init (#504)
 - Fix Chainlink database selection for leaf agents (#475)
 - Reviewer not re-spawned after leaf pushes fixes following ChangesRequested (#474)
