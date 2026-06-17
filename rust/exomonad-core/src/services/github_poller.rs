@@ -503,10 +503,12 @@ impl<
                 pr_number: pr_num,
             } => {
                 let agent_slug = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
-                let parent_session_id = branch
-                    .rsplit_once('.')
-                    .map(|(parent, _)| parent.to_string())
-                    .unwrap_or_else(|| "root".to_string());
+                let parent_session_id = match branch.rsplit_once('.') {
+                    Some((parent, _)) => {
+                        crate::services::delivery::canonical_parent_recipient(parent)
+                    }
+                    None => "root".to_string(),
+                };
                 let parent_name = crate::domain::AgentName::try_from_str(parent_session_id.as_str()).expect("validated string input is non-empty");
                 let parent_tab = crate::services::delivery::resolve_tab_name_for_agent(
                     &parent_name,

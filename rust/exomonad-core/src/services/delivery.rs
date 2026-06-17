@@ -510,6 +510,26 @@ fn delivery_method_from_result(result: DeliveryResult) -> DeliveryMethod {
     }
 }
 
+/// Canonicalize a computed parent branch into the recipient's AgentName.
+///
+/// A spawned agent's branch is always dotted (`{parent}.{slug}-{type}`); the
+/// last dot-segment is that agent's suffixed AgentName, which is the key it
+/// drains its durable inbox under. A top-level branch (no dot, e.g. `main` or
+/// `master`) hosts no spawned agent of its own — it belongs to the root TL,
+/// which is addressed and drains as the AgentName `root`.
+///
+/// Dotted branches are returned unchanged; the inbox keys them by their last
+/// dot-segment on write/drain. Collapsing top-level branches here keeps the
+/// recipient key equal to the agent's own AgentName at the notify_parent
+/// source, so the durable inbox never records an undeliverable key like `main`.
+pub(crate) fn canonical_parent_recipient(parent_branch: &str) -> String {
+    if parent_branch.contains('.') {
+        parent_branch.to_string()
+    } else {
+        "root".to_string()
+    }
+}
+
 fn record_inbox_delivery(
     ctx: &impl super::HasInboxStore,
     agent_key: &str,

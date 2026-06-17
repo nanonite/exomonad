@@ -19,20 +19,20 @@ fn structural_parent_session_id(
     birth_branch: &crate::domain::BirthBranch,
     identity: Option<&crate::services::agent_resolver::AgentIdentityRecord>,
 ) -> String {
-    if let Some(identity) = identity {
-        if identity.topology == crate::services::agent_control::Topology::SharedDir {
-            return identity.parent_branch.to_string();
+    let parent_branch = match identity {
+        Some(identity)
+            if identity.topology == crate::services::agent_control::Topology::SharedDir =>
+        {
+            identity.parent_branch.to_string()
         }
-    }
-
-    if agent_name.is_gemini_worker() {
-        birth_branch.to_string()
-    } else {
-        birth_branch
+        _ if agent_name.is_gemini_worker() => birth_branch.to_string(),
+        _ => birth_branch
             .parent()
             .map(|p| p.to_string())
-            .unwrap_or_else(|| "root".to_string())
-    }
+            .unwrap_or_else(|| "root".to_string()),
+    };
+
+    crate::services::delivery::canonical_parent_recipient(&parent_branch)
 }
 
 /// Events effect handler.
@@ -505,6 +505,23 @@ mod tests {
         assert_eq!(
             structural_parent_session_id(&agent_name, &birth_branch, None),
             "main.codex-tl-codex"
+        );
+    }
+
+    #[test]
+    fn leaf_under_root_notifies_root_not_top_level_branch() {
+        // A leaf spawned directly under root lives on `main.<leaf>`; its parent
+        // branch is the top-level `main`, which hosts the root TL. The recipient
+        // must resolve to the AgentName `root` (root's inbox drain key), not the
+        // raw branch name `main` — otherwise the notification is undeliverable.
+        let agent_name = AgentName::try_from_str("fix-ci-fmt-opencode")
+            .expect("literal validated string is non-empty");
+        let birth_branch = BirthBranch::try_from_str("main.fix-ci-fmt-opencode")
+            .expect("literal validated string is non-empty");
+
+        assert_eq!(
+            structural_parent_session_id(&agent_name, &birth_branch, None),
+            "root"
         );
     }
 }

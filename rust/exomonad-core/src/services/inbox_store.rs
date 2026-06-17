@@ -341,10 +341,11 @@ impl InboxStore {
     }
 }
 
+/// Inbox keys are the recipient's bare AgentName (the last dot-segment of a
+/// branch). This is a pure structural strip: semantic recipient resolution
+/// (e.g. a top-level branch like `main` belonging to the root agent) happens at
+/// the notify_parent source via `delivery::canonical_parent_recipient`, not here.
 fn normalize_agent_id(agent_id: &str) -> std::borrow::Cow<'_, str> {
-    if agent_id == "main" {
-        return std::borrow::Cow::Borrowed("root");
-    }
     match agent_id.rsplit_once('.') {
         Some((_, bare)) if !bare.is_empty() => std::borrow::Cow::Borrowed(bare),
         _ => std::borrow::Cow::Borrowed(agent_id),
@@ -598,12 +599,15 @@ mod tests {
     }
 
     #[test]
-    fn root_birth_branch_normalizes_to_root_agent() {
+    fn normalize_is_a_pure_branch_prefix_strip() {
+        // The inbox does not do semantic recipient remapping (e.g. main -> root);
+        // that lives at the notify_parent source. A bare AgentName round-trips
+        // unchanged here.
         let dir = tempfile::tempdir().unwrap();
         let store = InboxStore::open(dir.path()).unwrap();
 
         store
-            .write_message("worker-1", "main", "done", None)
+            .write_message("worker-1", "root", "done", None)
             .unwrap();
 
         let drained = store.drain_unread("root").unwrap();

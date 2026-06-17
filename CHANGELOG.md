@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- notify_parent recipient resolution: emit canonical AgentName, not raw branch (#508)
 - Inbox poke loop: identity mismatch spams agents + needs backoff cadence (#506)
 - Fix worker agent selection during init (#507)
 - Reviewer/spawned-agent envs lack FORGEJO_URL/FORGEJO_TOKEN/FORGEJO_REVIEWER_TOKEN when config changes after init (#504)
