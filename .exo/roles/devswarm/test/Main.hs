@@ -1,3 +1,5 @@
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -5,14 +7,22 @@ module Main where
 
 import AllRoles (lookupRole, roleListTools)
 import Control.Monad (forM_, unless)
-import Control.Monad.Freer (runM)
+import Control.Monad.Freer (Eff, runM)
 import Control.Monad.Freer.Coroutine (runC)
 import Control.Monad.Freer.Coroutine qualified as C
+import Data.Aeson (Value)
 import Data.Aeson qualified as Aeson
+import Data.ByteString qualified as BS
+import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Lazy.Char8 qualified as BSL
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Word (Word8)
 import DevPhase (DevEvent (..), DevPhase (..))
+import Effects.Envelope qualified as Envelope
+import Effects.Git qualified as Git
+import Effects.Kv qualified as KV
+import Effects.Log qualified as Log
 import DevRole qualified
 import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
@@ -20,13 +30,15 @@ import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandler
 import ExoMonad.Guest.Events.Templates qualified as Tpl
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
 import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
+import ExoMonad.Guest.Tool.Suspend.Types (EffectRequest (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), mergePRDescription, mergePRSchema)
-import ExoMonad.Guest.Types (HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
+import ExoMonad.Guest.Types (Effects, HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (ChainlinkDbPathState (..), HookConfig (..), RoleConfig (..), validateChainlinkDbEnv)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
 import ReviewerRole qualified
 import RootRole qualified
 import TLRole qualified
+import Proto3.Suite.Class (Message, toLazyByteString)
 import WorkerRole qualified
 
 denyTools :: [Text]
@@ -432,18 +444,40 @@ assertMergeReadyCIStatusNotifiesParent = do
   assertNotifyParent "merge-ready ci_status" 9 action
 
 runPRReviewEvent :: RoleConfig tools -> PRReviewEvent -> IO EventAction
-runPRReviewEvent cfg event = do
-  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (onPRReview (eventHandlers cfg) event)
-  case status of
-    C.Done output -> pure output
-    C.Continue {} -> fail "PR review event unexpectedly suspended"
+runPRReviewEvent cfg event =
+  runEventHandler "PR review" (onPRReview (eventHandlers cfg) event)
 
 runCIStatusEvent :: RoleConfig tools -> CIStatusEvent -> IO EventAction
-runCIStatusEvent cfg event = do
-  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend (onCIStatus (eventHandlers cfg) event)
-  case status of
-    C.Done output -> pure output
-    C.Continue {} -> fail "CI status event unexpectedly suspended"
+runCIStatusEvent cfg event =
+  runEventHandler "CI status" (onCIStatus (eventHandlers cfg) event)
+
+runEventHandler :: String -> Eff Effects EventAction -> IO EventAction
+runEventHandler label_ action = do
+  status <- runM $ runC $ runFileSystemSuspend $ runAgentControlSuspend action
+  resumeEventHandler label_ status
+
+resumeEventHandler :: String -> C.Status '[IO] EffectRequest Value EventAction -> IO EventAction
+resumeEventHandler _ (C.Done output) = pure output
+resumeEventHandler label_ (C.Continue request resume) = do
+  response <- eventEffectResponse label_ request
+  next <- runM (resume response)
+  resumeEventHandler label_ next
+
+eventEffectResponse :: String -> EffectRequest -> IO Value
+eventEffectResponse label_ request =
+  case erType request of
+    "git.get_branch" -> pure $ responseValue (Git.GetBranchResponse "main.feature" False)
+    "kv.get" -> pure $ responseValue (KV.GetResponse False "")
+    "kv.set" -> pure $ responseValue (KV.SetResponse True)
+    "log.info" -> pure $ responseValue (Log.LogResponse True)
+    "log.warn" -> pure $ responseValue (Log.LogResponse True)
+    other -> fail $ label_ <> " event unexpectedly suspended on " <> T.unpack other
+
+responseValue :: (Message payload) => payload -> Value
+responseValue payload =
+  let payloadBytes = BL.toStrict (toLazyByteString payload)
+      response = Envelope.EffectResponse (Just (Envelope.EffectResponseResultPayload payloadBytes))
+   in Aeson.toJSON (BS.unpack (BL.toStrict (toLazyByteString response)) :: [Word8])
 
 assertNotifyParent :: String -> Int -> EventAction -> IO ()
 assertNotifyParent label_ expectedPr action =
