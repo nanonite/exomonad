@@ -1,4 +1,4 @@
-use crate::domain::Address;
+use crate::domain::{Address, AgentName, Slug};
 use crate::services::agent_inbox::{InboxMessage, GLOBAL_AGENT_INBOX};
 use crate::services::tmux_events;
 use claude_teams_bridge as teams_mailbox;
@@ -441,13 +441,13 @@ async fn deliver_to_agent_for(
             deliver_to_agent(ctx, agent_key, tmux_target, from, message, summary).await
         }
         MessageDeliveryPath::TmuxOnly => {
-            if !record_inbox_delivery(ctx, agent_key, from, message, summary) {
+            if !record_inbox_delivery(ctx, agent_key, from, message, summary).await {
                 return DeliveryResult::Failed;
             }
             deliver_via_tmux(ctx.project_dir(), agent_key, tmux_target, from, message).await
         }
         MessageDeliveryPath::MailboxOnly => {
-            if !record_inbox_delivery(ctx, agent_key, from, message, summary) {
+            if !record_inbox_delivery(ctx, agent_key, from, message, summary).await {
                 return DeliveryResult::Failed;
             }
             deliver_to_agent_mailbox(ctx, agent_key, from, message, summary).await
@@ -530,22 +530,67 @@ pub(crate) fn canonical_parent_recipient(parent_branch: &str) -> String {
     }
 }
 
-fn record_inbox_delivery(
-    ctx: &impl super::HasInboxStore,
+async fn canonical_recipient_key(
+    resolver: &crate::services::AgentResolver,
+    agent_key: &str,
+) -> String {
+    if let Ok(name) = AgentName::try_from_str(agent_key) {
+        if resolver.get(&name).await.is_some() {
+            return agent_key.to_string();
+        }
+    }
+
+    if agent_key.contains('.') {
+        return agent_key.to_string();
+    }
+
+    if let Ok(slug) = Slug::try_from_str(agent_key) {
+        if let Some(record) = resolver.lookup_by_slug(&slug).await {
+            return record.agent_name.to_string();
+        }
+    }
+
+    let candidates = resolver
+        .all()
+        .await
+        .into_iter()
+        .map(|record| format!("{}:{}", record.slug, record.agent_name))
+        .collect::<Vec<_>>()
+        .join(",");
+    warn!(
+        unresolved_recipient = %agent_key,
+        resolver_candidates = %candidates,
+        "Unable to resolve inbox recipient key; recording message under unresolved key"
+    );
+    tracing::info!(
+        otel.name = "message.delivery",
+        recipient = %agent_key,
+        method = "agent_inbox",
+        outcome = "unresolved_recipient",
+        resolver_candidates = %candidates,
+        "[event] message.delivery"
+    );
+
+    agent_key.to_string()
+}
+
+async fn record_inbox_delivery(
+    ctx: &(impl super::HasInboxStore + super::HasAgentResolver),
     agent_key: &str,
     from: &crate::domain::AgentName,
     message: &str,
     summary: &str,
 ) -> bool {
+    let to_agent = canonical_recipient_key(ctx.agent_resolver(), agent_key).await;
     match ctx
         .inbox_store()
-        .write_message(from.as_str(), agent_key, message, Some(summary))
+        .write_message(from.as_str(), &to_agent, message, Some(summary))
     {
         Ok(message_id) => {
             debug!(
                 message_id,
                 from = %from,
-                to = %agent_key,
+                to = %to_agent,
                 "Recorded message in durable inbox"
             );
             true
@@ -553,7 +598,7 @@ fn record_inbox_delivery(
         Err(error) => {
             warn!(
                 from = %from,
-                to = %agent_key,
+                to = %to_agent,
                 error = %error,
                 "Failed to record message in durable inbox"
             );
@@ -1080,7 +1125,7 @@ pub async fn deliver_to_agent(
     let _agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
     let agent_type = agent_type_from_key(agent_key);
-    if !record_inbox_delivery(ctx, agent_key, from, message, summary) {
+    if !record_inbox_delivery(ctx, agent_key, from, message, summary).await {
         return DeliveryResult::Failed;
     }
     // Batch lookup: sender's team (for Tier 2 scoping) + recipient in-memory check.
@@ -1277,7 +1322,45 @@ pub async fn deliver_to_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::AgentName;
+    use crate::domain::{AgentName, BirthBranch, Slug};
+    use crate::services::agent_control::{AgentType, Topology};
+    use crate::services::{AgentIdentityRecord, AgentResolver, HasAgentResolver};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn agent_name(value: &str) -> AgentName {
+        AgentName::try_from_str(value).expect("literal validated string is non-empty")
+    }
+
+    fn birth_branch(value: &str) -> BirthBranch {
+        BirthBranch::try_from_str(value).expect("literal validated string is non-empty")
+    }
+
+    fn slug(value: &str) -> Slug {
+        Slug::try_from_str(value).expect("literal validated string is non-empty")
+    }
+
+    async fn services_with_agent(slug_value: &str, agent_value: &str) -> crate::services::Services {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let resolver = AgentResolver::load(temp_dir.path().to_path_buf()).await;
+        resolver
+            .register(AgentIdentityRecord {
+                agent_name: agent_name(agent_value),
+                slug: slug(slug_value),
+                agent_type: AgentType::OpenCode,
+                birth_branch: birth_branch(&format!("main.{agent_value}")),
+                parent_branch: birth_branch("main"),
+                working_dir: PathBuf::from(format!(".exo/worktrees/{agent_value}")),
+                display_name: agent_value.to_string(),
+                topology: Topology::WorktreePerAgent,
+            })
+            .await
+            .expect("identity registration should succeed");
+
+        let mut services = crate::services::Services::test();
+        services.agent_resolver = Arc::new(resolver);
+        services
+    }
 
     #[test]
     fn deliver_to_agent_reports_tmux_fallback_as_tmux_stdin() {
@@ -1354,6 +1437,53 @@ mod tests {
         assert_ne!(DeliveryResult::Teams, DeliveryResult::Tmux);
         assert_ne!(DeliveryResult::Teams, DeliveryResult::Failed);
         assert_ne!(DeliveryResult::Tmux, DeliveryResult::Failed);
+    }
+
+    #[tokio::test]
+    async fn record_inbox_delivery_resolves_slug_to_agent_name() {
+        let services = services_with_agent("patch-step-over", "patch-step-over-opencode").await;
+        let from = agent_name("root");
+
+        assert!(
+            record_inbox_delivery(&services, "patch-step-over", &from, "hello", "summary").await
+        );
+
+        let messages = services
+            .inbox_store
+            .drain_unread("patch-step-over-opencode")
+            .expect("inbox drain should succeed");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].to_agent, "patch-step-over-opencode");
+        assert_eq!(messages[0].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn canonical_recipient_key_keeps_registered_agent_name() {
+        let services = services_with_agent("patch-step-over", "patch-step-over-opencode").await;
+
+        let recipient =
+            canonical_recipient_key(services.agent_resolver(), "patch-step-over-opencode").await;
+
+        assert_eq!(recipient, "patch-step-over-opencode");
+    }
+
+    #[tokio::test]
+    async fn record_inbox_delivery_records_unresolved_key_unchanged() {
+        let services = crate::services::Services::test();
+        let from = agent_name("root");
+
+        assert!(record_inbox_delivery(&services, "parent", &from, "hello", "summary").await);
+
+        let messages = services
+            .inbox_store
+            .drain_unread("parent")
+            .expect("inbox drain should succeed");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].to_agent, "parent");
+        assert_eq!(
+            canonical_recipient_key(services.agent_resolver(), "parent").await,
+            "parent"
+        );
     }
 
     #[test]
