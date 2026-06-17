@@ -297,7 +297,7 @@ assertReviewerToolList =
       let names = map tdName (roleListTools roleCfg)
       assertEqual
         "reviewer tools"
-        ["approve_pr", "request_changes", "post_review_comment"]
+        ["approve_pr", "request_changes", "post_review_comment", "check_inbox", "list_agents"]
         names
       assertBool "reviewer must not expose send_tmux_message" ("send_tmux_message" `notElem` names)
       assertBool "reviewer must not expose send_mailbox_message" ("send_mailbox_message" `notElem` names)
