@@ -231,7 +231,7 @@ implements the spec, files a PR, and calls notify_parent when done. This is the 
 ## Other MCP Tools
 - file_pr: Create/update PR for your own branch.
 - merge_pr: Merge a child worker's PR after notification.
-- notify_parent: Send message to your parent agent.
+- notify_parent: Send message to your parent agent. Use this tool directly; never use send_message with recipient 'parent'.
 - send_tmux_message: Send a message by injecting it into a spawned agent tmux pane.
 - send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 
@@ -290,7 +290,7 @@ Implement the spec in your task. File a PR when done. Stay active to address rev
 These names are MCP tools exposed inside your agent tool interface. They are not shell commands, are not on PATH, and must not be invoked with bash commands like `which file_pr` or `file_pr ...`.
 
 - file_pr: Create/update a PR for your branch. Call this when your implementation is ready, and again after pushing review fixes.
-- notify_parent: Send a message to your parent TL when context calls for direct handoff. Use status 'success' for completed handoffs and 'failure' if you are stuck and cannot proceed.
+- notify_parent: Send a message to your parent TL when context calls for direct handoff. Use status 'success' for completed handoffs and 'failure' if you are stuck and cannot proceed. Never use send_message with recipient 'parent'; 'parent' is a reserved alias resolved only by notify_parent.
 - send_tmux_message: Send a message by injecting it into another agent tmux pane.
 - send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 
@@ -328,7 +328,7 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 - chainlink_session_work: Mark the assigned Chainlink issue as the active work item.
 - chainlink_issue_comment: Post progress on the assigned Chainlink issue.
 - chainlink_session_end: End the Chainlink session with handoff notes.
-- notify_parent: Send a direct message to your parent TL when needed.
+- notify_parent: Send a direct message to your parent TL when needed. Never use send_message with recipient 'parent'; 'parent' is a reserved alias resolved only by notify_parent.
 - send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
 - send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
 
@@ -358,7 +358,7 @@ Implement the spec in your task. File a PR when done. Stay active to address rev
 
 ## MCP Tools Available
 - file_pr: Create/update a PR for your branch. Call this when your implementation is ready, and again after pushing review fixes.
-- notify_parent: Send a message to your parent TL when context calls for direct handoff. Use status 'success' for completed handoffs and 'failure' if you are stuck and cannot proceed.
+- notify_parent: Send a message to your parent TL when context calls for direct handoff. Use status 'success' for completed handoffs and 'failure' if you are stuck and cannot proceed. Never use send_message with recipient 'parent'; 'parent' is a reserved alias resolved only by notify_parent.
 - send_tmux_message: Send a message by injecting it into another agent tmux pane.
 - send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 
@@ -395,7 +395,7 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 - chainlink_session_work: Mark the assigned Chainlink issue as the active work item.
 - chainlink_issue_comment: Post progress on the assigned Chainlink issue.
 - chainlink_session_end: End the Chainlink session with handoff notes.
-- notify_parent: Send a direct message to your parent TL when needed.
+- notify_parent: Send a direct message to your parent TL when needed. Never use send_message with recipient 'parent'; 'parent' is a reserved alias resolved only by notify_parent.
 - send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
 - send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
 

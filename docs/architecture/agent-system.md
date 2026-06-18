@@ -90,6 +90,8 @@ Authority summary: **issue decomposition and lifecycle authority lives at the TL
 
 Message delivery is serialized per recipient. Claude Code uses its native Teams inbox and InboxPoller. Codex, Gemini tmux fallback, OpenCode, and future runtimes without a native inbox route through ExoMonad's per-agent FIFO inbox with one consumer task per agent; see [cross-runtime-message-inbox.md](../decisions/cross-runtime-message-inbox.md).
 
+**Reserved alias `parent`.** The literal string `parent` is not an agent name — it is a reserved alias meaning "the caller's parent". To reach your parent, call `notify_parent`; never address a message to the literal recipient `parent`. The two delivery entrypoints treat it differently, on purpose: `notify_parent` accepts `parent` as a sentinel and resolves it to the real parent agent before delivery, while `send_message` **rejects** it (peer messaging requires a concrete agent name). No inbox row is ever written under `to_agent = "parent"`.
+
 ---
 
 ## 3. Hook Rules — per role

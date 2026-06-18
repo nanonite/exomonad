@@ -109,6 +109,13 @@ All messages are prefixed with `[from: id]` (or `[FAILED: id]` for failures). Ev
 
 Durable inbox writes canonicalize recipient keys at the single `record_inbox_delivery()` chokepoint. The delivery layer uses `AgentResolver` to resolve a caller-supplied bare slug such as `patch-step-over` to the recipient's suffixed `AgentName` such as `patch-step-over-opencode` before writing `to_agent`. Already-canonical agent names and dotted branch identities pass through unchanged; unresolved keys are recorded unchanged with a WARN and `[event] message.delivery` telemetry instead of silently orphaning without evidence.
 
+**Reserved alias `parent`.** The literal recipient `parent` is not an agent name — it is a reserved alias meaning "the caller's parent". Its behavior is context-dependent by design:
+
+- In `notify_parent`, an `override_recipient` of `Agent("parent")` is treated as the normal parent sentinel: it is rewritten to `Address::Supervisor` and resolved to the real parent via supervisor/structural routing before delivery. This guarantees no inbox row is ever written under `to_agent = "parent"`.
+- In generic `send_message` / `route_message`, `Agent("parent")` is **rejected** (`DeliveryOutcome::Failed`, no durable row): peer messaging requires a concrete agent name. An agent reaches its parent via `notify_parent`, never by addressing the literal string `parent`.
+
+This asymmetry is intentional — only the `notify_parent` relationship has a well-defined parent to resolve. Both paths fail loudly rather than orphan a message under the literal key.
+
 ## Forgejo Watcher and GitHub Poller State Machines
 
 `worktree_event_watcher.rs` is the active Forgejo-backed PR/review/CI watcher. It rebuilds PR registry state from Forgejo each cycle and persists only watcher bookkeeping such as review rounds and stuck flags. `github_poller.rs` is currently hibernated: it has zero active call sites. Keep its review-loop semantics in parity with `worktree_event_watcher` so future GitHub Actions integration can re-enable it as a thin transport shim.

@@ -500,6 +500,149 @@ mod tests {
         }
     }
 
+    fn proto_agent_address(agent: &str) -> Option<exomonad_proto::effects::events::Address> {
+        use exomonad_proto::effects::events::{address::Kind, Address as ProtoAddress};
+
+        Some(ProtoAddress {
+            kind: Some(Kind::Agent(agent.to_string())),
+        })
+    }
+
+    struct RuntimeParentCase {
+        runtime: AgentType,
+        agent_name: &'static str,
+        slug: &'static str,
+        birth_branch: &'static str,
+        parent_branch: &'static str,
+        topology: Topology,
+        expected_parent: &'static str,
+    }
+
+    async fn services_with_identity(case: &RuntimeParentCase) -> Arc<crate::services::Services> {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let resolver = crate::services::AgentResolver::load(temp_dir.path().to_path_buf()).await;
+        resolver
+            .register(AgentIdentityRecord {
+                agent_name: AgentName::try_from_str(case.agent_name)
+                    .expect("literal validated string is non-empty"),
+                slug: Slug::try_from_str(case.slug).expect("literal validated string is non-empty"),
+                agent_type: case.runtime,
+                birth_branch: BirthBranch::try_from_str(case.birth_branch)
+                    .expect("literal validated string is non-empty"),
+                parent_branch: BirthBranch::try_from_str(case.parent_branch)
+                    .expect("literal validated string is non-empty"),
+                working_dir: PathBuf::from(format!(".exo/worktrees/{}", case.agent_name)),
+                display_name: case.agent_name.to_string(),
+                topology: case.topology,
+            })
+            .await
+            .expect("identity registration should succeed");
+
+        let mut services = crate::services::Services::test();
+        services.agent_resolver = Arc::new(resolver);
+        Arc::new(services)
+    }
+
+    #[tokio::test]
+    async fn non_claude_parent_addressing_matrix_uses_notify_parent_not_literal_parent() {
+        let cases = [
+            RuntimeParentCase {
+                runtime: AgentType::Codex,
+                agent_name: "parent-matrix-codex-codex",
+                slug: "parent-matrix-codex",
+                birth_branch: "main.parent-matrix-codex-codex",
+                parent_branch: "main",
+                topology: Topology::WorktreePerAgent,
+                expected_parent: "root",
+            },
+            RuntimeParentCase {
+                runtime: AgentType::OpenCode,
+                agent_name: "parent-matrix-opencode-opencode",
+                slug: "parent-matrix-opencode",
+                birth_branch: "main.parent-matrix-opencode-opencode",
+                parent_branch: "main",
+                topology: Topology::WorktreePerAgent,
+                expected_parent: "root",
+            },
+            RuntimeParentCase {
+                runtime: AgentType::Gemini,
+                agent_name: "parent-matrix-gemini-gemini",
+                slug: "parent-matrix-gemini",
+                birth_branch: "main",
+                parent_branch: "main",
+                topology: Topology::SharedDir,
+                expected_parent: "root",
+            },
+        ];
+
+        for case in cases {
+            let services = services_with_identity(&case).await;
+            let handler = EventHandler::new(services.clone(), None);
+            let ctx = test_ctx(case.agent_name, case.birth_branch);
+            let body = format!("{} notify_parent matrix", case.agent_name);
+
+            let response = crate::effects::EventEffects::notify_parent(
+                &handler,
+                NotifyParentRequest {
+                    agent_id: "".to_string(),
+                    status: "success".to_string(),
+                    message: body.clone(),
+                    override_recipient: None,
+                },
+                &ctx,
+            )
+            .await
+            .expect("notify_parent should resolve through the event handler");
+            assert!(
+                response.ack,
+                "notify_parent should ack for {:?}",
+                case.runtime
+            );
+
+            let parent_messages = services
+                .inbox_store
+                .drain_unread(case.expected_parent)
+                .expect("parent inbox drain should succeed");
+            assert_eq!(
+                parent_messages.len(),
+                1,
+                "notify_parent should deliver once for {:?}",
+                case.runtime
+            );
+            assert_eq!(parent_messages[0].to_agent, case.expected_parent);
+            assert_eq!(
+                parent_messages[0].content,
+                format!("[from: {}] {}", case.agent_name, body)
+            );
+
+            let send_result = crate::effects::EventEffects::send_message(
+                &handler,
+                SendMessageRequest {
+                    recipient: proto_agent_address("parent"),
+                    content: "should fail".to_string(),
+                    summary: "reserved parent alias".to_string(),
+                },
+                &ctx,
+            )
+            .await;
+            assert!(
+                send_result.is_err(),
+                "send_message to literal parent should fail for {:?}",
+                case.runtime
+            );
+
+            let literal_parent_messages = services
+                .inbox_store
+                .drain_unread("parent")
+                .expect("literal parent inbox drain should succeed");
+            assert!(
+                literal_parent_messages.is_empty(),
+                "literal parent inbox should stay empty for {:?}",
+                case.runtime
+            );
+        }
+    }
+
     #[tokio::test]
     async fn notify_parent_override_parent_alias_resolves_to_real_parent() {
         use exomonad_proto::effects::events::{address::Kind, Address as ProtoAddress};
