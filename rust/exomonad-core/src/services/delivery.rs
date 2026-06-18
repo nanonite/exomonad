@@ -396,6 +396,17 @@ async fn route_message_with(
     summary: &str,
     path: MessageDeliveryPath,
 ) -> DeliveryOutcome {
+    if matches!(address, Address::Agent(name) if name.as_str() == "parent") {
+        warn!(
+            from = %from,
+            "Refusing to route message to reserved agent alias 'parent'"
+        );
+        return DeliveryOutcome::Failed {
+            original: "agent:parent".to_string(),
+            reason: "reserved agent alias 'parent' must be resolved by notify_parent".to_string(),
+        };
+    }
+
     match address {
         Address::Agent(name) => {
             let tab_name = resolve_tab_name_for_agent(name, Some(ctx.agent_resolver()));
@@ -1468,22 +1479,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_inbox_delivery_records_unresolved_key_unchanged() {
+    async fn route_message_rejects_reserved_parent_alias_without_recording() {
         let services = crate::services::Services::test();
         let from = agent_name("root");
+        let parent_alias = Address::Agent(agent_name("parent"));
 
-        assert!(record_inbox_delivery(&services, "parent", &from, "hello", "summary").await);
+        let outcome = route_message(&services, &parent_alias, &from, "hello", "summary").await;
 
+        assert!(matches!(outcome, DeliveryOutcome::Failed { .. }));
         let messages = services
             .inbox_store
             .drain_unread("parent")
             .expect("inbox drain should succeed");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].to_agent, "parent");
-        assert_eq!(
-            canonical_recipient_key(services.agent_resolver(), "parent").await,
-            "parent"
-        );
+        assert!(messages.is_empty());
     }
 
     #[test]

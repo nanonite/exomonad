@@ -76,7 +76,20 @@ fn explicit_message_address(
             ),
         ));
     }
+    if is_parent_alias(&address) {
+        return Err(crate::effects::EffectError::custom(
+            "events.invalid_input",
+            format!(
+                "{} cannot route to reserved agent alias 'parent'; use notify_parent without an override",
+                effect_name
+            ),
+        ));
+    }
     Ok(address)
+}
+
+fn is_parent_alias(address: &Address) -> bool {
+    matches!(address, Address::Agent(name) if name.as_str() == "parent")
 }
 
 impl<C: HasSupervisorRegistry> EventHandler<C> {
@@ -224,7 +237,14 @@ impl<
         );
 
         // Check for override_recipient first (explicit routing)
-        let override_addr = Address::from_proto(req.override_recipient.clone());
+        let mut override_addr = Address::from_proto(req.override_recipient.clone());
+        if is_parent_alias(&override_addr) {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "notify_parent: resolving reserved override_recipient alias 'parent' via normal parent routing"
+            );
+            override_addr = Address::Supervisor;
+        }
 
         // Resolve parent session ID:
         // 1. If override_recipient is set and not Supervisor, use that address via route_message
@@ -468,6 +488,60 @@ mod tests {
         let services = Arc::new(crate::services::Services::test());
         let handler = EventHandler::new(services, None);
         assert_eq!(handler.namespace(), "events");
+    }
+
+    fn test_ctx(agent_name: &str, birth_branch: &str) -> crate::effects::EffectContext {
+        crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str(agent_name)
+                .expect("literal validated string is non-empty"),
+            birth_branch: BirthBranch::try_from_str(birth_branch)
+                .expect("literal validated string is non-empty"),
+            working_dir: PathBuf::from("."),
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_parent_override_parent_alias_resolves_to_real_parent() {
+        use exomonad_proto::effects::events::{address::Kind, Address as ProtoAddress};
+
+        let services = Arc::new(crate::services::Services::test());
+        let handler = EventHandler::new(services.clone(), None);
+        let ctx = test_ctx(
+            "m1-breakpoints-step-opencode",
+            "main.m1-breakpoints-step-opencode",
+        );
+
+        crate::effects::EventEffects::notify_parent(
+            &handler,
+            NotifyParentRequest {
+                agent_id: "".to_string(),
+                status: "success".to_string(),
+                message: "done".to_string(),
+                override_recipient: Some(ProtoAddress {
+                    kind: Some(Kind::Agent("parent".to_string())),
+                }),
+            },
+            &ctx,
+        )
+        .await
+        .expect("notify_parent should resolve parent alias");
+
+        let root_messages = services
+            .inbox_store
+            .drain_unread("root")
+            .expect("root inbox drain should succeed");
+        assert_eq!(root_messages.len(), 1);
+        assert_eq!(root_messages[0].to_agent, "root");
+        assert_eq!(
+            root_messages[0].content,
+            "[from: m1-breakpoints-step-opencode] done"
+        );
+
+        let parent_messages = services
+            .inbox_store
+            .drain_unread("parent")
+            .expect("parent inbox drain should succeed");
+        assert!(parent_messages.is_empty());
     }
 
     #[test]
