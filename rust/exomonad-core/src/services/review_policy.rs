@@ -91,7 +91,7 @@ impl Default for ReviewPolicy {
     fn default() -> Self {
         Self {
             min_review_rounds: 1,
-            reviewer_max_rounds: 2,
+            reviewer_max_rounds: 5,
             review_freshness_window_secs: 1200,
             external_review_threshold: 300,
             external_review_paths: vec![
@@ -157,7 +157,7 @@ mod tests {
     fn test_default_policy_values() {
         let p = ReviewPolicy::default();
         assert_eq!(p.min_review_rounds, 1);
-        assert_eq!(p.reviewer_max_rounds, 2);
+        assert_eq!(p.reviewer_max_rounds, 5);
         assert_eq!(p.review_freshness_window_secs, 1200);
         assert_eq!(p.external_review_threshold, 300);
         assert_eq!(p.reviewer_max_wait_seconds, 1200);
@@ -194,7 +194,7 @@ mod tests {
         "#;
         let policy: ReviewPolicy = toml::from_str(toml_str).unwrap();
         assert_eq!(policy.min_review_rounds, 2);
-        assert_eq!(policy.reviewer_max_rounds, 2); // default
+        assert_eq!(policy.reviewer_max_rounds, 5); // default
     }
 
     #[test]

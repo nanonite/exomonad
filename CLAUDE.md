@@ -271,7 +271,7 @@ The reviewer convergence loop is configured via `.exo/review-policy.toml`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `min_review_rounds` | 1 | Minimum review rounds before merge is permitted |
-| `reviewer_max_rounds` | 2 | Max rounds before Stuck — PR surfaced to human |
+| `reviewer_max_rounds` | 5 | Max rounds before Stuck — PR surfaced to human |
 | `reviewer_max_wait_seconds` | 1200 | Max wait for reviewer response (20 min) |
 | `reviewer_max_rate_limit_retries` | 2 | Max rate-limit retries for reviewer agents |
 | `review_freshness_window_secs` | 1200 | Window for a review to be considered "fresh" |

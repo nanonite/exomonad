@@ -112,6 +112,9 @@ enum Commands {
         /// Project name (unused, reserved for future)
         #[arg(long)]
         name: Option<String>,
+        /// Maximum review rounds before a PR is escalated to Stuck (default: 5)
+        #[arg(long)]
+        reviewer_max_rounds: Option<u32>,
     },
 
     /// Recompile WASM plugin from Haskell source
@@ -349,8 +352,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::New { name } => {
-            new::run(name).await?;
+        Commands::New {
+            name,
+            reviewer_max_rounds,
+        } => {
+            new::run(name, reviewer_max_rounds).await?;
         }
 
         Commands::Reply {

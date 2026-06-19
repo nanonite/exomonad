@@ -331,6 +331,7 @@ impl InboxStore {
         ensure_column(&conn, "agent_inbox_meta", "last_poke_message_id", "INTEGER")?;
         ensure_column(&conn, "agent_inbox_meta", "poke_backoff_secs", "INTEGER")?;
         normalize_existing_agent_ids(&mut conn)?;
+        remap_legacy_branch_recipients(&mut conn)?;
         Ok(())
     }
 
@@ -476,6 +477,25 @@ fn max_option(left: Option<i64>, right: Option<i64>) -> Option<i64> {
     }
 }
 
+/// Remap legacy bare-branch `to_agent` values to `root`.
+///
+/// Old messages may carry `to_agent = "main"` (or "master", "parent") if they
+/// were written before `delivery::canonical_parent_recipient` existed at the
+/// write site. `normalize_agent_id` is a pure structural strip (last dot-segment)
+/// and does not apply semantic remapping, so those rows are never drained by
+/// `drain_unread("root")` — but `resolve_tab_name_for_agent` routes them to the
+/// "TL" window anyway, producing a poke that root cannot satisfy.
+///
+/// This migration is idempotent: after it runs there are no "main"/"master"/"parent"
+/// rows left, so subsequent runs are no-ops.
+fn remap_legacy_branch_recipients(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM agent_inbox_meta WHERE agent_id IN ('main', 'master', 'parent');
+         UPDATE messages SET to_agent = 'root' WHERE to_agent IN ('main', 'master', 'parent');",
+    )
+    .context("failed to remap legacy branch recipients to root")
+}
+
 fn select_messages(
     conn: &Connection,
     sql: &str,
@@ -613,6 +633,41 @@ mod tests {
         let drained = store.drain_unread("root").unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].to_agent, "root");
+    }
+
+    #[test]
+    fn legacy_bare_branch_recipients_remapped_to_root_on_migrate() {
+        let store = InboxStore::open_in_memory().unwrap();
+        {
+            let conn = store.connection().unwrap();
+            conn.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, summary, created_at)
+                 VALUES ('leaf-opencode', 'main', 'pr ready', NULL, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, summary, created_at)
+                 VALUES ('leaf-opencode', 'parent', 'done', NULL, 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_inbox_meta (agent_id, last_poke_at)
+                 VALUES ('main', 100)",
+                [],
+            )
+            .unwrap();
+        }
+
+        store.migrate().unwrap();
+
+        let drained = store.drain_unread("root").unwrap();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().all(|m| m.to_agent == "root"));
+        assert!(!store.has_unread("main").unwrap());
+        // poke metadata for the bare branch name is dropped
+        assert!(store.last_check_inbox_at("main").unwrap().is_none());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 /// Initialize a new exomonad project in the current directory.
 /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
-pub async fn run(_name: Option<String>) -> Result<()> {
+pub async fn run(_name: Option<String>, reviewer_max_rounds: Option<u32>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let config_path = cwd.join(".exo/config.toml");
 
@@ -21,13 +21,15 @@ pub async fn run(_name: Option<String>) -> Result<()> {
 
     let policy_path = cwd.join(".exo/review-policy.toml");
     if !policy_path.exists() {
+        let max_rounds = reviewer_max_rounds.unwrap_or(5);
         std::fs::write(
             &policy_path,
-            "# Review policy for the worktree event watcher and merge gate.
+            format!(
+                "# Review policy for the worktree event watcher and merge gate.
 # All fields are optional — defaults shown below.
 
 min_review_rounds = 1
-reviewer_max_rounds = 2
+reviewer_max_rounds = {max_rounds}
 reviewer_max_wait_seconds = 1200
 review_freshness_window_secs = 1200
 external_review_threshold = 300
@@ -38,9 +40,10 @@ complexity_line_threshold = 500
 
 [ci]
 gate = \"auto\"
-",
+"
+            ),
         )?;
-        info!("Created .exo/review-policy.toml (default review policy)");
+        info!("Created .exo/review-policy.toml (reviewer_max_rounds = {max_rounds})");
     }
 
     if let Err(error) = scaffold_forgejo_workflow(&cwd) {
