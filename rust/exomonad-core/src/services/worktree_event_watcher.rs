@@ -1302,20 +1302,27 @@ where
                                 let pr_clone = pr.clone();
                                 let pr_num = *pr_number;
                                 let sha = obs.head_sha.clone();
+                                let state = self.state.clone();
                                 tokio::spawn(async move {
                                     info!(pr_number = pr_num, head_sha = %sha, "Spawning reviewer agent for new PR head SHA");
                                     match spawner.spawn_reviewer_for_pr(&pr_clone).await {
-                                        Ok(_) => info!(
-                                            pr_number = pr_num,
-                                            head_sha = %sha,
-                                            "Reviewer agent spawned successfully for new PR head SHA"
-                                        ),
+                                        Ok(_) => {
+                                            info!(
+                                                pr_number = pr_num,
+                                                head_sha = %sha,
+                                                "Reviewer agent spawned successfully for new PR head SHA"
+                                            );
+                                            if let Some(ws) =
+                                                state.prs.lock().await.get_mut(&pr_num)
+                                            {
+                                                ws.reviewer_spawned = true;
+                                            }
+                                        }
                                         Err(e) => {
                                             warn!(pr_number = pr_num, head_sha = %sha, error = %e, "Failed to spawn reviewer for new PR head SHA")
                                         }
                                     }
                                 });
-                                old_state.reviewer_spawned = true;
                             }
                         }
                     }
@@ -1366,21 +1373,26 @@ where
                                 let spawner = spawner.clone();
                                 let pr_clone = pr_entry.clone();
                                 let pr_num = *pr_number;
+                                let state = self.state.clone();
                                 tokio::spawn(async move {
                                     info!(pr_number = pr_num, "Spawning reviewer agent for new PR");
                                     match spawner.spawn_reviewer_for_pr(&pr_clone).await {
-                                        Ok(_) => info!(
-                                            pr_number = pr_num,
-                                            "Reviewer agent spawned successfully"
-                                        ),
+                                        Ok(_) => {
+                                            info!(
+                                                pr_number = pr_num,
+                                                "Reviewer agent spawned successfully"
+                                            );
+                                            if let Some(ws) =
+                                                state.prs.lock().await.get_mut(&pr_num)
+                                            {
+                                                ws.reviewer_spawned = true;
+                                            }
+                                        }
                                         Err(e) => {
                                             warn!(pr_number = pr_num, error = %e, "Failed to spawn reviewer for PR")
                                         }
                                     }
                                 });
-                                if let Some(ws) = state_guard.get_mut(pr_number) {
-                                    ws.reviewer_spawned = true;
-                                }
                             }
                         }
                     }
@@ -5149,6 +5161,54 @@ mod tests {
         assert_eq!(
             watcher.observed_ci_status(&branch, "abc123").await,
             CIStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_reviewer_spawn_leaves_flag_false() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FailingSpawner {
+            called: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for FailingSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                _pr: &crate::services::pr_registry::PrEntry,
+            ) -> anyhow::Result<()> {
+                self.called.store(true, Ordering::SeqCst);
+                anyhow::bail!("spawn failed")
+            }
+        }
+
+        let called = Arc::new(AtomicBool::new(false));
+        let spawner = Arc::new(FailingSpawner {
+            called: called.clone(),
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
+        let pr = test_pr_entry();
+        let registry = test_registry(pr);
+        let mut observations = HashMap::new();
+        observations.insert(1u64, test_observation("abc123"));
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(called.load(Ordering::SeqCst));
+        let state = watcher.state.prs.lock().await;
+        assert!(
+            !state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(true),
+            "reviewer_spawned should remain false after a failed spawn"
         );
     }
 
