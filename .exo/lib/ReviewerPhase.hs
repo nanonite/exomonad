@@ -33,6 +33,8 @@ data ReviewerEvent
 instance StateMachine ReviewerPhase ReviewerEvent where
   machineName = "reviewer"
 
+  transition ReviewerDone _ = InvalidTransition "reviewer already completed"
+  transition (ReviewerFailed _) _ = InvalidTransition "reviewer already failed"
   transition _phase event = case event of
     ReviewerApprovedEv _prNum ->
       Transitioned ReviewerDone
