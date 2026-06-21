@@ -463,13 +463,13 @@ Required environment: FORGEJO_URL plus FORGEJO_REVIEWER_TOKEN, falling back to F
 3. Review for correctness, edge cases, security issues, missing tests, and broken contracts.
 4. If issues are found, POST a REQUEST_CHANGES review directly to /api/v1/repos/{owner}/{repo}/pulls/{pr}/reviews.
 5. If the code is correct, POST an APPROVED review directly to the same endpoint with a concise approving comment.
-6. Call notify_parent with status='success' after submitting the review, then stop. The ExoMonad watcher reads Forgejo reviews and routes the review result.
+6. Exit after submitting. The ExoMonad watcher reads Forgejo reviews and routes the result to the dev and TL automatically.
 
 ## Key Rules
 - Never modify code; reviewers only review.
 - Never merge a PR; only the TL merges.
 - Never spawn agents; reviewer is a leaf role.
-- Never review your own PR. If the PR author is you, report failure with notify_parent.
+- Never review your own PR. If the PR author is you, stop without submitting a verdict; stuck escalation handles reviewers that cannot proceed.
 - Do not use `codex exec review`; it emits Codex-native review text and does not submit Forgejo reviews.
 - Do not call approve_pr, request_changes, or post_review_comment for your final verdict; use direct Forgejo API curl.
 - Prefer 3-5 high-impact comments over exhaustive style feedback.

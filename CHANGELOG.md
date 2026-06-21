@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Reviewer task prompt instructs notify_parent but tool is not in reviewer role (#517)
 - Reviewer not auto-spawned on new PR: silent skip with no retry (#516)
 - notify_parent recipient resolution: emit canonical AgentName, not raw branch (#508)
 - Inbox poke loop: identity mismatch spams agents + needs backoff cadence (#506)

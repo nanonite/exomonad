@@ -1468,6 +1468,8 @@ mod tests {
         assert!(instructions.contains("FORGEJO_REVIEWER_TOKEN"));
         assert!(instructions.contains("/api/v1/repos/{owner}/{repo}/pulls/{pr}/reviews"));
         assert!(instructions.contains("Do not call approve_pr"));
+        assert!(instructions.contains("watcher reads Forgejo reviews"));
+        assert!(!instructions.contains("notify_parent"));
         assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
         assert!(codex_home.join("config.toml").exists());

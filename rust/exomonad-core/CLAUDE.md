@@ -149,6 +149,8 @@ ForgejoReviewVerdict::None ──(Forgejo review approves)──→ ForgejoRevie
 
 **Reviewer auto-spawn lifecycle:** The Forgejo watcher attempts reviewer spawn on first PR sighting and on every poll where `reviewer_spawned=false`, `reviewer_disposed=false`, and review rounds remain below policy. Failed spawn attempts keep `reviewer_spawned=false` so the next poll retries even when the head SHA is unchanged. A missing `reviewer_spawner` is a WARN because silent skips strand PRs without review.
 
+**Reviewer completion routing:** Reviewer agents submit Forgejo reviews directly and then exit. They do not call `notify_parent`; the watcher observes Forgejo verdicts and routes approval or requested-changes events to the dev leaf and TL.
+
 ### Event Dispatch Flow
 
 1. Poller detects state change (new comments, approval, timeout, merge)
