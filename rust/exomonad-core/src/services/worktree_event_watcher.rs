@@ -2165,7 +2165,10 @@ where
         bool,
     ) {
         let Some(forgejo) = self.ctx.forgejo_client() else {
-            warn!(pr_number, "forgejo_review_parts: no Forgejo client configured");
+            warn!(
+                pr_number,
+                "forgejo_review_parts: no Forgejo client configured"
+            );
             return (ForgejoReviewState::PendingReview, vec![], vec![], 0, false);
         };
         let repo_info = match repo::get_repo_info(self.ctx.project_dir()).await {

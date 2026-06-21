@@ -1753,6 +1753,7 @@ impl<
                     "Reusing existing leaf worktree"
                 );
             } else {
+                ensure_branch_fetched(effective_project_dir, &branch_name).await;
                 self.create_worktree_checked(&worktree_path, &branch_name, &current_branch).await?;
                 remove_worktree_on_spawn_failure = true;
             }
@@ -1774,6 +1775,85 @@ impl<
             Self::gemini_trust_folder(&worktree_path).await;
 
             let mut task = options.task.clone();
+
+            // If an open PR already exists for this branch (re-spawn after worktree loss),
+            // inject PR context so the leaf resumes instead of filing a new PR.
+            if let Some(forgejo) = self.ctx.forgejo_client() {
+                if let Ok(repo_info) =
+                    crate::services::repo::get_repo_info(effective_project_dir).await
+                {
+                    if let Ok(Some(pr)) = forgejo
+                        .find_open_pull_request(
+                            &repo_info.owner,
+                            &repo_info.repo,
+                            &branch_name,
+                        )
+                        .await
+                    {
+                        let pr_number = pr.number;
+                        let mut resume_context = format!(
+                            "\n\nIMPORTANT: You are resuming work on an existing pull request, not starting fresh.\n\
+                            Existing PR: #{} — {}\n\
+                            Do NOT create a new pull request. Continue working on this branch.\n",
+                            pr_number.as_u64(),
+                            pr.title
+                        );
+
+                        // Fetch review comments so the leaf sees existing feedback
+                        if let Ok(reviews) = forgejo
+                            .list_pull_request_reviews(
+                                &repo_info.owner,
+                                &repo_info.repo,
+                                pr_number,
+                            )
+                            .await
+                        {
+                            let mut review_bodies: Vec<String> = Vec::new();
+                            for review in &reviews {
+                                if !review.body.is_empty() {
+                                    review_bodies.push(review.body.clone());
+                                }
+                                // Fetch inline review comments
+                                if let Some(review_id) = review.id {
+                                    if let Ok(comments) = forgejo
+                                        .list_pull_request_review_comments(
+                                            &repo_info.owner,
+                                            &repo_info.repo,
+                                            pr_number,
+                                            review_id,
+                                        )
+                                        .await
+                                    {
+                                        for comment in &comments {
+                                            let file_label =
+                                                comment.path.as_deref().unwrap_or("unknown file");
+                                            resume_context.push_str(&format!(
+                                                "Review comment on {}: {}\n",
+                                                file_label, comment.body
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            if !review_bodies.is_empty() {
+                                resume_context.push_str("\nExisting review feedback:\n");
+                                for body in &review_bodies {
+                                    resume_context.push_str(body);
+                                    resume_context.push('\n');
+                                }
+                            }
+                        }
+
+                        info!(
+                            pr_number = pr_number.as_u64(),
+                            branch = %branch_name,
+                            "Injecting existing PR context into re-spawned leaf task"
+                        );
+                        task.push_str(&resume_context);
+                    }
+                }
+            }
+
             if options.standalone_repo && !options.allowed_dirs.is_empty() {
                 task.push_str("\n\nShared technical dependencies are available as read-only reference in `.exo/context/`. Do not modify files in this directory.");
             }

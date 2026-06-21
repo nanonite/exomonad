@@ -65,6 +65,53 @@ pub(crate) async fn ensure_branch_pushed(
     }
 }
 
+/// Fetch a branch from the remote if it exists (but not locally).
+///
+/// This is needed when re-spawning a leaf whose worktree was deleted but
+/// whose branch and PR still exist on the remote. `git worktree add` requires
+/// the branch to exist locally, so we fetch it first.
+pub(crate) async fn ensure_branch_fetched(project_dir: &Path, branch: &BranchName) {
+    let branch_str = branch.as_str();
+    let ls_output = match tokio::process::Command::new("git")
+        .args(["ls-remote", "origin", branch_str])
+        .current_dir(project_dir)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(branch = %branch_str, error = %e, "git ls-remote failed, skipping fetch");
+            return;
+        }
+    };
+
+    if !ls_output.status.success() || String::from_utf8_lossy(&ls_output.stdout).trim().is_empty() {
+        return;
+    }
+
+    info!(branch = %branch_str, "Branch exists on remote, fetching for worktree recovery");
+    match tokio::process::Command::new("git")
+        .args(["fetch", "origin", &format!("{}:{}", branch_str, branch_str)])
+        .current_dir(project_dir)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            info!(branch = %branch_str, "Fetched remote branch for recovery");
+        }
+        Ok(o) => {
+            warn!(
+                branch = %branch_str,
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "git fetch failed for branch recovery"
+            );
+        }
+        Err(e) => {
+            warn!(branch = %branch_str, error = %e, "git fetch command failed for branch recovery");
+        }
+    }
+}
+
 /// If no git remote is configured, create a local bare repo and set it as origin.
 /// This enables local-only workflows where agents need a remote for PR creation.
 pub(crate) async fn ensure_remote_exists(project_dir: &Path) {
