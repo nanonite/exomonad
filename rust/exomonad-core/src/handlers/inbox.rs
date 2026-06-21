@@ -66,14 +66,16 @@ impl<C: HasAgentResolver + HasInboxStore + 'static> InboxEffects for InboxHandle
 }
 
 async fn canonical_check_agent_key(resolver: &AgentResolver, agent_key: &str) -> String {
-    if let Ok(name) = AgentName::try_from_str(agent_key) {
-        if resolver.get(&name).await.is_some() {
-            return agent_key.to_string();
+    if !agent_key.contains('.') {
+        if let Ok(slug) = Slug::try_from_str(agent_key) {
+            if let Some(record) = resolver.lookup_by_slug(&slug).await {
+                return record.agent_name.to_string();
+            }
         }
     }
 
-    if let Ok(slug) = Slug::try_from_str(agent_key) {
-        if let Some(record) = resolver.lookup_by_slug(&slug).await {
+    if let Ok(name) = AgentName::try_from_str(agent_key) {
+        if let Some(record) = resolver.get(&name).await {
             return record.agent_name.to_string();
         }
     }
@@ -145,6 +147,60 @@ mod tests {
             })
             .await
             .expect("identity registration should succeed");
+        services
+            .inbox_store
+            .write_message("sender", "root-claude", "wake up", Some("wake"))
+            .unwrap();
+
+        let handler = InboxHandler::new(services.clone());
+        let result = handler
+            .check(InboxCheckEffect {}, &test_ctx("root"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].content, "wake up");
+        assert!(!services.inbox_store.has_unread("root-claude").unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_prefers_slug_canonical_name_over_bare_registered_name() {
+        let services = Arc::new(Services::test());
+        services
+            .agent_resolver
+            .register(AgentIdentityRecord {
+                agent_name: AgentName::try_from_str("root")
+                    .expect("literal validated string is non-empty"),
+                slug: Slug::try_from_str("root-bare")
+                    .expect("literal validated string is non-empty"),
+                agent_type: AgentType::Claude,
+                birth_branch: BirthBranch::try_from_str("main")
+                    .expect("literal validated string is non-empty"),
+                parent_branch: BirthBranch::try_from_str("main")
+                    .expect("literal validated string is non-empty"),
+                working_dir: std::path::PathBuf::from("."),
+                display_name: "root".to_string(),
+                topology: Topology::SharedDir,
+            })
+            .await
+            .expect("bare root registration should succeed");
+        services
+            .agent_resolver
+            .register(AgentIdentityRecord {
+                agent_name: AgentName::try_from_str("root-claude")
+                    .expect("literal validated string is non-empty"),
+                slug: Slug::try_from_str("root").expect("literal validated string is non-empty"),
+                agent_type: AgentType::Claude,
+                birth_branch: BirthBranch::try_from_str("main")
+                    .expect("literal validated string is non-empty"),
+                parent_branch: BirthBranch::try_from_str("main")
+                    .expect("literal validated string is non-empty"),
+                working_dir: std::path::PathBuf::from("."),
+                display_name: "root".to_string(),
+                topology: Topology::SharedDir,
+            })
+            .await
+            .expect("canonical root registration should succeed");
         services
             .inbox_store
             .write_message("sender", "root-claude", "wake up", Some("wake"))
