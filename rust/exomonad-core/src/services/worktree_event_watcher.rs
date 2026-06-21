@@ -2145,10 +2145,15 @@ where
         bool,
     ) {
         let Some(forgejo) = self.ctx.forgejo_client() else {
+            warn!(pr_number, "forgejo_review_parts: no Forgejo client configured");
             return (ForgejoReviewState::PendingReview, vec![], vec![], 0, false);
         };
-        let Ok(repo_info) = repo::get_repo_info(self.ctx.project_dir()).await else {
-            return (ForgejoReviewState::PendingReview, vec![], vec![], 0, false);
+        let repo_info = match repo::get_repo_info(self.ctx.project_dir()).await {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(pr_number, error = %e, "forgejo_review_parts: get_repo_info failed");
+                return (ForgejoReviewState::PendingReview, vec![], vec![], 0, false);
+            }
         };
         let reviews = match forgejo
             .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
