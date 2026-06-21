@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Watcher logging: per-PR observations only logged at debug level (#520)
 - Watcher logging: silent fallbacks in forgejo_review_parts (#519)
 - Ghost poke loop: check_inbox drains wrong agent key, unread messages never cleared (#518)
 - Reviewer task prompt instructs notify_parent but tool is not in reviewer role (#517)

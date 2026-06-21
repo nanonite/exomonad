@@ -1453,15 +1453,6 @@ where
                         payload,
                     } => {
                         let release_message = merge_ready_release_message(&payload);
-                        if event_type == "ci_status" {
-                            info!(
-                                pr_number = pending.pr_number,
-                                agent_name = %pending.agent_name,
-                                branch = %pending.branch,
-                                status = payload.get("status").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                                "Forgejo PR CI status event dispatching"
-                            );
-                        }
 
                         // Fan-out: every pr_review event has a reviewer-side handler in
                         // .exo/roles/devswarm/ReviewerRole.hs. Dispatch to the reviewer in
@@ -1478,6 +1469,14 @@ where
                             .and_then(|v| v.as_str())
                             .unwrap_or("<unknown>")
                             .to_string();
+                        info!(
+                            pr_number = pending.pr_number,
+                            agent_name = %pending.agent_name,
+                            branch = %pending.branch,
+                            event_type,
+                            kind = %payload_kind,
+                            "Dispatching WasmEvent"
+                        );
                         let reviewer_payload = match &fan_out_decision {
                             ReviewerFanOut::DispatchTo(_, _, _) => Some(payload.clone()),
                             _ => None,
