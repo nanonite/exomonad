@@ -147,6 +147,8 @@ ForgejoReviewVerdict::None ──(Forgejo review approves)──→ ForgejoRevie
 
 **Copilot review lifecycle:** The first review is automatic (triggered on PR creation). Subsequent reviews after pushing fixes are NOT — automatic re-review is not guaranteed. The `FixesPushed` event fills this gap: when the poller detects a SHA change on a PR that was `ChangesRequested`, it fires `fixes_pushed` immediately and uses a shorter 5-minute fallback timeout.
 
+**Reviewer auto-spawn lifecycle:** The Forgejo watcher attempts reviewer spawn on first PR sighting and on every poll where `reviewer_spawned=false`, `reviewer_disposed=false`, and review rounds remain below policy. Failed spawn attempts keep `reviewer_spawned=false` so the next poll retries even when the head SHA is unchanged. A missing `reviewer_spawner` is a WARN because silent skips strand PRs without review.
+
 ### Event Dispatch Flow
 
 1. Poller detects state change (new comments, approval, timeout, merge)

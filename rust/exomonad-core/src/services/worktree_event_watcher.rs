@@ -238,7 +238,7 @@ fn approved_review_round(old_rounds: u32, changes_requested_rounds: u32) -> u32 
 }
 
 fn should_spawn_reviewer_for_new_head(state: &WatchState, max_rounds: u32) -> bool {
-    !state.reviewer_spawned && state.rounds < max_rounds
+    !state.reviewer_spawned && !state.reviewer_disposed && state.rounds < max_rounds
 }
 
 fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
@@ -893,6 +893,49 @@ where
         self.ci_source_configured || self.ctx.forgejo_client().is_some()
     }
 
+    fn spawn_reviewer_for_pr(&self, pr_number: u64, pr: &PrEntry, head_sha: &str, reason: &str) {
+        let Some(spawner) = &self.reviewer_spawner else {
+            warn!(
+                pr_number,
+                head_sha,
+                reason,
+                "Reviewer spawner is not configured; skipping reviewer auto-spawn"
+            );
+            return;
+        };
+
+        let spawner = spawner.clone();
+        let pr_clone = pr.clone();
+        let state = self.state.clone();
+        let head_sha = head_sha.to_string();
+        let reason = reason.to_string();
+        tokio::spawn(async move {
+            info!(pr_number, head_sha = %head_sha, reason = %reason, "Spawning reviewer agent for PR");
+            match spawner.spawn_reviewer_for_pr(&pr_clone).await {
+                Ok(_) => {
+                    info!(
+                        pr_number,
+                        head_sha = %head_sha,
+                        reason = %reason,
+                        "Reviewer agent spawned successfully for PR"
+                    );
+                    if let Some(ws) = state.prs.lock().await.get_mut(&pr_number) {
+                        ws.reviewer_spawned = true;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        pr_number,
+                        head_sha = %head_sha,
+                        reason = %reason,
+                        error = %e,
+                        "Failed to spawn reviewer for PR"
+                    )
+                }
+            }
+        });
+    }
+
     async fn observed_ci_status(&self, branch: &BranchName, head_sha: &str) -> CIStatus {
         if !self.policy.ci.gate.enabled(self.ci_source_configured()) {
             return CIStatus::Neutral;
@@ -1293,38 +1336,17 @@ where
                     if head_sha_changed {
                         old_state.reviewer_spawned = false;
                         old_state.reviewer_disposed = false;
-                        if should_spawn_reviewer_for_new_head(
-                            old_state,
-                            self.policy.reviewer_max_rounds,
-                        ) {
-                            if let Some(spawner) = &self.reviewer_spawner {
-                                let spawner = spawner.clone();
-                                let pr_clone = pr.clone();
-                                let pr_num = *pr_number;
-                                let sha = obs.head_sha.clone();
-                                let state = self.state.clone();
-                                tokio::spawn(async move {
-                                    info!(pr_number = pr_num, head_sha = %sha, "Spawning reviewer agent for new PR head SHA");
-                                    match spawner.spawn_reviewer_for_pr(&pr_clone).await {
-                                        Ok(_) => {
-                                            info!(
-                                                pr_number = pr_num,
-                                                head_sha = %sha,
-                                                "Reviewer agent spawned successfully for new PR head SHA"
-                                            );
-                                            if let Some(ws) =
-                                                state.prs.lock().await.get_mut(&pr_num)
-                                            {
-                                                ws.reviewer_spawned = true;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(pr_number = pr_num, head_sha = %sha, error = %e, "Failed to spawn reviewer for new PR head SHA")
-                                        }
-                                    }
-                                });
-                            }
-                        }
+                    }
+                    if should_spawn_reviewer_for_new_head(
+                        old_state,
+                        self.policy.reviewer_max_rounds,
+                    ) {
+                        let reason = if head_sha_changed {
+                            "new_head_sha"
+                        } else {
+                            "retry_missing_reviewer"
+                        };
+                        self.spawn_reviewer_for_pr(*pr_number, pr, &obs.head_sha, reason);
                     }
                     compute_pr_actions_with_context(
                         old_state,
@@ -1368,33 +1390,7 @@ where
                     // Spawn reviewer immediately on first sighting of a new open PR
                     // unless the watcher restarted after a terminal review verdict.
                     if !terminal_review_observed {
-                        if let Some(spawner) = &self.reviewer_spawner {
-                            if let Some(pr_entry) = registry.prs.get(pr_number) {
-                                let spawner = spawner.clone();
-                                let pr_clone = pr_entry.clone();
-                                let pr_num = *pr_number;
-                                let state = self.state.clone();
-                                tokio::spawn(async move {
-                                    info!(pr_number = pr_num, "Spawning reviewer agent for new PR");
-                                    match spawner.spawn_reviewer_for_pr(&pr_clone).await {
-                                        Ok(_) => {
-                                            info!(
-                                                pr_number = pr_num,
-                                                "Reviewer agent spawned successfully"
-                                            );
-                                            if let Some(ws) =
-                                                state.prs.lock().await.get_mut(&pr_num)
-                                            {
-                                                ws.reviewer_spawned = true;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(pr_number = pr_num, error = %e, "Failed to spawn reviewer for PR")
-                                        }
-                                    }
-                                });
-                            }
-                        }
+                        self.spawn_reviewer_for_pr(*pr_number, pr, &obs.head_sha, "first_sighting");
                     }
                     actions
                 };
@@ -5209,6 +5205,72 @@ mod tests {
         assert!(
             !state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(true),
             "reviewer_spawned should remain false after a failed spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_reviewer_spawn_retries_without_head_sha_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailsOnceSpawner {
+            count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for FailsOnceSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                _pr: &crate::services::pr_registry::PrEntry,
+            ) -> anyhow::Result<()> {
+                let previous = self.count.fetch_add(1, Ordering::SeqCst);
+                if previous == 0 {
+                    anyhow::bail!("spawn failed")
+                }
+                Ok(())
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let spawner = Arc::new(FailsOnceSpawner {
+            count: call_count.clone(),
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
+        let mut pr = test_pr_entry();
+        pr.last_head_sha = Some("abc123".to_string());
+        let registry = test_registry(pr);
+        let mut observations = HashMap::new();
+        observations.insert(1u64, test_observation("abc123"));
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        {
+            let state = watcher.state.prs.lock().await;
+            assert!(
+                !state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(true),
+                "reviewer_spawned should remain false after the first failed spawn"
+            );
+        }
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        let state = watcher.state.prs.lock().await;
+        assert!(
+            state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(false),
+            "reviewer_spawned should become true after retry succeeds"
         );
     }
 
