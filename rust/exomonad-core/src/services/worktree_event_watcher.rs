@@ -1398,9 +1398,14 @@ where
                     actions
                 };
 
-                if terminal_review_observed {
+                if terminal_review_observed && !head_sha_changed {
                     if let Some(ws) = state_guard.get_mut(pr_number) {
                         if !ws.reviewer_disposed {
+                            tracing::info!(
+                                pr_number = *pr_number,
+                                head_sha_changed,
+                                "disposing reviewer after terminal review observed"
+                            );
                             reviewer_disposals.push(*pr_number);
                             ws.reviewer_disposed = true;
                         }

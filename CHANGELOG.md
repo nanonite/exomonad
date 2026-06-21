@@ -80,6 +80,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Inline PR review comments always empty: fetch per-review comments from Forgejo (#523)
 - Cross-harness inbox integration (#479)
 - Add poll_workers MCP tool for TL worker liveness checks (#437)
 - Add E2E test: TL-to-worker pane messaging (Codex TL + OpenCode worker) (#436)
