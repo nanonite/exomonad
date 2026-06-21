@@ -125,6 +125,8 @@ vendor/notebooklm-mcp/.exo/
 
 # Local exo runtime state
 .exo/prs.json
+.exo/inbox.db
+rust/exomonad-core/.exo/
 
 # Working notes (not committed)
 archive/
