@@ -1166,10 +1166,12 @@ where
         if !registry.prs.is_empty() {
             let observations = self.collect_observations(&registry).await?;
             for (num, obs) in &observations {
-                tracing::debug!(
+                tracing::info!(
                     pr = num,
                     review_state = ?obs.review_state,
                     ci_status = ?obs.ci_status,
+                    head_sha = %obs.head_sha,
+                    changes_requested_rounds = obs.changes_requested_rounds,
                     "[Watcher] PR observation"
                 );
             }
