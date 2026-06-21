@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Watcher logging: handle_event_action missing pre-delivery log (#522)
 - Watcher logging: missing pre-dispatch log for pr_review WasmEvents (#521)
 - Watcher logging: per-PR observations only logged at debug level (#520)
 - Watcher logging: silent fallbacks in forgejo_review_parts (#519)

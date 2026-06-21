@@ -284,6 +284,7 @@ mod tests {
     #[test]
     fn forgejo_review_maps_approved_state_and_commit() {
         let proto = forgejo_review_to_proto(ForgejoPullRequestReview {
+            id: None,
             state: "APPROVED".to_string(),
             body: "looks good".to_string(),
             commit_id: Some("abc123".to_string()),
@@ -297,6 +298,7 @@ mod tests {
     #[test]
     fn forgejo_review_maps_unknown_state_to_unspecified() {
         let proto = forgejo_review_to_proto(ForgejoPullRequestReview {
+            id: None,
             state: "STALE".to_string(),
             body: String::new(),
             commit_id: None,

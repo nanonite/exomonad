@@ -2262,6 +2262,7 @@ mod tests {
 
     fn test_review(state: &str, commit_id: Option<&str>) -> ForgejoPullRequestReview {
         ForgejoPullRequestReview {
+            id: None,
             state: state.to_string(),
             body: String::new(),
             commit_id: commit_id.map(str::to_string),

@@ -44,9 +44,19 @@ pub struct ForgejoPullRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgejoPullRequestReview {
+    pub id: Option<u64>,
     pub state: String,
     pub body: String,
     pub commit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoPullRequestReviewComment {
+    pub body: String,
+    pub path: Option<String>,
+    pub diff_hunk: Option<String>,
+    pub in_reply_to: Option<u64>,
+    pub resolved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,11 +141,25 @@ struct PullRequestBranch {
 #[derive(Debug, Deserialize)]
 struct PullRequestReviewResponse {
     #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
     state: String,
     #[serde(default)]
     body: String,
     #[serde(default)]
     commit_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestReviewCommentResponse {
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    diff_hunk: Option<String>,
+    #[serde(default, alias = "in_reply_to_id")]
+    in_reply_to: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +275,27 @@ impl ForgejoClient {
             }
             ForgejoBackend::Fj(client) => {
                 client.list_pull_request_reviews(owner, repo, number).await
+            }
+        }
+    }
+
+    pub async fn list_pull_request_review_comments(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        number: PRNumber,
+        review_id: u64,
+    ) -> Result<Vec<ForgejoPullRequestReviewComment>> {
+        match &self.backend {
+            ForgejoBackend::Http(client) => {
+                client
+                    .list_pull_request_review_comments(owner, repo, number, review_id)
+                    .await
+            }
+            ForgejoBackend::Fj(client) => {
+                client
+                    .list_pull_request_review_comments(owner, repo, number, review_id)
+                    .await
             }
         }
     }
@@ -565,9 +610,52 @@ impl HttpForgejoClient {
         Ok(reviews
             .into_iter()
             .map(|review| ForgejoPullRequestReview {
+                id: review.id,
                 state: review.state,
                 body: review.body,
                 commit_id: review.commit_id,
+            })
+            .collect())
+    }
+
+    pub async fn list_pull_request_review_comments(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        number: PRNumber,
+        review_id: u64,
+    ) -> Result<Vec<ForgejoPullRequestReviewComment>> {
+        let number_str = number.as_u64().to_string();
+        let review_id_str = review_id.to_string();
+        let url = self.api_url(&[
+            "repos",
+            owner.as_str(),
+            repo.as_str(),
+            "pulls",
+            &number_str,
+            "reviews",
+            &review_id_str,
+            "comments",
+        ])?;
+        let response = self
+            .http
+            .get(url)
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo PR review comments request failed")?;
+
+        let comments: Vec<PullRequestReviewCommentResponse> = self
+            .decode_response(response, "list Forgejo pull request review comments")
+            .await?;
+        Ok(comments
+            .into_iter()
+            .map(|c| ForgejoPullRequestReviewComment {
+                body: c.body,
+                path: c.path,
+                diff_hunk: c.diff_hunk,
+                in_reply_to: c.in_reply_to,
+                resolved: false,
             })
             .collect())
     }
@@ -1020,9 +1108,38 @@ impl FjForgejoClient {
         Ok(reviews
             .into_iter()
             .map(|review| ForgejoPullRequestReview {
+                id: review.id,
                 state: review.state,
                 body: review.body,
                 commit_id: review.commit_id,
+            })
+            .collect())
+    }
+
+    async fn list_pull_request_review_comments(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        number: PRNumber,
+        review_id: u64,
+    ) -> Result<Vec<ForgejoPullRequestReviewComment>> {
+        let path = format!(
+            "/repos/{}/{}/pulls/{}/reviews/{}/comments",
+            owner.as_str(),
+            repo.as_str(),
+            number.as_u64(),
+            review_id
+        );
+        let comments: Vec<PullRequestReviewCommentResponse> =
+            self.fj_api_json("GET", &path).await?;
+        Ok(comments
+            .into_iter()
+            .map(|c| ForgejoPullRequestReviewComment {
+                body: c.body,
+                path: c.path,
+                diff_hunk: c.diff_hunk,
+                in_reply_to: c.in_reply_to,
+                resolved: false,
             })
             .collect())
     }

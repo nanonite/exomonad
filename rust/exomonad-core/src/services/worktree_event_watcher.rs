@@ -58,6 +58,7 @@ struct ForgejoReviewComment {
 /// A Forgejo review with a typed verdict.
 #[derive(Debug, Clone, Serialize)]
 struct ForgejoReview {
+    review_id: Option<u64>,
     body: String,
     state: ForgejoReviewVerdict,
     author_branch: Option<String>,
@@ -2188,6 +2189,7 @@ where
                 continue;
             }
             let local_review = ForgejoReview {
+                review_id: review.id,
                 body: review.body,
                 state,
                 author_branch: None,
@@ -2227,9 +2229,42 @@ where
 
         let changes_requested_rounds = distinct_changes_requested_rounds(&all_reviews);
         let forgejo_review_present = !local_reviews.is_empty();
+
+        let mut inline_comments: Vec<ForgejoReviewComment> = Vec::new();
+        for review in &local_reviews {
+            let Some(review_id) = review.review_id else {
+                continue;
+            };
+            let comments = match forgejo
+                .list_pull_request_review_comments(
+                    &repo_info.owner,
+                    &repo_info.repo,
+                    PRNumber::new(pr_number),
+                    review_id,
+                )
+                .await
+            {
+                Ok(comments) => comments,
+                Err(error) => {
+                    debug!(pr_number, review_id, error = %error, "Forgejo review comment fetch failed");
+                    continue;
+                }
+            };
+            for comment in comments {
+                inline_comments.push(ForgejoReviewComment {
+                    body: comment.body,
+                    path: comment.path,
+                    diff_hunk: comment.diff_hunk,
+                    thread_id: comment.in_reply_to.map(|id| id.to_string()),
+                    resolved: false,
+                    author_branch: None,
+                });
+            }
+        }
+
         (
             review_state,
-            vec![],
+            inline_comments,
             local_reviews,
             changes_requested_rounds,
             forgejo_review_present,
@@ -2711,6 +2746,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
         .comments
         .iter()
         .map(|c| ForgejoReview {
+            review_id: None,
             body: c.body.clone(),
             state: state.clone(),
             author_branch: c.author_branch.clone(),
@@ -2720,6 +2756,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
 
     if obs.review_state == ForgejoReviewState::Approved && reviews.is_empty() {
         reviews.push(ForgejoReview {
+            review_id: None,
             body: "Approved".to_string(),
             state: ForgejoReviewVerdict::Approved,
             author_branch: None,
@@ -2727,6 +2764,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
         });
     } else if obs.review_state == ForgejoReviewState::ChangesRequested && reviews.is_empty() {
         reviews.push(ForgejoReview {
+            review_id: None,
             body: "Changes requested".to_string(),
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: None,
@@ -3199,6 +3237,7 @@ mod tests {
 
     fn test_review(body: &str, state: ForgejoReviewVerdict) -> ForgejoReview {
         ForgejoReview {
+            review_id: None,
             body: body.to_string(),
             state,
             author_branch: None,
@@ -3678,6 +3717,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let reviews = vec![ForgejoReview {
+            review_id: None,
             body: "Please address comments".to_string(),
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: Some("review-pr-1".to_string()),
@@ -4551,6 +4591,7 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Gemini, "abc123");
         let reviews = vec![ForgejoReview {
+            review_id: None,
             body: "I have reviewed this and it is APPROVED".to_string(),
             state: ForgejoReviewVerdict::None,
             author_branch: None,
@@ -4725,12 +4766,14 @@ mod tests {
     fn test_format_message_with_reviews() {
         let reviews = vec![
             ForgejoReview {
+                review_id: None,
                 body: "LGTM!".to_string(),
                 state: ForgejoReviewVerdict::Approved,
                 author_branch: None,
                 commit_id: None,
             },
             ForgejoReview {
+                review_id: None,
                 body: "Good work.".to_string(),
                 state: ForgejoReviewVerdict::None,
                 author_branch: None,
