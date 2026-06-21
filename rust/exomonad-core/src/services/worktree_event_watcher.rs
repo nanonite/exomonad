@@ -1908,6 +1908,12 @@ where
     ) -> bool {
         match action {
             EventActionResponse::InjectMessage { message } => {
+                let preview: String = message.chars().take(200).collect();
+                info!(
+                    branch,
+                    message = %preview,
+                    "handle_event_action: InjectMessage"
+                );
                 let agent_name =
                     AgentName::try_from_str(branch).expect("validated string input is non-empty");
                 let tab_name =
@@ -1945,6 +1951,13 @@ where
                     }
                     None => "root".to_string(),
                 };
+                let preview: String = message.chars().take(200).collect();
+                info!(
+                    agent_slug,
+                    parent_session_id = %parent_session_id,
+                    message = %preview,
+                    "handle_event_action: NotifyParent"
+                );
                 let parent_name = AgentName::try_from_str(parent_session_id.as_str())
                     .expect("validated string input is non-empty");
                 let parent_tab = crate::services::delivery::resolve_tab_name_for_agent(
