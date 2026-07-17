@@ -2514,6 +2514,47 @@ mod tests {
     }
 
     #[test]
+    fn codex_fugu_companion_config_inherits_worker_effort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.worker_effort_level = ResolvedEffort::from_cli(EffortLevel::High);
+
+        write_codex_companion_config(
+            &config,
+            tmp.path(),
+            "fugu-companion",
+            "worker",
+            AgentType::CodexFugu,
+            Some("fugu-ultra"),
+        )
+        .unwrap();
+
+        let rendered = std::fs::read_to_string(tmp.path().join(".codex/config.toml")).unwrap();
+        assert!(rendered.contains("model = \"fugu-ultra\""));
+        assert!(rendered.contains("model_reasoning_effort = \"high\""));
+        assert!(!rendered.contains("model_reasoning_effort = \"medium\""));
+    }
+
+    #[test]
+    fn codex_fugu_rejects_explicit_medium_for_each_role() {
+        for role in [
+            "--tl-effort-level",
+            "--worker-effort-level",
+            "--reviewer-effort-level",
+        ] {
+            let error = validate_effort_for_harness(
+                role,
+                "codex-fugu",
+                ResolvedEffort::from_cli(EffortLevel::Medium),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(role), "missing corrective flag in {error}");
+            assert!(error.contains("high, xhigh, or max"));
+        }
+    }
+
+    #[test]
     fn watcher_dashboard_window_detection_uses_window_name() {
         assert!(has_watcher_dashboard_window(["Server", "Watcher", "TL"]));
         assert!(!has_watcher_dashboard_window(["Server", "TL"]));

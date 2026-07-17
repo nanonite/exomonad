@@ -81,6 +81,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add effort and Codex Fugu integration coverage (#531)
 - Improve effort and harness CLI guidance (#530)
 - Add Codex Fugu as a supported agent harness (#529)
 - Propagate effort levels across agent roles and companions (#528)

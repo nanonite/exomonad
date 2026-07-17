@@ -264,6 +264,15 @@ check-e2e-codex-messaging:
     bash -n tests/e2e/codex-messaging/run.sh
     bash -n tests/e2e/codex-messaging/validate.sh
 
+# Run deterministic Codex-Fugu role/effort integration coverage with a fake CLI
+e2e-codex-fugu:
+    ./tests/e2e/codex-fugu/run.sh
+
+# Check Codex-Fugu role/effort coverage without provider credentials
+check-e2e-codex-fugu:
+    bash -n tests/e2e/codex-fugu/run.sh
+    ./tests/e2e/codex-fugu/run.sh
+
 # Run E2E mixed agent chain test (Claude TL -> OpenCode worker, Codex reviewer config)
 e2e-tl-to-worker-messaging:
     ./tests/e2e/tl-to-worker-messaging/run.sh
