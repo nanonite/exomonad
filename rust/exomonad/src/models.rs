@@ -63,6 +63,7 @@ fn run_codex_fugu() -> Result<()> {
     println!("fugu");
     println!("fugu-ultra");
     println!("Effort: high, xhigh, or max (max is sent to Fugu as xhigh).");
+    println!("Use --tl-model, --worker-model, or --reviewer-model with the matching role.");
     println!("Note: Codex-Fugu model discovery is not exposed. Static list is provider-defined.");
     Ok(())
 }

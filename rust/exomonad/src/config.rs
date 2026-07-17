@@ -1102,7 +1102,7 @@ pub fn validate_effort_for_harness(
 ) -> Result<()> {
     if is_fugu_harness(harness) && matches!(effort.level, EffortLevel::Low | EffortLevel::Medium) {
         anyhow::bail!(
-            "{role} effort `{}` is unsupported by codex-fugu; use the corresponding role effort flag with high, xhigh, or max",
+            "{role} effort `{}` is unsupported by codex-fugu; omitted effort defaults to high. Set {role} to high, xhigh, or max (max is sent as xhigh)",
             effort.level
         );
     }

@@ -77,10 +77,11 @@ enum Commands {
         #[arg(long)]
         openrouter: bool,
         /// Set root agent type (valid: claude|gemini|opencode|codex|codex-fugu|shoal;
-        /// overrides --opencode-as-tl)
+        /// overrides --opencode-as-tl and the configured root_agent_type)
         #[arg(long)]
         tl: Option<String>,
-        /// Set spawn agent type for workers/teammates
+        /// Set spawn agent type for workers/teammates. The worker effort level is
+        /// inherited by forked TLs, leaves, ephemeral workers, and companions.
         #[arg(long)]
         worker: Option<String>,
         /// Model for the root TL agent.
@@ -89,17 +90,21 @@ enum Commands {
         /// With other TL agents, stores the root agent model.
         #[arg(long)]
         tl_model: Option<String>,
-        /// Model for spawned workers when --worker=opencode.
-        /// Default: opencode picks (uses its built-in default model).
+        /// Model for spawned workers with --worker=opencode or --worker=codex-fugu.
+        /// Fugu accepts `fugu` or `fugu-ultra`; otherwise the harness picks its default.
         #[arg(long)]
         worker_model: Option<String>,
-        /// Effort level for the root TL: low, medium, high, xhigh, or max.
+        /// Effort for the root TL: low, medium, high, xhigh, or max. CLI effort
+        /// flags override config.toml; omitted effort defaults to medium, except
+        /// Codex-Fugu, which defaults to high and rejects explicit low/medium.
         #[arg(long, value_enum)]
         tl_effort_level: Option<config::EffortLevel>,
-        /// Effort level inherited by spawned workers and agent companions.
+        /// Effort inherited by forked TLs, leaves, ephemeral workers, and companions.
+        /// For OpenCode this becomes the model's `--variant` when supported.
         #[arg(long, value_enum)]
         worker_effort_level: Option<config::EffortLevel>,
-        /// Effort level for automatically spawned reviewers.
+        /// Effort for automatically spawned reviewers: low, medium, high, xhigh, or max.
+        /// CLI effort flags override config.toml; Codex-Fugu reviewers require high+.
         #[arg(long, value_enum)]
         reviewer_effort_level: Option<config::EffortLevel>,
         /// Set reviewer agent type (valid: claude|gemini|opencode|codex|codex-fugu|shoal).
@@ -173,6 +178,7 @@ enum Commands {
     /// List available models per agent harness.
     Models {
         /// Harness: opencode, gemini, claude, codex, or codex-fugu. Omit for all.
+        /// Codex-Fugu lists `fugu` and `fugu-ultra`; effort is high, xhigh, or max.
         #[arg(value_name = "HARNESS")]
         harness: Option<String>,
         /// Provider filter (opencode only). E.g. "anthropic", "openai".

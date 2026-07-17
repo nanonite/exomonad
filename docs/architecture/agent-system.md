@@ -21,9 +21,12 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 |------|-------|--------|----------|-----------|-----------|
 | `root` | Opus | yes | no | yes | persistent (TL window) |
 | `tl` | Opus | yes | yes | yes | per-subtree |
-| `dev` | Codex / Gemini / OpenCode | no | yes | no | per-spec, exits at merge-ready |
-| `reviewer` | Codex / Gemini | no | no | no | ephemeral per review round |
-| `worker` | Codex / Gemini | no | no | no | ephemeral, same-worktree edits |
+| `dev` | Codex / Codex-Fugu / Gemini / OpenCode | no | yes | no | per-spec, exits at merge-ready |
+| `reviewer` | Codex / Codex-Fugu / Gemini / OpenCode | no | no | no | ephemeral per review round |
+| `worker` | Codex / Codex-Fugu / Gemini / OpenCode | no | no | no | ephemeral, same-worktree edits |
+
+Codex-Fugu is a distinct harness identity but follows the Codex protocol for
+configuration, hooks, MCP, sandboxing, lifecycle, and reviewer delivery.
 
 ---
 

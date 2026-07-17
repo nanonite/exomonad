@@ -978,6 +978,19 @@ pub async fn run(
         }
     }
 
+    let root_model = if config.root_agent_type == AgentType::OpenCode {
+        config.opencode.tl_model.as_deref()
+    } else {
+        config.model.as_deref()
+    };
+    let worker_model = if matches!(
+        config.spawn_agent_type,
+        AgentType::OpenCode | AgentType::CodexFugu
+    ) {
+        config.opencode.worker_model.as_deref()
+    } else {
+        None
+    };
     let init_argv = redact_init_argv(std::env::args().collect::<Vec<_>>());
     if let Err(e) = append_init_invocation_log(&cwd, &config, &init_argv) {
         warn!(error = %e, "Failed to append init invocation log");
@@ -986,7 +999,9 @@ pub async fn run(
             root_agent_type = agent_type_str(config.root_agent_type),
             spawn_agent_type = agent_type_str(config.spawn_agent_type),
             reviewer_agent_type = agent_type_str(config.reviewer.agent_type),
-            opencode_worker_model = ?config.opencode.worker_model,
+            root_model = ?root_model,
+            worker_model = ?worker_model,
+            reviewer_model = ?config.reviewer.model,
             tl_effort = %config.tl_effort_level.level,
             tl_effort_source = %config.tl_effort_level.source,
             worker_effort = %config.worker_effort_level.level,

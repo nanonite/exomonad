@@ -50,6 +50,22 @@ The user config update is protected by a sidecar flock in `CODEX_HOME` and writt
 
 These shell hooks forward Codex events to the existing ExoMonad server over the Unix-domain socket. The server normalizes Codex hook stdin into ExoMonad's internal `HookInput`, calls the Haskell WASM hook handler, then formats the result back into Codex hook stdout semantics.
 
+## Codex-Fugu
+
+Codex-Fugu is a distinct `AgentType::CodexFugu` with wire name `codex-fugu`,
+executable `codex-fugu`, and worktree suffix `-codex-fugu`. Its supported models
+are `fugu` and `fugu-ultra`. It intentionally reuses the Codex runtime contract:
+`.codex/config.toml`, ExoMonad MCP, `HookRuntime::Codex` shell hooks, MCP servers,
+sandbox policy, delivery, lifecycle, and reviewer submission.
+
+Fugu effort accepts `high`, `xhigh`, or `max`; `max` is normalized to `xhigh` in
+the command/config sent to the provider. When no role-specific effort is set,
+Fugu defaults to `high`; an explicit `low` or `medium` is rejected before tmux,
+worktree, pane, or companion side effects. Init performs a `codex-fugu --version`
+PATH preflight and reports the install requirement before creating runtime state.
+The Fugu path does not mutate a separate user profile; it uses the existing Codex
+trust/config mechanism.
+
 ## Why Shell Hooks Instead Of A Plugin
 
 Codex hooks are shell-native. The hook system executes configured commands with JSON on stdin and consumes stdout/exit status. A Bun or TypeScript bridge would duplicate what Codex already provides.
