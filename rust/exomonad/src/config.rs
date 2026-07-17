@@ -1,6 +1,7 @@
 //! Configuration discovery from .exo/config.toml and config.local.toml
 
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use exomonad_core::services::AgentType;
 use exomonad_core::Role;
 
@@ -84,6 +85,8 @@ pub struct ReviewerConfig {
     /// Agent type for the reviewer. Accepts "claude" or "opencode". Default: claude.
     #[serde(default = "default_reviewer_agent_type")]
     pub agent_type: AgentType,
+    /// Optional reviewer effort override from the [reviewer] table.
+    pub effort_level: Option<EffortLevel>,
     /// Model string passed to the reviewer agent
     /// (e.g. "claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5").
     /// `None` means the agent picks its own default.
@@ -101,6 +104,7 @@ impl Default for ReviewerConfig {
     fn default() -> Self {
         Self {
             agent_type: AgentType::Claude,
+            effort_level: None,
             model: None,
             context: vec![],
         }
@@ -152,9 +156,13 @@ pub struct RawConfig {
 
     /// Agent type for the root (TL) tab.
     pub root_agent_type: Option<AgentType>,
+    /// Default effort level for the root TL.
+    pub tl_effort_level: Option<EffortLevel>,
 
     /// Agent type for spawned workers/teammates.
     pub spawn_agent_type: Option<AgentType>,
+    /// Default effort level for spawned workers and agent companions.
+    pub worker_effort_level: Option<EffortLevel>,
 
     /// Optional flake reference to use when building WASM plugin via nix.
     pub flake_ref: Option<String>,
@@ -247,8 +255,14 @@ pub struct Config {
     pub wasm_dir: PathBuf,
     /// Agent type for the root (TL) tab.
     pub root_agent_type: AgentType,
+    /// Resolved effort level for the root TL.
+    pub tl_effort_level: ResolvedEffort,
     /// Agent type for spawned workers/teammates.
     pub spawn_agent_type: AgentType,
+    /// Resolved effort level for spawned workers and agent companions.
+    pub worker_effort_level: ResolvedEffort,
+    /// Resolved effort level for reviewers.
+    pub reviewer_effort_level: ResolvedEffort,
     /// Flake reference to use when building WASM plugin via nix.
     pub flake_ref: Option<String>,
     /// Name of the WASM module (default: "devswarm").
@@ -415,6 +429,14 @@ impl Config {
             .or(global_raw.spawn_agent_type)
             .unwrap_or(AgentType::Gemini);
 
+        let tl_effort_level =
+            resolve_effort_setting(None, local_raw.tl_effort_level, global_raw.tl_effort_level);
+        let worker_effort_level = resolve_effort_setting(
+            None,
+            local_raw.worker_effort_level,
+            global_raw.worker_effort_level,
+        );
+
         // Resolve flake_ref: local > global > fallback to None
         let flake_ref = local_raw.flake_ref.or(global_raw.flake_ref);
 
@@ -505,6 +527,7 @@ impl Config {
                 reviewer.agent_type = agent_type;
             }
         }
+        let reviewer_effort_level = resolve_effort_setting(None, reviewer.effort_level, None);
 
         Ok(Self {
             project_dir,
@@ -515,7 +538,10 @@ impl Config {
             shell_command,
             wasm_dir,
             root_agent_type,
+            tl_effort_level,
             spawn_agent_type,
+            worker_effort_level,
+            reviewer_effort_level,
             flake_ref,
             wasm_name,
             extra_mcp_servers,
@@ -563,7 +589,10 @@ impl Default for Config {
             shell_command: None,
             wasm_dir: PathBuf::from(".exo/wasm"),
             root_agent_type: AgentType::Claude,
+            tl_effort_level: ResolvedEffort::MEDIUM_DEFAULT,
             spawn_agent_type: AgentType::Gemini,
+            worker_effort_level: ResolvedEffort::MEDIUM_DEFAULT,
+            reviewer_effort_level: ResolvedEffort::MEDIUM_DEFAULT,
             flake_ref: None,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: std::collections::HashMap::new(),
@@ -955,5 +984,214 @@ context = ["CLAUDE.md", ".exo/rules/reviewer.md"]
         assert_eq!(config.reviewer.agent_type, AgentType::Claude);
         assert!(config.reviewer.model.is_none());
         assert!(config.reviewer.context.is_empty());
+    }
+}
+
+/// Public effort levels accepted by supported harnesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, Serialize)]
+pub enum EffortLevel {
+    #[value(name = "low")]
+    #[serde(rename = "low")]
+    Low,
+    #[value(name = "medium")]
+    #[serde(rename = "medium")]
+    Medium,
+    #[value(name = "high")]
+    #[serde(rename = "high")]
+    High,
+    #[value(name = "xhigh")]
+    #[serde(rename = "xhigh")]
+    XHigh,
+    #[value(name = "max")]
+    #[serde(rename = "max")]
+    Max,
+}
+
+impl Default for EffortLevel {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+impl std::fmt::Display for EffortLevel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        })
+    }
+}
+
+/// Identifies whether a resolved effort value was explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum EffortSource {
+    Cli,
+    Config,
+    Default,
+}
+
+impl std::fmt::Display for EffortSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Cli => "cli",
+            Self::Config => "config",
+            Self::Default => "default",
+        })
+    }
+}
+
+/// A role effort value together with its provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ResolvedEffort {
+    pub level: EffortLevel,
+    pub source: EffortSource,
+}
+
+impl ResolvedEffort {
+    pub const MEDIUM_DEFAULT: Self = Self {
+        level: EffortLevel::Medium,
+        source: EffortSource::Default,
+    };
+
+    pub fn for_harness(self, harness: &str) -> Self {
+        if self.source == EffortSource::Default && is_fugu_harness(harness) {
+            return Self {
+                level: EffortLevel::High,
+                source: EffortSource::Default,
+            };
+        }
+        self
+    }
+
+    pub fn from_cli(level: EffortLevel) -> Self {
+        Self {
+            level,
+            source: EffortSource::Cli,
+        }
+    }
+}
+
+/// Resolve CLI over local config, global config, and the medium default.
+pub fn resolve_effort_setting(
+    cli: Option<EffortLevel>,
+    local: Option<EffortLevel>,
+    global: Option<EffortLevel>,
+) -> ResolvedEffort {
+    match (cli, local, global) {
+        (Some(level), _, _) => ResolvedEffort {
+            level,
+            source: EffortSource::Cli,
+        },
+        (None, Some(level), _) | (None, None, Some(level)) => ResolvedEffort {
+            level,
+            source: EffortSource::Config,
+        },
+        (None, None, None) => ResolvedEffort::MEDIUM_DEFAULT,
+    }
+}
+
+/// Validate an effort setting before starting a harness.
+pub fn validate_effort_for_harness(
+    role: &str,
+    harness: &str,
+    effort: ResolvedEffort,
+) -> Result<()> {
+    if is_fugu_harness(harness) && matches!(effort.level, EffortLevel::Low | EffortLevel::Medium) {
+        anyhow::bail!(
+            "{role} effort `{}` is unsupported by codex-fugu; use the corresponding role effort flag with high, xhigh, or max",
+            effort.level
+        );
+    }
+    Ok(())
+}
+
+fn is_fugu_harness(harness: &str) -> bool {
+    matches!(
+        harness.to_ascii_lowercase().as_str(),
+        "codex-fugu" | "codexfugu"
+    )
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+    use clap::ValueEnum;
+
+    #[test]
+    fn effort_levels_parse_display_and_serialize() {
+        #[derive(Serialize)]
+        struct EffortConfig {
+            effort_level: EffortLevel,
+        }
+
+        for (level, name) in [
+            (EffortLevel::Low, "low"),
+            (EffortLevel::Medium, "medium"),
+            (EffortLevel::High, "high"),
+            (EffortLevel::XHigh, "xhigh"),
+            (EffortLevel::Max, "max"),
+        ] {
+            assert_eq!(EffortLevel::from_str(name, false), Ok(level));
+            assert_eq!(level.to_string(), name);
+            let config = EffortConfig {
+                effort_level: level,
+            };
+            assert_eq!(
+                toml::to_string(&config).unwrap().trim(),
+                format!("effort_level = \"{name}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn effort_resolution_preserves_precedence_and_source() {
+        let cli = resolve_effort_setting(
+            Some(EffortLevel::High),
+            Some(EffortLevel::Low),
+            Some(EffortLevel::Max),
+        );
+        assert_eq!(cli.level, EffortLevel::High);
+        assert_eq!(cli.source, EffortSource::Cli);
+
+        let local = resolve_effort_setting(None, Some(EffortLevel::Low), Some(EffortLevel::Max));
+        assert_eq!(local.level, EffortLevel::Low);
+        assert_eq!(local.source, EffortSource::Config);
+
+        let default = resolve_effort_setting(None, None, None);
+        assert_eq!(default, ResolvedEffort::MEDIUM_DEFAULT);
+    }
+
+    #[test]
+    fn fugu_default_is_high_but_explicit_medium_is_rejected() {
+        let default = ResolvedEffort::MEDIUM_DEFAULT.for_harness("codex-fugu");
+        assert_eq!(default.level, EffortLevel::High);
+        assert_eq!(default.source, EffortSource::Default);
+
+        let explicit = ResolvedEffort::from_cli(EffortLevel::Medium);
+        assert!(
+            validate_effort_for_harness("--tl-effort-level", "codex-fugu", explicit)
+                .unwrap_err()
+                .to_string()
+                .contains("--tl-effort-level")
+        );
+    }
+
+    #[test]
+    fn effort_fields_parse_from_toml() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+                tl_effort_level = "high"
+                worker_effort_level = "low"
+                [reviewer]
+                effort_level = "xhigh"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(raw.tl_effort_level, Some(EffortLevel::High));
+        assert_eq!(raw.worker_effort_level, Some(EffortLevel::Low));
+        assert_eq!(raw.reviewer.unwrap().effort_level, Some(EffortLevel::XHigh));
     }
 }

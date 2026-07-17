@@ -1,6 +1,6 @@
 use crate::uds_client;
 use anyhow::{Context, Result};
-use exomonad::config::Config;
+use exomonad::config::{validate_effort_for_harness, Config, EffortLevel, ResolvedEffort};
 use exomonad_core::services::AgentType;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -88,6 +88,9 @@ fn append_init_invocation_log(cwd: &Path, config: &Config, argv: &[String]) -> R
             "opencode_tl_model": config.opencode.tl_model.as_deref(),
             "opencode_worker_model": config.opencode.worker_model.as_deref(),
             "reviewer_model": config.reviewer.model.as_deref(),
+            "tl_effort": config.tl_effort_level,
+            "worker_effort": config.worker_effort_level,
+            "reviewer_effort": config.reviewer_effort_level,
         }
     });
     let mut file = std::fs::OpenOptions::new()
@@ -581,6 +584,9 @@ pub async fn run(
     worker: Option<String>,
     tl_model: Option<String>,
     worker_model: Option<String>,
+    tl_effort_level: Option<EffortLevel>,
+    worker_effort_level: Option<EffortLevel>,
+    reviewer_effort_level: Option<EffortLevel>,
     reviewer: Option<String>,
     reviewer_model: Option<String>,
     verbose: bool,
@@ -620,6 +626,15 @@ pub async fn run(
             config.opencode.worker_model = Some(m);
         }
     }
+    if let Some(level) = tl_effort_level {
+        config.tl_effort_level = ResolvedEffort::from_cli(level);
+    }
+    if let Some(level) = worker_effort_level {
+        config.worker_effort_level = ResolvedEffort::from_cli(level);
+    }
+    if let Some(level) = reviewer_effort_level {
+        config.reviewer_effort_level = ResolvedEffort::from_cli(level);
+    }
     if let Some(ref reviewer_type) = reviewer {
         config.reviewer.agent_type = parse_agent_type(reviewer_type)?;
     }
@@ -630,6 +645,30 @@ pub async fn run(
         config.openrouter.enabled = true;
     }
 
+    config.tl_effort_level = config
+        .tl_effort_level
+        .for_harness(agent_type_str(config.root_agent_type));
+    config.worker_effort_level = config
+        .worker_effort_level
+        .for_harness(agent_type_str(config.spawn_agent_type));
+    config.reviewer_effort_level = config
+        .reviewer_effort_level
+        .for_harness(agent_type_str(config.reviewer.agent_type));
+    validate_effort_for_harness(
+        "--tl-effort-level",
+        agent_type_str(config.root_agent_type),
+        config.tl_effort_level,
+    )?;
+    validate_effort_for_harness(
+        "--worker-effort-level",
+        agent_type_str(config.spawn_agent_type),
+        config.worker_effort_level,
+    )?;
+    validate_effort_for_harness(
+        "--reviewer-effort-level",
+        agent_type_str(config.reviewer.agent_type),
+        config.reviewer_effort_level,
+    )?;
     validate_opencode_model_owner(
         config.root_agent_type,
         config.opencode.tl_model.as_deref(),
@@ -673,6 +712,12 @@ pub async fn run(
             spawn_agent_type = agent_type_str(config.spawn_agent_type),
             reviewer_agent_type = agent_type_str(config.reviewer.agent_type),
             opencode_worker_model = ?config.opencode.worker_model,
+            tl_effort = %config.tl_effort_level.level,
+            tl_effort_source = %config.tl_effort_level.source,
+            worker_effort = %config.worker_effort_level.level,
+            worker_effort_source = %config.worker_effort_level.source,
+            reviewer_effort = %config.reviewer_effort_level.level,
+            reviewer_effort_source = %config.reviewer_effort_level.source,
             "Resolved exomonad init agent configuration"
         );
     }

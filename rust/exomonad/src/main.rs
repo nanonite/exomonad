@@ -93,6 +93,15 @@ enum Commands {
         /// Default: opencode picks (uses its built-in default model).
         #[arg(long)]
         worker_model: Option<String>,
+        /// Effort level for the root TL: low, medium, high, xhigh, or max.
+        #[arg(long, value_enum)]
+        tl_effort_level: Option<config::EffortLevel>,
+        /// Effort level inherited by spawned workers and agent companions.
+        #[arg(long, value_enum)]
+        worker_effort_level: Option<config::EffortLevel>,
+        /// Effort level for automatically spawned reviewers.
+        #[arg(long, value_enum)]
+        reviewer_effort_level: Option<config::EffortLevel>,
         /// Set reviewer agent type (valid: claude|gemini|opencode|codex|shoal).
         /// Overrides [reviewer] in config.toml.
         #[arg(long)]
@@ -328,6 +337,9 @@ async fn main() -> Result<()> {
             worker,
             tl_model,
             worker_model,
+            tl_effort_level,
+            worker_effort_level,
+            reviewer_effort_level,
             reviewer,
             reviewer_model,
             verbose,
@@ -341,6 +353,9 @@ async fn main() -> Result<()> {
                 worker,
                 tl_model,
                 worker_model,
+                tl_effort_level,
+                worker_effort_level,
+                reviewer_effort_level,
                 reviewer,
                 reviewer_model,
                 verbose,
