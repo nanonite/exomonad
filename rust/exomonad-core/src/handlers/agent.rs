@@ -759,6 +759,7 @@ impl<
             standalone_repo: req.standalone_repo,
             allowed_dirs: req.allowed_dirs,
             model: None,
+            effort: None,
         };
 
         let result = self

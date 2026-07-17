@@ -1155,6 +1155,10 @@ Run `exomonad recompile` first to build it.",
     agent_control = agent_control.with_yolo(config.yolo);
     agent_control = agent_control.with_spawn_agent_type(config.spawn_agent_type);
     agent_control = agent_control.with_spawn_agent_model(config.opencode.worker_model.clone());
+    agent_control =
+        agent_control.with_spawn_agent_effort(Some(config.worker_effort_level.level.to_string()));
+    agent_control =
+        agent_control.with_reviewer_effort(Some(config.reviewer_effort_level.level.to_string()));
     agent_control = agent_control.with_reviewer_agent_type(config.reviewer.agent_type);
     agent_control = agent_control.with_reviewer_model(config.reviewer.model.clone());
     agent_control = agent_control.with_reviewer_context(config.reviewer.context.clone());

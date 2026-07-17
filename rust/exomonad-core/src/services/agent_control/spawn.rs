@@ -1016,6 +1016,15 @@ impl<
         role: &str,
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
     ) -> serde_json::Value {
+        Self::generate_opencode_tl_settings_with_effort(agent_name, role, extra_mcp_servers, None)
+    }
+
+    pub fn generate_opencode_tl_settings_with_effort(
+        agent_name: &str,
+        role: &str,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+        effort: Option<&str>,
+    ) -> serde_json::Value {
         let mut mcp_servers = serde_json::Map::new();
         mcp_servers.insert(
             "exomonad".to_string(),
@@ -1034,11 +1043,17 @@ impl<
             "worker" => serde_json::json!([OPENCODE_WORKER_INSTRUCTIONS]),
             _ => serde_json::json!([OPENCODE_DEV_INSTRUCTIONS]),
         };
-        serde_json::json!({
+        let mut settings = serde_json::json!({
             "mcp": mcp_servers,
             "instructions": instructions,
             "plugin": ["./.exo/opencode-plugin"],
-        })
+        });
+        if let Some(effort) = effort.filter(|value| !value.is_empty()) {
+            settings["agent"] = serde_json::json!({
+                format!("exomonad-{role}"): {"reasoningEffort": effort}
+            });
+        }
+        settings
     }
 
     /// Write the exomonad OpenCode plugin package to `<dir>/.exo/opencode-plugin/`.
@@ -1549,6 +1564,7 @@ impl<
                         None, // no fork_session for OpenCode
                         None, // no claude_flags
                         options.model.as_deref(),
+                        options.effort.as_deref(),
                     )
                     .await
                     .map_err(|e| {
@@ -1568,6 +1584,7 @@ impl<
                         fork_id,
                         None,
                         options.model.as_deref(),
+                        options.effort.as_deref(),
                     )
                     .await
                     .map_err(|e| {
@@ -1588,6 +1605,7 @@ impl<
                         fork_id,
                         Some(&options.claude_flags),
                         options.model.as_deref(),
+                        options.effort.as_deref(),
                     )
                     .await
                     .map_err(|e| {
@@ -2013,6 +2031,7 @@ impl<
             standalone_repo: false,
             allowed_dirs: vec![],
             model: self.reviewer_model.clone(),
+            effort: self.reviewer_effort().map(str::to_string),
         };
 
         let result = self.spawn_subtree(&options, caller_bb).await?;

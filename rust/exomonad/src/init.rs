@@ -401,11 +401,13 @@ fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
     let codex_dir = cwd.join(".codex");
     std::fs::create_dir_all(&codex_dir)?;
     let extra_mcp_servers = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
-    let codex_config = exomonad_core::codex_config::render_codex_config(
+    let effort = config.tl_effort_level.level.to_string();
+    let codex_config = exomonad_core::codex_config::render_codex_config_with_effort(
         "root",
         "root",
         exomonad_core::services::agent_control::CODEX_TL_INSTRUCTIONS,
         config.model.as_deref(),
+        Some(&effort),
         &extra_mcp_servers,
         &exomonad_core::find_exomonad_binary(),
     );
@@ -429,28 +431,53 @@ fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn build_claude_root_command(model: Option<&str>, initial_prompt: Option<&str>) -> String {
+    build_claude_root_command_with_effort(model, None, initial_prompt)
+}
+
+fn build_claude_root_command_with_effort(
+    model: Option<&str>,
+    effort: Option<&str>,
+    initial_prompt: Option<&str>,
+) -> String {
     let model_flag = model
         .filter(|value| !value.is_empty())
         .map(|value| format!(" --model {}", shell_escape::escape(value.into())))
+        .unwrap_or_default();
+    let effort_flag = effort
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" --effort {}", shell_escape::escape(value.into())))
         .unwrap_or_default();
 
     let launch = initial_prompt
         .filter(|value| !value.is_empty())
         .map(|prompt| {
             format!(
-                "claude --dangerously-skip-permissions{model_flag} {}",
+                "claude --dangerously-skip-permissions{model_flag}{effort_flag} {}",
                 shell_escape::escape(prompt.into())
             )
         })
-        .unwrap_or_else(|| format!("claude --dangerously-skip-permissions{model_flag}"));
+        .unwrap_or_else(|| {
+            format!("claude --dangerously-skip-permissions{model_flag}{effort_flag}")
+        });
 
     format!("{launch}; echo; echo [Claude Code exited]; exec bash -l")
 }
 
+#[allow(dead_code)]
 fn build_codex_root_command(
     cwd: &Path,
     model: Option<&str>,
+    initial_prompt: Option<&str>,
+) -> String {
+    build_codex_root_command_with_effort(cwd, model, None, initial_prompt)
+}
+
+fn build_codex_root_command_with_effort(
+    cwd: &Path,
+    model: Option<&str>,
+    effort: Option<&str>,
     initial_prompt: Option<&str>,
 ) -> String {
     let escaped_dir = shell_escape::escape(cwd.display().to_string().into());
@@ -458,19 +485,23 @@ fn build_codex_root_command(
         .filter(|value| !value.is_empty())
         .map(|value| format!(" --model {}", shell_escape::escape(value.into())))
         .unwrap_or_default();
+    let effort_flag = effort
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" -c model_reasoning_effort=\"{}\"", value))
+        .unwrap_or_default();
     let prompt = initial_prompt
         .filter(|value| !value.is_empty())
         .map(|value| format!(" {}", shell_escape::escape(value.into())))
         .unwrap_or_default();
 
     let command = format!(
-        "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
-        escaped_dir, model_flag, prompt
+        "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}{}",
+        escaped_dir, model_flag, effort_flag, prompt
     );
     let restart_hint = shell_escape::escape(
         format!(
-            "[Codex exited - restart with: codex --dangerously-bypass-approvals-and-sandbox --cd {}{}]",
-            escaped_dir, model_flag
+            "[Codex exited - restart with: codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}]",
+            escaped_dir, model_flag, effort_flag
         )
         .into(),
     );
@@ -498,37 +529,148 @@ fn validate_claude_model(model: &str) -> Result<()> {
     Ok(())
 }
 
-async fn validate_opencode_model(model: &str) -> Result<()> {
+fn parse_opencode_model_catalog(
+    text: &str,
+) -> std::collections::HashMap<String, std::collections::BTreeSet<String>> {
+    let mut catalog = std::collections::HashMap::new();
+    let mut json = String::new();
+    let mut label = None;
+
+    for line in text.lines() {
+        if json.is_empty() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('{') {
+                json.push_str(trimmed);
+            } else if !trimmed.is_empty() {
+                label = Some(trimmed.to_string());
+            }
+            continue;
+        }
+
+        json.push('\n');
+        json.push_str(line);
+        let Ok(value) = serde_json::from_str::<Value>(&json) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            json.clear();
+            label = None;
+            continue;
+        };
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| label.as_deref());
+        let provider = object.get("providerID").and_then(Value::as_str);
+        let variants: std::collections::BTreeSet<String> = object
+            .get("variants")
+            .and_then(Value::as_object)
+            .map(|variants| variants.keys().cloned().collect())
+            .unwrap_or_default();
+        if let Some(id) = id {
+            catalog.insert(id.to_string(), variants.clone());
+            if let Some(provider) = provider {
+                catalog.insert(format!("{provider}/{id}"), variants);
+            }
+        }
+        json.clear();
+        label = None;
+    }
+
+    catalog
+}
+
+async fn validate_opencode_model(model: &str, effort: Option<&str>) -> Result<()> {
     let out = tokio::process::Command::new("opencode")
-        .args(["models"])
+        .args(["models", "--verbose"])
         .output()
         .await
-        .context("Failed to run `opencode models` for validation")?;
+        .context("Failed to run `opencode models --verbose` for validation")?;
     if !out.status.success() {
         anyhow::bail!(
-            "`opencode models` exited {}: {}",
+            "`opencode models --verbose` exited {}: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
     }
     let text = std::str::from_utf8(&out.stdout)?;
-    let known: std::collections::HashSet<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    if !known.contains(model) {
+    let catalog = parse_opencode_model_catalog(text);
+    let Some(variants) = catalog.get(model) else {
         anyhow::bail!("Unknown opencode model `{model}`. Run `exomonad models` to see the list.");
+    };
+    if let Some(effort) = effort.filter(|value| !value.is_empty()) {
+        if !variants.contains(effort) {
+            let supported = if variants.is_empty() {
+                "none".to_string()
+            } else {
+                variants.iter().cloned().collect::<Vec<_>>().join(", ")
+            };
+            anyhow::bail!(
+                "Unsupported OpenCode effort `{effort}` for model `{model}`. Supported variants: {supported}. Correct with the role-specific effort flag."
+            );
+        }
     }
     Ok(())
 }
 
-fn validate_codex_model(model: &str) -> Result<()> {
+fn validate_codex_model_name(model: &str) -> Result<()> {
     if !model.starts_with("gpt-") {
         anyhow::bail!(
             "Unknown Codex model `{model}`. Use a Codex/OpenAI model ID starting with `gpt-` \
              (for example `gpt-5.2-codex`)."
         );
+    }
+    Ok(())
+}
+
+async fn validate_codex_model(model: &str, effort: Option<&str>) -> Result<()> {
+    validate_codex_model_name(model)?;
+    let out = tokio::process::Command::new("codex")
+        .args(["debug", "models"])
+        .output()
+        .await
+        .context("Failed to run `codex debug models` for validation")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`codex debug models` exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let catalog: Value =
+        serde_json::from_slice(&out.stdout).context("Codex model catalog was not valid JSON")?;
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .context("Codex model catalog did not contain a models array")?;
+    let Some(model_record) = models
+        .iter()
+        .find(|record| record.get("slug").and_then(Value::as_str) == Some(model))
+    else {
+        anyhow::bail!("Unknown Codex model `{model}`. Run `codex debug models` to see the list.");
+    };
+    if let Some(effort) = effort.filter(|value| !value.is_empty()) {
+        let supported = model_record
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .map(|levels| {
+                levels
+                    .iter()
+                    .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !supported.iter().any(|level| level == effort) {
+            let supported = if supported.is_empty() {
+                "none".to_string()
+            } else {
+                supported.join(", ")
+            };
+            anyhow::bail!(
+                "Unsupported Codex effort `{effort}` for model `{model}`. Supported reasoning levels: {supported}. Correct with the role-specific effort flag."
+            );
+        }
     }
     Ok(())
 }
@@ -561,16 +703,21 @@ fn validate_opencode_model_owner(
     );
 }
 
-fn validate_reviewer_model_for_harness(agent_type: AgentType, model: Option<&str>) -> Result<()> {
+async fn validate_reviewer_model_for_harness(
+    agent_type: AgentType,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<()> {
     let Some(model) = model else {
         return Ok(());
     };
 
     match agent_type {
         AgentType::Claude => validate_claude_model(model),
-        AgentType::Codex => validate_codex_model(model),
+        AgentType::Codex => validate_codex_model(model, effort).await,
         AgentType::Gemini => validate_gemini_model(model),
-        AgentType::OpenCode | AgentType::Shoal | AgentType::Process => Ok(()),
+        AgentType::OpenCode => validate_opencode_model(model, effort).await,
+        AgentType::Shoal | AgentType::Process => Ok(()),
     }
 }
 
@@ -682,26 +829,36 @@ pub async fn run(
         "spawn_agent_type",
     )?;
 
+    let tl_effort = config.tl_effort_level.level.to_string();
+    let worker_effort = config.worker_effort_level.level.to_string();
+    let reviewer_effort = config.reviewer_effort_level.level.to_string();
+    log_ignored_effort("tl", config.root_agent_type, &tl_effort);
+    log_ignored_effort("worker", config.spawn_agent_type, &worker_effort);
+    log_ignored_effort("reviewer", config.reviewer.agent_type, &reviewer_effort);
     if config.root_agent_type == AgentType::OpenCode {
         if let Some(m) = config.opencode.tl_model.as_deref() {
-            validate_opencode_model(m).await?;
+            validate_opencode_model(m, Some(&tl_effort)).await?;
+        }
+    } else if config.root_agent_type == AgentType::Codex {
+        if let Some(m) = config.model.as_deref() {
+            validate_codex_model(m, Some(&tl_effort)).await?;
         }
     }
     if config.spawn_agent_type == AgentType::OpenCode {
         if let Some(m) = config.opencode.worker_model.as_deref() {
-            validate_opencode_model(m).await?;
+            validate_opencode_model(m, Some(&worker_effort)).await?;
+        }
+    } else if config.spawn_agent_type == AgentType::Codex {
+        if let Some(m) = config.opencode.worker_model.as_deref() {
+            validate_codex_model(m, Some(&worker_effort)).await?;
         }
     }
-    if config.reviewer.agent_type == AgentType::OpenCode {
-        if let Some(m) = config.reviewer.model.as_deref() {
-            validate_opencode_model(m).await?;
-        }
-    } else {
-        validate_reviewer_model_for_harness(
-            config.reviewer.agent_type,
-            config.reviewer.model.as_deref(),
-        )?;
-    }
+    validate_reviewer_model_for_harness(
+        config.reviewer.agent_type,
+        config.reviewer.model.as_deref(),
+        Some(&reviewer_effort),
+    )
+    .await?;
 
     let init_argv = redact_init_argv(std::env::args().collect::<Vec<_>>());
     if let Err(e) = append_init_invocation_log(&cwd, &config, &init_argv) {
@@ -900,11 +1057,14 @@ pub async fn run(
             use exomonad_core::services::agent_control::AgentControlService;
             use exomonad_core::services::Services;
             let extra_mcp_servers = std::collections::HashMap::new();
-            let opencode_config = AgentControlService::<Services>::generate_opencode_tl_settings(
-                "root",
-                "root",
-                &extra_mcp_servers,
-            );
+            let effort = config.tl_effort_level.level.to_string();
+            let opencode_config =
+                AgentControlService::<Services>::generate_opencode_tl_settings_with_effort(
+                    "root",
+                    "root",
+                    &extra_mcp_servers,
+                    Some(&effort),
+                );
             let opencode_dir = cwd.join(".exo/agents/root");
             std::fs::create_dir_all(&opencode_dir)?;
             std::fs::write(
@@ -1329,9 +1489,14 @@ pub async fn run(
         use exomonad_core::services::Services;
         let extra_mcp = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
         // Write opencode.json to repo root so the TL window discovers it via CWD.
-        let opencode_config = AgentControlService::<Services>::generate_opencode_tl_settings(
-            "root", "root", &extra_mcp,
-        );
+        let effort = config.tl_effort_level.level.to_string();
+        let opencode_config =
+            AgentControlService::<Services>::generate_opencode_tl_settings_with_effort(
+                "root",
+                "root",
+                &extra_mcp,
+                Some(&effort),
+            );
         std::fs::write(
             cwd.join("opencode.json"),
             serde_json::to_string_pretty(&opencode_config)?,
@@ -1357,10 +1522,17 @@ pub async fn run(
             .as_deref()
             .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
             .unwrap_or_default();
+        let tl_effort = config.tl_effort_level.level.to_string();
+        let opencode_variant_flag = format!(
+            " --variant {}",
+            shell_escape::escape(tl_effort.as_str().into())
+        );
         match (config.root_agent_type, config.initial_prompt.as_deref()) {
-            (AgentType::Claude, prompt) => {
-                build_claude_root_command(config.model.as_deref(), prompt)
-            }
+            (AgentType::Claude, prompt) => build_claude_root_command_with_effort(
+                config.model.as_deref(),
+                Some(&tl_effort),
+                prompt,
+            ),
             (AgentType::Gemini, Some(prompt)) => {
                 let yolo_flag = if config.yolo { " --yolo" } else { "" };
                 format!(
@@ -1389,7 +1561,7 @@ pub async fn run(
                     None => prompt.to_string(),
                 };
                 format!(
-                    "opencode run{yolo}{opencode_model_flag} '{}'",
+                    "opencode run{yolo}{opencode_model_flag}{opencode_variant_flag} '{}'",
                     augmented.replace('\'', "'\\''")
                 )
             }
@@ -1399,11 +1571,14 @@ pub async fn run(
                 } else {
                     ""
                 };
-                format!("opencode{opencode_model_flag}{yolo}")
+                format!("opencode{opencode_model_flag}{yolo} --agent exomonad-root")
             }
-            (AgentType::Codex, prompt) => {
-                build_codex_root_command(&cwd, config.model.as_deref(), prompt)
-            }
+            (AgentType::Codex, prompt) => build_codex_root_command_with_effort(
+                &cwd,
+                config.model.as_deref(),
+                Some(&tl_effort),
+                prompt,
+            ),
             (AgentType::Process, _) => {
                 unreachable!("Process is for companions only, not root agent")
             }
@@ -1636,6 +1811,31 @@ pub async fn run(
             );
 
             worktree_path
+        } else if agent_type == AgentType::OpenCode {
+            use exomonad_core::services::agent_control::AgentControlService;
+            use exomonad_core::services::Services;
+            let exo_dir = agent_dir.join(".exo");
+            std::fs::create_dir_all(&exo_dir)?;
+            let socket_target = exo_dir.join("server.sock");
+            let _ = std::fs::remove_file(&socket_target);
+            std::os::unix::fs::symlink(cwd.join(".exo/server.sock"), &socket_target)?;
+            let extra_mcp = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
+            let effort = config.worker_effort_level.level.to_string();
+            let opencode_config =
+                AgentControlService::<Services>::generate_opencode_tl_settings_with_effort(
+                    &companion.name,
+                    &companion.role,
+                    &extra_mcp,
+                    Some(&effort),
+                );
+            std::fs::write(
+                agent_dir.join("opencode.json"),
+                serde_json::to_string_pretty(&opencode_config)?,
+            )?;
+            AgentControlService::<Services>::write_opencode_plugin_files(&agent_dir)
+                .await
+                .context("Failed to write companion OpenCode plugin files")?;
+            agent_dir.clone()
         } else {
             // Gemini/Shoal companions use project root CWD
             let companion_mcp = serde_json::json!({
@@ -1656,22 +1856,10 @@ pub async fn run(
                     )?;
                 }
                 AgentType::Shoal => {}
-                AgentType::OpenCode => {
-                    let opencode_config = serde_json::json!({
-                        "mcp": {
-                            "exomonad": {
-                                "type": "local",
-                                "command": ["exomonad", "mcp-stdio", "--role", &companion.role, "--name", &companion.name]
-                            }
-                        }
-                    });
-                    std::fs::write(
-                        agent_dir.join("opencode.json"),
-                        serde_json::to_string_pretty(&opencode_config)?,
-                    )?;
-                }
                 AgentType::Codex => {}
-                AgentType::Claude | AgentType::Process => unreachable!(),
+                AgentType::Claude | AgentType::OpenCode | AgentType::Process => {
+                    unreachable!()
+                }
             }
 
             cwd.clone()
@@ -1685,6 +1873,14 @@ pub async fn run(
             .as_ref()
             .map(|m| format!(" --model {}", m))
             .unwrap_or_default();
+        let worker_effort_flag = format!(
+            " --effort {}",
+            shell_escape::escape(config.worker_effort_level.level.to_string().into())
+        );
+        let worker_variant_flag = format!(
+            " --variant {}",
+            shell_escape::escape(config.worker_effort_level.level.to_string().into())
+        );
         let env_prefix = format!(
             "EXOMONAD_AGENT_ID={} EXOMONAD_ROLE={} ",
             companion.name, companion.role
@@ -1697,7 +1893,7 @@ pub async fn run(
                     None => String::new(),
                 };
                 format!(
-                    "{env_prefix}{}{model_flag}{task_part}; echo; echo '[{} exited]'; exec bash -l",
+                    "{env_prefix}{}{model_flag}{worker_effort_flag}{task_part}; echo; echo '[{} exited]'; exec bash -l",
                     companion.command, companion.name
                 )
             }
@@ -1742,7 +1938,16 @@ pub async fn run(
                     Some(t) => format!(" '{}'", t),
                     None => String::new(),
                 };
-                format!("{env_prefix}opencode run{yolo}{model_flag}{task_part}")
+                if escaped_task.is_some() {
+                    format!(
+                        "{env_prefix}opencode run{yolo}{model_flag}{worker_variant_flag}{task_part}"
+                    )
+                } else {
+                    format!(
+                        "{env_prefix}opencode{yolo}{model_flag} --agent exomonad-{}",
+                        companion.role
+                    )
+                }
             }
             AgentType::Codex => format!(
                 "{env_prefix}echo 'Codex companion startup is not implemented yet'; exec bash -l"
@@ -1990,6 +2195,17 @@ fn agent_type_str(t: AgentType) -> &'static str {
         AgentType::Codex => "codex",
         AgentType::Shoal => "shoal",
         AgentType::Process => "process",
+    }
+}
+
+fn log_ignored_effort(role: &str, agent_type: AgentType, effort: &str) {
+    if matches!(agent_type, AgentType::Gemini | AgentType::Shoal) {
+        info!(
+            role,
+            harness = agent_type_str(agent_type),
+            effort,
+            "Configured effort is ignored because this harness has no stable effort interface"
+        );
     }
 }
 
@@ -2324,9 +2540,9 @@ mod tests {
 
     #[test]
     fn test_validate_codex_model_rejects_non_codex_prefixes() {
-        assert!(validate_codex_model("gpt-5.2-codex").is_ok());
-        assert!(validate_codex_model("opencode-go/deepseek-v4-flash").is_err());
-        assert!(validate_codex_model("claude-sonnet-4-6").is_err());
+        assert!(validate_codex_model_name("gpt-5.2-codex").is_ok());
+        assert!(validate_codex_model_name("opencode-go/deepseek-v4-flash").is_err());
+        assert!(validate_codex_model_name("claude-sonnet-4-6").is_err());
     }
 
     #[test]
@@ -2395,6 +2611,39 @@ mod tests {
                 "agent-1"
             ]))
         );
+    }
+
+    #[test]
+    fn parses_opencode_verbose_catalog_variants() {
+        let catalog = parse_opencode_model_catalog(
+            "opencode-go/deepseek-v4-pro\n{\n  \"id\": \"deepseek-v4-pro\",\n  \"providerID\": \"opencode-go\",\n  \"variants\": {\n    \"high\": {},\n    \"max\": {}\n  }\n}\n",
+        );
+
+        assert!(catalog["opencode-go/deepseek-v4-pro"].contains("high"));
+        assert!(catalog["opencode-go/deepseek-v4-pro"].contains("max"));
+        assert!(!catalog["opencode-go/deepseek-v4-pro"].contains("medium"));
+    }
+
+    #[test]
+    fn claude_root_command_includes_effort() {
+        let command = build_claude_root_command_with_effort(Some("sonnet"), Some("xhigh"), None);
+
+        assert!(command
+            .starts_with("claude --dangerously-skip-permissions --model sonnet --effort xhigh"));
+    }
+
+    #[test]
+    fn codex_root_command_includes_effort() {
+        let command = build_codex_root_command_with_effort(
+            Path::new("/tmp/exomonad"),
+            Some("gpt-5.2"),
+            Some("high"),
+            None,
+        );
+
+        assert!(command.starts_with(
+            "codex --dangerously-bypass-approvals-and-sandbox --cd /tmp/exomonad --model gpt-5.2 -c model_reasoning_effort=\"high\""
+        ));
     }
 
     #[test]

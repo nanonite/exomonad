@@ -60,6 +60,26 @@ pub fn render_codex_config(
     extra_mcp_servers: &HashMap<String, Value>,
     exomonad_binary: &Path,
 ) -> String {
+    render_codex_config_with_effort(
+        agent_name,
+        role,
+        instructions,
+        model,
+        None,
+        extra_mcp_servers,
+        exomonad_binary,
+    )
+}
+
+pub fn render_codex_config_with_effort(
+    agent_name: &str,
+    role: &str,
+    instructions: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    extra_mcp_servers: &HashMap<String, Value>,
+    exomonad_binary: &Path,
+) -> String {
     let mut mcp_servers = toml::map::Map::new();
     mcp_servers.insert(
         "exomonad".to_string(),
@@ -84,7 +104,7 @@ pub fn render_codex_config(
     let hook_command_prefix = crate::util::shell_quote(&exomonad_binary);
 
     CODEX_CONFIG_TEMPLATE
-        .replace("{model_config}", &model_config_toml(model))
+        .replace("{model_config}", &model_config_toml(model, effort))
         .replace(
             "{instructions}",
             &escape_multiline_basic_string(instructions),
@@ -489,18 +509,27 @@ fn workspace_write_profile() -> toml::map::Map<String, toml::Value> {
     read_mostly_profile(&["."])
 }
 
-fn model_config_toml(model: Option<&str>) -> String {
-    match model.filter(|value| !value.is_empty()) {
-        Some(model) => {
-            let mut root = toml::map::Map::new();
-            root.insert("model".to_string(), toml::Value::String(model.to_string()));
-            let mut rendered = toml::to_string(&toml::Value::Table(root))
-                .expect("Codex model config should serialize");
-            rendered.push('\n');
-            rendered
-        }
-        None => String::new(),
+fn model_config_toml(model: Option<&str>, effort: Option<&str>) -> String {
+    if model.filter(|value| !value.is_empty()).is_none()
+        && effort.filter(|value| !value.is_empty()).is_none()
+    {
+        return String::new();
     }
+
+    let mut root = toml::map::Map::new();
+    if let Some(model) = model.filter(|value| !value.is_empty()) {
+        root.insert("model".to_string(), toml::Value::String(model.to_string()));
+    }
+    if let Some(effort) = effort.filter(|value| !value.is_empty()) {
+        root.insert(
+            "model_reasoning_effort".to_string(),
+            toml::Value::String(effort.to_string()),
+        );
+    }
+    let mut rendered =
+        toml::to_string(&toml::Value::Table(root)).expect("Codex model config should serialize");
+    rendered.push('\n');
+    rendered
 }
 
 fn exomonad_mcp_server(agent_name: &str, role: &str) -> toml::map::Map<String, toml::Value> {
@@ -687,6 +716,23 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
         assert!(config.starts_with("model = \"gpt-5.2\"\n\napproval_policy"));
+    }
+
+    #[test]
+    fn renders_effort_when_provided() {
+        let config = render_codex_config_with_effort(
+            "worker-1-codex",
+            "worker",
+            "Use ExoMonad tools.",
+            Some("gpt-5.2"),
+            Some("high"),
+            &HashMap::new(),
+            test_exomonad_binary(),
+        );
+
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
+        assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("high"));
     }
 
     #[test]

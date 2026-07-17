@@ -505,6 +505,9 @@ pub struct SpawnSubtreeOptions {
     /// Model override for this spawn. None = use service default (spawn_agent_model).
     #[serde(default)]
     pub model: Option<String>,
+    /// Effort override for this spawn. None = use the role service default.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// Options for spawning a Gemini leaf subtree agent.
@@ -734,6 +737,8 @@ pub struct AgentControlService<C> {
     /// Model for spawned OpenCode workers (passed to `opencode serve --model` / `opencode run --model`).
     /// `None` means let opencode pick.
     pub(crate) spawn_agent_model: Option<String>,
+    /// Effort inherited by spawned TLs, leaves, workers, and companions.
+    pub(crate) spawn_agent_effort: Option<String>,
     /// WASM name for role context resolution (default: "devswarm").
     pub(crate) wasm_name: String,
     /// Pre-serialized extra MCP servers to include in spawned agent configs.
@@ -744,6 +749,8 @@ pub struct AgentControlService<C> {
     pub(crate) reviewer_agent_type: AgentType,
     /// Model for the reviewer agent. None = agent picks its default.
     pub(crate) reviewer_model: Option<String>,
+    /// Effort used by automatically spawned reviewers.
+    pub(crate) reviewer_effort: Option<String>,
     /// Context file paths injected into the reviewer's task (e.g. CLAUDE.md, reviewer rules).
     pub(crate) reviewer_context: Vec<String>,
     /// Forgejo environment sourced from loaded config, overriding stale parent process env.
@@ -772,11 +779,13 @@ impl<
             yolo: false,
             spawn_agent_type: AgentType::Gemini,
             spawn_agent_model: None,
+            spawn_agent_effort: None,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: HashMap::new(),
             openrouter_api_key: None,
             reviewer_agent_type: AgentType::Claude,
             reviewer_model: None,
+            reviewer_effort: None,
             reviewer_context: vec![],
             forgejo_spawn_env: None,
         }
@@ -833,6 +842,28 @@ impl<
     /// Get the configured model for spawned OpenCode workers, if any.
     pub fn spawn_agent_model(&self) -> Option<&str> {
         self.spawn_agent_model.as_deref()
+    }
+
+    /// Set the effort inherited by spawned agents and companions.
+    pub fn with_spawn_agent_effort(mut self, effort: Option<String>) -> Self {
+        self.spawn_agent_effort = effort;
+        self
+    }
+
+    /// Get the inherited effort for spawned agents, if configured.
+    pub fn spawn_agent_effort(&self) -> Option<&str> {
+        self.spawn_agent_effort.as_deref()
+    }
+
+    /// Set the effort used by automatically spawned reviewers.
+    pub fn with_reviewer_effort(mut self, effort: Option<String>) -> Self {
+        self.reviewer_effort = effort;
+        self
+    }
+
+    /// Get the reviewer effort, if configured.
+    pub fn reviewer_effort(&self) -> Option<&str> {
+        self.reviewer_effort.as_deref()
     }
 
     /// Set the agent type for the reviewer.

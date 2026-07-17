@@ -4,6 +4,7 @@ fn generate_opencode_agent_settings(
     agent_name: &str,
     role: &str,
     extra_mcp_servers: &HashMap<String, serde_json::Value>,
+    effort: Option<&str>,
 ) -> serde_json::Value {
     let mut mcp_servers = serde_json::Map::new();
     mcp_servers.insert(
@@ -23,12 +24,18 @@ fn generate_opencode_agent_settings(
         _ => serde_json::json!([super::spawn::OPENCODE_DEV_INSTRUCTIONS]),
     };
 
-    serde_json::json!({
+    let mut settings = serde_json::json!({
         "mcp": mcp_servers,
         "instructions": instructions,
         "plugin": ["./.exo/opencode-plugin"],
         "permission": "allow",
-    })
+    });
+    if let Some(effort) = effort.filter(|value| !value.is_empty()) {
+        settings["agent"] = serde_json::json!({
+            format!("exomonad-{role}"): {"reasoningEffort": effort}
+        });
+    }
+    settings
 }
 
 async fn write_opencode_agent_plugin_files(dir: &Path) -> Result<()> {
@@ -51,6 +58,14 @@ impl<
             + 'static,
     > AgentControlService<C>
 {
+    fn effort_for_role(&self, role: &str) -> Option<&str> {
+        if role == "reviewer" {
+            self.reviewer_effort()
+        } else {
+            self.spawn_agent_effort()
+        }
+    }
+
     pub(crate) fn resolve_tmux_session(&self) -> Result<String> {
         self.tmux_session
             .clone()
@@ -324,8 +339,10 @@ impl<
         prompt: Option<&str>,
         env_vars: HashMap<String, String>,
     ) -> Result<super::tmux_ipc::WindowId> {
-        self.new_tmux_window_inner(name, cwd, agent_type, prompt, env_vars, None, None, None)
-            .await
+        self.new_tmux_window_inner(
+            name, cwd, agent_type, prompt, env_vars, None, None, None, None,
+        )
+        .await
     }
 
     /// Build the full shell command string for an agent.
@@ -335,6 +352,7 @@ impl<
     /// `prompt_file` is an absolute path to a file containing the prompt text.
     /// The prompt is read at runtime via `$(cat ...)` to avoid shell quoting issues
     /// with arbitrary prompt content (apostrophes, backticks, $(), etc.).
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn build_agent_command(
         agent_type: AgentType,
         prompt_file: Option<&Path>,
@@ -344,6 +362,31 @@ impl<
         claude_flags: Option<&ClaudeSpawnFlags>,
         yolo: bool,
         model: Option<&str>,
+    ) -> String {
+        Self::build_agent_command_with_effort(
+            agent_type,
+            prompt_file,
+            fork_session_id,
+            env_vars,
+            cwd,
+            claude_flags,
+            yolo,
+            model,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_agent_command_with_effort(
+        agent_type: AgentType,
+        prompt_file: Option<&Path>,
+        fork_session_id: Option<&str>,
+        env_vars: &HashMap<String, String>,
+        cwd: &Path,
+        claude_flags: Option<&ClaudeSpawnFlags>,
+        yolo: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
     ) -> String {
         let cmd = agent_type.command();
 
@@ -386,25 +429,49 @@ impl<
         let model_flag = model
             .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
             .unwrap_or_default();
+        let effort_flag = if agent_type == AgentType::Claude {
+            effort
+                .map(|level| format!(" --effort {}", shell_escape::escape(level.into())))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let variant_flag = effort
+            .map(|level| format!(" --variant {}", shell_escape::escape(level.into())))
+            .unwrap_or_default();
 
         let agent_command = match (prompt_file, fork_session_id) {
             (Some(pf), Some(session_id)) => {
                 let escaped_session = Self::escape_for_shell_command(session_id);
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
                 match agent_type {
-                    AgentType::Codex => {
-                        Self::build_codex_command(cwd, Some(pf), model, Some(session_id))
-                    }
+                    AgentType::Codex => Self::build_codex_command_with_effort(
+                        cwd,
+                        Some(pf),
+                        model,
+                        effort,
+                        Some(session_id),
+                    ),
                     AgentType::OpenCode => {
                         format!(
-                            "{} run --interactive{} --session {} --fork \"$(cat {})\"{}",
-                            cmd, perms_flags, escaped_session, escaped_path, model_flag
+                            "{} run --interactive{} --session {} --fork \"$(cat {})\"{}{}",
+                            cmd,
+                            perms_flags,
+                            escaped_session,
+                            escaped_path,
+                            model_flag,
+                            variant_flag
                         )
                     }
                     _ => {
                         format!(
-                            "{}{}{} --resume {} --fork-session \"$(cat {})\"",
-                            cmd, perms_flags, model_flag, escaped_session, escaped_path
+                            "{}{}{}{} --resume {} --fork-session \"$(cat {})\"",
+                            cmd,
+                            perms_flags,
+                            model_flag,
+                            effort_flag,
+                            escaped_session,
+                            escaped_path
                         )
                     }
                 }
@@ -412,32 +479,36 @@ impl<
             (Some(pf), None) => {
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
                 match agent_type {
-                    AgentType::Codex => Self::build_codex_command(cwd, Some(pf), model, None),
+                    AgentType::Codex => {
+                        Self::build_codex_command_with_effort(cwd, Some(pf), model, effort, None)
+                    }
                     AgentType::OpenCode => {
                         format!(
-                            "{} run --interactive{} \"$(cat {})\"{}",
-                            cmd, perms_flags, escaped_path, model_flag
+                            "{} run --interactive{} \"$(cat {})\"{}{}",
+                            cmd, perms_flags, escaped_path, model_flag, variant_flag
                         )
                     }
                     _ => {
                         let flag = agent_type.prompt_flag();
                         if flag.is_empty() {
                             format!(
-                                "{}{}{} \"$(cat {})\"",
-                                cmd, perms_flags, model_flag, escaped_path
+                                "{}{}{}{} \"$(cat {})\"",
+                                cmd, perms_flags, model_flag, effort_flag, escaped_path
                             )
                         } else {
                             format!(
-                                "{}{}{} {} \"$(cat {})\"",
-                                cmd, perms_flags, model_flag, flag, escaped_path
+                                "{}{}{}{} {} \"$(cat {})\"",
+                                cmd, perms_flags, model_flag, effort_flag, flag, escaped_path
                             )
                         }
                     }
                 }
             }
             _ => match agent_type {
-                AgentType::Codex => Self::build_codex_command(cwd, None, model, fork_session_id),
-                _ => format!("{}{}{}", cmd, perms_flags, model_flag),
+                AgentType::Codex => {
+                    Self::build_codex_command_with_effort(cwd, None, model, effort, fork_session_id)
+                }
+                _ => format!("{}{}{}{}", cmd, perms_flags, model_flag, effort_flag),
             },
         };
 
@@ -469,23 +540,44 @@ impl<
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn build_codex_command(
         worktree_dir: &Path,
         prompt_file: Option<&Path>,
         model: Option<&str>,
         fork_session_id: Option<&str>,
     ) -> String {
+        Self::build_codex_command_with_effort(
+            worktree_dir,
+            prompt_file,
+            model,
+            None,
+            fork_session_id,
+        )
+    }
+
+    pub(crate) fn build_codex_command_with_effort(
+        worktree_dir: &Path,
+        prompt_file: Option<&Path>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        fork_session_id: Option<&str>,
+    ) -> String {
         let escaped_dir = Self::escape_for_shell_command(&worktree_dir.display().to_string());
         let model_flag = model
             .map(|model| format!(" --model {}", shell_escape::escape(model.into())))
             .unwrap_or_default();
+        let effort_flag = effort
+            .map(|level| format!(" -c model_reasoning_effort=\"{}\"", level))
+            .unwrap_or_default();
 
         match fork_session_id {
             Some(session_id) => format!(
-                "codex fork {} --dangerously-bypass-approvals-and-sandbox --cd {}{}",
+                "codex fork {} --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
                 Self::escape_for_shell_command(session_id),
                 escaped_dir,
-                model_flag
+                model_flag,
+                effort_flag
             ),
             None => {
                 let prompt = prompt_file
@@ -497,8 +589,8 @@ impl<
                     })
                     .unwrap_or_default();
                 format!(
-                    "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
-                    escaped_dir, model_flag, prompt
+                    "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}{}",
+                    escaped_dir, model_flag, effort_flag, prompt
                 )
             }
         }
@@ -539,6 +631,7 @@ impl<
         fork_session_id: Option<&str>,
         claude_flags: Option<&ClaudeSpawnFlags>,
         model_override: Option<&str>,
+        effort_override: Option<&str>,
     ) -> Result<super::tmux_ipc::WindowId> {
         info!(name, cwd = %cwd.display(), agent_type = ?agent_type, fork = fork_session_id.is_some(), "Creating tmux window");
 
@@ -552,7 +645,7 @@ impl<
             AgentType::OpenCode => self.spawn_agent_model(),
             _ => None,
         });
-        let full_command = Self::build_agent_command(
+        let full_command = Self::build_agent_command_with_effort(
             agent_type,
             prompt_file.as_deref(),
             fork_session_id,
@@ -561,6 +654,7 @@ impl<
             claude_flags,
             self.yolo,
             model,
+            effort_override.or_else(|| self.effort_for_role("worker")),
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let tmux = self.tmux()?;
@@ -666,7 +760,7 @@ impl<
             AgentType::OpenCode => self.spawn_agent_model(),
             _ => None,
         };
-        let full_command = Self::build_agent_command(
+        let full_command = Self::build_agent_command_with_effort(
             agent_type,
             prompt_file.as_deref(),
             None,
@@ -675,6 +769,7 @@ impl<
             claude_flags,
             self.yolo,
             model,
+            self.effort_for_role("worker"),
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let tmux = self.tmux()?;
@@ -780,6 +875,7 @@ impl<
                     agent_name,
                     role.as_str(),
                     &self.extra_mcp_servers,
+                    self.effort_for_role(role.as_str()),
                 );
                 fs::write(
                     agent_dir.join("opencode.json"),
@@ -821,11 +917,13 @@ impl<
             "reviewer" => super::spawn::CODEX_REVIEWER_INSTRUCTIONS,
             _ => super::spawn::CODEX_DEV_INSTRUCTIONS,
         };
-        let config = crate::codex_config::render_codex_config(
+        let effort = self.effort_for_role(role.as_str());
+        let config = crate::codex_config::render_codex_config_with_effort(
             agent_name.as_str(),
             role.as_str(),
             instructions,
             model,
+            effort,
             extra_mcp_servers,
             &crate::util::find_exomonad_binary(),
         );
@@ -1921,6 +2019,89 @@ mod tests {
             cmd,
             "codex fork 'session-123' --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' --model gpt-5.2"
         );
+    }
+
+    #[test]
+    fn test_build_agent_command_claude_includes_effort() {
+        let cmd = ACS::build_agent_command_with_effort(
+            AgentType::Claude,
+            Some(Path::new("/tmp/test-prompt.txt")),
+            None,
+            &empty_env(),
+            Path::new("/tmp/worktree"),
+            None,
+            false,
+            Some("sonnet"),
+            Some("high"),
+        );
+
+        assert!(cmd.contains("--model sonnet --effort high"));
+    }
+
+    #[test]
+    fn test_build_agent_command_gemini_ignores_effort() {
+        let cmd = ACS::build_agent_command_with_effort(
+            AgentType::Gemini,
+            None,
+            None,
+            &empty_env(),
+            Path::new("/tmp/worktree"),
+            None,
+            false,
+            None,
+            Some("high"),
+        );
+
+        assert_eq!(cmd, "gemini");
+        assert!(!cmd.contains("effort"));
+    }
+
+    #[test]
+    fn test_build_agent_command_opencode_includes_variant() {
+        let cmd = ACS::build_agent_command_with_effort(
+            AgentType::OpenCode,
+            Some(Path::new("/tmp/test-prompt.txt")),
+            None,
+            &empty_env(),
+            Path::new("/tmp/worktree"),
+            None,
+            false,
+            Some("opencode-go/deepseek-v4-pro"),
+            Some("high"),
+        );
+
+        assert!(cmd.ends_with("--model opencode-go/deepseek-v4-pro --variant high"));
+    }
+
+    #[test]
+    fn test_build_codex_command_includes_effort() {
+        let cmd = ACS::build_codex_command_with_effort(
+            Path::new("/tmp/worktree"),
+            Some(Path::new("/tmp/test-prompt.txt")),
+            Some("gpt-5.2"),
+            Some("xhigh"),
+            None,
+        );
+
+        assert!(cmd.contains("--model gpt-5.2 -c model_reasoning_effort=\"xhigh\""));
+    }
+
+    #[test]
+    fn test_opencode_effort_profile_is_role_specific() {
+        let settings = ACS::generate_opencode_tl_settings_with_effort(
+            "test-worker",
+            "worker",
+            &HashMap::new(),
+            Some("high"),
+        );
+
+        assert_eq!(
+            settings["agent"]["exomonad-worker"]["reasoningEffort"],
+            "high"
+        );
+        assert!(settings["instructions"][0]
+            .as_str()
+            .is_some_and(|instructions| instructions.contains("# ExoMonad Worker Agent Protocol")));
     }
 
     #[test]
