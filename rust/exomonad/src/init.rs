@@ -397,11 +397,52 @@ fn extra_mcp_servers_to_json(
         .collect()
 }
 
+fn write_codex_companion_config(
+    config: &Config,
+    dir: &Path,
+    name: &str,
+    role: &str,
+    agent_type: AgentType,
+    model: Option<&str>,
+) -> Result<()> {
+    let codex_dir = dir.join(".codex");
+    std::fs::create_dir_all(&codex_dir)?;
+    let instructions = match role {
+        "tl" | "root" => exomonad_core::services::agent_control::CODEX_TL_INSTRUCTIONS,
+        "worker" => exomonad_core::services::agent_control::CODEX_WORKER_INSTRUCTIONS,
+        "reviewer" => exomonad_core::services::agent_control::CODEX_REVIEWER_INSTRUCTIONS,
+        _ => exomonad_core::services::agent_control::CODEX_DEV_INSTRUCTIONS,
+    };
+    let extra_mcp_servers = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
+    let configured_effort = config.worker_effort_level.level.to_string();
+    let effort = if agent_type == AgentType::CodexFugu && configured_effort == "max" {
+        "xhigh".to_string()
+    } else {
+        configured_effort
+    };
+    let rendered = exomonad_core::codex_config::render_codex_config_with_effort(
+        name,
+        role,
+        instructions,
+        model,
+        Some(&effort),
+        &extra_mcp_servers,
+        &exomonad_core::find_exomonad_binary(),
+    );
+    std::fs::write(codex_dir.join("config.toml"), rendered)?;
+    Ok(())
+}
+
 fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
     let codex_dir = cwd.join(".codex");
     std::fs::create_dir_all(&codex_dir)?;
     let extra_mcp_servers = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
-    let effort = config.tl_effort_level.level.to_string();
+    let configured_effort = config.tl_effort_level.level.to_string();
+    let effort = if config.root_agent_type == AgentType::CodexFugu && configured_effort == "max" {
+        "xhigh".to_string()
+    } else {
+        configured_effort
+    };
     let codex_config = exomonad_core::codex_config::render_codex_config_with_effort(
         "root",
         "root",
@@ -480,12 +521,27 @@ fn build_codex_root_command_with_effort(
     effort: Option<&str>,
     initial_prompt: Option<&str>,
 ) -> String {
+    build_codex_root_command_for_agent("codex", cwd, model, effort, initial_prompt)
+}
+
+fn build_codex_root_command_for_agent(
+    command: &str,
+    cwd: &Path,
+    model: Option<&str>,
+    effort: Option<&str>,
+    initial_prompt: Option<&str>,
+) -> String {
     let escaped_dir = shell_escape::escape(cwd.display().to_string().into());
     let model_flag = model
         .filter(|value| !value.is_empty())
         .map(|value| format!(" --model {}", shell_escape::escape(value.into())))
         .unwrap_or_default();
-    let effort_flag = effort
+    let effective_effort = if command == "codex-fugu" && effort == Some("max") {
+        Some("xhigh")
+    } else {
+        effort
+    };
+    let effort_flag = effective_effort
         .filter(|value| !value.is_empty())
         .map(|value| format!(" -c model_reasoning_effort=\"{}\"", value))
         .unwrap_or_default();
@@ -494,19 +550,24 @@ fn build_codex_root_command_with_effort(
         .map(|value| format!(" {}", shell_escape::escape(value.into())))
         .unwrap_or_default();
 
-    let command = format!(
-        "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}{}",
-        escaped_dir, model_flag, effort_flag, prompt
+    let command_line = format!(
+        "{} --dangerously-bypass-approvals-and-sandbox --cd {}{}{}{}",
+        command, escaped_dir, model_flag, effort_flag, prompt
     );
+    let display_name = if command == "codex" {
+        "Codex"
+    } else {
+        "Codex-Fugu"
+    };
     let restart_hint = shell_escape::escape(
         format!(
-            "[Codex exited - restart with: codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}]",
-            escaped_dir, model_flag, effort_flag
+            "[{display_name} exited - restart with: {} --dangerously-bypass-approvals-and-sandbox --cd {}{}{}]",
+            command, escaped_dir, model_flag, effort_flag
         )
         .into(),
     );
 
-    format!("{command}; echo; printf '%s\n' {restart_hint}; exec bash -l")
+    format!("{command_line}; echo; printf '%s\n' {restart_hint}; exec bash -l")
 }
 
 /// Reject `--tl-model` / `--worker-model` values that opencode doesn't recognise.
@@ -623,6 +684,33 @@ fn validate_codex_model_name(model: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_codex_fugu_model(model: &str) -> Result<()> {
+    if !matches!(model, "fugu" | "fugu-ultra") {
+        anyhow::bail!(
+            "Unknown Codex-Fugu model `{model}`. Use `fugu` or `fugu-ultra` (see `exomonad models codex-fugu`)."
+        );
+    }
+    Ok(())
+}
+
+fn ensure_codex_fugu_installed() -> Result<()> {
+    match std::process::Command::new("codex-fugu")
+        .arg("--version")
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => anyhow::bail!(
+            "Codex-Fugu is installed but `codex-fugu --version` failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+            "Codex-Fugu executable was not found on PATH. Install `codex-fugu` and retry."
+        ),
+        Err(error) => anyhow::bail!("Failed to execute `codex-fugu --version`: {error}"),
+    }
+}
+
 async fn validate_codex_model(model: &str, effort: Option<&str>) -> Result<()> {
     validate_codex_model_name(model)?;
     let out = tokio::process::Command::new("codex")
@@ -691,14 +779,14 @@ fn validate_opencode_model_owner(
     model_field: &str,
     harness_field: &str,
 ) -> Result<()> {
-    if agent_type == AgentType::OpenCode || model.is_none() {
+    if matches!(agent_type, AgentType::OpenCode | AgentType::CodexFugu) || model.is_none() {
         return Ok(());
     }
 
     let model = model.expect("checked above");
     anyhow::bail!(
         "{model_field} is set to `{model}`, but {harness_field} is `{}`. \
-         OpenCode model fields only apply when the matching harness is `opencode`.",
+         OpenCode/Codex-Fugu model fields only apply when the matching harness is `opencode` or `codex-fugu`.",
         agent_type_str(agent_type)
     );
 }
@@ -715,6 +803,7 @@ async fn validate_reviewer_model_for_harness(
     match agent_type {
         AgentType::Claude => validate_claude_model(model),
         AgentType::Codex => validate_codex_model(model, effort).await,
+        AgentType::CodexFugu => validate_codex_fugu_model(model),
         AgentType::Gemini => validate_gemini_model(model),
         AgentType::OpenCode => validate_opencode_model(model, effort).await,
         AgentType::Shoal | AgentType::Process => Ok(()),
@@ -769,7 +858,10 @@ pub async fn run(
         }
     }
     if let Some(m) = worker_model {
-        if config.spawn_agent_type == AgentType::OpenCode {
+        if matches!(
+            config.spawn_agent_type,
+            AgentType::OpenCode | AgentType::CodexFugu
+        ) {
             config.opencode.worker_model = Some(m);
         }
     }
@@ -843,6 +935,10 @@ pub async fn run(
         if let Some(m) = config.model.as_deref() {
             validate_codex_model(m, Some(&tl_effort)).await?;
         }
+    } else if config.root_agent_type == AgentType::CodexFugu {
+        if let Some(m) = config.model.as_deref() {
+            validate_codex_fugu_model(m)?;
+        }
     }
     if config.spawn_agent_type == AgentType::OpenCode {
         if let Some(m) = config.opencode.worker_model.as_deref() {
@@ -852,6 +948,10 @@ pub async fn run(
         if let Some(m) = config.opencode.worker_model.as_deref() {
             validate_codex_model(m, Some(&worker_effort)).await?;
         }
+    } else if config.spawn_agent_type == AgentType::CodexFugu {
+        if let Some(m) = config.opencode.worker_model.as_deref() {
+            validate_codex_fugu_model(m)?;
+        }
     }
     validate_reviewer_model_for_harness(
         config.reviewer.agent_type,
@@ -859,6 +959,24 @@ pub async fn run(
         Some(&reviewer_effort),
     )
     .await?;
+
+    let fugu_selected = matches!(config.root_agent_type, AgentType::CodexFugu)
+        || matches!(config.spawn_agent_type, AgentType::CodexFugu)
+        || matches!(config.reviewer.agent_type, AgentType::CodexFugu)
+        || config
+            .companions
+            .iter()
+            .any(|companion| companion.agent_type == Some(AgentType::CodexFugu));
+    if fugu_selected {
+        ensure_codex_fugu_installed()?;
+    }
+    for companion in &config.companions {
+        if companion.agent_type == Some(AgentType::CodexFugu) {
+            if let Some(model) = companion.model.as_deref() {
+                validate_codex_fugu_model(model)?;
+            }
+        }
+    }
 
     let init_argv = redact_init_argv(std::env::args().collect::<Vec<_>>());
     if let Err(e) = append_init_invocation_log(&cwd, &config, &init_argv) {
@@ -1076,7 +1194,7 @@ pub async fn run(
                 .context("Failed to write OpenCode plugin files to .exo/agents/root")?;
             info!("OpenCode configuration written to .exo/agents/root/");
         }
-        AgentType::Codex => {
+        AgentType::Codex | AgentType::CodexFugu => {
             write_codex_root_config(&config, &cwd).context("Failed to write Codex root config")?;
         }
         _ => {
@@ -1118,7 +1236,7 @@ pub async fn run(
         let context_source = resolve_role_context_path(&cwd, &config.wasm_name, "root");
         if let Some(src) = context_source {
             let rules_dir = match config.root_agent_type {
-                AgentType::Codex => cwd.join(".codex"),
+                AgentType::Codex | AgentType::CodexFugu => cwd.join(".codex"),
                 _ => cwd.join(".claude/rules"),
             };
             std::fs::create_dir_all(&rules_dir)?;
@@ -1579,6 +1697,13 @@ pub async fn run(
                 Some(&tl_effort),
                 prompt,
             ),
+            (AgentType::CodexFugu, prompt) => build_codex_root_command_for_agent(
+                "codex-fugu",
+                &cwd,
+                config.model.as_deref(),
+                Some(&tl_effort),
+                prompt,
+            ),
             (AgentType::Process, _) => {
                 unreachable!("Process is for companions only, not root agent")
             }
@@ -1586,7 +1711,7 @@ pub async fn run(
     };
 
     let tl_command = match config.shell_command {
-        Some(sc) => format!("{} -c \"{}\"", sc, base_command.replace('"', "\\\"")),
+        Some(ref sc) => format!("{} -c \"{}\"", sc, base_command.replace('"', "\\\"")),
         None => base_command,
     };
 
@@ -1836,6 +1961,21 @@ pub async fn run(
                 .await
                 .context("Failed to write companion OpenCode plugin files")?;
             agent_dir.clone()
+        } else if matches!(agent_type, AgentType::Codex | AgentType::CodexFugu) {
+            let exo_dir = agent_dir.join(".exo");
+            std::fs::create_dir_all(&exo_dir)?;
+            let socket_target = exo_dir.join("server.sock");
+            let _ = std::fs::remove_file(&socket_target);
+            std::os::unix::fs::symlink(cwd.join(".exo/server.sock"), &socket_target)?;
+            write_codex_companion_config(
+                &config,
+                &agent_dir,
+                &companion.name,
+                &companion.role,
+                agent_type,
+                companion.model.as_deref(),
+            )?;
+            agent_dir.clone()
         } else {
             // Gemini/Shoal companions use project root CWD
             let companion_mcp = serde_json::json!({
@@ -1856,7 +1996,7 @@ pub async fn run(
                     )?;
                 }
                 AgentType::Shoal => {}
-                AgentType::Codex => {}
+                AgentType::Codex | AgentType::CodexFugu => {}
                 AgentType::Claude | AgentType::OpenCode | AgentType::Process => {
                     unreachable!()
                 }
@@ -1949,9 +2089,29 @@ pub async fn run(
                     )
                 }
             }
-            AgentType::Codex => format!(
-                "{env_prefix}echo 'Codex companion startup is not implemented yet'; exec bash -l"
-            ),
+            AgentType::Codex | AgentType::CodexFugu => {
+                let task_part = match &escaped_task {
+                    Some(task) => format!(" '{}'", task),
+                    None => String::new(),
+                };
+                let configured_effort = config.worker_effort_level.level.to_string();
+                let effort = if agent_type == AgentType::CodexFugu && configured_effort == "max" {
+                    "xhigh"
+                } else {
+                    configured_effort.as_str()
+                };
+                let codex_model_flag = companion
+                    .model
+                    .as_deref()
+                    .map(|model| format!(" --model {}", shell_escape::escape(model.into())))
+                    .unwrap_or_default();
+                let effort_flag = format!(" -c model_reasoning_effort=\"{}\"", effort);
+                format!(
+                    "{env_prefix}{} --dangerously-bypass-approvals-and-sandbox --cd {}{codex_model_flag}{effort_flag}{task_part}",
+                    agent_type.command(),
+                    shell_escape::escape(companion_cwd.display().to_string().into())
+                )
+            }
             AgentType::Process => unreachable!("Process companions handled above"),
         };
         let window_id = ipc
@@ -2179,9 +2339,10 @@ fn parse_agent_type(s: &str) -> Result<AgentType> {
         "gemini" => Ok(AgentType::Gemini),
         "opencode" | "opencode-cli" => Ok(AgentType::OpenCode),
         "codex" => Ok(AgentType::Codex),
+        "codex-fugu" | "codexfugu" => Ok(AgentType::CodexFugu),
         "shoal" => Ok(AgentType::Shoal),
         _ => anyhow::bail!(
-            "Unknown agent type: {}. Valid values: claude, gemini, opencode, codex, shoal",
+            "Unknown agent type: {}. Valid values: claude, gemini, opencode, codex, codex-fugu, shoal",
             s
         ),
     }
@@ -2193,6 +2354,7 @@ fn agent_type_str(t: AgentType) -> &'static str {
         AgentType::Gemini => "gemini",
         AgentType::OpenCode => "opencode",
         AgentType::Codex => "codex",
+        AgentType::CodexFugu => "codex-fugu",
         AgentType::Shoal => "shoal",
         AgentType::Process => "process",
     }
@@ -2539,6 +2701,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_codex_fugu_and_validate_models() {
+        assert_eq!(
+            parse_agent_type("codex-fugu").unwrap(),
+            AgentType::CodexFugu
+        );
+        assert_eq!(parse_agent_type("codexfugu").unwrap(), AgentType::CodexFugu);
+        assert!(validate_codex_fugu_model("fugu").is_ok());
+        assert!(validate_codex_fugu_model("fugu-ultra").is_ok());
+        assert!(validate_codex_fugu_model("gpt-5.2-codex").is_err());
+    }
+
+    #[test]
     fn test_validate_codex_model_rejects_non_codex_prefixes() {
         assert!(validate_codex_model_name("gpt-5.2-codex").is_ok());
         assert!(validate_codex_model_name("opencode-go/deepseek-v4-flash").is_err());
@@ -2630,6 +2804,22 @@ mod tests {
 
         assert!(command
             .starts_with("claude --dangerously-skip-permissions --model sonnet --effort xhigh"));
+    }
+
+    #[test]
+    fn codex_fugu_root_command_uses_fugu_and_normalizes_max() {
+        let command = build_codex_root_command_for_agent(
+            "codex-fugu",
+            Path::new("/tmp/exomonad"),
+            Some("fugu"),
+            Some("max"),
+            None,
+        );
+
+        assert!(command.starts_with(
+            "codex-fugu --dangerously-bypass-approvals-and-sandbox --cd /tmp/exomonad --model fugu -c model_reasoning_effort=\"xhigh\""
+        ));
+        assert!(!command.contains("model_reasoning_effort=\"max\""));
     }
 
     #[test]

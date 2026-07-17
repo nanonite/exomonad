@@ -55,6 +55,7 @@ data AgentType
   | AgentTypeAGENT_TYPE_SHOAL
   | AgentTypeAGENT_TYPE_OPENCODE
   | AgentTypeAGENT_TYPE_CODEX
+  | AgentTypeAGENT_TYPE_CODEX_FUGU
   deriving (Hs.Show, Hs.Eq, Hs.Generic, Hs.NFData)
 
 instance (HsProtobuf.Named AgentType) where
@@ -64,7 +65,7 @@ instance (HsProtobuf.HasDefault AgentType)
 
 instance (Hs.Bounded AgentType) where
   minBound = AgentTypeAGENT_TYPE_UNSPECIFIED
-  maxBound = AgentTypeAGENT_TYPE_CODEX
+  maxBound = AgentTypeAGENT_TYPE_CODEX_FUGU
 
 instance (Hs.Ord AgentType) where
   compare x y =
@@ -79,6 +80,7 @@ instance (HsProtobuf.ProtoEnum AgentType) where
   toProtoEnumMay 3 = Hs.Just AgentTypeAGENT_TYPE_SHOAL
   toProtoEnumMay 4 = Hs.Just AgentTypeAGENT_TYPE_OPENCODE
   toProtoEnumMay 5 = Hs.Just AgentTypeAGENT_TYPE_CODEX
+  toProtoEnumMay 6 = Hs.Just AgentTypeAGENT_TYPE_CODEX_FUGU
   toProtoEnumMay _ = Hs.Nothing
   fromProtoEnum AgentTypeAGENT_TYPE_UNSPECIFIED = 0
   fromProtoEnum AgentTypeAGENT_TYPE_CLAUDE = 1
@@ -86,6 +88,7 @@ instance (HsProtobuf.ProtoEnum AgentType) where
   fromProtoEnum AgentTypeAGENT_TYPE_SHOAL = 3
   fromProtoEnum AgentTypeAGENT_TYPE_OPENCODE = 4
   fromProtoEnum AgentTypeAGENT_TYPE_CODEX = 5
+  fromProtoEnum AgentTypeAGENT_TYPE_CODEX_FUGU = 6
 
 instance (HsJSONPB.ToJSONPB AgentType) where
   toJSONPB x _ = HsJSONPB.enumFieldString x
@@ -104,6 +107,8 @@ instance (HsJSONPB.FromJSONPB AgentType) where
     Hs.pure AgentTypeAGENT_TYPE_OPENCODE
   parseJSONPB (HsJSONPB.String "AGENT_TYPE_CODEX") =
     Hs.pure AgentTypeAGENT_TYPE_CODEX
+  parseJSONPB (HsJSONPB.String "AGENT_TYPE_CODEX_FUGU") =
+    Hs.pure AgentTypeAGENT_TYPE_CODEX_FUGU
   parseJSONPB v = HsJSONPB.typeMismatch "AgentType" v
 
 instance (HsJSONPB.ToJSON AgentType) where

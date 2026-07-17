@@ -209,6 +209,7 @@ fn service_agent_type_to_proto(agent_type: AgentType) -> i32 {
         AgentType::Shoal => ProtoAgentType::Shoal as i32,
         AgentType::OpenCode => ProtoAgentType::Opencode as i32,
         AgentType::Codex => ProtoAgentType::Codex as i32,
+        AgentType::CodexFugu => ProtoAgentType::CodexFugu as i32,
         AgentType::Process => ProtoAgentType::Unspecified as i32,
     }
 }

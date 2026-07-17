@@ -60,7 +60,7 @@ fn test_init_help_describes_agent_type_flags() -> Result<(), Box<dyn std::error:
     let help = String::from_utf8(output)?;
 
     assert_eq!(
-        help.matches("valid: claude|gemini|opencode|codex|shoal")
+        help.matches("valid: claude|gemini|opencode|codex|codex-fugu|shoal")
             .count(),
         2
     );

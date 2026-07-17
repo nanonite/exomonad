@@ -651,7 +651,7 @@ impl<
                 AgentType::Gemini => crate::domain::Role::dev(),
                 AgentType::Shoal => crate::domain::Role::shoal(),
                 AgentType::OpenCode => crate::domain::Role::dev(),
-                AgentType::Codex => crate::domain::Role::dev(),
+                AgentType::Codex | AgentType::CodexFugu => crate::domain::Role::dev(),
                 AgentType::Process => unreachable!("Process agents are not spawned via effects"),
             };
             self.write_agent_mcp_config(
@@ -1252,7 +1252,7 @@ impl<
                     Self::write_opencode_git_stub(&agent_config_dir, self.project_dir()).await?;
                     info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json and plugin to agent config dir");
                 }
-                AgentType::Codex => {
+                AgentType::Codex | AgentType::CodexFugu => {
                     self.write_codex_config_files(
                         &agent_config_dir,
                         &role,
@@ -1270,7 +1270,7 @@ impl<
             // receive the worker role/name instead of inheriting the caller's
             // project config.
             let worker_cwd = match agent_type {
-                AgentType::OpenCode | AgentType::Codex => agent_config_dir.clone(),
+                AgentType::OpenCode | AgentType::Codex | AgentType::CodexFugu => agent_config_dir.clone(),
                 _ => absolute_worktree.clone(),
             };
 
@@ -1442,7 +1442,7 @@ impl<
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy OpenCode role context (non-fatal)"),
                         }
                     }
-                    AgentType::Codex => {
+                    AgentType::Codex | AgentType::CodexFugu => {
                         let dest_dir = worktree_path.join(".codex");
                         let _ = fs::create_dir_all(&dest_dir).await;
                         let dest = dest_dir.join("exomonad_role.md");
@@ -1573,7 +1573,7 @@ impl<
                     })?;
                     RoutingInfo::window(window_id)
                 }
-                AgentType::Codex => {
+                AgentType::Codex | AgentType::CodexFugu => {
                     let fork_id = options.parent_session_id.as_ref().map(|id| id.as_str());
                     let window_id = self.new_tmux_window_inner(
                         &display_name,

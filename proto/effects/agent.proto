@@ -17,6 +17,7 @@ enum AgentType {
   AGENT_TYPE_SHOAL = 3;
   AGENT_TYPE_OPENCODE = 4;
   AGENT_TYPE_CODEX = 5;
+  AGENT_TYPE_CODEX_FUGU = 6;
 }
 
 // Topology of the workspace.

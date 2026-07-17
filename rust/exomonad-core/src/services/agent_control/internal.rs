@@ -421,7 +421,7 @@ impl<
                     String::new()
                 }
             }
-            AgentType::Codex => String::new(),
+            AgentType::Codex | AgentType::CodexFugu => String::new(),
             AgentType::OpenCode => String::new(),
             AgentType::Shoal | AgentType::Process => String::new(),
         };
@@ -445,7 +445,8 @@ impl<
                 let escaped_session = Self::escape_for_shell_command(session_id);
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
                 match agent_type {
-                    AgentType::Codex => Self::build_codex_command_with_effort(
+                    AgentType::Codex | AgentType::CodexFugu => Self::build_codex_command_for_agent(
+                        agent_type.command(),
                         cwd,
                         Some(pf),
                         model,
@@ -479,9 +480,14 @@ impl<
             (Some(pf), None) => {
                 let escaped_path = Self::escape_for_shell_command(&pf.display().to_string());
                 match agent_type {
-                    AgentType::Codex => {
-                        Self::build_codex_command_with_effort(cwd, Some(pf), model, effort, None)
-                    }
+                    AgentType::Codex | AgentType::CodexFugu => Self::build_codex_command_for_agent(
+                        agent_type.command(),
+                        cwd,
+                        Some(pf),
+                        model,
+                        effort,
+                        None,
+                    ),
                     AgentType::OpenCode => {
                         format!(
                             "{} run --interactive{} \"$(cat {})\"{}{}",
@@ -505,9 +511,14 @@ impl<
                 }
             }
             _ => match agent_type {
-                AgentType::Codex => {
-                    Self::build_codex_command_with_effort(cwd, None, model, effort, fork_session_id)
-                }
+                AgentType::Codex | AgentType::CodexFugu => Self::build_codex_command_for_agent(
+                    agent_type.command(),
+                    cwd,
+                    None,
+                    model,
+                    effort,
+                    fork_session_id,
+                ),
                 _ => format!("{}{}{}{}", cmd, perms_flags, model_flag, effort_flag),
             },
         };
@@ -563,17 +574,41 @@ impl<
         effort: Option<&str>,
         fork_session_id: Option<&str>,
     ) -> String {
+        Self::build_codex_command_for_agent(
+            "codex",
+            worktree_dir,
+            prompt_file,
+            model,
+            effort,
+            fork_session_id,
+        )
+    }
+
+    fn build_codex_command_for_agent(
+        command: &str,
+        worktree_dir: &Path,
+        prompt_file: Option<&Path>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        fork_session_id: Option<&str>,
+    ) -> String {
         let escaped_dir = Self::escape_for_shell_command(&worktree_dir.display().to_string());
         let model_flag = model
             .map(|model| format!(" --model {}", shell_escape::escape(model.into())))
             .unwrap_or_default();
-        let effort_flag = effort
+        let effective_effort = if command == "codex-fugu" && effort == Some("max") {
+            Some("xhigh")
+        } else {
+            effort
+        };
+        let effort_flag = effective_effort
             .map(|level| format!(" -c model_reasoning_effort=\"{}\"", level))
             .unwrap_or_default();
 
         match fork_session_id {
             Some(session_id) => format!(
-                "codex fork {} --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
+                "{} fork {} --dangerously-bypass-approvals-and-sandbox --cd {}{}{}",
+                command,
                 Self::escape_for_shell_command(session_id),
                 escaped_dir,
                 model_flag,
@@ -589,8 +624,8 @@ impl<
                     })
                     .unwrap_or_default();
                 format!(
-                    "codex --dangerously-bypass-approvals-and-sandbox --cd {}{}{}{}",
-                    escaped_dir, model_flag, effort_flag, prompt
+                    "{} --dangerously-bypass-approvals-and-sandbox --cd {}{}{}{}",
+                    command, escaped_dir, model_flag, effort_flag, prompt
                 )
             }
         }
@@ -642,7 +677,7 @@ impl<
         };
 
         let model = model_override.or_else(|| match agent_type {
-            AgentType::OpenCode => self.spawn_agent_model(),
+            AgentType::OpenCode | AgentType::CodexFugu => self.spawn_agent_model(),
             _ => None,
         });
         let full_command = Self::build_agent_command_with_effort(
@@ -757,7 +792,7 @@ impl<
         };
 
         let model = match agent_type {
-            AgentType::OpenCode => self.spawn_agent_model(),
+            AgentType::OpenCode | AgentType::CodexFugu => self.spawn_agent_model(),
             _ => None,
         };
         let full_command = Self::build_agent_command_with_effort(
@@ -885,7 +920,7 @@ impl<
                 write_opencode_agent_plugin_files(agent_dir).await?;
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json and plugin for OpenCode agent");
             }
-            AgentType::Codex => {
+            AgentType::Codex | AgentType::CodexFugu => {
                 self.write_codex_config_files(
                     agent_dir,
                     role,
@@ -917,7 +952,17 @@ impl<
             "reviewer" => super::spawn::CODEX_REVIEWER_INSTRUCTIONS,
             _ => super::spawn::CODEX_DEV_INSTRUCTIONS,
         };
-        let effort = self.effort_for_role(role.as_str());
+        let configured_effort = self.effort_for_role(role.as_str());
+        let fugu_role = (role.as_str() == "reviewer"
+            && self.reviewer_agent_type == AgentType::CodexFugu)
+            || (role.as_str() != "reviewer" && self.spawn_agent_type == AgentType::CodexFugu);
+        let effort = configured_effort.map(|level| {
+            if fugu_role && level == "max" {
+                "xhigh"
+            } else {
+                level
+            }
+        });
         let config = crate::codex_config::render_codex_config_with_effort(
             agent_name.as_str(),
             role.as_str(),
@@ -1189,7 +1234,7 @@ impl<
                 }
                 serde_json::to_string_pretty(&config).unwrap()
             }
-            AgentType::Codex => String::new(),
+            AgentType::Codex | AgentType::CodexFugu => String::new(),
             AgentType::Process => String::new(),
         }
     }
@@ -2084,6 +2129,26 @@ mod tests {
         );
 
         assert!(cmd.contains("--model gpt-5.2 -c model_reasoning_effort=\"xhigh\""));
+    }
+
+    #[test]
+    fn test_build_agent_command_codex_fugu_uses_provider_command_and_effort_alias() {
+        let cmd = ACS::build_agent_command_with_effort(
+            AgentType::CodexFugu,
+            Some(Path::new("/tmp/test-prompt.txt")),
+            None,
+            &empty_env(),
+            Path::new("/tmp/worktree"),
+            None,
+            false,
+            Some("fugu-ultra"),
+            Some("max"),
+        );
+
+        assert_eq!(
+            cmd,
+            "codex-fugu --dangerously-bypass-approvals-and-sandbox --cd '/tmp/worktree' --model fugu-ultra -c model_reasoning_effort=\"xhigh\" \"$(cat '/tmp/test-prompt.txt')\""
+        );
     }
 
     #[test]

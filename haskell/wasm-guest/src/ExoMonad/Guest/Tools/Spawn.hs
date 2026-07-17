@@ -133,7 +133,7 @@ instance JsonSchema ForkWaveChild where
         [ ("slug", "Branch name suffix (will be prefixed with current branch)"),
           ("task", "One-line task description — the child inherits your full context, so keep it brief"),
           ("fork_session", "Inherit parent conversation context via --fork-session (default: true). Set false to start the child with a fresh context window."),
-          ("agent_type", "Agent type for the child: 'claude' (default), 'opencode', or 'codex'. OpenCode and Codex children get TL role and can spawn their own children.")
+          ("agent_type", "Agent type for the child: 'claude' (default), 'opencode', 'codex', or 'codex-fugu'. OpenCode, Codex, and Codex-Fugu children get TL role and can spawn their own children.")
         ]
 
 data ForkWaveArgs = ForkWaveArgs
@@ -275,7 +275,7 @@ spawnLeafSubtreeSchema =
   genericToolSchemaWith @SpawnLeafSubtreeArgs
     [ ("task", "Description of the sub-problem to solve"),
       ("branch_name", "Branch name suffix (will be prefixed with current branch)"),
-      ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
+      ("agent_type", "Agent type for the leaf: 'claude', 'opencode', 'codex', or 'codex-fugu'. Omit to use the server default."),
       ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
       ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
       ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction."),
@@ -382,7 +382,7 @@ instance JsonSchema WorkerSpec where
           ("context_files", "Paths to files to include in context"),
           ("verify_templates", "Verification script templates"),
           ("type", "Worker type: 'implementation' (default) or 'research'. Research workers are read-only — they explore, search, and report findings via notify_parent."),
-          ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
+          ("agent_type", "Agent type for the worker: 'claude', 'opencode', 'codex', or 'codex-fugu'. Omit to use the server default."),
           ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
           ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
           ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction.")
@@ -503,7 +503,7 @@ spawnLeafSchema =
   genericToolSchemaWith @SpawnLeafArgs
     [ ("name", "Branch name suffix (e.g., 'fix-clippy' \x2192 'main.fix-clippy')"),
       ("task", "What to build. Combined with steps/verify/boundary into structured spec"),
-      ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
+      ("agent_type", "Agent type for the leaf: 'claude', 'opencode', 'codex', or 'codex-fugu'. Omit to use the server default."),
       ("steps", "Numbered implementation steps with code snippets and exact file paths"),
       ("verify", "Exact verification commands (e.g., 'cargo test --workspace')"),
       ("boundary", "DO NOT rules for known failure modes"),
@@ -578,7 +578,7 @@ spawnWorkerToolSchema =
   genericToolSchemaWith @SpawnWorkerToolArgs
     [ ("name", "Worker name (pane title, messaging identity)"),
       ("task", "The full prompt. Everything the worker needs in one string"),
-      ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default.")
+      ("agent_type", "Agent type for the worker: 'claude', 'opencode', 'codex', or 'codex-fugu'. Omit to use the server default.")
     ]
 
 spawnWorkerToolCore :: SpawnWorkerToolArgs -> Eff Effects MCPCallOutput

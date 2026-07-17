@@ -376,7 +376,7 @@ impl<
             AgentType::Claude => "tl",
             AgentType::Gemini => "dev",
             AgentType::Shoal => "dev",
-            AgentType::OpenCode => "dev",
+            AgentType::OpenCode | AgentType::CodexFugu => "dev",
             AgentType::Process => return Ok(None), // Process companions don't have WASM handlers
         };
 

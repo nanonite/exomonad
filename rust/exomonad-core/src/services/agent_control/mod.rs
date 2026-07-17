@@ -9,7 +9,10 @@ mod cleanup;
 mod internal;
 mod spawn;
 
-pub use spawn::{CODEX_TL_INSTRUCTIONS, OPENCODE_TL_INSTRUCTIONS};
+pub use spawn::{
+    CODEX_DEV_INSTRUCTIONS, CODEX_REVIEWER_INSTRUCTIONS, CODEX_TL_INSTRUCTIONS,
+    CODEX_WORKER_INSTRUCTIONS, OPENCODE_TL_INSTRUCTIONS,
+};
 
 pub(crate) use crate::common::TimeoutError;
 pub(crate) use crate::domain::{
@@ -250,6 +253,10 @@ pub enum AgentType {
     /// OpenAI Codex CLI.
     Codex,
 
+    /// Codex-Fugu CLI using the Codex runtime protocol.
+    #[serde(rename = "codex-fugu")]
+    CodexFugu,
+
     /// Plain long-running process (no MCP, no agent identity, no worktree).
     /// Used for companion processes like mock servers, log tailers, etc.
     Process,
@@ -298,6 +305,13 @@ pub(crate) const CODEX_META: AgentMetadata = AgentMetadata {
     emoji: "\u{1F916}", // 🤖
 };
 
+pub(crate) const CODEX_FUGU_META: AgentMetadata = AgentMetadata {
+    command: "codex-fugu",
+    prompt_flag: "",
+    suffix: "codex-fugu",
+    emoji: "\u{1F916}", // 🤖
+};
+
 pub(crate) const PROCESS_META: AgentMetadata = AgentMetadata {
     command: "",
     prompt_flag: "",
@@ -313,11 +327,12 @@ impl AgentType {
             AgentType::Shoal => &SHOAL_META,
             AgentType::OpenCode => &OPENCODE_META,
             AgentType::Codex => &CODEX_META,
+            AgentType::CodexFugu => &CODEX_FUGU_META,
             AgentType::Process => &PROCESS_META,
         }
     }
 
-    pub(crate) fn command(&self) -> &'static str {
+    pub fn command(&self) -> &'static str {
         self.meta().command
     }
     pub(crate) fn prompt_flag(&self) -> &'static str {
@@ -353,6 +368,8 @@ impl AgentType {
             AgentType::Shoal
         } else if dir_name.ends_with("-opencode") {
             AgentType::OpenCode
+        } else if dir_name.ends_with("-codex-fugu") {
+            AgentType::CodexFugu
         } else if dir_name.ends_with("-codex") {
             AgentType::Codex
         } else if dir_name.ends_with("-process") {
@@ -1174,13 +1191,18 @@ mod tests {
     pub(crate) fn parse_agent_dir_name(name: &str) -> Option<ParsedAgentDirName<'_>> {
         let rest = name.strip_prefix("gh-")?;
         let (issue_id, rest) = rest.split_once('-')?;
-        let (slug, agent_suffix) = rest.rsplit_once('-')?;
+        let (slug, agent_suffix) = if let Some(slug) = rest.strip_suffix("-codex-fugu") {
+            (slug, "codex-fugu")
+        } else {
+            rest.rsplit_once('-')?
+        };
         let agent_type = match agent_suffix {
             "claude" => Some(super::AgentType::Claude),
             "gemini" => Some(super::AgentType::Gemini),
             "shoal" => Some(super::AgentType::Shoal),
             "opencode" => Some(super::AgentType::OpenCode),
             "codex" => Some(super::AgentType::Codex),
+            "codex-fugu" => Some(super::AgentType::CodexFugu),
             "process" => Some(super::AgentType::Process),
             _ => None,
         };
@@ -1204,6 +1226,7 @@ mod tests {
         assert_eq!(AgentType::Claude.command(), "claude");
         assert_eq!(AgentType::Gemini.command(), "gemini");
         assert_eq!(AgentType::Codex.command(), "codex");
+        assert_eq!(AgentType::CodexFugu.command(), "codex-fugu");
     }
 
     #[test]
@@ -1217,6 +1240,18 @@ mod tests {
         assert_eq!(AgentType::Claude.suffix(), "claude");
         assert_eq!(AgentType::Gemini.suffix(), "gemini");
         assert_eq!(AgentType::Codex.suffix(), "codex");
+        assert_eq!(AgentType::CodexFugu.suffix(), "codex-fugu");
+    }
+
+    #[test]
+    fn test_codex_fugu_agent_dir_suffix() {
+        let parsed = parse_agent_dir_name("gh-526-fugu-support-codex-fugu").unwrap();
+        assert_eq!(parsed.slug, "fugu-support");
+        assert_eq!(parsed.agent_type, Some(AgentType::CodexFugu));
+        assert_eq!(
+            AgentType::from_dir_name("gh-526-fugu-support-codex-fugu"),
+            AgentType::CodexFugu
+        );
     }
 
     #[test]

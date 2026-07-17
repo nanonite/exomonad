@@ -76,7 +76,7 @@ enum Commands {
         /// Enable OpenRouter for LLM routing
         #[arg(long)]
         openrouter: bool,
-        /// Set root agent type (valid: claude|gemini|opencode|codex|shoal;
+        /// Set root agent type (valid: claude|gemini|opencode|codex|codex-fugu|shoal;
         /// overrides --opencode-as-tl)
         #[arg(long)]
         tl: Option<String>,
@@ -102,7 +102,7 @@ enum Commands {
         /// Effort level for automatically spawned reviewers.
         #[arg(long, value_enum)]
         reviewer_effort_level: Option<config::EffortLevel>,
-        /// Set reviewer agent type (valid: claude|gemini|opencode|codex|shoal).
+        /// Set reviewer agent type (valid: claude|gemini|opencode|codex|codex-fugu|shoal).
         /// Overrides [reviewer] in config.toml.
         #[arg(long)]
         reviewer: Option<String>,
@@ -172,7 +172,7 @@ enum Commands {
 
     /// List available models per agent harness.
     Models {
-        /// Harness: opencode, gemini, claude, or codex. Omit for all.
+        /// Harness: opencode, gemini, claude, codex, or codex-fugu. Omit for all.
         #[arg(value_name = "HARNESS")]
         harness: Option<String>,
         /// Provider filter (opencode only). E.g. "anthropic", "openai".

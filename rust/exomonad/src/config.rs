@@ -11,6 +11,7 @@ fn parse_agent_type_env(s: &str) -> Option<AgentType> {
         "gemini" => Some(AgentType::Gemini),
         "opencode" | "opencode-cli" => Some(AgentType::OpenCode),
         "codex" => Some(AgentType::Codex),
+        "codex-fugu" | "codexfugu" => Some(AgentType::CodexFugu),
         "shoal" => Some(AgentType::Shoal),
         _ => None,
     }

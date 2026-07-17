@@ -8,7 +8,10 @@ pub async fn run(harness: Option<String>, provider: Option<String>) -> Result<()
         Some("gemini") => run_gemini(),
         Some("claude") => run_claude(),
         Some("codex") => run_codex(),
-        Some(other) => bail!("Unknown harness: {other}. Valid: opencode, gemini, claude, codex"),
+        Some("codex-fugu") | Some("codexfugu") => run_codex_fugu(),
+        Some(other) => {
+            bail!("Unknown harness: {other}. Valid: opencode, gemini, claude, codex, codex-fugu")
+        }
     }
 }
 
@@ -56,6 +59,14 @@ fn run_codex() -> Result<()> {
     Ok(())
 }
 
+fn run_codex_fugu() -> Result<()> {
+    println!("fugu");
+    println!("fugu-ultra");
+    println!("Effort: high, xhigh, or max (max is sent to Fugu as xhigh).");
+    println!("Note: Codex-Fugu model discovery is not exposed. Static list is provider-defined.");
+    Ok(())
+}
+
 async fn run_all(provider: Option<String>) -> Result<()> {
     println!("# opencode");
     if let Err(error) = run_opencode(provider).await {
@@ -70,5 +81,8 @@ async fn run_all(provider: Option<String>) -> Result<()> {
     println!();
     println!("# codex");
     run_codex()?;
+    println!();
+    println!("# codex-fugu");
+    run_codex_fugu()?;
     Ok(())
 }
