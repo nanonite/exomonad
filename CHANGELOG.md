@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- spawn_leaf cannot resume from existing remote branch when local worktree was deleted (#525)
 - Fix reviewer re-spawn blocked when terminal-review and SHA-change occur in same poll cycle (#524)
 - Watcher logging: handle_event_action missing pre-delivery log (#522)
 - Watcher logging: missing pre-dispatch log for pr_review WasmEvents (#521)
@@ -81,6 +82,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- `exomonad models codex` now queries `codex debug models` live instead of a hardcoded list; claude/gemini/codex-fugu disclaimers now explicitly state no discovery path is available (#532)
 - Add effort and Codex Fugu integration coverage (#531)
 - Improve effort and harness CLI guidance (#530)
 - Add Codex Fugu as a supported agent harness (#529)
