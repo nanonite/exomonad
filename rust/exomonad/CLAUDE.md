@@ -86,6 +86,16 @@ low/medium before launch side effects.
 
 **Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults) and `.gitignore` entries if missing.
 
+**Multi-remote projects:** `exomonad init --set-git-remote <name>` pins which
+git remote `file_pr`, `merge_pr`, the Forgejo watcher, and pushes use — needed
+when a repo has more than one remote (e.g. a GitHub `origin` kept for
+mirroring alongside a separate Forgejo remote), since auto-detect otherwise
+prefers whichever remote is literally named `origin` regardless of which
+backend it points at. The flag validates the remote exists, then persists it
+via `git config --local exomonad.remote <name>` (shared across worktrees via
+the main repo's `.git/config` — no config.toml field). See
+`services::repo::get_repo_info` in `exomonad-core`.
+
 **WASM resolution:** project `.exo/wasm/` → build from `.exo/roles/` → copy from `~/.exo/wasm/` (global install via `just install-all`).
 
 **Config hierarchy:**

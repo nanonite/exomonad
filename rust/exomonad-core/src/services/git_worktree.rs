@@ -88,7 +88,11 @@ fn headless_git_ssh_command() -> String {
     }
 }
 
-fn push_origin_command(branch: &BranchName, forgejo_token: Option<&str>) -> std::process::Command {
+fn push_remote_command(
+    remote: &str,
+    branch: &BranchName,
+    forgejo_token: Option<&str>,
+) -> std::process::Command {
     let mut command = headless_git_command();
     if let Some(token) = forgejo_token
         .map(str::trim)
@@ -98,8 +102,30 @@ fn push_origin_command(branch: &BranchName, forgejo_token: Option<&str>) -> std:
             .arg("-c")
             .arg(format!("http.extraheader=Authorization: token {token}"));
     }
-    command.args(["push", "origin", branch.as_str()]);
+    command.args(["push", remote, branch.as_str()]);
     command
+}
+
+/// Read the `exomonad.remote` git config override, if set. Mirrors
+/// `services::repo::configured_remote`, but synchronous — this module
+/// shells out via `std::process::Command`, not tokio.
+fn configured_remote(workspace_path: &Path) -> Option<String> {
+    let output = headless_git_command()
+        .args(["config", "--get", "exomonad.remote"])
+        .current_dir(workspace_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 impl GitWorktreeService {
@@ -276,30 +302,17 @@ impl GitWorktreeService {
         self.push_bookmark_with_token(workspace_path, branch, None)
     }
 
-    /// Push a branch to origin, using the Forgejo token for HTTP remote auth when provided.
+    /// Push a branch to the configured remote (see `exomonad.remote` git
+    /// config, defaulting to `origin`), using the Forgejo token for HTTP
+    /// remote auth when provided.
     pub fn push_bookmark_with_token(
         &self,
         workspace_path: &Path,
         branch: &BranchName,
         forgejo_token: Option<&str>,
     ) -> Result<(), WorktreeError> {
-        info!(branch = %branch, path = %workspace_path.display(), "Pushing branch");
-
-        let output = push_origin_command(branch, forgejo_token)
-            .current_dir(workspace_path)
-            .output()
-            .map_err(|e| WorktreeError::GitError {
-                message: format!("Failed to run git push: {}", e),
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!(stderr = %stderr, "git push failed");
-            return Err(self.parse_git_stderr(&stderr));
-        }
-
-        info!(branch = %branch, "Branch pushed successfully");
-        Ok(())
+        let remote = configured_remote(workspace_path).unwrap_or_else(|| "origin".to_string());
+        self.push_to_remote_with_token(workspace_path, branch, &remote, forgejo_token)
     }
 
     /// Push a branch to a named remote.
@@ -311,10 +324,23 @@ impl GitWorktreeService {
         branch: &BranchName,
         remote: &str,
     ) -> Result<(), WorktreeError> {
+        self.push_to_remote_with_token(workspace_path, branch, remote, None)
+    }
+
+    /// Push a branch to a named remote, using the Forgejo token for HTTP
+    /// remote auth when provided.
+    ///
+    /// Equivalent to: `git push {remote} {branch}` (run in workspace_path)
+    pub fn push_to_remote_with_token(
+        &self,
+        workspace_path: &Path,
+        branch: &BranchName,
+        remote: &str,
+        forgejo_token: Option<&str>,
+    ) -> Result<(), WorktreeError> {
         info!(branch = %branch, remote = %remote, path = %workspace_path.display(), "Pushing branch to remote");
 
-        let output = headless_git_command()
-            .args(["push", remote, branch.as_str()])
+        let output = push_remote_command(remote, branch, forgejo_token)
             .current_dir(workspace_path)
             .output()
             .map_err(|e| WorktreeError::GitError {
@@ -509,10 +535,10 @@ mod tests {
     }
 
     #[test]
-    fn push_origin_command_injects_forgejo_token_extraheader() {
+    fn push_remote_command_injects_forgejo_token_extraheader() {
         let branch = BranchName::try_from_str("feature-auth")
             .expect("literal validated string is non-empty");
-        let command = push_origin_command(&branch, Some("secret-token"));
+        let command = push_remote_command("origin", &branch, Some("secret-token"));
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string())
@@ -531,16 +557,67 @@ mod tests {
     }
 
     #[test]
-    fn push_origin_command_omits_empty_forgejo_token_extraheader() {
+    fn push_remote_command_injects_forgejo_token_for_named_remote() {
         let branch = BranchName::try_from_str("feature-auth")
             .expect("literal validated string is non-empty");
-        let command = push_origin_command(&branch, Some("   "));
+        let command = push_remote_command("forgejo", &branch, Some("secret-token"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "http.extraheader=Authorization: token secret-token",
+                "push",
+                "forgejo",
+                "feature-auth",
+            ]
+        );
+    }
+
+    #[test]
+    fn push_remote_command_omits_empty_forgejo_token_extraheader() {
+        let branch = BranchName::try_from_str("feature-auth")
+            .expect("literal validated string is non-empty");
+        let command = push_remote_command("origin", &branch, Some("   "));
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
 
         assert_eq!(args, vec!["push", "origin", "feature-auth"]);
+    }
+
+    #[test]
+    fn configured_remote_returns_none_when_unset() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(temp.path())
+            .output()
+            .expect("git init failed");
+
+        assert_eq!(configured_remote(temp.path()), None);
+    }
+
+    #[test]
+    fn configured_remote_returns_configured_value() {
+        let temp = TempDir::new().expect("failed to create temp dir");
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(temp.path())
+            .output()
+            .expect("git init failed");
+        std::process::Command::new("git")
+            .args(["config", "--local", "exomonad.remote", "forgejo"])
+            .current_dir(temp.path())
+            .output()
+            .expect("git config failed");
+
+        assert_eq!(configured_remote(temp.path()), Some("forgejo".to_string()));
     }
 
     fn init_test_repo() -> (TempDir, GitWorktreeService) {
@@ -766,6 +843,52 @@ mod tests {
 
         let result = service.push_to_remote(work_dir, &branch, "forgejo");
         assert!(result.is_ok(), "push_to_remote failed: {:?}", result);
+    }
+
+    #[test]
+    fn test_push_bookmark_with_token_honors_exomonad_remote_override() {
+        let bare = TempDir::new().expect("failed to create bare dir");
+        let work = TempDir::new().expect("failed to create work dir");
+        let work_dir = work.path();
+
+        let run_bare = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(bare.path())
+                .status()
+                .expect("git failed")
+        };
+        run_bare(&["init", "--bare"]);
+
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(work_dir)
+                .status()
+                .expect("git failed");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        run(&["commit", "--allow-empty", "-m", "Initial commit"]);
+        // "origin" intentionally left unset — only a non-default remote
+        // named "forgejo" exists, plus the exomonad.remote override
+        // pointing push_bookmark_with_token at it instead of "origin".
+        run(&["remote", "add", "forgejo", bare.path().to_str().unwrap()]);
+        run(&["config", "--local", "exomonad.remote", "forgejo"]);
+
+        let service = GitWorktreeService::new(work_dir.to_path_buf());
+        let default_branch = get_default_branch(work_dir);
+        let branch = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+
+        let result = service.push_bookmark_with_token(work_dir, &branch, None);
+        assert!(
+            result.is_ok(),
+            "push_bookmark_with_token failed to honor exomonad.remote: {:?}",
+            result
+        );
     }
 
     /// End-to-end: simulates the file_pr resolution chain.

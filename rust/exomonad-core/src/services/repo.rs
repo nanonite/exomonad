@@ -6,6 +6,14 @@ use tokio::process::Command;
 
 const DEFAULT_REMOTE: &str = "origin";
 
+/// Git config key holding an explicit remote-name override, set by
+/// `exomonad init --set-git-remote <name>` via `git config --local`. Lets a
+/// project pin which remote exomonad's PR/CI operations use when multiple
+/// remotes are configured (e.g. a GitHub `origin` alongside a Forgejo
+/// remote) — without it, the wrong remote's owner/repo can leak into calls
+/// meant for a different backend.
+const REMOTE_OVERRIDE_KEY: &str = "exomonad.remote";
+
 /// Shared repository information.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct RepoInfo {
@@ -17,16 +25,42 @@ pub struct RepoInfo {
 
 /// Get repository owner and name from git remote.
 ///
-/// This function detects the configured git remote and parses the owner and repo
-/// from the resulting URL (supporting both HTTPS and SSH formats).
+/// If `exomonad.remote` is set in git config (local or global), that remote
+/// is used directly. Otherwise, this function detects the configured git
+/// remote (preferring `origin`) and parses the owner and repo from the
+/// resulting URL (supporting both HTTPS and SSH formats).
 pub async fn get_repo_info<P: AsRef<Path>>(working_dir: P) -> Result<RepoInfo> {
     let working_dir = working_dir.as_ref();
-    let remote = detect_first_remote(working_dir).await?;
+    let remote = match configured_remote(working_dir).await? {
+        Some(remote) => remote,
+        None => detect_first_remote(working_dir).await?,
+    };
     let url = get_remote_url(working_dir, &remote).await?;
 
     let (owner, repo) = parse_github_url(&url)?;
 
     Ok(RepoInfo { owner, repo })
+}
+
+/// Read the `exomonad.remote` git config override, if set.
+///
+/// `git config --get` exits 1 when the key is absent — that is not an
+/// error, it just means no override is configured.
+async fn configured_remote(working_dir: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(working_dir)
+        .args(["config", "--get", REMOTE_OVERRIDE_KEY])
+        .output()
+        .await
+        .with_context(|| format!("Failed to execute git config --get {REMOTE_OVERRIDE_KEY}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if value.is_empty() { None } else { Some(value) })
 }
 
 async fn detect_first_remote(working_dir: &Path) -> Result<String> {
@@ -189,5 +223,83 @@ mod tests {
 
         assert!(err.contains("Remote is a local path"));
         assert!(err.contains("git remote set-url origin http://<forgejo>/owner/repo"));
+    }
+
+    async fn init_repo_with_remotes(remotes: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .current_dir(tmp.path())
+            .output()
+            .await
+            .unwrap();
+        for (name, url) in remotes {
+            Command::new("git")
+                .args(["remote", "add", name, url])
+                .current_dir(tmp.path())
+                .output()
+                .await
+                .unwrap();
+        }
+        tmp
+    }
+
+    #[tokio::test]
+    async fn get_repo_info_auto_detects_origin_when_no_override_configured() {
+        let tmp = init_repo_with_remotes(&[
+            ("forgejo", "http://localhost:3000/goya/repo.git"),
+            ("origin", "https://github.com/nanonite/repo.git"),
+        ])
+        .await;
+
+        let info = get_repo_info(tmp.path()).await.unwrap();
+
+        assert_eq!(info.owner.as_str(), "nanonite");
+        assert_eq!(info.repo.as_str(), "repo");
+    }
+
+    #[tokio::test]
+    async fn get_repo_info_honors_exomonad_remote_override() {
+        let tmp = init_repo_with_remotes(&[
+            ("origin", "https://github.com/nanonite/repo.git"),
+            ("forgejo", "http://localhost:3000/goya/repo.git"),
+        ])
+        .await;
+        Command::new("git")
+            .args(["config", "--local", "exomonad.remote", "forgejo"])
+            .current_dir(tmp.path())
+            .output()
+            .await
+            .unwrap();
+
+        let info = get_repo_info(tmp.path()).await.unwrap();
+
+        assert_eq!(info.owner.as_str(), "goya");
+        assert_eq!(info.repo.as_str(), "repo");
+    }
+
+    #[tokio::test]
+    async fn configured_remote_returns_none_when_unset() {
+        let tmp =
+            init_repo_with_remotes(&[("origin", "https://github.com/nanonite/repo.git")]).await;
+
+        assert_eq!(configured_remote(tmp.path()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn configured_remote_returns_configured_value() {
+        let tmp =
+            init_repo_with_remotes(&[("forgejo", "http://localhost:3000/goya/repo.git")]).await;
+        Command::new("git")
+            .args(["config", "--local", "exomonad.remote", "forgejo"])
+            .current_dir(tmp.path())
+            .output()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            configured_remote(tmp.path()).await.unwrap(),
+            Some("forgejo".to_string())
+        );
     }
 }

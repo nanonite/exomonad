@@ -165,14 +165,89 @@ struct RemoteRepoParts {
     has_http_auth: bool,
 }
 
-fn configure_forgejo_remote(cwd: &Path, forgejo_url: &str, forgejo_token: &str) -> Result<()> {
+/// Git config key holding an explicit remote-name override. Mirrors
+/// `exomonad_core::services::repo`'s `REMOTE_OVERRIDE_KEY` — kept as a
+/// literal here since this module doesn't depend on that private const.
+const GIT_REMOTE_OVERRIDE_KEY: &str = "exomonad.remote";
+
+/// Resolve which git remote exomonad's PR/CI operations should use: the
+/// `exomonad.remote` git config override if set, else `"origin"`.
+fn resolve_git_remote(cwd: &Path) -> String {
     let output = std::process::Command::new("git")
         .current_dir(cwd)
-        .args(["remote", "get-url", "origin"])
+        .args(["config", "--get", GIT_REMOTE_OVERRIDE_KEY])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let value = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if value.is_empty() {
+                "origin".to_string()
+            } else {
+                value
+            }
+        }
+        _ => "origin".to_string(),
+    }
+}
+
+/// Validate `remote` names an existing git remote, then persist it as the
+/// `exomonad.remote` git config override (`git config --local`). Used by
+/// `exomonad init --set-git-remote <name>` to pin which remote PR/CI
+/// operations use when a repo has multiple remotes (e.g. a GitHub `origin`
+/// alongside a Forgejo remote) — worktrees share the main repo's
+/// `.git/config`, so this applies to every spawned agent automatically.
+fn set_git_remote_override(cwd: &Path, remote: &str) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .arg("remote")
         .output()
-        .context("failed to run git remote get-url origin")?;
+        .context("failed to run git remote")?;
     if !output.status.success() {
-        warn!("No origin remote found; skipping Forgejo remote token auth setup");
+        anyhow::bail!("git remote exited with {}", output.status);
+    }
+    let remotes: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !remotes.iter().any(|r| r == remote) {
+        anyhow::bail!(
+            "--set-git-remote {remote}: no such git remote configured (found: {}). \
+             Add it first with `git remote add {remote} <url>`.",
+            remotes.join(", ")
+        );
+    }
+
+    let status = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["config", "--local", GIT_REMOTE_OVERRIDE_KEY, remote])
+        .status()
+        .with_context(|| format!("failed to run git config --local {GIT_REMOTE_OVERRIDE_KEY}"))?;
+    if !status.success() {
+        anyhow::bail!("git config --local {GIT_REMOTE_OVERRIDE_KEY} {remote} exited with {status}");
+    }
+
+    info!(remote, "Configured exomonad.remote git config override");
+    Ok(())
+}
+
+fn configure_forgejo_remote(
+    cwd: &Path,
+    forgejo_url: &str,
+    forgejo_token: &str,
+    remote: &str,
+) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["remote", "get-url", remote])
+        .output()
+        .with_context(|| format!("failed to run git remote get-url {remote}"))?;
+    if !output.status.success() {
+        warn!(
+            remote,
+            "No such remote found; skipping Forgejo remote token auth setup"
+        );
         return Ok(());
     }
 
@@ -182,14 +257,15 @@ fn configure_forgejo_remote(cwd: &Path, forgejo_url: &str, forgejo_token: &str) 
     };
     let status = std::process::Command::new("git")
         .current_dir(cwd)
-        .args(["remote", "set-url", "origin", &new_url])
+        .args(["remote", "set-url", remote, &new_url])
         .status()
-        .context("failed to run git remote set-url origin")?;
+        .with_context(|| format!("failed to run git remote set-url {remote}"))?;
     if !status.success() {
-        anyhow::bail!("git remote set-url origin exited with {status}");
+        anyhow::bail!("git remote set-url {remote} exited with {status}");
     }
 
     info!(
+        remote,
         old_url = %redact_remote_token(&old_url, forgejo_token),
         new_url = %redact_remote_token(&new_url, forgejo_token),
         "Configured git remote to use Forgejo HTTP token auth"
@@ -826,6 +902,7 @@ pub async fn run(
     reviewer: Option<String>,
     reviewer_model: Option<String>,
     verbose: bool,
+    set_git_remote: Option<String>,
 ) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
     use exomonad_core::services::{resolve_role_context_path, AgentType};
@@ -834,6 +911,10 @@ pub async fn run(
     let config_path = cwd.join(".exo/config.toml");
     if !config_path.exists() {
         anyhow::bail!("No exomonad project found. Run `exomonad new` first.");
+    }
+
+    if let Some(ref remote_name) = set_git_remote {
+        set_git_remote_override(&cwd, remote_name)?;
     }
 
     // Resolve config
@@ -1176,7 +1257,8 @@ pub async fn run(
         config.forgejo_url.as_deref(),
         config.forgejo_token.as_deref(),
     ) {
-        if let Err(e) = configure_forgejo_remote(&cwd, forgejo_url, forgejo_token) {
+        let git_remote = resolve_git_remote(&cwd);
+        if let Err(e) = configure_forgejo_remote(&cwd, forgejo_url, forgejo_token, &git_remote) {
             warn!(error = %e, "Failed to auto-configure Forgejo remote URL (non-fatal)");
         }
     } else if config.forgejo_url.is_none() && config.forgejo_token.is_none() {
@@ -2603,6 +2685,85 @@ mod tests {
             "token-123",
         )
         .is_none());
+    }
+
+    fn init_temp_git_repo(remotes: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        for (name, url) in remotes {
+            std::process::Command::new("git")
+                .args(["remote", "add", name, url])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn resolve_git_remote_defaults_to_origin_when_unset() {
+        let tmp = init_temp_git_repo(&[("origin", "https://github.com/nanonite/repo.git")]);
+        assert_eq!(resolve_git_remote(tmp.path()), "origin");
+    }
+
+    #[test]
+    fn set_git_remote_override_rejects_nonexistent_remote() {
+        let tmp = init_temp_git_repo(&[("origin", "https://github.com/nanonite/repo.git")]);
+        let err = set_git_remote_override(tmp.path(), "forgejo")
+            .expect_err("remote does not exist yet")
+            .to_string();
+        assert!(err.contains("no such git remote"), "{err}");
+    }
+
+    #[test]
+    fn set_git_remote_override_persists_and_resolves() {
+        let tmp = init_temp_git_repo(&[
+            ("origin", "https://github.com/nanonite/repo.git"),
+            ("forgejo", "http://localhost:3000/goya/repo.git"),
+        ]);
+        set_git_remote_override(tmp.path(), "forgejo").unwrap();
+        assert_eq!(resolve_git_remote(tmp.path()), "forgejo");
+    }
+
+    #[test]
+    fn configure_forgejo_remote_targets_configured_remote_not_origin() {
+        let tmp = init_temp_git_repo(&[
+            ("origin", "git@github.com:nanonite/repo.git"),
+            ("forgejo", "git@localhost:goya/repo.git"),
+        ]);
+
+        configure_forgejo_remote(tmp.path(), "http://localhost:3000", "token-123", "forgejo")
+            .unwrap();
+
+        let forgejo_url = std::process::Command::new("git")
+            .args(["remote", "get-url", "forgejo"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let forgejo_url = String::from_utf8_lossy(&forgejo_url.stdout)
+            .trim()
+            .to_string();
+        assert_eq!(
+            forgejo_url,
+            "http://forgejo_pat:token-123@localhost:3000/goya/repo.git"
+        );
+
+        let origin_url = std::process::Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let origin_url = String::from_utf8_lossy(&origin_url.stdout)
+            .trim()
+            .to_string();
+        assert_eq!(
+            origin_url, "git@github.com:nanonite/repo.git",
+            "origin must be untouched when the configured remote is 'forgejo'"
+        );
     }
 
     #[test]

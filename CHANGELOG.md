@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Multi-remote repos leak the wrong backend's owner/repo into Forgejo PR/CI calls; add `exomonad init --set-git-remote <name>` and `exomonad.remote` git config override (#533)
 - spawn_leaf cannot resume from existing remote branch when local worktree was deleted (#525)
 - Fix reviewer re-spawn blocked when terminal-review and SHA-change occur in same poll cycle (#524)
 - Watcher logging: handle_event_action missing pre-delivery log (#522)

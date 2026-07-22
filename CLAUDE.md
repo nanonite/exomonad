@@ -268,6 +268,17 @@ or max (max is launched as xhigh). Omitted Fugu effort defaults to high; explici
 low/medium fails before session, worktree, or pane side effects. Install `codex-fugu`
 on PATH before selecting it.
 
+**Multiple git remotes:** By default, PR/CI operations (`file_pr`, `merge_pr`, the
+Forgejo watcher, and pushes) auto-detect the git remote to use, preferring one
+named `origin`. If a project has more than one remote — e.g. a GitHub `origin`
+kept for mirroring alongside a separate remote pointing at a local Forgejo
+instance — that auto-detect can pick the wrong one, sending one backend's
+owner/repo to the other's API. Run `exomonad init --set-git-remote <name>` to
+pin which remote to use; it validates the remote exists, then persists the
+choice via `git config --local exomonad.remote <name>`. Git worktrees share the
+main repo's `.git/config`, so the setting applies to every spawned agent
+automatically. Omit the flag to keep today's auto-detect behavior.
+
 **Config hierarchy:**
 - `config.toml` uses `default_role` (project-wide default)
 - `config.local.toml` uses `role` (worktree-specific override)

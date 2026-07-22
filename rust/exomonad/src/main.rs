@@ -118,6 +118,16 @@ enum Commands {
         /// Sets RUST_LOG=info, EXOMONAD_HOOK_TRACE=1, and EXOMONAD_CHAINLINK_TRACE=1 on the server; EXOMONAD_VERBOSE=1 session-wide.
         #[arg(long)]
         verbose: bool,
+        /// Pin which git remote exomonad's PR/CI operations (file_pr, merge_pr,
+        /// the Forgejo watcher, and push) use, for repos with more than one
+        /// remote configured (e.g. a GitHub `origin` alongside a Forgejo
+        /// remote). Must already exist (`git remote add <name> <url>` first).
+        /// Persisted via `git config --local exomonad.remote <name>`, so it
+        /// applies to this repo and every worktree spawned from it. Omit to
+        /// keep today's behavior: auto-detect, preferring a remote named
+        /// `origin`.
+        #[arg(long)]
+        set_git_remote: Option<String>,
     },
 
     /// Initialize a new exomonad project in the current directory.
@@ -349,6 +359,7 @@ async fn main() -> Result<()> {
             reviewer,
             reviewer_model,
             verbose,
+            set_git_remote,
         } => {
             if let Err(e) = init::run(
                 session,
@@ -365,6 +376,7 @@ async fn main() -> Result<()> {
                 reviewer,
                 reviewer_model,
                 verbose,
+                set_git_remote,
             )
             .await
             {
