@@ -14,7 +14,6 @@ use chrono::Utc;
 use exomonad_proto::effects::events::{event::EventType, AgentMessage, Event};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +39,7 @@ const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 #[serde(rename_all = "snake_case")]
 enum ForgejoReviewVerdict {
     None,
+    Commented,
     ChangesRequested,
     Approved,
 }
@@ -106,30 +106,6 @@ struct PendingPrActions {
     agent_role: String,
 }
 
-/// Whether a PR review event should fan out to the reviewer in addition to the leaf,
-/// and the reviewer's identity when so.
-///
-/// The reviewer-side handlers in `.exo/roles/devswarm/ReviewerRole.hs` are only reachable
-/// when the watcher explicitly dispatches the event to the reviewer's plugin manager.
-/// This decision is computed by [`reviewer_fanout_decision`] and consumed by the
-/// dispatch loop in [`AgentControlService::process_observations`].
-#[derive(Debug, PartialEq, Eq)]
-enum ReviewerFanOut {
-    /// Event doesn't require reviewer fan-out (most events).
-    NotApplicable,
-    /// Event requires fan-out, but the PR has no registered reviewer — the
-    /// convergence loop will stall. Caller logs an error.
-    NoReviewer,
-    /// Event requires fan-out and the reviewer is registered.
-    DispatchTo(BranchName, AgentType, &'static str),
-    /// Event was authored by the registered reviewer and should not be echoed back.
-    SuppressedSelfEcho,
-}
-
-fn reviewer_worktree_path(project_dir: &Path, reviewer_agent: &str) -> PathBuf {
-    project_dir.join(".exo/worktrees").join(reviewer_agent)
-}
-
 fn evict_closed_prs_from_state(state: &mut WatcherStateFile, registry: &PrRegistry) -> Vec<u64> {
     let mut evicted = Vec::new();
     state.prs.retain(|pr_number, _| {
@@ -160,49 +136,13 @@ fn reviewer_disposal_log_line(pr_number: u64, reviewer_slugs: &[String]) -> Stri
     }
 }
 
-/// Decide whether to fan a PR review event out to the reviewer.
-///
-/// Only events that require a fresh reviewer action are fanned out to the
-/// reviewer. Approval and merge-ready events are watcher-owned terminal signals:
-/// the reviewer has already written its verdict and may exit.
-///
-/// Non-`pr_review` event_types (`ci_status`, `agent.sibling_merged`, etc.) remain
-/// leaf-only because the reviewer has no handler for them.
-fn reviewer_fanout_decision(
-    event_type: &str,
-    payload: &serde_json::Value,
-    pr_number: u64,
-    registry: &PrRegistry,
-) -> ReviewerFanOut {
-    if event_type != "pr_review" {
-        return ReviewerFanOut::NotApplicable;
-    }
-    if payload
-        .get("kind")
-        .and_then(|value| value.as_str())
-        .is_some_and(|kind| {
-            matches!(
-                kind,
-                "approved" | "merge_ready" | "ci_triggered" | "ci_blocked"
-            )
-        })
-    {
-        return ReviewerFanOut::NotApplicable;
-    }
-    let Some((branch, agent_type)) = registry.reviewer_for_pr(pr_number) else {
-        return ReviewerFanOut::NoReviewer;
-    };
-
-    if payload.get("kind").and_then(|value| value.as_str()) == Some("review_received")
-        && payload
-            .get("author_branch")
-            .and_then(|value| value.as_str())
-            .is_some_and(|author_branch| author_branch == branch.as_str())
-    {
-        ReviewerFanOut::SuppressedSelfEcho
-    } else {
-        ReviewerFanOut::DispatchTo(branch, agent_type, "reviewer")
-    }
+fn review_event_target(pr: &PrEntry) -> (BranchName, AgentType, String) {
+    (
+        BranchName::try_from_str(pr.head_branch.as_str())
+            .expect("validated string input is non-empty"),
+        AgentType::from_dir_name(&pr.author_agent),
+        pr.author_role.clone(),
+    )
 }
 
 fn review_state_disposes_reviewer(review_state: &ForgejoReviewState) -> bool {
@@ -516,6 +456,10 @@ fn review_received_message(pr_number: u64, comments: &str) -> String {
     format!("## Review on PR #{pr_number}\n\n{comments}\n\nAddress these comments and push fixes.")
 }
 
+fn review_commented_message(pr_number: u64, comments: &str) -> String {
+    format!("[REVIEW COMMENT] PR #{pr_number}:\n\n{comments}")
+}
+
 fn merge_ready_message(pr_number: u64, status: &str, branch: &str) -> String {
     format!(
         "[MERGE READY] PR #{pr_number} on branch {branch} has CI status {status} and reviewer approval. Merge with `merge_pr` tool."
@@ -634,6 +578,9 @@ fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventAction
                 message: review_received_message(pr_number, value_str(payload, "comments")?),
             })
         }
+        "review_commented" => Some(EventActionResponse::InjectMessage {
+            message: review_commented_message(pr_number, value_str(payload, "comments")?),
+        }),
         "approved" | "reviewer_approved" => Some(EventActionResponse::InjectMessage {
             message: pr_ready_message(pr_number),
         }),
@@ -697,6 +644,12 @@ fn native_leaf_pr_review_action(payload: &serde_json::Value) -> Option<EventActi
     match kind {
         "review_received" | "reviewer_requested_changes" => Some(EventActionResponse::InjectMessage {
             message: review_received_message(
+                value_u64(payload, "pr_number")?,
+                value_str(payload, "comments")?,
+            ),
+        }),
+        "review_commented" => Some(EventActionResponse::InjectMessage {
+            message: review_commented_message(
                 value_u64(payload, "pr_number")?,
                 value_str(payload, "comments")?,
             ),
@@ -1311,10 +1264,7 @@ where
                 };
 
                 let agent_name = &pr.author_agent;
-                let agent_type = AgentType::from_dir_name(agent_name);
-                let agent_role = pr.author_role.clone();
-                let branch = BranchName::try_from_str(pr.head_branch.as_str())
-                    .expect("validated string input is non-empty");
+                let (branch, agent_type, agent_role) = review_event_target(pr);
                 let persisted_last_head_sha = watcher_state
                     .prs
                     .get(pr_number)
@@ -1464,16 +1414,6 @@ where
                     } => {
                         let release_message = merge_ready_release_message(&payload);
 
-                        // Fan-out: every pr_review event has a reviewer-side handler in
-                        // .exo/roles/devswarm/ReviewerRole.hs. Dispatch to the reviewer in
-                        // addition to the leaf so the convergence loop progresses without
-                        // TL intervention. See reviewer_fanout_decision for the rationale.
-                        let fan_out_decision = reviewer_fanout_decision(
-                            event_type,
-                            &payload,
-                            pending.pr_number,
-                            registry,
-                        );
                         let payload_kind = payload
                             .get("kind")
                             .and_then(|v| v.as_str())
@@ -1487,12 +1427,14 @@ where
                             kind = %payload_kind,
                             "Dispatching WasmEvent"
                         );
-                        let reviewer_payload = match &fan_out_decision {
-                            ReviewerFanOut::DispatchTo(_, _, _) => Some(payload.clone()),
-                            _ => None,
-                        };
                         let requests_merge_ready_delivery =
                             requests_merge_ready_parent_delivery(event_type, &payload);
+
+                        // Reviewers are ephemeral: they submit their Forgejo verdict and exit.
+                        // Review events have one delivery target, the PR owner's dev leaf. A
+                        // subsequent review round is started by the watcher-owned
+                        // spawn_reviewer_for_pr state machine above; never inject an event into
+                        // the already-exited reviewer branch.
 
                         if let Ok(Some(response)) = self
                             .call_handle_event_for_role(
@@ -1522,77 +1464,6 @@ where
                                 )
                                 .await;
                             }
-                        }
-
-                        match fan_out_decision {
-                            ReviewerFanOut::DispatchTo(
-                                reviewer_branch,
-                                reviewer_agent_type,
-                                reviewer_role,
-                            ) => {
-                                if let Some(payload) = reviewer_payload {
-                                    if let Err(err) = self
-                                        .advance_reviewer_worktree_for_fixes(
-                                            registry,
-                                            pending.pr_number,
-                                            &payload,
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            pr_number = pending.pr_number,
-                                            reviewer_branch = %reviewer_branch,
-                                            error = %err,
-                                            "Failed to advance reviewer worktree before pr_review fan-out"
-                                        );
-                                    }
-                                    info!(
-                                        pr_number = pending.pr_number,
-                                        reviewer_branch = %reviewer_branch,
-                                        ?reviewer_agent_type,
-                                        reviewer_role,
-                                        kind = %payload_kind,
-                                        "Fanning out pr_review event to reviewer agent"
-                                    );
-                                    if let Ok(Some(response)) = self
-                                        .call_handle_event_for_role(
-                                            reviewer_branch.as_str(),
-                                            reviewer_agent_type,
-                                            &reviewer_role,
-                                            event_type,
-                                            payload,
-                                        )
-                                        .await
-                                    {
-                                        let _ = self
-                                            .handle_event_action(
-                                                response,
-                                                reviewer_branch.as_str(),
-                                                reviewer_agent_type,
-                                            )
-                                            .await;
-                                    }
-                                }
-                            }
-                            ReviewerFanOut::NoReviewer => {
-                                tracing::error!(
-                                    pr_number = pending.pr_number,
-                                    leaf_branch = %pending.branch,
-                                    kind = %payload_kind,
-                                    "pr_review event fired but no reviewer is registered for \
-                                     this PR — the leaf+reviewer convergence loop will \
-                                     stall. Check that spawn_reviewer_for_pr ran for this \
-                                     PR and that the Forgejo PR body has reviewer metadata."
-                                );
-                            }
-                            ReviewerFanOut::SuppressedSelfEcho => {
-                                debug!(
-                                    pr_number = pending.pr_number,
-                                    kind = %payload_kind,
-                                    "Suppressing reviewer self-echo"
-                                );
-                            }
-                            ReviewerFanOut::NotApplicable => {}
                         }
                     }
                     PendingAction::EmitEvent {
@@ -2225,19 +2096,7 @@ where
             local_reviews.push(local_review);
         }
 
-        let review_state = if local_reviews
-            .iter()
-            .any(|review| review.state == ForgejoReviewVerdict::ChangesRequested)
-        {
-            ForgejoReviewState::ChangesRequested
-        } else if local_reviews
-            .iter()
-            .any(|review| review.state == ForgejoReviewVerdict::Approved)
-        {
-            ForgejoReviewState::Approved
-        } else {
-            ForgejoReviewState::PendingReview
-        };
+        let review_state = aggregate_review_state(&local_reviews);
 
         let changes_requested_rounds = distinct_changes_requested_rounds(&all_reviews);
         let forgejo_review_present = !local_reviews.is_empty();
@@ -2281,84 +2140,6 @@ where
             changes_requested_rounds,
             forgejo_review_present,
         )
-    }
-
-    async fn advance_reviewer_worktree_for_fixes(
-        &self,
-        registry: &PrRegistry,
-        pr_number: u64,
-        payload: &serde_json::Value,
-    ) -> Result<()> {
-        if payload.get("kind").and_then(|value| value.as_str()) != Some("fixes_pushed") {
-            return Ok(());
-        }
-
-        let head_sha = payload
-            .get("head_sha")
-            .and_then(|value| value.as_str())
-            .filter(|sha| !sha.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("fixes_pushed event missing head_sha"))?;
-        let pr = registry
-            .prs
-            .get(&pr_number)
-            .ok_or_else(|| anyhow::anyhow!("PR #{} not found in registry", pr_number))?;
-        let reviewer_agent = pr
-            .reviewer_agent
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("PR #{} has no reviewer agent", pr_number))?;
-        let reviewer_dir = reviewer_worktree_path(self.ctx.project_dir(), reviewer_agent);
-
-        let fetch = Command::new("git")
-            .arg("-C")
-            .arg(&reviewer_dir)
-            .args(["fetch", "origin", pr.head_branch.as_str()])
-            .output()
-            .await;
-        match fetch {
-            Ok(output) if !output.status.success() => {
-                warn!(
-                    pr_number,
-                    reviewer_agent,
-                    path = %reviewer_dir.display(),
-                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                    "Reviewer worktree fetch failed before fixes_pushed checkout"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    pr_number,
-                    reviewer_agent,
-                    path = %reviewer_dir.display(),
-                    error = %err,
-                    "Failed to fetch reviewer worktree before fixes_pushed checkout"
-                );
-            }
-            _ => {}
-        }
-
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&reviewer_dir)
-            .args(["checkout", "--detach", head_sha])
-            .output()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to checkout reviewer worktree {} at {}",
-                    reviewer_dir.display(),
-                    head_sha
-                )
-            })?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "failed to checkout reviewer worktree {} at {}: {}",
-                reviewer_dir.display(),
-                head_sha,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
-        Ok(())
     }
 }
 
@@ -2622,10 +2403,38 @@ fn compute_pr_actions_with_context(
                         .expect("changes_requested review state has an event kind"),
                     "pr_number": pr_number.as_u64(),
                     "comments": message,
-                    "author_branch": review_author_branch(reviews),
+                    "author_branch": review_author_branch(
+                        reviews,
+                        ForgejoReviewVerdict::ChangesRequested,
+                    ),
                 }),
             });
         }
+    }
+
+    let commented = reviews
+        .iter()
+        .any(|review| review.state == ForgejoReviewVerdict::Commented);
+    if !approved
+        && !changes_requested
+        && commented
+        && old_state.last_review_state != ForgejoReviewVerdict::Commented
+    {
+        old_state.last_review_state = ForgejoReviewVerdict::Commented;
+        let message = format_message(comments, reviews);
+        pending_actions.push(PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": review_event_kind_for_state(&ForgejoReviewVerdict::Commented)
+                    .expect("commented review state has an event kind"),
+                "pr_number": pr_number.as_u64(),
+                "comments": message,
+                "author_branch": review_author_branch(
+                    reviews,
+                    ForgejoReviewVerdict::Commented,
+                ),
+            }),
+        });
     }
 
     if !approved && !changes_requested && observed_request_change_rounds > old_state.rounds {
@@ -2731,6 +2540,7 @@ fn review_state_from_str(state: &str) -> ForgejoReviewVerdict {
         "changes_requested" | "request_changes" | "request_changes_requested" => {
             ForgejoReviewVerdict::ChangesRequested
         }
+        "comment" | "commented" | "forgejo/comment" => ForgejoReviewVerdict::Commented,
         _ => ForgejoReviewVerdict::None,
     }
 }
@@ -2739,7 +2549,29 @@ fn review_event_kind_for_state(state: &ForgejoReviewVerdict) -> Option<&'static 
     match state {
         ForgejoReviewVerdict::Approved => Some("approved"),
         ForgejoReviewVerdict::ChangesRequested => Some("review_received"),
+        ForgejoReviewVerdict::Commented => Some("review_commented"),
         ForgejoReviewVerdict::None => None,
+    }
+}
+
+fn aggregate_review_state(reviews: &[ForgejoReview]) -> ForgejoReviewState {
+    if reviews
+        .iter()
+        .any(|review| review.state == ForgejoReviewVerdict::ChangesRequested)
+    {
+        ForgejoReviewState::ChangesRequested
+    } else if reviews
+        .iter()
+        .any(|review| review.state == ForgejoReviewVerdict::Approved)
+    {
+        ForgejoReviewState::Approved
+    } else if reviews
+        .iter()
+        .any(|review| review.state == ForgejoReviewVerdict::Commented)
+    {
+        ForgejoReviewState::Commented
+    } else {
+        ForgejoReviewState::PendingReview
     }
 }
 
@@ -2747,6 +2579,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
     let state = match obs.review_state {
         ForgejoReviewState::Approved => ForgejoReviewVerdict::Approved,
         ForgejoReviewState::ChangesRequested => ForgejoReviewVerdict::ChangesRequested,
+        ForgejoReviewState::Commented => ForgejoReviewVerdict::Commented,
         ForgejoReviewState::PendingReview => ForgejoReviewVerdict::None,
     };
 
@@ -2782,16 +2615,24 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             author_branch: None,
             commit_id: None,
         });
+    } else if obs.review_state == ForgejoReviewState::Commented && reviews.is_empty() {
+        reviews.push(ForgejoReview {
+            review_id: None,
+            body: "Commented".to_string(),
+            state: ForgejoReviewVerdict::Commented,
+            author_branch: None,
+            commit_id: None,
+        });
     }
 
     (reviews, state)
 }
 
-fn review_author_branch(reviews: &[ForgejoReview]) -> Option<&str> {
+fn review_author_branch(reviews: &[ForgejoReview], state: ForgejoReviewVerdict) -> Option<&str> {
     reviews
         .iter()
         .rev()
-        .find(|review| review.state == ForgejoReviewVerdict::ChangesRequested)
+        .find(|review| review.state == state)
         .and_then(|review| review.author_branch.as_deref())
 }
 
@@ -3499,148 +3340,18 @@ mod tests {
                 if payload["kind"] == "ci_blocked" && payload["ci_status"] == "failure"
         )));
     }
-    fn pr_with_reviewer(
-        pr_number: u64,
-        agent_name: &str,
-        birth_branch: &str,
-    ) -> crate::services::pr_registry::PrEntry {
+    #[test]
+    fn test_review_event_target_uses_pr_owner_not_ephemeral_reviewer() {
         let mut pr = test_pr_entry();
-        pr.number = pr_number;
-        pr.reviewer_agent = Some(agent_name.to_string());
-        pr.reviewer_birth_branch = Some(birth_branch.to_string());
-        pr
-    }
+        pr.reviewer_agent = Some("review-pr-1-codex".to_string());
+        pr.reviewer_birth_branch = Some("review-pr-1".to_string());
 
-    #[test]
-    fn test_reviewer_fanout_decision_dispatches_when_reviewer_registered() {
-        let registry = test_registry(pr_with_reviewer(7, "review-pr-7-codex", "review-pr-7"));
-        let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 7 });
+        let (branch, agent_type, role) = review_event_target(&pr);
 
-        let decision = reviewer_fanout_decision("pr_review", &payload, 7, &registry);
-        match decision {
-            ReviewerFanOut::DispatchTo(branch, agent_type, role) => {
-                assert_eq!(branch.as_str(), "review-pr-7");
-                assert_eq!(agent_type, AgentType::Codex);
-                assert_eq!(role, "reviewer");
-            }
-            other => panic!("expected DispatchTo, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_reviewer_fanout_decision_reports_missing_reviewer() {
-        let registry = test_registry(test_pr_entry()); // reviewer fields are None
-        let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 1 });
-
-        assert_eq!(
-            reviewer_fanout_decision("pr_review", &payload, 1, &registry),
-            ReviewerFanOut::NoReviewer,
-            "fixes_pushed with no registered reviewer must surface NoReviewer so the \
-             caller logs the stall condition"
-        );
-    }
-
-    #[test]
-    fn test_reviewer_fanout_decision_skips_non_pr_review_events() {
-        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
-        let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 1 });
-
-        assert_eq!(
-            reviewer_fanout_decision("ci_status", &payload, 1, &registry),
-            ReviewerFanOut::NotApplicable,
-            "non pr_review event types must never fan out, even if the kind happens \
-             to match"
-        );
-    }
-
-    #[test]
-    fn test_reviewer_fanout_decision_suppresses_self_authored_review_received() {
-        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
-        let payload = serde_json::json!({
-            "kind": "review_received",
-            "pr_number": 1,
-            "author_branch": "review-pr-1",
-        });
-
-        assert_eq!(
-            reviewer_fanout_decision("pr_review", &payload, 1, &registry),
-            ReviewerFanOut::SuppressedSelfEcho
-        );
-    }
-
-    #[test]
-    fn test_reviewer_fanout_decision_dispatches_review_from_other_author() {
-        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
-        let payload = serde_json::json!({
-            "kind": "review_received",
-            "pr_number": 1,
-            "author_branch": "human-reviewer",
-        });
-
-        match reviewer_fanout_decision("pr_review", &payload, 1, &registry) {
-            ReviewerFanOut::DispatchTo(branch, _, _) => assert_eq!(branch.as_str(), "review-pr-1"),
-            other => panic!("expected DispatchTo, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_reviewer_fanout_decision_dispatches_for_reviewer_action_kinds() {
-        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
-        for kind in [
-            "fixes_pushed",
-            "commits_pushed",
-            "review_received",
-            "timeout",
-            "reviewer_approved",
-            "reviewer_requested_changes",
-            "rate_limited",
-            "stuck",
-        ] {
-            let payload = serde_json::json!({ "kind": kind, "pr_number": 1 });
-            match reviewer_fanout_decision("pr_review", &payload, 1, &registry) {
-                ReviewerFanOut::DispatchTo(branch, agent_type, role) => {
-                    assert_eq!(branch.as_str(), "review-pr-1");
-                    assert_eq!(agent_type, AgentType::Codex, "kind {kind}");
-                    assert_eq!(role, "reviewer", "kind {kind}");
-                }
-                other => panic!("kind {kind} expected DispatchTo, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_reviewer_fanout_decision_keeps_terminal_signals_leaf_only() {
-        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
-        for kind in ["approved", "merge_ready", "ci_triggered", "ci_blocked"] {
-            let payload = serde_json::json!({ "kind": kind, "pr_number": 1 });
-            assert_eq!(
-                reviewer_fanout_decision("pr_review", &payload, 1, &registry),
-                ReviewerFanOut::NotApplicable,
-                "kind {kind} should not be dispatched to the reviewer"
-            );
-        }
-    }
-
-    #[test]
-    fn test_reviewer_fanout_uses_reviewer_role_not_runtime_role() {
-        let registry = test_registry(pr_with_reviewer(1, "review-pr-1-codex", "review-pr-1"));
-        let payload = serde_json::json!({ "kind": "fixes_pushed", "pr_number": 1 });
-
-        match reviewer_fanout_decision("pr_review", &payload, 1, &registry) {
-            ReviewerFanOut::DispatchTo(_, agent_type, role) => {
-                assert_eq!(agent_type, AgentType::Codex);
-                assert_eq!(
-                    legacy_event_role_for_agent_type(agent_type),
-                    "dev",
-                    "runtime-derived role would route this reviewer through DevRole"
-                );
-                assert_eq!(
-                    role, "reviewer",
-                    "reviewer fan-out must select ReviewerRole handlers explicitly"
-                );
-            }
-            other => panic!("expected DispatchTo, got {other:?}"),
-        }
+        assert_eq!(branch.as_str(), "main.feat-gemini");
+        assert_eq!(agent_type, AgentType::Gemini);
+        assert_eq!(role, "dev");
+        assert_ne!(branch.as_str(), "review-pr-1");
     }
 
     #[test]
@@ -4764,6 +4475,31 @@ mod tests {
             .any(|r| r.state == ForgejoReviewVerdict::ChangesRequested));
     }
 
+    #[test]
+    fn test_obs_to_review_parts_retains_comment_review_body() {
+        let review = ForgejoReview {
+            review_id: Some(42),
+            body: "A comment-only review body".to_string(),
+            state: ForgejoReviewVerdict::Commented,
+            author_branch: Some("main.review-pr-1-codex".to_string()),
+            commit_id: None,
+        };
+        let obs = Observation {
+            head_sha: "abc".into(),
+            review_state: ForgejoReviewState::Commented,
+            comments: vec![],
+            reviews: vec![review],
+            changes_requested_rounds: 0,
+            ci_status: CIStatus::Unknown,
+            forgejo_review_present: true,
+        };
+        let (reviews, state) = obs_to_review_parts(&obs);
+        assert_eq!(state, ForgejoReviewVerdict::Commented);
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].body, "A comment-only review body");
+        assert_eq!(reviews[0].review_id, Some(42));
+    }
+
     // ---------------------------------------------------------------------------
     // format_review_message tests
     // ---------------------------------------------------------------------------
@@ -4846,6 +4582,100 @@ mod tests {
             review_event_kind_for_state(&ForgejoReviewVerdict::None),
             None
         );
+        assert_eq!(
+            review_event_kind_for_state(&ForgejoReviewVerdict::Commented),
+            Some("review_commented")
+        );
+    }
+
+    #[test]
+    fn test_comment_review_state_parsing_and_precedence() {
+        for state in ["COMMENT", "comment", "commented", "Forgejo/COMMENT"] {
+            assert_eq!(
+                review_state_from_str(state),
+                ForgejoReviewVerdict::Commented
+            );
+        }
+
+        let commented = test_review(
+            "Looks good with a small suggestion",
+            ForgejoReviewVerdict::Commented,
+        );
+        assert_eq!(
+            aggregate_review_state(std::slice::from_ref(&commented)),
+            ForgejoReviewState::Commented
+        );
+        assert_eq!(
+            aggregate_review_state(&[
+                commented.clone(),
+                test_review("approved", ForgejoReviewVerdict::Approved),
+            ]),
+            ForgejoReviewState::Approved
+        );
+        assert_eq!(
+            aggregate_review_state(&[
+                commented,
+                test_review("needs work", ForgejoReviewVerdict::ChangesRequested),
+            ]),
+            ForgejoReviewState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn test_comment_review_is_retained_and_emits_body_once() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut comment = test_review(
+            "Looks good with a small suggestion",
+            ForgejoReviewVerdict::Commented,
+        );
+        comment.author_branch = Some("main.review-pr-1-codex".to_string());
+
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            std::slice::from_ref(&comment),
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, reviews| reviews[0].body.clone(),
+            5,
+        );
+        let payload = actions
+            .iter()
+            .find_map(|action| match action {
+                PendingAction::WasmEvent { payload, .. }
+                    if payload["kind"] == "review_commented" =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .expect("comment-only review should emit review_commented");
+        assert_eq!(payload["comments"], comment.body);
+        assert_eq!(payload["author_branch"], "main.review-pr-1-codex");
+        assert_eq!(state.last_review_state, ForgejoReviewVerdict::Commented);
+
+        let duplicate = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            std::slice::from_ref(&comment),
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, reviews| reviews[0].body.clone(),
+            5,
+        );
+        assert!(!duplicate.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "review_commented"
+        )));
     }
 
     // ---------------------------------------------------------------------------
@@ -4900,6 +4730,18 @@ mod tests {
             prs,
             next_number: 2,
         }
+    }
+
+    fn pr_with_reviewer(
+        pr_number: u64,
+        agent_name: &str,
+        birth_branch: &str,
+    ) -> crate::services::pr_registry::PrEntry {
+        let mut pr = test_pr_entry();
+        pr.number = pr_number;
+        pr.reviewer_agent = Some(agent_name.to_string());
+        pr.reviewer_birth_branch = Some(birth_branch.to_string());
+        pr
     }
 
     fn test_observation(sha: &str) -> Observation {

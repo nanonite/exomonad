@@ -27,6 +27,11 @@ data PRReviewEvent
       { prNumber :: Int,
         comments :: Text
       }
+  | ReviewCommented
+      { prNumber :: Int,
+        rcComments :: Text,
+        rcAuthorBranch :: Maybe Text
+      }
   | ReviewApproved
       { prNumber :: Int
       }
@@ -92,6 +97,7 @@ instance FromJSON PRReviewEvent where
     kind <- v .: "kind"
     case kind of
       "review_received" -> ReviewReceived <$> v .: "pr_number" <*> v .: "comments"
+      "review_commented" -> ReviewCommented <$> v .: "pr_number" <*> v .: "comments" <*> v .:? "author_branch"
       "approved" -> ReviewApproved <$> v .: "pr_number"
       "timeout" -> ReviewTimeout <$> v .: "pr_number" <*> v .: "minutes_elapsed"
       "fixes_pushed" -> FixesPushed <$> v .: "pr_number" <*> v .: "ci_status" <*> v .: "head_sha"
@@ -111,6 +117,7 @@ instance FromJSON PRReviewEvent where
 
 instance ToJSON PRReviewEvent where
   toJSON (ReviewReceived n c) = object ["kind" .= ("review_received" :: Text), "pr_number" .= n, "comments" .= c]
+  toJSON (ReviewCommented n c branch) = object ["kind" .= ("review_commented" :: Text), "pr_number" .= n, "comments" .= c, "author_branch" .= branch]
   toJSON (ReviewApproved n) = object ["kind" .= ("approved" :: Text), "pr_number" .= n]
   toJSON (ReviewTimeout n m) = object ["kind" .= ("timeout" :: Text), "pr_number" .= n, "minutes_elapsed" .= m]
   toJSON (FixesPushed n ci sha) = object ["kind" .= ("fixes_pushed" :: Text), "pr_number" .= n, "ci_status" .= ci, "head_sha" .= sha]

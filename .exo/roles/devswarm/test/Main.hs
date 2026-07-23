@@ -76,6 +76,7 @@ main = do
   assertCIFailureBlocksAfterTrigger
   assertMergeReadyReviewNotifiesParent
   assertMergeReadyCIStatusNotifiesParent
+  assertReviewCommentedJSONAndHandler
   assertReviewerFacingTextDoesNotMentionCopilot
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
@@ -442,6 +443,21 @@ assertMergeReadyCIStatusNotifiesParent = do
       DevRole.config
       (CIStatusEvent 9 "success" "main.feature" False True True)
   assertNotifyParent "merge-ready ci_status" 9 action
+
+assertReviewCommentedJSONAndHandler :: IO ()
+assertReviewCommentedJSONAndHandler = do
+  let event = ReviewCommented 9 "Looks good, with one suggestion." (Just "main.review-pr-9-codex")
+  case Aeson.fromJSON (Aeson.toJSON event) of
+    Aeson.Success (ReviewCommented n comments_ authorBranch) -> do
+      assertEqual "comment-only review PR number" 9 n
+      assertEqual "comment-only review body" "Looks good, with one suggestion." comments_
+      assertEqual "comment-only review author branch" (Just "main.review-pr-9-codex") authorBranch
+    other -> fail $ "comment-only review JSON roundtrip failed: " <> show other
+  action <- runPRReviewEvent DevRole.config event
+  case action of
+    InjectMessage message ->
+      assertBool "comment-only review uses distinct notification" ("[REVIEW COMMENT]" `T.isInfixOf` message)
+    other -> fail $ "comment-only review should inject a message, got " <> show other
 
 runPRReviewEvent :: RoleConfig tools -> PRReviewEvent -> IO EventAction
 runPRReviewEvent cfg event =

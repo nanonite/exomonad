@@ -15,6 +15,7 @@ module ExoMonad.Guest.Events.Templates
     fixesPushed,
     commitsPushed,
     reviewReceived,
+    reviewCommented,
     siblingMerged,
     ciStatus,
     mergeReady,
@@ -73,6 +74,14 @@ reviewReceived n comments =
     <> "\n\n"
     <> comments
     <> "\n\nAddress these comments and push fixes."
+
+-- | Comment-only Forgejo review — informational feedback, not a change request.
+reviewCommented :: Int -> Text -> Text
+reviewCommented n comments =
+  "[REVIEW COMMENT] PR #"
+    <> T.pack (show n)
+    <> ":\n\n"
+    <> comments
 
 -- | A sibling branch was merged — injected into the agent's pane with rebase instructions.
 --

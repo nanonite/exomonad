@@ -380,6 +380,9 @@ reviewerPRReviewHandler (ReviewReceived n comments_) = do
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv n comments_)
   pure (InjectMessage $ "[REVIEW] PR #" <> T.pack (show n) <> " received comments:\n" <> comments_)
+reviewerPRReviewHandler (ReviewCommented n _comments_ _authorBranch) = do
+  logHandler $ "Comment-only review observed on PR #" <> T.pack (show n) <> " (watcher-owned; reviewer ignores)"
+  pure NoAction
 reviewerPRReviewHandler (ReviewApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved"
   branch <- getCurrentBranch

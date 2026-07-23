@@ -50,6 +50,9 @@ prReviewHandler (ReviewReceived n comments_) = do
   branch <- getCurrentBranch
   phase <- applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
   pure $ reviewRequestAction n comments_ phase
+prReviewHandler (ReviewCommented n comments_ _authorBranch) = do
+  logHandler $ "Comment-only review received on PR #" <> T.pack (show n)
+  pure (InjectMessage (Tpl.reviewCommented n comments_))
 prReviewHandler (ReviewApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved (reviewer agent)"
   branch <- getCurrentBranch
@@ -127,6 +130,9 @@ tlPrReviewHandler :: PRReviewEvent -> Eff Effects EventAction
 tlPrReviewHandler (ReviewReceived n comments_) = do
   logHandler $ "TL observed review comments on PR #" <> T.pack (show n)
   pure (InjectMessage (Tpl.reviewReceived n comments_))
+tlPrReviewHandler (ReviewCommented n comments_ _authorBranch) = do
+  logHandler $ "TL observed comment-only review on PR #" <> T.pack (show n)
+  pure (InjectMessage (Tpl.reviewCommented n comments_))
 tlPrReviewHandler (ReviewApproved n) = do
   logHandler $ "TL observed PR #" <> T.pack (show n) <> " approved"
   pure (InjectMessage (Tpl.prReady n))

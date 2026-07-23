@@ -22,6 +22,7 @@ impl Default for PrState {
 #[serde(rename_all = "snake_case")]
 pub enum ForgejoReviewState {
     PendingReview,
+    Commented,
     ChangesRequested,
     Approved,
 }
