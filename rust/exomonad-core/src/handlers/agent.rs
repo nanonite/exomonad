@@ -905,6 +905,14 @@ impl<
             return Err(EffectError::invalid_input("pr_number is required"));
         }
 
+        let pr = self.resolve_open_forgejo_pr_entry(req.pr_number).await?;
+        tracing::info!(
+            pr_number = req.pr_number,
+            head_branch = %pr.head_branch,
+            head_sha = ?pr.last_head_sha,
+            "Resetting same-PR review cycle"
+        );
+
         let cleaned_reviewers =
             cleanup_force_reviewer_resources(&self.service, req.pr_number).await;
         let runtime_state_found = self
@@ -1257,15 +1265,9 @@ impl<
         // is a band-aid — the real fix is making agent_name consistent between MCP config
         // and routing.json (either always include the suffix, or never).
         let candidates = std::iter::once(agent_key.clone()).chain(
-            [
-                "gemini",
-                "claude",
-                "shoal",
-                "opencode",
-                "codex",
-            ]
-            .iter()
-            .map(|suffix| format!("{}-{}", agent_key, suffix)),
+            ["gemini", "claude", "shoal", "opencode", "codex"]
+                .iter()
+                .map(|suffix| format!("{}-{}", agent_key, suffix)),
         );
 
         let mut routing = None;
@@ -1564,13 +1566,18 @@ impl<
             .get_pull_request(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
             .await
             .effect_err("agent")?;
-        if pr.merged || !pr.state.eq_ignore_ascii_case("open") {
-            return Err(EffectError::invalid_input(format!(
-                "PR #{pr_number} is not open and cannot be reviewed"
-            )));
-        }
+        ensure_open_unmerged_pr(&pr, pr_number)?;
         Ok(pr_entry_from_forgejo_pull_request(pr))
     }
+}
+
+fn ensure_open_unmerged_pr(pr: &ForgejoPullRequest, pr_number: u64) -> EffectResult<()> {
+    if pr.merged || !pr.state.eq_ignore_ascii_case("open") {
+        return Err(EffectError::invalid_input(format!(
+            "PR #{pr_number} is not open and unmerged; use replace_close_pr for a closed PR"
+        )));
+    }
+    Ok(())
 }
 
 fn pr_entry_from_forgejo_pull_request(pr: ForgejoPullRequest) -> PrEntry {
@@ -1761,6 +1768,7 @@ async fn reset_watcher_pr_state_file(project_dir: &Path, pr_number: u64) -> anyh
             entry.insert("rounds".to_string(), serde_json::json!(0));
             entry.insert("stuck".to_string(), serde_json::json!(false));
             entry.insert("needs_human_review".to_string(), serde_json::json!(false));
+            entry.remove("last_review_fingerprint");
         })
         .is_some();
 
@@ -2186,6 +2194,21 @@ fn agent_is_alive(info: &AgentInfo) -> bool {
 mod tests {
     use super::*;
 
+    fn restart_test_pr() -> ForgejoPullRequest {
+        ForgejoPullRequest {
+            number: PRNumber::new(7),
+            url: "https://forgejo.local/pr/7".to_string(),
+            title: "Test PR".to_string(),
+            body: String::new(),
+            head_ref: BranchName::try_from_str("main.feature-codex")
+                .expect("literal branch is non-empty"),
+            base_ref: BranchName::try_from_str("main").expect("literal branch is non-empty"),
+            state: "open".to_string(),
+            merged: false,
+            head_sha: Some("abc123".to_string()),
+        }
+    }
+
     fn test_handler() -> AgentHandler<crate::services::Services> {
         let services = Arc::new(crate::services::Services::test());
         let service = Arc::new(AgentControlService::new(services.clone()));
@@ -2399,7 +2422,7 @@ mod tests {
         let state_path = dir.path().join(".exo/watcher-state.json");
         std::fs::write(
             &state_path,
-            r#"{"prs":{"7":{"rounds":3,"stuck":true,"needs_human_review":true},"8":{"rounds":2,"stuck":true,"needs_human_review":true}}}"#,
+            r#"{"prs":{"7":{"rounds":3,"stuck":true,"needs_human_review":true,"last_head_sha":"abc123","last_review_fingerprint":"old"},"8":{"rounds":2,"stuck":true,"needs_human_review":true}}}"#,
         )
         .unwrap();
 
@@ -2420,7 +2443,26 @@ mod tests {
         assert_eq!(state["prs"]["7"]["rounds"], 0);
         assert_eq!(state["prs"]["7"]["stuck"], false);
         assert_eq!(state["prs"]["7"]["needs_human_review"], false);
+        assert_eq!(state["prs"]["7"]["last_head_sha"], "abc123");
+        assert!(state["prs"]["7"].get("last_review_fingerprint").is_none());
         assert_eq!(state["prs"]["8"]["rounds"], 2);
+    }
+
+    #[test]
+    fn restart_review_requires_open_unmerged_pr() {
+        let mut closed = restart_test_pr();
+        closed.state = "closed".to_string();
+        let error = ensure_open_unmerged_pr(&closed, 7).unwrap_err().to_string();
+        assert!(error.contains("not open and unmerged"));
+        assert!(error.contains("replace_close_pr"));
+
+        let mut merged = restart_test_pr();
+        merged.merged = true;
+        let error = ensure_open_unmerged_pr(&merged, 7).unwrap_err().to_string();
+        assert!(error.contains("not open and unmerged"));
+
+        let open = restart_test_pr();
+        assert!(ensure_open_unmerged_pr(&open, 7).is_ok());
     }
 
     #[test]

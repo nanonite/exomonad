@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Update restart_review for safe same-PR recovery (#540)
 - Fix Forgejo review comment visibility and fan-out routing (#534)
 - `merge_pr`'s pre-merge Forgejo readiness check still leaked the GitHub `origin` remote's owner into Forgejo API calls on multi-remote repos, even with `exomonad.remote` set — `GitService::get_repo_info` (services/git.rs) had its own remote-detection logic that always preferred `origin` and never consulted the `exomonad.remote` override, a second, independent implementation of the same lookup `#533` had already fixed in `services::repo::get_repo_info`. `GitService::get_repo_info` now delegates to that override-aware function; added a regression test
 - Codex reviewers could never submit a Forgejo verdict: `CODEX_REVIEWER_INSTRUCTIONS` told reviewers to `curl`/`fj` Forgejo directly from their own shell, while the Codex reviewer sandbox profile sets `network_access = false`. Reverted to the MCP-tool verdict path (`approve_pr`/`request_changes`/`post_review_comment`), which runs in the unsandboxed ExoMonad host process; added a regression test and a new E2E test (`tests/e2e/codex-reviewer-sandbox`)

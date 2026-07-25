@@ -40,12 +40,12 @@ instance FromJSON RestartReviewArgs where
       <$> v .: "pr_number"
 
 restartReviewDescription :: Text
-restartReviewDescription = "Reset a stuck PR review cycle: clear watcher flags, dispose reviewer resources, and let the next watcher poll spawn a fresh reviewer."
+restartReviewDescription = "With human approval, reset the review cycle for an existing open and unmerged PR. Clears watcher flags, disposes reviewer resources, and lets the next watcher poll spawn a fresh reviewer without renaming or disposing the author worktree. For a closed PR, use replace_close_pr instead."
 
 restartReviewSchema :: Aeson.Object
 restartReviewSchema =
   genericToolSchemaWith @RestartReviewArgs
-    [("pr_number", "Existing PR number whose review cycle should be restarted")]
+    [("pr_number", "Open and unmerged PR number whose review cycle should be restarted after human approval")]
 
 restartReviewCore :: RestartReviewArgs -> Eff Effects (Either Text Aeson.Value)
 restartReviewCore args
