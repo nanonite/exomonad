@@ -185,11 +185,7 @@ fn should_spawn_reviewer_for_new_head(state: &WatchState, max_rounds: u32) -> bo
 fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
     match agent_type {
         AgentType::Claude => "tl",
-        AgentType::Gemini
-        | AgentType::Shoal
-        | AgentType::OpenCode
-        | AgentType::Codex
-        | AgentType::CodexFugu => "dev",
+        AgentType::Gemini | AgentType::Shoal | AgentType::OpenCode | AgentType::Codex => "dev",
         AgentType::Process => "process",
     }
 }

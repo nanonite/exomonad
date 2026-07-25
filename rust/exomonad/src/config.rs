@@ -11,7 +11,6 @@ fn parse_agent_type_env(s: &str) -> Option<AgentType> {
         "gemini" => Some(AgentType::Gemini),
         "opencode" | "opencode-cli" => Some(AgentType::OpenCode),
         "codex" => Some(AgentType::Codex),
-        "codex-fugu" | "codexfugu" => Some(AgentType::CodexFugu),
         "shoal" => Some(AgentType::Shoal),
         _ => None,
     }
@@ -1057,16 +1056,6 @@ impl ResolvedEffort {
         source: EffortSource::Default,
     };
 
-    pub fn for_harness(self, harness: &str) -> Self {
-        if self.source == EffortSource::Default && is_fugu_harness(harness) {
-            return Self {
-                level: EffortLevel::High,
-                source: EffortSource::Default,
-            };
-        }
-        self
-    }
-
     pub fn from_cli(level: EffortLevel) -> Self {
         Self {
             level,
@@ -1092,28 +1081,6 @@ pub fn resolve_effort_setting(
         },
         (None, None, None) => ResolvedEffort::MEDIUM_DEFAULT,
     }
-}
-
-/// Validate an effort setting before starting a harness.
-pub fn validate_effort_for_harness(
-    role: &str,
-    harness: &str,
-    effort: ResolvedEffort,
-) -> Result<()> {
-    if is_fugu_harness(harness) && matches!(effort.level, EffortLevel::Low | EffortLevel::Medium) {
-        anyhow::bail!(
-            "{role} effort `{}` is unsupported by codex-fugu; omitted effort defaults to high. Set {role} to high, xhigh, or max (max is sent as xhigh)",
-            effort.level
-        );
-    }
-    Ok(())
-}
-
-fn is_fugu_harness(harness: &str) -> bool {
-    matches!(
-        harness.to_ascii_lowercase().as_str(),
-        "codex-fugu" | "codexfugu"
-    )
 }
 
 #[cfg(test)]
@@ -1163,21 +1130,6 @@ mod effort_tests {
 
         let default = resolve_effort_setting(None, None, None);
         assert_eq!(default, ResolvedEffort::MEDIUM_DEFAULT);
-    }
-
-    #[test]
-    fn fugu_default_is_high_but_explicit_medium_is_rejected() {
-        let default = ResolvedEffort::MEDIUM_DEFAULT.for_harness("codex-fugu");
-        assert_eq!(default.level, EffortLevel::High);
-        assert_eq!(default.source, EffortSource::Default);
-
-        let explicit = ResolvedEffort::from_cli(EffortLevel::Medium);
-        assert!(
-            validate_effort_for_harness("--tl-effort-level", "codex-fugu", explicit)
-                .unwrap_err()
-                .to_string()
-                .contains("--tl-effort-level")
-        );
     }
 
     #[test]

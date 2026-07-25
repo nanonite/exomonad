@@ -8,9 +8,8 @@ pub async fn run(harness: Option<String>, provider: Option<String>) -> Result<()
         Some("gemini") => run_gemini(),
         Some("claude") => run_claude(),
         Some("codex") => run_codex(),
-        Some("codex-fugu") | Some("codexfugu") => run_codex_fugu(),
         Some(other) => {
-            bail!("Unknown harness: {other}. Valid: opencode, gemini, claude, codex, codex-fugu")
+            bail!("Unknown harness: {other}. Valid: opencode, gemini, claude, codex")
         }
     }
 }
@@ -46,7 +45,9 @@ fn run_claude() -> Result<()> {
     println!("claude-sonnet-4-6");
     println!("claude-haiku-4-5-20251001");
     println!("Use shorthand (opus, sonnet, haiku) or full ID with --tl-model.");
-    println!("Note: `claude --help` exposes no model-catalog subcommand. Static list may be stale.");
+    println!(
+        "Note: `claude --help` exposes no model-catalog subcommand. Static list may be stale."
+    );
     Ok(())
 }
 
@@ -119,18 +120,6 @@ fn parse_codex_catalog(json: &[u8]) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Codex-Fugu's wrapper unconditionally forces `-p fugu`/`-p fugu-ultra`
-/// server-side; neither slug appears in `codex debug models`' catalog and
-/// there is no local profile config to inspect. No discovery path exists.
-fn run_codex_fugu() -> Result<()> {
-    println!("fugu");
-    println!("fugu-ultra");
-    println!("Effort: high, xhigh, or max (max is sent to Fugu as xhigh).");
-    println!("Use --tl-model, --worker-model, or --reviewer-model with the matching role.");
-    println!("Note: Codex-Fugu resolves models server-side via profile; no discovery path exists. Static list is provider-defined.");
-    Ok(())
-}
-
 async fn run_all(provider: Option<String>) -> Result<()> {
     println!("# opencode");
     if let Err(error) = run_opencode(provider).await {
@@ -145,9 +134,6 @@ async fn run_all(provider: Option<String>) -> Result<()> {
     println!();
     println!("# codex");
     run_codex()?;
-    println!();
-    println!("# codex-fugu");
-    run_codex_fugu()?;
     Ok(())
 }
 

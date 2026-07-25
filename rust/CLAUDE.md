@@ -125,11 +125,10 @@ nix develop .#wasm -c wasm32-wasi-cabal build --project-file=cabal.project.wasm 
 
 `exomonad init` selects root, worker, and reviewer harnesses independently with
 `--tl`, `--worker`, and `--reviewer`, or the matching config fields. Supported
-harnesses are Claude, Gemini, OpenCode, Codex, Codex-Fugu, and Shoal where the
+harnesses are Claude, Gemini, OpenCode, Codex, and Shoal where the
 selected role supports them. Effort precedence is CLI > local config > global
-config > medium default; omitted Codex-Fugu effort is high, while explicit
-low/medium is rejected before launch side effects. OpenCode uses effort as a
-model-aware `--variant`, and `--worker-model` applies to OpenCode and Codex-Fugu.
+config > medium default. OpenCode uses effort as a
+model-aware `--variant`, and `--worker-model` applies to OpenCode.
 Gemini and Shoal accept the shared setting but log that it is ignored.
 
 ### Running

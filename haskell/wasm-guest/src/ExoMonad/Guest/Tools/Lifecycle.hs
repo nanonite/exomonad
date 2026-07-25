@@ -112,7 +112,6 @@ agentTypeText value =
     Right AgentProto.AgentTypeAGENT_TYPE_SHOAL -> "shoal"
     Right AgentProto.AgentTypeAGENT_TYPE_OPENCODE -> "opencode"
     Right AgentProto.AgentTypeAGENT_TYPE_CODEX -> "codex"
-    Right AgentProto.AgentTypeAGENT_TYPE_CODEX_FUGU -> "codex-fugu"
 
 strictText :: TL.Text -> Text
 strictText = TL.toStrict

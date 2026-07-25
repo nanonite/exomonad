@@ -42,7 +42,7 @@ exomonad shutdown                 # Gracefully shut down the running server
 
 `exomonad init` creates a tmux session with:
 - **Server window**: Runs `exomonad serve` (binds .exo/server.sock)
-- **TL window**: Runs the configured root agent (Claude by default; `--tl codex` or `--tl codex-fugu` writes `.codex/config.toml`, installs the shared ExoMonad hook block in the Codex user config, and launches the selected Codex-compatible harness with `--cd` in the project root)
+- **TL window**: Runs the configured root agent (Claude by default; `--tl codex` writes `.codex/config.toml`, installs the shared ExoMonad hook block in the Codex user config, and launches Codex with `--cd` in the project root)
 - **Companion windows**: One per `[[companions]]` entry in config. Claude companions get isolated git worktrees at `.exo/companions/{name}/` with `.mcp.json`, hooks, and socket symlink. Worktrees persist across `--recreate`. Process companions (`agent_type = "process"`) run a plain command — no MCP, no worktree, no agent identity.
 
 `exomonad init` requires `exomonad new` to have been run first to bootstrap the project configuration and WASM plugins.
@@ -67,7 +67,7 @@ shell_command = "nix develop"  # environment wrapper for TL tab + server
 wasm_dir = ".exo/wasm"        # project-local default
 wasm_name = "devswarm"        # auto-detected from .exo/roles/ if exactly one exists
 model = "sonnet"              # optional — --model flag for root TL agent
-root_agent_type = "claude"    # claude | gemini | opencode | codex | codex-fugu
+root_agent_type = "claude"    # claude | gemini | opencode | codex
 spawn_agent_type = "gemini"   # worker/leaf/companion harness
 tl_effort_level = "medium"    # CLI overrides config; Fugu omitted => high
 worker_effort_level = "medium"
@@ -80,9 +80,7 @@ effort_level = "medium"
 **Role-specific effort:** `--tl-effort-level`, `--worker-effort-level`, and
 `--reviewer-effort-level` override their matching config values. Resolution is CLI >
 local config > global config > medium default. OpenCode receives effort as a
-model-aware `--variant`; Gemini and Shoal log that effort is ignored. Codex-Fugu
-accepts `fugu`/`fugu-ultra`, defaults omitted effort to high, and rejects explicit
-low/medium before launch side effects.
+model-aware `--variant`; Gemini and Shoal log that effort is ignored.
 
 **Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults) and `.gitignore` entries if missing.
 

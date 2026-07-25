@@ -219,7 +219,7 @@ shell_command = "nix develop" # environment wrapper for TL tab + server
 wasm_dir = ".exo/wasm"       # project-local (default), override for shared installs
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
 model = "sonnet"             # optional — passed as --model flag to root TL agent
-root_agent_type = "claude"   # claude | gemini | opencode | codex | codex-fugu
+root_agent_type = "claude"   # claude | gemini | opencode | codex
 spawn_agent_type = "gemini"  # harness for workers, leaves, and companions
 # CLI flags override these values. Omitted effort is medium, except Fugu (high).
 tl_effort_level = "medium"
@@ -240,7 +240,7 @@ use_embedded_key = true  # true = use embedded key in opencode binary, false = u
 # tl_model/worker_model accept OpenCode model IDs; effort is sent as --variant.
 
 [reviewer]
-agent_type = "claude"     # claude | gemini | opencode | codex | codex-fugu | shoal
+agent_type = "claude"     # claude | gemini | opencode | codex | shoal
 effort_level = "medium"  # reviewer-only override
 
 [extra_mcp_servers.notebooklm]
@@ -251,7 +251,7 @@ args = []
 # Companion agents spawned alongside the root TL during init.
 [[companions]]
 name = "sleeptime"
-agent_type = "claude"          # claude | gemini | opencode | codex | codex-fugu | shoal | process
+agent_type = "claude"          # claude | gemini | opencode | codex | shoal | process
 role = "sleeptime"             # WASM role for MCP tools (default: "worker")
 command = "claude --dangerously-skip-permissions"
 task = "You are sleeptime"     # optional — omit for interactive session
@@ -263,10 +263,6 @@ root, worker/companion, and reviewer harnesses independently. Effort precedence 
 CLI flag > local config > global config > medium default. Worker effort is inherited
 by forked TLs, leaves, ephemeral workers, and companions. OpenCode receives the
 resolved level as its model `--variant`; Gemini and Shoal log that effort is ignored.
-Codex-Fugu uses `codex-fugu`, accepts only `fugu`/`fugu-ultra`, and permits high, xhigh,
-or max (max is launched as xhigh). Omitted Fugu effort defaults to high; explicit
-low/medium fails before session, worktree, or pane side effects. Install `codex-fugu`
-on PATH before selecting it.
 
 **Multiple git remotes:** By default, PR/CI operations (`file_pr`, `merge_pr`, the
 Forgejo watcher, and pushes) auto-detect the git remote to use, preferring one
@@ -339,12 +335,12 @@ What you can do with exomonad right now, end-to-end.
 
 Spawn heterogeneous agent teams as a recursive tree:
 
-- **`fork_wave`** — Fork N parallel agents (Claude, Codex, OpenCode, or Codex-Fugu), each in its own worktree. Agent type defaults to server config; set `agent_type` explicitly to override. Claude agents inherit context via `--fork-session`; Codex and OpenCode agents require context injected via the task spec (no team messaging support). Requires clean git state (committed and pushed).
+- **`fork_wave`** — Fork N parallel agents (Claude, Codex, or OpenCode), each in its own worktree. Agent type defaults to server config; set `agent_type` explicitly to override. Claude agents inherit context via `--fork-session`; Codex and OpenCode agents require context injected via the task spec (no team messaging support). Requires clean git state (committed and pushed).
 - **`spawn_leaf`** — Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields (steps, verify, boundary, context, read_first).
 - **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
 - **`spawn_codex`** — Spawn a Codex leaf agent in its own worktree+branch. Files PR when done.
 
-**Agent Types:** `Claude` (🤖), `Gemini` (💎), `OpenCode` (💻), `Codex` (🤖), `Codex-Fugu` (🐡), `Shoal` (🌊). Codex agents use per-agent `.codex/config.toml` for MCP/instructions and a shared ExoMonad-managed hook block in the Codex user config for shell-native hooks. Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
+**Agent Types:** `Claude` (🤖), `Gemini` (💎), `OpenCode` (💻), `Codex` (🤖), `Shoal` (🌊). Codex agents use per-agent `.codex/config.toml` for MCP/instructions and a shared ExoMonad-managed hook block in the Codex user config for shell-native hooks. Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
 
 **Multi-WASM:** The server loads multiple WASM modules from `.exo/wasm/`. Convention: if `wasm-guest-{role}.wasm` exists, it's used for that role; otherwise falls back to `wasm-guest-{wasm_name}.wasm` (default). Drop a WASM file, it's available.
 
@@ -395,7 +391,7 @@ Teams inbox registration and delivery are Claude Code-only. OpenCode, Codex, Gem
 | **Tempo observability** | **Built.** Grafana Tempo for lightweight trace storage (~100-200MB RAM). Agents query traces via `curl` + TraceQL against Tempo's HTTP API (port 3200). Optional Grafana UI at `http://localhost:3000`. |
 | **NotebookLM MCP** (optional) | **Vendored.** `vendor/notebooklm-mcp/` — stdio MCP server that automates Google NotebookLM via browser automation. Source-grounded, citation-backed answers from uploaded documentation. Opt-in via `extra_mcp_servers` in `config.toml`. |
 | **OpenCode hooks** (TypeScript plugin bridge) | **Built.** OpenCode agents get `tool.execute.before` / `tool.execute.after` / `event` hooks via a Bun TypeScript plugin written to `.exo/opencode-plugin/` at spawn time. The plugin shells out to `exomonad hook <event> --runtime opencode`, routing to the same WASM dispatch path as Claude Code and Gemini hooks. Enables role-based tool filtering and MCP call context steering (e.g. enforcing `file_pr` body format, `notify_parent` vocabulary). See `docs/decisions/opencode-hooks.md`. |
-| **Codex hooks and config** | **Built.** Codex and Codex-Fugu agents share `.codex/config.toml`, the ExoMonad MCP server, developer instructions, optional model, extra MCP servers, shell hooks, and lifecycle dispatch. ExoMonad installs shared Codex hook commands for `PreToolUse`, `PostToolUse`, and `Stop` into the active Codex user config so spawned worktrees do not create new hook trust prompts. Hook commands call `exomonad hook <event> --runtime codex` and use the same WASM dispatch path as the other runtimes. See `docs/decisions/codex-integration.md` and `docs/decisions/codex-hook-wire-format.md`. |
+| **Codex hooks and config** | **Built.** Codex agents share `.codex/config.toml`, the ExoMonad MCP server, developer instructions, optional model, extra MCP servers, shell hooks, and lifecycle dispatch. ExoMonad installs shared Codex hook commands for `PreToolUse`, `PostToolUse`, and `Stop` into the active Codex user config so spawned worktrees do not create new hook trust prompts. Hook commands call `exomonad hook <event> --runtime codex` and use the same WASM dispatch path as the other runtimes. See `docs/decisions/codex-integration.md` and `docs/decisions/codex-hook-wire-format.md`. |
 
 ### Tempo Observability
 
@@ -514,7 +510,7 @@ All tools implemented in Haskell WASM (`haskell/wasm-guest/src/ExoMonad/Guest/To
 
 | Tool | Role | Description |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel agents, each in its own worktree. Agent type defaults to server config; supported explicit runtimes include Claude, OpenCode, Codex, and Codex-Fugu. Context inheritance is runtime-specific. |
+| `fork_wave` | root, tl | Fork N parallel agents, each in its own worktree. Agent type defaults to server config; supported explicit runtimes include Claude, OpenCode, and Codex. Context inheritance is runtime-specific. |
 | `spawn_leaf` | root, tl | Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields: steps, verify, boundary, context, read_first. |
 | `spawn_opencode` | root, tl | Spawn OpenCode agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
 | `spawn_codex` | root, tl | Spawn Codex agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
@@ -697,7 +693,7 @@ The recursive execution pattern. Every TL at every level follows this protocol:
    - Commit and push. Children fork from this commit.
 
 2. **Fork** — Spawn wave N children. Zero deps between siblings in the same wave.
-   - Sub-TLs: `fork_wave` (Claude, Codex, OpenCode, or Codex-Fugu — agent type from config or explicit `agent_type`). Claude agents inherit context via `--fork-session`; Codex and OpenCode require context injected in the task spec.
+   - Sub-TLs: `fork_wave` (Claude, Codex, or OpenCode — agent type from config or explicit `agent_type`). Claude agents inherit context via `--fork-session`; Codex and OpenCode require context injected in the task spec.
    - Devs: `spawn_leaf` (worktree+PR, agent type from config) — they get CLAUDE.md from scaffolding
    - Workers: `spawn_worker` (ephemeral pane) — research or non-conflicting edits
 

@@ -62,7 +62,7 @@ import Proto3.Suite.Types (Enumerated (..))
 -- ============================================================================
 
 -- | Agent type for spawned agents.
-data AgentType = Claude | Gemini | Shoal | OpenCode | Codex | CodexFugu
+data AgentType = Claude | Gemini | Shoal | OpenCode | Codex
   deriving (Show, Eq, Generic)
 
 instance ToJSON AgentType where
@@ -71,7 +71,6 @@ instance ToJSON AgentType where
   toJSON Shoal = "shoal"
   toJSON OpenCode = "opencode"
   toJSON Codex = "codex"
-  toJSON CodexFugu = "codex-fugu"
 
 instance FromJSON AgentType where
   parseJSON = withText "AgentType" $ \case
@@ -80,14 +79,13 @@ instance FromJSON AgentType where
     "shoal" -> pure Shoal
     "opencode" -> pure OpenCode
     "codex" -> pure Codex
-    "codex-fugu" -> pure CodexFugu
     other -> fail $ "Invalid agent type: " <> T.unpack other
 
 instance JsonSchema AgentType where
   toSchema =
     object
       [ "type" .= ("string" :: Text),
-        "enum" .= (["claude", "gemini", "shoal", "opencode", "codex", "codex-fugu"] :: [Text])
+        "enum" .= (["claude", "gemini", "shoal", "opencode", "codex"] :: [Text])
       ]
 
 -- | Result of spawning an agent.
@@ -276,7 +274,6 @@ toProtoAgentType Gemini = PA.AgentTypeAGENT_TYPE_GEMINI
 toProtoAgentType Shoal = PA.AgentTypeAGENT_TYPE_SHOAL
 toProtoAgentType OpenCode = PA.AgentTypeAGENT_TYPE_OPENCODE
 toProtoAgentType Codex = PA.AgentTypeAGENT_TYPE_CODEX
-toProtoAgentType CodexFugu = PA.AgentTypeAGENT_TYPE_CODEX_FUGU
 
 agentTypeLabel :: AgentType -> Text
 agentTypeLabel Claude = "claude"
@@ -284,7 +281,6 @@ agentTypeLabel Gemini = "gemini"
 agentTypeLabel Shoal = "shoal"
 agentTypeLabel OpenCode = "opencode"
 agentTypeLabel Codex = "codex"
-agentTypeLabel CodexFugu = "codex-fugu"
 
 permissionsToProto :: ClaudePermissions -> PA.Permissions
 permissionsToProto perms =
@@ -306,7 +302,6 @@ protoAgentInfoToSpawnResult info =
         Enumerated (Right PA.AgentTypeAGENT_TYPE_SHOAL) -> "shoal"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_OPENCODE) -> "opencode"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_CODEX) -> "codex"
-        Enumerated (Right PA.AgentTypeAGENT_TYPE_CODEX_FUGU) -> "codex-fugu"
         _ -> "unknown",
       paneId =
         let value = toText (PA.agentInfoPaneId info)

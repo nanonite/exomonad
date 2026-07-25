@@ -1786,7 +1786,6 @@ mod proptest_tests {
             Just(crate::services::agent_control::AgentType::Claude),
             Just(crate::services::agent_control::AgentType::Gemini),
             Just(crate::services::agent_control::AgentType::Shoal),
-            Just(crate::services::agent_control::AgentType::CodexFugu),
         ]
     }
 }

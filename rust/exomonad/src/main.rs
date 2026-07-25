@@ -76,7 +76,7 @@ enum Commands {
         /// Enable OpenRouter for LLM routing
         #[arg(long)]
         openrouter: bool,
-        /// Set root agent type (valid: claude|gemini|opencode|codex|codex-fugu|shoal;
+        /// Set root agent type (valid: claude|gemini|opencode|codex|shoal;
         /// overrides --opencode-as-tl and the configured root_agent_type)
         #[arg(long)]
         tl: Option<String>,
@@ -90,13 +90,11 @@ enum Commands {
         /// With other TL agents, stores the root agent model.
         #[arg(long)]
         tl_model: Option<String>,
-        /// Model for spawned workers with --worker=opencode or --worker=codex-fugu.
-        /// Fugu accepts `fugu` or `fugu-ultra`; otherwise the harness picks its default.
+        /// Model for spawned workers with --worker=opencode.
         #[arg(long)]
         worker_model: Option<String>,
         /// Effort for the root TL: low, medium, high, xhigh, or max. CLI effort
-        /// flags override config.toml; omitted effort defaults to medium, except
-        /// Codex-Fugu, which defaults to high and rejects explicit low/medium.
+        /// flags override config.toml; omitted effort defaults to medium.
         #[arg(long, value_enum)]
         tl_effort_level: Option<config::EffortLevel>,
         /// Effort inherited by forked TLs, leaves, ephemeral workers, and companions.
@@ -104,10 +102,10 @@ enum Commands {
         #[arg(long, value_enum)]
         worker_effort_level: Option<config::EffortLevel>,
         /// Effort for automatically spawned reviewers: low, medium, high, xhigh, or max.
-        /// CLI effort flags override config.toml; Codex-Fugu reviewers require high+.
+        /// CLI effort flags override config.toml.
         #[arg(long, value_enum)]
         reviewer_effort_level: Option<config::EffortLevel>,
-        /// Set reviewer agent type (valid: claude|gemini|opencode|codex|codex-fugu|shoal).
+        /// Set reviewer agent type (valid: claude|gemini|opencode|codex|shoal).
         /// Overrides [reviewer] in config.toml.
         #[arg(long)]
         reviewer: Option<String>,
@@ -187,8 +185,7 @@ enum Commands {
 
     /// List available models per agent harness.
     Models {
-        /// Harness: opencode, gemini, claude, codex, or codex-fugu. Omit for all.
-        /// Codex-Fugu lists `fugu` and `fugu-ultra`; effort is high, xhigh, or max.
+        /// Harness: opencode, gemini, claude, or codex. Omit for all.
         #[arg(value_name = "HARNESS")]
         harness: Option<String>,
         /// Provider filter (opencode only). E.g. "anthropic", "openai".

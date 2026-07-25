@@ -452,17 +452,17 @@ You are a Codex reviewer agent in an ExoMonad agent tree. You review a sibling a
 ## Your Job
 Review the PR assigned in your task prompt. Approve correct changes or request specific fixes. Do not implement the fix yourself.
 
-## Direct Forgejo API Review
-Submit the final verdict with curl against Forgejo, not through MCP review tools. This keeps reviews working even if the reviewer worktree has no local .exo/server.sock.
-
-Required environment: FORGEJO_URL plus FORGEJO_REVIEWER_TOKEN, falling back to FORGEJO_TOKEN only if the reviewer token is unavailable. The task prompt gives the PR number and repo slug.
+## MCP Tools Available
+- approve_pr: Submit an approved Forgejo PR review.
+- request_changes: Submit a request-changes Forgejo PR review.
+- post_review_comment: Submit a comment-only Forgejo PR review.
 
 ## Workflow
 1. Read the task prompt for the PR number, PR branch, base branch, and author.
-2. Read the PR diff through Forgejo API: GET /api/v1/repos/{owner}/{repo}/pulls/{pr}/files. Use raw file API endpoints for changed file content.
+2. Run `git diff {base_branch}..HEAD` using the base branch from the prompt.
 3. Review for correctness, edge cases, security issues, missing tests, and broken contracts.
-4. If issues are found, POST a REQUEST_CHANGES review directly to /api/v1/repos/{owner}/{repo}/pulls/{pr}/reviews.
-5. If the code is correct, POST an APPROVED review directly to the same endpoint with a concise approving comment.
+4. If issues are found, call request_changes with specific, actionable feedback that references files and functions or lines.
+5. If the code is correct, call approve_pr with a concise approving comment.
 6. Exit after submitting. The ExoMonad watcher reads Forgejo reviews and routes the result to the dev and TL automatically.
 
 ## Key Rules
@@ -471,7 +471,7 @@ Required environment: FORGEJO_URL plus FORGEJO_REVIEWER_TOKEN, falling back to F
 - Never spawn agents; reviewer is a leaf role.
 - Never review your own PR. If the PR author is you, stop without submitting a verdict; stuck escalation handles reviewers that cannot proceed.
 - Do not use `codex exec review`; it emits Codex-native review text and does not submit Forgejo reviews.
-- Do not call approve_pr, request_changes, or post_review_comment for your final verdict; use direct Forgejo API curl.
+- This reviewer sandbox has no network access, so approve_pr/request_changes/post_review_comment (which run in the unsandboxed ExoMonad host process) are the only way to reach Forgejo — do not attempt a raw HTTP request from this session's own shell.
 - Prefer 3-5 high-impact comments over exhaustive style feedback.
 ";
 
@@ -482,64 +482,6 @@ Required environment: FORGEJO_URL plus FORGEJO_REVIEWER_TOKEN, falling back to F
 /// not the project root, and the context files live outside the worktree's tracked
 /// tree). Absolute paths pass through unchanged. Empty `reviewer_context` returns
 /// "" — no "Read first:" header emitted in that case (production default).
-pub(crate) fn render_reviewer_direct_api_section(
-    pr_number: u64,
-    repo_owner: Option<&str>,
-    repo_name: Option<&str>,
-) -> String {
-    let repo_exports = match (repo_owner, repo_name) {
-        (Some(owner), Some(repo)) => format!(
-            "FORGEJO_OWNER={}\nFORGEJO_REPO={}\n",
-            shell_escape::escape(owner.into()),
-            shell_escape::escape(repo.into())
-        ),
-        _ => "# Set FORGEJO_OWNER and FORGEJO_REPO before running these commands.\n".to_string(),
-    };
-
-    format!(
-        r#"
-
-Direct Forgejo review path:
-Use this path for the final verdict. Do not depend on local review files, approve_pr, request_changes, post_review_comment, or an ExoMonad socket.
-
-Prefer `fj` (Forgejo CLI, Rust binary) when available — fall back to `curl` if not.
-
-```bash
-PR_NUMBER={pr_number}
-{repo_exports}REVIEW_TOKEN="${{FORGEJO_REVIEWER_TOKEN:-$FORGEJO_TOKEN}}"
-test -n "$FORGEJO_URL" && test -n "$REVIEW_TOKEN" && test -n "$FORGEJO_OWNER" && test -n "$FORGEJO_REPO"
-
-# --- fj CLI (preferred) ---
-# Inspect PR diff and metadata.
-fj pr view $PR_NUMBER
-# List changed files.
-fj pr files $PR_NUMBER
-# Submit verdict (replace --approve with --request-changes when blocking issues exist).
-fj pr review $PR_NUMBER --approve -c "LGTM. Verified: <what you checked>."
-# fj pr review $PR_NUMBER --request-changes -c "<blocking findings>"
-
-# --- curl fallback (if fj is unavailable) ---
-# PR metadata, including head SHA.
-curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
-  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER"
-
-# Changed files.
-curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
-  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/files"
-
-# Changed file content once HEAD_SHA and FILE_PATH are known.
-curl -fsS -H "Authorization: token $REVIEW_TOKEN" \
-  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/raw/$HEAD_SHA/$FILE_PATH"
-
-# Final verdict via curl.
-curl -fsS -X POST -H "Authorization: token $REVIEW_TOKEN" -H "Content-Type: application/json" \
-  --data '{{"event":"APPROVED","body":"LGTM. Verified: <what you checked>."}}' \
-  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/reviews"
-```
-"#
-    )
-}
-
 pub(crate) fn render_reviewer_context_section(
     reviewer_context: &[String],
     project_dir: &std::path::Path,
@@ -651,7 +593,7 @@ impl<
                 AgentType::Gemini => crate::domain::Role::dev(),
                 AgentType::Shoal => crate::domain::Role::shoal(),
                 AgentType::OpenCode => crate::domain::Role::dev(),
-                AgentType::Codex | AgentType::CodexFugu => crate::domain::Role::dev(),
+                AgentType::Codex => crate::domain::Role::dev(),
                 AgentType::Process => unreachable!("Process agents are not spawned via effects"),
             };
             self.write_agent_mcp_config(
@@ -1252,7 +1194,7 @@ impl<
                     Self::write_opencode_git_stub(&agent_config_dir, self.project_dir()).await?;
                     info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json and plugin to agent config dir");
                 }
-                AgentType::Codex | AgentType::CodexFugu => {
+                AgentType::Codex => {
                     self.write_codex_config_files(
                         &agent_config_dir,
                         &role,
@@ -1270,7 +1212,7 @@ impl<
             // receive the worker role/name instead of inheriting the caller's
             // project config.
             let worker_cwd = match agent_type {
-                AgentType::OpenCode | AgentType::Codex | AgentType::CodexFugu => agent_config_dir.clone(),
+                AgentType::OpenCode | AgentType::Codex => agent_config_dir.clone(),
                 _ => absolute_worktree.clone(),
             };
 
@@ -1442,7 +1384,7 @@ impl<
                             Err(e) => warn!(role = %role, error = %e, "Failed to copy OpenCode role context (non-fatal)"),
                         }
                     }
-                    AgentType::Codex | AgentType::CodexFugu => {
+                    AgentType::Codex => {
                         let dest_dir = worktree_path.join(".codex");
                         let _ = fs::create_dir_all(&dest_dir).await;
                         let dest = dest_dir.join("exomonad_role.md");
@@ -1573,7 +1515,7 @@ impl<
                     })?;
                     RoutingInfo::window(window_id)
                 }
-                AgentType::Codex | AgentType::CodexFugu => {
+                AgentType::Codex => {
                     let fork_id = options.parent_session_id.as_ref().map(|id| id.as_str());
                     let window_id = self.new_tmux_window_inner(
                         &display_name,
@@ -1961,32 +1903,14 @@ impl<
     ) -> Result<SpawnResult> {
         let context_section =
             render_reviewer_context_section(&self.reviewer_context, self.project_dir());
-        let repo_info = match crate::services::repo::get_repo_info(self.project_dir()).await {
-            Ok(info) => Some(info),
-            Err(err) => {
-                warn!(error = %err, "Failed to resolve repo slug for reviewer direct API prompt");
-                None
-            }
-        };
-        let direct_api_section = render_reviewer_direct_api_section(
-            pr_entry.number,
-            repo_info.as_ref().map(|info| info.owner.as_str()),
-            repo_info.as_ref().map(|info| info.repo.as_str()),
-        );
-        let repo_slug = repo_info
-            .as_ref()
-            .map(|info| format!("{}/{}", info.owner, info.repo))
-            .unwrap_or_else(|| "unknown".to_string());
         let task = format!(
-            "Review PR #{}: {}\n\nRepo: {}\nBranch: {}\nBase: {}\nAuthor: {}{}{}",
+            "Review PR #{}: {}\n\nBranch: {}\nBase: {}\nAuthor: {}{}",
             pr_entry.number,
             pr_entry.title,
-            repo_slug,
             pr_entry.head_branch,
             pr_entry.base_branch,
             pr_entry.author_agent,
             context_section,
-            direct_api_section,
         );
 
         // Compute the reviewer's own identity and path — same derivation spawn_subtree uses
@@ -2389,18 +2313,31 @@ mod tests {
         }
     }
 
+    /// Regression test for a reviewer sandbox/instructions mismatch: `codex_config.rs`
+    /// hardcodes `network_access = false` for the Codex reviewer profile, so any
+    /// developer instructions that tell the reviewer to hit Forgejo over the network
+    /// from its own shell (curl, fj, wget) can never actually run. The verdict must
+    /// route through the MCP tools instead, which execute in the unsandboxed
+    /// ExoMonad host process. See docs/decisions/agent-sandbox-profiles.md.
     #[test]
-    fn test_render_reviewer_direct_api_section_includes_repo_and_review_endpoint() {
-        let section = render_reviewer_direct_api_section(17, Some("owner"), Some("repo"));
-        assert!(section.contains("PR_NUMBER=17"));
-        assert!(section.contains("FORGEJO_OWNER=owner"));
-        assert!(section.contains("FORGEJO_REPO=repo"));
+    fn test_codex_reviewer_instructions_do_not_require_sandboxed_network_access() {
+        let lower = CODEX_REVIEWER_INSTRUCTIONS.to_lowercase();
+        // Checks for actual shell invocations, not just the word "curl"/"fj" — the
+        // instructions are allowed to mention them by name when explaining why the
+        // reviewer must NOT invoke them directly (network_access = false).
         assert!(
-            section.contains("/api/v1/repos/$FORGEJO_OWNER/$FORGEJO_REPO/pulls/$PR_NUMBER/files")
+            !lower.contains("curl -") && !lower.contains("curl http"),
+            "reviewer instructions must not tell the sandboxed shell to curl Forgejo directly: {CODEX_REVIEWER_INSTRUCTIONS}"
         );
-        assert!(section.contains("/pulls/$PR_NUMBER/reviews"));
-        assert!(section.contains("FORGEJO_REVIEWER_TOKEN"));
-        assert!(section.contains("Do not depend on local review files"));
+        assert!(
+            !lower.contains("fj pr review") && !lower.contains("fj pr view") && !lower.contains("fj pr files"),
+            "reviewer instructions must not tell the sandboxed shell to run fj against Forgejo: {CODEX_REVIEWER_INSTRUCTIONS}"
+        );
+        assert!(
+            CODEX_REVIEWER_INSTRUCTIONS.contains("approve_pr")
+                && CODEX_REVIEWER_INSTRUCTIONS.contains("request_changes"),
+            "reviewer instructions must submit verdicts through the approve_pr/request_changes MCP tools"
+        );
     }
 
     #[test]

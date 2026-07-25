@@ -47,7 +47,7 @@ listAgentsDescription = "List known ExoMonad agents with type, birth branch, unr
 listAgentsSchema :: Aeson.Object
 listAgentsSchema =
   genericToolSchemaWith @ListAgentsArgs
-    [("filter_type", "Optional agent type filter, such as claude, gemini, opencode, codex, codex-fugu, or shoal.")]
+    [("filter_type", "Optional agent type filter, such as claude, gemini, opencode, codex, or shoal.")]
 
 listAgentsCore :: ListAgentsArgs -> Eff Effects (Either Text Value)
 listAgentsCore args = do
@@ -91,7 +91,6 @@ agentTypeText value =
     Right AgentProto.AgentTypeAGENT_TYPE_SHOAL -> "shoal"
     Right AgentProto.AgentTypeAGENT_TYPE_OPENCODE -> "opencode"
     Right AgentProto.AgentTypeAGENT_TYPE_CODEX -> "codex"
-    Right AgentProto.AgentTypeAGENT_TYPE_CODEX_FUGU -> "codex-fugu"
 
 strictText :: TL.Text -> Text
 strictText = TL.toStrict

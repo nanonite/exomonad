@@ -373,9 +373,8 @@ fn convert_agent_type(t: AgentType) -> EffectResult<ServiceAgentType> {
         AgentType::Shoal => Ok(ServiceAgentType::Shoal),
         AgentType::Opencode => Ok(ServiceAgentType::OpenCode),
         AgentType::Codex => Ok(ServiceAgentType::Codex),
-        AgentType::CodexFugu => Ok(ServiceAgentType::CodexFugu),
         AgentType::Unspecified => Err(EffectError::invalid_input(
-            "agent_type is required (must be 'claude', 'gemini', 'shoal', 'opencode', 'codex', or 'codex-fugu', got UNSPECIFIED)",
+            "agent_type is required (must be 'claude', 'gemini', 'shoal', 'opencode', or 'codex', got UNSPECIFIED)",
         )),
     }
 }
@@ -394,7 +393,6 @@ fn proto_agent_type_label(t: AgentType) -> &'static str {
         AgentType::Shoal => "shoal",
         AgentType::Opencode => "opencode",
         AgentType::Codex => "codex",
-        AgentType::CodexFugu => "codex-fugu",
         AgentType::Unspecified => "unspecified",
     }
 }
@@ -1265,7 +1263,6 @@ impl<
                 "shoal",
                 "opencode",
                 "codex",
-                "codex-fugu",
             ]
             .iter()
             .map(|suffix| format!("{}-{}", agent_key, suffix)),
@@ -2115,7 +2112,6 @@ fn service_agent_type_to_proto(at: ServiceAgentType) -> i32 {
         ServiceAgentType::Shoal => AgentType::Shoal as i32,
         ServiceAgentType::OpenCode => AgentType::Opencode as i32,
         ServiceAgentType::Codex => AgentType::Codex as i32,
-        ServiceAgentType::CodexFugu => AgentType::CodexFugu as i32,
         ServiceAgentType::Process => AgentType::Unspecified as i32,
     }
 }
@@ -2137,7 +2133,6 @@ fn service_info_to_proto(
         Some(ServiceAgentType::Shoal) => AgentType::Shoal as i32,
         Some(ServiceAgentType::OpenCode) => AgentType::Opencode as i32,
         Some(ServiceAgentType::Codex) => AgentType::Codex as i32,
-        Some(ServiceAgentType::CodexFugu) => AgentType::CodexFugu as i32,
         Some(ServiceAgentType::Process) => AgentType::Unspecified as i32,
         None => AgentType::Unspecified as i32,
     };
@@ -2216,10 +2211,6 @@ mod tests {
         assert_eq!(
             convert_agent_type(AgentType::Codex).unwrap(),
             ServiceAgentType::Codex
-        );
-        assert_eq!(
-            convert_agent_type(AgentType::CodexFugu).unwrap(),
-            ServiceAgentType::CodexFugu
         );
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
     }

@@ -50,21 +50,19 @@ The user config update is protected by a sidecar flock in `CODEX_HOME` and writt
 
 These shell hooks forward Codex events to the existing ExoMonad server over the Unix-domain socket. The server normalizes Codex hook stdin into ExoMonad's internal `HookInput`, calls the Haskell WASM hook handler, then formats the result back into Codex hook stdout semantics.
 
-## Codex-Fugu
+## Codex-Fugu (removed)
 
-Codex-Fugu is a distinct `AgentType::CodexFugu` with wire name `codex-fugu`,
-executable `codex-fugu`, and worktree suffix `-codex-fugu`. Its supported models
-are `fugu` and `fugu-ultra`. It intentionally reuses the Codex runtime contract:
-`.codex/config.toml`, ExoMonad MCP, `HookRuntime::Codex` shell hooks, MCP servers,
-sandbox policy, delivery, lifecycle, and reviewer submission.
-
-Fugu effort accepts `high`, `xhigh`, or `max`; `max` is normalized to `xhigh` in
-the command/config sent to the provider. When no role-specific effort is set,
-Fugu defaults to `high`; an explicit `low` or `medium` is rejected before tmux,
-worktree, pane, or companion side effects. Init performs a `codex-fugu --version`
-PATH preflight and reports the install requirement before creating runtime state.
-The Fugu path does not mutate a separate user profile; it uses the existing Codex
-trust/config mechanism.
+Codex-Fugu was briefly supported as a distinct `AgentType::CodexFugu`, reusing
+the Codex runtime contract described above. It was removed after diagnosis
+showed Sakana's Fugu models declare an empty `experimental_supported_tools`
+list in the model catalog Codex queries live from `https://api.sakana.ai` —
+Codex's own capability gate refuses to dispatch MCP tool calls to a model with
+no declared tool support. Since every ExoMonad role depends on at least
+`notify_parent` to report completion, this made Codex-Fugu unusable as an
+ExoMonad harness in any role, not a partial degradation. The constraint is
+upstream (Sakana's API response), not something ExoMonad's Codex integration
+controls; re-adding Codex-Fugu support would require Sakana to populate that
+field.
 
 ## Why Shell Hooks Instead Of A Plugin
 
@@ -108,7 +106,7 @@ Codex reviewers run as ordinary ExoMonad reviewer agents in tmux with `role=revi
 codex exec --dangerously-bypass-approvals-and-sandbox --cd <worktree_dir> "$(cat <prompt_file>)"
 ```
 
-Do not use `codex exec review` for ExoMonad reviewer agents. That subcommand emits Codex-native review output, but it does not submit ExoMonad Forgejo reviews. Codex reviewers submit final verdicts directly to the Forgejo reviews API with `curl`, using `FORGEJO_URL` and `FORGEJO_REVIEWER_TOKEN`/`FORGEJO_TOKEN`; this avoids any dependency on local `.exo/server.sock` or MCP review tools.
+Do not use `codex exec review` for ExoMonad reviewer agents. That subcommand emits Codex-native review output, but it does not submit ExoMonad Forgejo reviews. Codex reviewers submit final verdicts through the `approve_pr`/`request_changes`/`post_review_comment` MCP tools, the same as every other runtime. This is required, not just preferred: the Codex reviewer sandbox profile sets `network_access = false` (see `docs/decisions/agent-sandbox-profiles.md`), so a reviewer cannot reach Forgejo directly via `curl`/`fj` from its own shell — the MCP tools run in the unsandboxed ExoMonad host process and are the only path with real network access. A prior revision of this doc had reviewers submit verdicts via direct `curl` calls to work around the reviewer worktree allegedly lacking `.exo/server.sock`; that socket is unconditionally symlinked into every spawned worktree (`create_socket_symlink`) and preflighted before the reviewer starts, so the concern did not apply, and the `curl` path was silently broken by the sandbox's `network_access = false` the whole time.
 
 The reviewer identity discipline still applies: reviewer agents use distinct git identities and never review under the identity that authored the PR.
 

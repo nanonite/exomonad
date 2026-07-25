@@ -60,16 +60,14 @@ fn test_init_help_describes_agent_type_flags() -> Result<(), Box<dyn std::error:
     let help = String::from_utf8(output)?;
 
     assert_eq!(
-        help.matches("valid: claude|gemini|opencode|codex|codex-fugu|shoal")
+        help.matches("valid: claude|gemini|opencode|codex|shoal")
             .count(),
         2
     );
     assert!(help.contains("With --tl=opencode, stores [opencode].tl_model"));
     assert!(help.contains("With other TL agents, stores the root agent model"));
     assert!(help.contains("CLI effort flags override config.toml"));
-    assert!(help.contains("Codex-Fugu, which defaults to high"));
     assert!(help.contains("forked TLs, leaves, ephemeral workers, and companions"));
-    assert!(help.contains("fugu` or `fugu-ultra"));
 
     Ok(())
 }

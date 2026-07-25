@@ -12,7 +12,7 @@ Use exomonad MCP tools for orchestration. Git operations use `git` CLI. **Never 
 
 | Tool | Role | What it does |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel agents (Claude, Codex, OpenCode, or Codex-Fugu; own worktrees, context inheritance is runtime-specific) |
+| `fork_wave` | root, tl | Fork N parallel agents (Claude, Codex, or OpenCode; own worktrees, context inheritance is runtime-specific) |
 | `spawn_leaf` | root, tl | Spawn a leaf agent in its own worktree+branch (files PR when done). Agent type defaults to server config; pass `agent_type` only when this leaf needs a specific supported runtime. |
 | `spawn_worker` | root, tl | Spawn an ephemeral worker in a tmux pane (no branch, no PR). Agent type defaults to server config; pass `agent_type` only when this worker needs a specific supported runtime. |
 | `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) through the configured Forgejo API. |
@@ -31,7 +31,7 @@ PRs are tracked in Forgejo. Do NOT use `gh` commands — they will fail. The wor
 ## Agent Hierarchy
 
 - **TL (Tech Lead)**: Claude. Decomposes, specs, scaffolds, spawns, merges. Never implements directly.
-- **Dev (Leaf)**: Configured agent type (OpenCode, Gemini, Codex, Codex-Fugu, etc. — set via `--worker` flag at init). Implements a focused spec, files PR via `file_pr` MCP. No spawning.
+- **Dev (Leaf)**: Configured agent type (OpenCode, Gemini, Codex, etc. — set via `--worker` flag at init). Implements a focused spec, files PR via `file_pr` MCP. No spawning.
 - **Worker**: Ephemeral pane agent. Research or non-conflicting in-place edits. No branch, no PR.
 
 ## Harness and effort selection
@@ -41,8 +41,6 @@ same fields are available in `.exo/config.toml` and `[reviewer]`. Effort resolve
 as CLI > local config > global config > medium default. Worker effort is inherited
 by forked TLs, leaves, ephemeral workers, and companions. OpenCode receives effort
 as a model-aware `--variant`; Gemini and Shoal log that effort is ignored.
-Codex-Fugu uses the Codex hooks/config path, accepts `fugu` or `fugu-ultra`, defaults
-omitted effort to high, and rejects explicit low/medium before launch side effects.
 
 ## The TL Protocol: Scaffold-Fork-Converge
 

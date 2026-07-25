@@ -264,14 +264,6 @@ check-e2e-codex-messaging:
     bash -n tests/e2e/codex-messaging/run.sh
     bash -n tests/e2e/codex-messaging/validate.sh
 
-# Run deterministic Codex-Fugu role/effort integration coverage with a fake CLI
-e2e-codex-fugu:
-    ./tests/e2e/codex-fugu/run.sh
-
-# Check Codex-Fugu role/effort coverage without provider credentials
-check-e2e-codex-fugu:
-    bash -n tests/e2e/codex-fugu/run.sh
-    ./tests/e2e/codex-fugu/run.sh
 
 # Run E2E mixed agent chain test (Claude TL -> OpenCode worker, Codex reviewer config)
 e2e-tl-to-worker-messaging:
@@ -403,6 +395,15 @@ e2e-review-loop-stuck:
 # Check E2E review-loop stuck harness without launching the server
 check-e2e-review-loop-stuck:
     bash -n tests/e2e/review-loop-stuck/run.sh
+    python3 -m py_compile tests/e2e/mock_github.py
+
+# Run E2E Codex reviewer sandbox/instructions consistency test
+e2e-codex-reviewer-sandbox:
+    ./tests/e2e/codex-reviewer-sandbox/run.sh
+
+# Check E2E Codex reviewer sandbox harness without launching the server
+check-e2e-codex-reviewer-sandbox:
+    bash -n tests/e2e/codex-reviewer-sandbox/run.sh
     python3 -m py_compile tests/e2e/mock_github.py
 
 # Forgejo CI migration E2E
