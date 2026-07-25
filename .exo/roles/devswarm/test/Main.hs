@@ -77,6 +77,8 @@ main = do
   assertMergeReadyReviewNotifiesParent
   assertMergeReadyCIStatusNotifiesParent
   assertReviewCommentedJSONAndHandler
+  assertRequestedChangesNotifyParent
+  assertTLReviewHandlerPreservesReviewMetadata
   assertReviewerFacingTextDoesNotMentionCopilot
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
@@ -446,18 +448,54 @@ assertMergeReadyCIStatusNotifiesParent = do
 
 assertReviewCommentedJSONAndHandler :: IO ()
 assertReviewCommentedJSONAndHandler = do
-  let event = ReviewCommented 9 "Looks good, with one suggestion." (Just "main.review-pr-9-codex")
+  let event = ReviewCommented 9 "Looks good, with one suggestion." "main.feature-codex" (Just "main.review-pr-9-codex")
   case Aeson.fromJSON (Aeson.toJSON event) of
-    Aeson.Success (ReviewCommented n comments_ authorBranch) -> do
+    Aeson.Success (ReviewCommented n comments_ branch authorBranch) -> do
       assertEqual "comment-only review PR number" 9 n
       assertEqual "comment-only review body" "Looks good, with one suggestion." comments_
+      assertEqual "comment-only review head branch" "main.feature-codex" branch
       assertEqual "comment-only review author branch" (Just "main.review-pr-9-codex") authorBranch
     other -> fail $ "comment-only review JSON roundtrip failed: " <> show other
   action <- runPRReviewEvent DevRole.config event
   case action of
-    InjectMessage message ->
-      assertBool "comment-only review uses distinct notification" ("[REVIEW COMMENT]" `T.isInfixOf` message)
-    other -> fail $ "comment-only review should inject a message, got " <> show other
+    NotifyParentAction message prNumber -> do
+      assertEqual "comment-only review parent PR number" 9 prNumber
+      assertBool "comment-only review uses parent notification" ("[REVIEW ACTION REQUIRED]" `T.isInfixOf` message)
+      assertBool "comment-only review preserves head branch" ("main.feature-codex" `T.isInfixOf` message)
+      assertBool "comment-only review preserves reviewer branch" ("main.review-pr-9-codex" `T.isInfixOf` message)
+      assertBool "comment-only review preserves full text" ("Looks good, with one suggestion." `T.isInfixOf` message)
+    other -> fail $ "comment-only review should notify parent, got " <> show other
+
+assertRequestedChangesNotifyParent :: IO ()
+assertRequestedChangesNotifyParent = do
+  reviewAction <- runPRReviewEvent DevRole.config (ReviewReceived 12 "Please update the timeout path." "main.feature-codex" (Just "main.review-pr-12-codex"))
+  case reviewAction of
+    NotifyParentAction message prNumber -> do
+      assertEqual "review-received parent PR number" 12 prNumber
+      assertBool "review-received includes branch" ("main.feature-codex" `T.isInfixOf` message)
+      assertBool "review-received includes body" ("Please update the timeout path." `T.isInfixOf` message)
+    other -> fail $ "review received should notify parent, got " <> show other
+
+  let event = ReviewerRequestedChanges 10 "Please fix the error path." "main.feature-codex" (Just "main.review-pr-10-codex")
+  action <- runPRReviewEvent DevRole.config event
+  case action of
+    NotifyParentAction message prNumber -> do
+      assertEqual "requested-changes parent PR number" 10 prNumber
+      assertBool "requested-changes includes kind" ("changes requested" `T.isInfixOf` message)
+      assertBool "requested-changes includes body" ("Please fix the error path." `T.isInfixOf` message)
+    other -> fail $ "requested changes should notify parent, got " <> show other
+
+assertTLReviewHandlerPreservesReviewMetadata :: IO ()
+assertTLReviewHandlerPreservesReviewMetadata = do
+  let event = ReviewCommented 11 "Consider this edge case." "main.subtl.feature-codex" (Just "main.review-pr-11-codex")
+  action <- runPRReviewEvent TLRole.config event
+  case action of
+    InjectMessage message -> do
+      assertBool "TL review handler includes PR" ("PR #11" `T.isInfixOf` message)
+      assertBool "TL review handler includes head branch" ("main.subtl.feature-codex" `T.isInfixOf` message)
+      assertBool "TL review handler includes reviewer branch" ("main.review-pr-11-codex" `T.isInfixOf` message)
+      assertBool "TL review handler includes body" ("Consider this edge case." `T.isInfixOf` message)
+    other -> fail $ "TL review handler should inject a parent-formatted message, got " <> show other
 
 runPRReviewEvent :: RoleConfig tools -> PRReviewEvent -> IO EventAction
 runPRReviewEvent cfg event =

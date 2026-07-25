@@ -375,12 +375,12 @@ reviewerEventHandlers =
     }
 
 reviewerPRReviewHandler :: PRReviewEvent -> Eff Effects EventAction
-reviewerPRReviewHandler (ReviewReceived n comments_) = do
+reviewerPRReviewHandler (ReviewReceived n comments_ _branch _authorBranch) = do
   logHandler $ "Review received on PR #" <> T.pack (show n)
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv n comments_)
   pure (InjectMessage $ "[REVIEW] PR #" <> T.pack (show n) <> " received comments:\n" <> comments_)
-reviewerPRReviewHandler (ReviewCommented n _comments_ _authorBranch) = do
+reviewerPRReviewHandler (ReviewCommented n _comments_ _branch _authorBranch) = do
   logHandler $ "Comment-only review observed on PR #" <> T.pack (show n) <> " (watcher-owned; reviewer ignores)"
   pure NoAction
 reviewerPRReviewHandler (ReviewApproved n) = do
@@ -408,7 +408,7 @@ reviewerPRReviewHandler (ReviewerApproved n) = do
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv n)
   pure NoAction
-reviewerPRReviewHandler (ReviewerRequestedChanges n comments_) = do
+reviewerPRReviewHandler (ReviewerRequestedChanges n comments_ _branch _authorBranch) = do
   logHandler $ "Reviewer requested changes on PR #" <> T.pack (show n)
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv n comments_)

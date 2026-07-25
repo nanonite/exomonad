@@ -232,6 +232,7 @@ struct WatchState {
     first_seen: Instant,
     notified_parent_timeout: bool,
     last_review_state: ForgejoReviewVerdict,
+    last_review_fingerprint: Option<String>,
     last_sha: String,
     notified_parent_approved: bool,
     addressed_changes: bool,
@@ -314,6 +315,8 @@ struct WatcherPrState {
     needs_human_review: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_head_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_review_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -369,6 +372,7 @@ impl WatchState {
             first_seen: Instant::now(),
             notified_parent_timeout: false,
             last_review_state: ForgejoReviewVerdict::None,
+            last_review_fingerprint: None,
             last_sha: sha.to_string(),
             notified_parent_approved: false,
             addressed_changes: false,
@@ -401,6 +405,7 @@ impl WatchState {
         self.ci_mergeable_at = None;
         self.ci_triggered_sha = None;
         self.ci_blocked_notified = false;
+        self.last_review_fingerprint = None;
     }
 }
 
@@ -448,12 +453,17 @@ fn value_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(|value| value.as_str())
 }
 
-fn review_received_message(pr_number: u64, comments: &str) -> String {
-    format!("## Review on PR #{pr_number}\n\n{comments}\n\nAddress these comments and push fixes.")
-}
-
-fn review_commented_message(pr_number: u64, comments: &str) -> String {
-    format!("[REVIEW COMMENT] PR #{pr_number}:\n\n{comments}")
+fn review_parent_message(
+    pr_number: u64,
+    branch: &str,
+    review_kind: &str,
+    author_branch: Option<&str>,
+    comments: &str,
+) -> String {
+    let reviewer_branch = author_branch.unwrap_or("unknown");
+    format!(
+        "[REVIEW ACTION REQUIRED] PR #{pr_number} on branch {branch}\nReview kind: {review_kind}\nReviewer branch: {reviewer_branch}\n\n{comments}\n\nTL action: spawn a fresh dev leaf to address this review and include the PR branch in its task."
+    )
 }
 
 fn merge_ready_message(pr_number: u64, status: &str, branch: &str) -> String {
@@ -571,11 +581,23 @@ fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventAction
     match kind {
         "review_received" | "reviewer_requested_changes" => {
             Some(EventActionResponse::InjectMessage {
-                message: review_received_message(pr_number, value_str(payload, "comments")?),
+                message: review_parent_message(
+                    pr_number,
+                    value_str(payload, "branch").unwrap_or("unknown"),
+                    "changes requested",
+                    value_str(payload, "author_branch"),
+                    value_str(payload, "comments")?,
+                ),
             })
         }
         "review_commented" => Some(EventActionResponse::InjectMessage {
-            message: review_commented_message(pr_number, value_str(payload, "comments")?),
+            message: review_parent_message(
+                pr_number,
+                value_str(payload, "branch").unwrap_or("unknown"),
+                "comment-only",
+                value_str(payload, "author_branch"),
+                value_str(payload, "comments")?,
+            ),
         }),
         "approved" | "reviewer_approved" => Some(EventActionResponse::InjectMessage {
             message: pr_ready_message(pr_number),
@@ -638,18 +660,32 @@ fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventAction
 fn native_leaf_pr_review_action(payload: &serde_json::Value) -> Option<EventActionResponse> {
     let kind = value_str(payload, "kind")?;
     match kind {
-        "review_received" | "reviewer_requested_changes" => Some(EventActionResponse::InjectMessage {
-            message: review_received_message(
-                value_u64(payload, "pr_number")?,
-                value_str(payload, "comments")?,
-            ),
-        }),
-        "review_commented" => Some(EventActionResponse::InjectMessage {
-            message: review_commented_message(
-                value_u64(payload, "pr_number")?,
-                value_str(payload, "comments")?,
-            ),
-        }),
+        "review_received" | "reviewer_requested_changes" => {
+            let pr_number = value_u64(payload, "pr_number")?;
+            Some(EventActionResponse::NotifyParent {
+                message: review_parent_message(
+                    pr_number,
+                    value_str(payload, "branch").unwrap_or("unknown"),
+                    "changes requested",
+                    value_str(payload, "author_branch"),
+                    value_str(payload, "comments")?,
+                ),
+                pr_number: pr_number as i64,
+            })
+        }
+        "review_commented" => {
+            let pr_number = value_u64(payload, "pr_number")?;
+            Some(EventActionResponse::NotifyParent {
+                message: review_parent_message(
+                    pr_number,
+                    value_str(payload, "branch").unwrap_or("unknown"),
+                    "comment-only",
+                    value_str(payload, "author_branch"),
+                    value_str(payload, "comments")?,
+                ),
+                pr_number: pr_number as i64,
+            })
+        }
         "ci_triggered" => Some(EventActionResponse::InjectMessage {
             message: format!(
                 "[CI TRIGGERED] PR #{} on {}. Waiting for CI result.",
@@ -1265,6 +1301,10 @@ where
                     .prs
                     .get(pr_number)
                     .and_then(|state| state.last_head_sha.as_deref());
+                let persisted_review_fingerprint = watcher_state
+                    .prs
+                    .get(pr_number)
+                    .and_then(|state| state.last_review_fingerprint.clone());
                 let runtime_last_head_sha = state_guard
                     .get(pr_number)
                     .map(|state| state.last_sha.as_str());
@@ -1318,10 +1358,10 @@ where
                         self.policy.reviewer_max_wait_seconds,
                     )
                 } else {
-                    state_guard.insert(
-                        *pr_number,
-                        WatchState::new(&branch, agent_type, &obs.head_sha, CIStatus::Unknown, 0),
-                    );
+                    let mut new_state =
+                        WatchState::new(&branch, agent_type, &obs.head_sha, CIStatus::Unknown, 0);
+                    new_state.last_review_fingerprint = persisted_review_fingerprint;
+                    state_guard.insert(*pr_number, new_state);
                     let actions = compute_pr_actions_with_context(
                         state_guard
                             .get_mut(pr_number)
@@ -1425,6 +1465,7 @@ where
                         );
                         let requests_merge_ready_delivery =
                             requests_merge_ready_parent_delivery(event_type, &payload);
+                        let is_review_feedback = is_review_feedback_event(event_type, &payload);
 
                         // Reviewers are ephemeral: they submit their Forgejo verdict and exit.
                         // Review events have one delivery target, the PR owner's dev leaf. A
@@ -1432,7 +1473,7 @@ where
                         // spawn_reviewer_for_pr state machine above; never inject an event into
                         // the already-exited reviewer branch.
 
-                        if let Ok(Some(response)) = self
+                        let response = self
                             .call_handle_event_for_role(
                                 pending.branch.as_str(),
                                 pending.agent_type,
@@ -1440,25 +1481,58 @@ where
                                 event_type,
                                 payload,
                             )
-                            .await
-                        {
-                            let delivery_confirmed = self
-                                .handle_event_action(
-                                    response,
-                                    pending.branch.as_str(),
-                                    pending.agent_type,
-                                )
-                                .await;
-                            if delivery_confirmed && requests_merge_ready_delivery {
-                                self.mark_merge_ready_notified(pending.pr_number).await;
+                            .await;
+                        let delivery_confirmed = match response {
+                            Ok(Some(response)) => {
+                                let confirmed = self
+                                    .handle_event_action(
+                                        response,
+                                        pending.branch.as_str(),
+                                        pending.agent_type,
+                                    )
+                                    .await;
+                                if confirmed && requests_merge_ready_delivery {
+                                    self.mark_merge_ready_notified(pending.pr_number).await;
+                                }
+                                if confirmed {
+                                    if let Some(message) = release_message {
+                                        self.deliver_release_message(
+                                            pending.branch.as_str(),
+                                            pending.agent_type,
+                                            &message,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                confirmed
                             }
-                            if let Some(message) = release_message {
-                                self.deliver_release_message(
-                                    pending.branch.as_str(),
-                                    pending.agent_type,
-                                    &message,
-                                )
-                                .await;
+                            Ok(None) => {
+                                warn!(
+                                    pr_number = pending.pr_number,
+                                    event_type, "Event handler returned no action"
+                                );
+                                false
+                            }
+                            Err(error) => {
+                                warn!(
+                                    pr_number = pending.pr_number,
+                                    event_type,
+                                    %error,
+                                    "Event handler dispatch failed"
+                                );
+                                false
+                            }
+                        };
+                        if is_review_feedback && !delivery_confirmed {
+                            if let Err(error) = self
+                                .reset_review_delivery_fingerprint(pending.pr_number)
+                                .await
+                            {
+                                warn!(
+                                    pr_number = pending.pr_number,
+                                    %error,
+                                    "Failed to reset undelivered review fingerprint"
+                                );
                             }
                         }
                     }
@@ -1525,14 +1599,39 @@ where
         }
 
         let mut state = self.read_watcher_state().await.unwrap_or_default();
+        let runtime_state = self.state.prs.lock().await;
         for (pr_number, head_sha) in updates {
-            state.prs.entry(*pr_number).or_default().last_head_sha = Some(head_sha.clone());
+            let entry = state.prs.entry(*pr_number).or_default();
+            entry.last_head_sha = Some(head_sha.clone());
+            entry.last_review_fingerprint = runtime_state
+                .get(pr_number)
+                .and_then(|watch_state| watch_state.last_review_fingerprint.clone());
         }
+        drop(runtime_state);
         self.write_watcher_state(&state).await?;
         debug!(
             count = updates.len(),
             "Persisted last observed PR head SHAs"
         );
+        Ok(())
+    }
+
+    async fn reset_review_delivery_fingerprint(&self, pr_number: u64) -> Result<()> {
+        let mut runtime_state = self.state.prs.lock().await;
+        if let Some(watch_state) = runtime_state.get_mut(&pr_number) {
+            watch_state.last_review_fingerprint = None;
+        }
+        drop(runtime_state);
+
+        let mut state = self.read_watcher_state().await.unwrap_or_default();
+        let changed = state
+            .prs
+            .get_mut(&pr_number)
+            .and_then(|pr_state| pr_state.last_review_fingerprint.take())
+            .is_some();
+        if changed {
+            self.write_watcher_state(&state).await?;
+        }
         Ok(())
     }
 
@@ -2353,13 +2452,33 @@ fn compute_pr_actions_with_context(
     let changes_requested = reviews
         .iter()
         .any(|r| r.state == ForgejoReviewVerdict::ChangesRequested);
+    let changes_requested_fingerprint =
+        review_fingerprint(comments, reviews, ForgejoReviewVerdict::ChangesRequested);
     if !approved
         && changes_requested
-        && old_state.last_review_state != ForgejoReviewVerdict::ChangesRequested
+        && (old_state.last_review_state != ForgejoReviewVerdict::ChangesRequested
+            || old_state.last_review_fingerprint != changes_requested_fingerprint)
     {
         old_state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
+        old_state.last_review_fingerprint = changes_requested_fingerprint;
         old_state.first_seen = now;
         old_state.rounds = next_review_round;
+
+        let message = format_message(comments, reviews);
+        pending_actions.push(PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested)
+                    .expect("changes_requested review state has an event kind"),
+                "pr_number": pr_number.as_u64(),
+                "branch": branch,
+                "comments": message,
+                "author_branch": review_author_branch(
+                    reviews,
+                    ForgejoReviewVerdict::ChangesRequested,
+                ),
+            }),
+        });
 
         if old_state.rounds >= max_rounds {
             old_state.stuck = true;
@@ -2385,25 +2504,11 @@ fn compute_pr_actions_with_context(
                 pr_number: pr_number.as_u64(),
                 rounds: old_state.rounds,
             });
-            let message = format_message(comments, reviews);
             pending_actions.push(PendingAction::EmitEvent {
                 status: "copilot_review".to_string(),
                 message: message.clone(),
                 comments: Some(comments.to_vec()),
                 reviews: Some(reviews.to_vec()),
-            });
-            pending_actions.push(PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload: serde_json::json!({
-                    "kind": review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested)
-                        .expect("changes_requested review state has an event kind"),
-                    "pr_number": pr_number.as_u64(),
-                    "comments": message,
-                    "author_branch": review_author_branch(
-                        reviews,
-                        ForgejoReviewVerdict::ChangesRequested,
-                    ),
-                }),
             });
         }
     }
@@ -2411,12 +2516,16 @@ fn compute_pr_actions_with_context(
     let commented = reviews
         .iter()
         .any(|review| review.state == ForgejoReviewVerdict::Commented);
+    let commented_fingerprint =
+        review_fingerprint(comments, reviews, ForgejoReviewVerdict::Commented);
     if !approved
         && !changes_requested
         && commented
-        && old_state.last_review_state != ForgejoReviewVerdict::Commented
+        && (old_state.last_review_state != ForgejoReviewVerdict::Commented
+            || old_state.last_review_fingerprint != commented_fingerprint)
     {
         old_state.last_review_state = ForgejoReviewVerdict::Commented;
+        old_state.last_review_fingerprint = commented_fingerprint;
         let message = format_message(comments, reviews);
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
@@ -2424,6 +2533,7 @@ fn compute_pr_actions_with_context(
                 "kind": review_event_kind_for_state(&ForgejoReviewVerdict::Commented)
                     .expect("commented review state has an event kind"),
                 "pr_number": pr_number.as_u64(),
+                "branch": branch,
                 "comments": message,
                 "author_branch": review_author_branch(
                     reviews,
@@ -2632,6 +2742,52 @@ fn review_author_branch(reviews: &[ForgejoReview], state: ForgejoReviewVerdict) 
         .and_then(|review| review.author_branch.as_deref())
 }
 
+fn review_fingerprint(
+    comments: &[ForgejoReviewComment],
+    reviews: &[ForgejoReview],
+    state: ForgejoReviewVerdict,
+) -> Option<String> {
+    reviews
+        .iter()
+        .rev()
+        .find(|review| review.state == state)
+        .map(|review| {
+            let comment_fingerprint = comments
+                .iter()
+                .map(|comment| {
+                    format!(
+                        "{}\0{}\0{}",
+                        comment.path.as_deref().unwrap_or_default(),
+                        comment.thread_id.as_deref().unwrap_or_default(),
+                        comment.body
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\0");
+            format!(
+                "{}\0{}\0{}\0{}\0{}\0{}",
+                review
+                    .review_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                review.commit_id.as_deref().unwrap_or_default(),
+                review.author_branch.as_deref().unwrap_or_default(),
+                state_name(&review.state),
+                review.body,
+                comment_fingerprint,
+            )
+        })
+}
+
+fn state_name(state: &ForgejoReviewVerdict) -> &'static str {
+    match state {
+        ForgejoReviewVerdict::None => "none",
+        ForgejoReviewVerdict::Commented => "commented",
+        ForgejoReviewVerdict::ChangesRequested => "changes_requested",
+        ForgejoReviewVerdict::Approved => "approved",
+    }
+}
+
 fn signals_within_merge_ready_window(
     review_approved_at: Option<Instant>,
     ci_mergeable_at: Option<Instant>,
@@ -2688,6 +2844,14 @@ fn requests_merge_ready_parent_delivery(event_type: &str, payload: &serde_json::
             .unwrap_or(false),
         _ => false,
     }
+}
+
+fn is_review_feedback_event(event_type: &str, payload: &serde_json::Value) -> bool {
+    event_type == "pr_review"
+        && matches!(
+            value_str(payload, "kind"),
+            Some("review_received") | Some("reviewer_requested_changes") | Some("review_commented")
+        )
 }
 
 fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
@@ -2843,20 +3007,44 @@ mod tests {
     }
 
     #[test]
-    fn test_native_leaf_fallback_injects_review_received() {
+    fn test_native_leaf_fallback_notifies_parent_for_review_received() {
         let payload = serde_json::json!({
             "kind": "review_received",
             "pr_number": 42,
+            "branch": "main.feature-codex",
+            "author_branch": "main.review-pr-42-claude",
             "comments": "Fix the failing assertion",
         });
 
         match native_event_action("pr_review", &payload, "dev") {
-            Some(EventActionResponse::InjectMessage { message }) => {
-                assert!(message.contains("## Review on PR #42"));
+            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
+                assert_eq!(pr_number, 42);
+                assert!(message.contains("PR #42 on branch main.feature-codex"));
+                assert!(message.contains("changes requested"));
+                assert!(message.contains("main.review-pr-42-claude"));
                 assert!(message.contains("Fix the failing assertion"));
-                assert!(message.contains("Address these comments and push fixes."));
             }
-            other => panic!("expected InjectMessage fallback, got {other:?}"),
+            other => panic!("expected NotifyParent fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_native_leaf_fallback_notifies_parent_for_comment_only_review() {
+        let payload = serde_json::json!({
+            "kind": "review_commented",
+            "pr_number": 43,
+            "branch": "main.feature-codex",
+            "author_branch": "main.review-pr-43-gemini",
+            "comments": "Consider the error path.",
+        });
+
+        match native_event_action("pr_review", &payload, "dev") {
+            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
+                assert_eq!(pr_number, 43);
+                assert!(message.contains("comment-only"));
+                assert!(message.contains("Consider the error path."));
+            }
+            other => panic!("expected NotifyParent fallback, got {other:?}"),
         }
     }
 
@@ -3460,7 +3648,87 @@ mod tests {
             action,
             PendingAction::WasmEvent { payload, .. }
                 if payload["kind"] == "review_received"
+                    && payload["branch"] == "main.feat-gemini"
                     && payload["author_branch"] == "review-pr-1"
+        )));
+    }
+
+    #[test]
+    fn test_new_review_same_kind_emits_once_per_fingerprint() {
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let first = ForgejoReview {
+            review_id: Some(10),
+            body: "Address the error path".to_string(),
+            state: ForgejoReviewVerdict::ChangesRequested,
+            author_branch: Some("main.review-pr-10-codex".to_string()),
+            commit_id: Some("abc123".to_string()),
+        };
+        let first_actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            std::slice::from_ref(&first),
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, reviews| reviews[0].body.clone(),
+            5,
+        );
+        assert_eq!(
+            first_actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    PendingAction::WasmEvent { payload, .. }
+                        if payload["kind"] == "review_received"
+                ))
+                .count(),
+            1
+        );
+
+        let duplicate = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            std::slice::from_ref(&first),
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, reviews| reviews[0].body.clone(),
+            5,
+        );
+        assert!(!duplicate.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "review_received"
+        )));
+
+        let second = ForgejoReview {
+            review_id: Some(11),
+            body: "Also handle the timeout path".to_string(),
+            ..first
+        };
+        let second_actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            std::slice::from_ref(&second),
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &|_, reviews| reviews[0].body.clone(),
+            5,
+        );
+        assert!(second_actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "review_received"
+                    && payload["comments"] == "Also handle the timeout path"
         )));
     }
 
@@ -3901,6 +4169,12 @@ mod tests {
 
         assert!(state.stuck);
         assert_eq!(state.rounds, 2);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "review_received"
+                    && payload["comments"] == "Still needs work"
+        )));
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WriteRegistryStuck {
@@ -4816,6 +5090,7 @@ mod tests {
                 stuck: true,
                 needs_human_review: true,
                 last_head_sha: None,
+                last_review_fingerprint: None,
             },
         );
         state.prs.insert(
@@ -4825,6 +5100,7 @@ mod tests {
                 stuck: false,
                 needs_human_review: false,
                 last_head_sha: None,
+                last_review_fingerprint: None,
             },
         );
         state.prs.insert(
@@ -4834,6 +5110,7 @@ mod tests {
                 stuck: true,
                 needs_human_review: false,
                 last_head_sha: None,
+                last_review_fingerprint: None,
             },
         );
         let mut registry = PrRegistry::default();
@@ -4901,6 +5178,7 @@ mod tests {
                 stuck: true,
                 needs_human_review: true,
                 last_head_sha: None,
+                last_review_fingerprint: None,
             },
         );
         watcher.write_watcher_state(&state).await.unwrap();

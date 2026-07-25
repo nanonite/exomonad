@@ -16,6 +16,8 @@ module ExoMonad.Guest.Events.Templates
     commitsPushed,
     reviewReceived,
     reviewCommented,
+    reviewReceivedForParent,
+    reviewCommentedForParent,
     siblingMerged,
     ciStatus,
     mergeReady,
@@ -82,6 +84,35 @@ reviewCommented n comments =
     <> T.pack (show n)
     <> ":\n\n"
     <> comments
+
+-- | Full requested-change feedback delivered to the PR owner's parent TL.
+reviewReceivedForParent :: Int -> Text -> Maybe Text -> Text -> Text
+reviewReceivedForParent n branch authorBranch comments =
+  reviewParentMessage n branch "changes requested" authorBranch comments
+
+-- | Comment-only feedback delivered to the PR owner's parent TL.
+reviewCommentedForParent :: Int -> Text -> Maybe Text -> Text -> Text
+reviewCommentedForParent n branch authorBranch comments =
+  reviewParentMessage n branch "comment-only" authorBranch comments
+
+reviewParentMessage :: Int -> Text -> Text -> Maybe Text -> Text -> Text
+reviewParentMessage n branch reviewKind authorBranch comments =
+  "[REVIEW ACTION REQUIRED] PR #"
+    <> T.pack (show n)
+    <> " on branch "
+    <> displayOrUnknown branch
+    <> "\nReview kind: "
+    <> reviewKind
+    <> "\nReviewer branch: "
+    <> maybe "unknown" id authorBranch
+    <> "\n\n"
+    <> comments
+    <> "\n\nTL action: spawn a fresh dev leaf to address this review and include the PR branch in its task."
+
+displayOrUnknown :: Text -> Text
+displayOrUnknown value
+  | T.null value = "unknown"
+  | otherwise = value
 
 -- | A sibling branch was merged — injected into the agent's pane with rebase instructions.
 --

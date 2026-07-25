@@ -25,11 +25,14 @@ import GHC.Generics (Generic)
 data PRReviewEvent
   = ReviewReceived
       { prNumber :: Int,
-        comments :: Text
+        comments :: Text,
+        reviewBranch :: Text,
+        reviewAuthorBranch :: Maybe Text
       }
   | ReviewCommented
       { prNumber :: Int,
         rcComments :: Text,
+        rcBranch :: Text,
         rcAuthorBranch :: Maybe Text
       }
   | ReviewApproved
@@ -53,7 +56,9 @@ data PRReviewEvent
       }
   | ReviewerRequestedChanges
       { prNumber :: Int,
-        rcComments :: Text
+        rrcComments :: Text,
+        rrcBranch :: Text,
+        rrcAuthorBranch :: Maybe Text
       }
   | RateLimited
       { rlRetriesRemaining :: Int,
@@ -96,14 +101,14 @@ instance FromJSON PRReviewEvent where
   parseJSON = withObject "PRReviewEvent" $ \v -> do
     kind <- v .: "kind"
     case kind of
-      "review_received" -> ReviewReceived <$> v .: "pr_number" <*> v .: "comments"
-      "review_commented" -> ReviewCommented <$> v .: "pr_number" <*> v .: "comments" <*> v .:? "author_branch"
+      "review_received" -> ReviewReceived <$> v .: "pr_number" <*> v .: "comments" <*> v .:? "branch" .!= "" <*> v .:? "author_branch"
+      "review_commented" -> ReviewCommented <$> v .: "pr_number" <*> v .: "comments" <*> v .:? "branch" .!= "" <*> v .:? "author_branch"
       "approved" -> ReviewApproved <$> v .: "pr_number"
       "timeout" -> ReviewTimeout <$> v .: "pr_number" <*> v .: "minutes_elapsed"
       "fixes_pushed" -> FixesPushed <$> v .: "pr_number" <*> v .: "ci_status" <*> v .: "head_sha"
       "commits_pushed" -> CommitsPushed <$> v .: "pr_number" <*> v .: "ci_status"
       "reviewer_approved" -> ReviewerApproved <$> v .: "pr_number"
-      "reviewer_requested_changes" -> ReviewerRequestedChanges <$> v .: "pr_number" <*> v .: "comments"
+      "reviewer_requested_changes" -> ReviewerRequestedChanges <$> v .: "pr_number" <*> v .: "comments" <*> v .:? "branch" .!= "" <*> v .:? "author_branch"
       "rate_limited" -> RateLimited <$> v .: "retries_remaining" <*> v .: "seconds_until_reset"
       "stuck" -> Stuck <$> v .: "pr_number" <*> v .: "rounds"
       "ci_triggered" -> CITriggered <$> v .: "pr_number" <*> v .: "branch" <*> v .: "head_sha"
@@ -116,14 +121,14 @@ instance FromJSON PRReviewEvent where
       other -> fail $ "Unknown PRReviewEvent kind: " <> show (other :: Text)
 
 instance ToJSON PRReviewEvent where
-  toJSON (ReviewReceived n c) = object ["kind" .= ("review_received" :: Text), "pr_number" .= n, "comments" .= c]
-  toJSON (ReviewCommented n c branch) = object ["kind" .= ("review_commented" :: Text), "pr_number" .= n, "comments" .= c, "author_branch" .= branch]
+  toJSON (ReviewReceived n c branch authorBranch) = object ["kind" .= ("review_received" :: Text), "pr_number" .= n, "comments" .= c, "branch" .= branch, "author_branch" .= authorBranch]
+  toJSON (ReviewCommented n c branch authorBranch) = object ["kind" .= ("review_commented" :: Text), "pr_number" .= n, "comments" .= c, "branch" .= branch, "author_branch" .= authorBranch]
   toJSON (ReviewApproved n) = object ["kind" .= ("approved" :: Text), "pr_number" .= n]
   toJSON (ReviewTimeout n m) = object ["kind" .= ("timeout" :: Text), "pr_number" .= n, "minutes_elapsed" .= m]
   toJSON (FixesPushed n ci sha) = object ["kind" .= ("fixes_pushed" :: Text), "pr_number" .= n, "ci_status" .= ci, "head_sha" .= sha]
   toJSON (CommitsPushed n ci) = object ["kind" .= ("commits_pushed" :: Text), "pr_number" .= n, "ci_status" .= ci]
   toJSON (ReviewerApproved n) = object ["kind" .= ("reviewer_approved" :: Text), "pr_number" .= n]
-  toJSON (ReviewerRequestedChanges n c) = object ["kind" .= ("reviewer_requested_changes" :: Text), "pr_number" .= n, "comments" .= c]
+  toJSON (ReviewerRequestedChanges n c branch authorBranch) = object ["kind" .= ("reviewer_requested_changes" :: Text), "pr_number" .= n, "comments" .= c, "branch" .= branch, "author_branch" .= authorBranch]
   toJSON (RateLimited r s) = object ["kind" .= ("rate_limited" :: Text), "retries_remaining" .= r, "seconds_until_reset" .= s]
   toJSON (Stuck n r) = object ["kind" .= ("stuck" :: Text), "pr_number" .= n, "rounds" .= r]
   toJSON (CITriggered n branch sha) = object ["kind" .= ("ci_triggered" :: Text), "pr_number" .= n, "branch" .= branch, "head_sha" .= sha]

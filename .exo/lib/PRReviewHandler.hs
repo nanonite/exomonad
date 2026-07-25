@@ -45,14 +45,14 @@ tlPRReviewEventHandlers =
     }
 
 prReviewHandler :: PRReviewEvent -> Eff Effects EventAction
-prReviewHandler (ReviewReceived n comments_) = do
+prReviewHandler (ReviewReceived n comments_ reviewBranch authorBranch) = do
   logHandler $ "Review received on PR #" <> T.pack (show n)
-  branch <- getCurrentBranch
-  phase <- applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
-  pure $ reviewRequestAction n comments_ phase
-prReviewHandler (ReviewCommented n comments_ _authorBranch) = do
+  currentBranch <- getCurrentBranch
+  phase <- applyEvent @DevPhase @DevEvent currentBranch DevSpawned (ReviewReceivedEv n comments_)
+  pure $ reviewRequestAction n comments_ reviewBranch authorBranch phase
+prReviewHandler (ReviewCommented n comments_ reviewBranch authorBranch) = do
   logHandler $ "Comment-only review received on PR #" <> T.pack (show n)
-  pure (InjectMessage (Tpl.reviewCommented n comments_))
+  pure (NotifyParentAction (Tpl.reviewCommentedForParent n reviewBranch authorBranch comments_) n)
 prReviewHandler (ReviewApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved (reviewer agent)"
   branch <- getCurrentBranch
@@ -76,11 +76,11 @@ prReviewHandler (CommitsPushed n ci) = do
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CommitsPushedEv n ci)
   pure NoAction
-prReviewHandler (ReviewerRequestedChanges n comments_) = do
+prReviewHandler (ReviewerRequestedChanges n comments_ reviewBranch authorBranch) = do
   logHandler $ "Reviewer requested changes on PR #" <> T.pack (show n)
   branch <- getCurrentBranch
   phase <- applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
-  pure $ reviewRequestAction n comments_ phase
+  pure $ reviewRequestAction n comments_ reviewBranch authorBranch phase
 prReviewHandler (RateLimited remaining secs) = do
   logHandler $ "Rate limited: " <> T.pack (show remaining) <> " retries, " <> T.pack (show secs) <> "s until reset"
   pure NoAction
@@ -127,12 +127,12 @@ prReviewHandler (ReviewDevFailed n) = do
 
 
 tlPrReviewHandler :: PRReviewEvent -> Eff Effects EventAction
-tlPrReviewHandler (ReviewReceived n comments_) = do
+tlPrReviewHandler (ReviewReceived n comments_ branch authorBranch) = do
   logHandler $ "TL observed review comments on PR #" <> T.pack (show n)
-  pure (InjectMessage (Tpl.reviewReceived n comments_))
-tlPrReviewHandler (ReviewCommented n comments_ _authorBranch) = do
+  pure (InjectMessage (Tpl.reviewReceivedForParent n branch authorBranch comments_))
+tlPrReviewHandler (ReviewCommented n comments_ branch authorBranch) = do
   logHandler $ "TL observed comment-only review on PR #" <> T.pack (show n)
-  pure (InjectMessage (Tpl.reviewCommented n comments_))
+  pure (InjectMessage (Tpl.reviewCommentedForParent n branch authorBranch comments_))
 tlPrReviewHandler (ReviewApproved n) = do
   logHandler $ "TL observed PR #" <> T.pack (show n) <> " approved"
   pure (InjectMessage (Tpl.prReady n))
@@ -148,9 +148,9 @@ tlPrReviewHandler (FixesPushed n ci _headSha) = do
 tlPrReviewHandler (CommitsPushed n ci) = do
   logHandler $ "TL observed commits pushed on PR #" <> T.pack (show n)
   pure (InjectMessage (Tpl.commitsPushed n ci))
-tlPrReviewHandler (ReviewerRequestedChanges n comments_) = do
+tlPrReviewHandler (ReviewerRequestedChanges n comments_ branch authorBranch) = do
   logHandler $ "TL observed reviewer requested changes on PR #" <> T.pack (show n)
-  pure (InjectMessage (Tpl.reviewReceived n comments_))
+  pure (InjectMessage (Tpl.reviewReceivedForParent n branch authorBranch comments_))
 tlPrReviewHandler (RateLimited remaining secs) = do
   logHandler $ "TL observed review rate limit"
   pure (InjectMessage $ "[RATE LIMITED] Review polling has " <> T.pack (show remaining) <> " retries remaining; reset in " <> T.pack (show secs) <> " seconds.")
@@ -238,18 +238,17 @@ tlCiStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerApp
     then pure (InjectMessage (Tpl.mergeReady n status_ branch_))
     else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
 
-reviewRequestAction :: Int -> Text -> Maybe DevPhase -> EventAction
-reviewRequestAction n _comments (Just (DevNeedsHumanDirection _ reason)) =
+reviewRequestAction :: Int -> Text -> Text -> Maybe Text -> Maybe DevPhase -> EventAction
+reviewRequestAction n comments_ reviewBranch authorBranch phase =
   NotifyParentAction
-    ( "[STUCK: PR #"
-        <> T.pack (show n)
-        <> "] Review loop needs human direction: "
-        <> reason
-        <> ". Dev leaf is staying alive and waiting for TL clarification."
+    ( Tpl.reviewReceivedForParent n reviewBranch authorBranch comments_
+        <> stuckSuffix phase
     )
     n
-reviewRequestAction n comments_ _ =
-  InjectMessage (Tpl.reviewReceived n comments_)
+  where
+    stuckSuffix (Just (DevNeedsHumanDirection _ reason)) =
+      "\n\nReview loop needs human direction: " <> reason <> ". The existing dev leaf is staying alive."
+    stuckSuffix _ = ""
 
 -- | Helper to log handler entry.
 logHandler :: Text -> Eff Effects ()

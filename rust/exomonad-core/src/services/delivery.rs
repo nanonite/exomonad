@@ -1,4 +1,4 @@
-use crate::domain::{Address, AgentName, Slug};
+use crate::domain::{Address, AgentName, BirthBranch, Slug};
 use crate::services::agent_inbox::{InboxMessage, GLOBAL_AGENT_INBOX};
 use crate::services::tmux_events;
 use claude_teams_bridge as teams_mailbox;
@@ -15,20 +15,8 @@ pub enum DeliveryResult {
     Failed,
 }
 
-fn pinned_tmux_target(target: &str) -> String {
-    if target.starts_with('%') {
-        target.to_string()
-    } else {
-        format!("{}.0", target)
-    }
-}
-
 fn routing_tmux_target(routing: &serde_json::Value) -> Option<String> {
-    routing["pane_id"]
-        .as_str()
-        .or_else(|| routing["window_id"].as_str())
-        .or_else(|| routing["parent_tab"].as_str())
-        .map(|s| s.to_string())
+    routing["pane_id"].as_str().map(ToOwned::to_owned)
 }
 
 fn agent_type_from_key(agent_key: &str) -> crate::services::AgentType {
@@ -92,6 +80,34 @@ async fn tmux_target_alive(target: &str) -> Result<bool, String> {
         .await
         .map_err(|error| error.to_string())?;
     Ok(output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+async fn current_tmux_pane_target(target: &str) -> Option<String> {
+    if target.starts_with('%') {
+        return Some(target.to_string());
+    }
+
+    let session = std::env::var("EXOMONAD_TMUX_SESSION").ok()?;
+    if session.trim().is_empty() {
+        return None;
+    }
+    let qualified_target = crate::services::tmux_ipc::qualify_tmux_target(&session, target);
+    let output = Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &qualified_target,
+            "#{pane_id}",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!pane_id.is_empty()).then_some(pane_id)
 }
 
 async fn routing_target_alive_or_cleanup(
@@ -551,6 +567,17 @@ async fn canonical_recipient_key(
         }
     }
 
+    if let Ok(branch) = BirthBranch::try_from_str(agent_key) {
+        if let Some(record) = resolver
+            .all()
+            .await
+            .into_iter()
+            .find(|record| record.birth_branch == branch)
+        {
+            return record.agent_name.to_string();
+        }
+    }
+
     if agent_key.contains('.') {
         return agent_key.to_string();
     }
@@ -634,6 +661,12 @@ pub fn resolve_tab_name_for_agent(
     if let Some(resolver) = resolver {
         if let Ok(records) = resolver.records_ref().try_read() {
             if let Some(record) = records.get(agent_key) {
+                return record.display_name.clone();
+            }
+            if let Some(record) = records
+                .values()
+                .find(|record| record.birth_branch.as_str() == agent_key.as_str())
+            {
                 return record.display_name.clone();
             }
         }
@@ -969,18 +1002,8 @@ async fn deliver_via_tmux(
             crate::services::resolve_working_dir(agent_key)
         };
         let effective_pd = project_dir.join(worktree);
-        // Pin to pane 0 when target is a window name/ID (not a %N pane ID) so
-        // injection reaches the TL's main pane rather than an active worker pane.
-        let pinned_target = pinned_tmux_target(&target);
-        return enqueue_tmux_delivery(
-            agent_key,
-            &pinned_target,
-            effective_pd,
-            from,
-            message,
-            &target,
-        )
-        .await;
+        return enqueue_tmux_delivery(agent_key, &target, effective_pd, from, message, &target)
+            .await;
     }
 
     tracing::Span::current().record("delivery_method", "tmux");
@@ -996,13 +1019,15 @@ async fn deliver_via_tmux(
         crate::services::resolve_worktree_from_tab(tmux_target)
     };
     let effective_pd = project_dir.join(worktree);
-    // When the target is a window name (not a %N pane ID), append ".0" to pin
-    // injection to the first pane. Without this, tmux sends to the active pane,
-    // which may be a worker pane rather than the TL's main pane.
-    let pinned_target = pinned_tmux_target(tmux_target);
+    // Resolve the current pane from the display name. Window and pane indexes
+    // are session-local and can become stale after a restart; the display name
+    // is the stable identity supplied by AgentResolver.
+    let current_target = current_tmux_pane_target(tmux_target)
+        .await
+        .unwrap_or_else(|| tmux_target.to_string());
     enqueue_tmux_delivery(
         agent_key,
-        &pinned_target,
+        &current_target,
         effective_pd,
         from,
         message,
@@ -1479,6 +1504,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_recipient_key_resolves_parent_birth_branch() {
+        let services = services_with_agent("patch-step-over", "patch-step-over-opencode").await;
+
+        let recipient =
+            canonical_recipient_key(services.agent_resolver(), "main.patch-step-over-opencode")
+                .await;
+
+        assert_eq!(recipient, "patch-step-over-opencode");
+    }
+
+    #[tokio::test]
+    async fn resolve_tab_name_uses_current_identity_for_birth_branch() {
+        let services = services_with_agent("patch-step-over", "patch-step-over-opencode").await;
+        let branch = agent_name("main.patch-step-over-opencode");
+
+        assert_eq!(
+            resolve_tab_name_for_agent(&branch, Some(services.agent_resolver())),
+            "patch-step-over-opencode"
+        );
+    }
+
+    #[tokio::test]
     async fn route_message_rejects_reserved_parent_alias_without_recording() {
         let services = crate::services::Services::test();
         let from = agent_name("root");
@@ -1514,23 +1561,13 @@ mod tests {
     }
 
     #[test]
-    fn test_routing_tmux_target_falls_back_to_window() {
+    fn test_routing_tmux_target_ignores_stale_window_ids() {
         let routing = serde_json::json!({
             "window_id": "@7",
             "parent_tab": "TL"
         });
 
-        assert_eq!(routing_tmux_target(&routing), Some("@7".to_string()));
-    }
-
-    #[test]
-    fn test_pinned_tmux_target_leaves_pane_id_unmodified() {
-        assert_eq!(pinned_tmux_target("%42"), "%42");
-    }
-
-    #[test]
-    fn test_pinned_tmux_target_pins_window_name_to_first_pane() {
-        assert_eq!(pinned_tmux_target("TL"), "TL.0");
+        assert_eq!(routing_tmux_target(&routing), None);
     }
 
     #[tokio::test]
