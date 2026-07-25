@@ -46,6 +46,7 @@ import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
 import ExoMonad.Guest.Tools.Lifecycle (HasPendingWork (..), ShutdownServer (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
+import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
@@ -187,6 +188,7 @@ data Tools mode = Tools
     cleanupReviewerLeaf :: mode :- CleanupReviewerLeaf,
     closeReviewerWindow :: mode :- CloseReviewerWindow,
     restartReview :: mode :- RestartReview,
+    replaceClosedPr :: mode :- ReplaceClosedPr,
     watcherPrState :: mode :- WatcherPrState,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
@@ -236,6 +238,7 @@ config =
             cleanupReviewerLeaf = mkHandler @CleanupReviewerLeaf,
             closeReviewerWindow = mkHandler @CloseReviewerWindow,
             restartReview = mkHandler @RestartReview,
+            replaceClosedPr = mkHandler @ReplaceClosedPr,
             watcherPrState = mkHandler @WatcherPrState,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,

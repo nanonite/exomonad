@@ -483,6 +483,49 @@ message CloseIssueAndCleanupResponse {
 }
 
 // ============================================================================
+// ReplaceClosedPr - Replace a closed, unmerged PR with a fresh leaf identity
+// ============================================================================
+
+message ReplaceClosedPrRequest {
+  // Chainlink issue that must remain open and attached to the replacement.
+  uint64 chainlink_issue_id = 1;
+  // Closed, unmerged Forgejo PR to replace.
+  uint64 closed_pr_number = 2;
+  // Existing author leaf identity to retire.
+  string old_leaf_name = 3;
+  // Required fresh author leaf slug; must not match old_leaf_name.
+  string new_leaf_name = 4;
+  // Complete implementation task for the replacement leaf.
+  string replacement_task = 5;
+  // Optional agent runtime; unspecified uses the server default.
+  AgentType agent_type = 6;
+  // Optional operator context to include in the replacement prompt.
+  string operator_context = 7;
+  // Explicit human approval boundary for retiring the old leaf and PR state.
+  bool human_approved = 8;
+}
+
+message ReplaceClosedPrResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 chainlink_issue_id = 3;
+  uint64 old_pr_number = 4;
+  string old_pr_state = 5;
+  bool old_pr_merged = 6;
+  string old_head_branch = 7;
+  string source_head_sha = 8;
+  string original_base_branch = 9;
+  string old_leaf_name = 10;
+  repeated string retired_resources = 11;
+  string new_leaf_name = 12;
+  string new_branch = 13;
+  string worktree_path = 14;
+  string spawn_status = 15;
+  string next_action = 16;
+  bool replacement_already_exists = 17;
+}
+
+// ============================================================================
 // Service definition
 // ============================================================================
 
@@ -506,4 +549,5 @@ service AgentEffects {
   rpc CloseWorkerPane(CloseWorkerPaneRequest) returns (CloseWorkerPaneResponse);
   rpc CloseReviewerWindow(CloseReviewerWindowRequest) returns (CloseReviewerWindowResponse);
   rpc CloseIssueAndCleanup(CloseIssueAndCleanupRequest) returns (CloseIssueAndCleanupResponse);
+  rpc ReplaceClosedPr(ReplaceClosedPrRequest) returns (ReplaceClosedPrResponse);
 }

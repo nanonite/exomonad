@@ -105,6 +105,22 @@ The TL does NOT iterate on children's work. Convergence is **leaf + reviewer**, 
 The TL never manually reviews code, never fixes a leaf's implementation.
 See `.exo/review-policy.toml` for review round limits, timeouts, and complexity thresholds.
 
+### Closed-PR replacement recovery
+
+When a human approves replacing a closed, unmerged PR, use the root/TL-only
+`replace_close_pr` MCP command. Provide the still-open Chainlink issue id, the
+closed PR number, the exact old author leaf identity, a fresh bare leaf slug,
+the complete replacement task, and `human_approved: true`. The command keeps
+the old PR branch and exact head SHA as recoverable source, targets the old PR
+base branch for the new PR, clears old watcher/reviewer state, and retires the
+old leaf's tmux identity, resolver record, config, and worktree.
+
+Do not use it for an open PR (`restart_review` is the same-PR path), a merged PR,
+or a new Chainlink issue. If it reports cleanup or spawn failure, preserve the
+returned source SHA and retry the same replacement request; the durable record
+under `.exo/replacements/` makes retries idempotent and prevents duplicate
+fresh leaves.
+
 ## Branch Naming
 
 `{parent_branch}.{slug}` (dot separator). PRs target the parent branch, not main. Merged via recursive fold up the tree.

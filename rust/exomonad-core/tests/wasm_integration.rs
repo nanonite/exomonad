@@ -437,6 +437,28 @@ impl EffectHandler for MockAgentHandler {
                 legacy_review_file_removed: true,
             }
             .encode_to_vec()),
+            "agent.replace_closed_pr" => {
+                let req = ReplaceClosedPrRequest::decode(payload)
+                    .expect("mock agent handler should decode replace_closed_pr request");
+                Ok(ReplaceClosedPrResponse {
+                    success: true,
+                    chainlink_issue_id: req.chainlink_issue_id,
+                    old_pr_number: req.closed_pr_number,
+                    old_pr_state: "closed".into(),
+                    old_pr_merged: false,
+                    old_head_branch: "main.old-leaf-codex".into(),
+                    source_head_sha: "abc123".into(),
+                    original_base_branch: "main".into(),
+                    old_leaf_name: req.old_leaf_name,
+                    new_leaf_name: req.new_leaf_name,
+                    new_branch: "main.fresh-leaf-codex".into(),
+                    worktree_path: "/tmp/fresh-leaf-codex".into(),
+                    spawn_status: "spawned".into(),
+                    next_action: "Wait for the fresh leaf to file a new PR".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec())
+            }
             "agent.watcher_pr_state" => Ok(WatcherPrStateResponse {
                 success: true,
                 error: String::new(),
@@ -828,6 +850,7 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
         "notify_parent",
         "cleanup_reviewer_leaf",
         "restart_review",
+        "replace_close_pr",
         "watcher_pr_state",
     ] {
         assert!(
@@ -835,6 +858,36 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
             "TL role missing tool '{expected}'. Got: {names:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_replace_closed_pr_roundtrip_preserves_replacement_context() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "replace_close_pr",
+        json!({
+            "chainlink_issue_id": 541,
+            "closed_pr_number": 7,
+            "old_leaf_name": "old-leaf-codex",
+            "new_leaf_name": "fresh-leaf",
+            "replacement_task": "Address the remaining review findings",
+            "operator_context": "Human approved replacement after the old PR was closed",
+            "human_approved": true
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "replace_close_pr");
+    assert_eq!(output["result"]["success"], true);
+    assert_eq!(output["result"]["chainlink_issue_id"], 541);
+    assert_eq!(output["result"]["old_pr_number"], 7);
+    assert_eq!(output["result"]["source_head_sha"], "abc123");
+    assert_eq!(output["result"]["original_base_branch"], "main");
+    assert_eq!(output["result"]["new_leaf_name"], "fresh-leaf");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -974,6 +1027,7 @@ async fn wasm_chainlink_tools_are_scoped_by_role() {
         "close_issue_and_cleanup",
         "cleanup_reviewer_leaf",
         "restart_review",
+        "replace_close_pr",
         "watcher_pr_state",
     ];
 

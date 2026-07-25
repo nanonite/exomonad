@@ -6427,3 +6427,791 @@ instance (HsJSONPB.ToJSON CloseIssueAndCleanupResponse) where
 
 instance (HsJSONPB.FromJSON CloseIssueAndCleanupResponse) where
   parseJSON = HsJSONPB.parseJSONPB
+
+data ReplaceClosedPrRequest
+  = ReplaceClosedPrRequest
+  { replaceClosedPrRequestChainlinkIssueId :: Hs.Word64,
+    replaceClosedPrRequestClosedPrNumber :: Hs.Word64,
+    replaceClosedPrRequestOldLeafName :: Hs.Text,
+    replaceClosedPrRequestNewLeafName :: Hs.Text,
+    replaceClosedPrRequestReplacementTask :: Hs.Text,
+    replaceClosedPrRequestAgentType :: (HsProtobuf.Enumerated Effects.Agent.AgentType),
+    replaceClosedPrRequestOperatorContext :: Hs.Text,
+    replaceClosedPrRequestHumanApproved :: Hs.Bool
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData ReplaceClosedPrRequest)
+
+instance (HsProtobuf.Named ReplaceClosedPrRequest) where
+  nameOf _ = Hs.fromString "ReplaceClosedPrRequest"
+
+instance (HsProtobuf.HasDefault ReplaceClosedPrRequest)
+
+instance (HsProtobuf.Message ReplaceClosedPrRequest) where
+  encodeMessage
+    _
+    ReplaceClosedPrRequest
+      { replaceClosedPrRequestChainlinkIssueId,
+        replaceClosedPrRequestClosedPrNumber,
+        replaceClosedPrRequestOldLeafName,
+        replaceClosedPrRequestNewLeafName,
+        replaceClosedPrRequestReplacementTask,
+        replaceClosedPrRequestAgentType,
+        replaceClosedPrRequestOperatorContext,
+        replaceClosedPrRequestHumanApproved
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 1)
+                                    replaceClosedPrRequestChainlinkIssueId
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 2)
+                                    replaceClosedPrRequestClosedPrNumber
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 3)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    replaceClosedPrRequestOldLeafName
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 4)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                replaceClosedPrRequestNewLeafName
+                            )
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 5)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            replaceClosedPrRequestReplacementTask
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 6)
+                    replaceClosedPrRequestAgentType
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 7)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    replaceClosedPrRequestOperatorContext
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 8)
+            replaceClosedPrRequestHumanApproved
+        )
+  decodeMessage _ =
+    Hs.pure ReplaceClosedPrRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 2)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 6)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 8)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "chainlink_issue_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "closed_pr_number")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "old_leaf_name")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "new_leaf_name")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "replacement_task")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "AgentType"))
+        )
+        (HsProtobufAST.Single "agent_type")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "operator_context")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "human_approved")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB ReplaceClosedPrRequest) where
+  toJSONPB (ReplaceClosedPrRequest f1 f2 f3 f4 f5 f6 f7 f8) =
+    HsJSONPB.object
+      [ "chainlink_issue_id" .= f1,
+        "closed_pr_number" .= f2,
+        "old_leaf_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "new_leaf_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "replacement_task"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "agent_type" .= f6,
+        "operator_context"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "human_approved" .= f8
+      ]
+  toEncodingPB (ReplaceClosedPrRequest f1 f2 f3 f4 f5 f6 f7 f8) =
+    HsJSONPB.pairs
+      [ "chainlink_issue_id" .= f1,
+        "closed_pr_number" .= f2,
+        "old_leaf_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "new_leaf_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "replacement_task"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "agent_type" .= f6,
+        "operator_context"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "human_approved" .= f8
+      ]
+
+instance (HsJSONPB.FromJSONPB ReplaceClosedPrRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "ReplaceClosedPrRequest"
+      ( \obj ->
+          Hs.pure ReplaceClosedPrRequest
+            <*> obj .: "chainlink_issue_id"
+            <*> obj .: "closed_pr_number"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "old_leaf_name")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "new_leaf_name")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "replacement_task")
+                )
+            <*> obj .: "agent_type"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "operator_context")
+                )
+            <*> obj .: "human_approved"
+      )
+
+instance (HsJSONPB.ToJSON ReplaceClosedPrRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON ReplaceClosedPrRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data ReplaceClosedPrResponse
+  = ReplaceClosedPrResponse
+  { replaceClosedPrResponseSuccess :: Hs.Bool,
+    replaceClosedPrResponseError :: Hs.Text,
+    replaceClosedPrResponseChainlinkIssueId :: Hs.Word64,
+    replaceClosedPrResponseOldPrNumber :: Hs.Word64,
+    replaceClosedPrResponseOldPrState :: Hs.Text,
+    replaceClosedPrResponseOldPrMerged :: Hs.Bool,
+    replaceClosedPrResponseOldHeadBranch :: Hs.Text,
+    replaceClosedPrResponseSourceHeadSha :: Hs.Text,
+    replaceClosedPrResponseOriginalBaseBranch :: Hs.Text,
+    replaceClosedPrResponseOldLeafName :: Hs.Text,
+    replaceClosedPrResponseRetiredResources :: (Hs.Vector Hs.Text),
+    replaceClosedPrResponseNewLeafName :: Hs.Text,
+    replaceClosedPrResponseNewBranch :: Hs.Text,
+    replaceClosedPrResponseWorktreePath :: Hs.Text,
+    replaceClosedPrResponseSpawnStatus :: Hs.Text,
+    replaceClosedPrResponseNextAction :: Hs.Text,
+    replaceClosedPrResponseReplacementAlreadyExists :: Hs.Bool
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData ReplaceClosedPrResponse)
+
+instance (HsProtobuf.Named ReplaceClosedPrResponse) where
+  nameOf _ = Hs.fromString "ReplaceClosedPrResponse"
+
+instance (HsProtobuf.HasDefault ReplaceClosedPrResponse)
+
+instance (HsProtobuf.Message ReplaceClosedPrResponse) where
+  encodeMessage
+    _
+    ReplaceClosedPrResponse
+      { replaceClosedPrResponseSuccess,
+        replaceClosedPrResponseError,
+        replaceClosedPrResponseChainlinkIssueId,
+        replaceClosedPrResponseOldPrNumber,
+        replaceClosedPrResponseOldPrState,
+        replaceClosedPrResponseOldPrMerged,
+        replaceClosedPrResponseOldHeadBranch,
+        replaceClosedPrResponseSourceHeadSha,
+        replaceClosedPrResponseOriginalBaseBranch,
+        replaceClosedPrResponseOldLeafName,
+        replaceClosedPrResponseRetiredResources,
+        replaceClosedPrResponseNewLeafName,
+        replaceClosedPrResponseNewBranch,
+        replaceClosedPrResponseWorktreePath,
+        replaceClosedPrResponseSpawnStatus,
+        replaceClosedPrResponseNextAction,
+        replaceClosedPrResponseReplacementAlreadyExists
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( Hs.mappend
+                                    ( Hs.mappend
+                                        ( Hs.mappend
+                                            ( Hs.mappend
+                                                ( Hs.mappend
+                                                    ( Hs.mappend
+                                                        ( Hs.mappend
+                                                            ( Hs.mappend
+                                                                ( Hs.mappend
+                                                                    ( HsProtobuf.encodeMessageField
+                                                                        (HsProtobuf.FieldNumber 1)
+                                                                        replaceClosedPrResponseSuccess
+                                                                    )
+                                                                    ( HsProtobuf.encodeMessageField
+                                                                        (HsProtobuf.FieldNumber 2)
+                                                                        ( ( Hs.coerce
+                                                                              @Hs.Text
+                                                                              @(HsProtobuf.String Hs.Text)
+                                                                          )
+                                                                            replaceClosedPrResponseError
+                                                                        )
+                                                                    )
+                                                                )
+                                                                ( HsProtobuf.encodeMessageField
+                                                                    (HsProtobuf.FieldNumber 3)
+                                                                    replaceClosedPrResponseChainlinkIssueId
+                                                                )
+                                                            )
+                                                            ( HsProtobuf.encodeMessageField
+                                                                (HsProtobuf.FieldNumber 4)
+                                                                replaceClosedPrResponseOldPrNumber
+                                                            )
+                                                        )
+                                                        ( HsProtobuf.encodeMessageField
+                                                            (HsProtobuf.FieldNumber 5)
+                                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                                replaceClosedPrResponseOldPrState
+                                                            )
+                                                        )
+                                                    )
+                                                    ( HsProtobuf.encodeMessageField
+                                                        (HsProtobuf.FieldNumber 6)
+                                                        replaceClosedPrResponseOldPrMerged
+                                                    )
+                                                )
+                                                ( HsProtobuf.encodeMessageField
+                                                    (HsProtobuf.FieldNumber 7)
+                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                        replaceClosedPrResponseOldHeadBranch
+                                                    )
+                                                )
+                                            )
+                                            ( HsProtobuf.encodeMessageField
+                                                (HsProtobuf.FieldNumber 8)
+                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                    replaceClosedPrResponseSourceHeadSha
+                                                )
+                                            )
+                                        )
+                                        ( HsProtobuf.encodeMessageField
+                                            (HsProtobuf.FieldNumber 9)
+                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                replaceClosedPrResponseOriginalBaseBranch
+                                            )
+                                        )
+                                    )
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 10)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            replaceClosedPrResponseOldLeafName
+                                        )
+                                    )
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 11)
+                                    ( ( Hs.coerce
+                                          @(Hs.Vector Hs.Text)
+                                          @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                      )
+                                        replaceClosedPrResponseRetiredResources
+                                    )
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 12)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    replaceClosedPrResponseNewLeafName
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 13)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                replaceClosedPrResponseNewBranch
+                            )
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 14)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            replaceClosedPrResponseWorktreePath
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 15)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        replaceClosedPrResponseSpawnStatus
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 16)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    replaceClosedPrResponseNextAction
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 17)
+            replaceClosedPrResponseReplacementAlreadyExists
+        )
+  decodeMessage _ =
+    Hs.pure ReplaceClosedPrResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 3)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 4)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 6)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 9)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 10)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 11)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 12)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 13)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 14)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 15)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 16)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 17)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "chainlink_issue_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "old_pr_number")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "old_pr_state")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "old_pr_merged")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "old_head_branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "source_head_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "original_base_branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 10)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "old_leaf_name")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 11)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "retired_resources")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 12)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "new_leaf_name")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 13)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "new_branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 14)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "worktree_path")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 15)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "spawn_status")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 16)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "next_action")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 17)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "replacement_already_exists")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB ReplaceClosedPrResponse) where
+  toJSONPB
+    ( ReplaceClosedPrResponse
+        f1
+        f2
+        f3
+        f4
+        f5
+        f6
+        f7
+        f8
+        f9
+        f10
+        f11
+        f12
+        f13
+        f14
+        f15
+        f16
+        f17
+      ) =
+      HsJSONPB.object
+        [ "success" .= f1,
+          "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+          "chainlink_issue_id" .= f3,
+          "old_pr_number" .= f4,
+          "old_pr_state"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+          "old_pr_merged" .= f6,
+          "old_head_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+          "source_head_sha"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+          "original_base_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+          "old_leaf_name"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f10),
+          "retired_resources"
+            .= ( ( Hs.coerce
+                     @(Hs.Vector Hs.Text)
+                     @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                 )
+                   f11
+               ),
+          "new_leaf_name"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f12),
+          "new_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
+          "worktree_path"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
+          "spawn_status"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15),
+          "next_action"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f16),
+          "replacement_already_exists" .= f17
+        ]
+  toEncodingPB
+    ( ReplaceClosedPrResponse
+        f1
+        f2
+        f3
+        f4
+        f5
+        f6
+        f7
+        f8
+        f9
+        f10
+        f11
+        f12
+        f13
+        f14
+        f15
+        f16
+        f17
+      ) =
+      HsJSONPB.pairs
+        [ "success" .= f1,
+          "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+          "chainlink_issue_id" .= f3,
+          "old_pr_number" .= f4,
+          "old_pr_state"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+          "old_pr_merged" .= f6,
+          "old_head_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+          "source_head_sha"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+          "original_base_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+          "old_leaf_name"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f10),
+          "retired_resources"
+            .= ( ( Hs.coerce
+                     @(Hs.Vector Hs.Text)
+                     @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                 )
+                   f11
+               ),
+          "new_leaf_name"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f12),
+          "new_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
+          "worktree_path"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
+          "spawn_status"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15),
+          "next_action"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f16),
+          "replacement_already_exists" .= f17
+        ]
+
+instance (HsJSONPB.FromJSONPB ReplaceClosedPrResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "ReplaceClosedPrResponse"
+      ( \obj ->
+          Hs.pure ReplaceClosedPrResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+            <*> obj .: "chainlink_issue_id"
+            <*> obj .: "old_pr_number"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "old_pr_state")
+                )
+            <*> obj .: "old_pr_merged"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "old_head_branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "source_head_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "original_base_branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "old_leaf_name")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "retired_resources")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "new_leaf_name")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "new_branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "worktree_path")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "spawn_status")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "next_action")
+                )
+            <*> obj .: "replacement_already_exists"
+      )
+
+instance (HsJSONPB.ToJSON ReplaceClosedPrResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON ReplaceClosedPrResponse) where
+  parseJSON = HsJSONPB.parseJSONPB

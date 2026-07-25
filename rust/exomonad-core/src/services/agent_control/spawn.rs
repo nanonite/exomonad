@@ -1623,8 +1623,13 @@ impl<
             let effective_project_dir = self.project_dir();
             ensure_clean_spawn_worktree(effective_project_dir).await?;
 
-            // Parent branch derived from typed birth-branch.
-            let current_branch = BranchName::try_from_str(effective_birth.as_parent_branch())
+            // Replacement leaves may start from an old PR head while their branch
+            // hierarchy still targets the original PR base branch.
+            let parent_branch = options
+                .base_branch
+                .as_deref()
+                .unwrap_or(effective_birth.as_parent_branch());
+            let current_branch = BranchName::try_from_str(parent_branch)
                 .context("effective birth branch was empty")?;
 
             // Sanitize branch name and construct typed identity
@@ -1685,10 +1690,16 @@ impl<
             // Push parent branch so child PRs can reference it as base
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
-            let child_birth = existing_identity_record
-                .as_ref()
-                .map(|record| record.birth_branch.clone())
-                .unwrap_or_else(|| effective_birth.child(agent_name.as_str()));
+            let child_birth = if let Some(base_branch) = options.base_branch.as_deref() {
+                BirthBranch::try_from_str(base_branch)
+                    .context("replacement base branch was empty")?
+                    .child(agent_name.as_str())
+            } else {
+                existing_identity_record
+                    .as_ref()
+                    .map(|record| record.birth_branch.clone())
+                    .unwrap_or_else(|| effective_birth.child(agent_name.as_str()))
+            };
             let branch_name = BranchName::try_from_str(child_birth.to_string().as_str())
                 .expect("validated string input is non-empty");
 
@@ -1707,6 +1718,19 @@ impl<
                         worktree_path.display()
                     ));
                 }
+                if options.start_point.is_some() {
+                    let actual_branch = self
+                        .git_wt()
+                        .get_workspace_bookmark(&worktree_path)
+                        .context("failed to inspect existing replacement worktree")?;
+                    if actual_branch.as_deref() != Some(branch_name.as_str()) {
+                        return Err(anyhow!(
+                            "Existing replacement worktree is on {:?}, expected {}",
+                            actual_branch,
+                            branch_name
+                        ));
+                    }
+                }
                 info!(
                     worktree_path = %worktree_path.display(),
                     branch_name = %branch_name,
@@ -1714,7 +1738,25 @@ impl<
                 );
             } else {
                 ensure_branch_fetched(effective_project_dir, &branch_name).await;
-                self.create_worktree_checked(&worktree_path, &branch_name, &current_branch).await?;
+                if let Some(start_point) = options.start_point.as_deref() {
+                    if self.git_wt().branch_exists(&branch_name)? {
+                        self.create_worktree_from_existing_branch_checked(
+                            &worktree_path,
+                            &branch_name,
+                        )
+                        .await?;
+                    } else {
+                        self.create_worktree_from_revision_checked(
+                            &worktree_path,
+                            &branch_name,
+                            start_point,
+                        )
+                        .await?;
+                    }
+                } else {
+                    self.create_worktree_checked(&worktree_path, &branch_name, &current_branch)
+                        .await?;
+                }
                 remove_worktree_on_spawn_failure = true;
             }
 

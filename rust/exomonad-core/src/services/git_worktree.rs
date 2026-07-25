@@ -142,17 +142,81 @@ impl GitWorktreeService {
         branch: &BranchName,
         base: &BranchName,
     ) -> Result<(), WorktreeError> {
-        info!(path = %path.display(), branch = %branch, base = %base, "Creating git worktree");
+        self.create_workspace_from_ref(path, branch, base.as_str(), true)
+    }
 
+    /// Create a new git worktree with a new branch based on an exact revision.
+    ///
+    /// This is used by replacement workflows where the old PR head must remain
+    /// the starting point while the new PR targets the old PR's base branch.
+    pub fn create_workspace_from_revision(
+        &self,
+        path: &Path,
+        branch: &BranchName,
+        revision: &str,
+    ) -> Result<(), WorktreeError> {
+        if revision.trim().is_empty() {
+            return Err(WorktreeError::GitError {
+                message: "worktree start revision is empty".to_string(),
+            });
+        }
+        self.create_workspace_from_ref(path, branch, revision, true)
+    }
+
+    /// Attach a worktree to an existing local branch without recreating it.
+    ///
+    /// Replacement retries use this path after the first attempt has created
+    /// the new branch but failed before the agent window was registered.
+    pub fn create_workspace_from_existing_branch(
+        &self,
+        path: &Path,
+        branch: &BranchName,
+    ) -> Result<(), WorktreeError> {
+        self.create_workspace_from_ref(path, branch, branch.as_str(), false)
+    }
+
+    /// Check whether a local branch exists without mutating the repository.
+    pub fn branch_exists(&self, branch: &BranchName) -> Result<bool, WorktreeError> {
         let output = headless_git_command()
-            .args([
-                "worktree",
-                "add",
-                "-b",
-                branch.as_str(),
-                &path.to_string_lossy(),
-                base.as_str(),
-            ])
+            .args(["show-ref", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{}", branch.as_str()))
+            .current_dir(&self.project_dir)
+            .output()
+            .map_err(|e| WorktreeError::GitError {
+                message: format!("Failed to inspect git branch: {}", e),
+            })?;
+        if output.status.success() {
+            Ok(true)
+        } else if output.status.code() == Some(1) {
+            Ok(false)
+        } else {
+            Err(WorktreeError::GitError {
+                message: format!(
+                    "Failed to inspect branch {}: {}",
+                    branch,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            })
+        }
+    }
+
+    fn create_workspace_from_ref(
+        &self,
+        path: &Path,
+        branch: &BranchName,
+        base_ref: &str,
+        create_branch: bool,
+    ) -> Result<(), WorktreeError> {
+        info!(path = %path.display(), branch = %branch, base = %base_ref, "Creating git worktree");
+
+        let mut command = headless_git_command();
+        command.args(["worktree", "add"]);
+        if create_branch {
+            command.args(["-b", branch.as_str()]);
+        }
+        let output = command
+            .arg(path)
+            .arg(base_ref)
             .current_dir(&self.project_dir)
             .output()
             .map_err(|e| WorktreeError::GitError {
@@ -667,6 +731,57 @@ mod tests {
 
         assert!(worktree_path.exists());
         assert!(worktree_path.join(".git").exists());
+    }
+
+    #[test]
+    fn test_create_workspace_from_revision_preserves_source_head() {
+        let (temp, service) = init_test_repo();
+        std::fs::write(temp.path().join("source.txt"), "old PR head\n").unwrap();
+        let status = Command::new("git")
+            .args(["add", "source.txt"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args(["commit", "-m", "source head"])
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let sha = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(temp.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let branch = BranchName::try_from_str("main.replacement-codex")
+            .expect("literal validated string is non-empty");
+        let worktree_path = temp.path().join("replacement-codex");
+
+        service
+            .create_workspace_from_revision(&worktree_path, &branch, &sha)
+            .unwrap();
+
+        let head = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&worktree_path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(head, sha);
+        assert_eq!(
+            service.get_workspace_bookmark(&worktree_path).unwrap(),
+            Some(branch.to_string())
+        );
     }
 
     #[test]

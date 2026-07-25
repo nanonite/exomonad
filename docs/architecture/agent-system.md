@@ -45,6 +45,7 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 | `cleanup_reviewer_leaf` | x | x | | | |
 | `close_reviewer_window` | x | x | | | |
 | `restart_review` | x | x | | | |
+| `replace_close_pr` | x | x | | | |
 | `cleanup_orphan` | x | x | | | |
 | `watcher_pr_state` | x | x | | | |
 | `file_pr` | | x | x | | |
@@ -61,6 +62,22 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 | `approve_pr` | | | | x | |
 | `request_changes` | | | | x | |
 | `post_review_comment` | | | | x | |
+
+### Closed-PR replacement
+
+`replace_close_pr` is the explicit recovery path for a human-approved, closed
+and unmerged Forgejo PR. It requires the still-open Chainlink issue, the old
+author identity, and a fresh bare leaf slug plus a complete replacement task.
+The host validates the old PR metadata, preserves its exact head SHA and source
+branch, clears reviewer and watcher state, retires the old coupled identity and
+worktree, then creates a new branch from that SHA whose dotted parent is the
+old PR base branch. The old PR head is never used as the new PR base.
+
+The operation records durable state in `.exo/replacements/pr-<number>.json`.
+Retries return an already-spawned replacement or resume cleanup/spawn after a
+partial failure; they never silently reuse a different slug or create a second
+replacement. Open PRs must use `restart_review`, merged PRs are rejected, and
+the Chainlink issue is never closed by this command.
 
 ### Chainlink tools
 

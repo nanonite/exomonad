@@ -87,6 +87,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add TL-approved closed-PR replacement workflow (#541)
 - `exomonad models codex` now queries `codex debug models` live instead of a hardcoded list; claude/gemini/codex-fugu disclaimers now explicitly state no discovery path is available (#532)
 - Add effort and Codex Fugu integration coverage (#531)
 - Improve effort and harness CLI guidance (#530)

@@ -2,10 +2,9 @@
 //!
 //! Uses proto-generated types from `exomonad_proto::effects::agent`.
 
-#[cfg(test)]
-use crate::domain::BranchName;
 use crate::domain::{
-    AgentName, AgentPermissions, BirthBranch, CIStatus, ClaudeSessionUuid, RoutingInfo, TeamName,
+    AgentName, AgentPermissions, BirthBranch, BranchName, CIStatus, ClaudeSessionUuid, RoutingInfo,
+    Slug, TeamName,
 };
 use crate::effects::{
     dispatch_agent_effect, AgentEffects, EffectError, EffectHandler, EffectResult, ResultExt,
@@ -14,9 +13,9 @@ use crate::effects::{
 
 use super::non_empty;
 use crate::services::agent_control::{
-    AgentControlService, AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags,
-    SpawnGeminiTeammateOptions, SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions,
-    SpawnWorkerOptions,
+    slugify, AgentControlService, AgentIdentity, AgentInfo, AgentType as ServiceAgentType,
+    ClaudeSpawnFlags, SpawnGeminiTeammateOptions, SpawnLeafOptions, SpawnOptions,
+    SpawnSubtreeOptions, SpawnWorkerOptions,
 };
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
@@ -28,6 +27,7 @@ use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use async_trait::async_trait;
 use chrono::Utc;
 use exomonad_proto::effects::agent::*;
+use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -943,6 +943,262 @@ impl<
         }
     }
 
+    async fn replace_closed_pr(
+        &self,
+        req: ReplaceClosedPrRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<ReplaceClosedPrResponse> {
+        let issue_id = req.chainlink_issue_id;
+        let old_pr_number = req.closed_pr_number;
+        let old_leaf_name = req.old_leaf_name.trim().to_string();
+        let new_leaf_name = req.new_leaf_name.trim().to_string();
+        let replacement_task = req.replacement_task.trim().to_string();
+
+        if issue_id == 0 {
+            return Ok(replace_closed_pr_error("chainlink_issue_id is required"));
+        }
+        if old_pr_number == 0 {
+            return Ok(replace_closed_pr_error("closed_pr_number is required"));
+        }
+        if old_leaf_name.is_empty() {
+            return Ok(replace_closed_pr_error("old_leaf_name is required"));
+        }
+        if new_leaf_name.is_empty() {
+            return Ok(replace_closed_pr_error("new_leaf_name is required"));
+        }
+        if replacement_task.is_empty() {
+            return Ok(replace_closed_pr_error("replacement_task is required"));
+        }
+        if !req.human_approved {
+            return Ok(replace_closed_pr_error(
+                "human_approved must be true before retiring the old PR and leaf",
+            ));
+        }
+
+        let new_slug = slugify(&new_leaf_name);
+        if new_slug != new_leaf_name {
+            return Ok(replace_closed_pr_error(
+                "new_leaf_name must be a fresh bare slug without a runtime suffix",
+            ));
+        }
+        let old_identity = AgentIdentity::from_internal_name(&old_leaf_name);
+        if new_slug == old_identity.slug() {
+            return Ok(replace_closed_pr_error(
+                "new_leaf_name must differ from the old leaf identity",
+            ));
+        }
+
+        if let Err(error) = ensure_chainlink_issue_open(self.ctx.project_dir(), issue_id).await {
+            return Ok(replace_closed_pr_error(&error));
+        }
+
+        let pr = match self.resolve_forgejo_pr(old_pr_number).await {
+            Ok(pr) => pr,
+            Err(error) => return Ok(replace_closed_pr_error(&error.to_string())),
+        };
+        if let Err(error) = ensure_closed_unmerged_pr(&pr, old_pr_number) {
+            return Ok(replace_closed_pr_error(&error.to_string()));
+        }
+
+        let metadata = parse_pr_body_metadata(&pr.body);
+        if let Some(metadata_issue_id) = metadata.chainlink_issue_id {
+            if metadata_issue_id != issue_id {
+                return Ok(replace_closed_pr_error(&format!(
+                    "closed PR #{old_pr_number} belongs to Chainlink issue #{metadata_issue_id}, not #{issue_id}"
+                )));
+            }
+        }
+        if let Some(author_agent) = metadata.author_agent.as_deref() {
+            if !leaf_identity_matches(author_agent, &old_leaf_name) {
+                return Ok(replace_closed_pr_error(&format!(
+                    "closed PR #{old_pr_number} author '{author_agent}' does not match old_leaf_name '{old_leaf_name}'"
+                )));
+            }
+        }
+
+        let source_head_sha = match pr.head_sha.clone().filter(|sha| !sha.trim().is_empty()) {
+            Some(sha) => sha,
+            None => {
+                return Ok(replace_closed_pr_error(&format!(
+                    "closed PR #{old_pr_number} has no exact head SHA; refusing replacement"
+                )))
+            }
+        };
+        let old_head_branch = pr.head_ref.to_string();
+        let original_base_branch = pr.base_ref.to_string();
+        if let Err(error) = ensure_git_revision_reachable(
+            self.ctx.project_dir(),
+            &old_head_branch,
+            &source_head_sha,
+        )
+        .await
+        {
+            return Ok(replace_closed_pr_error(&error));
+        }
+
+        let agent_type = convert_agent_type_or_default(
+            req.agent_type(),
+            self.service.default_spawn_agent_type(),
+        );
+        let new_identity = AgentIdentity::new(new_slug.clone(), agent_type);
+        let new_internal_name = new_identity.internal_name().to_string();
+        let new_branch = match BirthBranch::try_from_str(&original_base_branch) {
+            Ok(base) => base.child(&new_internal_name).to_string(),
+            Err(error) => return Ok(replace_closed_pr_error(&error.to_string())),
+        };
+        let new_worktree_path = self.service.worktree_base.join(new_internal_name.as_str());
+        let record_path = replacement_record_path(self.ctx.project_dir(), old_pr_number);
+
+        if let Some(record) = read_replacement_record(&record_path).await? {
+            if !record.matches_request(
+                issue_id,
+                old_pr_number,
+                &old_leaf_name,
+                &new_slug,
+                &source_head_sha,
+                &original_base_branch,
+            ) {
+                return Ok(replace_closed_pr_error(&format!(
+                    "replacement record for PR #{old_pr_number} does not match this request"
+                )));
+            }
+            if record.spawn_status == "spawned" {
+                return Ok(record.to_response(true));
+            }
+        } else if let Some(conflict) = self
+            .replacement_identity_conflict(&new_slug, &new_branch, &new_worktree_path)
+            .await?
+        {
+            return Ok(replace_closed_pr_error(&conflict));
+        }
+
+        let mut record = ReplacementRecord::new(
+            issue_id,
+            old_pr_number,
+            &pr.state,
+            pr.merged,
+            &old_head_branch,
+            &source_head_sha,
+            &original_base_branch,
+            &old_leaf_name,
+            &new_slug,
+            &new_branch,
+            &new_worktree_path,
+        );
+        write_replacement_record(&record_path, &record).await?;
+
+        let cleaned_reviewers =
+            cleanup_force_reviewer_resources(&self.service, old_pr_number).await;
+        let mut retired_resources = cleaned_reviewers
+            .iter()
+            .map(|name| format!("reviewer:{name}"))
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            clear_reviewer_review_artifacts(self.ctx.project_dir(), old_pr_number).await
+        {
+            record.spawn_status = "cleanup_failed".to_string();
+            record.error = error.to_string();
+            record.retired_resources = retired_resources;
+            write_replacement_record(&record_path, &record).await?;
+            return Ok(record.to_response(false));
+        }
+        retired_resources.push(format!("watcher-state:pr-{old_pr_number}"));
+
+        if let Err(error) = self.service.cleanup_agent(&old_leaf_name).await {
+            record.spawn_status = "cleanup_failed".to_string();
+            record.error = error.to_string();
+            record.retired_resources = retired_resources;
+            write_replacement_record(&record_path, &record).await?;
+            return Ok(record.to_response(false));
+        }
+        if old_leaf_worktree_exists(&self.service.worktree_base, &old_identity) {
+            record.spawn_status = "cleanup_failed".to_string();
+            record.error = format!(
+                "old leaf worktree for '{}' still exists after cleanup",
+                old_leaf_name
+            );
+            record.retired_resources = retired_resources;
+            write_replacement_record(&record_path, &record).await?;
+            return Ok(record.to_response(false));
+        }
+        retired_resources.push(format!("author-worktree:{old_leaf_name}"));
+        record.retired_resources = retired_resources;
+        record.spawn_status = "cleanup_complete".to_string();
+        write_replacement_record(&record_path, &record).await?;
+
+        let operator_context = req.operator_context.trim();
+        let task = format!(
+            "{replacement_task}\n\nReplacement PR context:\n- Chainlink issue: #{issue_id} (keep this issue open and continue it)\n- Old PR: #{old_pr_number} (closed, unmerged; do not reopen or resume it)\n- Source branch: {old_head_branch}\n- Source head SHA: {source_head_sha}\n- New PR base branch: {original_base_branch}\n- Fresh leaf identity: {new_leaf_name}\n\nStart from the exact source SHA, make the requested fixes, and file a NEW PR targeting the stated base branch. Do not create a new Chainlink issue.{}",
+            if operator_context.is_empty() {
+                String::new()
+            } else {
+                format!("\n- Operator context: {operator_context}")
+            }
+        );
+        let options = SpawnLeafOptions {
+            task,
+            branch_name: new_slug.clone(),
+            role: Some(crate::domain::Role::dev()),
+            agent_type,
+            claude_flags: ClaudeSpawnFlags::default(),
+            standalone_repo: false,
+            allowed_dirs: Vec::new(),
+            start_point: Some(source_head_sha.clone()),
+            base_branch: Some(original_base_branch.clone()),
+        };
+        let spawn_result = match self
+            .service
+            .spawn_leaf_subtree(&options, &ctx.birth_branch)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                record.spawn_status = "spawn_failed".to_string();
+                record.error = error.to_string();
+                write_replacement_record(&record_path, &record).await?;
+                return Ok(record.to_response(false));
+            }
+        };
+
+        let agent_info = leaf_subtree_result_to_proto(&new_slug, &spawn_result);
+        if spawn_result.agent_type == ServiceAgentType::Claude {
+            self.register_claude_team_child(
+                &spawn_result.agent_name,
+                &format!("{}-leaf", spawn_result.agent_type.suffix()),
+                &new_branch,
+                ctx,
+            )
+            .await;
+        } else {
+            self.register_child_supervisor(agent_info.id.as_str(), ctx)
+                .await;
+        }
+
+        record.spawn_status = "spawned".to_string();
+        record.error.clear();
+        record.worktree_path = spawn_result.agent_dir.to_string_lossy().to_string();
+        write_replacement_record(&record_path, &record).await?;
+        if let Some(log) = self.ctx.event_log() {
+            let _ = log.append(
+                "pr.replaced",
+                ctx.agent_name.as_ref(),
+                &serde_json::json!({
+                    "chainlink_issue_id": issue_id,
+                    "old_pr_number": old_pr_number,
+                    "old_leaf_name": old_leaf_name,
+                    "source_branch": old_head_branch,
+                    "source_head_sha": source_head_sha,
+                    "base_branch": original_base_branch,
+                    "new_leaf_name": new_slug,
+                    "new_branch": new_branch,
+                    "worktree_path": record.worktree_path,
+                    "new_agent": agent_info.id,
+                }),
+            );
+        }
+        Ok(record.to_response(false))
+    }
+
     async fn watcher_pr_state(
         &self,
         req: WatcherPrStateRequest,
@@ -1042,6 +1298,8 @@ impl<
             ),
             standalone_repo: req.standalone_repo,
             allowed_dirs: req.allowed_dirs,
+            start_point: None,
+            base_branch: None,
         };
 
         let result = self
@@ -1528,6 +1786,53 @@ impl<
             + 'static,
     > AgentHandler<C>
 {
+    async fn resolve_forgejo_pr(&self, pr_number: u64) -> EffectResult<ForgejoPullRequest> {
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Err(EffectError::not_found(
+                "Forgejo is not configured; cannot replace a closed PR",
+            ));
+        };
+        let repo_info = crate::services::repo::get_repo_info(self.ctx.project_dir())
+            .await
+            .effect_err("agent")?;
+        forgejo
+            .get_pull_request(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
+            .await
+            .effect_err("agent")
+    }
+
+    async fn replacement_identity_conflict(
+        &self,
+        new_slug: &str,
+        new_branch: &str,
+        new_worktree_path: &Path,
+    ) -> EffectResult<Option<String>> {
+        let slug = Slug::try_from_str(new_slug).expect("validated replacement slug is non-empty");
+        if self
+            .service
+            .agent_resolver()
+            .lookup_by_slug(&slug)
+            .await
+            .is_some()
+        {
+            return Ok(Some(format!(
+                "new leaf identity '{new_slug}' is already registered"
+            )));
+        }
+        if new_worktree_path.exists()
+            || self.service.worktree_base.join(new_slug).exists()
+            || self.service.git_wt().branch_exists(
+                &BranchName::try_from_str(new_branch)
+                    .expect("validated replacement branch is non-empty"),
+            )?
+        {
+            return Ok(Some(format!(
+                "new leaf identity '{new_slug}' or branch '{new_branch}' already exists; choose a fresh slug"
+            )));
+        }
+        Ok(None)
+    }
+
     async fn matching_open_forgejo_prs_for_cleanup(
         &self,
         issue_id: u64,
@@ -1578,6 +1883,252 @@ fn ensure_open_unmerged_pr(pr: &ForgejoPullRequest, pr_number: u64) -> EffectRes
         )));
     }
     Ok(())
+}
+
+fn ensure_closed_unmerged_pr(pr: &ForgejoPullRequest, pr_number: u64) -> Result<(), EffectError> {
+    if pr.merged {
+        return Err(EffectError::invalid_input(format!(
+            "PR #{pr_number} is merged; replacement is only for closed, unmerged PRs"
+        )));
+    }
+    if !pr.state.eq_ignore_ascii_case("closed") {
+        return Err(EffectError::invalid_input(format!(
+            "PR #{pr_number} is open; use restart_review for an open PR"
+        )));
+    }
+    Ok(())
+}
+
+fn leaf_identity_matches(metadata_name: &str, requested_name: &str) -> bool {
+    if metadata_name == requested_name {
+        return true;
+    }
+    let has_runtime_suffix = ["-claude", "-gemini", "-shoal", "-opencode", "-codex"]
+        .iter()
+        .any(|suffix| metadata_name.ends_with(suffix));
+    !has_runtime_suffix
+        && AgentIdentity::from_internal_name(metadata_name).slug()
+            == AgentIdentity::from_internal_name(requested_name).slug()
+}
+
+async fn ensure_chainlink_issue_open(project_dir: &Path, issue_id: u64) -> Result<(), String> {
+    let output = Command::new("chainlink")
+        .args(["show", &issue_id.to_string()])
+        .current_dir(project_dir)
+        .output()
+        .await
+        .map_err(|error| format!("failed to inspect Chainlink issue #{issue_id}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Chainlink issue #{issue_id} could not be inspected: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("Status: closed"))
+    {
+        return Err(format!(
+            "Chainlink issue #{issue_id} is closed; replacement must continue the existing open issue"
+        ));
+    }
+    if !stdout
+        .lines()
+        .any(|line| line.trim().to_ascii_lowercase().starts_with("status:"))
+    {
+        return Err(format!(
+            "Chainlink issue #{issue_id} status was not returned; refusing replacement"
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_git_revision_reachable(
+    project_dir: &Path,
+    source_branch: &str,
+    source_sha: &str,
+) -> Result<(), String> {
+    let revision = format!("{source_sha}^{{commit}}");
+    let reachable = Command::new("git")
+        .args(["cat-file", "-e", &revision])
+        .current_dir(project_dir)
+        .output()
+        .await
+        .map_err(|error| format!("failed to inspect source SHA {source_sha}: {error}"))?;
+    if reachable.status.success() {
+        return Ok(());
+    }
+
+    let fetched = Command::new("git")
+        .args(["fetch", "--all", "--prune"])
+        .current_dir(project_dir)
+        .output()
+        .await
+        .map_err(|error| format!("failed to fetch source branch '{source_branch}': {error}"))?;
+    if !fetched.status.success() {
+        return Err(format!(
+            "source SHA {source_sha} for branch '{source_branch}' is unavailable and fetch failed: {}",
+            String::from_utf8_lossy(&fetched.stderr).trim()
+        ));
+    }
+
+    let reachable_after_fetch = Command::new("git")
+        .args(["cat-file", "-e", &revision])
+        .current_dir(project_dir)
+        .output()
+        .await
+        .map_err(|error| format!("failed to verify fetched source SHA {source_sha}: {error}"))?;
+    if reachable_after_fetch.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "source SHA {source_sha} for branch '{source_branch}' is not reachable locally or from configured remotes"
+        ))
+    }
+}
+
+fn old_leaf_worktree_exists(worktree_base: &Path, identity: &AgentIdentity) -> bool {
+    worktree_base.join(identity.slug()).exists()
+        || worktree_base
+            .join(identity.internal_name().as_str())
+            .exists()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplacementRecord {
+    chainlink_issue_id: u64,
+    old_pr_number: u64,
+    old_pr_state: String,
+    old_pr_merged: bool,
+    old_head_branch: String,
+    source_head_sha: String,
+    original_base_branch: String,
+    old_leaf_name: String,
+    new_leaf_name: String,
+    new_branch: String,
+    worktree_path: String,
+    retired_resources: Vec<String>,
+    spawn_status: String,
+    error: String,
+}
+
+impl ReplacementRecord {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        chainlink_issue_id: u64,
+        old_pr_number: u64,
+        old_pr_state: &str,
+        old_pr_merged: bool,
+        old_head_branch: &str,
+        source_head_sha: &str,
+        original_base_branch: &str,
+        old_leaf_name: &str,
+        new_leaf_name: &str,
+        new_branch: &str,
+        worktree_path: &Path,
+    ) -> Self {
+        Self {
+            chainlink_issue_id,
+            old_pr_number,
+            old_pr_state: old_pr_state.to_string(),
+            old_pr_merged,
+            old_head_branch: old_head_branch.to_string(),
+            source_head_sha: source_head_sha.to_string(),
+            original_base_branch: original_base_branch.to_string(),
+            old_leaf_name: old_leaf_name.to_string(),
+            new_leaf_name: new_leaf_name.to_string(),
+            new_branch: new_branch.to_string(),
+            worktree_path: worktree_path.to_string_lossy().to_string(),
+            retired_resources: Vec::new(),
+            spawn_status: "pending".to_string(),
+            error: String::new(),
+        }
+    }
+
+    fn matches_request(
+        &self,
+        issue_id: u64,
+        old_pr_number: u64,
+        old_leaf_name: &str,
+        new_leaf_name: &str,
+        source_head_sha: &str,
+        original_base_branch: &str,
+    ) -> bool {
+        self.chainlink_issue_id == issue_id
+            && self.old_pr_number == old_pr_number
+            && self.old_leaf_name == old_leaf_name
+            && self.new_leaf_name == new_leaf_name
+            && self.source_head_sha == source_head_sha
+            && self.original_base_branch == original_base_branch
+    }
+
+    fn to_response(&self, already_exists: bool) -> ReplaceClosedPrResponse {
+        let success = self.spawn_status == "spawned";
+        ReplaceClosedPrResponse {
+            success,
+            error: self.error.clone(),
+            chainlink_issue_id: self.chainlink_issue_id,
+            old_pr_number: self.old_pr_number,
+            old_pr_state: self.old_pr_state.clone(),
+            old_pr_merged: self.old_pr_merged,
+            old_head_branch: self.old_head_branch.clone(),
+            source_head_sha: self.source_head_sha.clone(),
+            original_base_branch: self.original_base_branch.clone(),
+            old_leaf_name: self.old_leaf_name.clone(),
+            retired_resources: self.retired_resources.clone(),
+            new_leaf_name: self.new_leaf_name.clone(),
+            new_branch: self.new_branch.clone(),
+            worktree_path: self.worktree_path.clone(),
+            spawn_status: self.spawn_status.clone(),
+            next_action: if success {
+                "Wait for the fresh leaf to file a new PR against the original base branch"
+                    .to_string()
+            } else {
+                "Inspect the reported state and retry replace_close_pr; the old PR head and replacement record are preserved"
+                    .to_string()
+            },
+            replacement_already_exists: already_exists,
+        }
+    }
+}
+
+fn replace_closed_pr_error(message: &str) -> ReplaceClosedPrResponse {
+    ReplaceClosedPrResponse {
+        success: false,
+        error: message.to_string(),
+        ..Default::default()
+    }
+}
+
+fn replacement_record_path(project_dir: &Path, old_pr_number: u64) -> PathBuf {
+    project_dir
+        .join(".exo/replacements")
+        .join(format!("pr-{old_pr_number}.json"))
+}
+
+async fn read_replacement_record(path: &Path) -> EffectResult<Option<ReplacementRecord>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => serde_json::from_str(&contents)
+            .map(Some)
+            .effect_err("agent"),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(EffectError::custom(
+            "replacement_record_error",
+            format!("failed to read {}: {error}", path.display()),
+        )),
+    }
+}
+
+async fn write_replacement_record(path: &Path, record: &ReplacementRecord) -> EffectResult<()> {
+    tokio::fs::create_dir_all(
+        path.parent()
+            .expect("replacement record path always has a parent directory"),
+    )
+    .await
+    .effect_err("agent")?;
+    let contents = serde_json::to_vec_pretty(record).effect_err("agent")?;
+    tokio::fs::write(path, contents).await.effect_err("agent")
 }
 
 fn pr_entry_from_forgejo_pull_request(pr: ForgejoPullRequest) -> PrEntry {
@@ -2463,6 +3014,64 @@ mod tests {
 
         let open = restart_test_pr();
         assert!(ensure_open_unmerged_pr(&open, 7).is_ok());
+    }
+
+    #[test]
+    fn replace_closed_pr_rejects_open_and_merged_targets() {
+        let open = restart_test_pr();
+        let error = ensure_closed_unmerged_pr(&open, 7).unwrap_err().to_string();
+        assert!(error.contains("open"));
+
+        let mut merged = restart_test_pr();
+        merged.state = "closed".to_string();
+        merged.merged = true;
+        let error = ensure_closed_unmerged_pr(&merged, 7)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("merged"));
+
+        let mut closed = restart_test_pr();
+        closed.state = "closed".to_string();
+        assert!(ensure_closed_unmerged_pr(&closed, 7).is_ok());
+    }
+
+    #[test]
+    fn replace_closed_pr_enforces_leaf_identity_and_source_base_separation() {
+        assert!(leaf_identity_matches("old-leaf-codex", "old-leaf-codex"));
+        assert!(leaf_identity_matches("old-leaf", "old-leaf-codex"));
+        assert!(!leaf_identity_matches("other-leaf-codex", "old-leaf-codex"));
+
+        let identity = AgentIdentity::new("fresh-leaf".to_string(), ServiceAgentType::Codex);
+        let branch = BirthBranch::try_from_str("release/2026")
+            .unwrap()
+            .child(&identity.internal_name().to_string());
+        assert_eq!(branch.to_string(), "release/2026.fresh-leaf-codex");
+        assert_ne!(branch.to_string(), "old-pr-head");
+    }
+
+    #[test]
+    fn replacement_record_is_retry_safe_and_preserves_failure_details() {
+        let mut record = ReplacementRecord::new(
+            540,
+            7,
+            "closed",
+            false,
+            "main.old-leaf-codex",
+            "abc123",
+            "main",
+            "old-leaf-codex",
+            "fresh-leaf",
+            "main.fresh-leaf-codex",
+            Path::new(".exo/worktrees/fresh-leaf-codex"),
+        );
+        assert!(record.matches_request(540, 7, "old-leaf-codex", "fresh-leaf", "abc123", "main"));
+        record.spawn_status = "spawn_failed".to_string();
+        record.error = "tmux unavailable".to_string();
+        let response = record.to_response(false);
+        assert!(!response.success);
+        assert_eq!(response.source_head_sha, "abc123");
+        assert_eq!(response.original_base_branch, "main");
+        assert!(response.next_action.contains("retry"));
     }
 
     #[test]

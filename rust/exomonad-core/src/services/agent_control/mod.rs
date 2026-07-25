@@ -531,6 +531,12 @@ pub struct SpawnLeafOptions {
     pub standalone_repo: bool,
     /// Directories from the parent project to be copied into the agent's worktree.
     pub allowed_dirs: Vec<String>,
+    /// Optional exact revision from which to create the leaf branch.
+    #[serde(default)]
+    pub start_point: Option<String>,
+    /// Optional base branch used for the leaf birth branch and future PR target.
+    #[serde(default)]
+    pub base_branch: Option<String>,
 }
 
 /// Result of spawning an agent.

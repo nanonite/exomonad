@@ -91,6 +91,54 @@ impl<
         branch_name: &BranchName,
         base_branch: &BranchName,
     ) -> Result<()> {
+        self.create_worktree_checked_at(
+            worktree_path,
+            branch_name,
+            base_branch.as_str(),
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// Create a worktree from an exact revision while retaining the supplied branch name.
+    pub(crate) async fn create_worktree_from_revision_checked(
+        &self,
+        worktree_path: &Path,
+        branch_name: &BranchName,
+        revision: &str,
+    ) -> Result<()> {
+        if revision.trim().is_empty() {
+            return Err(anyhow!("worktree start revision is empty"));
+        }
+        self.create_worktree_checked_at(worktree_path, branch_name, revision, true, false)
+            .await
+    }
+
+    /// Reattach a worktree to an already-created branch during a retry.
+    pub(crate) async fn create_worktree_from_existing_branch_checked(
+        &self,
+        worktree_path: &Path,
+        branch_name: &BranchName,
+    ) -> Result<()> {
+        self.create_worktree_checked_at(
+            worktree_path,
+            branch_name,
+            branch_name.as_str(),
+            false,
+            true,
+        )
+        .await
+    }
+
+    async fn create_worktree_checked_at(
+        &self,
+        worktree_path: &Path,
+        branch_name: &BranchName,
+        base_ref: &str,
+        from_revision: bool,
+        existing_branch: bool,
+    ) -> Result<()> {
         if worktree_path.exists() {
             info!(path = %worktree_path.display(), "Removing existing workspace for idempotency");
             let git_wt = self.git_wt().clone();
@@ -107,7 +155,7 @@ impl<
         }
 
         info!(
-            base_branch = %base_branch,
+            base_ref,
             branch_name = %branch_name,
             worktree_path = %worktree_path.display(),
             "Creating git worktree"
@@ -116,10 +164,18 @@ impl<
         let git_wt = self.git_wt().clone();
         let path = worktree_path.to_path_buf();
         let bookmark = branch_name.clone();
-        let base = base_branch.clone();
+        let base_ref = base_ref.to_string();
         let result = tokio::task::spawn_blocking(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                git_wt.create_workspace(&path, &bookmark, &base)
+                if existing_branch {
+                    git_wt.create_workspace_from_existing_branch(&path, &bookmark)
+                } else if from_revision {
+                    git_wt.create_workspace_from_revision(&path, &bookmark, &base_ref)
+                } else {
+                    let base = BranchName::try_from_str(&base_ref)
+                        .expect("validated branch name is non-empty");
+                    git_wt.create_workspace(&path, &bookmark, &base)
+                }
             }))
         })
         .await
