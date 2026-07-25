@@ -230,12 +230,18 @@ impl GitService {
             .get_branch(dir)
             .await?
             .context("HEAD is detached; repository info requires a branch")?;
-        let remote_url = self.get_remote_url(dir, "").await.ok();
 
-        let (owner, name) = remote_url
-            .as_ref()
-            .and_then(|url| repo::parse_github_url(url).ok())
-            .unzip();
+        // Delegate owner/repo resolution to `repo::get_repo_info`, which honors the
+        // `exomonad.remote` override. This function used to resolve the remote itself
+        // via `get_remote_url(dir, "")` / `detect_first_remote`, which always prefers
+        // "origin" — ignoring `exomonad.remote` entirely. That let merge_pr's Forgejo
+        // readiness check leak the GitHub remote's owner into Forgejo API calls on
+        // multi-remote repos even after `exomonad init --set-git-remote` was set,
+        // because this was a second, independent remote-selection implementation.
+        let (owner, name) = match repo::get_repo_info(dir).await {
+            Ok(info) => (Some(info.owner), Some(info.repo)),
+            Err(_) => (None, None),
+        };
 
         Ok(RepoInfo {
             branch,
@@ -463,5 +469,51 @@ mod tests {
 
         // Empty string
         assert_eq!(extract_agent_id(""), None);
+    }
+
+    /// Regression test: `get_repo_info` used to resolve owner/repo via its own
+    /// `get_remote_url(dir, "")` → `detect_first_remote` → `select_remote` chain,
+    /// which always prefers "origin" and never consults the `exomonad.remote`
+    /// git config override. On a repo with both a GitHub `origin` and a Forgejo
+    /// remote, that leaked the GitHub owner into Forgejo API calls (e.g.
+    /// merge_pr's readiness check) even after `exomonad init --set-git-remote`
+    /// pinned the Forgejo remote. `get_repo_info` must delegate to
+    /// `services::repo::get_repo_info`, which honors the override.
+    #[tokio::test]
+    async fn test_get_repo_info_honors_exomonad_remote_override() {
+        use crate::services::local::LocalExecutor;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git command should run")
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["commit", "--allow-empty", "-q", "-m", "init"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/nanonite/repo.git",
+        ]);
+        run(&[
+            "remote",
+            "add",
+            "forgejo",
+            "http://localhost:3000/goya/repo.git",
+        ]);
+        run(&["config", "--local", "exomonad.remote", "forgejo"]);
+
+        let service = GitService::new(Arc::new(LocalExecutor::new()));
+        let info = service.get_repo_info(dir.to_str().unwrap()).await.unwrap();
+
+        assert_eq!(info.owner.as_ref().map(|o| o.as_str()), Some("goya"));
+        assert_eq!(info.name.as_ref().map(|n| n.as_str()), Some("repo"));
     }
 }

@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix Forgejo review comment visibility and fan-out routing (#534)
+- `merge_pr`'s pre-merge Forgejo readiness check still leaked the GitHub `origin` remote's owner into Forgejo API calls on multi-remote repos, even with `exomonad.remote` set — `GitService::get_repo_info` (services/git.rs) had its own remote-detection logic that always preferred `origin` and never consulted the `exomonad.remote` override, a second, independent implementation of the same lookup `#533` had already fixed in `services::repo::get_repo_info`. `GitService::get_repo_info` now delegates to that override-aware function; added a regression test
+- Codex reviewers could never submit a Forgejo verdict: `CODEX_REVIEWER_INSTRUCTIONS` told reviewers to `curl`/`fj` Forgejo directly from their own shell, while the Codex reviewer sandbox profile sets `network_access = false`. Reverted to the MCP-tool verdict path (`approve_pr`/`request_changes`/`post_review_comment`), which runs in the unsandboxed ExoMonad host process; added a regression test and a new E2E test (`tests/e2e/codex-reviewer-sandbox`)
 - Multi-remote repos leak the wrong backend's owner/repo into Forgejo PR/CI calls; add `exomonad init --set-git-remote <name>` and `exomonad.remote` git config override (#533)
 - spawn_leaf cannot resume from existing remote branch when local worktree was deleted (#525)
 - Fix reviewer re-spawn blocked when terminal-review and SHA-change occur in same poll cycle (#524)
@@ -194,6 +197,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Route review fan-out to the dev leaf and spawn each reviewer round explicitly (#536)
 - Route comment-only Forgejo reviews through the watcher review-state pipeline (#535)
 - Prefer fj CLI over curl in reviewer/dev/root Forgejo interaction prompts (#505)
 - Add e2e test: two ChangesRequested review rounds → watcher fires Stuck → human review-loop escalation (#503)

@@ -74,6 +74,10 @@ rust/exomonad/.exo/
 # GHC TemplateHaskell splice .so dumps (leaked to CWD)
 .*-[0-9]*.so
 
+# Python test caches
+**/__pycache__/
+*.pyc
+
 # Stale Nix shell tempdirs (leak to CWD when shell is killed hard)
 nix-develop-*/
 nix-shell.*/

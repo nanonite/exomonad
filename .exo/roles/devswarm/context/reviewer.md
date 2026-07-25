@@ -22,18 +22,7 @@ review comments, and approve or request changes.
 
 ## Review Access
 
-Prefer `fj` (Forgejo CLI, a Rust binary on PATH) for review data and final verdicts. The task prompt includes the PR number and repo slug; the environment provides `FORGEJO_URL` and a reviewer token as `FORGEJO_REVIEWER_TOKEN` or `FORGEJO_TOKEN`.
-
-Use `fj` commands where available:
-- `fj pr view <number>` — inspect PR metadata and diff
-- `fj pr review <number> --approve -c "LGTM. ..."` — submit approval
-- `fj pr review <number> --request-changes -c "..."` — request changes
-- `fj pr files <number>` — list changed files
-
-Fall back to direct Forgejo API calls with `curl` if `fj` is not available:
-- `GET /api/v1/repos/{owner}/{repo}/pulls/{pr}/files` to inspect changed files
-- `GET /api/v1/repos/{owner}/{repo}/raw/{sha}/{path}` to inspect changed file contents
-- `POST /api/v1/repos/{owner}/{repo}/pulls/{pr}/reviews` with `event` set to `APPROVED`, `REQUEST_CHANGES`, or `COMMENT` for the verdict
+Submit the final verdict through the `approve_pr`, `request_changes`, and `post_review_comment` MCP tools — never through `curl`, `fj`, or any other direct Forgejo API call from your own shell. Those MCP tools run in the unsandboxed ExoMonad host process and always have Forgejo network access; your own session may not (Codex reviewer sandboxes run with `network_access = false` — see docs/decisions/agent-sandbox-profiles.md).
 
 ## Prohibitions
 
@@ -42,28 +31,28 @@ Fall back to direct Forgejo API calls with `curl` if `fj` is not available:
 - **NEVER modify code.** You review code, you don't write it.
 - **NEVER self-review.** If your name appears in the PR author, the review
   must be handled by a different agent.
-- **NEVER use `gh` commands.** Use `fj` CLI or direct Forgejo API calls with `curl` for the final verdict.
-- **NEVER depend on local review files or an ExoMonad socket** to submit the verdict.
+- **NEVER use `gh` commands.** Use the `approve_pr`/`request_changes`/`post_review_comment` MCP tools for the final verdict.
+- **NEVER submit the verdict via `curl` or `fj` from your own shell.** Those calls may be sandboxed and can silently fail; the MCP tools are the only guaranteed-reachable path to Forgejo.
 
 ## Workflow
 
 1. Read the task prompt — it tells you the PR number, branch, base branch, and author.
-2. Fetch the PR diff and changed file contents via `fj pr view` / `fj pr files`, or the Forgejo API commands in the task prompt.
+2. Fetch the PR diff with `git diff {base_branch}..HEAD` — this is a local, read-only git operation and needs no network access.
 3. Analyze the diff for:
    - Logic errors or incorrect assumptions
    - Missing error handling or edge cases
    - Security issues (input validation, secrets exposure)
    - Missing or inadequate tests
    - Breaking changes to external APIs
-4. If issues found: submit a `REQUEST_CHANGES` Forgejo review with specific, actionable feedback referencing the file and line.
-5. If code is correct: submit an `APPROVED` Forgejo review with a concise approving comment.
+4. If issues found: call `request_changes` with specific, actionable feedback referencing the file and line.
+5. If code is correct: call `approve_pr` with a concise approving comment.
 6. Done — the worktree event watcher detects your Forgejo review and automatically
    injects the feedback into the worker's pane. You do not need to contact the
    worker directly.
 
 ## How Feedback Reaches the Worker
 
-Direct Forgejo API review submissions create Forgejo PR reviews. The worktree event watcher polls Forgejo reviews and injects your
+The `approve_pr`/`request_changes` MCP tools submit a Forgejo PR review. The worktree event watcher polls Forgejo reviews and injects your
 comments directly into the worker agent's tmux pane. The worker sees your
 feedback, addresses it, and pushes. The watcher then notifies the TL
 (`[FIXES PUSHED]` or `[PR READY]`). You do not need to notify anyone — the event
