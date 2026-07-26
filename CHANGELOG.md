@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- fix: agent inbox consumer stalls permanently after a failed tmux delivery (#543)
 - Update restart_review for safe same-PR recovery (#540)
 - Fix Forgejo review comment visibility and fan-out routing (#534)
 - `merge_pr`'s pre-merge Forgejo readiness check still leaked the GitHub `origin` remote's owner into Forgejo API calls on multi-remote repos, even with `exomonad.remote` set — `GitService::get_repo_info` (services/git.rs) had its own remote-detection logic that always preferred `origin` and never consulted the `exomonad.remote` override, a second, independent implementation of the same lookup `#533` had already fixed in `services::repo::get_repo_info`. `GitService::get_repo_info` now delegates to that override-aware function; added a regression test

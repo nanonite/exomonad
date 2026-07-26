@@ -99,6 +99,8 @@ Delivery functions are generic over `C` via `impl Has*` bounds (no concrete `Ser
 
 **Worker pane delivery** (tmux fallback for workers): `routing.json` stores `pane_id` (e.g. `%42`) for direct tmux targeting. `inject_input` passes `pane_id` as the `target` argument.
 
+Agent inbox queues maintain the invariant that a non-empty queue always has a consumer; the consumer exits only when the queue is empty. Failed tmux injection retries up to `MAX_DELIVERY_ATTEMPTS` with exponential backoff capped at `MAX_DELIVERY_BACKOFF`, then abandons the message with an ERROR log and the `agent_inbox.messages_abandoned` metric. Abandoned messages clear `pending` without marking the event `recent`, so the same event can be re-delivered on a later `enqueue`.
+
 All messages are prefixed with `[from: id]` (or `[FAILED: id]` for failures). Event handler messages include structural tags inside the body (e.g. `[from: leaf-id] [PR READY] PR #5 approved...`).
 
 **Rule**: Any code path that notifies a parent MUST use `notify_parent_delivery()`, never raw `deliver_to_agent()`. This ensures OTel span events, EventQueue publication, and consistent `[from:]`/`[FAILED:]` formatting.

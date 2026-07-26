@@ -7,6 +7,12 @@ use exomonad_proto::effects::events::{event, AgentMessage, Event};
 use tokio::process::Command;
 use tracing::{debug, info, instrument, warn};
 
+/// Delivery attempts for a single queued message before it is abandoned.
+const MAX_DELIVERY_ATTEMPTS: u32 = 6;
+/// First retry delay; doubles per attempt up to `MAX_DELIVERY_BACKOFF`.
+const INITIAL_DELIVERY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_DELIVERY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryResult {
     Teams,
@@ -780,42 +786,75 @@ async fn spawn_inbox_consumer(agent: String) {
                 return;
             };
 
-            let result = tmux_events::inject_input_with_options(
-                &message.target,
-                &message.body,
-                &message.project_dir,
-                message.injection_options,
-            )
-            .await;
-            let success = result.is_ok();
-            if let Err(e) = result {
+            let mut attempt: u32 = 0;
+            loop {
+                attempt += 1;
+                let result = tmux_events::inject_input_with_options(
+                    &message.target,
+                    &message.body,
+                    &message.project_dir,
+                    message.injection_options,
+                )
+                .await;
+                let success = result.is_ok();
+
+                tracing::info!(
+                    otel.name = "message.delivery",
+                    agent_id = %message.from,
+                    recipient = %message.recipient,
+                    method = "agent_inbox_tmux",
+                    outcome = if success { "success" } else { "failed" },
+                    attempt,
+                    detail = %message.detail,
+                    "[event] message.delivery"
+                );
+
+                if success {
+                    GLOBAL_AGENT_INBOX
+                        .complete_delivery(&agent, message.id, true)
+                        .await;
+                    break;
+                }
+
+                let error = result.unwrap_err();
+
+                if attempt >= MAX_DELIVERY_ATTEMPTS {
+                    tracing::error!(
+                        target = %message.target,
+                        recipient = %message.recipient,
+                        attempts = attempt,
+                        error = %error,
+                        "agent inbox delivery abandoned after exhausting retries; message dropped"
+                    );
+                    tracing::info!(
+                        otel.name = "agent_inbox.messages_abandoned",
+                        recipient = %message.recipient,
+                        attempts = attempt,
+                        "[metric] agent_inbox.messages_abandoned"
+                    );
+                    GLOBAL_AGENT_INBOX
+                        .abandon_delivery(&agent, message.id)
+                        .await;
+                    break;
+                }
+
                 warn!(
                     target = %message.target,
                     recipient = %message.recipient,
-                    error = %e,
-                    "agent inbox delivery failed; message remains queued for retry"
+                    attempt,
+                    error = %error,
+                    "agent inbox delivery failed; retrying after backoff"
                 );
-            }
-
-            tracing::info!(
-                otel.name = "message.delivery",
-                agent_id = %message.from,
-                recipient = %message.recipient,
-                method = "agent_inbox_tmux",
-                outcome = if success { "success" } else { "failed" },
-                detail = %message.detail,
-                "[event] message.delivery"
-            );
-
-            GLOBAL_AGENT_INBOX
-                .complete_delivery(&agent, message.id, success)
-                .await;
-
-            if !success {
-                return;
+                tokio::time::sleep(delivery_backoff(attempt)).await;
             }
         }
     });
+}
+
+fn delivery_backoff(attempt: u32) -> std::time::Duration {
+    INITIAL_DELIVERY_BACKOFF
+        .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+        .min(MAX_DELIVERY_BACKOFF)
 }
 
 async fn enqueue_tmux_delivery(
@@ -1473,6 +1512,15 @@ mod tests {
         assert_ne!(DeliveryResult::Teams, DeliveryResult::Tmux);
         assert_ne!(DeliveryResult::Teams, DeliveryResult::Failed);
         assert_ne!(DeliveryResult::Tmux, DeliveryResult::Failed);
+    }
+
+    #[test]
+    fn delivery_backoff_doubles_and_saturates_at_cap() {
+        assert_eq!(delivery_backoff(1), std::time::Duration::from_secs(1));
+        assert_eq!(delivery_backoff(2), std::time::Duration::from_secs(2));
+        assert_eq!(delivery_backoff(3), std::time::Duration::from_secs(4));
+        assert_eq!(delivery_backoff(6), std::time::Duration::from_secs(30));
+        assert_eq!(delivery_backoff(64), MAX_DELIVERY_BACKOFF);
     }
 
     #[tokio::test]

@@ -216,7 +216,7 @@ impl AgentInbox {
             return Ok(EnqueueOutcome {
                 depth: queue.messages.len(),
                 warning_emitted: false,
-                should_start_consumer: false,
+                should_start_consumer: !queue.consumer_active && !queue.messages.is_empty(),
                 dropped_as_duplicate: true,
             });
         }
@@ -275,6 +275,29 @@ impl AgentInbox {
 
         if let Some(key) = delivered_key {
             queue.recent.insert(key, Instant::now());
+        }
+
+        queue.consumer_active = false;
+        queue.prune_recent(Instant::now(), self.dedup_window);
+    }
+
+    /// Drop the head message after delivery attempts are exhausted. Clears the
+    /// dedup `pending` entry without marking it recently-delivered, so an
+    /// identical event can be re-enqueued immediately.
+    pub async fn abandon_delivery(&self, agent: &str, message_id: u64) {
+        let mut queues = self.queues.lock().await;
+        let Some(queue) = queues.get_mut(agent) else {
+            return;
+        };
+
+        if queue
+            .messages
+            .front()
+            .is_some_and(|message| message.id == message_id)
+        {
+            if let Some(message) = queue.messages.pop_front() {
+                queue.pending.remove(&message.dedup_key);
+            }
         }
 
         queue.consumer_active = false;
@@ -409,6 +432,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_after_failed_delivery_still_requests_a_consumer() {
+        let inbox = AgentInbox::new(8, 32);
+        let body = "[MERGE READY] PR #42 approved";
+
+        let first = inbox.enqueue("agent", message(body)).await.unwrap();
+        assert!(first.should_start_consumer);
+
+        // Consumer runs, delivery fails, consumer task exits (delivery.rs:814).
+        let queued = inbox.begin_delivery("agent").await.unwrap();
+        inbox.complete_delivery("agent", queued.id, false).await;
+        assert_eq!(inbox.queue_depth("agent").await, 1);
+        assert!(!inbox.is_consumer_active("agent").await);
+
+        // A repeat of the same event is the only thing that could restart the
+        // consumer; it must not leave the queue stranded.
+        let second = inbox.enqueue("agent", message(body)).await.unwrap();
+        assert!(second.dropped_as_duplicate);
+        assert!(
+            second.should_start_consumer,
+            "stranded queue (depth {}) with no active consumer must request a restart",
+            second.depth
+        );
+    }
+
+    #[tokio::test]
     async fn successful_delivery_pops_head_before_next_message() {
         let inbox = AgentInbox::new(8, 32);
         inbox.enqueue("agent", message("first")).await.unwrap();
@@ -418,6 +466,37 @@ mod tests {
 
         let second = inbox.begin_delivery("agent").await.unwrap();
         assert_eq!(second.body, "second");
+    }
+
+    #[tokio::test]
+    async fn abandoned_delivery_drains_queue_and_allows_reenqueue() {
+        let inbox = AgentInbox::new(8, 32);
+        let body = "[MERGE READY] PR #42 approved";
+        inbox.enqueue("agent", message(body)).await.unwrap();
+
+        let queued = inbox.begin_delivery("agent").await.unwrap();
+        inbox.abandon_delivery("agent", queued.id).await;
+
+        assert_eq!(inbox.queue_depth("agent").await, 0);
+        assert!(!inbox.is_consumer_active("agent").await);
+
+        // Abandoned messages are not marked recently-delivered, so an identical
+        // event is accepted rather than suppressed by the dedup window.
+        let retry = inbox.enqueue("agent", message(body)).await.unwrap();
+        assert!(!retry.dropped_as_duplicate);
+        assert!(retry.should_start_consumer);
+        assert_eq!(inbox.queue_depth("agent").await, 1);
+    }
+
+    #[tokio::test]
+    async fn abandon_delivery_ignores_stale_message_id() {
+        let inbox = AgentInbox::new(8, 32);
+        inbox.enqueue("agent", message("first")).await.unwrap();
+        let queued = inbox.begin_delivery("agent").await.unwrap();
+
+        inbox.abandon_delivery("agent", queued.id + 999).await;
+
+        assert_eq!(inbox.queue_depth("agent").await, 1);
     }
 
     #[tokio::test]
