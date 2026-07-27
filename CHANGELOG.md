@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- fix: test temp dirs depend on ambient TMPDIR; remove stale Codex-Fugu docs (#546)
 - test: cover agent inbox consumer retry loop and isolate injection panics (#544)
 - fix: path traversal bypass in FileSystemService::resolve_path when target parent is absent (#545)
 - Fix watcher review comments delivery to the TL (#537)
