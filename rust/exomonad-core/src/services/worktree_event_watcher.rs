@@ -2438,21 +2438,6 @@ fn compute_pr_actions_with_context(
         old_state.rounds = next_review_round;
 
         let message = format_message(comments, reviews);
-        pending_actions.push(PendingAction::WasmEvent {
-            event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested)
-                    .expect("changes_requested review state has an event kind"),
-                "pr_number": pr_number.as_u64(),
-                "branch": branch,
-                "comments": message,
-                "author_branch": review_author_branch(
-                    reviews,
-                    ForgejoReviewVerdict::ChangesRequested,
-                ),
-            }),
-        });
-
         if old_state.rounds >= max_rounds {
             old_state.stuck = true;
             pending_actions.push(PendingAction::WriteRegistryStuck {
@@ -2473,6 +2458,20 @@ fn compute_pr_actions_with_context(
                 ),
             });
         } else {
+            pending_actions.push(PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload: serde_json::json!({
+                    "kind": review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested)
+                        .expect("changes_requested review state has an event kind"),
+                    "pr_number": pr_number.as_u64(),
+                    "branch": branch,
+                    "comments": message,
+                    "author_branch": review_author_branch(
+                        reviews,
+                        ForgejoReviewVerdict::ChangesRequested,
+                    ),
+                }),
+            });
             pending_actions.push(PendingAction::WriteRegistryRounds {
                 pr_number: pr_number.as_u64(),
                 rounds: old_state.rounds,
@@ -4142,7 +4141,7 @@ mod tests {
 
         assert!(state.stuck);
         assert_eq!(state.rounds, 2);
-        assert!(actions.iter().any(|action| matches!(
+        assert!(!actions.iter().any(|action| matches!(
             action,
             PendingAction::WasmEvent { payload, .. }
                 if payload["kind"] == "review_received"
