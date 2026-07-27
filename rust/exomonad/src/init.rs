@@ -854,9 +854,10 @@ pub async fn run(
     reviewer_model: Option<String>,
     verbose: bool,
     set_git_remote: Option<String>,
+    reset_inbox: bool,
 ) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
-    use exomonad_core::services::{resolve_role_context_path, AgentType};
+    use exomonad_core::services::{resolve_role_context_path, AgentType, InboxStore};
     use std::io::{IsTerminal, Write};
     let cwd = std::env::current_dir()?;
     let config_path = cwd.join(".exo/config.toml");
@@ -866,6 +867,11 @@ pub async fn run(
 
     if let Some(ref remote_name) = set_git_remote {
         set_git_remote_override(&cwd, remote_name)?;
+    }
+
+    if reset_inbox {
+        InboxStore::open(&cwd)?.clear_all()?;
+        info!("cleared inbox messages and metadata");
     }
 
     // Resolve config

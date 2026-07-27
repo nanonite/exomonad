@@ -126,6 +126,9 @@ enum Commands {
         /// `origin`.
         #[arg(long)]
         set_git_remote: Option<String>,
+        /// Clear all persisted inbox messages and metadata before starting.
+        #[arg(long)]
+        reset_inbox: bool,
     },
 
     /// Initialize a new exomonad project in the current directory.
@@ -357,6 +360,7 @@ async fn main() -> Result<()> {
             reviewer_model,
             verbose,
             set_git_remote,
+            reset_inbox,
         } => {
             if let Err(e) = init::run(
                 session,
@@ -374,6 +378,7 @@ async fn main() -> Result<()> {
                 reviewer_model,
                 verbose,
                 set_git_remote,
+                reset_inbox,
             )
             .await
             {

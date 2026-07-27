@@ -92,6 +92,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add --reset-inbox flag to exomonad init (#548)
 - Add role-specific effort levels for TL, worker, and reviewer harnesses (#526)
 - E2E: verify OpenCode + Codex notify_parent delivery over real transport (#512)
 - Wire and verify TL review recovery commands and operator guidance (#542)

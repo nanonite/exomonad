@@ -71,6 +71,16 @@ impl InboxStore {
         &self.db_path
     }
 
+    pub fn clear_all(&self) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute_batch(
+            "DELETE FROM messages;
+             DELETE FROM agent_inbox_meta;",
+        )
+        .context("failed to clear inbox")?;
+        Ok(())
+    }
+
     pub fn write_message(
         &self,
         from_agent: &str,
@@ -793,5 +803,34 @@ mod tests {
 
         assert_eq!(store.db_path(), &dir.path().join(".exo/inbox.db"));
         assert!(store.db_path().exists());
+    }
+
+    #[test]
+    fn clear_all_removes_messages_and_metadata() {
+        let store = InboxStore::open_in_memory().unwrap();
+        store
+            .write_message("root", "worker-1", "please check this", None)
+            .unwrap();
+        store.drain_unread("worker-1").unwrap();
+
+        store.clear_all().unwrap();
+
+        let conn = store.connection().unwrap();
+        let message_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        let metadata_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_inbox_meta", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(message_count, 0);
+        assert_eq!(metadata_count, 0);
+        drop(conn);
+
+        store
+            .write_message("root", "worker-1", "schema still works", None)
+            .unwrap();
+        assert_eq!(store.drain_unread("worker-1").unwrap().len(), 1);
     }
 }

@@ -94,6 +94,10 @@ via `git config --local exomonad.remote <name>` (shared across worktrees via
 the main repo's `.git/config` — no config.toml field). See
 `services::repo::get_repo_info` in `exomonad-core`.
 
+Use `exomonad init --reset-inbox` to clear all persisted inbox messages and
+agent inbox metadata before starting the session, while preserving the inbox
+database schema.
+
 **WASM resolution:** project `.exo/wasm/` → build from `.exo/roles/` → copy from `~/.exo/wasm/` (global install via `just install-all`).
 
 **Config hierarchy:**
