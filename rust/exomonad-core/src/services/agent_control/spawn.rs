@@ -672,6 +672,7 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: agent_dir.clone(),
+                branch_name: branch_name.to_string(),
                 agent_name,
                 issue_title: issue.title,
                 agent_type: options.agent_type,
@@ -762,6 +763,7 @@ impl<
                 info!(name = %options.name, "Teammate already running, returning existing");
                 return Ok(SpawnResult {
                     agent_dir: PathBuf::new(),
+                    branch_name: String::new(),
                     agent_name,
                     issue_title: options.name.to_string(),
                     agent_type: options.agent_type,
@@ -852,6 +854,7 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: PathBuf::new(),
+                branch_name: branch_name.to_string(),
                 agent_name,
                 issue_title: options.name.to_string(),
                 agent_type: options.agent_type,
@@ -1140,6 +1143,7 @@ impl<
                     info!(name = %options.name, "Worker pane still alive, returning existing");
                     return Ok(SpawnResult {
                         agent_dir: PathBuf::new(),
+                        branch_name: String::new(),
                         agent_name,
                         issue_title: options.name.to_string(),
                         agent_type,
@@ -1259,6 +1263,7 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: PathBuf::new(),
+                branch_name: String::new(),
                 agent_name,
                 issue_title: options.name.to_string(),
                 agent_type,
@@ -1304,6 +1309,7 @@ impl<
             let identity = AgentIdentity::new(slugify(&options.branch_name), agent_type);
             let agent_name = identity.internal_name();
             let display_name = identity.display_name();
+            let child_birth = effective_birth.child(agent_name.as_str());
 
             // Idempotency check: if tmux window is alive, return existing info
             let tab_alive = self.is_tmux_window_alive(&display_name).await;
@@ -1311,11 +1317,12 @@ impl<
                 info!(slug = %identity.slug(), "Subtree already running, returning existing");
                 return Ok(SpawnResult {
                     agent_dir: self.worktree_base.join(agent_name.as_str()),
-                      agent_name,
-                      issue_title: options.branch_name.clone(),
-                      agent_type,
-                      pane_id: None,
-                  });
+                    branch_name: child_birth.to_string(),
+                    agent_name,
+                    issue_title: options.branch_name.clone(),
+                    agent_type,
+                    pane_id: None,
+                });
             }
 
             // Parent branch derived from typed birth-branch.
@@ -1329,7 +1336,6 @@ impl<
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
             // Branch: {current_branch}.{agent_name} (suffixed for unified namespace)
-            let child_birth = effective_birth.child(agent_name.as_str());
             let branch_name = child_birth.to_string();
 
             // Path resolution: working_dir overrides the default worktree location.
@@ -1596,11 +1602,12 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: worktree_path.clone(),
-                  agent_name,
-                  issue_title: options.branch_name.clone(),
-                  agent_type,
-                  pane_id: None,
-              })
+                branch_name: branch_name.clone(),
+                agent_name,
+                issue_title: options.branch_name.clone(),
+                agent_type,
+                pane_id: None,
+            })
         })
         .await
         .map_err(|_| {
@@ -1679,12 +1686,35 @@ impl<
                 }
             }
 
+            let existing_branch = if !options.standalone_repo && worktree_path.exists() {
+                self.git_wt()
+                    .get_workspace_bookmark(&worktree_path)
+                    .context("failed to inspect existing leaf worktree branch")?
+                    .map(|branch| BirthBranch::try_from_str(&branch))
+                    .transpose()
+                    .context("existing leaf worktree branch was invalid")?
+            } else {
+                None
+            };
+            let child_birth = if let Some(branch) = existing_branch {
+                branch
+            } else if let Some(record) = existing_identity_record.as_ref() {
+                record.birth_branch.clone()
+            } else if let Some(base_branch) = options.base_branch.as_deref() {
+                BirthBranch::try_from_str(base_branch)
+                    .context("replacement base branch was empty")?
+                    .child(agent_name.as_str())
+            } else {
+                effective_birth.child(agent_name.as_str())
+            };
+
             // Idempotency check
             let tab_alive = self.is_tmux_window_alive(&display_name).await;
             if tab_alive {
                 info!(slug = %identity.slug(), "Leaf subtree already running, returning existing");
                 return Ok(SpawnResult {
                     agent_dir: worktree_path,
+                    branch_name: child_birth.to_string(),
                     agent_name,
                     issue_title: options.branch_name.clone(),
                     agent_type,
@@ -1698,18 +1728,9 @@ impl<
             // Push parent branch so child PRs can reference it as base
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
-            let child_birth = if let Some(base_branch) = options.base_branch.as_deref() {
-                BirthBranch::try_from_str(base_branch)
-                    .context("replacement base branch was empty")?
-                    .child(agent_name.as_str())
-            } else {
-                existing_identity_record
-                    .as_ref()
-                    .map(|record| record.birth_branch.clone())
-                    .unwrap_or_else(|| effective_birth.child(agent_name.as_str()))
-            };
             let branch_name = BranchName::try_from_str(child_birth.to_string().as_str())
                 .expect("validated string input is non-empty");
+            let actual_branch_name = branch_name.to_string();
 
             let mut remove_worktree_on_spawn_failure = false;
 
@@ -1910,11 +1931,12 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: worktree_path.clone(),
-                  agent_name,
-                  issue_title: options.branch_name.clone(),
-                  agent_type,
-                  pane_id: None,
-              })
+                branch_name: actual_branch_name,
+                agent_name,
+                issue_title: options.branch_name.clone(),
+                agent_type,
+                pane_id: None,
+            })
         })
         .await
         .map_err(|_| {

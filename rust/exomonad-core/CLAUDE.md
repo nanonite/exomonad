@@ -35,6 +35,11 @@ Without `runtime`: only `ui_protocol` module available (agent event types, telem
 | `SpawnSubtreeOptions` | Options for spawning a Claude agent (permissions, etc.) |
 | `SpawnLeafOptions` | Options for spawning a Gemini agent |
 
+`SpawnResult.branch_name` is the actual dot-prefixed git branch created or
+resumed by worktree spawns. Agent response conversion must use this value
+instead of the raw branch-name suffix from the MCP request; shared-directory
+worker results leave it empty because they do not create a git branch.
+
 ## Capability Traits (`Has*` Pattern)
 
 Handlers and delivery functions are generic over a context `C` bounded by capability traits. Each consumer declares only the traits it needs — the bounds ARE the dependency graph.

@@ -544,6 +544,8 @@ pub struct SpawnLeafOptions {
 pub struct SpawnResult {
     /// Path to the agent directory (.exo/agents/{agent_id}/)
     pub agent_dir: PathBuf,
+    /// Actual git branch created or resumed for the agent. Empty for shared-dir workers.
+    pub branch_name: String,
     /// Agent's internal name (suffixed, e.g., "feature-a-claude").
     /// Typed as `AgentName` to prevent confusion with bare slugs.
     pub agent_name: AgentName,

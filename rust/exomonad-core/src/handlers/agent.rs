@@ -768,7 +768,7 @@ impl<
             .await
             .effect_err_preserve("agent")?;
 
-        let agent_info = subtree_result_to_proto(&req.branch_name, &result);
+        let agent_info = subtree_result_to_proto(&req.branch_name, &result)?;
 
         tracing::info!(
             otel.name = "agent.spawned",
@@ -855,7 +855,7 @@ impl<
             .spawn_reviewer_for_recovery_named(&pr, &ctx.birth_branch, &reviewer_branch)
             .await
             .effect_err_preserve("agent")?;
-        let agent_info = subtree_result_to_proto(&reviewer_branch, &result);
+        let agent_info = subtree_result_to_proto(&reviewer_branch, &result)?;
         let reviewer_name = result.agent_name.to_string();
 
         if result.agent_type == ServiceAgentType::Claude {
@@ -996,7 +996,7 @@ impl<
             Ok(pr) => pr,
             Err(error) => return Ok(replace_closed_pr_error(&error.to_string())),
         };
-        if let Err(error) = ensure_closed_unmerged_pr(&pr, old_pr_number) {
+        if let Err(error) = ensure_replaceable_unmerged_pr(&pr, old_pr_number) {
             return Ok(replace_closed_pr_error(&error.to_string()));
         }
 
@@ -1004,14 +1004,14 @@ impl<
         if let Some(metadata_issue_id) = metadata.chainlink_issue_id {
             if metadata_issue_id != issue_id {
                 return Ok(replace_closed_pr_error(&format!(
-                    "closed PR #{old_pr_number} belongs to Chainlink issue #{metadata_issue_id}, not #{issue_id}"
+                    "PR #{old_pr_number} belongs to Chainlink issue #{metadata_issue_id}, not #{issue_id}"
                 )));
             }
         }
         if let Some(author_agent) = metadata.author_agent.as_deref() {
             if !leaf_identity_matches(author_agent, &old_leaf_name) {
                 return Ok(replace_closed_pr_error(&format!(
-                    "closed PR #{old_pr_number} author '{author_agent}' does not match old_leaf_name '{old_leaf_name}'"
+                    "PR #{old_pr_number} author '{author_agent}' does not match old_leaf_name '{old_leaf_name}'"
                 )));
             }
         }
@@ -1020,7 +1020,7 @@ impl<
             Some(sha) => sha,
             None => {
                 return Ok(replace_closed_pr_error(&format!(
-                    "closed PR #{old_pr_number} has no exact head SHA; refusing replacement"
+                    "PR #{old_pr_number} has no exact head SHA; refusing replacement"
                 )))
             }
         };
@@ -1127,8 +1127,13 @@ impl<
         write_replacement_record(&record_path, &record).await?;
 
         let operator_context = req.operator_context.trim();
+        let old_pr_context = if pr.state.eq_ignore_ascii_case("open") {
+            "open and unmerged; this tool does not close it. After verifying the replacement PR, explicitly reconcile or close the old PR"
+        } else {
+            "closed and unmerged; do not reopen or resume it"
+        };
         let task = format!(
-            "{replacement_task}\n\nReplacement PR context:\n- Chainlink issue: #{issue_id} (keep this issue open and continue it)\n- Old PR: #{old_pr_number} (closed, unmerged; do not reopen or resume it)\n- Source branch: {old_head_branch}\n- Source head SHA: {source_head_sha}\n- New PR base branch: {original_base_branch}\n- Fresh leaf identity: {new_leaf_name}\n\nStart from the exact source SHA, make the requested fixes, and file a NEW PR targeting the stated base branch. Do not create a new Chainlink issue.{}",
+            "{replacement_task}\n\nReplacement PR context:\n- Chainlink issue: #{issue_id} (keep this issue open and continue it)\n- Old PR: #{old_pr_number} ({old_pr_context})\n- Source branch: {old_head_branch}\n- Source head SHA: {source_head_sha}\n- New PR base branch: {original_base_branch}\n- Fresh leaf identity: {new_leaf_name}\n\nStart from the exact source SHA, make the requested fixes, and file a NEW PR targeting the stated base branch. Do not create a new Chainlink issue.{}",
             if operator_context.is_empty() {
                 String::new()
             } else {
@@ -1146,6 +1151,15 @@ impl<
             start_point: Some(source_head_sha.clone()),
             base_branch: Some(original_base_branch.clone()),
         };
+        info!(
+            chainlink_issue_id = issue_id,
+            old_pr_number,
+            old_pr_state = %pr.state,
+            source_head_sha = %source_head_sha,
+            original_base_branch = %original_base_branch,
+            new_branch = %new_branch,
+            "Spawning approved PR replacement leaf"
+        );
         let spawn_result = match self
             .service
             .spawn_leaf_subtree(&options, &ctx.birth_branch)
@@ -1153,6 +1167,15 @@ impl<
         {
             Ok(result) => result,
             Err(error) => {
+                warn!(
+                    chainlink_issue_id = issue_id,
+                    old_pr_number,
+                    source_head_sha = %source_head_sha,
+                    original_base_branch = %original_base_branch,
+                    new_branch = %new_branch,
+                    error = %error,
+                    "Approved PR replacement leaf failed to spawn"
+                );
                 record.spawn_status = "spawn_failed".to_string();
                 record.error = error.to_string();
                 write_replacement_record(&record_path, &record).await?;
@@ -1160,7 +1183,7 @@ impl<
             }
         };
 
-        let agent_info = leaf_subtree_result_to_proto(&new_slug, &spawn_result);
+        let agent_info = leaf_subtree_result_to_proto(&new_slug, &spawn_result)?;
         if spawn_result.agent_type == ServiceAgentType::Claude {
             self.register_claude_team_child(
                 &spawn_result.agent_name,
@@ -1177,6 +1200,16 @@ impl<
         record.spawn_status = "spawned".to_string();
         record.error.clear();
         record.worktree_path = spawn_result.agent_dir.to_string_lossy().to_string();
+        info!(
+            chainlink_issue_id = issue_id,
+            old_pr_number,
+            old_pr_state = %pr.state,
+            source_head_sha = %source_head_sha,
+            original_base_branch = %original_base_branch,
+            new_branch = %new_branch,
+            new_agent = %agent_info.id,
+            "Approved PR replacement leaf spawned; new PR will be filed by the leaf"
+        );
         write_replacement_record(&record_path, &record).await?;
         if let Some(log) = self.ctx.event_log() {
             let _ = log.append(
@@ -1308,7 +1341,7 @@ impl<
             .await
             .effect_err_preserve("agent")?;
 
-        let agent_info = leaf_subtree_result_to_proto(&req.branch_name, &result);
+        let agent_info = leaf_subtree_result_to_proto(&req.branch_name, &result)?;
 
         tracing::info!(
             otel.name = "agent.spawned",
@@ -1885,15 +1918,19 @@ fn ensure_open_unmerged_pr(pr: &ForgejoPullRequest, pr_number: u64) -> EffectRes
     Ok(())
 }
 
-fn ensure_closed_unmerged_pr(pr: &ForgejoPullRequest, pr_number: u64) -> Result<(), EffectError> {
+fn ensure_replaceable_unmerged_pr(
+    pr: &ForgejoPullRequest,
+    pr_number: u64,
+) -> Result<(), EffectError> {
     if pr.merged {
         return Err(EffectError::invalid_input(format!(
-            "PR #{pr_number} is merged; replacement is only for closed, unmerged PRs"
+            "PR #{pr_number} is merged; replacement requires an unmerged PR"
         )));
     }
-    if !pr.state.eq_ignore_ascii_case("closed") {
+    if !pr.state.eq_ignore_ascii_case("closed") && !pr.state.eq_ignore_ascii_case("open") {
         return Err(EffectError::invalid_input(format!(
-            "PR #{pr_number} is open; use restart_review for an open PR"
+            "PR #{pr_number} has unsupported state '{}'; replacement requires an open or closed PR",
+            pr.state
         )));
     }
     Ok(())
@@ -2065,6 +2102,20 @@ impl ReplacementRecord {
 
     fn to_response(&self, already_exists: bool) -> ReplaceClosedPrResponse {
         let success = self.spawn_status == "spawned";
+        let next_action = if success {
+            if self.old_pr_state.eq_ignore_ascii_case("open") {
+                format!(
+                    "Wait for the fresh leaf to file a new PR, then explicitly reconcile or close superseded PR #{}",
+                    self.old_pr_number
+                )
+            } else {
+                "Wait for the fresh leaf to file a new PR against the original base branch"
+                    .to_string()
+            }
+        } else {
+            "Inspect the reported state and retry replace_close_pr; the old PR head and replacement record are preserved"
+                .to_string()
+        };
         ReplaceClosedPrResponse {
             success,
             error: self.error.clone(),
@@ -2081,13 +2132,7 @@ impl ReplacementRecord {
             new_branch: self.new_branch.clone(),
             worktree_path: self.worktree_path.clone(),
             spawn_status: self.spawn_status.clone(),
-            next_action: if success {
-                "Wait for the fresh leaf to file a new PR against the original base branch"
-                    .to_string()
-            } else {
-                "Inspect the reported state and retry replace_close_pr; the old PR head and replacement record are preserved"
-                    .to_string()
-            },
+            next_action,
             replacement_already_exists: already_exists,
         }
     }
@@ -2619,14 +2664,15 @@ fn worker_result_to_proto(
 fn subtree_result_to_proto(
     branch_name: &str,
     result: &crate::services::agent_control::SpawnResult,
-) -> exomonad_proto::effects::agent::AgentInfo {
+) -> EffectResult<exomonad_proto::effects::agent::AgentInfo> {
     use crate::services::agent_control::Topology;
+    let actual_branch = spawn_result_branch_name(result)?;
 
-    exomonad_proto::effects::agent::AgentInfo {
+    Ok(exomonad_proto::effects::agent::AgentInfo {
         id: result.agent_name.to_string(),
         issue: String::new(),
         worktree_path: result.agent_dir.display().to_string(),
-        branch_name: branch_name.to_string(),
+        branch_name: actual_branch.to_string(),
         agent_type: service_agent_type_to_proto(result.agent_type),
         role: 0,
         alive: true,
@@ -2637,20 +2683,21 @@ fn subtree_result_to_proto(
         topology: Topology::WorktreePerAgent.to_proto(),
         pane_id: result.pane_id.clone().unwrap_or_default(),
         ..Default::default()
-    }
+    })
 }
 
 fn leaf_subtree_result_to_proto(
     branch_name: &str,
     result: &crate::services::agent_control::SpawnResult,
-) -> exomonad_proto::effects::agent::AgentInfo {
+) -> EffectResult<exomonad_proto::effects::agent::AgentInfo> {
     use crate::services::agent_control::Topology;
+    let actual_branch = spawn_result_branch_name(result)?;
 
-    exomonad_proto::effects::agent::AgentInfo {
+    Ok(exomonad_proto::effects::agent::AgentInfo {
         id: result.agent_name.to_string(),
         issue: String::new(),
         worktree_path: result.agent_dir.display().to_string(),
-        branch_name: branch_name.to_string(),
+        branch_name: actual_branch.to_string(),
         agent_type: service_agent_type_to_proto(result.agent_type),
         role: 0,
         alive: true,
@@ -2661,7 +2708,19 @@ fn leaf_subtree_result_to_proto(
         topology: Topology::WorktreePerAgent.to_proto(),
         pane_id: result.pane_id.clone().unwrap_or_default(),
         ..Default::default()
+    })
+}
+
+fn spawn_result_branch_name(
+    result: &crate::services::agent_control::SpawnResult,
+) -> EffectResult<&str> {
+    if result.branch_name.trim().is_empty() {
+        tracing::error!(agent = %result.agent_name, "spawn result did not include the actual git branch");
+        return Err(EffectError::invalid_input(
+            "spawn result did not include the actual git branch",
+        ));
     }
+    Ok(&result.branch_name)
 }
 
 fn service_agent_type_to_proto(at: ServiceAgentType) -> i32 {
@@ -3017,22 +3076,28 @@ mod tests {
     }
 
     #[test]
-    fn replace_closed_pr_rejects_open_and_merged_targets() {
+    fn replace_pr_accepts_open_and_closed_unmerged_targets() {
         let open = restart_test_pr();
-        let error = ensure_closed_unmerged_pr(&open, 7).unwrap_err().to_string();
-        assert!(error.contains("open"));
+        assert!(ensure_replaceable_unmerged_pr(&open, 7).is_ok());
 
         let mut merged = restart_test_pr();
         merged.state = "closed".to_string();
         merged.merged = true;
-        let error = ensure_closed_unmerged_pr(&merged, 7)
+        let error = ensure_replaceable_unmerged_pr(&merged, 7)
             .unwrap_err()
             .to_string();
         assert!(error.contains("merged"));
 
         let mut closed = restart_test_pr();
         closed.state = "closed".to_string();
-        assert!(ensure_closed_unmerged_pr(&closed, 7).is_ok());
+        assert!(ensure_replaceable_unmerged_pr(&closed, 7).is_ok());
+
+        let mut unknown = restart_test_pr();
+        unknown.state = "draft".to_string();
+        let error = ensure_replaceable_unmerged_pr(&unknown, 7)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported state"));
     }
 
     #[test]
@@ -3047,6 +3112,47 @@ mod tests {
             .child(&identity.internal_name().to_string());
         assert_eq!(branch.to_string(), "release/2026.fresh-leaf-codex");
         assert_ne!(branch.to_string(), "old-pr-head");
+    }
+
+    #[test]
+    fn leaf_subtree_response_reports_actual_branch_for_new_and_resumed_leaves() {
+        let result = crate::services::agent_control::SpawnResult {
+            agent_dir: PathBuf::from(".exo/worktrees/fix-pr97-ci-gemini"),
+            branch_name: "main.fix-pr97-ci".to_string(),
+            agent_name: AgentName::try_from_str("fix-pr97-ci-gemini").unwrap(),
+            issue_title: "fix CI".to_string(),
+            agent_type: ServiceAgentType::Gemini,
+            pane_id: None,
+        };
+        let response = leaf_subtree_result_to_proto("fix-pr97-ci", &result).unwrap();
+        assert_eq!(response.branch_name, "main.fix-pr97-ci");
+        let response = subtree_result_to_proto("fix-pr97-ci", &result).unwrap();
+        assert_eq!(response.branch_name, "main.fix-pr97-ci");
+
+        let resumed = crate::services::agent_control::SpawnResult {
+            branch_name: "main.rebase-pr95-main-conflicts-opencode".to_string(),
+            ..result
+        };
+        let response =
+            leaf_subtree_result_to_proto("rebase-pr95-main-conflicts-opencode", &resumed).unwrap();
+        assert_eq!(
+            response.branch_name,
+            "main.rebase-pr95-main-conflicts-opencode"
+        );
+    }
+
+    #[test]
+    fn branch_response_rejects_missing_actual_branch() {
+        let result = crate::services::agent_control::SpawnResult {
+            agent_dir: PathBuf::new(),
+            branch_name: String::new(),
+            agent_name: AgentName::try_from_str("missing-branch-gemini").unwrap(),
+            issue_title: String::new(),
+            agent_type: ServiceAgentType::Gemini,
+            pane_id: None,
+        };
+        let error = leaf_subtree_result_to_proto("missing-branch", &result).unwrap_err();
+        assert!(error.to_string().contains("actual git branch"));
     }
 
     #[test]

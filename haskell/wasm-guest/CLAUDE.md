@@ -33,6 +33,7 @@ The guest exports MCP tools that agents can call. These are defined in `ExoMonad
 - **`spawn_worker`**: Spawn an ephemeral worker in a tmux pane. No branch, no PR. Agent type defaults to the server's worker setting; pass `agent_type` only for a specific supported runtime.
 - **`spawn_leaf_subtree`** (SDK core): Lower-level worktree/standalone spawn used by `spawn_leaf`.
 - **`spawn_workers`** (SDK core): Lower-level batch inline pane spawn used by `spawn_worker`.
+- **`replace_close_pr`**: With explicit human approval, replace an open or closed unmerged PR from its exact head SHA and original base branch. It does not close the old PR; reconcile that PR explicitly after verifying the replacement.
 
 ### Task Tools (`ExoMonad.Guest.Tools.Tasks`)
 

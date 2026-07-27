@@ -97,6 +97,13 @@ Workers are ephemeral pane agents with no PR. When a worker reports a blocker vi
 
 **Never wait silently** for a stuck worker. Either steer it, escalate to the human, or re-spec.
 
+## Fixing an Existing PR's CI/Review Problem
+
+- **DO NOT** call `spawn_leaf` with a new, unrelated `name` to fix another PR's CI failure, review comments, or merge conflicts. A new name always creates a disconnected sibling branch from the caller's branch, often targeting `main`, rather than continuing the target PR.
+- **DO** first resolve the agent that owns the target PR: call `watcher_pr_state` (or `list_agents`) for the PR number, read `head_branch`, and take its last dot-segment. That string is the owning agent name under the branch-naming convention.
+- **DO** call `spawn_leaf` again with that exact same name. `spawn_leaf` resumes the existing leaf worktree by slug and, when the PR already exists, injects its review context instead of filing a duplicate PR.
+- If resume-by-name cannot recover the genuinely missing or corrupt leaf and the PR is still open, do not invent another leaf name. With explicit human approval, use `replace_close_pr` to continue from the old PR head on its original base branch; this creates a replacement leaf without closing the old PR, so the TL must explicitly reconcile or close the old PR. For a closed, unmerged PR, the same tool already provides the replacement path. If the approved replacement path is unavailable, escalate through Chainlink `review-stuck`.
+
 ## Chainlink Coordination
 
 You own issue decomposition, timer lifecycle, PR merge decisions, and final issue close authority.

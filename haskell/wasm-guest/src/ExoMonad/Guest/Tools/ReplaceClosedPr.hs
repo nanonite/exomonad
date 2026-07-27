@@ -57,13 +57,13 @@ instance FromJSON ReplaceClosedPrArgs where
 
 replaceClosedPrDescription :: Text
 replaceClosedPrDescription =
-  "With human approval, replace a closed and unmerged Forgejo PR while continuing the existing open Chainlink issue. Retires the old reviewer and author resources, preserves the old PR head SHA, and starts a fresh leaf and branch targeting the old PR base. Never use this for an open or merged PR."
+  "With human approval, replace an open or closed and unmerged Forgejo PR while continuing the existing open Chainlink issue. Retires the old reviewer and author resources, preserves the old PR head SHA, and starts a fresh leaf and branch targeting the old PR base. This tool does not close the old PR; after verifying the replacement, explicitly reconcile or close it. Never use this for a merged PR."
 
 replaceClosedPrSchema :: Aeson.Object
 replaceClosedPrSchema =
   genericToolSchemaWith @ReplaceClosedPrArgs
     [ ("chainlink_issue_id", "Positive open Chainlink issue id to continue"),
-      ("closed_pr_number", "Closed, unmerged Forgejo PR number to replace"),
+      ("closed_pr_number", "Target open or closed, unmerged Forgejo PR number to replace"),
       ("old_leaf_name", "Explicit old author leaf identity to retire"),
       ("new_leaf_name", "Required fresh bare leaf slug; do not reuse the old slug"),
       ("replacement_task", "Complete task for the fresh leaf, including acceptance criteria"),

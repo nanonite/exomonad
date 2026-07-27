@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- TL spawns disconnected fix-PRs instead of resuming the owning agent (#549)
+- Fix spawn_leaf/fork_wave response branch_name to report the real dot-prefixed branch (#551)
 - fix: test temp dirs depend on ambient TMPDIR; remove stale Codex-Fugu docs (#546)
 - test: cover agent inbox consumer retry loop and isolate injection panics (#544)
 - fix: path traversal bypass in FileSystemService::resolve_path when target parent is absent (#545)
@@ -92,6 +94,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add open-PR equivalent of replace_close_pr for unrecoverable-by-name leaves (#552)
 - Add --reset-inbox flag to exomonad init (#548)
 - Add role-specific effort levels for TL, worker, and reviewer harnesses (#526)
 - E2E: verify OpenCode + Codex notify_parent delivery over real transport (#512)
@@ -209,6 +212,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Protocol guardrail: resume PR-owning agent by name instead of inventing a new spawn_leaf name (#550)
 - e2e-claude-teams-inbox: E2E test for Claude TL → Claude dev leaf → Claude reviewer via Teams inbox (#462)
 - Route review fan-out to the dev leaf and spawn each reviewer round explicitly (#536)
 - Route comment-only Forgejo reviews through the watcher review-state pipeline (#535)
