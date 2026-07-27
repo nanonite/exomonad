@@ -177,13 +177,34 @@ message CleanupResponse {
 // ============================================================================
 
 message DisposeOrphanRequest {
+  // Agent slug to clean when sweep is false.
   string agent_slug = 1;
+  // Require a dead window, clean worktree, and merged/closed PR before cleanup.
+  bool verify_pr_state = 2;
+  // Report the verification result without disposing resources.
+  bool dry_run = 3;
+  // Verify and clean every worktree whose agent window is dead.
+  bool sweep = 4;
 }
 
 message DisposeOrphanResponse {
   bool removed_worktree = 1;
   bool removed_agent_dir = 2;
   string message = 3;
+  // PR state used by verified cleanup (for example, "merged" or "closed").
+  string pr_state = 4;
+  // PR number used by verified cleanup.
+  uint64 pr_number = 5;
+  // Whether the safety checks completed successfully.
+  bool verified = 6;
+  // Whether this response describes a dry run.
+  bool dry_run = 7;
+  // Agent slugs disposed during a sweep.
+  repeated string cleaned_agents = 8;
+  // Agent slugs refused during a sweep.
+  repeated string skipped_agents = 9;
+  // Per-agent errors from a sweep.
+  repeated string errors = 10;
 }
 
 // ============================================================================

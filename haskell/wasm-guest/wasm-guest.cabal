@@ -83,6 +83,7 @@ library wasm-guest-internal
         ExoMonad.Guest.Tools.CloseIssueAndCleanup
         ExoMonad.Guest.Tools.ReplaceClosedPr
         ExoMonad.Guest.Tools.CleanupOrphan
+        ExoMonad.Guest.Tools.CleanupLeaf
         ExoMonad.Guest.Tools.DisposeLeaf
         ExoMonad.Guest.Tools.DiscardWorkerOutput
         ExoMonad.Guest.Tools.TestRunner

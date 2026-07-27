@@ -35,6 +35,11 @@ The guest exports MCP tools that agents can call. These are defined in `ExoMonad
 - **`spawn_workers`** (SDK core): Lower-level batch inline pane spawn used by `spawn_worker`.
 - **`replace_close_pr`**: With explicit human approval, replace an open or closed unmerged PR from its exact head SHA and original base branch. It does not close the old PR; reconcile that PR explicitly after verifying the replacement.
 
+### Cleanup Tools
+
+- **`cleanup_orphan`**: Legacy cleanup for a named dead agent. It refuses live tmux windows and is intended for the existing orphan path.
+- **`cleanup_leaf`**: On-demand safety-checked cleanup for a named orphan or a `sweep=true` set. The host verifies dead tmux state, a clean worktree, exactly one matching PR, and a merged or closed-unmerged PR before using the shared disposal path. Use `dry_run=true` to inspect; it never force-cleans dirty or ambiguous targets.
+
 ### Task Tools (`ExoMonad.Guest.Tools.Tasks`)
 
 - **`task_list`**: List tasks from the shared Claude Code task list. Optionally filter by status. Team name auto-resolved from TeamRegistry.

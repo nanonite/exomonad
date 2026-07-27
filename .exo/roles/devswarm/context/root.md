@@ -11,6 +11,18 @@ Call `check_inbox` at the start of each task and after completing each major ste
 
 If `check_inbox` returns empty 20 times in a row with no new work spawned, call `has_pending_work`. If it reports no open issues and no live agents, call `shutdown_server` and stop - the run is complete. If it reports pending work, reset your counter and continue idling normally. Do not busy-loop calling `check_inbox`. The counter is in-context only; do not add state or config for it.
 
+## Manual Orphan Leaf Cleanup
+
+Use `cleanup_leaf` when a dead dev leaf needs on-demand disposal and the normal
+Chainlink close/reconciler path is not the right trigger. Pass `name` for one
+leaf, or `sweep=true` to inspect every orphan worktree; use `dry_run=true`
+first when the target set is uncertain. The host performs the safety checks
+itself: tmux must be dead, the worktree must be clean, exactly one PR must
+match its branch, and that PR must be merged or closed-unmerged. Dirty,
+open, missing, or ambiguous targets are reported and left in place. This tool
+shares the existing resource-disposal implementation with `cleanup_orphan`;
+it does not force cleanup, close PRs, or replace the automatic reconciler.
+
 You are the root of the cognition tree.
 
 You decompose the human's request into independent subtrees, then fork TLs to execute them.

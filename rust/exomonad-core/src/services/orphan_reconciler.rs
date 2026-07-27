@@ -67,14 +67,24 @@ async fn reconcile_issue_worktrees(
         let Some(slug) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        let Some(issue_id) = issue_id_from_slug(&slug) else {
+        let Some(issue_id) = issue_id_for_worktree(project_dir, &slug).await else {
             continue;
         };
-        if issue_closed_event_already_recorded(project_dir, issue_id).await? {
+        if issue_closed_event_already_recorded(project_dir, issue_id, &slug).await? {
             continue;
         }
+        if let Some(previous_slug) =
+            issue_closed_event_recorded_for_other_worktree(project_dir, issue_id, &slug).await?
+        {
+            info!(
+                issue_id,
+                previous_agent = %previous_slug,
+                agent = %slug,
+                "Closed issue was already reconciled for a different worktree; checking this worktree independently"
+            );
+        }
         if chainlink_issue_is_closed(project_dir, issue_id).await? {
-            append_issue_closed_event(project_dir, issue_id, "orphan_reconciler").await?;
+            append_issue_closed_event(project_dir, issue_id, &slug, "orphan_reconciler").await?;
             dispose_agent_resources(project_dir, git_wt.clone(), &slug).await;
             info!(issue_id, agent = %slug, "Reconciled closed Chainlink issue for live worktree");
         }
@@ -119,30 +129,72 @@ fn issue_id_from_slug(slug: &str) -> Option<u64> {
     }
 }
 
-async fn issue_closed_event_already_recorded(project_dir: &Path, issue_id: u64) -> Result<bool> {
+async fn issue_id_for_worktree(project_dir: &Path, slug: &str) -> Option<u64> {
+    let active_issue_path = project_dir
+        .join(".exo/agents")
+        .join(slug)
+        .join("active_issue");
+    match tokio::fs::read_to_string(active_issue_path).await {
+        Ok(active_issue) => active_issue
+            .trim()
+            .parse()
+            .ok()
+            .or_else(|| issue_id_from_slug(slug)),
+        Err(_) => issue_id_from_slug(slug),
+    }
+}
+
+async fn issue_closed_event_already_recorded(
+    project_dir: &Path,
+    issue_id: u64,
+    slug: &str,
+) -> Result<bool> {
     let path = project_dir.join(".exo/events/issue_closed.jsonl");
     let Ok(content) = tokio::fs::read_to_string(path).await else {
         return Ok(false);
     };
     Ok(content
         .lines()
-        .any(|line| issue_closed_line_matches(line, issue_id)))
+        .any(|line| issue_closed_line_matches(line, issue_id, slug)))
 }
 
-fn issue_closed_line_matches(line: &str, issue_id: u64) -> bool {
+async fn issue_closed_event_recorded_for_other_worktree(
+    project_dir: &Path,
+    issue_id: u64,
+    slug: &str,
+) -> Result<Option<String>> {
+    let path = project_dir.join(".exo/events/issue_closed.jsonl");
+    let Ok(content) = tokio::fs::read_to_string(path).await else {
+        return Ok(None);
+    };
+    Ok(content.lines().find_map(|line| {
+        let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+        let payload = value.get("payload")?;
+        let recorded_issue_id = payload.get("issue_id")?.as_u64()?;
+        let recorded_slug = payload.get("slug")?.as_str()?;
+        (recorded_issue_id == issue_id && recorded_slug != slug).then(|| recorded_slug.to_string())
+    }))
+}
+
+fn issue_closed_line_matches(line: &str, issue_id: u64, slug: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return false;
     };
-    value
-        .get("payload")
+    let payload = value.get("payload");
+    payload
         .and_then(|payload| payload.get("issue_id"))
         .and_then(serde_json::Value::as_u64)
         == Some(issue_id)
+        && payload
+            .and_then(|payload| payload.get("slug"))
+            .and_then(serde_json::Value::as_str)
+            == Some(slug)
 }
 
 async fn append_issue_closed_event(
     project_dir: &Path,
     issue_id: u64,
+    slug: &str,
     closed_by: &str,
 ) -> Result<()> {
     let events_dir = project_dir.join(".exo/events");
@@ -151,6 +203,7 @@ async fn append_issue_closed_event(
         "event_type": "issue_closed",
         "payload": {
             "issue_id": issue_id,
+            "slug": slug,
             "closed_by": closed_by,
         }
     });
@@ -417,6 +470,21 @@ mod tests {
         assert_eq!(issue_id_from_slug("issue-runtime-hook"), None);
     }
 
+    #[tokio::test]
+    async fn active_issue_file_overrides_slug_issue_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent_dir = temp_dir.path().join(".exo/agents/ad-hoc-leaf-opencode");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        tokio::fs::write(agent_dir.join("active_issue"), "313\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issue_id_for_worktree(temp_dir.path(), "ad-hoc-leaf-opencode").await,
+            Some(313)
+        );
+    }
+
     #[test]
     fn parses_closed_chainlink_show_output() {
         let output = "Issue #313: test\nStatus: closed\nPriority: medium\n";
@@ -426,8 +494,38 @@ mod tests {
 
     #[test]
     fn detects_recorded_issue_closed_lines() {
-        let line = r#"{"event_type":"issue_closed","payload":{"issue_id":313,"closed_by":"test"}}"#;
-        assert!(issue_closed_line_matches(line, 313));
-        assert!(!issue_closed_line_matches(line, 312));
+        let line = r#"{"event_type":"issue_closed","payload":{"issue_id":313,"slug":"issue-313-first","closed_by":"test"}}"#;
+        assert!(issue_closed_line_matches(line, 313, "issue-313-first"));
+        assert!(!issue_closed_line_matches(line, 313, "issue-313-second"));
+        assert!(!issue_closed_line_matches(line, 312, "issue-313-first"));
+    }
+
+    #[tokio::test]
+    async fn same_issue_worktrees_have_independent_disposal_ledger_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        append_issue_closed_event(temp_dir.path(), 313, "issue-313-first", "test")
+            .await
+            .unwrap();
+
+        assert!(
+            issue_closed_event_already_recorded(temp_dir.path(), 313, "issue-313-first")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !issue_closed_event_already_recorded(temp_dir.path(), 313, "issue-313-second")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            issue_closed_event_recorded_for_other_worktree(
+                temp_dir.path(),
+                313,
+                "issue-313-second"
+            )
+            .await
+            .unwrap(),
+            Some("issue-313-first".to_string())
+        );
     }
 }

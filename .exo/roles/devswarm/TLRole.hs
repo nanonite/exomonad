@@ -38,6 +38,7 @@ import ExoMonad.Guest.Tools.Chainlink
     ChainlinkTimerStop (..),
   )
 import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
+import ExoMonad.Guest.Tools.CleanupLeaf (CleanupLeaf (..))
 import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.CloseReviewerWindow (CloseReviewerWindow (..))
@@ -274,6 +275,7 @@ data Tools mode = Tools
     chainlinkIssueClose :: mode :- ChainlinkIssueClose,
     closeIssueAndCleanup :: mode :- CloseIssueAndCleanup,
     cleanupOrphan :: mode :- CleanupOrphan,
+    cleanupLeaf :: mode :- CleanupLeaf,
     chainlinkTimerStart :: mode :- ChainlinkTimerStart,
     chainlinkTimerStop :: mode :- ChainlinkTimerStop,
     chainlinkTimerStatus :: mode :- ChainlinkTimerStatus,
@@ -324,6 +326,7 @@ config =
             chainlinkIssueClose = mkHandler @ChainlinkIssueClose,
             closeIssueAndCleanup = mkHandler @CloseIssueAndCleanup,
             cleanupOrphan = mkHandler @CleanupOrphan,
+            cleanupLeaf = mkHandler @CleanupLeaf,
             chainlinkTimerStart = mkHandler @ChainlinkTimerStart,
             chainlinkTimerStop = mkHandler @ChainlinkTimerStop,
             chainlinkTimerStatus = mkHandler @ChainlinkTimerStatus,

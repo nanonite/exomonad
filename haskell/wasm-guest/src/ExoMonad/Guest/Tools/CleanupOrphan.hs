@@ -101,7 +101,13 @@ dryRunOutput args found =
 
 disposeOrphan :: CleanupOrphanArgs -> Maybe PS.AgentStatus -> Eff Effects (Either Text Aeson.Value)
 disposeOrphan args found = do
-  let req = PA.DisposeOrphanRequest {PA.disposeOrphanRequestAgentSlug = fromText (coaName args)}
+  let req =
+        PA.DisposeOrphanRequest
+          { PA.disposeOrphanRequestAgentSlug = fromText (coaName args),
+            PA.disposeOrphanRequestVerifyPrState = False,
+            PA.disposeOrphanRequestDryRun = False,
+            PA.disposeOrphanRequestSweep = False
+          }
   result <- suspendEffect @Agent.AgentDisposeOrphan req
   pure $ case result of
     Left err -> Left (spawnErrorMessage err)

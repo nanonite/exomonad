@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix orphan reconciler: per-worktree idempotency instead of per-issue-id (#555)
 - Warn when --reset-inbox targets an already-running session (#553)
 - TL spawns disconnected fix-PRs instead of resuming the owning agent (#549)
 - Fix spawn_leaf/fork_wave response branch_name to report the real dot-prefixed branch (#551)
@@ -95,6 +96,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add cleanup_leaf: manual on-demand disposal tool for stale leaf worktrees (#556)
 - Add open-PR equivalent of replace_close_pr for unrecoverable-by-name leaves (#552)
 - Add --reset-inbox flag to exomonad init (#548)
 - Add role-specific effort levels for TL, worker, and reviewer harnesses (#526)

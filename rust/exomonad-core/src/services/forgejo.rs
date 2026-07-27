@@ -252,6 +252,27 @@ impl ForgejoClient {
         }
     }
 
+    /// Find every PR, including closed and merged PRs, whose head branch matches.
+    ///
+    /// Cleanup needs the full PR history: an open-only lookup would make a
+    /// closed orphan look like it has no PR and would either leak resources or
+    /// tempt callers into an unsafe forced cleanup.
+    pub async fn find_pull_requests_by_head(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        head: &BranchName,
+    ) -> Result<Vec<ForgejoPullRequest>> {
+        match &self.backend {
+            ForgejoBackend::Http(client) => {
+                client.find_pull_requests_by_head(owner, repo, head).await
+            }
+            ForgejoBackend::Fj(client) => {
+                client.find_pull_requests_by_head(owner, repo, head).await
+            }
+        }
+    }
+
     pub async fn list_open_pull_requests(
         &self,
         owner: &GithubOwner,
@@ -558,6 +579,31 @@ impl HttpForgejoClient {
             .find(|pr| pr.head.ref_name == head.as_str())
             .map(ForgejoPullRequest::try_from)
             .transpose()
+    }
+
+    pub async fn find_pull_requests_by_head(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        head: &BranchName,
+    ) -> Result<Vec<ForgejoPullRequest>> {
+        let url = self.repo_pulls_url(owner, repo)?;
+        let response = self
+            .http
+            .get(url)
+            .query(&[("state", "all"), ("limit", "100")])
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo PR list request failed")?;
+
+        let prs: Vec<PullRequestResponse> = self
+            .decode_response(response, "list Forgejo pull requests")
+            .await?;
+        prs.into_iter()
+            .filter(|pr| pr.head.ref_name == head.as_str())
+            .map(ForgejoPullRequest::try_from)
+            .collect()
     }
 
     pub async fn list_open_pull_requests(
@@ -1079,6 +1125,31 @@ impl FjForgejoClient {
             .await?
             .into_iter()
             .find(|pr| pr.head_ref == *head))
+    }
+
+    async fn find_pull_requests_by_head(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        head: &BranchName,
+    ) -> Result<Vec<ForgejoPullRequest>> {
+        Ok(self
+            .list_pull_requests(owner, repo)
+            .await?
+            .into_iter()
+            .filter(|pr| pr.head_ref == *head)
+            .collect())
+    }
+
+    async fn list_pull_requests(
+        &self,
+        _owner: &GithubOwner,
+        _repo: &GithubRepo,
+    ) -> Result<Vec<ForgejoPullRequest>> {
+        let prs: Vec<PullRequestResponse> = self
+            .fj_json(["pr", "list", "--state", "all", "--json"])
+            .await?;
+        prs.into_iter().map(ForgejoPullRequest::try_from).collect()
     }
 
     async fn list_open_pull_requests(
