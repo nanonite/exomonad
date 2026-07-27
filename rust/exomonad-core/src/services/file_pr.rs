@@ -272,6 +272,52 @@ pub async fn file_pr_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn git_repository_root(path: &Path) -> Option<PathBuf> {
+        let output = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(path)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .expect("failed to run git repository detection");
+        if output.status.success() {
+            return Some(PathBuf::from(
+                String::from_utf8_lossy(&output.stdout).trim(),
+            ));
+        }
+        None
+    }
+
+    /// Create a temp directory outside any git repository.
+    fn tempdir_outside_any_repo() -> tempfile::TempDir {
+        let mut rejected = Vec::new();
+        let candidates = [
+            tempfile::tempdir(),
+            tempfile::tempdir_in("/tmp"),
+            tempfile::tempdir_in("/var/tmp"),
+        ];
+
+        for result in candidates {
+            let Ok(dir) = result else {
+                continue;
+            };
+            if let Some(repo) = git_repository_root(dir.path()) {
+                rejected.push(format!(
+                    "{} (found .git at {})",
+                    dir.path().display(),
+                    repo.display()
+                ));
+                continue;
+            }
+            return dir;
+        }
+
+        panic!(
+            "failed to create a temp dir outside any git repository; rejected={rejected:?}, TMPDIR={:?}",
+            std::env::var("TMPDIR").ok(),
+        );
+    }
 
     // =========================================================================
     // resolve_base_branch tests
@@ -425,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_pr_async_no_git_repo() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
+        let temp_dir = tempdir_outside_any_repo();
         let git_wt = Arc::new(GitWorktreeService::new(temp_dir.path().to_path_buf()));
         let input = FilePRInput {
             title: "Test PR".to_string(),
@@ -437,8 +483,16 @@ mod tests {
         };
 
         let forgejo = ForgejoClient::new("http://forgejo.local", "token").unwrap();
-        let result = file_pr_async(&input, git_wt, forgejo.as_ref()).await;
-        assert!(result.is_err());
+        let err = file_pr_async(&input, git_wt, forgejo.as_ref())
+            .await
+            .expect_err("filing a PR outside a git repo must fail");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "No bookmark found for workspace at {}",
+                temp_dir.path().display()
+            )
+        );
 
         Ok(())
     }

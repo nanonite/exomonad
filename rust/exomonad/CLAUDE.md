@@ -69,7 +69,7 @@ wasm_name = "devswarm"        # auto-detected from .exo/roles/ if exactly one ex
 model = "sonnet"              # optional — --model flag for root TL agent
 root_agent_type = "claude"    # claude | gemini | opencode | codex
 spawn_agent_type = "gemini"   # worker/leaf/companion harness
-tl_effort_level = "medium"    # CLI overrides config; Fugu omitted => high
+tl_effort_level = "medium"    # CLI overrides config
 worker_effort_level = "medium"
 poll_interval = 60            # optional — GitHub poll cycle in seconds (default: 60)
 [reviewer]

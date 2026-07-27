@@ -253,6 +253,11 @@ cargo test -p exomonad-core             # All library tests (framework + handler
 cargo test -p exomonad-proto            # Wire format compatibility tests
 ```
 
+Tests that require a directory outside any git repository must use the
+outside-repository tempdir helper, because `tempfile::tempdir()` honors `TMPDIR`.
+The dev shell pins nix-created `TMPDIR` values back to a system temp directory,
+while helpers still validate this precondition when tests run directly.
+
 ## Design Decisions
 
 | Decision | Rationale |

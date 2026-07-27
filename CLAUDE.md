@@ -221,7 +221,7 @@ wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one rol
 model = "sonnet"             # optional — passed as --model flag to root TL agent
 root_agent_type = "claude"   # claude | gemini | opencode | codex
 spawn_agent_type = "gemini"  # harness for workers, leaves, and companions
-# CLI flags override these values. Omitted effort is medium, except Fugu (high).
+# CLI flags override these values. Omitted effort is medium.
 tl_effort_level = "medium"
 worker_effort_level = "medium"
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)

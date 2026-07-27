@@ -98,10 +98,12 @@
               ++ [ notebooklm-mcp ]; # NotebookLM MCP server (opt-in via config.toml)
 
             shellHook = ''
-              # nix mkShell overrides TMPDIR to /tmp/nix-shell.*, which breaks
-              # tmux and other tools socket discovery.
-              # Restore native TMPDIR — devShells are interactive, not hermetic builds.
-              if [[ "$TMPDIR" == /tmp/nix-shell.* ]]; then
+              # nix mkShell points TMPDIR at a per-shell scratch dir derived from the
+              # ambient TMPDIR, which breaks tmux socket discovery and puts test
+              # tempdirs inside the repo when the ambient value is the project root.
+              # Restore a real system temp dir — devShells are interactive, not
+              # hermetic builds.
+              if [[ "$TMPDIR" == */nix-shell.* ]]; then
                 export TMPDIR="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo /tmp)"
               fi
 
