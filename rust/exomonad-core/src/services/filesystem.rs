@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use tokio::fs;
 
 // ============================================================================
@@ -68,43 +68,58 @@ pub struct FileSystemService {
     project_dir: PathBuf,
 }
 
+/// Resolve `.` and `..` components without touching the filesystem.
+///
+/// The containment check must not depend on whether the target exists, so
+/// normalization is purely lexical. `..` at or above the root is clamped, matching
+/// POSIX behavior where `/..` is `/`.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    None | Some(Component::RootDir)
+                ) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 impl FileSystemService {
     /// Create a new filesystem service.
     pub fn new(project_dir: PathBuf) -> Self {
         Self { project_dir }
     }
 
-    /// Resolve a path (absolute or relative to project_dir).
+    /// Resolve a caller-supplied path against the project root.
     ///
-    /// Returns an error if the resolved path escapes the project root (path traversal).
+    /// Containment is decided lexically so it holds for paths that do not yet
+    /// exist. Existing paths are additionally re-checked after symlink
+    /// resolution. Both checks fail closed.
     fn resolve_path(&self, path: &str) -> Result<PathBuf> {
-        let p = PathBuf::from(path);
-        let resolved = if p.is_absolute() {
-            p
+        let canonical_root = self.project_dir.canonicalize().with_context(|| {
+            format!(
+                "project root does not resolve: {}",
+                self.project_dir.display()
+            )
+        })?;
+
+        let requested = PathBuf::from(path);
+        let joined = if requested.is_absolute() {
+            requested
         } else {
-            self.project_dir.join(p)
+            canonical_root.join(requested)
         };
 
-        // Canonicalize both paths to resolve symlinks and .. components.
-        // For new files, canonicalize the parent directory instead.
-        let canonical = if resolved.exists() {
-            resolved.canonicalize()
-        } else if let Some(parent) = resolved.parent() {
-            // Parent must exist for us to validate the path
-            parent
-                .canonicalize()
-                .map(|p| p.join(resolved.file_name().unwrap_or_default()))
-        } else {
-            Ok(resolved.clone())
-        }
-        .unwrap_or(resolved.clone());
-
-        let canonical_root = self
-            .project_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.project_dir.clone());
-
-        if !canonical.starts_with(&canonical_root) {
+        let normalized = normalize_lexically(&joined);
+        if !normalized.starts_with(&canonical_root) {
             anyhow::bail!(
                 "Path traversal denied: '{}' escapes project root '{}'",
                 path,
@@ -112,7 +127,45 @@ impl FileSystemService {
             );
         }
 
-        Ok(resolved)
+        // Secondary check: an existing path (or existing parent) may be a symlink
+        // pointing out of the root. Only applies when the target is materialized.
+        let symlink_target = if normalized.exists() {
+            Some(
+                normalized
+                    .canonicalize()
+                    .with_context(|| format!("failed to resolve path: {}", normalized.display()))?,
+            )
+        } else {
+            match normalized.parent() {
+                Some(parent) if parent.exists() => {
+                    let file_name = normalized.file_name().with_context(|| {
+                        format!("failed to determine file name: {}", normalized.display())
+                    })?;
+                    Some(
+                        parent
+                            .canonicalize()
+                            .with_context(|| {
+                                format!("failed to resolve parent: {}", parent.display())
+                            })?
+                            .join(file_name),
+                    )
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(resolved) = symlink_target {
+            if !resolved.starts_with(&canonical_root) {
+                anyhow::bail!(
+                    "Path traversal denied: '{}' resolves through a symlink to '{}', outside project root '{}'",
+                    path,
+                    resolved.display(),
+                    canonical_root.display()
+                );
+            }
+        }
+
+        Ok(normalized)
     }
 
     /// Read a file.
@@ -270,5 +323,95 @@ mod tests {
         };
         let read_result = service.read_file(&read_input).await.unwrap();
         assert_eq!(read_result.content, "nested");
+    }
+
+    /// Traversal is denied when the escape target does not exist.
+    #[tokio::test]
+    async fn test_path_traversal_rejected_when_target_absent() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let service = FileSystemService::new(root);
+
+        let input = ReadFileInput {
+            path: "../escape/secret.txt".to_string(),
+            max_bytes: 0,
+        };
+        let err = service.read_file(&input).await.unwrap_err().to_string();
+        assert!(err.contains("Path traversal denied"), "got: {err}");
+    }
+
+    /// Parent creation cannot materialize a directory outside the project root.
+    #[tokio::test]
+    async fn test_write_with_create_parents_cannot_escape_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let escape = dir.path().join("escape");
+        let service = FileSystemService::new(root);
+
+        let input = WriteFileInput {
+            path: "../escape/deep/pwned.txt".to_string(),
+            content: "pwned".to_string(),
+            create_parents: true,
+        };
+        let err = service.write_file(&input).await.unwrap_err().to_string();
+        assert!(err.contains("Path traversal denied"), "got: {err}");
+        assert!(!escape.exists(), "escape directory must not be created");
+    }
+
+    /// A symlink inside the root pointing outside is denied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlink_escape_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let service = FileSystemService::new(root);
+        let input = ReadFileInput {
+            path: "link/secret.txt".to_string(),
+            max_bytes: 0,
+        };
+        let err = service.read_file(&input).await.unwrap_err().to_string();
+        assert!(err.contains("Path traversal denied"), "got: {err}");
+    }
+
+    /// Interior `..` components that stay inside the root remain valid.
+    #[tokio::test]
+    async fn test_interior_parent_components_allowed() {
+        let dir = tempdir().unwrap();
+        let service = FileSystemService::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("b.txt"), "hello").unwrap();
+
+        let input = ReadFileInput {
+            path: "a/../b.txt".to_string(),
+            max_bytes: 0,
+        };
+        let out = service.read_file(&input).await.unwrap();
+        assert_eq!(out.content, "hello");
+    }
+
+    /// Parent creation still works for legitimate nested paths.
+    #[tokio::test]
+    async fn test_write_create_parents_inside_root_still_allowed() {
+        let dir = tempdir().unwrap();
+        let service = FileSystemService::new(dir.path().to_path_buf());
+
+        let input = WriteFileInput {
+            path: "nested/deep/file.txt".to_string(),
+            content: "ok".to_string(),
+            create_parents: true,
+        };
+        service.write_file(&input).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nested/deep/file.txt")).unwrap(),
+            "ok"
+        );
     }
 }
