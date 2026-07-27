@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tracing::{debug, info, instrument, warn};
 
 /// Delivery attempts for a single queued message before it is abandoned.
-const MAX_DELIVERY_ATTEMPTS: u32 = 6;
+const MAX_DELIVERY_ATTEMPTS: u32 = 8;
 /// First retry delay; doubles per attempt up to `MAX_DELIVERY_BACKOFF`.
 const INITIAL_DELIVERY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_DELIVERY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
@@ -777,78 +777,108 @@ pub async fn notify_parent_delivery(
     delivery_result
 }
 
-/// Deliver a notification via HTTP POST over a Unix domain socket.
-/// Fire-and-forget with 5s timeout.
+/// Drain `agent`'s inbox queue, injecting each message into its tmux target.
+/// Exits only when the queue is empty; a failing delivery is retried with
+/// backoff and then abandoned, never left stranded without a consumer.
 async fn spawn_inbox_consumer(agent: String) {
-    tokio::spawn(async move {
+    tokio::spawn(run_inbox_consumer(
+        agent,
+        |message: InboxMessage| async move {
+            tmux_events::inject_input_with_options(
+                &message.target,
+                &message.body,
+                &message.project_dir,
+                message.injection_options,
+            )
+            .await
+        },
+    ));
+}
+
+/// Consumer loop, generic over the injector so tests can drive failure paths.
+async fn run_inbox_consumer<F, Fut>(agent: String, inject: F)
+where
+    F: Fn(InboxMessage) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    loop {
+        let Some(message) = GLOBAL_AGENT_INBOX.begin_delivery(&agent).await else {
+            return;
+        };
+
+        let mut attempt: u32 = 0;
         loop {
-            let Some(message) = GLOBAL_AGENT_INBOX.begin_delivery(&agent).await else {
-                return;
-            };
+            attempt += 1;
+            let result = deliver_once(&inject, message.clone()).await;
+            let success = result.is_ok();
 
-            let mut attempt: u32 = 0;
-            loop {
-                attempt += 1;
-                let result = tmux_events::inject_input_with_options(
-                    &message.target,
-                    &message.body,
-                    &message.project_dir,
-                    message.injection_options,
-                )
-                .await;
-                let success = result.is_ok();
+            tracing::info!(
+                otel.name = "message.delivery",
+                agent_id = %message.from,
+                recipient = %message.recipient,
+                method = "agent_inbox_tmux",
+                outcome = if success { "success" } else { "failed" },
+                attempt,
+                detail = %message.detail,
+                "[event] message.delivery"
+            );
 
-                tracing::info!(
-                    otel.name = "message.delivery",
-                    agent_id = %message.from,
-                    recipient = %message.recipient,
-                    method = "agent_inbox_tmux",
-                    outcome = if success { "success" } else { "failed" },
-                    attempt,
-                    detail = %message.detail,
-                    "[event] message.delivery"
-                );
+            if success {
+                GLOBAL_AGENT_INBOX
+                    .complete_delivery(&agent, message.id, true)
+                    .await;
+                break;
+            }
 
-                if success {
-                    GLOBAL_AGENT_INBOX
-                        .complete_delivery(&agent, message.id, true)
-                        .await;
-                    break;
-                }
+            let error = result.unwrap_err();
 
-                let error = result.unwrap_err();
-
-                if attempt >= MAX_DELIVERY_ATTEMPTS {
-                    tracing::error!(
-                        target = %message.target,
-                        recipient = %message.recipient,
-                        attempts = attempt,
-                        error = %error,
-                        "agent inbox delivery abandoned after exhausting retries; message dropped"
-                    );
-                    tracing::info!(
-                        otel.name = "agent_inbox.messages_abandoned",
-                        recipient = %message.recipient,
-                        attempts = attempt,
-                        "[metric] agent_inbox.messages_abandoned"
-                    );
-                    GLOBAL_AGENT_INBOX
-                        .abandon_delivery(&agent, message.id)
-                        .await;
-                    break;
-                }
-
-                warn!(
+            if attempt >= MAX_DELIVERY_ATTEMPTS {
+                tracing::error!(
                     target = %message.target,
                     recipient = %message.recipient,
-                    attempt,
+                    attempts = attempt,
                     error = %error,
-                    "agent inbox delivery failed; retrying after backoff"
+                    "agent inbox delivery abandoned after exhausting retries; message dropped"
                 );
-                tokio::time::sleep(delivery_backoff(attempt)).await;
+                tracing::info!(
+                    otel.name = "agent_inbox.messages_abandoned",
+                    recipient = %message.recipient,
+                    attempts = attempt,
+                    "[metric] agent_inbox.messages_abandoned"
+                );
+                GLOBAL_AGENT_INBOX
+                    .abandon_delivery(&agent, message.id)
+                    .await;
+                break;
             }
+
+            warn!(
+                target = %message.target,
+                recipient = %message.recipient,
+                attempt,
+                error = %error,
+                "agent inbox delivery failed; retrying after backoff"
+            );
+            tokio::time::sleep(delivery_backoff(attempt)).await;
         }
-    });
+    }
+}
+
+/// Run one injection attempt in its own task so a panic inside tmux injection
+/// becomes an ordinary failed attempt instead of killing the consumer and
+/// stranding the queue.
+async fn deliver_once<F, Fut>(inject: &F, message: InboxMessage) -> anyhow::Result<()>
+where
+    F: Fn(InboxMessage) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    match tokio::spawn(inject(message)).await {
+        Ok(result) => result,
+        Err(join_error) if join_error.is_panic() => {
+            Err(anyhow::anyhow!("delivery task panicked: {join_error}"))
+        }
+        Err(join_error) => Err(anyhow::anyhow!("delivery task failed: {join_error}")),
+    }
 }
 
 fn delivery_backoff(attempt: u32) -> std::time::Duration {
@@ -1401,6 +1431,7 @@ mod tests {
     use crate::services::agent_control::{AgentType, Topology};
     use crate::services::{AgentIdentityRecord, AgentResolver, HasAgentResolver};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::sync::Arc;
 
     fn agent_name(value: &str) -> AgentName {
@@ -1413,6 +1444,46 @@ mod tests {
 
     fn slug(value: &str) -> Slug {
         Slug::try_from_str(value).expect("literal validated string is non-empty")
+    }
+
+    fn tmux_message(body: &str) -> crate::services::agent_inbox::InboxMessage {
+        crate::services::agent_inbox::InboxMessage::new(
+            "%1".to_string(),
+            std::path::PathBuf::from("."),
+            "sender".to_string(),
+            "recipient".to_string(),
+            body.to_string(),
+            "%1".to_string(),
+        )
+    }
+
+    /// Injector that fails its first `fail_times` calls, then succeeds.
+    fn flaky_injector(
+        fail_times: u32,
+    ) -> (
+        Arc<AtomicU32>,
+        impl Fn(
+                crate::services::agent_inbox::InboxMessage,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        let inject = move |_message| {
+            let seen = counter.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            Box::pin(async move {
+                if seen <= fail_times {
+                    Err(anyhow::anyhow!("simulated tmux failure"))
+                } else {
+                    Ok(())
+                }
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+        };
+        (calls, inject)
     }
 
     async fn services_with_agent(slug_value: &str, agent_value: &str) -> crate::services::Services {
@@ -1637,5 +1708,103 @@ mod tests {
         assert_eq!(drained[0].from_agent, "test");
         assert_eq!(drained[0].content, "hello");
         assert_eq!(drained[0].summary.as_deref(), Some("summary"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consumer_retries_failed_delivery_then_succeeds() {
+        let agent = "retry-then-succeed-agent";
+        GLOBAL_AGENT_INBOX
+            .enqueue(agent, tmux_message("[MERGE READY] PR #42"))
+            .await
+            .unwrap();
+
+        let (calls, inject) = flaky_injector(2);
+        run_inbox_consumer(agent.to_string(), inject).await;
+
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            3,
+            "two failures then success"
+        );
+        assert_eq!(GLOBAL_AGENT_INBOX.queue_depth(agent).await, 0);
+        assert!(!GLOBAL_AGENT_INBOX.is_consumer_active(agent).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consumer_abandons_message_after_exhausting_attempts() {
+        let agent = "abandon-after-max-agent";
+        let body = "[MERGE READY] PR #99";
+        GLOBAL_AGENT_INBOX
+            .enqueue(agent, tmux_message(body))
+            .await
+            .unwrap();
+
+        let (calls, inject) = flaky_injector(u32::MAX);
+        run_inbox_consumer(agent.to_string(), inject).await;
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), MAX_DELIVERY_ATTEMPTS);
+        assert_eq!(GLOBAL_AGENT_INBOX.queue_depth(agent).await, 0);
+        assert!(!GLOBAL_AGENT_INBOX.is_consumer_active(agent).await);
+
+        // Abandoned, not marked recently-delivered: the same event is accepted again.
+        let retry = GLOBAL_AGENT_INBOX
+            .enqueue(agent, tmux_message(body))
+            .await
+            .unwrap();
+        assert!(!retry.dropped_as_duplicate);
+    }
+
+    /// Regression test for #543: a failed delivery must not end the consumer while
+    /// later messages are still queued.
+    #[tokio::test(start_paused = true)]
+    async fn consumer_survives_failure_and_drains_remaining_messages() {
+        let agent = "survives-failure-agent";
+        GLOBAL_AGENT_INBOX
+            .enqueue(agent, tmux_message("[MERGE READY] PR #1"))
+            .await
+            .unwrap();
+        GLOBAL_AGENT_INBOX
+            .enqueue(agent, tmux_message("[PR READY] PR #2"))
+            .await
+            .unwrap();
+
+        let (_calls, inject) = flaky_injector(1);
+        run_inbox_consumer(agent.to_string(), inject).await;
+
+        assert_eq!(
+            GLOBAL_AGENT_INBOX.queue_depth(agent).await,
+            0,
+            "consumer must drain the queue despite the first attempt failing"
+        );
+    }
+
+    /// A panicking injector must be treated as a failed attempt, not kill the
+    /// consumer and strand the queue with `consumer_active == true`.
+    #[tokio::test(start_paused = true)]
+    async fn panicking_injector_is_retried_not_fatal() {
+        let agent = "panicking-injector-agent";
+        GLOBAL_AGENT_INBOX
+            .enqueue(agent, tmux_message("[MERGE READY] PR #7"))
+            .await
+            .unwrap();
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        let inject = move |_message| {
+            let seen = counter.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            Box::pin(async move {
+                if seen == 1 {
+                    panic!("simulated panic inside tmux injection");
+                }
+                Ok(())
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+        };
+
+        run_inbox_consumer(agent.to_string(), inject).await;
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2, "panic retried once");
+        assert_eq!(GLOBAL_AGENT_INBOX.queue_depth(agent).await, 0);
+        assert!(!GLOBAL_AGENT_INBOX.is_consumer_active(agent).await);
     }
 }
