@@ -216,6 +216,8 @@ struct RunnerResponse {
     last_online: Option<String>,
 }
 
+const PULL_REQUEST_PAGE_SIZE: usize = 50;
+
 impl ForgejoClient {
     pub fn new(forgejo_url: &str, forgejo_token: &str) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
@@ -525,6 +527,46 @@ fn binary_in_path(binary: &str) -> bool {
         .any(|dir| dir.join(binary).is_file())
 }
 
+fn next_pull_request_page(
+    link_header: Option<&str>,
+    total_count: Option<usize>,
+    page: u32,
+    result_count: usize,
+) -> Option<u32> {
+    if let Some(next_page) = link_header
+        .and_then(next_page_from_link)
+        .filter(|next_page| *next_page > page)
+    {
+        return Some(next_page);
+    }
+
+    let next_page = page.saturating_add(1);
+    if total_count.is_some_and(|total| (page as usize) * PULL_REQUEST_PAGE_SIZE < total)
+        || total_count.is_none() && result_count == PULL_REQUEST_PAGE_SIZE
+    {
+        Some(next_page)
+    } else {
+        None
+    }
+}
+
+fn next_page_from_link(link_header: &str) -> Option<u32> {
+    link_header.split(',').find_map(|link| {
+        let (target, parameters) = link.split_once(';')?;
+        let is_next = parameters
+            .split(';')
+            .any(|parameter| parameter.trim() == r#"rel="next""#);
+        if !is_next {
+            return None;
+        }
+        let target = target.trim().strip_prefix('<')?.strip_suffix('>')?;
+        Url::parse(target)
+            .ok()?
+            .query_pairs()
+            .find_map(|(key, value)| (key == "page").then(|| value.parse::<u32>().ok()).flatten())
+    })
+}
+
 impl HttpForgejoClient {
     fn new(forgejo_url: &str, forgejo_token: &str) -> Result<Self> {
         let forgejo_url = forgejo_url.trim();
@@ -588,22 +630,52 @@ impl HttpForgejoClient {
         head: &BranchName,
     ) -> Result<Vec<ForgejoPullRequest>> {
         let url = self.repo_pulls_url(owner, repo)?;
-        let response = self
-            .http
-            .get(url)
-            .query(&[("state", "all"), ("limit", "100")])
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .context("Forgejo PR list request failed")?;
+        let mut page = 1;
+        let mut matching_prs = Vec::new();
+        loop {
+            let page_size = PULL_REQUEST_PAGE_SIZE.to_string();
+            let page_number = page.to_string();
+            let response = self
+                .http
+                .get(url.clone())
+                .query(&[
+                    ("state", "all"),
+                    ("limit", page_size.as_str()),
+                    ("page", page_number.as_str()),
+                ])
+                .headers(self.auth_headers()?)
+                .send()
+                .await
+                .context("Forgejo PR list request failed")?;
+            let link_header = response
+                .headers()
+                .get(header::LINK)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let total_count = response
+                .headers()
+                .get("x-total-count")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok());
+            let prs: Vec<PullRequestResponse> = self
+                .decode_response(response, "list Forgejo pull requests")
+                .await?;
+            let result_count = prs.len();
+            matching_prs.extend(
+                prs.into_iter()
+                    .filter(|pr| pr.head.ref_name == head.as_str())
+                    .map(ForgejoPullRequest::try_from)
+                    .collect::<Result<Vec<_>>>()?,
+            );
 
-        let prs: Vec<PullRequestResponse> = self
-            .decode_response(response, "list Forgejo pull requests")
-            .await?;
-        prs.into_iter()
-            .filter(|pr| pr.head.ref_name == head.as_str())
-            .map(ForgejoPullRequest::try_from)
-            .collect()
+            let Some(next_page) =
+                next_pull_request_page(link_header.as_deref(), total_count, page, result_count)
+            else {
+                break;
+            };
+            page = next_page;
+        }
+        Ok(matching_prs)
     }
 
     pub async fn list_open_pull_requests(
@@ -1847,6 +1919,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(pr.number.as_u64(), 9);
+    }
+
+    #[tokio::test]
+    async fn finds_pull_request_by_head_across_paginated_history() {
+        let (client, server) = client().await;
+        let first_page: Vec<_> = (54..=103)
+            .map(|number| {
+                serde_json::json!({
+                    "number": number,
+                    "html_url": format!("http://forgejo.local/owner/repo/pulls/{number}"),
+                    "head": { "ref": format!("branch-{number}") },
+                    "base": { "ref": "main" },
+                    "state": "closed"
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/pulls"))
+            .and(query_param("state", "all"))
+            .and(query_param("limit", "50"))
+            .and(query_param("page", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "Link",
+                        format!(
+                            "<{}/api/v1/repos/owner/repo/pulls?page=2>; rel=\"next\"",
+                            server.uri()
+                        ),
+                    )
+                    .set_body_json(first_page),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/pulls"))
+            .and(query_param("state", "all"))
+            .and(query_param("limit", "50"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "number": 24,
+                    "html_url": "http://forgejo.local/owner/repo/pulls/24",
+                    "head": { "ref": "issue-33-performance-debugging-opencode" },
+                    "base": { "ref": "main" },
+                    "state": "closed"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let prs = client
+            .find_pull_requests_by_head(
+                &owner(),
+                &repo(),
+                &branch("issue-33-performance-debugging-opencode"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prs.iter().map(|pr| pr.number.as_u64()).collect::<Vec<_>>(),
+            [24]
+        );
     }
 
     #[tokio::test]
