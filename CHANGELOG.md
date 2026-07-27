@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix watcher review comments delivery to the TL (#537)
 - fix: agent inbox consumer stalls permanently after a failed tmux delivery (#543)
 - Update restart_review for safe same-PR recovery (#540)
 - Fix Forgejo review comment visibility and fan-out routing (#534)
@@ -88,6 +89,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add role-specific effort levels for TL, worker, and reviewer harnesses (#526)
+- E2E: verify OpenCode + Codex notify_parent delivery over real transport (#512)
+- Wire and verify TL review recovery commands and operator guidance (#542)
+- Add explicit recovery workflows for same-PR restarts and closed-PR replacement (#539)
 - Add TL-approved closed-PR replacement workflow (#541)
 - `exomonad models codex` now queries `codex debug models` live instead of a hardcoded list; claude/gemini/codex-fugu disclaimers now explicitly state no discovery path is available (#532)
 - Add effort and Codex Fugu integration coverage (#531)
@@ -200,6 +205,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- e2e-claude-teams-inbox: E2E test for Claude TL → Claude dev leaf → Claude reviewer via Teams inbox (#462)
 - Route review fan-out to the dev leaf and spawn each reviewer round explicitly (#536)
 - Route comment-only Forgejo reviews through the watcher review-state pipeline (#535)
 - Prefer fj CLI over curl in reviewer/dev/root Forgejo interaction prompts (#505)
