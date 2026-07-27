@@ -1053,6 +1053,12 @@ pub async fn run(
     let session = session_override.unwrap_or(config.tmux_session.clone());
     let session_alive = TmuxIpc::has_session(&session).await?;
     if should_attach_existing_session(recreate, session_alive) {
+        if reset_inbox {
+            warn!(
+                session = %session,
+                "--reset-inbox cleared the inbox while an existing session was alive; attaching without restarting it"
+            );
+        }
         let ipc = TmuxIpc::new(&session);
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await;

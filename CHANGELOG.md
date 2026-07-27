@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Warn when --reset-inbox targets an already-running session (#553)
 - TL spawns disconnected fix-PRs instead of resuming the owning agent (#549)
 - Fix spawn_leaf/fork_wave response branch_name to report the real dot-prefixed branch (#551)
 - fix: test temp dirs depend on ambient TMPDIR; remove stale Codex-Fugu docs (#546)

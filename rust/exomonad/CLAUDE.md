@@ -96,7 +96,9 @@ the main repo's `.git/config` — no config.toml field). See
 
 Use `exomonad init --reset-inbox` to clear all persisted inbox messages and
 agent inbox metadata before starting the session, while preserving the inbox
-database schema.
+database schema. If init attaches to an already-running session without
+`--recreate`, it still clears the inbox and emits a warning; use `--recreate`
+when the reset should accompany a session restart.
 
 **WASM resolution:** project `.exo/wasm/` → build from `.exo/roles/` → copy from `~/.exo/wasm/` (global install via `just install-all`).
 
