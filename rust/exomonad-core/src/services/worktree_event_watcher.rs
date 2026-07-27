@@ -35,9 +35,10 @@ fn inbox_poke_message(unread_count: usize) -> String {
 const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Overall verdict derived from Forgejo reviews for a single open PR.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum ForgejoReviewVerdict {
+    #[default]
     None,
     Commented,
     ChangesRequested,
@@ -295,10 +296,24 @@ struct WatcherPrState {
     stuck: bool,
     #[serde(default)]
     needs_human_review: bool,
+    #[serde(default)]
+    last_review_state: ForgejoReviewVerdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_head_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_review_fingerprint: Option<String>,
+    #[serde(default)]
+    notified_parent_timeout: bool,
+    #[serde(default)]
+    notified_parent_approved: bool,
+    #[serde(default)]
+    addressed_changes: bool,
+    #[serde(default)]
+    merge_ready_notified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ci_triggered_sha: Option<String>,
+    #[serde(default)]
+    ci_blocked_notified: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1279,14 +1294,13 @@ where
 
                 let agent_name = &pr.author_agent;
                 let (branch, agent_type, agent_role) = review_event_target(pr);
-                let persisted_last_head_sha = watcher_state
+                let persisted = watcher_state
                     .prs
                     .get(pr_number)
-                    .and_then(|state| state.last_head_sha.as_deref());
-                let persisted_review_fingerprint = watcher_state
-                    .prs
-                    .get(pr_number)
-                    .and_then(|state| state.last_review_fingerprint.clone());
+                    .cloned()
+                    .unwrap_or_default();
+                let persisted_last_head_sha = persisted.last_head_sha.as_deref();
+                let persisted_review_fingerprint = persisted.last_review_fingerprint.clone();
                 let runtime_last_head_sha = state_guard
                     .get(pr_number)
                     .map(|state| state.last_sha.as_str());
@@ -1311,6 +1325,7 @@ where
                     if head_sha_changed {
                         old_state.reviewer_spawned = false;
                         old_state.reviewer_disposed = false;
+                        old_state.stuck = false;
                     }
                     if should_spawn_reviewer_for_new_head(
                         old_state,
@@ -1340,9 +1355,19 @@ where
                         self.policy.reviewer_max_wait_seconds,
                     )
                 } else {
+                    let last_sha = persisted_last_head_sha.unwrap_or(&obs.head_sha);
                     let mut new_state =
-                        WatchState::new(&branch, agent_type, &obs.head_sha, CIStatus::Unknown, 0);
+                        WatchState::new(&branch, agent_type, last_sha, CIStatus::Unknown, 0);
+                    new_state.last_review_state = persisted.last_review_state.clone();
                     new_state.last_review_fingerprint = persisted_review_fingerprint;
+                    new_state.notified_parent_timeout = persisted.notified_parent_timeout;
+                    new_state.notified_parent_approved = persisted.notified_parent_approved;
+                    new_state.addressed_changes = persisted.addressed_changes;
+                    new_state.rounds = persisted.rounds;
+                    new_state.stuck = persisted.stuck || persisted.needs_human_review;
+                    new_state.merge_ready_notified = persisted.merge_ready_notified;
+                    new_state.ci_triggered_sha = persisted.ci_triggered_sha.clone();
+                    new_state.ci_blocked_notified = persisted.ci_blocked_notified;
                     state_guard.insert(*pr_number, new_state);
                     let actions = compute_pr_actions_with_context(
                         state_guard
@@ -1364,7 +1389,10 @@ where
                     );
                     // Spawn reviewer immediately on first sighting of a new open PR
                     // unless the watcher restarted after a terminal review verdict.
-                    if !terminal_review_observed {
+                    let should_spawn_reviewer = state_guard.get(pr_number).is_some_and(|state| {
+                        should_spawn_reviewer_for_new_head(state, self.policy.reviewer_max_rounds)
+                    });
+                    if !terminal_review_observed && should_spawn_reviewer {
                         self.spawn_reviewer_for_pr(*pr_number, pr, &obs.head_sha, "first_sighting");
                     }
                     actions
@@ -1587,9 +1615,19 @@ where
         for (pr_number, head_sha) in updates {
             let entry = state.prs.entry(*pr_number).or_default();
             entry.last_head_sha = Some(head_sha.clone());
-            entry.last_review_fingerprint = runtime_state
-                .get(pr_number)
-                .and_then(|watch_state| watch_state.last_review_fingerprint.clone());
+            if let Some(watch_state) = runtime_state.get(pr_number) {
+                entry.rounds = watch_state.rounds;
+                entry.stuck = watch_state.stuck;
+                entry.needs_human_review = watch_state.stuck;
+                entry.last_review_state = watch_state.last_review_state.clone();
+                entry.last_review_fingerprint = watch_state.last_review_fingerprint.clone();
+                entry.notified_parent_timeout = watch_state.notified_parent_timeout;
+                entry.notified_parent_approved = watch_state.notified_parent_approved;
+                entry.addressed_changes = watch_state.addressed_changes;
+                entry.merge_ready_notified = watch_state.merge_ready_notified;
+                entry.ci_triggered_sha = watch_state.ci_triggered_sha.clone();
+                entry.ci_blocked_notified = watch_state.ci_blocked_notified;
+            }
         }
         drop(runtime_state);
         self.write_watcher_state(&state).await?;
@@ -1850,13 +1888,32 @@ where
 
     async fn mark_merge_ready_notified(&self, pr_number: u64) {
         let mut state_guard = self.state.prs.lock().await;
-        if let Some(state) = state_guard.get_mut(&pr_number) {
+        let marked = if let Some(state) = state_guard.get_mut(&pr_number) {
             state.merge_ready_notified = true;
+            true
         } else {
             warn!(
                 pr_number,
                 "Cannot mark merge-ready notification delivered because watcher state is missing"
             );
+            false
+        };
+        drop(state_guard);
+
+        if marked {
+            let mut persisted = self.read_watcher_state().await.unwrap_or_default();
+            persisted
+                .prs
+                .entry(pr_number)
+                .or_default()
+                .merge_ready_notified = true;
+            if let Err(error) = self.write_watcher_state(&persisted).await {
+                warn!(
+                    pr_number,
+                    %error,
+                    "Failed to persist merge-ready notification state"
+                );
+            }
         }
     }
 
@@ -2230,6 +2287,7 @@ fn compute_pr_actions_with_context(
         old_state.merge_ready_notified = false;
         old_state.ci_triggered_sha = None;
         old_state.ci_blocked_notified = false;
+        old_state.stuck = false;
         old_state.first_seen = Instant::now();
         merge_ready_now = false;
         if was_changes_requested {
@@ -5004,8 +5062,7 @@ mod tests {
                 rounds: 1,
                 stuck: true,
                 needs_human_review: true,
-                last_head_sha: None,
-                last_review_fingerprint: None,
+                ..Default::default()
             },
         );
         state.prs.insert(
@@ -5014,8 +5071,7 @@ mod tests {
                 rounds: 2,
                 stuck: false,
                 needs_human_review: false,
-                last_head_sha: None,
-                last_review_fingerprint: None,
+                ..Default::default()
             },
         );
         state.prs.insert(
@@ -5024,8 +5080,7 @@ mod tests {
                 rounds: 3,
                 stuck: true,
                 needs_human_review: false,
-                last_head_sha: None,
-                last_review_fingerprint: None,
+                ..Default::default()
             },
         );
         let mut registry = PrRegistry::default();
@@ -5079,7 +5134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_observations_does_not_persist_review_state_on_approval() {
+    async fn test_process_observations_preserves_persisted_terminal_state_on_approval() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
@@ -5092,8 +5147,7 @@ mod tests {
                 rounds: 2,
                 stuck: true,
                 needs_human_review: true,
-                last_head_sha: None,
-                last_review_fingerprint: None,
+                ..Default::default()
             },
         );
         watcher.write_watcher_state(&state).await.unwrap();
@@ -5120,10 +5174,61 @@ mod tests {
 
         let persisted = watcher.read_watcher_state().await.unwrap();
         let pr_state = persisted.prs.get(&1).unwrap();
-        assert_eq!(pr_state.rounds, 1);
+        assert_eq!(pr_state.rounds, 2);
         assert!(pr_state.stuck);
         assert!(pr_state.needs_human_review);
         assert!(!temp_dir.path().join(".exo/prs.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_hydrates_persisted_terminal_runtime_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let mut persisted = WatcherStateFile::default();
+        persisted.prs.insert(
+            1,
+            WatcherPrState {
+                rounds: 3,
+                stuck: true,
+                needs_human_review: true,
+                last_review_state: ForgejoReviewVerdict::ChangesRequested,
+                last_head_sha: Some("abc123".to_string()),
+                last_review_fingerprint: Some("persisted-review".to_string()),
+                notified_parent_timeout: true,
+                merge_ready_notified: true,
+                ci_blocked_notified: true,
+                ..Default::default()
+            },
+        );
+        watcher.write_watcher_state(&persisted).await.unwrap();
+
+        let registry = test_registry(test_pr_entry());
+        let mut observations = HashMap::new();
+        observations.insert(1u64, test_observation("abc123"));
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        let runtime = watcher.state.prs.lock().await;
+        let state = runtime.get(&1).expect("persisted PR state should hydrate");
+        assert_eq!(state.rounds, 3);
+        assert!(state.stuck);
+        assert_eq!(
+            state.last_review_state,
+            ForgejoReviewVerdict::ChangesRequested
+        );
+        assert_eq!(
+            state.last_review_fingerprint.as_deref(),
+            Some("persisted-review")
+        );
+        assert!(state.notified_parent_timeout);
+        assert!(state.merge_ready_notified);
+        assert!(state.ci_blocked_notified);
     }
 
     #[test]
