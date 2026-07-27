@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- fix: path traversal bypass in FileSystemService::resolve_path when target parent is absent (#545)
 - Fix watcher review comments delivery to the TL (#537)
 - fix: agent inbox consumer stalls permanently after a failed tmux delivery (#543)
 - Update restart_review for safe same-PR recovery (#540)
