@@ -459,7 +459,7 @@ fn review_parent_message(
 ) -> String {
     let reviewer_branch = author_branch.unwrap_or("unknown");
     format!(
-        "[REVIEW ACTION REQUIRED] PR #{pr_number} on branch {branch}\nReview kind: {review_kind}\nReviewer branch: {reviewer_branch}\n\n{comments}\n\nTL action: spawn a fresh dev leaf to address this review and include the PR branch in its task."
+        "[REVIEW ACTION REQUIRED] PR #{pr_number} on branch {branch}\nReview kind: {review_kind}\nReviewer branch: {reviewer_branch}\n\n{comments}\n\nTL action: use the existing owning work item and PR branch to coordinate the fix. Do not create a new Chainlink issue for this review."
     )
 }
 
@@ -4114,6 +4114,21 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn review_message_keeps_follow_up_on_existing_chainlink_work_item() {
+        let message = review_parent_message(
+            7,
+            "main.feature",
+            "changes requested",
+            Some("review-pr-7"),
+            "Address the parser edge case",
+        );
+
+        assert!(message.contains("existing owning work item"));
+        assert!(message.contains("Do not create a new Chainlink issue"));
+        assert!(!message.contains("spawn a fresh dev leaf"));
     }
 
     #[test]

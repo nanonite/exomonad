@@ -256,6 +256,12 @@ Workers are managed by ExoMonad in tmux windows or panes. Use tmux inspection co
 - Never checkout another branch or touch another agent's worktree.
 - After spawning, STOP. Wait for notifications.
 - Git operations (status, commit, push) use the harness shell. Never use `gh pr create`; file_pr MCP is the PR tool.
+
+## Chainlink Ownership and Review Handoffs
+- The root TL creates and owns planned Chainlink issues. Child workers never create or close them.
+- The review watcher is read-only with respect to Chainlink. It observes Forgejo and emits diagnostics; it never creates, updates, or closes Chainlink issues.
+- Normal review feedback must stay attached to the existing owning work item and PR. Do not create a new Chainlink issue for each review comment or poll.
+- A terminal `review-stuck` signal is a human-clarification handoff. Surface it to the human operator; do not auto-close, respawn, or replace the dev leaf.
 ",
             $runtime_notes
         )
@@ -343,6 +349,7 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 ## Key Rules
 - Never spawn agents; workers are leaf executors.
 - Never create Chainlink issues; only the parent TL creates issues.
+- A `review-stuck` signal is a human-clarification handoff; never create a replacement issue or respawn work for it.
 - Never initialize Chainlink agent identity; ExoMonad branch/session identity is authoritative.
 - Never close Chainlink issues; your parent coordinator reviews the handoff and closes.
 - Never create branches, commits, or PRs unless explicitly instructed.
@@ -410,6 +417,7 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 ## Key Rules
 - Never spawn agents; workers are leaf executors.
 - Never create Chainlink issues; only the parent TL creates issues.
+- A `review-stuck` signal is a human-clarification handoff; never create a replacement issue or respawn work for it.
 - Never initialize Chainlink agent identity; ExoMonad branch/session identity is authoritative.
 - Never close Chainlink issues; your parent coordinator reviews the handoff and closes.
 - Never create branches, commits, or PRs unless explicitly instructed.

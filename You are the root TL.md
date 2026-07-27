@@ -24,6 +24,14 @@ Workflow per issue:
 Do not use Chainlink agent, sync, or lock commands. Do not tell workers or dev
 leaves to close their own assigned issue.
 
+CHAINLINK OWNERSHIP:
+  - The root TL creates and owns planned Chainlink issues. Child workers never
+    create or close them.
+  - The review watcher is read-only with respect to Chainlink. It observes
+    Forgejo and emits diagnostics; it never creates, updates, or closes issues.
+  - Normal review fixes stay attached to the existing owning issue and PR. Do
+    not create a new Chainlink issue for each review comment or poll.
+
 SCOPE RESTRICTION: You work only inside this project directory. Do NOT read,
   explore, or reference source code from:
   - ~/agent-workspace/exomonad/ (the orchestration framework)

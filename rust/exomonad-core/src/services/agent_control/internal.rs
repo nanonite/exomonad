@@ -1502,8 +1502,25 @@ mod tests {
         assert!(instructions.contains("chainlink_session_work"));
         assert!(instructions.contains("chainlink_session_end"));
         assert!(instructions.contains("notify_parent"));
+        assert!(instructions.contains("review-stuck"));
+        assert!(instructions.contains("Never create Chainlink issues"));
         assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
         assert!(!instructions.contains("file_pr"));
+    }
+
+    #[test]
+    fn test_opencode_tl_settings_define_chainlink_review_ownership() {
+        let settings = ACS::generate_opencode_tl_settings("test-tl", "tl", &HashMap::new());
+        let instructions = settings["instructions"]
+            .as_array()
+            .expect("instructions must be an array")[0]
+            .as_str()
+            .expect("first instruction entry must be a string");
+
+        assert!(instructions.contains("Chainlink Ownership and Review Handoffs"));
+        assert!(instructions.contains("review watcher is read-only with respect to Chainlink"));
+        assert!(instructions.contains("terminal `review-stuck` signal"));
+        assert!(instructions.contains("do not auto-close, respawn, or replace the dev leaf"));
     }
 
     #[test]
