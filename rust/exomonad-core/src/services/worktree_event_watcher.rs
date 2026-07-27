@@ -257,14 +257,6 @@ enum ReviewStallKind {
     CiFailed,
 }
 
-const REVIEW_STALL_KINDS: [ReviewStallKind; 5] = [
-    ReviewStallKind::DevNotPushing,
-    ReviewStallKind::ReviewerNotResponding,
-    ReviewStallKind::ReviewerNeverStarted,
-    ReviewStallKind::DevFailed,
-    ReviewStallKind::CiFailed,
-];
-
 impl ReviewStallKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -273,16 +265,6 @@ impl ReviewStallKind {
             ReviewStallKind::ReviewerNeverStarted => "reviewer_never_started",
             ReviewStallKind::DevFailed => "dev_failed",
             ReviewStallKind::CiFailed => "ci_failed",
-        }
-    }
-
-    fn title_fragment(self) -> &'static str {
-        match self {
-            ReviewStallKind::DevNotPushing => "dev leaf stopped pushing fixes",
-            ReviewStallKind::ReviewerNotResponding => "reviewer stopped responding",
-            ReviewStallKind::ReviewerNeverStarted => "reviewer never started",
-            ReviewStallKind::DevFailed => "dev leaf reported failure",
-            ReviewStallKind::CiFailed => "CI failed after reviewer approval",
         }
     }
 }
@@ -1567,17 +1549,19 @@ where
                         classification,
                         diagnostic,
                     } => {
-                        if let Err(e) = self
-                            .file_review_loop_escalation(pr_number, classification, &diagnostic)
-                            .await
-                        {
-                            warn!(
-                                pr_number,
-                                classification = classification.as_str(),
-                                error = %e,
-                                "Failed to file review-loop human escalation"
-                            );
-                        }
+                        info!(
+                            pr_number,
+                            classification = classification.as_str(),
+                            branch = %diagnostic.branch,
+                            head_sha = %diagnostic.head_sha,
+                            last_observed_sha = %diagnostic.last_observed_sha,
+                            rounds = diagnostic.rounds,
+                            reviewer_registered = diagnostic.reviewer_registered,
+                            forgejo_review_present = diagnostic.forgejo_review_present,
+                            wait_seconds = diagnostic.wait_seconds,
+                            ci_status = %diagnostic.ci_status,
+                            "Review-loop human handoff required; watcher does not create Chainlink issues"
+                        );
                     }
                     PendingAction::TriggerManualCi {
                         pr_number,
@@ -1960,75 +1944,6 @@ where
             }
             EventActionResponse::NoAction => false,
         }
-    }
-
-    async fn file_review_loop_escalation(
-        &self,
-        pr_number: u64,
-        classification: ReviewStallKind,
-        diagnostic: &ReviewStallDiagnostic,
-    ) -> Result<()> {
-        debug_assert!(REVIEW_STALL_KINDS.contains(&classification));
-        let title = format!(
-            "Fix review loop escalation for PR #{}: {}",
-            pr_number,
-            classification.title_fragment()
-        );
-        let description = format!(
-            "Watcher classified PR #{} as `{}`.\n\n\
-             This is routed to the human review-loop escalation surface, not to the TL. \
-             The TL contract is intentionally limited to `[MERGE READY]`.\n\n\
-             Diagnostic:\n\
-             - branch: `{}`\n\
-             - head_sha: `{}`\n\
-             - last_observed_sha: `{}`\n\
-             - rounds: `{}`\n\
-             - reviewer_registered: `{}`\n\
-             - forgejo_review_present: `{}`\n\
-             - wait_seconds: `{}`\n\
-             - ci_status: `{}`",
-            pr_number,
-            classification.as_str(),
-            diagnostic.branch,
-            diagnostic.head_sha,
-            diagnostic.last_observed_sha,
-            diagnostic.rounds,
-            diagnostic.reviewer_registered,
-            diagnostic.forgejo_review_present,
-            diagnostic.wait_seconds,
-            diagnostic.ci_status
-        );
-
-        let output = Command::new("chainlink")
-            .current_dir(self.ctx.project_dir())
-            .args([
-                "create",
-                title.as_str(),
-                "-p",
-                "high",
-                "-l",
-                "review-stuck",
-                "-d",
-                description.as_str(),
-            ])
-            .output()
-            .await
-            .context("failed to run chainlink create for review-loop escalation")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "chainlink create failed for review-loop escalation: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
-        info!(
-            pr_number,
-            classification = classification.as_str(),
-            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
-            "Filed review-loop human escalation issue"
-        );
-        Ok(())
     }
 
     async fn deliver_release_message(&self, branch: &str, agent_type: AgentType, message: &str) {
