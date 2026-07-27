@@ -4998,6 +4998,21 @@ mod tests {
         }
     }
 
+    fn terminal_changes_requested_observation(sha: &str) -> Observation {
+        Observation {
+            head_sha: sha.to_string(),
+            review_state: crate::services::pr_registry::ForgejoReviewState::ChangesRequested,
+            comments: vec![],
+            reviews: vec![test_review(
+                "Still needs work",
+                ForgejoReviewVerdict::ChangesRequested,
+            )],
+            changes_requested_rounds: 2,
+            ci_status: CIStatus::Unknown,
+            forgejo_review_present: true,
+        }
+    }
+
     #[tokio::test]
     async fn test_resolve_event_agent_name_uses_reviewer_birth_branch() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -5228,6 +5243,89 @@ mod tests {
         assert!(state.notified_parent_timeout);
         assert!(state.merge_ready_notified);
         assert!(state.ci_blocked_notified);
+    }
+
+    #[tokio::test]
+    async fn test_terminal_review_handoff_does_not_create_chainlink_issue() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let policy = ReviewPolicy {
+            reviewer_max_rounds: 2,
+            ..ReviewPolicy::default()
+        };
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_policy(policy);
+        let registry = test_registry(test_pr_entry());
+        let mut observations = HashMap::new();
+        observations.insert(1u64, terminal_changes_requested_observation("abc123"));
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        assert!(
+            !temp_dir.path().join(".chainlink").exists(),
+            "watcher terminal handoff must not create a Chainlink directory"
+        );
+        assert!(watcher
+            .state
+            .prs
+            .lock()
+            .await
+            .get(&1)
+            .is_some_and(|state| state.stuck));
+    }
+
+    #[tokio::test]
+    async fn test_restarted_terminal_review_does_not_replay_handoff() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let policy = ReviewPolicy {
+            reviewer_max_rounds: 2,
+            ..ReviewPolicy::default()
+        };
+        let registry = test_registry(test_pr_entry());
+        let mut observations = HashMap::new();
+        observations.insert(1u64, terminal_changes_requested_observation("abc123"));
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_policy(policy.clone());
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        let persisted_before_restart =
+            tokio::fs::read_to_string(temp_dir.path().join(".exo/watcher-state.json"))
+                .await
+                .unwrap();
+        drop(watcher);
+
+        let mut restarted_services = crate::services::Services::test();
+        restarted_services.project_dir = temp_dir.path().to_path_buf();
+        let restarted_watcher =
+            WorktreeEventWatcher::new(Arc::new(restarted_services)).with_policy(policy);
+        restarted_watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        assert!(
+            !temp_dir.path().join(".chainlink").exists(),
+            "restarting the watcher must not create a Chainlink issue"
+        );
+        let persisted_after_restart =
+            tokio::fs::read_to_string(temp_dir.path().join(".exo/watcher-state.json"))
+                .await
+                .unwrap();
+        assert_eq!(persisted_after_restart, persisted_before_restart);
+        assert!(restarted_watcher
+            .state
+            .prs
+            .lock()
+            .await
+            .get(&1)
+            .is_some_and(|state| state.stuck));
     }
 
     #[test]
