@@ -48,6 +48,7 @@ import ExoMonad.Guest.Tools.Lifecycle (HasPendingWork (..), ShutdownServer (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
+import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
@@ -190,6 +191,7 @@ data Tools mode = Tools
     closeReviewerWindow :: mode :- CloseReviewerWindow,
     restartReview :: mode :- RestartReview,
     replaceClosedPr :: mode :- ReplaceClosedPr,
+    resumePr :: mode :- ResumePr,
     watcherPrState :: mode :- WatcherPrState,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
@@ -241,6 +243,7 @@ config =
             closeReviewerWindow = mkHandler @CloseReviewerWindow,
             restartReview = mkHandler @RestartReview,
             replaceClosedPr = mkHandler @ReplaceClosedPr,
+            resumePr = mkHandler @ResumePr,
             watcherPrState = mkHandler @WatcherPrState,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,

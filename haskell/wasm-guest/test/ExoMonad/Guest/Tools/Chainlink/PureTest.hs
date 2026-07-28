@@ -76,7 +76,7 @@ pureTests =
           @=? ["session", "end", "--notes", "Implemented the feature"],
       -- buildCloseArgs
       testCase "buildCloseArgs: basic" $
-        buildCloseArgs (ChainlinkIssueCloseArgs 42 Nothing)
+        buildCloseArgs (ChainlinkIssueCloseArgs 42 Nothing False)
           @=? ["close", "42", "-q"],
       -- buildTimerArgs
       testCase "buildTimerStartArgs: basic" $

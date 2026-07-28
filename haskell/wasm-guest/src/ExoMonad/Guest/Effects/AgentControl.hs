@@ -18,6 +18,7 @@ module ExoMonad.Guest.Effects.AgentControl
     -- * Smart constructors
     spawnSubtree,
     spawnLeafSubtree,
+    resumePr,
     spawnWorker,
     closeWorkerPane,
 
@@ -31,6 +32,7 @@ module ExoMonad.Guest.Effects.AgentControl
     defaultPermFlags,
     SpawnSubtreeConfig (..),
     SpawnLeafSubtreeConfig (..),
+    ResumePrConfig (..),
     SpawnWorkerConfig (..),
 
     -- * Helpers
@@ -162,6 +164,15 @@ data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
   }
   deriving (Show, Eq, Generic)
 
+-- | Typed target for resuming an existing open pull request.
+-- The host resolves the owning branch, slug, and runtime from PR state.
+data ResumePrConfig = ResumePrConfig
+  { rpcTask :: Text,
+    rpcPrNumber :: Word64,
+    rpcExpectedHeadSha :: Text
+  }
+  deriving (Show, Eq, Generic)
+
 -- | Configuration for spawning a Gemini worker agent.
 data SpawnWorkerConfig = SpawnWorkerConfig
   { swcName :: Text,
@@ -175,6 +186,7 @@ data SpawnWorkerConfig = SpawnWorkerConfig
 data AgentControl a where
   SpawnSubtreeC :: SpawnSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnLeafSubtreeC :: SpawnLeafSubtreeConfig -> AgentControl (Either EffectError SpawnResult)
+  ResumePrC :: ResumePrConfig -> AgentControl (Either EffectError SpawnResult)
   SpawnWorkerC :: SpawnWorkerConfig -> AgentControl (Either EffectError SpawnResult)
   CloseWorkerPaneC :: Text -> AgentControl (Either EffectError PA.CloseWorkerPaneResponse)
 
@@ -184,6 +196,9 @@ spawnSubtree cfg = send (SpawnSubtreeC cfg)
 
 spawnLeafSubtree :: (Member AgentControl r) => SpawnLeafSubtreeConfig -> Eff r (Either EffectError SpawnResult)
 spawnLeafSubtree cfg = send (SpawnLeafSubtreeC cfg)
+
+resumePr :: (Member AgentControl r) => ResumePrConfig -> Eff r (Either EffectError SpawnResult)
+resumePr cfg = send (ResumePrC cfg)
 
 spawnWorker :: (Member AgentControl r) => SpawnWorkerConfig -> Eff r (Either EffectError SpawnResult)
 spawnWorker cfg = send (SpawnWorkerC cfg)
@@ -233,13 +248,36 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestAllowedTools = V.fromList (map fromText (allowedTools (slcPerms cfg))),
               PA.spawnLeafSubtreeRequestDisallowedTools = V.fromList (map fromText (disallowedTools (slcPerms cfg))),
               PA.spawnLeafSubtreeRequestStandaloneRepo = slcStandaloneRepo cfg,
-              PA.spawnLeafSubtreeRequestAllowedDirs = V.fromList (map fromText (slcAllowedDirs cfg))
+              PA.spawnLeafSubtreeRequestAllowedDirs = V.fromList (map fromText (slcAllowedDirs cfg)),
+              PA.spawnLeafSubtreeRequestResumePrNumber = 0,
+              PA.spawnLeafSubtreeRequestExpectedHeadSha = fromText ""
             }
     result <- suspendEffect @Agent.AgentSpawnLeafSubtree req
     pure $ case result of
       Left err -> Left err
       Right resp -> case PA.spawnLeafSubtreeResponseAgent resp of
         Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnLeafSubtree succeeded but no agent info returned"))))
+        Just info -> Right (protoAgentInfoToSpawnResult info)
+  ResumePrC cfg -> do
+    let req =
+          PA.SpawnLeafSubtreeRequest
+            { PA.spawnLeafSubtreeRequestTask = fromText (rpcTask cfg),
+              PA.spawnLeafSubtreeRequestBranchName = fromText "",
+              PA.spawnLeafSubtreeRequestRole = fromText "",
+              PA.spawnLeafSubtreeRequestAgentType = Enumerated (Right PA.AgentTypeAGENT_TYPE_UNSPECIFIED),
+              PA.spawnLeafSubtreeRequestPermissionMode = fromText "",
+              PA.spawnLeafSubtreeRequestAllowedTools = V.empty,
+              PA.spawnLeafSubtreeRequestDisallowedTools = V.empty,
+              PA.spawnLeafSubtreeRequestStandaloneRepo = False,
+              PA.spawnLeafSubtreeRequestAllowedDirs = V.empty,
+              PA.spawnLeafSubtreeRequestResumePrNumber = rpcPrNumber cfg,
+              PA.spawnLeafSubtreeRequestExpectedHeadSha = fromText (rpcExpectedHeadSha cfg)
+            }
+    result <- suspendEffect @Agent.AgentSpawnLeafSubtree req
+    pure $ case result of
+      Left err -> Left err
+      Right resp -> case PA.spawnLeafSubtreeResponseAgent resp of
+        Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "ResumePr succeeded but no agent info returned"))))
         Just info -> Right (protoAgentInfoToSpawnResult info)
   SpawnWorkerC cfg -> do
     let req =

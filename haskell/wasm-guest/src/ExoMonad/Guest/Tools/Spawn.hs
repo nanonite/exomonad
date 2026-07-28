@@ -204,15 +204,6 @@ forkWaveCore args = do
                     }
             result <- AC.spawnSubtree cfg
             case result of
-              Left err | hasCustomCode "worktree.branch_exists" err -> do
-                let retrySlug = fwcSlug child <> "-2"
-                let cfg' = cfg {AC.stcBranchName = retrySlug}
-                result' <- AC.spawnSubtree cfg'
-                case result' of
-                  Left err' -> pure (Left (spawnErrorMessage err'))
-                  Right spawnResult -> do
-                    emitSpawnEvent retrySlug labelStr (fwcTask child)
-                    pure (Right (retrySlug, spawnResult))
               Left err -> pure (Left (spawnErrorMessage err))
               Right spawnResult -> do
                 emitSpawnEvent (fwcSlug child) labelStr (fwcTask child)
@@ -307,15 +298,6 @@ spawnLeafSubtreeCore args = do
           }
   result <- AC.spawnLeafSubtree cfg
   case result of
-    Left err | hasCustomCode "worktree.branch_exists" err -> do
-      let retrySlug = slsBranchName args <> "-2"
-      let cfg' = cfg {AC.slcBranchName = retrySlug}
-      result' <- AC.spawnLeafSubtree cfg'
-      case result' of
-        Left err' -> pure $ Left (spawnErrorMessage err')
-        Right spawnResult -> do
-          emitSpawnEvent retrySlug "auto" (slsTask args)
-          pure $ Right (retrySlug, spawnResult)
     Left err -> pure $ Left (spawnErrorMessage err)
     Right spawnResult -> do
       emitSpawnEvent (slsBranchName args) "auto" (slsTask args)

@@ -537,6 +537,10 @@ pub struct SpawnLeafOptions {
     /// Optional base branch used for the leaf birth branch and future PR target.
     #[serde(default)]
     pub base_branch: Option<String>,
+    /// Canonical identity resolved by the host for an existing-PR resume.
+    /// When set, no directory scan or alternate runtime may replace it.
+    #[serde(default)]
+    pub expected_agent_name: Option<AgentName>,
 }
 
 /// Result of spawning an agent.

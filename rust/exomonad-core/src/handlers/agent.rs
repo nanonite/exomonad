@@ -15,7 +15,7 @@ use super::non_empty;
 use crate::services::agent_control::{
     slugify, AgentControlService, AgentIdentity, AgentInfo, AgentType as ServiceAgentType,
     ClaudeSpawnFlags, SpawnGeminiTeammateOptions, SpawnLeafOptions, SpawnOptions,
-    SpawnSubtreeOptions, SpawnWorkerOptions,
+    SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
 };
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
@@ -1174,6 +1174,7 @@ impl<
             allowed_dirs: Vec::new(),
             start_point: Some(source_head_sha.clone()),
             base_branch: Some(original_base_branch.clone()),
+            expected_agent_name: None,
         };
         info!(
             chainlink_issue_id = issue_id,
@@ -1332,6 +1333,14 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
         self.ensure_tl_spawn_preflight(ctx).await?;
+        if req.resume_pr_number != 0 || !req.expected_head_sha.trim().is_empty() {
+            return self.resume_existing_pr(&req, ctx).await;
+        }
+        if req.branch_name.trim().is_empty() {
+            return Err(EffectError::invalid_input(
+                "branch_name is required for an ordinary spawn",
+            ));
+        }
         let default_type = self.service.default_spawn_agent_type();
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
@@ -1357,6 +1366,7 @@ impl<
             allowed_dirs: req.allowed_dirs,
             start_point: None,
             base_branch: None,
+            expected_agent_name: None,
         };
 
         let result = self
@@ -2152,11 +2162,212 @@ impl<
     }
 }
 
+impl<
+        C: HasTeamRegistry
+            + HasAgentResolver
+            + HasGitHubClient
+            + HasProjectDir
+            + HasGitWorktreeService
+            + HasInboxStore
+            + HasSupervisorRegistry
+            + HasClaudeSessionRegistry
+            + HasEventLog
+            + HasForgejoClient
+            + HasWatcherRuntimeState
+            + 'static,
+    > AgentHandler<C>
+{
+    async fn resume_existing_pr(
+        &self,
+        req: &SpawnLeafSubtreeRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SpawnLeafSubtreeResponse> {
+        validate_resume_request(req)?;
+        let forgejo = self.ctx.forgejo_client().ok_or_else(|| {
+            EffectError::invalid_input("Forgejo is not configured; cannot resume a PR")
+        })?;
+        let repo_info = crate::services::repo::get_repo_info(self.ctx.project_dir())
+            .await
+            .effect_err("agent")?;
+        let pr = forgejo
+            .get_pull_request(
+                &repo_info.owner,
+                &repo_info.repo,
+                PRNumber::new(req.resume_pr_number),
+            )
+            .await
+            .effect_err("agent")?;
+        ensure_open_unmerged_pr(&pr, req.resume_pr_number)?;
+
+        let head_branch = pr.head_ref.as_str();
+        let head_sha = pr
+            .head_sha
+            .as_deref()
+            .filter(|sha| !sha.trim().is_empty())
+            .ok_or_else(|| {
+                EffectError::invalid_input(format!(
+                    "PR #{} has no head SHA; refusing to resume it",
+                    req.resume_pr_number
+                ))
+            })?;
+        if head_sha != req.expected_head_sha.trim() {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} head SHA changed: expected {}, found {}; retry resume_pr to refresh state",
+                req.resume_pr_number,
+                req.expected_head_sha.trim(),
+                head_sha
+            )));
+        }
+        if head_branch.trim().is_empty() || pr.base_ref.as_str().trim().is_empty() {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} has an incomplete branch identity; refusing to resume it",
+                req.resume_pr_number
+            )));
+        }
+
+        let metadata = parse_pr_body_metadata(&pr.body);
+        if let Some(metadata_branch) = metadata.birth_branch.as_deref() {
+            if metadata_branch != head_branch {
+                return Err(EffectError::invalid_input(format!(
+                    "PR #{} Birth-Branch metadata '{}' does not match head branch '{}'",
+                    req.resume_pr_number, metadata_branch, head_branch
+                )));
+            }
+        }
+
+        let owners = self
+            .ctx
+            .agent_resolver()
+            .all()
+            .await
+            .into_iter()
+            .filter(|record| {
+                record.topology == Topology::WorktreePerAgent
+                    && record.birth_branch.as_str() == head_branch
+            })
+            .collect::<Vec<_>>();
+        let owner = match owners.as_slice() {
+            [] => {
+                return Err(EffectError::invalid_input(format!(
+                    "PR #{} owner is unresolved for head branch '{}'; use replace_close_pr only with human approval",
+                    req.resume_pr_number, head_branch
+                )))
+            }
+            [owner] => owner,
+            _ => {
+                return Err(EffectError::invalid_input(format!(
+                    "PR #{} has multiple owners for head branch '{}'; refusing to resume it",
+                    req.resume_pr_number, head_branch
+                )))
+            }
+        };
+        if let Some(metadata_agent) = metadata.author_agent.as_deref() {
+            let matches_owner = metadata_agent == owner.agent_name.as_str()
+                || metadata_agent == owner.slug.as_str()
+                || leaf_identity_matches(metadata_agent, owner.agent_name.as_str());
+            if !matches_owner {
+                return Err(EffectError::invalid_input(format!(
+                    "PR #{} Authoring-Agent metadata '{}' does not match resolved owner '{}'",
+                    req.resume_pr_number, metadata_agent, owner.agent_name
+                )));
+            }
+        }
+        let expected_birth_branch = BirthBranch::try_from_str(pr.base_ref.as_str())
+            .map_err(|error| EffectError::invalid_input(error.to_string()))?
+            .child(owner.agent_name.as_str());
+        if expected_birth_branch.as_str() != head_branch {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} head branch '{}' is not the resolved owner's child of base branch '{}'",
+                req.resume_pr_number, head_branch, pr.base_ref
+            )));
+        }
+
+        let options = SpawnLeafOptions {
+            task: req.task.clone(),
+            branch_name: owner.slug.to_string(),
+            role: Some(crate::domain::Role::dev()),
+            agent_type: owner.agent_type,
+            claude_flags: ClaudeSpawnFlags::default(),
+            standalone_repo: false,
+            allowed_dirs: Vec::new(),
+            start_point: Some(head_sha.to_string()),
+            base_branch: Some(pr.base_ref.to_string()),
+            expected_agent_name: Some(owner.agent_name.clone()),
+        };
+        let result = self
+            .service
+            .spawn_leaf_subtree(&options, &ctx.birth_branch)
+            .await
+            .effect_err_preserve("agent")?;
+        let agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
+
+        if result.agent_type == ServiceAgentType::Claude {
+            self.register_claude_team_child(
+                &result.agent_name,
+                &format!("{}-leaf", result.agent_type.suffix()),
+                &result.branch_name,
+                ctx,
+            )
+            .await;
+        } else {
+            self.register_child_supervisor(agent_info.id.as_str(), ctx)
+                .await;
+        }
+
+        info!(
+            pr_number = req.resume_pr_number,
+            head_branch,
+            head_sha,
+            owner = %owner.agent_name,
+            "Resumed exact existing PR owner"
+        );
+        Ok(SpawnLeafSubtreeResponse {
+            agent: Some(agent_info),
+        })
+    }
+}
+
 fn ensure_open_unmerged_pr(pr: &ForgejoPullRequest, pr_number: u64) -> EffectResult<()> {
     if pr.merged || !pr.state.eq_ignore_ascii_case("open") {
         return Err(EffectError::invalid_input(format!(
             "PR #{pr_number} is not open and unmerged; use replace_close_pr for a closed PR"
         )));
+    }
+    Ok(())
+}
+
+fn validate_resume_request(req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
+    if req.resume_pr_number == 0 {
+        return Err(EffectError::invalid_input(
+            "resume_pr_number is required for a PR resume",
+        ));
+    }
+    if req.expected_head_sha.trim().is_empty() {
+        return Err(EffectError::invalid_input(
+            "expected_head_sha is required for a PR resume",
+        ));
+    }
+    if !req.branch_name.trim().is_empty() {
+        return Err(EffectError::invalid_input(
+            "resume_pr resolves the owning branch; branch_name must be omitted",
+        ));
+    }
+    if !req.role.trim().is_empty()
+        || req.agent_type() != AgentType::Unspecified
+        || !req.permission_mode.trim().is_empty()
+        || !req.allowed_tools.is_empty()
+        || !req.disallowed_tools.is_empty()
+        || req.standalone_repo
+        || !req.allowed_dirs.is_empty()
+    {
+        return Err(EffectError::invalid_input(
+            "resume_pr accepts only pr_number, expected_head_sha, and task; the host resolves all agent identity",
+        ));
+    }
+    if req.task.trim().is_empty() {
+        return Err(EffectError::invalid_input(
+            "task is required for a PR resume",
+        ));
     }
     Ok(())
 }
@@ -3089,6 +3300,51 @@ mod tests {
             ServiceAgentType::Codex
         );
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
+    }
+
+    fn resume_request() -> SpawnLeafSubtreeRequest {
+        SpawnLeafSubtreeRequest {
+            task: "address review feedback".to_string(),
+            resume_pr_number: 104,
+            expected_head_sha: "abc123".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resume_request_requires_host_resolved_identity() {
+        assert!(validate_resume_request(&resume_request()).is_ok());
+
+        let mut missing_sha = resume_request();
+        missing_sha.expected_head_sha.clear();
+        assert!(validate_resume_request(&missing_sha).is_err());
+
+        let mut caller_named_branch = resume_request();
+        caller_named_branch.branch_name = "invented-fix-opencode".to_string();
+        let error = validate_resume_request(&caller_named_branch)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("branch_name must be omitted"));
+
+        let mut caller_selected_runtime = resume_request();
+        caller_selected_runtime.agent_type = AgentType::Codex as i32;
+        assert!(validate_resume_request(&caller_selected_runtime).is_err());
+    }
+
+    #[test]
+    fn resume_identity_accepts_canonical_and_bare_metadata() {
+        assert!(leaf_identity_matches(
+            "m7-3a-fixture-oracle-opencode",
+            "m7-3a-fixture-oracle-opencode"
+        ));
+        assert!(leaf_identity_matches(
+            "m7-3a-fixture-oracle",
+            "m7-3a-fixture-oracle-opencode"
+        ));
+        assert!(!leaf_identity_matches(
+            "unrelated-fix-opencode",
+            "m7-3a-fixture-oracle-opencode"
+        ));
     }
 
     #[test]

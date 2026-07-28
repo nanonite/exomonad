@@ -185,6 +185,39 @@ async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
     }
 }
 
+async fn verify_branch_head(
+    project_dir: &Path,
+    branch: &BranchName,
+    expected_sha: &str,
+) -> Result<()> {
+    info!(branch = %branch, expected_sha, "Verifying resumed branch head");
+    let revision = format!("{}^{{commit}}", branch.as_str());
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", revision.as_str()])
+        .current_dir(project_dir)
+        .output()
+        .await
+        .with_context(|| format!("failed to inspect head of branch {}", branch))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "could not resolve head of resumed branch {}: {}",
+            branch,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let actual_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if actual_sha != expected_sha {
+        anyhow::bail!(
+            "resumed branch {} points at {}, expected {}",
+            branch,
+            actual_sha,
+            expected_sha
+        );
+    }
+    info!(branch = %branch, actual_sha, "Resumed branch head matches PR head SHA");
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveWorker {
     name: String,
@@ -1657,7 +1690,17 @@ impl<
             let mut worktree_path = self.worktree_base.join(agent_name.as_str());
             let mut existing_identity_record = None;
 
-            if !options.standalone_repo && !worktree_path.exists() {
+            if let Some(expected_agent_name) = options.expected_agent_name.as_ref() {
+                if expected_agent_name != &agent_name {
+                    return Err(anyhow!(
+                        "resolved resume identity {} does not match slug/runtime {}",
+                        expected_agent_name,
+                        agent_name
+                    ));
+                }
+                agent_name = expected_agent_name.clone();
+                worktree_path = self.worktree_base.join(agent_name.as_str());
+            } else if !options.standalone_repo && !worktree_path.exists() {
                 if let Some(record) = self.agent_resolver().lookup_by_slug(&slug_key).await {
                     if record.topology == Topology::WorktreePerAgent {
                         let record_worktree =
@@ -1696,7 +1739,7 @@ impl<
             } else {
                 None
             };
-            let child_birth = if let Some(branch) = existing_branch {
+            let child_birth = if let Some(branch) = existing_branch.clone() {
                 branch
             } else if let Some(record) = existing_identity_record.as_ref() {
                 record.birth_branch.clone()
@@ -1731,6 +1774,22 @@ impl<
             let branch_name = BranchName::try_from_str(child_birth.to_string().as_str())
                 .expect("validated string input is non-empty");
             let actual_branch_name = branch_name.to_string();
+
+            if options.expected_agent_name.is_some() {
+                if let Some(existing_branch) = existing_branch.as_ref() {
+                    if existing_branch.as_str() != branch_name.as_str() {
+                        return Err(anyhow!(
+                            "existing resume worktree is on {}, expected {}",
+                            existing_branch,
+                            branch_name
+                        ));
+                    }
+                    if let Some(expected_sha) = options.start_point.as_deref() {
+                        verify_branch_head(effective_project_dir, &branch_name, expected_sha)
+                            .await?;
+                    }
+                }
+            }
 
             let mut remove_worktree_on_spawn_failure = false;
 
@@ -1769,6 +1828,10 @@ impl<
                 ensure_branch_fetched(effective_project_dir, &branch_name).await;
                 if let Some(start_point) = options.start_point.as_deref() {
                     if self.git_wt().branch_exists(&branch_name)? {
+                        if options.expected_agent_name.is_some() {
+                            verify_branch_head(effective_project_dir, &branch_name, start_point)
+                                .await?;
+                        }
                         self.create_worktree_from_existing_branch_checked(
                             &worktree_path,
                             &branch_name,

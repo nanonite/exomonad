@@ -434,6 +434,10 @@ message SpawnLeafSubtreeRequest {
   bool standalone_repo = 10;
   // Directories from the parent project to be copied into the agent's worktree.
   repeated string allowed_dirs = 11;
+  // Existing PR number to resume. When set, the host resolves branch and agent ownership.
+  uint64 resume_pr_number = 12;
+  // Head SHA observed by the caller; the host re-fetches and requires an exact match.
+  string expected_head_sha = 13;
 }
 
 message SpawnLeafSubtreeResponse {
