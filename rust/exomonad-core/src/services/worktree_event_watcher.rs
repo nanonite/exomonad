@@ -254,7 +254,6 @@ enum ReviewStallKind {
     DevNotPushing,
     ReviewerNotResponding,
     ReviewerNeverStarted,
-    DevFailed,
     CiFailed,
 }
 
@@ -264,7 +263,6 @@ impl ReviewStallKind {
             ReviewStallKind::DevNotPushing => "dev_not_pushing",
             ReviewStallKind::ReviewerNotResponding => "reviewer_not_responding",
             ReviewStallKind::ReviewerNeverStarted => "reviewer_never_started",
-            ReviewStallKind::DevFailed => "dev_failed",
             ReviewStallKind::CiFailed => "ci_failed",
         }
     }
@@ -4651,8 +4649,6 @@ mod tests {
             classify_review_stall(&state, true, false),
             ReviewStallKind::ReviewerNeverStarted
         );
-
-        assert_eq!(ReviewStallKind::DevFailed.as_str(), "dev_failed");
     }
 
     #[test]
