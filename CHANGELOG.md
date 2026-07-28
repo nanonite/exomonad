@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Add typed existing-PR resume enforcement to prevent orphan branches (#564)
 - Watcher dashboard Event Log panel never showed live poll-cycle activity (#559)
 - Orphan reconciler leaks leaf worktrees when multiple leaves share one Chainlink issue id (#554)
 - Fix orphan reconciler: per-worktree idempotency instead of per-issue-id (#555)
