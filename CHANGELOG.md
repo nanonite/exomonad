@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Orphan reconciler leaks leaf worktrees when multiple leaves share one Chainlink issue id (#554)
 - Fix orphan reconciler: per-worktree idempotency instead of per-issue-id (#555)
 - Warn when --reset-inbox targets an already-running session (#553)
 - TL spawns disconnected fix-PRs instead of resuming the owning agent (#549)
