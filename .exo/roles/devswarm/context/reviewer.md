@@ -38,15 +38,49 @@ Submit the final verdict through the `approve_pr`, `request_changes`, and `post_
 
 1. Read the task prompt — it tells you the PR number, branch, base branch, and author.
 2. Fetch the PR diff with `git diff {base_branch}..HEAD` — this is a local, read-only git operation and needs no network access.
-3. Analyze the diff for:
-   - Logic errors or incorrect assumptions
-   - Missing error handling or edge cases
+3. Describe in one paragraph what the change does and confirm it's internally
+   consistent — if the stated intent (e.g. "pure refactor, no functional
+   changes") doesn't match the diff, that mismatch is itself a blocking finding.
+4. Analyze the diff across these categories:
+
+   **Correctness & CLAUDE.md compliance**
+   - Logic errors, incorrect assumptions, race conditions
    - Security issues (input validation, secrets exposure)
-   - Missing or inadequate tests
    - Breaking changes to external APIs
-4. If issues found: call `request_changes` with specific, actionable feedback referencing the file and line.
-5. If code is correct: call `approve_pr` with a concise approving comment.
-6. Done — the worktree event watcher detects your Forgejo review and automatically
+   - Explicit violations of this project's CLAUDE.md rules
+   - Skip stylistic nitpicks a linter would already catch
+
+   **Error handling (silent failures)**
+   - Empty catch blocks are never acceptable
+   - Catch blocks that log-and-continue, or catch broader error types than
+     the failure they're meant to handle
+   - Fallbacks to defaults/mocks/stubs that mask a real error instead of
+     surfacing it
+   - Errors that should propagate to a caller but are swallowed here
+
+   **Test coverage**
+   - Missing coverage for new error paths, edge cases, boundary conditions
+   - Negative test cases absent for new validation logic
+   - Tests asserting implementation details rather than behavior
+
+   **Type design** (new/changed types only)
+   - Can invariants be violated from outside the constructor?
+   - Are illegal states representable that shouldn't be?
+   - Is validation enforced at every mutation point, or only at construction?
+
+   **Comment accuracy**
+   - Does every comment's claim match what the code actually does?
+   - Flag comments that just restate the code instead of explaining a
+     non-obvious why
+
+   **Negative space** (what the diff doesn't touch but should)
+   - Does CLAUDE.md or another doc need updating for this change?
+   - Other call sites, tests, or config still referencing the old behavior?
+   - If the PR claims "pure refactor," are there any behavioral deltas at all?
+
+5. If issues found: call `request_changes` with specific, actionable feedback referencing the file and line.
+6. If code is correct: call `approve_pr` with a concise approving comment.
+7. Done — the worktree event watcher detects your Forgejo review and automatically
    injects the feedback into the worker's pane. You do not need to contact the
    worker directly.
 
