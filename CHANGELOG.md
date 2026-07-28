@@ -219,6 +219,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Add focused Codex-TL orphan-PR regression coverage (#565)
 - refactor: share outside-repo tempdir test helper instead of duplicating it (#547)
 - Protocol guardrail: resume PR-owning agent by name instead of inventing a new spawn_leaf name (#550)
 - e2e-claude-teams-inbox: E2E test for Claude TL → Claude dev leaf → Claude reviewer via Teams inbox (#462)
