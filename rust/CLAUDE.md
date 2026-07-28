@@ -99,6 +99,7 @@ rust/CLAUDE.md  ← YOU ARE HERE (router)
 | [exomonad](exomonad/CLAUDE.md) | Binary (`exomonad`) | MCP + Hook handler via WASM |
 | exomonad-core | Library | Framework, handlers, services, protocol types, UI protocol |
 | exomonad-proto | Library | Proto-generated types (prost) for FFI + effects |
+| exomonad-test-support | Library (dev-only) | Shared test scaffolding |
 
 ### Feature Flags (exomonad-core)
 
@@ -253,8 +254,9 @@ cargo test -p exomonad-core             # All library tests (framework + handler
 cargo test -p exomonad-proto            # Wire format compatibility tests
 ```
 
-Tests that require a directory outside any git repository must use the
-outside-repository tempdir helper, because `tempfile::tempdir()` honors `TMPDIR`.
+Tests that require a directory outside any git repository must use
+`exomonad-test-support`'s outside-repository tempdir helper, because
+`tempfile::tempdir()` honors `TMPDIR`.
 The dev shell pins nix-created `TMPDIR` values back to a system temp directory,
 while helpers still validate this precondition when tests run directly.
 

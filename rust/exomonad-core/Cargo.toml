@@ -106,6 +106,7 @@ http-body-util = { workspace = true, optional = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 exomonad-proto = { path = "../exomonad-proto", version = "0.1.0", features = ["effects"] }
+exomonad-test-support = { path = "../exomonad-test-support" }
 prost = { workspace = true }
 proptest = "1.4"
 serde_json = { workspace = true }

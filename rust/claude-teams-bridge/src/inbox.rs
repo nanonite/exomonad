@@ -264,47 +264,8 @@ pub fn unread_messages(team: &str, recipient: &str) -> io::Result<Vec<TeamsMessa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use exomonad_test_support::tempdir_outside_any_repo;
     use tempfile::tempdir;
-
-    fn git_repository_root(path: &Path) -> Option<PathBuf> {
-        let output = std::process::Command::new("git")
-            .args(["-C"])
-            .arg(path)
-            .args(["rev-parse", "--show-toplevel"])
-            .output()
-            .expect("failed to run git repository detection");
-        if output.status.success() {
-            return Some(PathBuf::from(
-                String::from_utf8_lossy(&output.stdout).trim(),
-            ));
-        }
-        None
-    }
-
-    fn tempdir_outside_any_repo() -> tempfile::TempDir {
-        let ambient = tempdir().expect("failed to create ambient temp dir");
-        let inside_repo = git_repository_root(ambient.path());
-        if inside_repo.is_none() {
-            return ambient;
-        }
-
-        drop(ambient);
-        for base in [Path::new("/tmp"), Path::new("/var/tmp")] {
-            let Ok(dir) = tempfile::tempdir_in(base) else {
-                continue;
-            };
-            if git_repository_root(dir.path()).is_none() {
-                return dir;
-            }
-        }
-
-        panic!(
-            "failed to create an inbox test directory outside any git repository; found .git at {}, TMPDIR={:?}",
-            inside_repo.expect("checked above").display(),
-            std::env::var("TMPDIR").ok(),
-        );
-    }
 
     #[test]
     fn test_write_creates_inbox_dir() {
