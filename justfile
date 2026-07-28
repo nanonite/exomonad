@@ -310,6 +310,14 @@ check-e2e-chainlink-codex:
     bash -n tests/e2e/chainlink-codex/run.sh
     bash -n tests/e2e/chainlink-codex/validate.sh
 
+# Run the opt-in Codex-TL orphan-PR resume smoke test
+e2e-orphan-pr-guard-codex:
+    ./tests/e2e/orphan-pr-guard/run.sh
+
+# Check the Codex-TL orphan-PR smoke harness without launching Codex/tmux
+check-e2e-orphan-pr-guard-codex:
+    bash -n tests/e2e/orphan-pr-guard/run.sh
+
 # Run E2E Chainlink sqlite direct DB access block test
 e2e-chainlink-sqlite-block:
     ./tests/e2e/chainlink-sqlite-block/run.sh
