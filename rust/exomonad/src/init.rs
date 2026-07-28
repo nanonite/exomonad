@@ -7,24 +7,38 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-/// Read chainlink-tl.md from the project directory, strip YAML frontmatter,
-/// and return the content. Returns None if the file cannot be read (non-fatal).
-fn read_chainlink_tl_protocol(cwd: &Path) -> Option<String> {
-    let path = cwd.join(".exo/roles/devswarm/context/chainlink-tl.md");
-    let content = std::fs::read_to_string(&path).ok()?;
-    let stripped = if content.starts_with("---") {
-        if let Some(end) = content[3..].find("---") {
-            content[3 + end + 3..].trim().to_string()
-        } else {
-            content
-        }
-    } else {
-        content
-    };
-    if stripped.is_empty() {
-        None
-    } else {
-        Some(stripped)
+const ROOT_PROTOCOL_ENV: &str = "EXOMONAD_ROOT_TL_PROTOCOL_PATH";
+
+fn root_tl_context_path(cwd: &Path, wasm_name: &str) -> Option<PathBuf> {
+    exomonad_core::services::agent_control::resolve_role_context_path(cwd, wasm_name, "root")
+}
+
+fn read_root_tl_protocol(cwd: &Path, wasm_name: &str) -> Option<String> {
+    exomonad_core::services::agent_control::load_role_context(cwd, wasm_name, "root")
+}
+
+fn codex_root_instructions(cwd: &Path, wasm_name: &str) -> String {
+    read_root_tl_protocol(cwd, wasm_name)
+        .map(|protocol| {
+            format!(
+                "{protocol}\n\n{}",
+                exomonad_core::services::agent_control::CODEX_TL_RUNTIME_NOTES
+            )
+        })
+        .unwrap_or_else(|| {
+            exomonad_core::services::agent_control::CODEX_TL_RUNTIME_NOTES.to_string()
+        })
+}
+
+fn custom_root_command_with_protocol(command: &str, protocol_path: Option<&Path>) -> String {
+    match protocol_path {
+        Some(path) => format!(
+            "{}={} {}",
+            ROOT_PROTOCOL_ENV,
+            shell_escape::escape(path.display().to_string().into()),
+            command
+        ),
+        None => command.to_string(),
     }
 }
 
@@ -482,8 +496,12 @@ fn write_codex_companion_config(
 ) -> Result<()> {
     let codex_dir = dir.join(".codex");
     std::fs::create_dir_all(&codex_dir)?;
+    let root_instructions;
     let instructions = match role {
-        "tl" | "root" => exomonad_core::services::agent_control::CODEX_TL_INSTRUCTIONS,
+        "tl" | "root" => {
+            root_instructions = codex_root_instructions(dir, &config.wasm_name);
+            &root_instructions
+        }
         "worker" => exomonad_core::services::agent_control::CODEX_WORKER_INSTRUCTIONS,
         "reviewer" => exomonad_core::services::agent_control::CODEX_REVIEWER_INSTRUCTIONS,
         _ => exomonad_core::services::agent_control::CODEX_DEV_INSTRUCTIONS,
@@ -511,7 +529,7 @@ fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
     let codex_config = exomonad_core::codex_config::render_codex_config_with_effort(
         "root",
         "root",
-        exomonad_core::services::agent_control::CODEX_TL_INSTRUCTIONS,
+        &codex_root_instructions(cwd, &config.wasm_name),
         config.model.as_deref(),
         Some(&configured_effort),
         &extra_mcp_servers,
@@ -1180,10 +1198,17 @@ pub async fn run(
             use exomonad_core::services::Services;
             let extra_mcp_servers = std::collections::HashMap::new();
             let effort = config.tl_effort_level.level.to_string();
+            let root_context = root_tl_context_path(&cwd, &config.wasm_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "canonical root TL protocol not found for wasm '{}'; expected .exo/roles/{}/context/root.md",
+                    config.wasm_name,
+                    config.wasm_name
+                )
+            })?;
             let opencode_config =
-                AgentControlService::<Services>::generate_opencode_tl_settings_with_effort(
+                AgentControlService::<Services>::generate_opencode_root_settings_with_context(
                     "root",
-                    "root",
+                    &root_context,
                     &extra_mcp_servers,
                     Some(&effort),
                 );
@@ -1262,6 +1287,13 @@ pub async fn run(
         let gemini_dir = cwd.join(".gemini");
         std::fs::create_dir_all(&gemini_dir)?;
         let settings_path = gemini_dir.join("settings.json");
+        let root_context = root_tl_context_path(&cwd, &config.wasm_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "canonical root TL protocol not found for wasm '{}'; expected .exo/roles/{}/context/root.md",
+                config.wasm_name,
+                config.wasm_name
+            )
+        })?;
 
         let mut mcp_servers = serde_json::Map::new();
         mcp_servers.insert(
@@ -1282,6 +1314,9 @@ pub async fn run(
 
         let settings = serde_json::json!({
             "mcpServers": mcp_servers,
+            "context": {
+                "fileName": ["GEMINI.md", root_context.to_string_lossy()]
+            },
             "hooks": gemini_hooks()
         });
         std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
@@ -1612,10 +1647,17 @@ pub async fn run(
         let extra_mcp = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
         // Write opencode.json to repo root so the TL window discovers it via CWD.
         let effort = config.tl_effort_level.level.to_string();
+        let root_context = root_tl_context_path(&cwd, &config.wasm_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "canonical root TL protocol not found for wasm '{}'; expected .exo/roles/{}/context/root.md",
+                config.wasm_name,
+                config.wasm_name
+            )
+        })?;
         let opencode_config =
-            AgentControlService::<Services>::generate_opencode_tl_settings_with_effort(
+            AgentControlService::<Services>::generate_opencode_root_settings_with_context(
                 "root",
-                "root",
+                &root_context,
                 &extra_mcp,
                 Some(&effort),
             );
@@ -1631,7 +1673,25 @@ pub async fn run(
     let tl_cwd = cwd.clone();
 
     let base_command = if let Some(ref cmd) = config.root_command {
-        cmd.clone()
+        match root_tl_context_path(&cwd, &config.wasm_name) {
+            Some(path) => {
+                warn!(
+                    command = %cmd,
+                    protocol_path = %path.display(),
+                    env_var = ROOT_PROTOCOL_ENV,
+                    "Custom root_command must consume the canonical root TL protocol"
+                );
+                custom_root_command_with_protocol(cmd, Some(&path))
+            }
+            None => {
+                warn!(
+                    command = %cmd,
+                    env_var = ROOT_PROTOCOL_ENV,
+                    "Custom root_command has no canonical root TL protocol path"
+                );
+                cmd.clone()
+            }
+        }
     } else {
         let model_flag = config
             .model
@@ -1677,14 +1737,9 @@ pub async fn run(
                 } else {
                     ""
                 };
-                let chainlink_protocol = read_chainlink_tl_protocol(&cwd);
-                let augmented = match chainlink_protocol {
-                    Some(ref protocol) => format!("{}\n\n---\n\n{}", protocol, prompt),
-                    None => prompt.to_string(),
-                };
                 format!(
                     "opencode run{yolo}{opencode_model_flag}{opencode_variant_flag} '{}'",
-                    augmented.replace('\'', "'\\''")
+                    prompt.replace('\'', "'\\''")
                 )
             }
             (AgentType::OpenCode, None) => {
@@ -2415,6 +2470,55 @@ fn gemini_hooks() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_protocol_loader_prefers_local_sentinel_and_strips_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".exo/roles/sentinel/context");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("root.md"),
+            "---\npaths: [\"**\"]\n---\n\nSENTINEL ROOT PROTOCOL\n",
+        )
+        .unwrap();
+
+        let resolved = root_tl_context_path(tmp.path(), "sentinel").unwrap();
+        assert_eq!(resolved, path.join("root.md"));
+        assert_eq!(
+            read_root_tl_protocol(tmp.path(), "sentinel").as_deref(),
+            Some("SENTINEL ROOT PROTOCOL")
+        );
+    }
+
+    #[test]
+    fn codex_protocol_delivery_is_prompt_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".exo/roles/sentinel/context");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("root.md"), "SENTINEL ROOT PROTOCOL").unwrap();
+
+        for initial_prompt in [None, Some("task-only initial prompt")] {
+            let instructions = codex_root_instructions(tmp.path(), "sentinel");
+            assert!(instructions.contains("SENTINEL ROOT PROTOCOL"));
+            assert!(instructions.contains("Codex Runtime Notes"));
+            if let Some(prompt) = initial_prompt {
+                assert!(!instructions.contains(prompt));
+            }
+        }
+    }
+
+    #[test]
+    fn custom_root_command_exposes_canonical_protocol_path() {
+        let path = Path::new("/tmp/sentinel-root.md");
+        let command = custom_root_command_with_protocol("custom-root", Some(path));
+        assert!(command.starts_with("EXOMONAD_ROOT_TL_PROTOCOL_PATH="));
+        assert!(command.contains("/tmp/sentinel-root.md"));
+        assert!(command.ends_with(" custom-root"));
+        assert_eq!(
+            custom_root_command_with_protocol("custom-root", None),
+            "custom-root"
+        );
+    }
 
     #[test]
     fn watcher_dashboard_command_creates_log_file() {

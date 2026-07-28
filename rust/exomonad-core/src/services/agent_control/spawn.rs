@@ -243,79 +243,15 @@ fn active_worker_error(worker: &ActiveWorker) -> anyhow::Error {
     )
 }
 
-macro_rules! exomonad_tl_instructions {
-    ($runtime_notes:literal) => {
-        concat!(
-            "\
-# ExoMonad Root TL Protocol
+pub(crate) const ROOT_CONTEXT_RELATIVE_PATH: &str = ".exo/roles/devswarm/context/root.md";
 
-You are the root TL of an ExoMonad agent tree. You are running inside a supported coding harness and have access to the `exomonad` MCP server.
-
-## Your Job
-Decompose the request into independent tasks. Spawn implementation workers via spawn_leaf. \
-Idle until notifications arrive. Merge results.
-
-## Spawn Tool Selection
-- spawn_leaf: Use this for implementation tasks. Each worker gets its own worktree+branch, \
-implements the spec, files a PR, and calls notify_parent when done. This is the primary tool.
-- fork_wave: Use this only for sub-TLs that need to further decompose and spawn children.
-- spawn_worker: Ephemeral pane (no branch, no PR). Research or quick in-place edits only.
-
-## Other MCP Tools
-- file_pr: Create/update PR for your own branch.
-- merge_pr: Merge a child worker's PR after notification.
-- notify_parent: Send message to your parent agent. Use this tool directly; never use send_message with recipient 'parent'.
-- send_tmux_message: Send a message by injecting it into a spawned agent tmux pane.
-- send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
-
-## Workflow: Plan → Spawn → Idle → Merge
-1. PLAN: Research until decomposition is clear.
-2. SPAWN: Call spawn_leaf for each independent implementation task. Do NOT set agent_type.
-3. IDLE: Stop immediately after spawning. Do NOT poll or check status.
-4. MERGE: On [PR READY] or [REVIEW TIMEOUT] with green CI → call merge_pr.
-
-## Convergence Signals
-- [PR READY] — worker PR approved. Call merge_pr.
-- [FIXES PUSHED] — worker pushed fixes. Merge if CI passes.
-- [REVIEW TIMEOUT] — no review after timeout. Merge if CI passes.
-- [FAILED: id] — worker failed. Re-spec or escalate.
-- [from: id] — informational. Read, do not merge.
-
-## Worker Verification
-Workers are managed by ExoMonad in tmux windows or panes. Use tmux inspection commands when you need to confirm that a spawned worker exists.
-
-## Key Rules
-- Never implement directly. Decompose and delegate everything.
-- Never checkout another branch or touch another agent's worktree.
-- After spawning, STOP. Wait for notifications.
-- Git operations (status, commit, push) use the harness shell. Never use `gh pr create`; file_pr MCP is the PR tool.
-
-## Chainlink Ownership and Review Handoffs
-- The root TL creates and owns planned Chainlink issues. Child workers never create or close them.
-- The review watcher is read-only with respect to Chainlink. It observes Forgejo and emits diagnostics; it never creates, updates, or closes Chainlink issues.
-- Normal review feedback must stay attached to the existing owning work item and PR. Do not create a new Chainlink issue for each review comment or poll.
-- A terminal `review-stuck` signal is a human-clarification handoff. Surface it to the human operator; do not auto-close, respawn, or replace the dev leaf.
-",
-            $runtime_notes
-        )
-    };
-}
-
-pub const OPENCODE_TL_INSTRUCTIONS: &str = exomonad_tl_instructions!(
-    "\n## OpenCode Runtime Notes
-- ExoMonad manages OpenCode TLs in tmux and routes messages through OpenCode's supported delivery paths, not Claude Code Teams inboxes.
-- OpenCode hooks are installed through the ExoMonad TypeScript plugin bridge and should behave like the same PreToolUse/PostToolUse/Stop policy layer used by other runtimes.
-"
-);
-
-pub const CODEX_TL_INSTRUCTIONS: &str = exomonad_tl_instructions!(
-    "\n## Codex Runtime Notes
+pub const CODEX_TL_RUNTIME_NOTES: &str = "\
+## Codex Runtime Notes
 - ExoMonad manages Codex TLs in tmux and routes messages through Codex's supported delivery paths, not Claude Code Teams inboxes.
 - Codex hooks are shell-native and configured in `.codex/hooks.json` for PreToolUse, PostToolUse, and Stop. SessionStart is Claude-specific and is not part of the Codex hook set.
 - If you manually restart Codex from the TL shell, restart with `codex --dangerously-bypass-approvals-and-sandbox --cd <project-root>` so ExoMonad hooks do not enter Codex's hook review queue.
 - Context inheritance for Codex children uses `codex fork <session_id>`, not ClaudeSessionRegistry.
-"
-);
+";
 
 pub const OPENCODE_DEV_INSTRUCTIONS: &str = "\
 # ExoMonad Dev Agent Protocol
@@ -920,6 +856,24 @@ impl<
         context_path: Option<&Path>,
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
     ) -> serde_json::Value {
+        Self::generate_gemini_settings(agent_name, "worker", context_path, extra_mcp_servers)
+    }
+
+    /// Generate root Gemini settings that load the canonical root protocol.
+    pub fn generate_gemini_root_settings(
+        agent_name: &str,
+        context_path: Option<&Path>,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+    ) -> serde_json::Value {
+        Self::generate_gemini_settings(agent_name, "root", context_path, extra_mcp_servers)
+    }
+
+    fn generate_gemini_settings(
+        agent_name: &str,
+        role: &str,
+        context_path: Option<&Path>,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+    ) -> serde_json::Value {
         let mut context_files = vec![serde_json::Value::String("GEMINI.md".to_string())];
         if let Some(path) = context_path {
             context_files.push(serde_json::Value::String(
@@ -931,7 +885,7 @@ impl<
                 "exomonad": {
                     "type": "stdio",
                     "command": "exomonad",
-                    "args": ["mcp-stdio", "--role", "worker", "--name", agent_name]
+                    "args": ["mcp-stdio", "--role", role, "--name", agent_name]
                 }
             },
             "context": {
@@ -1011,6 +965,32 @@ impl<
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
         effort: Option<&str>,
     ) -> serde_json::Value {
+        Self::generate_opencode_settings(agent_name, role, extra_mcp_servers, effort, None)
+    }
+
+    /// Generate root OpenCode settings that load the canonical root protocol.
+    pub fn generate_opencode_root_settings_with_context(
+        agent_name: &str,
+        context_path: &Path,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+        effort: Option<&str>,
+    ) -> serde_json::Value {
+        Self::generate_opencode_settings(
+            agent_name,
+            "root",
+            extra_mcp_servers,
+            effort,
+            Some(context_path),
+        )
+    }
+
+    fn generate_opencode_settings(
+        agent_name: &str,
+        role: &str,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+        effort: Option<&str>,
+        context_path: Option<&Path>,
+    ) -> serde_json::Value {
         let mut mcp_servers = serde_json::Map::new();
         mcp_servers.insert(
             "exomonad".to_string(),
@@ -1023,11 +1003,15 @@ impl<
             mcp_servers.insert(k.clone(), v.clone());
         }
 
-        // instructions must be an array per OpenCode's schema.
-        let instructions = match role {
-            "root" | "tl" => serde_json::json!([OPENCODE_TL_INSTRUCTIONS]),
-            "worker" => serde_json::json!([OPENCODE_WORKER_INSTRUCTIONS]),
-            _ => serde_json::json!([OPENCODE_DEV_INSTRUCTIONS]),
+        // instructions must be an array per OpenCode's schema. Root settings
+        // contain a path so the harness reads the canonical protocol itself.
+        let instructions = match context_path {
+            Some(path) => serde_json::json!([path.to_string_lossy()]),
+            None => match role {
+                "root" | "tl" => serde_json::json!([ROOT_CONTEXT_RELATIVE_PATH]),
+                "worker" => serde_json::json!([OPENCODE_WORKER_INSTRUCTIONS]),
+                _ => serde_json::json!([OPENCODE_DEV_INSTRUCTIONS]),
+            },
         };
         let mut settings = serde_json::json!({
             "mcp": mcp_servers,

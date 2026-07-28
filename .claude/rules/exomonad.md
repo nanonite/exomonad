@@ -97,8 +97,6 @@ The TL does NOT iterate on children's work. Convergence is **leaf + reviewer**, 
 The TL never manually reviews code, never fixes a leaf's implementation.
 See `.exo/review-policy.toml` for review round limits, timeouts, and complexity thresholds.
 
-When fixing an existing PR, first call `watcher_pr_state` (or `list_agents`) and derive the owning agent name from the last dot-segment of the PR's `head_branch`. Resume with `spawn_leaf` using that exact same name; do not invent a new name, which would create a disconnected sibling branch. If same-name resume cannot recover a genuinely missing leaf, use the human-approved `replace_close_pr` path for an open PR or escalate through Chainlink `review-stuck`; reconcile or close the superseded PR explicitly.
-
 ## Branch Naming
 
 `{parent_branch}.{slug}-{type}` (dot separator, suffixed). The last dot-segment IS the `AgentName` — one namespace, zero translation. PRs target the parent branch, not main. Merged via recursive fold up the tree.

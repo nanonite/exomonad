@@ -10,8 +10,8 @@ mod internal;
 mod spawn;
 
 pub use spawn::{
-    CODEX_DEV_INSTRUCTIONS, CODEX_REVIEWER_INSTRUCTIONS, CODEX_TL_INSTRUCTIONS,
-    CODEX_WORKER_INSTRUCTIONS, OPENCODE_TL_INSTRUCTIONS,
+    CODEX_DEV_INSTRUCTIONS, CODEX_REVIEWER_INSTRUCTIONS, CODEX_TL_RUNTIME_NOTES,
+    CODEX_WORKER_INSTRUCTIONS, OPENCODE_DEV_INSTRUCTIONS, OPENCODE_WORKER_INSTRUCTIONS,
 };
 
 pub(crate) use crate::common::TimeoutError;
@@ -1147,6 +1147,25 @@ pub fn resolve_role_context_path(
         }
     }
     None
+}
+
+/// Load a role context file from the same project-local/global resolution used
+/// when copying context into agent worktrees.
+pub fn load_role_context(project_dir: &Path, wasm_name: &str, role: &str) -> Option<String> {
+    let path = resolve_role_context_path(project_dir, wasm_name, role)?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let content = strip_role_context_frontmatter(&content);
+    (!content.is_empty()).then_some(content)
+}
+
+fn strip_role_context_frontmatter(content: &str) -> String {
+    if !content.starts_with("---") {
+        return content.trim().to_string();
+    }
+    content[3..]
+        .find("---")
+        .map(|end| content[3 + end + 3..].trim().to_string())
+        .unwrap_or_else(|| content.trim().to_string())
 }
 
 /// Create a URL-safe slug from a title.

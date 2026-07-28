@@ -19,7 +19,7 @@ fn generate_opencode_agent_settings(
     }
 
     let instructions = match role {
-        "root" | "tl" => serde_json::json!([super::spawn::OPENCODE_TL_INSTRUCTIONS]),
+        "root" | "tl" => serde_json::json!([super::spawn::ROOT_CONTEXT_RELATIVE_PATH]),
         "worker" => serde_json::json!([super::spawn::OPENCODE_WORKER_INSTRUCTIONS]),
         _ => serde_json::json!([super::spawn::OPENCODE_DEV_INSTRUCTIONS]),
     };
@@ -998,16 +998,22 @@ impl<
         fs::create_dir_all(&codex_dir).await?;
 
         let instructions = match role.as_str() {
-            "tl" | "root" => super::spawn::CODEX_TL_INSTRUCTIONS,
-            "worker" => super::spawn::CODEX_WORKER_INSTRUCTIONS,
-            "reviewer" => super::spawn::CODEX_REVIEWER_INSTRUCTIONS,
-            _ => super::spawn::CODEX_DEV_INSTRUCTIONS,
+            "tl" | "root" => crate::services::agent_control::load_role_context(
+                self.project_dir(),
+                self.wasm_name.as_str(),
+                "root",
+            )
+            .map(|protocol| format!("{protocol}\n\n{}", super::spawn::CODEX_TL_RUNTIME_NOTES))
+            .unwrap_or_else(|| super::spawn::CODEX_TL_RUNTIME_NOTES.to_string()),
+            "worker" => super::spawn::CODEX_WORKER_INSTRUCTIONS.to_string(),
+            "reviewer" => super::spawn::CODEX_REVIEWER_INSTRUCTIONS.to_string(),
+            _ => super::spawn::CODEX_DEV_INSTRUCTIONS.to_string(),
         };
         let configured_effort = self.effort_for_role(role.as_str());
         let config = crate::codex_config::render_codex_config_with_effort(
             agent_name.as_str(),
             role.as_str(),
-            instructions,
+            &instructions,
             model,
             configured_effort,
             extra_mcp_servers,
@@ -1510,17 +1516,34 @@ mod tests {
 
     #[test]
     fn test_opencode_tl_settings_define_chainlink_review_ownership() {
-        let settings = ACS::generate_opencode_tl_settings("test-tl", "tl", &HashMap::new());
+        let context_path = Path::new("/tmp/sentinel-root.md");
+        let settings = ACS::generate_opencode_root_settings_with_context(
+            "test-tl",
+            context_path,
+            &HashMap::new(),
+            None,
+        );
         let instructions = settings["instructions"]
             .as_array()
             .expect("instructions must be an array")[0]
             .as_str()
             .expect("first instruction entry must be a string");
 
-        assert!(instructions.contains("Chainlink Ownership and Review Handoffs"));
-        assert!(instructions.contains("review watcher is read-only with respect to Chainlink"));
-        assert!(instructions.contains("terminal `review-stuck` signal"));
-        assert!(instructions.contains("do not auto-close, respawn, or replace the dev leaf"));
+        assert_eq!(instructions, "/tmp/sentinel-root.md");
+    }
+
+    #[test]
+    fn test_gemini_root_settings_load_canonical_context() {
+        let context_path = Path::new("/tmp/sentinel-root.md");
+        let settings =
+            ACS::generate_gemini_root_settings("test-root", Some(context_path), &HashMap::new());
+        let context_files = settings["context"]["fileName"]
+            .as_array()
+            .expect("context.fileName must be an array");
+
+        assert_eq!(context_files[0], "GEMINI.md");
+        assert_eq!(context_files[1], "/tmp/sentinel-root.md");
+        assert_eq!(settings["mcpServers"]["exomonad"]["args"][2], "root");
     }
 
     #[test]

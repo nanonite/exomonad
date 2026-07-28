@@ -49,7 +49,7 @@ Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is
 
 TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `MultiEdit`, and `NotebookEdit`. The denial text is the redispatch nudge: follow it by steering the existing worker with `send_tmux_message`, letting the leaf handle reviewer feedback, or spawning a new `spawn_leaf` / `spawn_worker`.
 
-`spawn_leaf` is also the resume path for an existing leaf worktree. If the worktree already exists but its tmux window/session is gone, call `spawn_leaf` again with the same assignment; ExoMonad reuses that worktree and starts a fresh session instead of duplicating the task.
+For an existing open PR, call `resume_pr` with the PR number and complete task. The host resolves the persisted owner, branch, and runtime; never pass a leaf name, branch name, or agent type. `spawn_leaf` remains for new implementation work.
 
 ## Notification Vocabulary
 
@@ -112,9 +112,10 @@ Workers are ephemeral pane agents with no PR. When a worker reports a blocker vi
 ## Fixing an Existing PR's CI/Review Problem
 
 - **DO NOT** call `spawn_leaf` with a new, unrelated `name` to fix another PR's CI failure, review comments, or merge conflicts. A new name always creates a disconnected sibling branch from the caller's branch, often targeting `main`, rather than continuing the target PR.
-- **DO** first resolve the agent that owns the target PR: call `watcher_pr_state` (or `list_agents`) for the PR number, read `head_branch`, and take its last dot-segment. That string is the owning agent name under the branch-naming convention.
-- **DO** call `spawn_leaf` again with that exact same name. `spawn_leaf` resumes the existing leaf worktree by slug and, when the PR already exists, injects its review context instead of filing a duplicate PR.
-- If resume-by-name cannot recover the genuinely missing or corrupt leaf and the PR is still open, do not invent another leaf name. With explicit human approval, use `replace_close_pr` to continue from the old PR head on its original base branch; this creates a replacement leaf without closing the old PR, so the TL must explicitly reconcile or close the old PR. For a closed, unmerged PR, the same tool already provides the replacement path. If the approved replacement path is unavailable, escalate through Chainlink `review-stuck`.
+- **DO** first call `watcher_pr_state` for the PR number and confirm it is open, unmerged, and has a head branch and SHA.
+- **DO** call `resume_pr` with that PR number and the complete review-fix task. The host re-fetches the head SHA, resolves exactly one persisted owner, and resumes its existing worktree.
+- **DO NOT** pass a leaf name, branch name, agent type, or invented suffix. The host owns identity resolution and rejects stale, duplicate, ambiguous, or mismatched metadata.
+- If the PR is closed or cannot be safely recovered, use `replace_close_pr` only with explicit human approval and reconcile the superseded PR. Never create an automatic `-2` branch.
 
 ## Chainlink Coordination
 
