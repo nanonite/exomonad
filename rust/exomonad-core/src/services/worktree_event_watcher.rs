@@ -1147,6 +1147,10 @@ where
         tracing::info!(pr_count, "[Watcher] poll cycle");
         self.append_watcher_log(&format!("poll: {} open PR(s)", pr_count))
             .await;
+        self.log_watcher_event(
+            "watcher.poll_cycle",
+            &serde_json::json!({ "pr_count": pr_count }),
+        );
         self.evict_closed_prs_from_watcher_state(&registry).await?;
         if !registry.prs.is_empty() {
             let observations = self.collect_observations(&registry).await?;
@@ -1158,6 +1162,16 @@ where
                     head_sha = %obs.head_sha,
                     changes_requested_rounds = obs.changes_requested_rounds,
                     "[Watcher] PR observation"
+                );
+                self.log_watcher_event(
+                    "watcher.pr_observation",
+                    &serde_json::json!({
+                        "pr_number": num,
+                        "review_state": obs.review_state,
+                        "ci_status": obs.ci_status,
+                        "head_sha": obs.head_sha,
+                        "changes_requested_rounds": obs.changes_requested_rounds,
+                    }),
                 );
             }
             self.append_watcher_log(&format!(
@@ -1171,6 +1185,16 @@ where
 
         self.poke_unread_inbox_agents().await?;
         Ok(())
+    }
+
+    /// Mirrors watcher activity into the same structured `.exo/logs/*.jsonl`
+    /// stream that agent lifecycle events use, so the dashboard's Event Log
+    /// panel (which only scans `*.jsonl`, not `watcher.log`) reflects live
+    /// poll cycles instead of only agent-initiated events.
+    fn log_watcher_event(&self, event_type: &str, data: &serde_json::Value) {
+        if let Some(log) = self.ctx.event_log() {
+            let _ = log.append(event_type, "watcher", data);
+        }
     }
 
     async fn poke_unread_inbox_agents(&self) -> Result<()> {
