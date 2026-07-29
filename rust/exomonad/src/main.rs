@@ -112,6 +112,10 @@ enum Commands {
         /// Model for the reviewer agent. Validated against the agent type.
         #[arg(long)]
         reviewer_model: Option<String>,
+        /// Maximum reviewer rounds before a PR is escalated to Stuck.
+        /// Overrides `.exo/review-policy.toml` for this initialized session.
+        #[arg(long, value_parser = config::parse_positive_u32)]
+        reviewer_max_rounds: Option<u32>,
         /// Enable verbose observability logging: hooks, Chainlink commands, decisions, reviewer spawns, Forgejo CI events.
         /// Sets RUST_LOG=info, EXOMONAD_HOOK_TRACE=1, and EXOMONAD_CHAINLINK_TRACE=1 on the server; EXOMONAD_VERBOSE=1 session-wide.
         #[arg(long)]
@@ -358,6 +362,7 @@ async fn main() -> Result<()> {
             reviewer_effort_level,
             reviewer,
             reviewer_model,
+            reviewer_max_rounds,
             verbose,
             set_git_remote,
             reset_inbox,
@@ -376,6 +381,7 @@ async fn main() -> Result<()> {
                 reviewer_effort_level,
                 reviewer,
                 reviewer_model,
+                reviewer_max_rounds,
                 verbose,
                 set_git_remote,
                 reset_inbox,

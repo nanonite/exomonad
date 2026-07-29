@@ -49,6 +49,7 @@ First build downloads Nix dependencies and initializes the WASM toolchain — su
 ```bash
 cd your-project/
 exomonad init       # Creates tmux session with Server + TL windows
+exomonad init --reviewer-max-rounds 5  # Session-only reviewer cap override
                     # Writes .mcp.json (auto-registers MCP tools)
                     # Starts background server on .exo/server.sock
 ```

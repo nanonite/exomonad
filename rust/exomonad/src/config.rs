@@ -5,6 +5,18 @@ use clap::ValueEnum;
 use exomonad_core::services::AgentType;
 use exomonad_core::Role;
 
+pub const REVIEWER_MAX_ROUNDS_ENV: &str = "EXOMONAD_REVIEWER_MAX_ROUNDS";
+
+pub fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|error| format!("must be a positive integer: {error}"))?;
+    if parsed == 0 {
+        return Err("must be at least 1".to_string());
+    }
+    Ok(parsed)
+}
+
 fn parse_agent_type_env(s: &str) -> Option<AgentType> {
     match s.to_lowercase().as_str() {
         "claude" | "claude-code" => Some(AgentType::Claude),
@@ -673,6 +685,15 @@ mod tests {
         "#;
         let raw: RawConfig = toml::from_str(content).unwrap();
         assert_eq!(raw.role, Some(Role::dev()));
+    }
+
+    #[test]
+    fn test_parse_positive_u32_rejects_zero_and_invalid_values() {
+        assert_eq!(parse_positive_u32("1"), Ok(1));
+        assert_eq!(parse_positive_u32("42"), Ok(42));
+        assert!(parse_positive_u32("0").is_err());
+        assert!(parse_positive_u32("not-a-number").is_err());
+        assert!(parse_positive_u32("4294967296").is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::uds_client;
 use anyhow::{Context, Result};
-use exomonad::config::{Config, EffortLevel, ResolvedEffort};
+use exomonad::config::{Config, EffortLevel, ResolvedEffort, REVIEWER_MAX_ROUNDS_ENV};
 use exomonad_core::services::AgentType;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -855,6 +855,41 @@ async fn validate_reviewer_model_for_harness(
     }
 }
 
+fn reviewer_max_rounds_tmux_args(session: &str, value: Option<u32>) -> Vec<String> {
+    let mut args = vec![
+        "set-environment".to_string(),
+        "-t".to_string(),
+        session.to_string(),
+    ];
+    match value {
+        Some(rounds) => {
+            args.push(REVIEWER_MAX_ROUNDS_ENV.to_string());
+            args.push(rounds.to_string());
+        }
+        None => {
+            args.push("-u".to_string());
+            args.push(REVIEWER_MAX_ROUNDS_ENV.to_string());
+        }
+    }
+    args
+}
+
+fn set_reviewer_max_rounds_environment(session: &str, value: Option<u32>) -> Result<()> {
+    let args = reviewer_max_rounds_tmux_args(session, value);
+    let output = std::process::Command::new("tmux")
+        .args(&args)
+        .output()
+        .context("Failed to propagate reviewer round limit to tmux session")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux set-environment failed for {}: {}",
+            REVIEWER_MAX_ROUNDS_ENV,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Run the init command: create or attach to tmux session.
 pub async fn run(
     session_override: Option<String>,
@@ -870,6 +905,7 @@ pub async fn run(
     reviewer_effort_level: Option<EffortLevel>,
     reviewer: Option<String>,
     reviewer_model: Option<String>,
+    reviewer_max_rounds: Option<u32>,
     verbose: bool,
     set_git_remote: Option<String>,
     reset_inbox: bool,
@@ -878,6 +914,9 @@ pub async fn run(
     use exomonad_core::services::{resolve_role_context_path, AgentType, InboxStore};
     use std::io::{IsTerminal, Write};
     let cwd = std::env::current_dir()?;
+    if reviewer_max_rounds == Some(0) {
+        anyhow::bail!("--reviewer-max-rounds must be at least 1, got 0");
+    }
     let config_path = cwd.join(".exo/config.toml");
     if !config_path.exists() {
         anyhow::bail!("No exomonad project found. Run `exomonad new` first.");
@@ -1071,6 +1110,11 @@ pub async fn run(
     let session = session_override.unwrap_or(config.tmux_session.clone());
     let session_alive = TmuxIpc::has_session(&session).await?;
     if should_attach_existing_session(recreate, session_alive) {
+        if reviewer_max_rounds.is_some() {
+            anyhow::bail!(
+                "--reviewer-max-rounds applies when starting a server; use --recreate to restart the existing session"
+            );
+        }
         if reset_inbox {
             warn!(
                 session = %session,
@@ -1430,6 +1474,8 @@ pub async fn run(
             session
         );
     }
+
+    set_reviewer_max_rounds_environment(&session, reviewer_max_rounds)?;
 
     if let Some(forgejo_url) = config.forgejo_url.as_deref() {
         for (var, value) in forgejo_env_vars(
@@ -2517,6 +2563,30 @@ mod tests {
         assert_eq!(
             custom_root_command_with_protocol("custom-root", None),
             "custom-root"
+        );
+    }
+
+    #[test]
+    fn reviewer_max_rounds_tmux_args_set_or_clear_session_override() {
+        assert_eq!(
+            reviewer_max_rounds_tmux_args("demo", Some(7)),
+            vec![
+                "set-environment",
+                "-t",
+                "demo",
+                REVIEWER_MAX_ROUNDS_ENV,
+                "7"
+            ]
+        );
+        assert_eq!(
+            reviewer_max_rounds_tmux_args("demo", None),
+            vec![
+                "set-environment",
+                "-t",
+                "demo",
+                "-u",
+                REVIEWER_MAX_ROUNDS_ENV
+            ]
         );
     }
 

@@ -129,6 +129,26 @@ impl ReviewPolicy {
         Ok(policy)
     }
 
+    /// Load the file policy and apply an explicit init/session override.
+    pub async fn load_with_reviewer_max_rounds(
+        project_dir: &Path,
+        reviewer_max_rounds: Option<u32>,
+    ) -> Result<Self> {
+        let policy = Self::load(project_dir).await?;
+        policy.with_reviewer_max_rounds(reviewer_max_rounds)
+    }
+
+    /// Apply an explicit reviewer cap, preserving the file/default policy when omitted.
+    pub fn with_reviewer_max_rounds(mut self, reviewer_max_rounds: Option<u32>) -> Result<Self> {
+        if let Some(rounds) = reviewer_max_rounds {
+            if rounds == 0 {
+                anyhow::bail!("reviewer_max_rounds must be at least 1, got 0");
+            }
+            self.reviewer_max_rounds = rounds;
+        }
+        Ok(self)
+    }
+
     /// Check whether a changed path triggers external review.
     pub fn path_triggers_external_review(&self, path: &str) -> bool {
         if self.external_review_paths.is_empty() {
@@ -224,6 +244,56 @@ mod tests {
         assert!(policy.require_second_reviewer_complexity);
         assert_eq!(policy.complexity_line_threshold, 1000);
         assert_eq!(policy.ci.gate, CiGate::Off);
+    }
+
+    #[tokio::test]
+    async fn test_file_policy_and_init_override_resolve_in_precedence_order() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let exo_dir = temp_dir.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        std::fs::write(
+            exo_dir.join("review-policy.toml"),
+            "reviewer_max_rounds = 2\n",
+        )
+        .unwrap();
+
+        let overridden = ReviewPolicy::load_with_reviewer_max_rounds(temp_dir.path(), Some(5))
+            .await
+            .unwrap();
+        let file_value = ReviewPolicy::load_with_reviewer_max_rounds(temp_dir.path(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(overridden.reviewer_max_rounds, 5);
+        assert_eq!(file_value.reviewer_max_rounds, 2);
+    }
+
+    #[test]
+    fn test_explicit_reviewer_max_rounds_override_wins_over_policy_file_value() {
+        let policy = ReviewPolicy {
+            reviewer_max_rounds: 2,
+            ..ReviewPolicy::default()
+        };
+        let resolved = policy.with_reviewer_max_rounds(Some(5)).unwrap();
+        assert_eq!(resolved.reviewer_max_rounds, 5);
+    }
+
+    #[test]
+    fn test_omitted_reviewer_max_rounds_preserves_policy_file_value() {
+        let policy = ReviewPolicy {
+            reviewer_max_rounds: 2,
+            ..ReviewPolicy::default()
+        };
+        let resolved = policy.with_reviewer_max_rounds(None).unwrap();
+        assert_eq!(resolved.reviewer_max_rounds, 2);
+    }
+
+    #[test]
+    fn test_reviewer_max_rounds_override_rejects_zero() {
+        let error = ReviewPolicy::default()
+            .with_reviewer_max_rounds(Some(0))
+            .expect_err("zero must be rejected");
+        assert!(error.to_string().contains("at least 1"));
     }
 
     #[test]

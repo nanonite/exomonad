@@ -293,7 +293,7 @@ Gemini agents get settings via `GEMINI_CLI_SYSTEM_SETTINGS_PATH` env var (NOT `.
 
 ### Review Policy
 
-The reviewer convergence loop is configured via `.exo/review-policy.toml`:
+The reviewer convergence loop is configured via `.exo/review-policy.toml`. To override only the running session without rewriting that file, use `exomonad init --reviewer-max-rounds 5` (and `--recreate` when replacing an existing session). The precedence is init override, then policy file, then built-in defaults.
 
 | Setting | Default | Description |
 |---------|---------|-------------|

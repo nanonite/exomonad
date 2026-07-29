@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use exomonad::config::Config;
+use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -25,6 +25,28 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument, warn, Instrument};
+
+fn parse_reviewer_max_rounds_override(value: Option<&str>) -> Result<Option<u32>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let rounds = value.parse::<u32>().with_context(|| {
+        format!("Invalid {REVIEWER_MAX_ROUNDS_ENV} value `{value}`: expected a positive integer")
+    })?;
+    if rounds == 0 {
+        anyhow::bail!("Invalid {REVIEWER_MAX_ROUNDS_ENV} value `0`: must be at least 1");
+    }
+    Ok(Some(rounds))
+}
+
+fn reviewer_max_rounds_override_from_env() -> Result<Option<u32>> {
+    let value = match std::env::var(REVIEWER_MAX_ROUNDS_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => anyhow::bail!("Invalid {REVIEWER_MAX_ROUNDS_ENV}: {error}"),
+    };
+    parse_reviewer_max_rounds_override(value.as_deref())
+}
 
 // ============================================================================
 // Config Helpers
@@ -1273,7 +1295,12 @@ Run `exomonad recompile` first to build it.",
     std::fs::write(&server_pid_path, serde_json::to_string_pretty(&pid_info)?)?;
     info!(path = %server_pid_path.display(), "Wrote server.pid");
 
-    let review_policy = exomonad_core::services::review_policy::ReviewPolicy::load(&project_dir)
+    let reviewer_max_rounds = reviewer_max_rounds_override_from_env()?;
+    let review_policy =
+        exomonad_core::services::review_policy::ReviewPolicy::load_with_reviewer_max_rounds(
+            &project_dir,
+            reviewer_max_rounds,
+        )
         .await
         .context("Failed to load review policy")?;
     let orphan_max_leaf = review_policy.max_leaf_session_seconds;
@@ -1493,6 +1520,18 @@ mod tests {
             notified_at: None,
             read_at: None,
         }
+    }
+
+    #[test]
+    fn reviewer_max_rounds_override_parser_preserves_absence_and_rejects_invalid_values() {
+        assert_eq!(parse_reviewer_max_rounds_override(None).unwrap(), None);
+        assert_eq!(
+            parse_reviewer_max_rounds_override(Some("5")).unwrap(),
+            Some(5)
+        );
+        assert_eq!(parse_reviewer_max_rounds_override(Some(" ")).unwrap(), None);
+        assert!(parse_reviewer_max_rounds_override(Some("0")).is_err());
+        assert!(parse_reviewer_max_rounds_override(Some("invalid")).is_err());
     }
 
     #[test]

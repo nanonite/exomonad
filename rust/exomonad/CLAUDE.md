@@ -45,7 +45,7 @@ exomonad shutdown                 # Gracefully shut down the running server
 - **TL window**: Runs the configured root agent (Claude by default; `--tl codex` writes `.codex/config.toml`, installs the shared ExoMonad hook block in the Codex user config, and launches Codex with `--cd` in the project root)
 - **Companion windows**: One per `[[companions]]` entry in config. Claude companions get isolated git worktrees at `.exo/companions/{name}/` with `.mcp.json`, hooks, and socket symlink. Worktrees persist across `--recreate`. Process companions (`agent_type = "process"`) run a plain command — no MCP, no worktree, no agent identity.
 
-`exomonad init` requires `exomonad new` to have been run first to bootstrap the project configuration and WASM plugins.
+`exomonad init` requires `exomonad new` to have been run first to bootstrap the project configuration and WASM plugins. Use `exomonad init --reviewer-max-rounds N` for a validated, session-only reviewer cap override; it takes precedence over `.exo/review-policy.toml` without changing that file.
 
 Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is newer (consuming projects only, not source projects with `.exo/roles/`).
 
@@ -76,6 +76,8 @@ poll_interval = 60            # optional — GitHub poll cycle in seconds (defau
 agent_type = "claude"
 effort_level = "medium"
 ```
+
+**Reviewer policy:** `--reviewer-max-rounds N` is valid for `exomonad init` when `N >= 1`. It overrides `.exo/review-policy.toml` for the new server session; omitting it preserves the policy file and built-in defaults.
 
 **Role-specific effort:** `--tl-effort-level`, `--worker-effort-level`, and
 `--reviewer-effort-level` override their matching config values. Resolution is CLI >
