@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- spawn_leaf orphan-PR bug recurred despite #549-552 fixes — investigate root cause (#558)
 - Load the canonical root TL protocol across supported harnesses (#563)
 - Add typed existing-PR resume enforcement to prevent orphan branches (#564)
 - Watcher dashboard Event Log panel never showed live poll-cycle activity (#559)
