@@ -101,6 +101,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add structured TL review-fix handoffs for existing PRs (#567)
 - Add reviewer round limit override to exomonad init (#566)
 - Add cleanup_leaf: manual on-demand disposal tool for stale leaf worktrees (#556)
 - Add open-PR equivalent of replace_close_pr for unrecoverable-by-name leaves (#552)
@@ -221,6 +222,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Add review handoff regression and integration tests (#571)
+- Add structured resume_pr context fields for leaf launch (#570)
+- Add TL review-fix handoff prompt and scaffolding contract (#569)
+- Align reviewer messages with resume_pr handoff workflow (#568)
 - Add focused Codex-TL orphan-PR regression coverage (#565)
 - refactor: share outside-repo tempdir test helper instead of duplicating it (#547)
 - Protocol guardrail: resume PR-owning agent by name instead of inventing a new spawn_leaf name (#550)
