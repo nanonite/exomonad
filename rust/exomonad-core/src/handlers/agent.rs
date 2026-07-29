@@ -1336,6 +1336,7 @@ impl<
         if req.resume_pr_number != 0 || !req.expected_head_sha.trim().is_empty() {
             return self.resume_existing_pr(&req, ctx).await;
         }
+        self.reject_orphan_pr_spawn(&req).await?;
         if req.branch_name.trim().is_empty() {
             return Err(EffectError::invalid_input(
                 "branch_name is required for an ordinary spawn",
@@ -2325,6 +2326,46 @@ impl<
             agent: Some(agent_info),
         })
     }
+    async fn reject_orphan_pr_spawn(&self, req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
+        let Some(pr_number) = referenced_pr_number(&req.task) else {
+            return Ok(());
+        };
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Ok(());
+        };
+        let repo_info = crate::services::repo::get_repo_info(self.ctx.project_dir())
+            .await
+            .effect_err("agent")?;
+        let pr = forgejo
+            .get_pull_request(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
+            .await
+            .effect_err("agent")?;
+        if pr.merged || !pr.state.eq_ignore_ascii_case("open") {
+            return Ok(());
+        }
+
+        let owners = self
+            .ctx
+            .agent_resolver()
+            .all()
+            .await
+            .into_iter()
+            .filter(|record| {
+                record.topology == Topology::WorktreePerAgent
+                    && record.birth_branch.as_str() == pr.head_ref.as_str()
+            })
+            .collect::<Vec<_>>();
+        match owners.as_slice() {
+            [] => Ok(()),
+            [owner] => Err(EffectError::invalid_input(format!(
+                "task references open PR #{pr_number} owned by {}; call resume_pr instead of spawning {}",
+                owner.agent_name, req.branch_name
+            ))),
+            _ => Err(EffectError::invalid_input(format!(
+                "task references open PR #{pr_number} with multiple persisted owners; call resume_pr instead of spawn_leaf"
+            ))),
+        }
+    }
 }
 
 fn ensure_open_unmerged_pr(pr: &ForgejoPullRequest, pr_number: u64) -> EffectResult<()> {
@@ -2400,6 +2441,27 @@ fn leaf_identity_matches(metadata_name: &str, requested_name: &str) -> bool {
     !has_runtime_suffix
         && AgentIdentity::from_internal_name(metadata_name).slug()
             == AgentIdentity::from_internal_name(requested_name).slug()
+}
+
+fn referenced_pr_number(task: &str) -> Option<u64> {
+    let task = task.to_ascii_lowercase();
+    ["pull request #", "pr #", "pr#"].iter().find_map(|marker| {
+        let start = task.find(marker)? + marker.len();
+        let rest = &task[start..];
+        let digits = rest
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .collect::<Vec<_>>();
+        if digits.is_empty()
+            || rest
+                .as_bytes()
+                .get(digits.len())
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        std::str::from_utf8(&digits).ok()?.parse::<u64>().ok()
+    })
 }
 
 async fn ensure_chainlink_issue_open(project_dir: &Path, issue_id: u64) -> Result<(), String> {
@@ -3300,6 +3362,19 @@ mod tests {
             ServiceAgentType::Codex
         );
         assert!(convert_agent_type(AgentType::Unspecified).is_err());
+    }
+
+    #[test]
+    fn referenced_pr_number_requires_an_explicit_pr_marker() {
+        assert_eq!(
+            referenced_pr_number("Fix PR #104 review comments"),
+            Some(104)
+        );
+        assert_eq!(referenced_pr_number("Repair pull request #7"), Some(7));
+        assert_eq!(referenced_pr_number("resume PR#56 after review"), Some(56));
+        assert_eq!(referenced_pr_number("Implement issue #104"), None);
+        assert_eq!(referenced_pr_number("Fix PR #"), None);
+        assert_eq!(referenced_pr_number("Fix PR #104foo"), None);
     }
 
     fn resume_request() -> SpawnLeafSubtreeRequest {

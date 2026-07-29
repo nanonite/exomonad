@@ -113,7 +113,8 @@ Workers are ephemeral pane agents with no PR. When a worker reports a blocker vi
 
 - **DO NOT** call `spawn_leaf` with a new, unrelated `name` to fix another PR's CI failure, review comments, or merge conflicts. A new name always creates a disconnected sibling branch from the caller's branch, often targeting `main`, rather than continuing the target PR.
 - **DO** first call `watcher_pr_state` for the PR number and confirm it is open, unmerged, and has a head branch and SHA.
-- **DO** call `resume_pr` with that PR number and the complete review-fix task. The host re-fetches the head SHA, resolves exactly one persisted owner, and resumes its existing worktree.
+- **DO** read the review, diagnose the root cause, propose the solution, and call `resume_pr` with a complete structured repair handoff. The host re-fetches the head SHA, resolves exactly one persisted owner, and resumes its existing worktree.
+- The handoff must include ROOT CAUSE, PROPOSED SOLUTION, READ FIRST, STEPS, VERIFY, BOUNDARY, and DONE CRITERIA. Preserve the owning Chainlink issue; do not create or close one during review repair.
 - **DO NOT** pass a leaf name, branch name, agent type, or invented suffix. The host owns identity resolution and rejects stale, duplicate, ambiguous, or mismatched metadata.
 - If the PR is closed or cannot be safely recovered, use `replace_close_pr` only with explicit human approval and reconcile the superseded PR. Never create an automatic `-2` branch.
 

@@ -448,6 +448,16 @@ fn value_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(|value| value.as_str())
 }
 
+const REVIEW_HANDOFF_INSTRUCTIONS: &str = concat!(
+    "TL review-fix handoff (required):\n",
+    "1. Read the PR diff, reviewer comments, and affected source/tests before deciding.\n",
+    "2. State the root cause of each requested change.\n",
+    "3. Propose the concrete solution, naming exact files/lines and expected behavior.\n",
+    "4. Build a complete repair task with ROOT CAUSE, PROPOSED SOLUTION, READ FIRST, STEPS, VERIFY, BOUNDARY, and DONE CRITERIA sections.\n",
+    "5. For this existing open PR, call `resume_pr` with the PR number and complete task. Do not call `spawn_leaf`, create a sibling branch, create a new Chainlink issue, or close the owning issue.\n",
+    "The resumed leaf must commit/push the fix, end its Chainlink session, and report the verification results to its parent.",
+);
+
 fn review_parent_message(
     pr_number: u64,
     branch: &str,
@@ -457,7 +467,7 @@ fn review_parent_message(
 ) -> String {
     let reviewer_branch = author_branch.unwrap_or("unknown");
     format!(
-        "[REVIEW ACTION REQUIRED] PR #{pr_number} on branch {branch}\nReview kind: {review_kind}\nReviewer branch: {reviewer_branch}\n\n{comments}\n\nTL action: use the existing owning work item and PR branch to coordinate the fix. Do not create a new Chainlink issue for this review."
+        "[REVIEW ACTION REQUIRED] PR #{pr_number} on branch {branch}\nReview kind: {review_kind}\nReviewer branch: {reviewer_branch}\n\n{comments}\n\nTL action: analyze this feedback and resume the existing PR owner with a complete repair task.\n\n{REVIEW_HANDOFF_INSTRUCTIONS}"
     )
 }
 
@@ -3134,6 +3144,26 @@ mod tests {
                 }
                 other => panic!("expected TL InjectMessage fallback for {payload}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn test_native_tl_fallback_review_handoff_requires_resume_pr() {
+        let payload = serde_json::json!({
+            "kind": "reviewer_requested_changes",
+            "pr_number": 56,
+            "branch": "main.feature",
+            "comments": "Fix the reviewed behavior.",
+        });
+
+        match native_event_action("pr_review", &payload, "tl") {
+            Some(EventActionResponse::InjectMessage { message }) => {
+                assert!(message.contains("TL review-fix handoff"));
+                assert!(message.contains("resume_pr"));
+                assert!(message.contains("ROOT CAUSE"));
+                assert!(!message.contains("spawn a fresh dev leaf"));
+            }
+            other => panic!("expected TL review handoff, got {other:?}"),
         }
     }
 

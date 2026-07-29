@@ -19,11 +19,11 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word8)
 import DevPhase (DevEvent (..), DevPhase (..))
+import DevRole qualified
 import Effects.Envelope qualified as Envelope
 import Effects.Git qualified as Git
 import Effects.Kv qualified as KV
 import Effects.Log qualified as Log
-import DevRole qualified
 import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
 import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), PRReviewEvent (..))
@@ -34,11 +34,11 @@ import ExoMonad.Guest.Tool.Suspend.Types (EffectRequest (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), mergePRDescription, mergePRSchema)
 import ExoMonad.Guest.Types (Effects, HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (ChainlinkDbPathState (..), HookConfig (..), RoleConfig (..), validateChainlinkDbEnv)
+import Proto3.Suite.Class (Message, toLazyByteString)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
 import ReviewerRole qualified
 import RootRole qualified
 import TLRole qualified
-import Proto3.Suite.Class (Message, toLazyByteString)
 import WorkerRole qualified
 
 denyTools :: [Text]
@@ -474,6 +474,9 @@ assertRequestedChangesNotifyParent = do
       assertEqual "review-received parent PR number" 12 prNumber
       assertBool "review-received includes branch" ("main.feature-codex" `T.isInfixOf` message)
       assertBool "review-received includes body" ("Please update the timeout path." `T.isInfixOf` message)
+      assertBool "review-received requires TL analysis" ("TL review-fix handoff" `T.isInfixOf` message)
+      assertBool "review-received requires resume_pr" ("resume_pr" `T.isInfixOf` message)
+      assertBool "review-received requires root cause" ("ROOT CAUSE" `T.isInfixOf` message)
     other -> fail $ "review received should notify parent, got " <> show other
 
   let event = ReviewerRequestedChanges 10 "Please fix the error path." "main.feature-codex" (Just "main.review-pr-10-codex")

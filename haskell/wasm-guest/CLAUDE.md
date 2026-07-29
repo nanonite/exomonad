@@ -187,7 +187,7 @@ GitHub poller (Rust, 60s interval)
 
 | Event | Action | Effect |
 |-------|--------|--------|
-| `ReviewReceived` | `InjectMessage` | Copilot comments injected into agent pane |
+| `ReviewReceived` | `NotifyParentAction` for dev, `InjectMessage` for TL | Review comments reach the owning TL, which diagnoses them and resumes the existing PR owner with a repair handoff |
 | `ReviewApproved` | `NotifyParentAction` | Sends `[from: id] [PR READY] PR #N...` to parent via `notify_parent_delivery` |
 | `ReviewTimeout` (15 min initial, 5 min after fixes) | `NotifyParentAction` | Sends `[from: id] [REVIEW TIMEOUT] PR #N...` to parent via `notify_parent_delivery` |
 | `FixesPushed` | `NotifyParentAction` | Sends `[from: id] [FIXES PUSHED] PR #N...` to parent — Copilot does NOT re-review, so this is the actionable signal |

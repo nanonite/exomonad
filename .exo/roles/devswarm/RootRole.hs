@@ -14,6 +14,7 @@ import Data.Text (Text)
 import ExoMonad
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
 import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
+import ExoMonad.Guest.ReviewHandoff (reviewHandoffInstructions)
 import ExoMonad.Guest.StateMachine (applyEvent)
 import ExoMonad.Guest.Tools.Agents (ListAgents (..))
 import ExoMonad.Guest.Tools.Chainlink
@@ -37,8 +38,8 @@ import ExoMonad.Guest.Tools.Chainlink
     ChainlinkTimerStatus (..),
     ChainlinkTimerStop (..),
   )
-import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
 import ExoMonad.Guest.Tools.CleanupLeaf (CleanupLeaf (..))
+import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
 import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.CloseReviewerWindow (CloseReviewerWindow (..))
@@ -48,8 +49,8 @@ import ExoMonad.Guest.Tools.Lifecycle (HasPendingWork (..), ShutdownServer (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
-import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
+import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
@@ -87,8 +88,9 @@ rootRedispatchMessage toolName =
   "TL agents cannot use "
     <> toolName
     <> ". The TL plans and dispatches; implementation belongs to leaves and workers.\n"
-    <> "If a leaf needs to fix code based on review feedback, the leaf does it; reviewer comments are injected into its pane automatically.\n"
-    <> "If a worker is blocked, use send_tmux_message to inject a clarification into the worker's pane. See Worker Correction Loop in .exo/roles/devswarm/context/root.md.\n"
+    <> "Reviewer comments are delivered to the TL; they are not auto-applied to a leaf. Read the review, analyze the root cause, and prepare the repair handoff before steering the owner.\n"
+    <> reviewHandoffInstructions
+    <> "\nIf a worker is blocked, use send_tmux_message to inject a clarification into the worker's pane. See Worker Correction Loop in .exo/roles/devswarm/context/root.md.\n"
     <> "If neither path fits, re-decompose with spawn_leaf or spawn_worker.\n"
     <> "See CLAUDE.md § Tech Lead Praxis for the full protocol."
 

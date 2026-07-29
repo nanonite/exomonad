@@ -9,10 +9,10 @@ where
 
 import Control.Monad (void)
 import Control.Monad.Freer (Eff)
-import Data.Text (Text)
-import Data.Text qualified as T
 import Data.Aeson qualified as Aeson
 import Data.Aeson.KeyMap qualified as KM
+import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
 import DevPhase (DevEvent (..), DevPhase (..))
 import ExoMonad.Effects.Log qualified as Log
@@ -20,13 +20,13 @@ import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), IssueClosedEvent (..), PRReviewEvent (..), SiblingMergedEvent (..), defaultEventHandlers)
 import ExoMonad.Guest.Events.Templates qualified as Tpl
 import ExoMonad.Guest.StateMachine (applyEvent)
-import ExoMonad.Guest.Tools.Chainlink (chainlinkSessionStatusCore)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
+import ExoMonad.Guest.Tools.Chainlink (chainlinkSessionStatusCore)
 import ExoMonad.Guest.Types (Effects)
 
--- | Dev-leaf PR review handling updates DevPhase and injects actionable review
--- messages into the leaf pane. TL/root handling injects the same structured
--- signals into its own pane without cascading NotifyParentAction upward.
+-- | Dev-leaf PR review handling records feedback and notifies the owning TL.
+-- The TL analyzes the review and resumes the existing PR owner with a complete
+-- repair handoff; TL/root handling injects the same signal into its own pane.
 prReviewEventHandlers :: EventHandlerConfig
 prReviewEventHandlers =
   defaultEventHandlers
@@ -124,7 +124,6 @@ prReviewHandler (ReviewerNeverStarted n) = do
 prReviewHandler (ReviewDevFailed n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " dev leaf reported failure"
   pure NoAction
-
 
 tlPrReviewHandler :: PRReviewEvent -> Eff Effects EventAction
 tlPrReviewHandler (ReviewReceived n comments_ branch authorBranch) = do

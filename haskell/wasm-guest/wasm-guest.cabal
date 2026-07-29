@@ -89,6 +89,7 @@ library wasm-guest-internal
         ExoMonad.Guest.Tools.DiscardWorkerOutput
         ExoMonad.Guest.Tools.TestRunner
         ExoMonad.Guest.Prompt
+        ExoMonad.Guest.ReviewHandoff
         ExoMonad.Guest.Events
         ExoMonad.Guest.Events.Templates
         -- State machine primitive

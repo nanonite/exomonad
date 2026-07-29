@@ -31,6 +31,16 @@ Write specs complete enough that children don't need to ask — but be ready whe
 If a task involves more than scaffolding, split or extend. Never implement alone.
 Never touch another agent's worktree. Never checkout another branch.
 
+## Review-fix handoff
+
+When a `[REVIEW ACTION REQUIRED]` message arrives, reviewer text is input, not a patch plan. Before steering the leaf:
+
+1. Read the PR diff, reviewer comments, and affected source/tests.
+2. State the root cause and propose the concrete solution with exact files/lines.
+3. Build a complete handoff with ROOT CAUSE, PROPOSED SOLUTION, READ FIRST, STEPS, VERIFY, BOUNDARY, and DONE CRITERIA.
+4. For an existing open PR, call `resume_pr` with the PR number and structured fields. Do not call `spawn_leaf`, create a sibling branch, create a new issue, or close the owning issue.
+5. Require the leaf to commit/push, end its Chainlink session, and report verification results.
+
 ## Worker Spawning
 
 When calling `spawn_worker`, omit `agent_type` to use `{{spawn_agent_type}}`; set it only when the task explicitly requires a different type.

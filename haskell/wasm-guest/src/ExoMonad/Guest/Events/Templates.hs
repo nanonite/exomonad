@@ -27,6 +27,7 @@ where
 
 import Data.Text (Text)
 import Data.Text qualified as T
+import ExoMonad.Guest.ReviewHandoff (reviewHandoffInstructions)
 
 -- | PR approved by a Forgejo reviewer — signals TL to merge.
 --
@@ -107,7 +108,9 @@ reviewParentMessage n branch reviewKind authorBranch comments =
     <> maybe "unknown" id authorBranch
     <> "\n\n"
     <> comments
-    <> "\n\nTL action: spawn a fresh dev leaf to address this review and include the PR branch in its task."
+    <> "\n\nTL action: analyze this feedback and resume the existing PR owner with a complete repair task."
+    <> "\n\n"
+    <> reviewHandoffInstructions
 
 displayOrUnknown :: Text -> Text
 displayOrUnknown value
