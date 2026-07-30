@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- fix: review_message_keeps_follow_up_on_existing_chainlink_work_item test fails on main (#573)
 - spawn_leaf orphan-PR bug recurred despite #549-552 fixes — investigate root cause (#558)
 - Load the canonical root TL protocol across supported harnesses (#563)
 - Add typed existing-PR resume enforcement to prevent orphan branches (#564)

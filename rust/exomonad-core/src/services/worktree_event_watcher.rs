@@ -4178,8 +4178,10 @@ mod tests {
             "Address the parser edge case",
         );
 
-        assert!(message.contains("existing owning work item"));
-        assert!(message.contains("Do not create a new Chainlink issue"));
+        assert!(message.contains("resume the existing PR owner"));
+        assert!(message.contains("call `resume_pr`"));
+        assert!(message.contains("Do not call `spawn_leaf`"));
+        assert!(message.contains("create a new Chainlink issue"));
         assert!(!message.contains("spawn a fresh dev leaf"));
     }
 
