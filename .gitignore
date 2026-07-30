@@ -78,9 +78,9 @@ rust/exomonad/.exo/
 **/__pycache__/
 *.pyc
 
-# Stale Nix shell tempdirs (leak to CWD when shell is killed hard)
+# Stale Nix shell tempdirs/tempfiles (leak to CWD when shell is killed hard)
 nix-develop-*/
-nix-shell.*/
+nix-shell.*
 
 # Temporary task files for worktree dispatch
 *.md.tmp
