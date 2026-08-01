@@ -261,6 +261,10 @@ async fn reconcile_session_timeouts(
         let agent_dir = agents_dir.join(&slug);
         let routing_path = agent_dir.join("routing.json");
         if !routing_path.exists() {
+            warn!(
+                agent = %slug,
+                "Skipping session timeout because routing.json is missing"
+            );
             continue;
         }
         if agent_dir.join("exited_at").exists() {
@@ -279,8 +283,17 @@ async fn reconcile_session_timeouts(
             Err(_) => continue,
         };
 
-        let age_secs = now_secs.saturating_sub(spawned_at);
-        if age_secs <= limit {
+        let last_activity_at = match tokio::fs::read_to_string(
+            agent_dir.join(crate::services::agent_control::LAST_ACTIVITY_FILE),
+        )
+        .await
+        {
+            Ok(value) => value.trim().parse::<u64>().ok(),
+            Err(_) => None,
+        };
+
+        let age_secs = session_age_secs(now_secs, spawned_at, last_activity_at);
+        if !timeout_due(age_secs, limit) {
             continue;
         }
 
@@ -290,29 +303,102 @@ async fn reconcile_session_timeouts(
             .map(|s| s.trim().to_string());
 
         let limit_mins = limit / 60;
-        info!(
-            agent = %slug,
-            age_secs,
-            limit_secs = limit,
-            issue = ?active_issue,
-            "Session timeout: killing agent"
-        );
+        let Some(session) = tmux_session else {
+            warn!(
+                agent = %slug,
+                age_secs,
+                limit_secs = limit,
+                "Skipping session timeout because tmux routing cannot be verified without a session"
+            );
+            continue;
+        };
 
-        if let Some(session) = tmux_session {
-            let was_alive = kill_agent_window(session, &agent_dir, &slug).await;
-            let _ = tokio::fs::remove_file(&routing_path).await;
-            notify_tl_about_agent(
-                project_dir,
-                session,
-                &slug,
-                &active_issue,
-                limit_mins,
-                was_alive,
-            )
-            .await;
+        match verify_routing_liveness(&agent_dir, session).await {
+            RoutingLiveness::Live => {
+                info!(
+                    agent = %slug,
+                    age_secs,
+                    limit_secs = limit,
+                    issue = ?active_issue,
+                    "Session timeout: killing verified live agent"
+                );
+                let was_alive = kill_agent_window(session, &agent_dir, &slug).await;
+                let _ = tokio::fs::remove_file(&routing_path).await;
+                notify_tl_about_agent(
+                    project_dir,
+                    session,
+                    &slug,
+                    &active_issue,
+                    limit_mins,
+                    was_alive,
+                )
+                .await;
+            }
+            RoutingLiveness::Dead => {
+                let _ = tokio::fs::remove_file(&routing_path).await;
+                info!(
+                    agent = %slug,
+                    age_secs,
+                    limit_secs = limit,
+                    "Cleaned stale registry for an already-dead agent"
+                );
+                notify_tl_about_agent(
+                    project_dir,
+                    session,
+                    &slug,
+                    &active_issue,
+                    limit_mins,
+                    false,
+                )
+                .await;
+            }
+            RoutingLiveness::Unverifiable(reason) => {
+                warn!(
+                    agent = %slug,
+                    age_secs,
+                    limit_secs = limit,
+                    reason,
+                    "Skipping session timeout because agent liveness is unverifiable"
+                );
+            }
         }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RoutingLiveness {
+    Live,
+    Dead,
+    Unverifiable(String),
+}
+
+fn session_age_secs(now_secs: u64, spawned_at: u64, last_activity_at: Option<u64>) -> u64 {
+    let activity_at = last_activity_at.unwrap_or(spawned_at).max(spawned_at);
+    now_secs.saturating_sub(activity_at)
+}
+
+fn timeout_due(age_secs: u64, limit_secs: u64) -> bool {
+    age_secs > limit_secs
+}
+
+async fn verify_routing_liveness(agent_dir: &Path, session: &str) -> RoutingLiveness {
+    let routing = match crate::domain::RoutingInfo::read_from_dir(agent_dir).await {
+        Ok(routing) => routing,
+        Err(error) => return RoutingLiveness::Unverifiable(error.to_string()),
+    };
+    if !routing.has_delivery_target() {
+        return RoutingLiveness::Unverifiable(
+            "routing.json has no window_id or pane_id".to_string(),
+        );
+    }
+
+    let tmux = crate::services::tmux_ipc::TmuxIpc::new(session);
+    match crate::services::tmux_ipc::routing_target_alive(&routing, &tmux).await {
+        Ok(true) => RoutingLiveness::Live,
+        Ok(false) => RoutingLiveness::Dead,
+        Err(error) => RoutingLiveness::Unverifiable(error.to_string()),
+    }
 }
 
 async fn kill_agent_window(session: &str, agent_dir: &std::path::Path, slug: &str) -> bool {
@@ -458,6 +544,18 @@ mod tests {
         assert!(message.contains("[STALE REGISTRY: agent-b]"));
         assert!(message.contains("registry entry cleaned up"));
         assert!(message.contains("chainlink show 372"));
+    }
+
+    #[test]
+    fn recent_activity_prevents_timeout_from_old_spawn_age() {
+        let age = session_age_secs(10_000, 1_000, Some(9_950));
+
+        assert_eq!(age, 50);
+        assert!(!timeout_due(age, 60));
+        assert!(timeout_due(
+            session_age_secs(10_000, 1_000, Some(9_900)),
+            60
+        ));
     }
 
     #[test]

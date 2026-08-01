@@ -191,7 +191,8 @@ data AgentInfo
     agentInfoBirthBranch :: Hs.Text,
     agentInfoHasUnread :: Hs.Bool,
     agentInfoLastCheckInboxAt :: Hs.Int64,
-    agentInfoIsAlive :: Hs.Bool
+    agentInfoIsAlive :: Hs.Bool,
+    agentInfoLastActivityAt :: Hs.Int64
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -222,7 +223,8 @@ instance (HsProtobuf.Message AgentInfo) where
         agentInfoBirthBranch,
         agentInfoHasUnread,
         agentInfoLastCheckInboxAt,
-        agentInfoIsAlive
+        agentInfoIsAlive,
+        agentInfoLastActivityAt
       } =
       Hs.mappend
         ( Hs.mappend
@@ -346,9 +348,15 @@ instance (HsProtobuf.Message AgentInfo) where
                 agentInfoLastCheckInboxAt
             )
         )
-        ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 17)
-            agentInfoIsAlive
+        ( Hs.mappend
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 17)
+                agentInfoIsAlive
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 18)
+                agentInfoLastActivityAt
+            )
         )
   decodeMessage _ =
     Hs.pure AgentInfo
@@ -430,6 +438,9 @@ instance (HsProtobuf.Message AgentInfo) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 17)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 18)
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -542,6 +553,12 @@ instance (HsProtobuf.Message AgentInfo) where
         (HsProtobufAST.Prim HsProtobufAST.Bool)
         (HsProtobufAST.Single "is_alive")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 18)
+        (HsProtobufAST.Prim HsProtobufAST.Int64)
+        (HsProtobufAST.Single "last_activity_at")
+        []
         ""
     ]
 
@@ -565,6 +582,7 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
         f15
         f16
         f17
+        f18
       ) =
       HsJSONPB.object
         [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -589,7 +607,8 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
           "has_unread" .= f15,
           "last_check_inbox_at" .= f16,
-          "is_alive" .= f17
+          "is_alive" .= f17,
+          "last_activity_at" .= f18
         ]
   toEncodingPB
     ( AgentInfo
@@ -610,6 +629,7 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
         f15
         f16
         f17
+        f18
       ) =
       HsJSONPB.pairs
         [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -634,7 +654,8 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
           "has_unread" .= f15,
           "last_check_inbox_at" .= f16,
-          "is_alive" .= f17
+          "is_alive" .= f17,
+          "last_activity_at" .= f18
         ]
 
 instance (HsJSONPB.FromJSONPB AgentInfo) where
@@ -678,6 +699,7 @@ instance (HsJSONPB.FromJSONPB AgentInfo) where
             <*> obj .: "has_unread"
             <*> obj .: "last_check_inbox_at"
             <*> obj .: "is_alive"
+            <*> obj .: "last_activity_at"
       )
 
 instance (HsJSONPB.ToJSON AgentInfo) where

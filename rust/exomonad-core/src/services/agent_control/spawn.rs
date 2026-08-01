@@ -1735,9 +1735,20 @@ impl<
                 effective_birth.child(agent_name.as_str())
             };
 
-            // Idempotency check
-            let tab_alive = self.is_tmux_window_alive(&display_name).await;
+            // Idempotency check: stable routing IDs take precedence over a
+            // stale display-name scan when resuming an existing owner.
+            let config_dir = self
+                .project_dir()
+                .join(".exo/agents")
+                .join(agent_name.as_str());
+            let tab_alive = match self.routing_liveness(&config_dir).await {
+                Some(alive) => alive,
+                None => self.is_tmux_window_alive(&display_name).await,
+            };
             if tab_alive {
+                if options.expected_agent_name.is_some() {
+                    self.refresh_agent_activity(&agent_name).await?;
+                }
                 info!(slug = %identity.slug(), "Leaf subtree already running, returning existing");
                 return Ok(SpawnResult {
                     agent_dir: worktree_path,

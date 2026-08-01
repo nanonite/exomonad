@@ -11,6 +11,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
+use crate::domain::RoutingInfo;
+
 /// Per-target injection locks. Uses Weak references so entries are automatically
 /// reclaimable when no inject_input call holds the Arc.
 ///
@@ -762,6 +764,20 @@ impl TmuxIpc {
             .context("Failed to run tmux display-message")?;
         Ok(status.success())
     }
+}
+
+/// Verify the live tmux target recorded for an agent.
+///
+/// Stable routing IDs are authoritative when present; display-name scans are
+/// only a fallback for legacy entries that have no routing record.
+pub async fn routing_target_alive(routing: &RoutingInfo, tmux: &TmuxIpc) -> Result<bool> {
+    if let Some(window_id) = &routing.window_id {
+        return tmux.window_exists(window_id).await;
+    }
+    if let Some(pane_id) = &routing.pane_id {
+        return tmux.pane_exists(pane_id).await;
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

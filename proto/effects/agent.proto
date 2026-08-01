@@ -62,6 +62,9 @@ message AgentInfo {
   int64 last_check_inbox_at = 16;
   // Alias for alive used by agent-list tools.
   bool is_alive = 17;
+  // Unix timestamp for lifecycle activity or PR-resume refresh.
+  // This is distinct from last_check_inbox_at, which only records check_inbox.
+  int64 last_activity_at = 18;
 }
 
 // ============================================================================

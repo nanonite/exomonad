@@ -577,13 +577,9 @@ async fn routing_alive(routing: Option<&RoutingInfo>, tmux: Option<&TmuxIpc>) ->
     let Some(routing) = routing else {
         return false;
     };
-    if let Some(window_id) = &routing.window_id {
-        return tmux.window_exists(window_id).await.unwrap_or(false);
-    }
-    if let Some(pane_id) = &routing.pane_id {
-        return tmux.pane_exists(pane_id).await.unwrap_or(false);
-    }
-    false
+    crate::services::tmux_ipc::routing_target_alive(routing, tmux)
+        .await
+        .unwrap_or(false)
 }
 
 async fn read_identity(agent_dir: &Path) -> Option<AgentIdentityRecord> {

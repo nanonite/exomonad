@@ -41,6 +41,7 @@ pub(crate) use std::sync::Arc;
 
 pub(crate) const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const TMUX_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const LAST_ACTIVITY_FILE: &str = "last_activity_at";
 
 /// Push the parent branch to the remote so child PRs can reference it as
 /// their base. Non-fatal: warns on failure (supports local/airgapped setups
@@ -624,6 +625,10 @@ pub struct AgentInfo {
     /// Associated PR if one exists
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr: Option<AgentPrInfo>,
+    /// Unix timestamp for the last lifecycle activity or resume refresh.
+    /// This is distinct from the inbox check timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<u64>,
 }
 
 impl FFIBoundary for AgentInfo {}
@@ -984,6 +989,11 @@ impl<
             .unwrap_or_default()
             .as_secs();
         let _ = fs::write(agent_config_dir.join("spawned_at"), now_secs.to_string()).await;
+        let _ = fs::write(
+            agent_config_dir.join(LAST_ACTIVITY_FILE),
+            now_secs.to_string(),
+        )
+        .await;
 
         if let Some(issue_id) = issue_id_from_agent_name(agent_name.as_str()) {
             let _ = fs::write(agent_config_dir.join("active_issue"), issue_id.to_string()).await;
@@ -996,6 +1006,34 @@ impl<
         }
 
         Ok(agent_config_dir)
+    }
+
+    /// Refresh lifecycle activity for an already-live agent.
+    ///
+    /// This updates only the activity marker. Routing and identity files are
+    /// intentionally left untouched so a resume cannot change message
+    /// delivery or ownership.
+    pub async fn refresh_agent_activity(&self, agent_name: &AgentName) -> Result<u64> {
+        let agent_config_dir = self
+            .project_dir()
+            .join(".exo/agents")
+            .join(agent_name.as_str());
+        if !agent_config_dir.is_dir() {
+            return Err(anyhow!(
+                "cannot refresh activity for {}: agent registry directory is missing",
+                agent_name
+            ));
+        }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        fs::write(
+            agent_config_dir.join(LAST_ACTIVITY_FILE),
+            now_secs.to_string(),
+        )
+        .await?;
+        Ok(now_secs)
     }
 
     /// Initialize a standalone git repo at the given path.
@@ -1403,6 +1441,64 @@ mod tests {
                 .await
                 .unwrap(),
             "65"
+        );
+        assert!(agent_dir.join(LAST_ACTIVITY_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_activity_preserves_routing_and_identity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.clone(),
+        ));
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.git_wt = git_wt;
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let service = AgentControlService::new(Arc::new(services));
+
+        let agent_name = AgentName::try_from_str("resume-owner-codex").unwrap();
+        let agent_dir = project_dir.join(".exo/agents").join(agent_name.as_str());
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        RoutingInfo::window(tmux_ipc::WindowId::parse("@42").unwrap())
+            .write_to_dir(&agent_dir)
+            .await
+            .unwrap();
+        tokio::fs::write(agent_dir.join("identity.json"), "valid identity")
+            .await
+            .unwrap();
+        tokio::fs::write(agent_dir.join(LAST_ACTIVITY_FILE), "1")
+            .await
+            .unwrap();
+        let routing_before = tokio::fs::read_to_string(agent_dir.join("routing.json"))
+            .await
+            .unwrap();
+        let identity_before = tokio::fs::read_to_string(agent_dir.join("identity.json"))
+            .await
+            .unwrap();
+
+        let refreshed_at = service.refresh_agent_activity(&agent_name).await.unwrap();
+        let marker = tokio::fs::read_to_string(agent_dir.join(LAST_ACTIVITY_FILE))
+            .await
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+
+        assert_eq!(marker, refreshed_at);
+        assert!(marker > 1);
+        assert_eq!(
+            tokio::fs::read_to_string(agent_dir.join("routing.json"))
+                .await
+                .unwrap(),
+            routing_before
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(agent_dir.join("identity.json"))
+                .await
+                .unwrap(),
+            identity_before
         );
     }
 

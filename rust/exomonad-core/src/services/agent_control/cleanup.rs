@@ -9,6 +9,54 @@ impl<
             + 'static,
     > AgentControlService<C>
 {
+    pub(crate) async fn routing_liveness(&self, agent_dir: &Path) -> Option<bool> {
+        if !agent_dir.is_dir() {
+            return None;
+        }
+        if agent_dir.join("exited_at").exists() {
+            return Some(false);
+        }
+        let routing = match RoutingInfo::read_from_dir(agent_dir).await {
+            Ok(routing) => routing,
+            Err(error) if !agent_dir.join("routing.json").exists() => {
+                warn!(path = %agent_dir.display(), error = %error, "Agent routing is missing for liveness");
+                return Some(false);
+            }
+            Err(error) => {
+                warn!(path = %agent_dir.display(), error = %error, "Could not read agent routing for liveness");
+                return Some(false);
+            }
+        };
+        if !routing.has_delivery_target() {
+            warn!(path = %agent_dir.display(), "Agent routing has no live target");
+            return Some(false);
+        }
+        let tmux = match self.tmux() {
+            Ok(tmux) => tmux,
+            Err(error) => {
+                warn!(path = %agent_dir.display(), error = %error, "Could not create tmux client for agent liveness");
+                return Some(false);
+            }
+        };
+        Some(
+            crate::services::tmux_ipc::routing_target_alive(&routing, &tmux)
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(path = %agent_dir.display(), error = %error, "Routing liveness check failed");
+                    false
+                }),
+        )
+    }
+
+    async fn activity_marker(&self, agent_dir: &Path) -> Option<u64> {
+        tokio::fs::read_to_string(agent_dir.join(LAST_ACTIVITY_FILE))
+            .await
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     /// Clean up an agent by identifier (internal_name or issue_id).
     ///
     /// Kills the tmux window, unregisters from Teams config.json,
@@ -301,7 +349,13 @@ impl<
                         let slug_str = name.strip_suffix(&suffix).unwrap_or(name);
                         let display_name = format!("{} {}", agent_type.emoji(), slug_str);
 
-                        let has_tab = windows.iter().any(|t| t == &display_name);
+                        let config_dir = self.project_dir().join(".exo/agents").join(name);
+                        let display_alive = windows.iter().any(|t| t == &display_name);
+                        let has_tab = self
+                            .routing_liveness(&config_dir)
+                            .await
+                            .unwrap_or(display_alive);
+                        let last_activity_at = self.activity_marker(&config_dir).await;
 
                         agents.push(AgentInfo {
                             internal_name: AgentName::try_from_str(name)
@@ -315,6 +369,7 @@ impl<
                             ),
                             agent_type: Some(agent_type),
                             pr: None,
+                            last_activity_at,
                         });
 
                         // 2. Scan subtree's .exo/agents for workers
@@ -368,7 +423,9 @@ impl<
 
                     // Liveness: for workers, they might be panes in a window.
                     // Currently list_agents only sees windows.
-                    let has_tab = windows.iter().any(|t| t == &display_name);
+                    let display_alive = windows.iter().any(|t| t == &display_name);
+                    let has_tab = self.routing_liveness(&path).await.unwrap_or(display_alive);
+                    let last_activity_at = self.activity_marker(&path).await;
 
                     agents.push(AgentInfo {
                         internal_name: AgentName::try_from_str(name)
@@ -382,6 +439,7 @@ impl<
                         ),
                         agent_type: Some(AgentType::Gemini),
                         pr: None,
+                        last_activity_at,
                     });
                 }
             }

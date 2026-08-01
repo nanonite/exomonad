@@ -1581,6 +1581,7 @@ impl<
                 .last_check_inbox_at(agent_key)
                 .effect_err("agent")?
                 .unwrap_or_default();
+            let last_activity_at = info.last_activity_at.unwrap_or_default();
 
             agents.push(service_info_to_proto(
                 info,
@@ -1588,6 +1589,7 @@ impl<
                     birth_branch,
                     has_unread,
                     last_check_inbox_at,
+                    last_activity_at,
                     is_alive,
                 },
             ));
@@ -3027,19 +3029,9 @@ async fn orphan_agent_window_alive(project_dir: &Path, agent_slug: &str) -> Resu
         return Err("EXOMONAD_TMUX_SESSION is empty".to_string());
     }
     let tmux = crate::services::tmux_ipc::TmuxIpc::new(&session);
-    if let Some(window_id) = &routing.window_id {
-        return tmux
-            .window_exists(window_id)
-            .await
-            .map_err(|error| error.to_string());
-    }
-    if let Some(pane_id) = &routing.pane_id {
-        return tmux
-            .pane_exists(pane_id)
-            .await
-            .map_err(|error| error.to_string());
-    }
-    Ok(false)
+    crate::services::tmux_ipc::routing_target_alive(&routing, &tmux)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn close_issue_cleanup_error(message: &str) -> CloseIssueAndCleanupResponse {
@@ -3254,6 +3246,7 @@ struct AgentListMetadata {
     birth_branch: String,
     has_unread: bool,
     last_check_inbox_at: i64,
+    last_activity_at: u64,
     is_alive: bool,
 }
 
@@ -3293,7 +3286,7 @@ fn service_info_to_proto(
         has_unread: metadata.has_unread,
         last_check_inbox_at: metadata.last_check_inbox_at,
         is_alive: metadata.is_alive,
-        ..Default::default()
+        last_activity_at: metadata.last_activity_at as i64,
     }
 }
 
@@ -3440,6 +3433,35 @@ mod tests {
             convert_agent_type_or_default(AgentType::Claude, ServiceAgentType::OpenCode),
             ServiceAgentType::Claude
         );
+    }
+
+    #[test]
+    fn list_metadata_reports_live_resume_activity_separately_from_inbox_check() {
+        let internal_name = AgentName::try_from_str("resume-owner-codex").unwrap();
+        let info = AgentInfo {
+            internal_name,
+            has_tab: true,
+            topology: Topology::WorktreePerAgent,
+            agent_dir: None,
+            slug: None,
+            agent_type: Some(ServiceAgentType::Codex),
+            pr: None,
+            last_activity_at: Some(1_700_000_000),
+        };
+        let proto = service_info_to_proto(
+            &info,
+            AgentListMetadata {
+                birth_branch: "main.resume-owner-codex".to_string(),
+                has_unread: false,
+                last_check_inbox_at: 0,
+                last_activity_at: 1_700_000_000,
+                is_alive: agent_is_alive(&info),
+            },
+        );
+
+        assert!(proto.is_alive);
+        assert_eq!(proto.last_check_inbox_at, 0);
+        assert_eq!(proto.last_activity_at, 1_700_000_000);
     }
 
     #[tokio::test]

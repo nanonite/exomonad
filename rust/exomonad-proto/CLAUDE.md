@@ -94,7 +94,7 @@ Claude Code hooks:
 
 Agent management:
 - `AgentType` - Claude/Gemini/Shoal
-- `AgentInfo` - Agent metadata with `alive` bool (tmux liveness)
+- `AgentInfo` - Agent metadata with `alive` bool (tmux liveness), explicit `last_check_inbox_at`, and separate lifecycle `last_activity_at`
 - Spawn/Cleanup/List request/response types
 
 ## Usage

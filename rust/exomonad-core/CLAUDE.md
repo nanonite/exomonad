@@ -125,6 +125,13 @@ This asymmetry is intentional — only the `notify_parent` relationship has a we
 
 `check_inbox` resolves a bare agent key through the `AgentResolver` slug table before exact-name fallback. This lets a root context whose runtime identity is `root` drain mail stored under the canonical suffixed agent name such as `root-claude`, preventing unread poke loops.
 
+## Agent Resume and Liveness Contract
+
+- A successful resume of an already-live PR owner refreshes `.exo/agents/{agent}/last_activity_at` without rewriting `routing.json` or identity metadata.
+- `last_activity_at` is lifecycle/resume metadata and must not be reported as `last_check_inbox_at`; the latter is reserved for an explicit `check_inbox` drain.
+- Timeout reconciliation uses the newest activity marker before considering historical `spawned_at` age, then re-verifies the stable routing window/pane ID through tmux before any kill. Missing or unverifiable routing is handled conservatively.
+- Agent listing treats a valid routing target as the liveness source of truth, using display-name scans only for legacy entries without routing metadata.
+
 ## Forgejo Watcher and GitHub Poller State Machines
 
 `worktree_event_watcher.rs` is the active Forgejo-backed PR/review/CI watcher. It rebuilds PR registry state from Forgejo each cycle and persists only watcher bookkeeping such as review rounds and stuck flags. `github_poller.rs` is currently hibernated: it has zero active call sites. Keep its review-loop semantics in parity with `worktree_event_watcher` so future GitHub Actions integration can re-enable it as a thin transport shim.
