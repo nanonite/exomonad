@@ -1,4 +1,7 @@
-use crate::domain::{Address, AgentName, BirthBranch, Slug};
+use crate::domain::{Address, AgentName, BirthBranch, RoutingInfo, Slug};
+use crate::services::agent_control::{
+    finish_invocation_and_tombstone, InvocationFinishResult, InvocationStatus,
+};
 use crate::services::agent_inbox::{InboxMessage, GLOBAL_AGENT_INBOX};
 use crate::services::tmux_events;
 use claude_teams_bridge as teams_mailbox;
@@ -49,21 +52,39 @@ fn worker_gone_detail(agent_key: &str, target: &str) -> String {
     format!("[WORKER GONE: {agent_key}] routing target {target} is not alive")
 }
 
-async fn mark_agent_exited(agent_dir: &std::path::Path) {
-    let exited_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-        .to_string();
-    if let Err(error) = tokio::fs::write(agent_dir.join("exited_at"), exited_at).await {
-        warn!(path = %agent_dir.display(), %error, "failed to write agent exited_at tombstone");
+async fn mark_agent_exited(agent_dir: &std::path::Path, expected_target: &str) {
+    let Ok(routing) = RoutingInfo::read_from_dir(agent_dir).await else {
+        warn!(
+            path = %agent_dir.display(),
+            "preserving agent routing because exit reconciliation could not parse routing"
+        );
+        return;
+    };
+    if routing
+        .pane_id
+        .as_ref()
+        .is_none_or(|pane_id| pane_id.as_str() != expected_target)
+    {
+        warn!(
+            path = %agent_dir.display(),
+            expected_target,
+            "ignoring stale exit for a replaced routing target"
+        );
+        return;
     }
-    match tokio::fs::remove_file(agent_dir.join("routing.json")).await {
-        Ok(()) => info!(path = %agent_dir.display(), "removed stale agent routing"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            warn!(path = %agent_dir.display(), %error, "failed to remove stale agent routing")
+    match finish_invocation_and_tombstone(agent_dir, &routing, InvocationStatus::Exited, None).await
+    {
+        Ok(InvocationFinishResult::IgnoredStale) => {
+            info!(path = %agent_dir.display(), "ignored stale agent exit")
         }
+        Ok(InvocationFinishResult::Finished(_)) | Ok(InvocationFinishResult::Missing) => {
+            info!(path = %agent_dir.display(), "removed stale agent routing")
+        }
+        Err(error) => warn!(
+            path = %agent_dir.display(),
+            %error,
+            "failed to finish invocation; preserving stale agent routing"
+        ),
     }
 }
 
@@ -127,7 +148,7 @@ async fn routing_target_alive_or_cleanup(
         Ok(true) => true,
         Ok(false) => {
             let agent_dir = project_dir.join(".exo/agents").join(agent_dir_name);
-            mark_agent_exited(&agent_dir).await;
+            mark_agent_exited(&agent_dir, target).await;
             let detail = worker_gone_detail(agent_key, target);
             tracing::info!(
                 otel.name = "message.delivery",

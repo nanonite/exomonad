@@ -16,21 +16,44 @@ impl<
         if agent_dir.join("exited_at").exists() {
             return Some(false);
         }
-        let routing = match RoutingInfo::read_from_dir(agent_dir).await {
-            Ok(routing) => routing,
-            Err(error) if !agent_dir.join("routing.json").exists() => {
-                warn!(path = %agent_dir.display(), error = %error, "Agent routing is missing for liveness");
+        let invocation_routing = match invocation::read_invocation(agent_dir).await {
+            Ok(Some(invocation)) if invocation.is_live() => Some(invocation.routing),
+            Ok(Some(_)) => return Some(false),
+            Ok(None) => None,
+            Err(error) => {
+                warn!(
+                    path = %agent_dir.display(),
+                    %error,
+                    "Could not read invocation metadata for liveness"
+                );
                 return Some(false);
             }
+        };
+        let routing = match RoutingInfo::read_from_dir(agent_dir).await {
+            Ok(routing) => routing,
             Err(error) => {
-                warn!(path = %agent_dir.display(), error = %error, "Could not read agent routing for liveness");
-                return Some(false);
+                if let Some(invocation_routing) = invocation_routing.clone() {
+                    warn!(
+                        path = %agent_dir.display(),
+                        %error,
+                        "Using routing captured by current invocation metadata"
+                    );
+                    invocation_routing
+                } else {
+                    warn!(
+                        path = %agent_dir.display(),
+                        %error,
+                        "Could not read agent routing for liveness"
+                    );
+                    return Some(false);
+                }
             }
         };
         if !routing.has_delivery_target() {
             warn!(path = %agent_dir.display(), "Agent routing has no live target");
             return Some(false);
         }
+        let routing = invocation_routing.as_ref().unwrap_or(&routing);
         let tmux = match self.tmux() {
             Ok(tmux) => tmux,
             Err(error) => {
@@ -39,7 +62,7 @@ impl<
             }
         };
         Some(
-            crate::services::tmux_ipc::routing_target_alive(&routing, &tmux)
+            crate::services::tmux_ipc::routing_target_alive(routing, &tmux)
                 .await
                 .unwrap_or_else(|error| {
                     warn!(path = %agent_dir.display(), error = %error, "Routing liveness check failed");

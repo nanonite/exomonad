@@ -13,9 +13,10 @@ use crate::effects::{
 
 use super::non_empty;
 use crate::services::agent_control::{
-    slugify, AgentControlService, AgentIdentity, AgentInfo, AgentType as ServiceAgentType,
-    ClaudeSpawnFlags, SpawnGeminiTeammateOptions, SpawnLeafOptions, SpawnOptions,
-    SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
+    finish_invocation_and_tombstone, slugify, AgentControlService, AgentIdentity, AgentInfo,
+    AgentType as ServiceAgentType, ClaudeSpawnFlags, InvocationFinishResult, InvocationStatus,
+    SpawnGeminiTeammateOptions, SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions,
+    SpawnWorkerOptions, Topology,
 };
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
@@ -784,6 +785,8 @@ impl<
             allowed_dirs: req.allowed_dirs,
             model: None,
             effort: None,
+            invocation_pr_number: None,
+            invocation_head_sha: None,
         };
 
         let result = self
@@ -1175,6 +1178,7 @@ impl<
             start_point: Some(source_head_sha.clone()),
             base_branch: Some(original_base_branch.clone()),
             expected_agent_name: None,
+            invocation_pr_number: None,
         };
         info!(
             chainlink_issue_id = issue_id,
@@ -1368,6 +1372,7 @@ impl<
             start_point: None,
             base_branch: None,
             expected_agent_name: None,
+            invocation_pr_number: None,
         };
 
         let result = self
@@ -1636,7 +1641,23 @@ impl<
             let agent_dir = agents_dir.join(&resolved_internal_name);
             // Tombstone before killing the tmux target so future TL messages cannot route
             // through a stale routing.json if the pane/window disappears immediately.
-            tombstone_agent_dir(&agent_dir).await;
+            // The exact routing guard prevents an old close from killing a resumed
+            // invocation that replaced this target.
+            let Some(expected_routing) = serde_json::from_value::<RoutingInfo>(r.clone()).ok()
+            else {
+                warn!(agent = %ctx.agent_name, "Refusing to close agent with malformed routing metadata");
+                return Ok(CloseSelfResponse {
+                    success: false,
+                    error: "malformed routing metadata".to_string(),
+                });
+            };
+            if !tombstone_agent_dir_with_routing(&agent_dir, &expected_routing).await {
+                warn!(agent = %ctx.agent_name, "Refusing to close stale agent routing target");
+                return Ok(CloseSelfResponse {
+                    success: false,
+                    error: "agent routing changed before close".to_string(),
+                });
+            }
 
             // Try pane_id first (ephemeral workers)
             if let Some(pane_id) = r["pane_id"].as_str() {
@@ -2296,6 +2317,7 @@ impl<
             start_point: Some(head_sha.to_string()),
             base_branch: Some(pr.base_ref.to_string()),
             expected_agent_name: Some(owner.agent_name.clone()),
+            invocation_pr_number: Some(req.resume_pr_number),
         };
         let result = self
             .service
@@ -2973,15 +2995,28 @@ fn reviewer_window_matches_pr(window_name: &str, pr_number: u64) -> bool {
 }
 
 async fn tombstone_agent_dir(agent_dir: &Path) {
-    let exited_at = Utc::now().timestamp().max(0).to_string();
-    if let Err(error) = tokio::fs::write(agent_dir.join("exited_at"), exited_at).await {
-        warn!(path = %agent_dir.display(), %error, "failed to write agent exited_at tombstone");
-    }
-    match tokio::fs::remove_file(agent_dir.join("routing.json")).await {
-        Ok(()) => info!(path = %agent_dir.display(), "removed agent routing after exit"),
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
+    let Ok(routing) = RoutingInfo::read_from_dir(agent_dir).await else {
+        warn!(path = %agent_dir.display(), "refusing to tombstone agent without valid routing");
+        return;
+    };
+    let _ = tombstone_agent_dir_with_routing(agent_dir, &routing).await;
+}
+
+async fn tombstone_agent_dir_with_routing(agent_dir: &Path, routing: &RoutingInfo) -> bool {
+    match finish_invocation_and_tombstone(agent_dir, routing, InvocationStatus::Killed, None).await
+    {
+        Ok(InvocationFinishResult::IgnoredStale) => false,
+        Ok(InvocationFinishResult::Finished(_)) | Ok(InvocationFinishResult::Missing) => {
+            info!(path = %agent_dir.display(), "removed agent routing after exit");
+            true
+        }
         Err(error) => {
-            warn!(path = %agent_dir.display(), %error, "failed to remove agent routing after exit")
+            warn!(
+                path = %agent_dir.display(),
+                %error,
+                "failed to finish invocation; preserving agent routing"
+            );
+            false
         }
     }
 }
@@ -3008,8 +3043,7 @@ async fn tombstone_agent_by_pane(project_dir: &Path, pane_id: &str) -> bool {
             .as_ref()
             .is_some_and(|candidate| candidate.as_str() == pane_id)
         {
-            tombstone_agent_dir(&agent_dir).await;
-            return true;
+            return tombstone_agent_dir_with_routing(&agent_dir, &routing).await;
         }
     }
     false

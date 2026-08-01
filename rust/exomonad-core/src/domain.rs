@@ -833,7 +833,7 @@ pub struct AgentPermissions {
 ///
 /// `window_id` and `pane_id` use validated tmux types (`WindowId`/@N, `PaneId`/%N).
 /// `parent_tab` is a display name string (not a validated ID).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoutingInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_id: Option<crate::services::tmux_ipc::WindowId>,

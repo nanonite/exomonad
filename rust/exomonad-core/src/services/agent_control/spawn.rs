@@ -1614,7 +1614,26 @@ impl<
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,
             };
-            self.finalize_spawn(&agent_name, routing, Some(identity_record))
+            let trigger = if options
+                .role
+                .as_ref()
+                .is_some_and(|role| role.as_str() == "reviewer")
+            {
+                InvocationTrigger::Review
+            } else {
+                InvocationTrigger::Spawn
+            };
+            self.finalize_spawn_with_invocation(
+                &agent_name,
+                routing,
+                Some(identity_record),
+                InvocationMetadata {
+                    runtime: agent_type,
+                    trigger,
+                    pr_number: options.invocation_pr_number,
+                    head_sha: options.invocation_head_sha.clone(),
+                },
+            )
                 .await?;
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
@@ -1984,7 +2003,22 @@ impl<
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,
             };
-            self.finalize_spawn(&agent_name, routing, Some(identity_record))
+            let trigger = if options.expected_agent_name.is_some() {
+                InvocationTrigger::ResumePr
+            } else {
+                InvocationTrigger::Spawn
+            };
+            self.finalize_spawn_with_invocation(
+                &agent_name,
+                routing,
+                Some(identity_record),
+                InvocationMetadata {
+                    runtime: agent_type,
+                    trigger,
+                    pr_number: options.invocation_pr_number,
+                    head_sha: options.start_point.clone(),
+                },
+            )
                 .await?;
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
@@ -2086,6 +2120,8 @@ impl<
             allowed_dirs: vec![],
             model: self.reviewer_model.clone(),
             effort: self.reviewer_effort().map(str::to_string),
+            invocation_pr_number: Some(pr_entry.number),
+            invocation_head_sha: pr_entry.last_head_sha.clone(),
         };
 
         let result = self.spawn_subtree(&options, caller_bb).await?;

@@ -132,6 +132,37 @@ This asymmetry is intentional — only the `notify_parent` relationship has a we
 - Timeout reconciliation uses the newest activity marker before considering historical `spawned_at` age, then re-verifies the stable routing window/pane ID through tmux before any kill. Missing or unverifiable routing is handled conservatively.
 - Agent listing treats a valid routing target as the liveness source of truth, using display-name scans only for legacy entries without routing metadata.
 
+### Ownership versus invocation
+
+The canonical owner remains one Chainlink issue → one agent identity → one
+worktree → one branch/PR. A process attempt is metadata inside that existing
+identity, not a second workflow owner and not a stacked-PR abstraction.
+
+.exo/agents/{agent}/invocation.json stores exactly the current generation:
+
+    {
+      "invocation_id": "uuid",
+      "runtime": "codex",
+      "trigger": "spawn",
+      "routing": {"window_id": "@42"},
+      "started_at": 1730000000,
+      "ended_at": null,
+      "status": "running",
+      "exit_code": null,
+      "pr_number": 580,
+      "head_sha": "abc123"
+    }
+
+runtime, trigger, routing, started_at, and status are required. ended_at,
+exit_code, pr_number, and head_sha are optional. Starting resume_pr or a
+SHA-scoped reviewer replaces only this record and records the exact current
+tmux window/pane. Finishing must supply the invocation ID (or matching
+routing) and cannot change a newer record. Missing or malformed records are
+legacy metadata: status and cleanup paths log the condition and avoid
+destructive reconciliation. A finished invocation is dormant ownership; an
+open PR, review, or CI work unit remains pending and does not dispose the
+issue-owned worktree.
+
 ## Forgejo Watcher and GitHub Poller State Machines
 
 `worktree_event_watcher.rs` is the active Forgejo-backed PR/review/CI watcher. It rebuilds PR registry state from Forgejo each cycle and persists only watcher bookkeeping such as review rounds and stuck flags. `github_poller.rs` is currently hibernated: it has zero active call sites. Keep its review-loop semantics in parity with `worktree_event_watcher` so future GitHub Actions integration can re-enable it as a thin transport shim.

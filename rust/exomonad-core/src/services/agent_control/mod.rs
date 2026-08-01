@@ -7,8 +7,14 @@
 
 mod cleanup;
 mod internal;
+pub mod invocation;
 mod spawn;
 
+pub use invocation::{
+    finish_invocation, finish_invocation_and_tombstone, read_invocation,
+    read_invocation_conservatively, start_invocation, InvocationFinishResult, InvocationMetadata,
+    InvocationRecord, InvocationStatus, InvocationTrigger, INVOCATION_FILENAME,
+};
 pub use spawn::{
     CODEX_DEV_INSTRUCTIONS, CODEX_REVIEWER_INSTRUCTIONS, CODEX_TL_RUNTIME_NOTES,
     CODEX_WORKER_INSTRUCTIONS, OPENCODE_DEV_INSTRUCTIONS, OPENCODE_WORKER_INSTRUCTIONS,
@@ -512,6 +518,12 @@ pub struct SpawnSubtreeOptions {
     /// Effort override for this spawn. None = use the role service default.
     #[serde(default)]
     pub effort: Option<String>,
+    /// PR context for reviewer invocation metadata.
+    #[serde(default)]
+    pub invocation_pr_number: Option<u64>,
+    /// Exact reviewed head SHA for invocation metadata.
+    #[serde(default)]
+    pub invocation_head_sha: Option<String>,
 }
 
 /// Options for spawning a Gemini leaf subtree agent.
@@ -542,6 +554,9 @@ pub struct SpawnLeafOptions {
     /// When set, no directory scan or alternate runtime may replace it.
     #[serde(default)]
     pub expected_agent_name: Option<AgentName>,
+    /// PR number when this starts a resume_pr invocation.
+    #[serde(default)]
+    pub invocation_pr_number: Option<u64>,
 }
 
 /// Result of spawning an agent.
@@ -971,6 +986,31 @@ impl<
         routing: RoutingInfo,
         identity: Option<AgentIdentityRecord>,
     ) -> Result<PathBuf> {
+        let runtime = identity
+            .as_ref()
+            .map(|record| record.agent_type)
+            .unwrap_or_else(|| AgentType::from_dir_name(agent_name.as_str()));
+        self.finalize_spawn_with_invocation(
+            agent_name,
+            routing,
+            identity,
+            InvocationMetadata {
+                runtime,
+                trigger: InvocationTrigger::Spawn,
+                pr_number: None,
+                head_sha: None,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn finalize_spawn_with_invocation(
+        &self,
+        agent_name: &AgentName,
+        routing: RoutingInfo,
+        identity: Option<AgentIdentityRecord>,
+        metadata: InvocationMetadata,
+    ) -> Result<PathBuf> {
         let agent_config_dir = self
             .project_dir()
             .join(".exo/agents")
@@ -983,6 +1023,24 @@ impl<
             ));
         }
         routing.write_to_dir(&agent_config_dir).await?;
+        invocation::start_invocation(
+            &agent_config_dir,
+            metadata.runtime,
+            metadata.trigger,
+            routing,
+            metadata.pr_number,
+            metadata.head_sha,
+        )
+        .await?;
+        if let Err(error) = fs::remove_file(agent_config_dir.join("exited_at")).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    agent = %agent_name,
+                    %error,
+                    "Failed to clear previous invocation tombstone"
+                );
+            }
+        }
 
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -5,6 +5,7 @@
 
 use crate::domain::{CIStatus, ClaudeSessionUuid, RoutingInfo};
 use crate::effects::{dispatch_session_effect, EffectResult, ResultExt, SessionEffects};
+use crate::services::agent_control::invocation::read_invocation;
 use crate::services::agent_resolver::AgentIdentityRecord;
 use crate::services::forgejo::{ForgejoClient, ForgejoPullRequestReview};
 use crate::services::pr_registry::ForgejoReviewState;
@@ -401,7 +402,21 @@ async fn agent_status_from_dir(
         .and_then(|routing| routing.pane_id.as_ref())
         .map(ToString::to_string)
         .unwrap_or_default();
-    let window_alive = routing_alive(routing.as_ref(), tmux).await;
+    let window_alive = match read_invocation(agent_dir).await {
+        Ok(Some(invocation)) if invocation.is_live() => {
+            routing_alive(Some(&invocation.routing), tmux).await
+        }
+        Ok(Some(_)) => false,
+        Ok(None) => routing_alive(routing.as_ref(), tmux).await,
+        Err(error) => {
+            warn!(
+                path = %agent_dir.display(),
+                %error,
+                "Treating agent with malformed invocation metadata as dormant"
+            );
+            false
+        }
+    };
     let role = infer_role(name, routing.as_ref(), &birth_branch);
     let lifecycle_status =
         derive_lifecycle_status(window_alive, &issue, worktree_present, work_unit);
@@ -630,6 +645,10 @@ mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch};
     use crate::effects::{EffectContext, EffectHandler};
+    use crate::services::agent_control::{
+        finish_invocation, start_invocation, InvocationStatus, InvocationTrigger,
+    };
+    use crate::services::tmux_ipc::WindowId;
     use crate::services::Services;
 
     fn test_ctx() -> EffectContext {
@@ -718,6 +737,52 @@ mod tests {
 
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "feature-codex");
+        assert!(!agents[0].window_alive);
+        assert_eq!(agents[0].lifecycle_status, "WAITING-ON-CI");
+    }
+
+    #[tokio::test]
+    async fn finished_invocation_keeps_open_pr_work_pending() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree_dir = temp_dir.path().join(".exo/worktrees/feature-codex");
+        let agent_dir = temp_dir.path().join(".exo/agents/feature-codex");
+        tokio::fs::create_dir_all(&worktree_dir).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let routing = RoutingInfo::window(WindowId::parse("@42").unwrap());
+        routing.write_to_dir(&agent_dir).await.unwrap();
+        let invocation = start_invocation(
+            &agent_dir,
+            crate::services::AgentType::Codex,
+            InvocationTrigger::Spawn,
+            routing,
+            Some(580),
+            Some("abc123".to_string()),
+        )
+        .await
+        .unwrap();
+        finish_invocation(
+            &agent_dir,
+            &invocation.invocation_id,
+            InvocationStatus::Exited,
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+        let mut work_units = HashMap::new();
+        work_units.insert(
+            "feature-codex".to_string(),
+            SessionWorkUnit {
+                review_state: ForgejoReviewState::Approved,
+                ci_status: CIStatus::Pending,
+                reviewer_worktree_present: true,
+            },
+        );
+        let agents = list_agent_statuses(temp_dir.path(), None, false, &work_units)
+            .await
+            .unwrap();
+
+        assert_eq!(agents.len(), 1);
         assert!(!agents[0].window_alive);
         assert_eq!(agents[0].lifecycle_status, "WAITING-ON-CI");
     }
