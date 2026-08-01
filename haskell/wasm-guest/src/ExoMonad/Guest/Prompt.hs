@@ -155,7 +155,7 @@ leafProfile =
             "1. **Commit your changes** with a descriptive message.",
             "   - `git add <specific files>` \x2014 NEVER `git add .` or `git add -A`",
             "   - `git commit -m \"feat: <description>\"`",
-            "2. **File a PR** using `file_pr` tool. The base branch is auto-detected from your branch name.",
+            "2. **File a PR** using `file_pr` tool. The body must contain the literal `## Acceptance Criteria` heading with every issue Definition-of-Done bullet copied verbatim beneath it; preserve or update that heading on resumed work. The base branch is auto-detected from your branch name.",
             "3. **Review and CI are automatic.** After you file a PR, stay alive. The watcher routes reviewer comments, CI status, and merge-ready back into this pane.",
             "4. **Use `notify_parent` to send status updates** \x2014 e.g., \"PR filed, awaiting review\" or \"hit a blocker, need guidance.\" Call with `failure` status to escalate problems. Never use `send_message` with recipient `parent`; `parent` is a reserved alias resolved only by `notify_parent`.",
             "5. **Stop only after merge-ready.** Merge-ready means reviewer approval plus passing/neutral CI; your parent TL merges after that.",

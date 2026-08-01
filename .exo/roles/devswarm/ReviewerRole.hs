@@ -6,7 +6,7 @@
 
 -- | Reviewer role: diff review only — no spawn, merge, or PR tools.
 --   Tool restrictions enforced at the WASM hook layer.
-module ReviewerRole (config, Tools, appendVerdict, emptyReviewFile, ReviewFile (..), ReviewVerdict (..)) where
+module ReviewerRole (config, Tools, appendVerdict, emptyReviewFile, ReviewFile (..), ReviewVerdict (..), reviewerAcceptanceCriteriaGuidance) where
 
 import Control.Monad (void)
 import Control.Monad.Freer (Eff)
@@ -43,6 +43,13 @@ reviewerRedispatchMessage toolName =
   "Reviewers do not edit code. The "
     <> toolName
     <> " tool is unavailable in reviewer sessions. Use `request_changes` or `post_review_comment` to relay the fix to the worker that owns the worktree. The worker's git identity is the canonical author of every commit on its branch."
+
+reviewerAcceptanceCriteriaGuidance :: Text
+reviewerAcceptanceCriteriaGuidance =
+  "Review contract: locate the literal `## Acceptance Criteria` heading in the PR body. Treat its bullets as authoritative. Check every bullet against the diff and tests. If the heading is missing or any bullet is unsatisfied, request changes. Do not invent or guess acceptance criteria when the heading is missing."
+
+reviewerReviewToolDescription :: Text -> Text
+reviewerReviewToolDescription description = description <> " " <> reviewerAcceptanceCriteriaGuidance
 
 reviewerVerdictExitNudge :: Text
 reviewerVerdictExitNudge =
@@ -261,7 +268,7 @@ data ReviewerApprovePR
 instance MCPTool ReviewerApprovePR where
   type ToolArgs ReviewerApprovePR = ApprovePRArgs
   toolName = "approve_pr"
-  toolDescription = "Approve a Forgejo PR by submitting an APPROVED review."
+  toolDescription = reviewerReviewToolDescription "Approve a Forgejo PR by submitting an APPROVED review."
   toolSchema =
     genericToolSchemaWith @ApprovePRArgs
       [ ("pr_number", "Local PR number to approve"),
@@ -284,7 +291,7 @@ data ReviewerRequestChanges
 instance MCPTool ReviewerRequestChanges where
   type ToolArgs ReviewerRequestChanges = RequestChangesArgs
   toolName = "request_changes"
-  toolDescription = "Request changes on a Forgejo PR by submitting a REQUEST_CHANGES review."
+  toolDescription = reviewerReviewToolDescription "Request changes on a Forgejo PR by submitting a REQUEST_CHANGES review."
   toolSchema =
     genericToolSchemaWith @RequestChangesArgs
       [ ("pr_number", "Local PR number to review"),
@@ -310,7 +317,7 @@ data ReviewerPostReviewComment
 instance MCPTool ReviewerPostReviewComment where
   type ToolArgs ReviewerPostReviewComment = PostReviewCommentArgs
   toolName = "post_review_comment"
-  toolDescription = "Post a comment-only Forgejo PR review without changing the approval decision."
+  toolDescription = reviewerReviewToolDescription "Post a comment-only Forgejo PR review without changing the approval decision."
   toolSchema =
     genericToolSchemaWith @PostReviewCommentArgs
       [ ("pr_number", "Local PR number to comment on"),

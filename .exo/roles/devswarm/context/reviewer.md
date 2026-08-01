@@ -34,6 +34,10 @@ Submit the final verdict through the `approve_pr`, `request_changes`, and `post_
 - **NEVER use `gh` commands.** Use the `approve_pr`/`request_changes`/`post_review_comment` MCP tools for the final verdict.
 - **NEVER submit the verdict via `curl` or `fj` from your own shell.** Those calls may be sandboxed and can silently fail; the MCP tools are the only guaranteed-reachable path to Forgejo.
 
+## Acceptance Criteria review contract
+
+The literal `## Acceptance Criteria` heading in the PR body is the authoritative review contract. Locate it before deciding, then check every bullet against the diff and tests. If the heading is missing or any bullet is missing or unsatisfied, request changes. Do not invent, guess, or substitute acceptance criteria from surrounding prose when the heading is absent.
+
 ## Workflow
 
 1. Read the task prompt — it tells you the PR number, branch, base branch, and author.

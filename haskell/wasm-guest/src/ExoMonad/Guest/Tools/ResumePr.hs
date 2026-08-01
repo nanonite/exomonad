@@ -59,7 +59,7 @@ instance FromJSON ResumePrArgs where
 
 resumePrDescription :: Text
 resumePrDescription =
-  "Resume an existing open, unmerged PR by number. The host re-fetches its head SHA and resolves the exact owning agent, branch, and runtime. Provide the task summary plus optional read_first, steps, verify, boundary, context, and done_criteria fields for a complete review-fix handoff. Never provide a leaf name or agent type. For closed or unrecoverable PRs, use the human-approved replace_close_pr workflow."
+  "Resume an existing open, unmerged PR by number. The host re-fetches its head SHA and resolves the exact owning agent, branch, and runtime. Provide the task summary plus optional read_first, steps, verify, boundary, context, and done_criteria fields for a complete review-fix handoff. On the resumed owner's next `file_pr` call, preserve or update the PR body with the literal heading `## Acceptance Criteria` and copy every issue Definition-of-Done bullet verbatim beneath it; use done_criteria as the handoff source and do not silently drop or paraphrase the heading. Never provide a leaf name or agent type. For closed or unrecoverable PRs, use the human-approved replace_close_pr workflow."
 
 resumePrSchema :: Aeson.Object
 resumePrSchema =
@@ -71,7 +71,7 @@ resumePrSchema =
       ("verify", "Exact commands the leaf must run before reporting completion"),
       ("boundary", "Constraints and anti-patterns for the repair"),
       ("context", "Reviewer analysis, root cause, proposed solution, and relevant snippets"),
-      ("done_criteria", "Acceptance criteria for the repair")
+      ("done_criteria", "Issue Definition-of-Done bullets for the repair; the resumed owner must copy them verbatim beneath the literal `## Acceptance Criteria` heading in the next file_pr body")
     ]
 
 resumePrCore :: ResumePrArgs -> Eff Effects (Either Text Aeson.Value)

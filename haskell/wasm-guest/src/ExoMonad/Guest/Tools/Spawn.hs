@@ -278,7 +278,7 @@ spawnLeafSubtreeSchema =
 -- Returns (actualSlug, spawnResult) on success.
 spawnLeafSubtreeCore :: SpawnLeafSubtreeArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
 spawnLeafSubtreeCore args = do
-  let renderedTask = slsTask args <> "\n\n" <> leafProfileText
+  let renderedTask = slsTask args <> "\n\n" <> leafProfileText <> "\n\n" <> leafAcceptanceCriteriaText
       standaloneRepo = fromMaybe False (slsStandaloneRepo args)
       perms =
         AC.PermissionFlags
@@ -654,6 +654,10 @@ renderSpec spec =
 -- | Pre-rendered leaf profile text.
 leafProfileText :: Text
 leafProfileText = "## Completion Protocol (Leaf Subtree)\nYou are a **leaf agent** in your own git worktree and branch. Your branch name follows the pattern `{parent}.{slug}`.\n\nWhen you are done:\n\n1. **Commit your changes** with a descriptive message.\n   - `git add <specific files>` \x2014 NEVER `git add .` or `git add -A`\n   - `git commit -m \"feat: <description>\"`\n2. **File a PR** using `file_pr` tool. The base branch is auto-detected from your branch name.\n3. **Review and CI are automatic.** After you file a PR, stay alive. The watcher routes reviewer comments, CI status, and merge-ready back into this pane.\n4. **Use `notify_parent` to send status updates** \x2014 e.g., \"PR filed, awaiting review\" or \"hit a blocker, need guidance.\" Call with `failure` status to escalate problems. Never use `send_message` with recipient `parent`; `parent` is a reserved alias resolved only by `notify_parent`.\n5. **Stop only after merge-ready.** Merge-ready means reviewer approval plus passing/neutral CI; your parent TL merges after that.\n\n**DO NOT:**\n- Merge your own PR (the parent TL merges)\n- Push to main or any branch other than your own\n- Create additional branches\n- Stop immediately after filing a PR"
+
+leafAcceptanceCriteriaText :: Text
+leafAcceptanceCriteriaText =
+  "## PR BODY CONTRACT\nBefore the next `file_pr` call, make the PR body contain the literal heading `## Acceptance Criteria`. Copy every issue Definition-of-Done bullet verbatim beneath it, and preserve or update that heading on resumed work."
 
 -- | Pre-rendered worker profile text.
 workerProfileText :: Text

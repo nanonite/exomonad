@@ -31,6 +31,10 @@ Write specs complete enough that children don't need to ask — but be ready whe
 If a task involves more than scaffolding, split or extend. Never implement alone.
 Never touch another agent's worktree. Never checkout another branch.
 
+## PR acceptance criteria handoff
+
+When filing or updating a PR, require its body to contain the literal `## Acceptance Criteria` heading with the issue's Definition-of-Done bullets copied verbatim beneath it. When composing a `resume_pr` repair handoff, put those same bullets in `done_criteria` and tell the resumed owner to preserve or update that heading on the next `file_pr` call.
+
 ## Review-fix handoff
 
 When a `[REVIEW ACTION REQUIRED]` message arrives, reviewer text is input, not a patch plan. Before steering the leaf:

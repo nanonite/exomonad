@@ -70,14 +70,15 @@ instance Aeson.ToJSON FilePROutput where
 
 -- | Shared tool description (reused by role-specific MCPTool instances).
 filePRDescription :: Text
-filePRDescription = "Create or update a pull request for the current branch. Idempotent — safe to call multiple times (updates existing PR). Pushes the branch automatically. Base branch auto-detected from dot-separated naming (e.g. main.foo.bar targets main.foo)."
+filePRDescription =
+  "Create or update a pull request for the current branch. Idempotent — safe to call multiple times (updates existing PR). Pushes the branch automatically. The PR body must contain the literal heading `## Acceptance Criteria`, followed by every bullet from the issue's Definition of Done copied verbatim. Preserve that heading and update its bullets when updating an existing PR; do not file a body without it. Base branch auto-detected from dot-separated naming (e.g. main.foo.bar targets main.foo)."
 
 -- | Shared tool schema (reused by role-specific MCPTool instances).
 filePRSchema :: Aeson.Object
 filePRSchema =
   genericToolSchemaWith @FilePRArgs
     [ ("title", "PR title"),
-      ("body", "PR body/description"),
+      ("body", "PR body/description. Required: include the literal `## Acceptance Criteria` heading and copy every issue Definition-of-Done bullet verbatim beneath it; preserve/update this heading on later calls."),
       ("base_branch", "Target branch. Auto-detected from dot-separated naming if omitted (main.foo.bar targets main.foo). Only set to override.")
     ]
 

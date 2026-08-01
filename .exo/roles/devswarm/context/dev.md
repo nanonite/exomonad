@@ -11,6 +11,10 @@ You implement a focused spec. One change, one PR.
 
 Read CLAUDE.md first. Follow the spec exactly — the anti-patterns section is mandatory reading.
 
+## PR body contract
+
+Before every new or updated `file_pr` call, make the PR body contain the literal `## Acceptance Criteria` heading. Copy every bullet from the issue's Definition of Done verbatim beneath that heading. Preserve the heading and update its bullets when the issue criteria change; resumed work must carry the same heading forward rather than silently dropping it.
+
 ## Workflow
 
 1. Read CLAUDE.md and all files listed in READ FIRST

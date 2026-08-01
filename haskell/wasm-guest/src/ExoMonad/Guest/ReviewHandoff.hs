@@ -37,7 +37,13 @@ renderReviewFixTask spec =
         maybe "" (Prompt.render . Prompt.steps) (reviewFixSteps spec),
         maybe "" (Prompt.render . Prompt.context) (reviewFixContext spec),
         maybe "" (Prompt.render . Prompt.verify) (reviewFixVerify spec),
-        maybe "" (Prompt.render . Prompt.doneCriteria) (reviewFixDoneCriteria spec)
+        maybe "" (Prompt.render . Prompt.doneCriteria) (reviewFixDoneCriteria spec),
+        Prompt.render $
+          Prompt.raw $
+            "## PR BODY CONTRACT\n"
+              <> "Before the next `file_pr` call, preserve or update the existing PR body so it contains this literal heading:\n"
+              <> "## Acceptance Criteria\n"
+              <> "Copy every issue Definition-of-Done bullet verbatim beneath it. Use the `done_criteria` bullets as the copy source; if they are absent, read the issue's Definition of Done before filing. Never silently drop or paraphrase the heading or its bullets."
       ]
 
 -- | Instructions injected into the TL's review notification before it composes
@@ -49,5 +55,6 @@ reviewHandoffInstructions =
     <> "2. State the root cause of each requested change.\n"
     <> "3. Propose the concrete solution, naming exact files/lines and expected behavior.\n"
     <> "4. Build a complete repair task with ROOT CAUSE, PROPOSED SOLUTION, READ FIRST, STEPS, VERIFY, BOUNDARY, and DONE CRITERIA sections.\n"
-    <> "5. For this existing open PR, call `resume_pr` with the PR number and complete task. Do not call `spawn_leaf`, create a sibling branch, create a new Chainlink issue, or close the owning issue.\n"
-    <> "The resumed leaf must commit/push the fix, end its Chainlink session, and report the verification results to its parent."
+    <> "5. In DONE CRITERIA, preserve the issue's Definition of Done bullets verbatim. The resumed owner must carry those bullets into the existing PR body under the literal `## Acceptance Criteria` heading on the next `file_pr` call, updating the heading when the criteria change.\n"
+    <> "6. For this existing open PR, call `resume_pr` with the PR number and complete task. Do not call `spawn_leaf`, create a sibling branch, create a new Chainlink issue, or close the owning issue.\n"
+    <> "The resumed leaf must preserve or update `## Acceptance Criteria` in the PR body, commit/push the fix, end its Chainlink session, and report the verification results to its parent."

@@ -28,10 +28,14 @@ import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
 import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), PRReviewEvent (..))
 import ExoMonad.Guest.Events.Templates qualified as Tpl
+import ExoMonad.Guest.Prompt qualified as Prompt
+import ExoMonad.Guest.ReviewHandoff (ReviewFixTask (..), renderReviewFixTask, reviewHandoffInstructions)
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
-import ExoMonad.Guest.Tool.Class (ToolDefinition (tdName))
+import ExoMonad.Guest.Tool.Class (ToolDefinition (tdDescription, tdName))
 import ExoMonad.Guest.Tool.Suspend.Types (EffectRequest (..))
+import ExoMonad.Guest.Tools.FilePR (filePRDescription, filePRSchema)
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), mergePRDescription, mergePRSchema)
+import ExoMonad.Guest.Tools.ResumePr (ResumePrArgs (..), renderResumePrTask, resumePrDescription, resumePrSchema)
 import ExoMonad.Guest.Types (Effects, HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (ChainlinkDbPathState (..), HookConfig (..), RoleConfig (..), validateChainlinkDbEnv)
 import Proto3.Suite.Class (Message, toLazyByteString)
@@ -80,6 +84,8 @@ main = do
   assertRequestedChangesNotifyParent
   assertTLReviewHandlerPreservesReviewMetadata
   assertReviewerFacingTextDoesNotMentionCopilot
+  assertAcceptanceCriteriaContract
+  assertReviewerAcceptanceCriteriaGuidance
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -559,6 +565,69 @@ assertReviewerFacingTextDoesNotMentionCopilot = do
   case Aeson.fromJSON (Aeson.object ["pr_number" Aeson..= (7 :: Int), "chainlink_issue_id" Aeson..= (42 :: Int)]) of
     Aeson.Success args -> assertEqual "merge_pr parses chainlink_issue_id" (Just 42) (mprChainlinkIssueId args)
     Aeson.Error err -> fail $ "merge_pr args parse failed: " <> err
+
+assertAcceptanceCriteriaContract :: IO ()
+assertAcceptanceCriteriaContract = do
+  let heading = "## Acceptance Criteria"
+      filePrSchemaText = T.pack (BSL.unpack (Aeson.encode filePRSchema))
+      resumePrSchemaText = T.pack (BSL.unpack (Aeson.encode resumePrSchema))
+      resumeArgs =
+        ResumePrArgs
+          { rpaPrNumber = 104,
+            rpaTask = "Repair the reviewed PR",
+            rpaReadFirst = Nothing,
+            rpaSteps = Nothing,
+            rpaVerify = Nothing,
+            rpaBoundary = Nothing,
+            rpaContext = Nothing,
+            rpaDoneCriteria = Just ["Preserve this issue bullet verbatim"]
+          }
+      renderedResume = renderResumePrTask resumeArgs
+      renderedReviewHandoff =
+        renderReviewFixTask
+          ReviewFixTask
+            { reviewFixTask = "Repair the reviewed PR",
+              reviewFixBoundary = Nothing,
+              reviewFixReadFirst = Nothing,
+              reviewFixSteps = Nothing,
+              reviewFixContext = Nothing,
+              reviewFixVerify = Nothing,
+              reviewFixDoneCriteria = Just ["Preserve this issue bullet verbatim"]
+            }
+  assertContains "file_pr description heading" heading filePRDescription
+  assertContains "file_pr description verbatim" "copied verbatim" filePRDescription
+  assertContains "file_pr schema heading" heading filePrSchemaText
+  assertContains "file_pr schema Definition of Done" "Definition-of-Done" filePrSchemaText
+  assertContains "resume_pr description heading" heading resumePrDescription
+  assertContains "resume_pr description done criteria" "done_criteria" resumePrDescription
+  assertContains "resume_pr description preserve" "do not silently drop" resumePrDescription
+  assertContains "resume_pr schema heading" heading resumePrSchemaText
+  assertContains "resume_pr schema verbatim" "copy them verbatim" resumePrSchemaText
+  assertContains "resume task heading" heading renderedResume
+  assertContains "resume task done criteria" "Preserve this issue bullet verbatim" renderedResume
+  assertContains "review handoff heading" heading reviewHandoffInstructions
+  assertContains "review handoff file_pr" "next `file_pr` call" reviewHandoffInstructions
+  assertContains "review handoff done criteria" "DONE CRITERIA" reviewHandoffInstructions
+  assertContains "rendered handoff heading" heading renderedReviewHandoff
+  assertContains "rendered handoff done criteria" "Preserve this issue bullet verbatim" renderedReviewHandoff
+  assertContains "leaf prompt heading" heading (Prompt.render Prompt.leafProfile)
+  assertContains "leaf prompt Definition of Done" "Definition-of-Done" (Prompt.render Prompt.leafProfile)
+
+assertReviewerAcceptanceCriteriaGuidance :: IO ()
+assertReviewerAcceptanceCriteriaGuidance = do
+  let guidance = ReviewerRole.reviewerAcceptanceCriteriaGuidance
+  assertContains "reviewer guidance heading" "## Acceptance Criteria" guidance
+  assertContains "reviewer guidance authoritative" "authoritative" guidance
+  assertContains "reviewer guidance diff" "diff and tests" guidance
+  assertContains "reviewer guidance missing" "heading is missing" guidance
+  assertContains "reviewer guidance no guessing" "Do not invent or guess" guidance
+  case lookupRole "reviewer" of
+    Nothing -> fail "reviewer role missing from registry"
+    Just roleCfg ->
+      forM_ ["approve_pr", "request_changes", "post_review_comment"] $ \toolName ->
+        case [tdDescription definition | definition <- roleListTools roleCfg, tdName definition == toolName] of
+          [description] -> assertContains (T.unpack toolName <> " reviewer guidance") "## Acceptance Criteria" description
+          other -> fail $ "expected one reviewer tool definition for " <> T.unpack toolName <> ", got " <> show other
 
 assertNoCopilot :: String -> Text -> IO ()
 assertNoCopilot label_ value =
