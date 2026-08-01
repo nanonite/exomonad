@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Dev-worker liveness registry goes stale for resumed/active agents (#574)
 - fix: review_message_keeps_follow_up_on_existing_chainlink_work_item test fails on main (#573)
 - spawn_leaf orphan-PR bug recurred despite #549-552 fixes — investigate root cause (#558)
 - Load the canonical root TL protocol across supported harnesses (#563)
@@ -223,6 +224,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- list_agents reports stale is_alive/last_check_inbox_at for resumed agents (reporting only) (#576)
+- orphan_reconciler kills resumed dev-workers on age alone, no activity check (#575)
+- Reviewer lacks structured Definition-of-Done; TL currently injects it ad hoc (#577)
 - Add review handoff regression and integration tests (#571)
 - Add structured resume_pr context fields for leaf launch (#570)
 - Add TL review-fix handoff prompt and scaffolding contract (#569)
