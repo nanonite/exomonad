@@ -32,6 +32,7 @@ pub struct FilePROutput {
     pub pr_number: PRNumber,
     pub head_branch: BranchName,
     pub base_branch: BranchName,
+    pub head_sha: String,
     pub created: bool,
 }
 
@@ -49,6 +50,9 @@ enum FilePrError {
 
     #[error("Forgejo PR list failed: {0}")]
     List(String),
+
+    #[error("Forgejo PR publication was not confirmed: {0}")]
+    UnconfirmedPublication(String),
 }
 
 // ============================================================================
@@ -125,11 +129,52 @@ async fn update_pr(
     title: &str,
     body: &str,
     base: &BranchName,
-) -> Result<(), FilePrError> {
+) -> Result<ForgejoPullRequest, FilePrError> {
     forgejo
         .update_pull_request(owner, repo, number, title, body, base)
         .await
         .map_err(|e| FilePrError::Update(e.to_string()))
+}
+
+fn confirmed_output(
+    pr: ForgejoPullRequest,
+    expected_head: &BranchName,
+    expected_base: &BranchName,
+    created: bool,
+) -> Result<FilePROutput, FilePrError> {
+    if pr.number.as_u64() == 0 {
+        return Err(FilePrError::UnconfirmedPublication(
+            "response did not include a PR number".to_string(),
+        ));
+    }
+    if pr.head_ref != *expected_head {
+        return Err(FilePrError::UnconfirmedPublication(format!(
+            "response head branch {} did not match {}",
+            pr.head_ref, expected_head
+        )));
+    }
+    if pr.base_ref != *expected_base {
+        return Err(FilePrError::UnconfirmedPublication(format!(
+            "response base branch {} did not match {}",
+            pr.base_ref, expected_base
+        )));
+    }
+    let head_sha = pr
+        .head_sha
+        .filter(|sha| !sha.trim().is_empty())
+        .ok_or_else(|| {
+            FilePrError::UnconfirmedPublication(
+                "response did not include a non-empty head SHA".to_string(),
+            )
+        })?;
+    Ok(FilePROutput {
+        pr_url: pr.url,
+        pr_number: pr.number,
+        head_branch: pr.head_ref,
+        base_branch: pr.base_ref,
+        head_sha,
+        created,
+    })
 }
 
 async fn create_pr(
@@ -203,7 +248,7 @@ pub async fn file_pr_async(
     if let Some(pr) = existing {
         let pr_number = pr.number;
         info!("[FilePR] Updating existing PR #{}", pr_number);
-        update_pr(
+        let updated = update_pr(
             forgejo,
             &repo_info.owner,
             &repo_info.repo,
@@ -214,13 +259,7 @@ pub async fn file_pr_async(
         )
         .await?;
         info!("[FilePR] Updated PR #{}: {}", pr_number, pr.url);
-        return Ok(FilePROutput {
-            pr_url: pr.url,
-            pr_number,
-            head_branch: pr.head_ref,
-            base_branch: base,
-            created: false,
-        });
+        return confirmed_output(updated, &head, &base, false).map_err(Into::into);
     }
 
     // Create new PR
@@ -236,14 +275,16 @@ pub async fn file_pr_async(
     )
     .await?;
 
-    // Emit pr:filed event (only if in tmux session)
+    let output = confirmed_output(pr, &head, &base, true)?;
+
+    // Emit pr:filed event only after the Forgejo response is confirmed.
     if let Ok(session) = std::env::var("EXOMONAD_TMUX_SESSION") {
         if let Some(agent_id_str) = git::extract_agent_id(head.as_str()) {
             match crate::ui_protocol::AgentId::try_from(agent_id_str) {
                 Ok(agent_id) => {
                     let event = crate::ui_protocol::AgentEvent::PrFiled {
                         agent_id,
-                        pr_number: pr.number,
+                        pr_number: output.pr_number,
                         timestamp: tmux_events::now_iso8601(),
                     };
                     if let Err(e) = tmux_events::emit_event(&session, &event) {
@@ -260,13 +301,7 @@ pub async fn file_pr_async(
         }
     }
 
-    Ok(FilePROutput {
-        pr_url: pr.url,
-        pr_number: pr.number,
-        head_branch: pr.head_ref,
-        base_branch: base,
-        created: true,
-    })
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -418,6 +453,45 @@ mod tests {
             BranchName::try_from_str("main.core-eval.optimize.inline")
                 .expect("literal validated string is non-empty")
         );
+    }
+
+    fn forgejo_pr_for_test(head_sha: Option<&str>) -> ForgejoPullRequest {
+        ForgejoPullRequest {
+            number: PRNumber::new(9),
+            url: "https://forgejo.local/owner/repo/pulls/9".to_string(),
+            title: "Test PR".to_string(),
+            body: "Test body".to_string(),
+            head_ref: BranchName::try_from_str("main.feature-codex")
+                .expect("literal branch is valid"),
+            base_ref: BranchName::try_from_str("main").expect("literal branch is valid"),
+            state: "open".to_string(),
+            merged: false,
+            head_sha: head_sha.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn confirmed_output_requires_forgejo_head_sha() {
+        let head = BranchName::try_from_str("main.feature-codex").unwrap();
+        let base = BranchName::try_from_str("main").unwrap();
+        let error = confirmed_output(forgejo_pr_for_test(None), &head, &base, true)
+            .expect_err("missing Forgejo SHA must not publish");
+
+        assert!(error.to_string().contains("head SHA"));
+    }
+
+    #[test]
+    fn confirmed_output_preserves_verified_create_and_update_metadata() {
+        let head = BranchName::try_from_str("main.feature-codex").unwrap();
+        let base = BranchName::try_from_str("main").unwrap();
+        let output =
+            confirmed_output(forgejo_pr_for_test(Some("sha-123")), &head, &base, false).unwrap();
+
+        assert_eq!(output.pr_number.as_u64(), 9);
+        assert_eq!(output.head_branch, head);
+        assert_eq!(output.base_branch, base);
+        assert_eq!(output.head_sha, "sha-123");
+        assert!(!output.created);
     }
 
     // =========================================================================

@@ -180,6 +180,25 @@ startup; it does not create a new owner.
 
 ## Forgejo Watcher and GitHub Poller State Machines
 
+### Authoritative PR publication
+
+`file_pr` may publish a `PublishedHead` only after the successful Forgejo
+create/update response confirms the PR number, exact head and base branches,
+and a non-empty head SHA. The publication is durably deduplicated by PR,
+branch, and SHA in `.exo/published-heads.json`. A repeated PR+SHA publication
+is harmless; a different SHA is retained as a new review-cycle candidate.
+
+The Forgejo watcher consumes a publication only when its PR number, branches,
+and SHA match the current Forgejo PR response. Missing, stale, or unconfirmed
+heads are ignored, so they cannot spawn a reviewer or advance a review verdict.
+The existing issue → agent identity → worktree → branch/PR ownership remains
+unchanged. Invocation ID/runtime/trigger fields are optional context attached
+to the publication, never a second owner model.
+
+Inbox and exact-pane tmux delivery are guidance channels. Injection success,
+process exit, and local push events do not advance watcher state; publication,
+Forgejo review verdicts, and CI observations remain the state-machine inputs.
+
 `worktree_event_watcher.rs` is the active Forgejo-backed PR/review/CI watcher. It rebuilds PR registry state from Forgejo each cycle and persists only watcher bookkeeping such as review rounds and stuck flags. `github_poller.rs` is currently hibernated: it has zero active call sites. Keep its review-loop semantics in parity with `worktree_event_watcher` so future GitHub Actions integration can re-enable it as a thin transport shim.
 
 `GitHubPoller<C>` is generic over capability traits. Single-phase init: `GitHubPoller::new(ctx)` — no `with_services()`. Background tokio task polling GitHub every 60s. Tracks per-PR state in `HashMap<PRNumber, PRState>`.

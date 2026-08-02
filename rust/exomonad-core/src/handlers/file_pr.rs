@@ -8,6 +8,7 @@ use crate::effects::{
     dispatch_file_pr_effect, EffectError, EffectHandler, EffectResult, FilePrEffects, ResultExt,
 };
 use crate::services::file_pr::{self, FilePRInput};
+use crate::services::pr_registry::{publish_verified_head, PublishedHead};
 use crate::services::repo;
 use async_trait::async_trait;
 use exomonad_proto::effects::file_pr::*;
@@ -110,9 +111,57 @@ impl<
         .await
         .effect_err("file_pr")?;
 
+        let invocation_dir = self
+            .ctx
+            .project_dir()
+            .join(".exo/agents")
+            .join(ctx.agent_name.as_str());
+        let invocation =
+            crate::services::agent_control::read_invocation_conservatively(&invocation_dir).await;
+        let publication = PublishedHead {
+            pr_number: output.pr_number.as_u64(),
+            head_branch: output.head_branch.to_string(),
+            base_branch: output.base_branch.to_string(),
+            head_sha: output.head_sha.clone(),
+            author_agent: Some(ctx.agent_name.to_string()),
+            author_role: Some("dev".to_string()),
+            invocation_id: invocation
+                .as_ref()
+                .map(|record| record.invocation_id.clone()),
+            invocation_trigger: invocation
+                .as_ref()
+                .map(|record| format!("{:?}", record.trigger).to_ascii_lowercase()),
+            invocation_runtime: invocation
+                .as_ref()
+                .map(|record| format!("{:?}", record.runtime).to_ascii_lowercase()),
+        };
+        let disposition = publish_verified_head(self.ctx.project_dir(), publication)
+            .await
+            .effect_err("file_pr")?;
+
+        if let Some(log) = self.ctx.event_log() {
+            if let Err(error) = log.append(
+                "pr.published",
+                ctx.agent_name.as_ref(),
+                &serde_json::json!({
+                    "verified": true,
+                    "pr_number": output.pr_number.as_u64(),
+                    "head_branch": output.head_branch.to_string(),
+                    "base_branch": output.base_branch.to_string(),
+                    "head_sha": output.head_sha.clone(),
+                    "publication": format!("{:?}", disposition),
+                    "invocation_id": invocation.as_ref().map(|record| &record.invocation_id),
+                }),
+            ) {
+                tracing::warn!(%error, "Failed to write verified PR publication event");
+            }
+        }
+
         tracing::info!(
             pr_number = output.pr_number.as_u64(),
             created = output.created,
+            head_sha = %output.head_sha,
+            ?disposition,
             "[FilePR] file_pr complete"
         );
 
@@ -143,6 +192,7 @@ impl<
                     "pr_url": output.pr_url,
                     "head_branch": output.head_branch.to_string(),
                     "base_branch": output.base_branch.to_string(),
+                    "head_sha": output.head_sha.clone(),
                     "created": output.created,
                     "title": input.title,
                 }),

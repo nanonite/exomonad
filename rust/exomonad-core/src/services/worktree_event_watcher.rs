@@ -2,7 +2,9 @@ use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::agent_resources::dispose_reviewers_for_pr;
-use crate::services::pr_registry::{ForgejoReviewState, PrEntry, PrRegistry, PrState};
+use crate::services::pr_registry::{
+    read_published_heads, ForgejoReviewState, PrEntry, PrRegistry, PrState, PublishedHead,
+};
 use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
@@ -17,7 +19,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
 
@@ -785,6 +786,9 @@ fn native_ci_status_action(payload: &serde_json::Value, role: &str) -> Option<Ev
 
 /// Observation collected from Forgejo and worktree state for one open PR.
 struct Observation {
+    /// The Forgejo-confirmed publication that authorizes this observation.
+    /// Guidance delivery and process lifecycle events never populate this.
+    publication: Option<PublishedHead>,
     head_sha: String,
     review_state: ForgejoReviewState,
     comments: Vec<ForgejoReviewComment>,
@@ -1077,6 +1081,13 @@ where
         };
         let repo_info = repo::get_repo_info(self.ctx.project_dir()).await?;
         let watcher_state = self.read_watcher_state().await.unwrap_or_default();
+        let published_heads = match read_published_heads(self.ctx.project_dir()).await {
+            Ok(heads) => heads,
+            Err(error) => {
+                warn!(%error, "Ignoring malformed PR publication registry conservatively");
+                Vec::new()
+            }
+        };
         let pull_requests = forgejo
             .list_open_pull_requests(&repo_info.owner, &repo_info.repo)
             .await?;
@@ -1095,7 +1106,16 @@ where
                 .or_else(|| author_agent_from_branch(birth_branch))
                 .unwrap_or_else(|| pr.head_ref.to_string());
             let author_role = metadata.author_role.unwrap_or_else(|| "dev".to_string());
-            let head_sha = pr.head_sha.clone();
+            let head_sha = pr.head_sha.clone().filter(|sha| {
+                published_heads.iter().any(|publication| {
+                    publication.matches_current(
+                        number,
+                        pr.head_ref.as_str(),
+                        pr.base_ref.as_str(),
+                        sha,
+                    )
+                })
+            });
             registry.prs.insert(
                 number,
                 PrEntry {
@@ -1266,18 +1286,35 @@ where
     ) -> Result<HashMap<u64, Observation>> {
         let mut observations = HashMap::new();
         let project_dir = self.ctx.project_dir().to_path_buf();
+        let published_heads = match read_published_heads(&project_dir).await {
+            Ok(heads) => heads,
+            Err(error) => {
+                warn!(%error, "Ignoring malformed PR publication registry conservatively");
+                Vec::new()
+            }
+        };
 
         for (number, pr) in &registry.prs {
             if pr.state != PrState::Open {
                 continue;
             }
 
-            let head_sha = match pr.last_head_sha.as_deref() {
-                Some(sha) if !sha.is_empty() => sha.to_string(),
-                _ => {
-                    let worktree_path = project_dir.join(".exo/worktrees").join(&pr.author_agent);
-                    git_head_sha(&worktree_path).await.unwrap_or_default()
-                }
+            let Some(head_sha) = pr
+                .last_head_sha
+                .clone()
+                .filter(|sha| !sha.trim().is_empty())
+            else {
+                continue;
+            };
+            let Some(publication) = published_heads.iter().find(|publication| {
+                publication.matches_current(
+                    *number,
+                    pr.head_branch.as_str(),
+                    pr.base_branch.as_str(),
+                    &head_sha,
+                )
+            }) else {
+                continue;
             };
 
             let (review_state, comments, reviews, changes_requested_rounds, forgejo_review_present) =
@@ -1290,6 +1327,7 @@ where
             observations.insert(
                 *number,
                 Observation {
+                    publication: Some(publication.clone()),
                     head_sha,
                     review_state,
                     comments,
@@ -1323,6 +1361,28 @@ where
                     Some(p) => p,
                     None => continue,
                 };
+
+                let Some(publication) = obs.publication.as_ref() else {
+                    debug!(
+                        pr_number,
+                        "Ignoring PR observation without a verified publication"
+                    );
+                    continue;
+                };
+                if !publication.matches_current(
+                    *pr_number,
+                    pr.head_branch.as_str(),
+                    pr.base_branch.as_str(),
+                    &obs.head_sha,
+                ) {
+                    warn!(
+                        pr_number,
+                        observed_sha = %obs.head_sha,
+                        published_sha = %publication.head_sha,
+                        "Ignoring stale or unconfirmed PR observation"
+                    );
+                    continue;
+                }
 
                 let agent_name = &pr.author_agent;
                 let (branch, agent_type, agent_role) = review_event_target(pr);
@@ -2976,25 +3036,6 @@ fn extract_pipeline_status(event: &serde_json::Value) -> Option<(String, String)
         None
     } else {
         Some((rkey, status.to_string()))
-    }
-}
-
-async fn git_head_sha(worktree_path: &std::path::Path) -> Result<String> {
-    if !worktree_path.exists() {
-        return Ok(String::new());
-    }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .await?;
-
-    if output.status.success() {
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(sha)
-    } else {
-        Ok(String::new())
     }
 }
 
@@ -4735,6 +4776,7 @@ mod tests {
     #[test]
     fn test_obs_to_review_parts_pending() {
         let obs = Observation {
+            publication: None,
             head_sha: "abc".into(),
             review_state: ForgejoReviewState::PendingReview,
             comments: vec![],
@@ -4751,6 +4793,7 @@ mod tests {
     #[test]
     fn test_obs_to_review_parts_approved_with_no_comments_creates_synthetic() {
         let obs = Observation {
+            publication: None,
             head_sha: "abc".into(),
             review_state: ForgejoReviewState::Approved,
             comments: vec![],
@@ -4769,6 +4812,7 @@ mod tests {
     #[test]
     fn test_obs_to_review_parts_changes_requested() {
         let obs = Observation {
+            publication: None,
             head_sha: "abc".into(),
             review_state: ForgejoReviewState::ChangesRequested,
             comments: vec![],
@@ -4794,6 +4838,7 @@ mod tests {
             commit_id: None,
         };
         let obs = Observation {
+            publication: None,
             head_sha: "abc".into(),
             review_state: ForgejoReviewState::Commented,
             comments: vec![],
@@ -5055,6 +5100,17 @@ mod tests {
 
     fn test_observation(sha: &str) -> Observation {
         Observation {
+            publication: Some(PublishedHead {
+                pr_number: 1,
+                head_branch: "main.feat-gemini".to_string(),
+                base_branch: "main".to_string(),
+                head_sha: sha.to_string(),
+                author_agent: None,
+                author_role: None,
+                invocation_id: None,
+                invocation_trigger: None,
+                invocation_runtime: None,
+            }),
             head_sha: sha.to_string(),
             review_state: crate::services::pr_registry::ForgejoReviewState::PendingReview,
             comments: vec![],
@@ -5067,6 +5123,17 @@ mod tests {
 
     fn terminal_changes_requested_observation(sha: &str) -> Observation {
         Observation {
+            publication: Some(PublishedHead {
+                pr_number: 1,
+                head_branch: "main.feat-gemini".to_string(),
+                base_branch: "main".to_string(),
+                head_sha: sha.to_string(),
+                author_agent: None,
+                author_role: None,
+                invocation_id: None,
+                invocation_trigger: None,
+                invocation_runtime: None,
+            }),
             head_sha: sha.to_string(),
             review_state: crate::services::pr_registry::ForgejoReviewState::ChangesRequested,
             comments: vec![],
@@ -5132,6 +5199,83 @@ mod tests {
             .unwrap();
 
         assert!(!temp_dir.path().join(".exo/prs.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_does_not_spawn_reviewer_without_publication() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSpawner(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for CountingSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                _pr: &crate::services::pr_registry::PrEntry,
+            ) -> anyhow::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services))
+            .with_reviewer_spawner(Arc::new(CountingSpawner(call_count.clone())));
+        let registry = test_registry(test_pr_entry());
+        let mut observation = test_observation("abc123");
+        observation.publication = None;
+        let observations = HashMap::from([(1u64, observation)]);
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+        assert!(watcher.state.prs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_rejects_stale_publication_before_review_transition() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let branch = BranchName::try_from_str("main.feat-gemini").unwrap();
+        let state = WatchState::new(&branch, AgentType::Gemini, "new-sha", CIStatus::Unknown, 0);
+        watcher.state.prs.lock().await.insert(1, state);
+
+        let registry = test_registry(test_pr_entry());
+        let mut observation = test_observation("new-sha");
+        observation.publication.as_mut().unwrap().head_sha = "old-sha".to_string();
+        let observations = HashMap::from([(1u64, observation)]);
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        let state = watcher.state.prs.lock().await;
+        assert_eq!(state.get(&1).unwrap().last_sha, "new-sha");
+        assert_eq!(state.get(&1).unwrap().rounds, 0);
+    }
+
+    #[tokio::test]
+    async fn test_collect_observations_requires_current_published_head() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let mut pr = test_pr_entry();
+        pr.last_head_sha = Some("current-sha".to_string());
+        let registry = test_registry(pr);
+
+        let observations = watcher.collect_observations(&registry).await.unwrap();
+
+        assert!(observations.is_empty());
     }
 
     #[test]
@@ -5238,6 +5382,17 @@ mod tests {
         observations.insert(
             1u64,
             Observation {
+                publication: Some(PublishedHead {
+                    pr_number: 1,
+                    head_branch: "main.feat-gemini".to_string(),
+                    base_branch: "main".to_string(),
+                    head_sha: "abc123".to_string(),
+                    author_agent: None,
+                    author_role: None,
+                    invocation_id: None,
+                    invocation_trigger: None,
+                    invocation_runtime: None,
+                }),
                 head_sha: "abc123".to_string(),
                 review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
                 comments: vec![],
@@ -5440,6 +5595,17 @@ mod tests {
         observations.insert(
             1u64,
             Observation {
+                publication: Some(PublishedHead {
+                    pr_number: 1,
+                    head_branch: "main.feat-gemini".to_string(),
+                    base_branch: "main".to_string(),
+                    head_sha: "abc123".to_string(),
+                    author_agent: None,
+                    author_role: None,
+                    invocation_id: None,
+                    invocation_trigger: None,
+                    invocation_runtime: None,
+                }),
                 head_sha: "abc123".to_string(),
                 review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
                 comments: vec![],
@@ -5489,6 +5655,17 @@ mod tests {
         observations.insert(
             1u64,
             Observation {
+                publication: Some(PublishedHead {
+                    pr_number: 1,
+                    head_branch: "main.feat-gemini".to_string(),
+                    base_branch: "main".to_string(),
+                    head_sha: "abc123".to_string(),
+                    author_agent: None,
+                    author_role: None,
+                    invocation_id: None,
+                    invocation_trigger: None,
+                    invocation_runtime: None,
+                }),
                 head_sha: "abc123".to_string(),
                 review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
                 comments: vec![],
@@ -5783,6 +5960,17 @@ mod tests {
         observations.insert(
             1u64,
             Observation {
+                publication: Some(PublishedHead {
+                    pr_number: 1,
+                    head_branch: "main.feat-gemini".to_string(),
+                    base_branch: "main".to_string(),
+                    head_sha: "def456".to_string(),
+                    author_agent: None,
+                    author_role: None,
+                    invocation_id: None,
+                    invocation_trigger: None,
+                    invocation_runtime: None,
+                }),
                 head_sha: "def456".to_string(),
                 review_state: ForgejoReviewState::ChangesRequested,
                 comments: vec![],
@@ -5852,6 +6040,17 @@ mod tests {
         observations.insert(
             1u64,
             Observation {
+                publication: Some(PublishedHead {
+                    pr_number: 1,
+                    head_branch: "main.feat-gemini".to_string(),
+                    base_branch: "main".to_string(),
+                    head_sha: "def456".to_string(),
+                    author_agent: None,
+                    author_role: None,
+                    invocation_id: None,
+                    invocation_trigger: None,
+                    invocation_runtime: None,
+                }),
                 head_sha: "def456".to_string(),
                 review_state: ForgejoReviewState::PendingReview,
                 comments: vec![],

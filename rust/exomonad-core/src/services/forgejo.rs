@@ -504,7 +504,7 @@ impl ForgejoClient {
         title: &str,
         body: &str,
         base: &BranchName,
-    ) -> Result<()> {
+    ) -> Result<ForgejoPullRequest> {
         match &self.backend {
             ForgejoBackend::Http(client) => {
                 client
@@ -1085,7 +1085,7 @@ impl HttpForgejoClient {
         title: &str,
         body: &str,
         base: &BranchName,
-    ) -> Result<()> {
+    ) -> Result<ForgejoPullRequest> {
         let url = self.repo_pull_url(owner, repo, number)?;
         let request_body = UpdatePullRequestBody {
             title,
@@ -1102,8 +1102,10 @@ impl HttpForgejoClient {
             .await
             .context("Forgejo PR update request failed")?;
 
-        self.expect_success(response, "update Forgejo pull request")
-            .await
+        let pr: PullRequestResponse = self
+            .decode_response(response, "update Forgejo pull request")
+            .await?;
+        ForgejoPullRequest::try_from(pr)
     }
 
     fn repo_pulls_url(&self, owner: &GithubOwner, repo: &GithubRepo) -> Result<Url> {
@@ -1473,8 +1475,9 @@ impl FjForgejoClient {
         title: &str,
         body: &str,
         base: &BranchName,
-    ) -> Result<()> {
-        let number = number.as_u64().to_string();
+    ) -> Result<ForgejoPullRequest> {
+        let pr_number = number;
+        let number = pr_number.as_u64().to_string();
         self.fj_status([
             "pr",
             "edit",
@@ -1486,7 +1489,8 @@ impl FjForgejoClient {
             "--base",
             base.as_str(),
         ])
-        .await
+        .await?;
+        self.get_pull_request(_owner, _repo, pr_number).await
     }
 
     async fn fj_api_json<T: serde::de::DeserializeOwned>(
@@ -1587,7 +1591,7 @@ impl TryFrom<PullRequestResponse> for ForgejoPullRequest {
 
     fn try_from(value: PullRequestResponse) -> Result<Self> {
         Ok(Self {
-            number: PRNumber::new(value.number),
+            number: PRNumber::try_from(value.number)?,
             url: value.html_url.or(value.url).unwrap_or_default(),
             title: value.title,
             body: value.body,
@@ -1708,7 +1712,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "number": 9,
                 "html_url": "http://forgejo.local/owner/repo/pulls/9",
-                "head": { "ref": "main.feature" },
+                "head": { "ref": "main.feature", "sha": "sha-create" },
                 "base": { "ref": "main" }
             })))
             .mount(&server)
@@ -1729,6 +1733,7 @@ mod tests {
         assert_eq!(pr.number.as_u64(), 9);
         assert_eq!(pr.head_ref.as_str(), "main.feature");
         assert_eq!(pr.base_ref.as_str(), "main");
+        assert_eq!(pr.head_sha.as_deref(), Some("sha-create"));
     }
 
     #[tokio::test]
@@ -1740,13 +1745,13 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "number": 9,
                 "html_url": "http://forgejo.local/owner/repo/pulls/9",
-                "head": { "ref": "main.feature" },
+                "head": { "ref": "main.feature", "sha": "sha-update" },
                 "base": { "ref": "main" }
             })))
             .mount(&server)
             .await;
 
-        client
+        let pr = client
             .update_pull_request(
                 &owner(),
                 &repo(),
@@ -1757,6 +1762,30 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(pr.head_sha.as_deref(), Some("sha-update"));
+    }
+
+    #[test]
+    fn rejects_missing_pr_number_without_panicking() {
+        let response = PullRequestResponse {
+            number: 0,
+            title: String::new(),
+            body: String::new(),
+            state: "open".to_string(),
+            merged: false,
+            html_url: None,
+            url: None,
+            head: PullRequestBranch {
+                ref_name: "main.feature".to_string(),
+                sha: Some("sha-1".to_string()),
+            },
+            base: PullRequestBranch {
+                ref_name: "main".to_string(),
+                sha: None,
+            },
+        };
+
+        assert!(ForgejoPullRequest::try_from(response).is_err());
     }
 
     #[tokio::test]
