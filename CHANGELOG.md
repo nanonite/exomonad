@@ -226,6 +226,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Update agent guidance for the one-shot invocation workflow (#587)
 - Add cross-provider one-shot lifecycle coverage and rollout controls (#585)
 - Route review feedback through parent repair handoffs (#584)
 - Make reviewer orchestration durable and SHA-scoped (#583)
