@@ -93,7 +93,7 @@ prReviewHandler (CIBlocked n status_ branch_) = do
   logHandler $ "CI blocked PR #" <> T.pack (show n) <> ", status: " <> status_
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CIBlockedEv n status_ branch_)
-  pure $ NotifyParentAction ("[CI BLOCKED: PR #" <> T.pack (show n) <> "] CI finished with status " <> status_ <> " on " <> branch_ <> ". The TL owns the next decision and may use resume_pr.") n
+  pure NoAction
 prReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
   branch <- getCurrentBranch

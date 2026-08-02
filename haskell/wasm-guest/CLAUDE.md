@@ -199,10 +199,10 @@ GitHub poller (Rust, 60s interval)
 
 | Event | Action | Effect |
 |-------|--------|--------|
-| `ReviewReceived` | `NotifyParentAction` for dev, `InjectMessage` for TL | Review comments reach the owning TL, which diagnoses them and resumes the existing PR owner with a repair handoff |
-| `ReviewApproved` | `NotifyParentAction` | Sends `[from: id] [PR READY] PR #N...` to parent via `notify_parent_delivery` |
-| `ReviewTimeout` (15 min initial, 5 min after fixes) | `NotifyParentAction` | Sends `[from: id] [REVIEW TIMEOUT] PR #N...` to parent via `notify_parent_delivery` |
-| `FixesPushed` | `NotifyParentAction` | Sends `[from: id] [FIXES PUSHED] PR #N...` to parent — Copilot does NOT re-review, so this is the actionable signal |
+| `ReviewReceived`, `ReviewCommented`, `ReviewerRequestedChanges` | `NoAction` for dev, `InjectMessage` for TL | The dev records review state where applicable but does not notify the parent directly. The Rust watcher emits the durable, SHA-scoped parent handoff; the TL diagnoses it and resumes the existing PR owner. |
+| `ReviewApproved`, `ReviewerApproved`, `ReviewTimeout`, `CIBlocked`, `MergeReady` | `NoAction` for dev, `InjectMessage` for TL | The Rust watcher owns the authoritative parent handoff, keyed to the verified PR head and review outcome. Forgejo verdicts, verified head, and CI remain the state-machine inputs. |
+| `FixesPushed`, `CommitsPushed` | `NoAction` for dev, `InjectMessage` for TL | The Rust watcher records the new verified head and starts the next review cycle; delivery is not a workflow transition. |
+| `CITriggered` and `Stuck` | `InjectMessage` for dev and TL | Runtime guidance remains available to the live exact invocation; it does not itself advance watcher state. |
 | `SiblingMerged` | `InjectMessage` | Injects rebase instructions when a sibling branch is merged |
 
 ### Wiring

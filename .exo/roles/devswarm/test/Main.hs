@@ -79,10 +79,10 @@ main = do
   assertApprovedCanExitOnWatcherMergeReady
   assertCITriggeredMergeReadyTransitionsToDoneAndExits
   assertCIFailureBlocksAfterTrigger
-  assertMergeReadyReviewNotifiesParent
-  assertMergeReadyCIStatusNotifiesParent
+  assertMergeReadyReviewLeavesParentToWatcher
+  assertMergeReadyCIStatusLeavesParentToWatcher
   assertReviewCommentedJSONAndHandler
-  assertRequestedChangesNotifyParent
+  assertRequestedChangesLeaveParentToWatcher
   assertTLReviewHandlerPreservesReviewMetadata
   assertReviewerFacingTextDoesNotMentionCopilot
   assertAcceptanceCriteriaContract
@@ -448,18 +448,18 @@ assertCIFailureBlocksAfterTrigger = do
     other -> fail $ "expected DevCIBlocked after failed CI, got " <> showDevTransition other
   assertClean "ci-blocked invocation exits for TL decision" (canExit @DevPhase @DevEvent (DevCIBlocked 9 "failure"))
 
-assertMergeReadyReviewNotifiesParent :: IO ()
-assertMergeReadyReviewNotifiesParent = do
+assertMergeReadyReviewLeavesParentToWatcher :: IO ()
+assertMergeReadyReviewLeavesParentToWatcher = do
   action <- runPRReviewEvent DevRole.config (MergeReady 9 "success" "main.feature")
-  assertNotifyParent "merge-ready pr_review" 9 action
+  assertNoAction "merge-ready pr_review dev handler" action
 
-assertMergeReadyCIStatusNotifiesParent :: IO ()
-assertMergeReadyCIStatusNotifiesParent = do
+assertMergeReadyCIStatusLeavesParentToWatcher :: IO ()
+assertMergeReadyCIStatusLeavesParentToWatcher = do
   action <-
     runCIStatusEvent
       DevRole.config
       (CIStatusEvent 9 "success" "main.feature" False True True)
-  assertNotifyParent "merge-ready ci_status" 9 action
+  assertNoAction "merge-ready ci_status dev handler" action
 
 assertReviewCommentedJSONAndHandler :: IO ()
 assertReviewCommentedJSONAndHandler = do
@@ -472,36 +472,16 @@ assertReviewCommentedJSONAndHandler = do
       assertEqual "comment-only review author branch" (Just "main.review-pr-9-codex") authorBranch
     other -> fail $ "comment-only review JSON roundtrip failed: " <> show other
   action <- runPRReviewEvent DevRole.config event
-  case action of
-    NotifyParentAction message prNumber -> do
-      assertEqual "comment-only review parent PR number" 9 prNumber
-      assertBool "comment-only review uses parent notification" ("[REVIEW ACTION REQUIRED]" `T.isInfixOf` message)
-      assertBool "comment-only review preserves head branch" ("main.feature-codex" `T.isInfixOf` message)
-      assertBool "comment-only review preserves reviewer branch" ("main.review-pr-9-codex" `T.isInfixOf` message)
-      assertBool "comment-only review preserves full text" ("Looks good, with one suggestion." `T.isInfixOf` message)
-    other -> fail $ "comment-only review should notify parent, got " <> show other
+  assertNoAction "comment-only review dev handler" action
 
-assertRequestedChangesNotifyParent :: IO ()
-assertRequestedChangesNotifyParent = do
+assertRequestedChangesLeaveParentToWatcher :: IO ()
+assertRequestedChangesLeaveParentToWatcher = do
   reviewAction <- runPRReviewEvent DevRole.config (ReviewReceived 12 "Please update the timeout path." "main.feature-codex" (Just "main.review-pr-12-codex"))
-  case reviewAction of
-    NotifyParentAction message prNumber -> do
-      assertEqual "review-received parent PR number" 12 prNumber
-      assertBool "review-received includes branch" ("main.feature-codex" `T.isInfixOf` message)
-      assertBool "review-received includes body" ("Please update the timeout path." `T.isInfixOf` message)
-      assertBool "review-received requires TL analysis" ("TL review-fix handoff" `T.isInfixOf` message)
-      assertBool "review-received requires resume_pr" ("resume_pr" `T.isInfixOf` message)
-      assertBool "review-received requires root cause" ("ROOT CAUSE" `T.isInfixOf` message)
-    other -> fail $ "review received should notify parent, got " <> show other
+  assertNoAction "review received dev handler" reviewAction
 
   let event = ReviewerRequestedChanges 10 "Please fix the error path." "main.feature-codex" (Just "main.review-pr-10-codex")
   action <- runPRReviewEvent DevRole.config event
-  case action of
-    NotifyParentAction message prNumber -> do
-      assertEqual "requested-changes parent PR number" 10 prNumber
-      assertBool "requested-changes includes kind" ("changes requested" `T.isInfixOf` message)
-      assertBool "requested-changes includes body" ("Please fix the error path." `T.isInfixOf` message)
-    other -> fail $ "requested changes should notify parent, got " <> show other
+  assertNoAction "requested-changes dev handler" action
 
 assertTLReviewHandlerPreservesReviewMetadata :: IO ()
 assertTLReviewHandlerPreservesReviewMetadata = do
@@ -551,13 +531,11 @@ responseValue payload =
       response = Envelope.EffectResponse (Just (Envelope.EffectResponseResultPayload payloadBytes))
    in Aeson.toJSON (BS.unpack (BL.toStrict (toLazyByteString response)) :: [Word8])
 
-assertNotifyParent :: String -> Int -> EventAction -> IO ()
-assertNotifyParent label_ expectedPr action =
+assertNoAction :: String -> EventAction -> IO ()
+assertNoAction label_ action =
   case action of
-    NotifyParentAction message prNumber -> do
-      assertEqual (label_ <> " pr_number") expectedPr prNumber
-      assertBool (label_ <> " message") ("[MERGE READY]" `T.isInfixOf` message)
-    other -> fail $ label_ <> ": expected NotifyParentAction, got " <> show other
+    NoAction -> pure ()
+    other -> fail $ label_ <> ": expected NoAction, got " <> show other
 
 assertReviewerFacingTextDoesNotMentionCopilot :: IO ()
 assertReviewerFacingTextDoesNotMentionCopilot = do
