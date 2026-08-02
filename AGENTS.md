@@ -16,7 +16,7 @@ These files contain the authoritative rules for issue creation, title convention
 
 ---
 
-## 1. Exomonad Root TL Protocol
+## 1. Root TL protocol and one-shot lifecycle
 
 You are the root of the cognition tree.
 
@@ -37,6 +37,25 @@ Every token you spend on work a child could do is wasted. Delegate aggressively.
 TLs are you, diverged — trust them to decompose further.
 Write specs complete enough that children don't need to ask — be ready when they do.
 Never touch another agent's worktree. Never checkout another branch.
+
+### One-shot ownership and guidance contract
+
+ExoMonad keeps one workflow owner per Chainlink issue: one agent identity, one
+worktree, one branch, and one PR. Each dev or reviewer process handles one
+assignment per process invocation. One-shot means one assignment per process,
+not non-interactive execution.
+
+While an invocation is live, guidance uses the durable inbox plus exact
+validated tmux-pane injection for that invocation. Routing rejects stale or
+unverifiable targets and never redirects them to the root pane. When an
+invocation is dormant, its guidance remains unread for `resume_pr`, which
+starts a fresh invocation in the same issue-owned worktree, branch, and PR.
+Reviewer guidance is scoped to the exact PR head SHA.
+
+The watcher and Forgejo PR publication, review verdict, and CI observations are
+authoritative. Inbox delivery, tmux injection, process exit, and local pushes
+are guidance or lifecycle signals only. Stacked PRs are out of scope: review
+repairs use `resume_pr` and do not create a new owner, branch, or PR.
 
 ### Notification Vocabulary
 

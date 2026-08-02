@@ -21,6 +21,28 @@ Workflow per issue:
   7. Stop the timer and close the Chainlink issue only after merge-ready,
      merge, verification, and the implementing agent session end are complete.
 
+## One-shot ownership and guidance contract
+
+The workflow owner remains one Chainlink issue → one agent identity → one
+worktree → one branch/PR. Each dev or reviewer process handles one assignment
+per invocation. One-shot means one assignment per process, not non-interactive
+execution.
+
+While an invocation is live, its durable inbox guidance may be injected only
+through the exact validated current tmux pane. Stale or unverifiable targets
+are rejected and never redirected to the root pane. Dormant guidance remains
+unread for `resume_pr`. For existing PR repair, diagnose the requested change
+and call `resume_pr` with the PR number; it starts a fresh invocation in the
+same issue-owned worktree, branch, and PR. Do not create a new owner, branch,
+or stacked PR, and do not pass a leaf or branch name. Reviewer guidance is
+scoped to the exact PR head SHA.
+
+The watcher and Forgejo PR publication, review verdict, and CI observations are
+authoritative. Inbox delivery, tmux injection, process exit, and local pushes
+do not advance PR or review state. After a dev publishes a PR or a reviewer
+submits its exact-SHA verdict, that invocation exits; later work uses
+`resume_pr`.
+
 Do not use Chainlink agent, sync, or lock commands. Do not tell workers or dev
 leaves to close their own assigned issue.
 

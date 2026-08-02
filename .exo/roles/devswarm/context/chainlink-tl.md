@@ -13,6 +13,26 @@ Chainlink is your single source of truth for what work exists, who owns it, and 
 
 Copy the issue's Definition of Done bullets verbatim into the PR body under the literal `## Acceptance Criteria` heading on every new or updated `file_pr` call. For review repairs, pass the same bullets through `resume_pr`'s `done_criteria` field and require the resumed owner to preserve or update that heading rather than dropping it.
 
+## One-shot lifecycle and guidance contract
+
+Chainlink keeps one workflow owner per issue: one agent identity, one
+worktree, one branch, and one PR. Each dev or reviewer process handles one
+assignment per process invocation. One-shot means one assignment per process,
+not non-interactive execution.
+
+While an invocation is live, guidance is available through the durable inbox
+and exact validated tmux-pane injection for that invocation. Stale or
+unverifiable targets are rejected and never redirected to the root pane. When
+the invocation is dormant, guidance remains unread for `resume_pr`. A resume
+starts a fresh invocation in the same issue-owned worktree, branch, and PR; it
+does not create a new owner or a stacked PR. Reviewer guidance is SHA-scoped.
+
+The watcher and Forgejo PR publication, review verdict, and CI observations are
+authoritative. Inbox delivery, tmux injection, process exit, and local pushes
+are not PR, review, or CI state transitions. After a dev publishes a PR or a
+reviewer submits its exact-SHA verdict, that invocation exits; later work uses
+`resume_pr`. Stacked PRs are out of scope.
+
 ## Canonical DB Location
 
 The project's chainlink DB lives at `<project_root>/.chainlink/` regardless of which worktree any agent runs in. ExoMonad sets `CHAINLINK_DB` to that directory in every spawned agent's environment, so leaves and workers resolve the same DB you do.
