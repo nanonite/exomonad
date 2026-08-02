@@ -987,7 +987,7 @@ where
             }
             drop(state);
             if let Err(error) = self
-                .persist_last_head_shas(&[(request.pr_number, request.head_sha)])
+                .persist_runtime_pr_state(&[(request.pr_number, request.head_sha)], &[])
                 .await
             {
                 warn!(
@@ -1038,7 +1038,7 @@ where
                 }
                 drop(state);
                 if let Err(error) = self
-                    .persist_last_head_shas(&[(pr_number, head_sha.clone())])
+                    .persist_runtime_pr_state(&[(pr_number, head_sha.clone())], &[])
                     .await
                 {
                     warn!(pr_number, %error, "Failed to persist successful reviewer attempt");
@@ -1065,7 +1065,7 @@ where
                 }
                 drop(state);
                 if let Err(persist_error) = self
-                    .persist_last_head_shas(&[(pr_number, head_sha.clone())])
+                    .persist_runtime_pr_state(&[(pr_number, head_sha.clone())], &[])
                     .await
                 {
                     warn!(pr_number, %persist_error, "Failed to persist failed reviewer attempt");
@@ -1852,7 +1852,8 @@ where
             }
         }
 
-        self.persist_last_head_shas(&head_sha_updates).await?;
+        self.persist_runtime_pr_state(&head_sha_updates, &reviewer_spawns)
+            .await?;
         for request in reviewer_spawns {
             self.spawn_reviewer_for_pr(request).await;
         }
@@ -2026,13 +2027,50 @@ where
         Ok(removed_prs)
     }
 
-    async fn persist_last_head_shas(&self, updates: &[(u64, String)]) -> Result<()> {
-        if updates.is_empty() {
+    /// Persist the complete runtime projection for the supplied PRs.
+    ///
+    /// `expected_claims` is used immediately before reviewer spawn. Keeping
+    /// the claim validation under the same runtime lock as the snapshot means
+    /// a request cannot proceed unless its exact PR/SHA/attempt claim is
+    /// included in the atomically replaced watcher-state file.
+    async fn persist_runtime_pr_state(
+        &self,
+        updates: &[(u64, String)],
+        expected_claims: &[ReviewerSpawnRequest],
+    ) -> Result<()> {
+        if updates.is_empty() && expected_claims.is_empty() {
             return Ok(());
         }
 
         let mut state = self.read_watcher_state().await.unwrap_or_default();
         let runtime_state = self.state.prs.lock().await;
+        for request in expected_claims {
+            let Some(watch_state) = runtime_state.get(&request.pr_number) else {
+                anyhow::bail!(
+                    "reviewer claim for PR #{} disappeared before persistence",
+                    request.pr_number
+                );
+            };
+            let Some(attempt) = watch_state.reviewer_attempt.as_ref() else {
+                anyhow::bail!(
+                    "reviewer claim for PR #{} has no durable attempt before spawn",
+                    request.pr_number
+                );
+            };
+            if !reviewer_attempt_is_current(
+                watch_state,
+                request.pr_number,
+                &request.head_sha,
+                &request.attempt_id,
+            ) || attempt.phase != ReviewerAttemptPhase::Claimed
+            {
+                anyhow::bail!(
+                    "reviewer claim {} for PR #{} is no longer current before spawn",
+                    request.attempt_id,
+                    request.pr_number
+                );
+            }
+        }
         for (pr_number, head_sha) in updates {
             let entry = state.prs.entry(*pr_number).or_default();
             entry.last_head_sha = Some(head_sha.clone());
@@ -2055,7 +2093,8 @@ where
         self.write_watcher_state(&state).await?;
         debug!(
             count = updates.len(),
-            "Persisted last observed PR head SHAs"
+            claim_count = expected_claims.len(),
+            "Persisted PR runtime state"
         );
         Ok(())
     }
@@ -5382,7 +5421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reviewer_attempt_persists_exact_invocation_and_routing() {
+    async fn reviewer_attempt_persists_current_sha_before_spawn_and_exact_invocation() {
         struct MetadataSpawner {
             project_dir: std::path::PathBuf,
         }
@@ -5393,13 +5432,20 @@ mod tests {
                 &self,
                 pr: &crate::services::pr_registry::PrEntry,
             ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                assert_eq!(pr.last_head_sha.as_deref(), Some("sha-1"));
+                assert_eq!(
+                    pr.last_head_sha.as_deref(),
+                    Some("sha-current"),
+                    "reviewer must receive the verified observation SHA, not stale registry metadata"
+                );
                 let state: serde_json::Value = serde_json::from_str(
                     &tokio::fs::read_to_string(self.project_dir.join(".exo/watcher-state.json"))
                         .await?,
                 )?;
-                assert_eq!(state["prs"]["1"]["last_head_sha"], "sha-1");
-                assert_eq!(state["prs"]["1"]["reviewer_attempt"]["head_sha"], "sha-1");
+                assert_eq!(state["prs"]["1"]["last_head_sha"], "sha-current");
+                assert_eq!(
+                    state["prs"]["1"]["reviewer_attempt"]["head_sha"],
+                    "sha-current"
+                );
                 assert_eq!(state["prs"]["1"]["reviewer_attempt"]["phase"], "claimed");
                 Ok(crate::services::ReviewerSpawnMetadata {
                     invocation_id: Some("review-invocation-1".to_string()),
@@ -5420,9 +5466,11 @@ mod tests {
                 project_dir: temp_dir.path().to_path_buf(),
             }),
         );
-        let registry = test_registry(test_pr_entry());
+        let mut pr = test_pr_entry();
+        pr.last_head_sha = Some("sha-stale".to_string());
+        let registry = test_registry(pr);
         let mut observations = HashMap::new();
-        observations.insert(1u64, test_observation("sha-1"));
+        observations.insert(1u64, test_observation("sha-current"));
 
         watcher
             .process_observations(&registry, &observations)
@@ -5434,7 +5482,7 @@ mod tests {
             .get(&1)
             .and_then(|state| state.reviewer_attempt.as_ref())
             .unwrap();
-        assert_eq!(attempt.head_sha, "sha-1");
+        assert_eq!(attempt.head_sha, "sha-current");
         assert_eq!(attempt.phase, ReviewerAttemptPhase::Running);
         assert_eq!(
             attempt.invocation_id.as_deref(),
@@ -6272,6 +6320,10 @@ mod tests {
                 "reviewer_spawned should remain false after the first failed spawn"
             );
         }
+        let persisted = watcher.read_watcher_state().await.unwrap();
+        let attempt = persisted.prs[&1].reviewer_attempt.as_ref().unwrap();
+        assert_eq!(attempt.phase, ReviewerAttemptPhase::Failed);
+        assert_eq!(attempt.failure.as_deref(), Some("spawn failed"));
 
         watcher
             .process_observations(&registry, &observations)
