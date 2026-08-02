@@ -171,6 +171,24 @@ install-all: (_install "release")
 # Install everything (fast dev build)
 install-all-dev: (_install "dev")
 
+# Compatibility entry point for profile-based install commands
+install profile:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    case "{{profile}}" in
+        all)
+            just install-all
+            ;;
+        all-dev)
+            just install-all-dev
+            ;;
+        *)
+            echo "Usage: just install all | all-dev" >&2
+            exit 2
+            ;;
+    esac
+
 # Regenerate Haskell proto types
 # Generated files are checked in - only run when protos change
 proto-gen-haskell:

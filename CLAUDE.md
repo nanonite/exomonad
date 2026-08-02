@@ -180,6 +180,10 @@ just install-all-dev
 # Or install release build (optimized, slower compile)
 just install-all
 
+# Compatibility forms
+just install all
+just install all-dev
+
 # WASM builds (two equivalent options)
 just wasm-all                     # Build all WASM via nix
 exomonad recompile --role devswarm # Build specific role's WASM via nix

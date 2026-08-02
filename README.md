@@ -40,6 +40,10 @@ cd exomonad
 just install-all      # Release build (optimized, slower compile)
 # or
 just install-all-dev  # Debug build (fast compile, good for development)
+
+# Compatibility forms
+just install all       # Release install
+just install all-dev   # Debug install
 ```
 
 First build downloads Nix dependencies and initializes the WASM toolchain — subsequent builds are cached. Artifacts are installed to `~/.cargo/bin/exomonad` and `~/.exo/wasm/`.
