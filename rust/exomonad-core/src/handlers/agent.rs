@@ -2904,6 +2904,7 @@ async fn reset_watcher_pr_state_file(project_dir: &Path, pr_number: u64) -> anyh
             entry.insert("rounds".to_string(), serde_json::json!(0));
             entry.insert("stuck".to_string(), serde_json::json!(false));
             entry.insert("needs_human_review".to_string(), serde_json::json!(false));
+            entry.insert("reviewer_attempt".to_string(), serde_json::Value::Null);
             entry.remove("last_review_fingerprint");
         })
         .is_some();

@@ -2092,10 +2092,19 @@ impl<
         // Create a detached-HEAD worktree at the PR branch tip unless it already exists.
         // Detached so we don't compete with the worker's branch; the reviewer never commits.
         // This prevents clobbering the worker's opencode.json/MCP config while both run.
+        let at_ref = pr_entry
+            .last_head_sha
+            .clone()
+            .filter(|sha| !sha.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "refusing reviewer spawn for PR #{} without a verified head SHA",
+                    pr_entry.number
+                )
+            })?;
         if !reviewer_path.exists() {
             let git_wt = self.git_wt().clone();
             let path = reviewer_path.clone();
-            let at_ref = pr_entry.head_branch.clone();
             let name = identity.internal_name().to_string();
             tokio::task::spawn_blocking(move || {
                 git_wt.create_workspace_detached(&path, &at_ref, &name)
@@ -2103,6 +2112,30 @@ impl<
             .await
             .context("tokio join error creating reviewer worktree")?
             .context("Failed to create reviewer worktree")?;
+        } else {
+            let current_head = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&reviewer_path)
+                .output()
+                .await
+                .context("failed to inspect reviewer worktree head")?;
+            let current_head = String::from_utf8_lossy(&current_head.stdout)
+                .trim()
+                .to_string();
+            if !current_head.eq_ignore_ascii_case(&at_ref) {
+                let checkout = Command::new("git")
+                    .args(["checkout", "--detach", "--force", &at_ref])
+                    .current_dir(&reviewer_path)
+                    .output()
+                    .await
+                    .context("failed to align reviewer worktree with published head")?;
+                if !checkout.status.success() {
+                    anyhow::bail!(
+                        "reviewer worktree is at {current_head}, cannot checkout published head {at_ref}: {}",
+                        String::from_utf8_lossy(&checkout.stderr).trim()
+                    );
+                }
+            }
         }
 
         let options = SpawnSubtreeOptions {
@@ -2228,7 +2261,7 @@ impl<
     async fn spawn_reviewer_for_pr(
         &self,
         pr: &crate::services::pr_registry::PrEntry,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
         // Guard: if the author's worktree is gone, this PR is stale from a previous
         // session (crash or --recreate). Skip — no agent will respond to feedback.
         let worktree_path = self.worktree_base.join(&pr.author_agent);
@@ -2239,13 +2272,22 @@ impl<
                 path = %worktree_path.display(),
                 "Skipping reviewer spawn — author worktree absent (stale PR from previous session)"
             );
-            return Ok(());
+            anyhow::bail!(
+                "reviewer spawn skipped for PR #{} because author worktree is absent",
+                pr.number
+            );
         }
         let caller_bb = BirthBranch::try_from_str(pr.base_branch.as_str())
             .expect("validated string input is non-empty");
-        self.spawn_reviewer_for_recovery(pr, &caller_bb).await?;
-
-        Ok(())
+        let result = self.spawn_reviewer_for_recovery(pr, &caller_bb).await?;
+        let invocation = read_invocation(&result.agent_dir).await?;
+        Ok(crate::services::ReviewerSpawnMetadata {
+            invocation_id: invocation
+                .as_ref()
+                .map(|record| record.invocation_id.clone()),
+            reviewer_agent: Some(result.agent_name.to_string()),
+            routing: invocation.map(|record| record.routing),
+        })
     }
 }
 

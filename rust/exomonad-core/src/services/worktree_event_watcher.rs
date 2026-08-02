@@ -4,6 +4,7 @@ use crate::services::agent_control::AgentType;
 use crate::services::agent_resources::dispose_reviewers_for_pr;
 use crate::services::pr_registry::{
     read_published_heads, ForgejoReviewState, PrEntry, PrRegistry, PrState, PublishedHead,
+    ReviewerAttempt, ReviewerAttemptPhase,
 };
 use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
+use uuid::Uuid;
 
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
 const DEFAULT_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(30);
@@ -108,6 +110,15 @@ struct PendingPrActions {
     agent_role: String,
 }
 
+#[derive(Debug, Clone)]
+struct ReviewerSpawnRequest {
+    pr_number: u64,
+    head_sha: String,
+    reason: &'static str,
+    attempt_id: String,
+    pr: PrEntry,
+}
+
 fn evict_closed_prs_from_state(state: &mut WatcherStateFile, registry: &PrRegistry) -> Vec<u64> {
     let mut evicted = Vec::new();
     state.prs.retain(|pr_number, _| {
@@ -180,8 +191,61 @@ fn approved_review_round(old_rounds: u32, changes_requested_rounds: u32) -> u32 
     }
 }
 
-fn should_spawn_reviewer_for_new_head(state: &WatchState, max_rounds: u32) -> bool {
-    !state.reviewer_spawned && !state.reviewer_disposed && state.rounds < max_rounds
+fn should_spawn_reviewer_for_new_head(state: &WatchState, head_sha: &str, max_rounds: u32) -> bool {
+    if state.rounds >= max_rounds || state.reviewer_disposed {
+        return false;
+    }
+
+    match state.reviewer_attempt.as_ref() {
+        Some(attempt) if attempt.head_sha == head_sha && attempt.round == state.rounds => {
+            matches!(attempt.phase, ReviewerAttemptPhase::Failed)
+        }
+        Some(_) => true,
+        None => !state.reviewer_spawned,
+    }
+}
+
+fn claim_reviewer_attempt(
+    state: &mut WatchState,
+    pr_number: u64,
+    head_sha: &str,
+    max_rounds: u32,
+) -> Option<String> {
+    if !should_spawn_reviewer_for_new_head(state, head_sha, max_rounds) {
+        return None;
+    }
+
+    let attempt_id = Uuid::new_v4().to_string();
+    state.reviewer_attempt = Some(ReviewerAttempt {
+        pr_number,
+        head_sha: head_sha.to_string(),
+        round: state.rounds,
+        attempt_id: attempt_id.clone(),
+        phase: ReviewerAttemptPhase::Claimed,
+        invocation_id: None,
+        reviewer_agent: None,
+        routing: None,
+        claimed_at: Utc::now(),
+        started_at: None,
+        finished_at: None,
+        failure: None,
+    });
+    state.reviewer_spawned = false;
+    state.reviewer_disposed = false;
+    Some(attempt_id)
+}
+
+fn reviewer_attempt_is_current(
+    state: &WatchState,
+    pr_number: u64,
+    head_sha: &str,
+    attempt_id: &str,
+) -> bool {
+    state.reviewer_attempt.as_ref().is_some_and(|attempt| {
+        attempt.pr_number == pr_number
+            && attempt.head_sha == head_sha
+            && attempt.attempt_id == attempt_id
+    })
 }
 
 fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
@@ -242,6 +306,7 @@ struct WatchState {
     stuck: bool,
     reviewer_spawned: bool,
     reviewer_disposed: bool,
+    reviewer_attempt: Option<ReviewerAttempt>,
     review_approved_at: Option<Instant>,
     ci_mergeable_at: Option<Instant>,
     merge_ready_notified: bool,
@@ -313,6 +378,8 @@ struct WatcherPrState {
     ci_triggered_sha: Option<String>,
     #[serde(default)]
     ci_blocked_notified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewer_attempt: Option<ReviewerAttempt>,
 }
 
 #[derive(Debug, Default)]
@@ -376,6 +443,7 @@ impl WatchState {
             stuck: false,
             reviewer_spawned: false,
             reviewer_disposed: false,
+            reviewer_attempt: None,
             review_approved_at: None,
             ci_mergeable_at: if matches!(ci_status, CIStatus::Success | CIStatus::Neutral) {
                 Some(Instant::now())
@@ -397,6 +465,7 @@ impl WatchState {
         self.stuck = false;
         self.reviewer_spawned = false;
         self.reviewer_disposed = false;
+        self.reviewer_attempt = None;
         self.review_approved_at = None;
         self.ci_mergeable_at = None;
         self.ci_triggered_sha = None;
@@ -892,47 +961,117 @@ where
         self.ci_source_configured || self.ctx.forgejo_client().is_some()
     }
 
-    fn spawn_reviewer_for_pr(&self, pr_number: u64, pr: &PrEntry, head_sha: &str, reason: &str) {
+    async fn spawn_reviewer_for_pr(&self, request: ReviewerSpawnRequest) {
         let Some(spawner) = &self.reviewer_spawner else {
             warn!(
-                pr_number,
-                head_sha,
-                reason,
+                pr_number = request.pr_number,
+                head_sha = %request.head_sha,
+                reason = request.reason,
                 "Reviewer spawner is not configured; skipping reviewer auto-spawn"
             );
+            let mut state = self.state.prs.lock().await;
+            if let Some(ws) = state.get_mut(&request.pr_number) {
+                if reviewer_attempt_is_current(
+                    ws,
+                    request.pr_number,
+                    &request.head_sha,
+                    &request.attempt_id,
+                ) {
+                    if let Some(attempt) = ws.reviewer_attempt.as_mut() {
+                        attempt.phase = ReviewerAttemptPhase::Failed;
+                        attempt.finished_at = Some(Utc::now());
+                        attempt.failure = Some("reviewer spawner is not configured".to_string());
+                    }
+                    ws.reviewer_spawned = false;
+                }
+            }
+            drop(state);
+            if let Err(error) = self
+                .persist_last_head_shas(&[(request.pr_number, request.head_sha)])
+                .await
+            {
+                warn!(
+                    pr_number = request.pr_number,
+                    %error,
+                    "Failed to persist unavailable reviewer spawner state"
+                );
+            }
             return;
         };
 
         let spawner = spawner.clone();
-        let pr_clone = pr.clone();
-        let state = self.state.clone();
-        let head_sha = head_sha.to_string();
-        let reason = reason.to_string();
-        tokio::spawn(async move {
-            info!(pr_number, head_sha = %head_sha, reason = %reason, "Spawning reviewer agent for PR");
-            match spawner.spawn_reviewer_for_pr(&pr_clone).await {
-                Ok(_) => {
-                    info!(
-                        pr_number,
-                        head_sha = %head_sha,
-                        reason = %reason,
-                        "Reviewer agent spawned successfully for PR"
-                    );
-                    if let Some(ws) = state.prs.lock().await.get_mut(&pr_number) {
-                        ws.reviewer_spawned = true;
+        let pr_number = request.pr_number;
+        let head_sha = request.head_sha;
+        let attempt_id = request.attempt_id;
+        info!(
+            pr_number,
+            head_sha = %head_sha,
+            reason = request.reason,
+            attempt_id = %attempt_id,
+            "Spawning reviewer agent for PR"
+        );
+        match spawner.spawn_reviewer_for_pr(&request.pr).await {
+            Ok(metadata) => {
+                let mut state = self.state.prs.lock().await;
+                if state.get(&pr_number).is_some_and(|ws| {
+                    reviewer_attempt_is_current(ws, pr_number, &head_sha, &attempt_id)
+                }) {
+                    let ws = state
+                        .get_mut(&pr_number)
+                        .expect("reviewer attempt was present during claim");
+                    if let Some(attempt) = ws.reviewer_attempt.as_mut() {
+                        attempt.phase = ReviewerAttemptPhase::Running;
+                        attempt.invocation_id = metadata.invocation_id;
+                        attempt.reviewer_agent = metadata.reviewer_agent;
+                        attempt.routing = metadata.routing;
+                        attempt.started_at = Some(Utc::now());
+                        attempt.failure = None;
                     }
-                }
-                Err(e) => {
+                    ws.reviewer_spawned = true;
+                } else {
                     warn!(
                         pr_number,
                         head_sha = %head_sha,
-                        reason = %reason,
-                        error = %e,
-                        "Failed to spawn reviewer for PR"
-                    )
+                        attempt_id = %attempt_id,
+                        "Ignoring reviewer spawn result for a replaced attempt"
+                    );
+                }
+                drop(state);
+                if let Err(error) = self
+                    .persist_last_head_shas(&[(pr_number, head_sha.clone())])
+                    .await
+                {
+                    warn!(pr_number, %error, "Failed to persist successful reviewer attempt");
                 }
             }
-        });
+            Err(error) => {
+                warn!(
+                    pr_number,
+                    head_sha = %head_sha,
+                    attempt_id = %attempt_id,
+                    error = %error,
+                    "Failed to spawn reviewer for PR"
+                );
+                let mut state = self.state.prs.lock().await;
+                if let Some(ws) = state.get_mut(&pr_number) {
+                    if reviewer_attempt_is_current(ws, pr_number, &head_sha, &attempt_id) {
+                        if let Some(attempt) = ws.reviewer_attempt.as_mut() {
+                            attempt.phase = ReviewerAttemptPhase::Failed;
+                            attempt.finished_at = Some(Utc::now());
+                            attempt.failure = Some(error.to_string());
+                        }
+                        ws.reviewer_spawned = false;
+                    }
+                }
+                drop(state);
+                if let Err(persist_error) = self
+                    .persist_last_head_shas(&[(pr_number, head_sha.clone())])
+                    .await
+                {
+                    warn!(pr_number, %persist_error, "Failed to persist failed reviewer attempt");
+                }
+            }
+        }
     }
 
     async fn observed_ci_status(&self, branch: &BranchName, head_sha: &str) -> CIStatus {
@@ -1045,7 +1184,99 @@ where
             tokio::fs::create_dir_all(parent).await?;
         }
         let data = serde_json::to_string_pretty(state)?;
-        tokio::fs::write(&self.watcher_state_path, data).await?;
+        let temporary = self
+            .watcher_state_path
+            .with_extension(format!("json.{}.tmp", Uuid::new_v4()));
+        if let Err(error) = tokio::fs::write(&temporary, data).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to write temporary watcher state {}",
+                    temporary.display()
+                )
+            });
+        }
+        if let Err(error) = tokio::fs::rename(&temporary, &self.watcher_state_path).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to replace watcher state {}",
+                    self.watcher_state_path.display()
+                )
+            });
+        }
+        Ok(())
+    }
+
+    async fn reconcile_reviewer_attempts(&self) -> Result<()> {
+        let mut persisted = self.read_watcher_state().await.unwrap_or_default();
+        let mut changed = false;
+        for (pr_number, state) in &mut persisted.prs {
+            let Some(attempt) = state.reviewer_attempt.as_mut() else {
+                continue;
+            };
+            if attempt.phase != ReviewerAttemptPhase::Running {
+                continue;
+            }
+            let Some(agent) = attempt.reviewer_agent.as_deref() else {
+                continue;
+            };
+            let agent_dir = self.ctx.project_dir().join(".exo/agents").join(agent);
+            let invocation = match crate::services::agent_control::read_invocation(&agent_dir).await
+            {
+                Ok(invocation) => invocation,
+                Err(error) => {
+                    warn!(
+                        pr_number,
+                        agent,
+                        %error,
+                        "Cannot reconcile reviewer invocation; preserving attempt conservatively"
+                    );
+                    continue;
+                }
+            };
+            let still_live = invocation.as_ref().is_some_and(|record| {
+                record.invocation_id == attempt.invocation_id.as_deref().unwrap_or_default()
+                    && record.is_live()
+            });
+            if still_live {
+                continue;
+            }
+            attempt.phase = ReviewerAttemptPhase::Failed;
+            attempt.finished_at = Some(Utc::now());
+            attempt.failure = Some("reviewer invocation exited before a verdict".to_string());
+            changed = true;
+            warn!(
+                pr_number,
+                head_sha = %attempt.head_sha,
+                attempt_id = %attempt.attempt_id,
+                "Reconciled missing or exited reviewer invocation for retry"
+            );
+        }
+        if changed {
+            let mut runtime = self.state.prs.lock().await;
+            for (pr_number, persisted_state) in &persisted.prs {
+                let Some(persisted_attempt) = persisted_state.reviewer_attempt.as_ref() else {
+                    continue;
+                };
+                if persisted_attempt.phase != ReviewerAttemptPhase::Failed {
+                    continue;
+                }
+                if let Some(runtime_state) = runtime.get_mut(pr_number) {
+                    if reviewer_attempt_is_current(
+                        runtime_state,
+                        *pr_number,
+                        &persisted_attempt.head_sha,
+                        &persisted_attempt.attempt_id,
+                    ) {
+                        runtime_state.reviewer_attempt = Some(persisted_attempt.clone());
+                        runtime_state.reviewer_spawned = false;
+                    }
+                }
+            }
+            drop(runtime);
+            self.write_watcher_state(&persisted).await?;
+        }
         Ok(())
     }
 
@@ -1347,9 +1578,11 @@ where
         registry: &crate::services::pr_registry::PrRegistry,
         observations: &HashMap<u64, Observation>,
     ) -> Result<Vec<u64>> {
+        self.reconcile_reviewer_attempts().await?;
         let mut removed_prs = Vec::new();
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
         let mut reviewer_disposals: Vec<u64> = Vec::new();
+        let mut reviewer_spawns: Vec<ReviewerSpawnRequest> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
         let watcher_state = self.read_watcher_state().await.unwrap_or_default();
 
@@ -1401,26 +1634,51 @@ where
                     .or(pr.last_head_sha.as_deref());
                 let head_sha_changed = last_observed_head_sha
                     .is_some_and(|last_head_sha| last_head_sha != obs.head_sha.as_str());
+                let (all_observed_reviews, _) = obs_to_review_parts(obs);
+                let current_reviews: Vec<ForgejoReview> = all_observed_reviews
+                    .into_iter()
+                    .filter(|review| {
+                        review
+                            .commit_id
+                            .as_deref()
+                            .is_none_or(|review_sha| review_sha == obs.head_sha)
+                    })
+                    .collect();
+                let current_review_present = if obs.reviews.is_empty() {
+                    obs.forgejo_review_present
+                } else {
+                    !current_reviews.is_empty()
+                };
+                let stale_reviews = !obs.reviews.is_empty() && current_reviews.is_empty();
                 let stale_terminal_review_after_head_change = head_sha_changed
                     && review_state_disposes_reviewer(&obs.review_state)
-                    && !obs.forgejo_review_present;
+                    && !current_review_present;
                 let terminal_review_observed = review_state_disposes_reviewer(&obs.review_state)
-                    && !stale_terminal_review_after_head_change;
-                let (local_reviews, _local_review_state) =
-                    if stale_terminal_review_after_head_change {
-                        (Vec::new(), ForgejoReviewVerdict::None)
-                    } else {
-                        obs_to_review_parts(obs)
-                    };
+                    && !stale_terminal_review_after_head_change
+                    && current_review_present;
+                let local_reviews = if stale_terminal_review_after_head_change {
+                    Vec::new()
+                } else {
+                    current_reviews
+                };
+                let current_changes_requested_rounds = if stale_reviews {
+                    0
+                } else {
+                    obs.changes_requested_rounds
+                        .max(distinct_changes_requested_rounds(&local_reviews))
+                };
                 head_sha_updates.push((*pr_number, obs.head_sha.clone()));
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
                     if head_sha_changed {
                         old_state.reviewer_spawned = false;
                         old_state.reviewer_disposed = false;
+                        old_state.reviewer_attempt = None;
                         old_state.stuck = false;
                     }
-                    if should_spawn_reviewer_for_new_head(
+                    if let Some(attempt_id) = claim_reviewer_attempt(
                         old_state,
+                        *pr_number,
+                        &obs.head_sha,
                         self.policy.reviewer_max_rounds,
                     ) {
                         let reason = if head_sha_changed {
@@ -1428,7 +1686,16 @@ where
                         } else {
                             "retry_missing_reviewer"
                         };
-                        self.spawn_reviewer_for_pr(*pr_number, pr, &obs.head_sha, reason);
+                        reviewer_spawns.push(ReviewerSpawnRequest {
+                            pr_number: *pr_number,
+                            head_sha: obs.head_sha.clone(),
+                            reason,
+                            attempt_id,
+                            pr: PrEntry {
+                                last_head_sha: Some(obs.head_sha.clone()),
+                                ..pr.clone()
+                            },
+                        });
                     }
                     compute_pr_actions_with_context(
                         old_state,
@@ -1436,7 +1703,7 @@ where
                         &obs.head_sha,
                         &obs.comments,
                         &local_reviews,
-                        obs.changes_requested_rounds,
+                        current_changes_requested_rounds,
                         obs.ci_status,
                         pr.merge_blocked_on_ci,
                         pr.reviewer_agent.is_some(),
@@ -1457,6 +1724,32 @@ where
                     new_state.addressed_changes = persisted.addressed_changes;
                     new_state.rounds = persisted.rounds;
                     new_state.stuck = persisted.stuck || persisted.needs_human_review;
+                    new_state.reviewer_attempt = persisted.reviewer_attempt.clone();
+                    if new_state
+                        .reviewer_attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.head_sha != obs.head_sha)
+                    {
+                        new_state.reviewer_attempt = None;
+                    }
+                    new_state.reviewer_spawned =
+                        new_state.reviewer_attempt.as_ref().is_some_and(|attempt| {
+                            matches!(
+                                attempt.phase,
+                                ReviewerAttemptPhase::Claimed | ReviewerAttemptPhase::Running
+                            )
+                        });
+                    new_state.reviewer_disposed =
+                        new_state.reviewer_attempt.as_ref().is_some_and(|attempt| {
+                            matches!(
+                                attempt.phase,
+                                ReviewerAttemptPhase::Approved
+                                    | ReviewerAttemptPhase::ChangesRequested
+                                    | ReviewerAttemptPhase::Commented
+                                    | ReviewerAttemptPhase::Disposed
+                                    | ReviewerAttemptPhase::Stuck
+                            )
+                        });
                     new_state.merge_ready_notified = persisted.merge_ready_notified;
                     new_state.ci_triggered_sha = persisted.ci_triggered_sha.clone();
                     new_state.ci_blocked_notified = persisted.ci_blocked_notified;
@@ -1469,7 +1762,7 @@ where
                         &obs.head_sha,
                         &obs.comments,
                         &local_reviews,
-                        obs.changes_requested_rounds,
+                        current_changes_requested_rounds,
                         obs.ci_status,
                         pr.merge_blocked_on_ci,
                         pr.reviewer_agent.is_some(),
@@ -1481,11 +1774,29 @@ where
                     );
                     // Spawn reviewer immediately on first sighting of a new open PR
                     // unless the watcher restarted after a terminal review verdict.
-                    let should_spawn_reviewer = state_guard.get(pr_number).is_some_and(|state| {
-                        should_spawn_reviewer_for_new_head(state, self.policy.reviewer_max_rounds)
-                    });
-                    if !terminal_review_observed && should_spawn_reviewer {
-                        self.spawn_reviewer_for_pr(*pr_number, pr, &obs.head_sha, "first_sighting");
+                    let attempt_id = if !terminal_review_observed {
+                        state_guard.get_mut(pr_number).and_then(|state| {
+                            claim_reviewer_attempt(
+                                state,
+                                *pr_number,
+                                &obs.head_sha,
+                                self.policy.reviewer_max_rounds,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(attempt_id) = attempt_id {
+                        reviewer_spawns.push(ReviewerSpawnRequest {
+                            pr_number: *pr_number,
+                            head_sha: obs.head_sha.clone(),
+                            reason: "first_sighting",
+                            attempt_id,
+                            pr: PrEntry {
+                                last_head_sha: Some(obs.head_sha.clone()),
+                                ..pr.clone()
+                            },
+                        });
                     }
                     actions
                 };
@@ -1500,6 +1811,21 @@ where
                             );
                             reviewer_disposals.push(*pr_number);
                             ws.reviewer_disposed = true;
+                            if let Some(attempt) = ws.reviewer_attempt.as_mut() {
+                                attempt.phase = match obs.review_state {
+                                    ForgejoReviewState::Approved => ReviewerAttemptPhase::Approved,
+                                    ForgejoReviewState::ChangesRequested => {
+                                        ReviewerAttemptPhase::ChangesRequested
+                                    }
+                                    ForgejoReviewState::Commented => {
+                                        ReviewerAttemptPhase::Commented
+                                    }
+                                    ForgejoReviewState::PendingReview => {
+                                        ReviewerAttemptPhase::Disposed
+                                    }
+                                };
+                                attempt.finished_at = Some(Utc::now());
+                            }
                         }
                     }
                 }
@@ -1527,6 +1853,9 @@ where
         }
 
         self.persist_last_head_shas(&head_sha_updates).await?;
+        for request in reviewer_spawns {
+            self.spawn_reviewer_for_pr(request).await;
+        }
         for pr_number in reviewer_disposals {
             let reviewer_slugs = dispose_reviewers_for_pr(
                 self.ctx.project_dir(),
@@ -1719,6 +2048,7 @@ where
                 entry.merge_ready_notified = watch_state.merge_ready_notified;
                 entry.ci_triggered_sha = watch_state.ci_triggered_sha.clone();
                 entry.ci_blocked_notified = watch_state.ci_blocked_notified;
+                entry.reviewer_attempt = watch_state.reviewer_attempt.clone();
             }
         }
         drop(runtime_state);
@@ -2224,7 +2554,6 @@ where
         };
 
         let mut local_reviews = Vec::new();
-        let mut all_reviews = Vec::new();
         for review in reviews {
             let state = review_state_from_str(&review.state);
             if state == ForgejoReviewVerdict::None {
@@ -2237,8 +2566,6 @@ where
                 author_branch: None,
                 commit_id: review.commit_id,
             };
-            all_reviews.push(local_review.clone());
-
             if let Some(review_commit) = local_review
                 .commit_id
                 .as_deref()
@@ -2257,7 +2584,7 @@ where
 
         let review_state = aggregate_review_state(&local_reviews);
 
-        let changes_requested_rounds = distinct_changes_requested_rounds(&all_reviews);
+        let changes_requested_rounds = distinct_changes_requested_rounds(&local_reviews);
         let forgejo_review_present = !local_reviews.is_empty();
 
         let mut inline_comments: Vec<ForgejoReviewComment> = Vec::new();
@@ -5036,6 +5363,141 @@ mod tests {
     // Reviewer spawner tests
     // ---------------------------------------------------------------------------
 
+    #[test]
+    fn reviewer_attempt_claim_is_idempotent_and_sha_scoped() {
+        let branch = BranchName::try_from_str("main.feature-codex").unwrap();
+        let mut state = WatchState::new(&branch, AgentType::Codex, "sha-1", CIStatus::Unknown, 0);
+
+        let first = claim_reviewer_attempt(&mut state, 7, "sha-1", 3).unwrap();
+        assert!(claim_reviewer_attempt(&mut state, 7, "sha-1", 3).is_none());
+
+        state.reviewer_attempt.as_mut().unwrap().phase = ReviewerAttemptPhase::Failed;
+        let retry = claim_reviewer_attempt(&mut state, 7, "sha-1", 3).unwrap();
+        assert_ne!(first, retry);
+
+        state.reviewer_attempt = None;
+        let next_head = claim_reviewer_attempt(&mut state, 7, "sha-2", 3).unwrap();
+        assert_ne!(retry, next_head);
+        assert_eq!(state.reviewer_attempt.as_ref().unwrap().head_sha, "sha-2");
+    }
+
+    #[tokio::test]
+    async fn reviewer_attempt_persists_exact_invocation_and_routing() {
+        struct MetadataSpawner {
+            project_dir: std::path::PathBuf,
+        }
+
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for MetadataSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                pr: &crate::services::pr_registry::PrEntry,
+            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
+                assert_eq!(pr.last_head_sha.as_deref(), Some("sha-1"));
+                let state: serde_json::Value = serde_json::from_str(
+                    &tokio::fs::read_to_string(self.project_dir.join(".exo/watcher-state.json"))
+                        .await?,
+                )?;
+                assert_eq!(state["prs"]["1"]["last_head_sha"], "sha-1");
+                assert_eq!(state["prs"]["1"]["reviewer_attempt"]["head_sha"], "sha-1");
+                assert_eq!(state["prs"]["1"]["reviewer_attempt"]["phase"], "claimed");
+                Ok(crate::services::ReviewerSpawnMetadata {
+                    invocation_id: Some("review-invocation-1".to_string()),
+                    reviewer_agent: Some("review-pr-1-codex".to_string()),
+                    routing: Some(crate::domain::RoutingInfo::pane(
+                        crate::services::tmux_ipc::PaneId::parse("%42").unwrap(),
+                        "review-pr-1",
+                    )),
+                })
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(
+            Arc::new(MetadataSpawner {
+                project_dir: temp_dir.path().to_path_buf(),
+            }),
+        );
+        let registry = test_registry(test_pr_entry());
+        let mut observations = HashMap::new();
+        observations.insert(1u64, test_observation("sha-1"));
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        let state = watcher.state.prs.lock().await;
+        let attempt = state
+            .get(&1)
+            .and_then(|state| state.reviewer_attempt.as_ref())
+            .unwrap();
+        assert_eq!(attempt.head_sha, "sha-1");
+        assert_eq!(attempt.phase, ReviewerAttemptPhase::Running);
+        assert_eq!(
+            attempt.invocation_id.as_deref(),
+            Some("review-invocation-1")
+        );
+        assert_eq!(attempt.reviewer_agent.as_deref(), Some("review-pr-1-codex"));
+        assert_eq!(
+            attempt
+                .routing
+                .as_ref()
+                .unwrap()
+                .pane_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "%42"
+        );
+        drop(state);
+
+        let persisted = watcher.read_watcher_state().await.unwrap();
+        let persisted_attempt = persisted.prs[&1].reviewer_attempt.as_ref().unwrap();
+        assert_eq!(persisted_attempt.attempt_id.len(), 36);
+        assert_eq!(persisted_attempt.phase, ReviewerAttemptPhase::Running);
+    }
+
+    #[tokio::test]
+    async fn stale_reviewer_verdict_does_not_advance_authoritative_phase() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let registry = test_registry(test_pr_entry());
+        let mut observation = test_observation("sha-current");
+        observation.review_state = ForgejoReviewState::Approved;
+        observation.forgejo_review_present = true;
+        observation.reviews = vec![ForgejoReview {
+            review_id: Some(9),
+            body: "stale approval".to_string(),
+            state: ForgejoReviewVerdict::Approved,
+            author_branch: None,
+            commit_id: Some("sha-old".to_string()),
+        }];
+        let mut observations = HashMap::new();
+        observations.insert(1u64, observation);
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        let state = watcher.state.prs.lock().await;
+        let state = state.get(&1).unwrap();
+        assert_eq!(state.last_review_state, ForgejoReviewVerdict::None);
+        assert!(!state.reviewer_disposed);
+        assert!(!matches!(
+            state.reviewer_attempt.as_ref().unwrap().phase,
+            ReviewerAttemptPhase::Approved
+                | ReviewerAttemptPhase::ChangesRequested
+                | ReviewerAttemptPhase::Commented
+                | ReviewerAttemptPhase::Disposed
+        ));
+    }
+
     struct MockReviewerSpawner {
         called: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -5045,9 +5507,9 @@ mod tests {
         async fn spawn_reviewer_for_pr(
             &self,
             _pr: &crate::services::pr_registry::PrEntry,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+            Ok(Default::default())
         }
     }
 
@@ -5212,9 +5674,9 @@ mod tests {
             async fn spawn_reviewer_for_pr(
                 &self,
                 _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<()> {
+            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(Default::default())
             }
         }
 
@@ -5724,7 +6186,7 @@ mod tests {
             async fn spawn_reviewer_for_pr(
                 &self,
                 _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<()> {
+            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
                 self.called.store(true, Ordering::SeqCst);
                 anyhow::bail!("spawn failed")
             }
@@ -5772,12 +6234,12 @@ mod tests {
             async fn spawn_reviewer_for_pr(
                 &self,
                 _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<()> {
+            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
                 let previous = self.count.fetch_add(1, Ordering::SeqCst);
                 if previous == 0 {
                     anyhow::bail!("spawn failed")
                 }
-                Ok(())
+                Ok(Default::default())
             }
         }
 
@@ -5877,9 +6339,9 @@ mod tests {
             async fn spawn_reviewer_for_pr(
                 &self,
                 _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<()> {
+            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
                 self.count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(Default::default())
             }
         }
 
@@ -5927,9 +6389,9 @@ mod tests {
             async fn spawn_reviewer_for_pr(
                 &self,
                 _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<()> {
+            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
                 self.count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(Default::default())
             }
         }
 
@@ -6009,9 +6471,9 @@ mod tests {
             async fn spawn_reviewer_for_pr(
                 &self,
                 _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<()> {
+            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
                 self.count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(Default::default())
             }
         }
 
@@ -6124,9 +6586,9 @@ mod tests {
             async fn spawn_reviewer_for_pr(
                 &self,
                 _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<()> {
+            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
                 self.count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(Default::default())
             }
         }
 
