@@ -158,6 +158,7 @@ pub async fn start_invocation(
         head_sha,
     };
     write_atomic(agent_dir, &record).await?;
+    crate::services::lifecycle::record_invocation_started(agent_dir, &record);
     info!(
         path = %invocation_path(agent_dir).display(),
         invocation_id = %record.invocation_id,
@@ -186,6 +187,7 @@ async fn finish_locked(
     record.status = status;
     record.exit_code = exit_code;
     write_atomic(agent_dir, &record).await?;
+    crate::services::lifecycle::record_invocation_finished(agent_dir, &record);
     info!(
         path = %invocation_path(agent_dir).display(),
         invocation_id,

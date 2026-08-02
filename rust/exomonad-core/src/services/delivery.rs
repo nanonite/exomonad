@@ -847,6 +847,15 @@ where
             let result = deliver_once(&inject, message.clone()).await;
             let success = result.is_ok();
 
+            crate::services::lifecycle::record_guidance_delivery(
+                &message.project_dir,
+                &message.recipient,
+                &message.from,
+                "tmux_injection",
+                if success { "success" } else { "failed" },
+            )
+            .await;
+
             tracing::info!(
                 otel.name = "message.delivery",
                 agent_id = %message.from,
@@ -1291,6 +1300,14 @@ pub async fn deliver_to_agent(
     let project_dir = ctx.project_dir();
     let agent_type = agent_type_from_key(agent_key);
     if !record_inbox_delivery(ctx, agent_key, from, message, summary).await {
+        crate::services::lifecycle::record_guidance_delivery(
+            project_dir,
+            agent_key,
+            from.as_str(),
+            "durable_inbox",
+            "failed",
+        )
+        .await;
         return DeliveryResult::Failed;
     }
     // Batch lookup: sender's team (for Tier 2 scoping) + recipient in-memory check.
@@ -1367,6 +1384,14 @@ pub async fn deliver_to_agent(
                     detail = format!("{}/{}", team_info.team_name, team_info.inbox_name),
                     "[event] message.delivery"
                 );
+                crate::services::lifecycle::record_guidance_delivery(
+                    project_dir,
+                    agent_key,
+                    from.as_str(),
+                    "teams_inbox",
+                    "success",
+                )
+                .await;
 
                 // Spawn background task to verify CC's InboxPoller read the message.
                 // If not read within 30s, fall back to tmux STDIN injection.
@@ -1463,6 +1488,14 @@ pub async fn deliver_to_agent(
                     detail = %socket_path.to_string_lossy(),
                     "[event] message.delivery"
                 );
+                crate::services::lifecycle::record_guidance_delivery(
+                    project_dir,
+                    agent_key,
+                    from.as_str(),
+                    "uds",
+                    "success",
+                )
+                .await;
                 return DeliveryResult::Uds;
             }
             Err(e) => {
@@ -1476,12 +1509,33 @@ pub async fn deliver_to_agent(
                     detail = %e,
                     "[event] message.delivery"
                 );
+                crate::services::lifecycle::record_guidance_delivery(
+                    project_dir,
+                    agent_key,
+                    from.as_str(),
+                    "uds",
+                    "failed",
+                )
+                .await;
             }
         }
     }
 
     // Fall back to tmux STDIN injection
-    match deliver_via_tmux(project_dir, agent_key, tmux_target, from, message).await {
+    let result = deliver_via_tmux(project_dir, agent_key, tmux_target, from, message).await;
+    crate::services::lifecycle::record_guidance_delivery(
+        project_dir,
+        agent_key,
+        from.as_str(),
+        "exact_tmux",
+        if matches!(result, DeliveryResult::Failed) {
+            "failed"
+        } else {
+            "queued"
+        },
+    )
+    .await;
+    match result {
         DeliveryResult::Failed => DeliveryResult::Durable,
         result => result,
     }

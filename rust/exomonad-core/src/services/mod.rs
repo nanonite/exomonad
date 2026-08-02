@@ -18,6 +18,7 @@ pub mod git_worktree;
 pub mod github;
 pub mod inbox_store;
 pub mod inbox_watcher;
+pub mod lifecycle;
 pub mod local;
 pub mod log;
 pub mod merge_pr;
