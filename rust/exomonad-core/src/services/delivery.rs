@@ -1753,7 +1753,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deliver_no_registry_returns_tmux() {
+    async fn test_deliver_no_registry_preserves_durable_inbox() {
         let services = crate::services::Services::test();
         let result = deliver_to_agent(
             &services,
@@ -1764,7 +1764,11 @@ mod tests {
             "summary",
         )
         .await;
-        assert_eq!(result, DeliveryResult::Tmux);
+        assert_eq!(
+            result,
+            DeliveryResult::Durable,
+            "stale or unavailable panes must reject tmux while preserving the inbox message"
+        );
 
         let drained = services.inbox_store.drain_unread("agent-1").unwrap();
         assert_eq!(drained.len(), 1);
