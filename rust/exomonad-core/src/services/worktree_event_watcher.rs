@@ -488,7 +488,7 @@ fn ci_status_message(pr_number: u64, status: &str, branch: &str) -> String {
 
 fn ci_blocked_message(pr_number: u64, status: &str, branch: &str) -> String {
     format!(
-        "[CI BLOCKED: PR #{pr_number}] CI finished with status {status} on {branch}. Dev leaf is staying alive and waiting for TL direction."
+        "[CI BLOCKED: PR #{pr_number}] CI finished with status {status} on {branch}. The TL owns the next decision and may use resume_pr."
     )
 }
 
@@ -711,7 +711,7 @@ fn native_leaf_pr_review_action(payload: &serde_json::Value) -> Option<EventActi
         }
         "stuck" => Some(EventActionResponse::InjectMessage {
             message: format!(
-                "Review loop stopped for PR #{} after {} rounds. Stay alive and wait for TL clarification.",
+                "Review loop stopped for PR #{} after {} rounds. The TL must provide the next repair assignment through resume_pr; this invocation may exit.",
                 value_u64(payload, "pr_number")?,
                 value_u64(payload, "rounds")?
             ),
@@ -3085,7 +3085,7 @@ mod tests {
                 assert_eq!(pr_number, 44);
                 assert_eq!(
                     message,
-                    "[CI BLOCKED: PR #44] CI finished with status failure on main.feature-codex. Dev leaf is staying alive and waiting for TL direction."
+                    "[CI BLOCKED: PR #44] CI finished with status failure on main.feature-codex. The TL owns the next decision and may use resume_pr."
                 );
             }
             other => panic!("expected CI blocked NotifyParent fallback, got {other:?}"),

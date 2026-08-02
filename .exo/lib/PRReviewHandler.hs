@@ -93,20 +93,20 @@ prReviewHandler (CIBlocked n status_ branch_) = do
   logHandler $ "CI blocked PR #" <> T.pack (show n) <> ", status: " <> status_
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CIBlockedEv n status_ branch_)
-  pure $ NotifyParentAction ("[CI BLOCKED: PR #" <> T.pack (show n) <> "] CI finished with status " <> status_ <> " on " <> branch_ <> ". Dev leaf is staying alive and waiting for TL direction.") n
+  pure $ NotifyParentAction ("[CI BLOCKED: PR #" <> T.pack (show n) <> "] CI finished with status " <> status_ <> " on " <> branch_ <> ". The TL owns the next decision and may use resume_pr.") n
 prReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
   branch <- getCurrentBranch
   void $
     applyEvent @DevPhase @DevEvent branch DevSpawned $
-      ReviewReceivedEv n ("Review loop exceeded " <> T.pack (show rounds_) <> " rounds. Stay alive and wait for TL clarification.")
+      ReviewReceivedEv n ("Review loop exceeded " <> T.pack (show rounds_) <> " rounds. The TL must provide the next repair assignment through resume_pr.")
   pure $
     InjectMessage $
       "Review loop stopped for PR #"
         <> T.pack (show n)
         <> " after "
         <> T.pack (show rounds_)
-        <> " rounds. Stay alive and wait for TL clarification."
+        <> " rounds. The TL must provide the next repair assignment through resume_pr."
 prReviewHandler (MergeReady n ci branch_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
   branch <- getCurrentBranch
@@ -227,7 +227,7 @@ ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerAppro
         then do
           branch <- getCurrentBranch
           void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CIBlockedEv n status_ branch_)
-          pure $ NotifyParentAction ("[CI BLOCKED: PR #" <> T.pack (show n) <> "] CI finished with status " <> status_ <> " on " <> branch_ <> ". Dev leaf is staying alive and waiting for TL direction.") n
+          pure $ NotifyParentAction ("[CI BLOCKED: PR #" <> T.pack (show n) <> "] CI finished with status " <> status_ <> " on " <> branch_ <> ". The TL owns the next decision and may use resume_pr.") n
         else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
 
 tlCiStatusHandler :: CIStatusEvent -> Eff Effects EventAction
@@ -246,7 +246,7 @@ reviewRequestAction n comments_ reviewBranch authorBranch phase =
     n
   where
     stuckSuffix (Just (DevNeedsHumanDirection _ reason)) =
-      "\n\nReview loop needs human direction: " <> reason <> ". The existing dev leaf is staying alive."
+      "\n\nReview loop needs human direction: " <> reason <> ". The TL must use resume_pr for the next invocation."
     stuckSuffix _ = ""
 
 -- | Helper to log handler entry.

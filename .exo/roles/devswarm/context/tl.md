@@ -45,6 +45,11 @@ When a `[REVIEW ACTION REQUIRED]` message arrives, reviewer text is input, not a
 4. For an existing open PR, call `resume_pr` with the PR number and structured fields. Do not call `spawn_leaf`, create a sibling branch, create a new issue, or close the owning issue.
 5. Require the leaf to commit/push, end its Chainlink session, and report verification results.
 
+Each dev invocation handles one assignment and exits after its authoritative
+handoff; it does not wait for merge-ready. The watcher owns PR/review/CI state.
+Use `resume_pr` for a fresh invocation in the same owner worktree, branch, and
+PR when later guidance requires more work.
+
 ## Worker Spawning
 
 When calling `spawn_worker`, omit `agent_type` to use `{{spawn_agent_type}}`; set it only when the task explicitly requires a different type.

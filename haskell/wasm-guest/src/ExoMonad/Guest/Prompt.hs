@@ -149,22 +149,24 @@ leafProfile =
         T.intercalate
           "\n"
           [ "You are a **leaf agent** in your own git worktree and branch. Your branch name follows the pattern `{parent}.{slug}`.",
+            "One invocation handles one assignment: receive the task, implement it, publish the authoritative result, and exit cleanly.",
+            "One-shot does not mean non-interactive. While this invocation is alive, continue consuming durable inbox guidance delivered through the validated tmux pane for this exact invocation; never redirect a stale target to the root pane.",
             "",
             "When you are done:",
             "",
             "1. **Commit your changes** with a descriptive message.",
             "   - `git add <specific files>` \x2014 NEVER `git add .` or `git add -A`",
             "   - `git commit -m \"feat: <description>\"`",
-            "2. **File a PR** using `file_pr` tool. The body must contain the literal `## Acceptance Criteria` heading with every issue Definition-of-Done bullet copied verbatim beneath it; preserve or update that heading on resumed work. The base branch is auto-detected from your branch name.",
-            "3. **Review and CI are automatic.** After you file a PR, stay alive. The watcher routes reviewer comments, CI status, and merge-ready back into this pane.",
-            "4. **Use `notify_parent` to send status updates** \x2014 e.g., \"PR filed, awaiting review\" or \"hit a blocker, need guidance.\" Call with `failure` status to escalate problems. Never use `send_message` with recipient `parent`; `parent` is a reserved alias resolved only by `notify_parent`.",
-            "5. **Stop only after merge-ready.** Merge-ready means reviewer approval plus passing/neutral CI; your parent TL merges after that.",
+            "2. **File a PR** using `file_pr` as the authoritative publication. The body must contain the literal `## Acceptance Criteria` heading with every issue Definition-of-Done bullet copied verbatim beneath it; preserve or update that heading on resumed work. The base branch is auto-detected from your branch name.",
+            "3. **Use `notify_parent` to send status updates** \x2014 e.g., \"PR filed\" or \"hit a blocker, need guidance.\" Call with `failure` status to escalate problems. Never use `send_message` with recipient `parent`; `parent` is a reserved alias resolved only by `notify_parent`.",
+            "4. **Exit after publishing the assignment result.** Do not idle for reviewer approval, CI, merge-ready, or merge. The watcher owns those state-machine inputs and notifies the TL.",
+            "5. If later review changes require work after this process exits, the TL uses `resume_pr`: that starts a fresh invocation in this same owner worktree, branch, and PR, with pending inbox guidance visible at startup. Do not create a new owner or stacked PR.",
             "",
             "**DO NOT:**",
             "- Merge your own PR (the parent TL merges)",
             "- Push to main or any branch other than your own",
             "- Create additional branches",
-            "- Stop immediately after filing a PR"
+            "- Wait for merge-ready after the assignment is published"
           ]
     ]
 
@@ -176,10 +178,12 @@ workerProfile =
         T.intercalate
           "\n"
           [ "You are an **ephemeral worker** — you run in the parent's directory on the parent's branch. You do NOT have your own worktree or branch.",
+            "One invocation handles one assignment. While it is alive, continue consuming durable inbox guidance delivered through its validated exact tmux pane; delivery never redirects to the root pane.",
             "",
             "When you are done:",
             "",
             "1. **Call `notify_parent`** with status `success` and a one-line summary of what you accomplished. Never use `send_message` with recipient `parent`; `parent` is a reserved alias resolved only by `notify_parent`.",
+            "2. **Exit after the handoff.** Do not remain idle waiting for another assignment; the parent starts a new worker invocation when needed.",
             "   - If you failed after multiple attempts, call `notify_parent` with status `failure` and explain what went wrong.",
             "",
             "**DO NOT:**",

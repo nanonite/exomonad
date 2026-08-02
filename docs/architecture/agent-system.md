@@ -21,7 +21,7 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 |------|-------|--------|----------|-----------|-----------|
 | `root` | Opus | yes | no | yes | persistent (TL window) |
 | `tl` | Opus | yes | yes | yes | per-subtree |
-| `dev` | Codex / Gemini / OpenCode | no | yes | no | per-spec, exits at merge-ready |
+| `dev` | Codex / Gemini / OpenCode | no | yes | no | one assignment per invocation, exits after handoff |
 | `reviewer` | Codex / Gemini / OpenCode | no | no | no | ephemeral per review round |
 | `worker` | Codex / Gemini / OpenCode | no | no | no | ephemeral, same-worktree edits |
 
@@ -193,15 +193,15 @@ stateDiagram-v2
   DevUnderReview --> DevNeedsHumanDirection: ReviewReceivedEv\n(round >= 1)
   DevApproved --> DevDone: MergeReadyEv
   DevPRFiled --> DevDone: MergeReadyEv
-  DevNeedsHumanDirection --> [*]: (escalated, stays alive)
+  DevNeedsHumanDirection --> [*]: (escalated, resume_pr if work is needed)
   DevDone --> [*]
   DevFailed --> [*]
 
   note right of DevChangesRequested: canExit = MustBlock
-  note right of DevPRFiled: canExit = MustBlock
-  note right of DevUnderReview: canExit = MustBlock
-  note right of DevApproved: canExit = MustBlock\n(awaits CI merge-ready)
-  note right of DevNeedsHumanDirection: canExit = MustBlock
+  note right of DevPRFiled: canExit = Clean\n(after authoritative handoff)
+  note right of DevUnderReview: canExit = Clean\n(after authoritative handoff)
+  note right of DevApproved: canExit = Clean\n(watcher owns CI)
+  note right of DevNeedsHumanDirection: canExit = Clean\n(TL uses resume_pr for repair)
 ```
 
 Round vocabulary is zero-based and tied to reviewer verdicts. Round 0 is the first reviewer verdict after the PR is filed. If that verdict requests changes, the dev fixes and pushes; `FixesPushedEv` moves the dev to `DevUnderReview` with `review_round=1`. A second `ReviewReceivedEv` in round 1 transitions to `DevNeedsHumanDirection`, and the handler notifies the TL with `[STUCK: PR #N]`. That is an in-band human-clarification signal, not a watcher health failure and not a Chainlink `review-stuck` issue.
@@ -264,7 +264,7 @@ sequenceDiagram
   Reviewer->>Reviewer: approve_pr (submits Forgejo review)
   Note over Reviewer: ReviewerPhase: ReviewerPosted
   Watcher->>Dev: handle_event(ReviewApproved) -> NoAction
-  Note over Dev: DevPhase: DevApproved (MustBlock)
+  Note over Dev: DevPhase: DevApproved (Clean; watcher owns CI)
   CI-->>Watcher: CIStatus = success
   Watcher->>Dev: handle_event(CIStatus, mergeReady=true) -> NotifyParentAction
   Watcher->>TL: deliver [from: dev] [MERGE READY] PR #N
@@ -314,7 +314,7 @@ These are the `PRReviewEvent` constructors the watcher emits. Each role's `prRev
 | `CommitsPushed` | SHA change outside the changes-requested window | `CommitsPushedEv` -> round++ | `ReviewerCommitsPushedEv` |
 | `ReviewTimeout` | no reviewer response within `reviewer_max_wait_seconds` | log only | `ReviewerTimedOutEv` -> Done |
 | `MergeReady` | reviewer approval AND CI success/neutral both seen | `MergeReadyEv` -> Dev sends `[MERGE READY]` to TL | `ReviewerMergeReadyEv` -> Done |
-| `Stuck` | rounds exceed `reviewer_max_rounds` | inject "stay alive, wait for TL" | `ReviewerStuckEv` -> Done |
+| `Stuck` | rounds exceed `reviewer_max_rounds` | notify TL; use `resume_pr` for repair | `ReviewerStuckEv` -> Done |
 | `RateLimited` | rate-limit hit | log only | log only |
 | `DevNotPushing` / `ReviewerNotResponding` / `ReviewerNeverStarted` / `ReviewDevFailed` | health probes | log only (escalated by watcher to chainlink `review-stuck`) | n/a |
 
@@ -347,7 +347,7 @@ Beyond per-PR events, the watcher escalates terminal failure modes to **chainlin
 | `reviewer_not_responding` | open chainlink `review-stuck` issue |
 | `reviewer_never_started` | open chainlink `review-stuck` issue |
 | `dev_failed` | open chainlink `review-stuck` issue |
-| `Stuck` (rounds exceeded) | inject "wait for TL", dev moves to `DevNeedsHumanDirection` |
+| `Stuck` (rounds exceeded) | notify TL; a later repair uses `resume_pr`, dev moves to `DevNeedsHumanDirection` |
 
 ---
 

@@ -51,6 +51,11 @@ TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `Mul
 
 For an existing open PR, call `resume_pr` with the PR number and complete task. The host resolves the persisted owner, branch, and runtime; never pass a leaf name, branch name, or agent type. `spawn_leaf` remains for new implementation work.
 
+The dev process is one-shot per assignment: after publishing its PR and handoff
+it exits, while the watcher remains authoritative for review and CI. `resume_pr`
+starts a fresh invocation in the same owner worktree, branch, and PR when more
+work is needed; pending inbox guidance is shown at startup.
+
 ## Notification Vocabulary
 
 ### Dev-leaf signals (PR review loop)

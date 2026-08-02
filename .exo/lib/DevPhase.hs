@@ -104,19 +104,15 @@ instance StateMachine DevPhase DevEvent where
       Transitioned (DevDismissed issueId closedBy)
 
   canExit (DevChangesRequested pr _) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " has changes requested. Address review comments before stopping."
-  canExit (DevPRFiled pr _) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " awaiting review. Stay alive until merge-ready."
-  canExit (DevUnderReview pr _) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " under review. Stay alive until merge-ready."
-  canExit (DevNeedsHumanDirection pr _) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " has unresolved review feedback in round 1 after the first fix push; awaiting human direction."
-  canExit (DevApproved pr) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " approved, waiting for CI to be triggered."
-  canExit (DevCITriggered pr _) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " CI triggered, waiting for CI merge-ready signal."
-  canExit (DevCIBlocked pr status_) =
-    MustBlock $ "PR #" <> T.pack (show pr) <> " blocked by CI status " <> status_ <> "; awaiting TL direction."
+    MustBlock $ "PR #" <> T.pack (show pr) <> " has changes requested. Address the current repair assignment before stopping."
+  canExit (DevPRFiled _ _) = Clean
+  canExit (DevUnderReview _ _) = Clean
+  canExit (DevNeedsHumanDirection _ _) =
+    Clean
+  canExit (DevApproved _) = Clean
+  canExit (DevCITriggered _ _) = Clean
+  canExit (DevCIBlocked _ _) =
+    Clean
   canExit _ = Clean
 
 instance ToJSON DevPhase where

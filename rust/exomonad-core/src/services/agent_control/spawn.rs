@@ -259,7 +259,9 @@ pub const OPENCODE_DEV_INSTRUCTIONS: &str = "\
 You are a dev agent in an ExoMonad agent tree. You work in your own git worktree on your own branch.
 
 ## Your Job
-Implement the spec in your task. File a PR when done. Stay active to address reviewer feedback.
+Handle one assignment in this process: read the task, implement it, publish the authoritative PR result, and exit cleanly. One-shot means one assignment per process, not non-interactive execution.
+
+While this invocation is alive, continue consuming durable inbox guidance delivered through the validated tmux target for this exact invocation. A stale target is rejected and never redirected to the root pane.
 
 ## MCP Tools Available
 These names are MCP tools exposed inside your agent tool interface. They are not shell commands, are not on PATH, and must not be invoked with bash commands like `which file_pr` or `file_pr ...`.
@@ -273,11 +275,9 @@ These names are MCP tools exposed inside your agent tool interface. They are not
 1. Read the spec carefully. Re-read any files mentioned before editing.
 2. Implement the changes on your branch.
 3. Build and verify (exact commands in your spec).
-4. Call file_pr to create the PR.
-5. Stay active. A reviewer agent will examine the PR and may post comments back into this
-   conversation. Read them carefully and address every point raised.
-6. After addressing review comments: commit, push, then call file_pr again to update the PR.
-   The system normally notifies your parent TL automatically when review is complete.
+4. Call file_pr to create the PR as the authoritative publication.
+5. Call notify_parent with status='success' or status='failure' for the handoff, then exit. Do not wait for reviewer approval, CI, merge-ready, or merge.
+6. If review guidance arrives before this invocation exits, consume it through the durable inbox and exact validated tmux target. If it arrives after exit, the TL uses `resume_pr` to start a fresh invocation in the same owner worktree, branch, and PR, with pending guidance visible at startup.
 7. Use notify_parent with status='success' or status='failure' when direct handoff is
    appropriate for the context, including completion outside the normal review loop or being
    truly stuck after multiple attempts.
@@ -287,7 +287,7 @@ These names are MCP tools exposed inside your agent tool interface. They are not
 - Never call fork_wave or spawn_leaf — you are a leaf, not a TL.
 - NEVER merge PRs. Never call merge_pr, never run `gh pr merge`, never use any bash tool (ctx_execute, shell commands) to merge. Merging is exclusively the parent TL's responsibility.
 - Git operations (status, commit, push) use bash. EXCEPTION: file_pr is the MCP tool for PRs — never use `gh pr create`.
-- Do not exit or consider yourself done after filing the PR. The review loop may require further work.
+- Do not create a new owner, branch, or stacked PR for review fixes.
 ";
 
 pub const OPENCODE_WORKER_INSTRUCTIONS: &str = "\
@@ -330,7 +330,9 @@ pub const CODEX_DEV_INSTRUCTIONS: &str = "\
 You are a Codex dev agent in an ExoMonad agent tree. You work in your own git worktree on your own branch.
 
 ## Your Job
-Implement the spec in your task. File a PR when done. Stay active to address reviewer feedback.
+Handle one assignment in this process: read the task, implement it, publish the authoritative PR result, and exit cleanly. One-shot means one assignment per process, not non-interactive execution.
+
+While this invocation is alive, continue consuming durable inbox guidance delivered through the validated tmux target for this exact invocation. A stale target is rejected and never redirected to the root pane.
 
 ## MCP Tools Available
 - file_pr: Create/update a PR for your branch. Call this when your implementation is ready, and again after pushing review fixes.
@@ -342,11 +344,9 @@ Implement the spec in your task. File a PR when done. Stay active to address rev
 1. Read the spec carefully. Re-read any files mentioned before editing.
 2. Implement the changes on your branch.
 3. Build and verify using the exact commands in your spec.
-4. Call file_pr to create the PR.
-5. Stay active. A reviewer agent will examine the PR and may post comments back into this
-   conversation. Read them carefully and address every point raised.
-6. After addressing review comments: commit, push, then call file_pr again to update the PR.
-   The system normally notifies your parent TL automatically when review is complete.
+4. Call file_pr to create the PR as the authoritative publication.
+5. Call notify_parent with status='success' or status='failure' for the handoff, then exit. Do not wait for reviewer approval, CI, merge-ready, or merge.
+6. If review guidance arrives before this invocation exits, consume it through the durable inbox and exact validated tmux target. If it arrives after exit, the TL uses `resume_pr` to start a fresh invocation in the same owner worktree, branch, and PR, with pending guidance visible at startup.
 7. Use notify_parent with status='success' or status='failure' when direct handoff is
    appropriate for the context, including completion outside the normal review loop or being
    truly stuck after multiple attempts.
@@ -355,7 +355,7 @@ Implement the spec in your task. File a PR when done. Stay active to address rev
 - Work only in your worktree. Never checkout another branch.
 - Never call fork_wave or spawn_leaf; you are a leaf, not a TL.
 - Git operations use shell commands. Use file_pr for PR creation.
-- Do not exit or consider yourself done after filing the PR. The review loop may require further work.
+- Do not create a new owner, branch, or stacked PR for review fixes.
 ";
 
 pub const CODEX_WORKER_INSTRUCTIONS: &str = "\
@@ -429,6 +429,8 @@ You are a Codex reviewer agent in an ExoMonad agent tree. You review a sibling a
 ## Your Job
 Review the PR assigned in your task prompt. Approve correct changes or request specific fixes. Do not implement the fix yourself.
 
+This reviewer process handles one exact PR/SHA assignment. Submit one authoritative verdict or comment, then exit; never wait for CI, merge-ready, or merge. While the invocation is alive, durable inbox guidance may be injected only into its validated exact tmux target. A stale target is rejected and never redirected to the root pane.
+
 ## MCP Tools Available
 - approve_pr: Submit an approved Forgejo PR review.
 - request_changes: Submit a request-changes Forgejo PR review.
@@ -440,7 +442,7 @@ Review the PR assigned in your task prompt. Approve correct changes or request s
 3. Review for correctness, edge cases, security issues, missing tests, and broken contracts.
 4. If issues are found, call request_changes with specific, actionable feedback that references files and functions or lines.
 5. If the code is correct, call approve_pr with a concise approving comment.
-6. Exit after submitting. The ExoMonad watcher reads Forgejo reviews and routes the result to the dev and TL automatically.
+6. Exit after submitting. The ExoMonad watcher reads Forgejo reviews and routes the result to the dev and TL automatically. If a later review round is needed, the watcher starts a fresh SHA-scoped reviewer invocation.
 
 ## Key Rules
 - Never modify code; reviewers only review.
@@ -2477,6 +2479,23 @@ mod tests {
                 "reviewer harness permissions must deny {tool}"
             );
         }
+    }
+
+    #[test]
+    fn test_coding_profiles_use_one_shot_assignment_handoff() {
+        for instructions in [OPENCODE_DEV_INSTRUCTIONS, CODEX_DEV_INSTRUCTIONS] {
+            assert!(instructions.contains("one assignment"));
+            assert!(instructions.contains("exact invocation"));
+            assert!(instructions.contains("resume_pr"));
+            assert!(instructions.contains("exit"));
+            assert!(!instructions.contains("Stay active"));
+            assert!(!instructions.contains("Do not exit or consider yourself done"));
+        }
+
+        assert!(CODEX_REVIEWER_INSTRUCTIONS.contains("one exact PR/SHA assignment"));
+        assert!(CODEX_REVIEWER_INSTRUCTIONS.contains("Exit after submitting"));
+        assert!(CODEX_REVIEWER_INSTRUCTIONS.contains("fresh SHA-scoped reviewer invocation"));
+        assert!(CODEX_REVIEWER_INSTRUCTIONS.contains("never wait for CI, merge-ready"));
     }
 
     /// Regression test for a reviewer sandbox/instructions mismatch: `codex_config.rs`

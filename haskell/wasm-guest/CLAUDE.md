@@ -104,7 +104,7 @@ Every new or updated `file_pr` body carries the issue's Definition of Done under
 |------|-------|---------------|------------|
 | **root** | `RootForkWave`, `RootSpawnLeaf`, `RootSpawnCodex`, `RootSpawnWorker`, `RootMergePR`, `SendTmuxMessage / SendMailboxMessage` | `TLPhase` (tracks children via `ChildSpawned`/`ChildCompleted`) | `exomonad init` (human-facing TL) |
 | **tl** | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnCodex`, `TLSpawnWorker`, `TLMergePR`, `TLFilePR`, `TLNotifyParent`, `SendTmuxMessage / SendMailboxMessage` | `TLPhase` | `fork_wave` |
-| **dev** | `DevFilePR`, `DevNotifyParent`, `SendTmuxMessage / SendMailboxMessage`, `DevTaskList`, `DevTaskGet`, `DevTaskUpdate` | `DevPhase` (tracks PR lifecycle, parent controls agent exit) | `spawn_leaf` (worktree) |
+| **dev** | `DevFilePR`, `DevNotifyParent`, `SendTmuxMessage / SendMailboxMessage`, `DevTaskList`, `DevTaskGet`, `DevTaskUpdate` | `DevPhase` (one assignment per process; watcher owns later PR/review/CI state) | `spawn_leaf` (worktree) |
 | **worker** | `WorkerNotifyParent`, `SendTmuxMessage / SendMailboxMessage`, `WorkerTaskList`, `WorkerTaskGet`, `WorkerTaskUpdate` | None (ephemeral, parent controls exit) | `spawn_worker` |
 | **testrunner** | `Instruct`, `TestrunnerNotifyParent` | None (allow-all hooks) | Companion config |
 
@@ -161,6 +161,14 @@ void $ applyEvent @DevPhase @DevEvent DevSpawned (PRCreated prNum url branch)
 | No PR filed for branch | ShouldNudge | Yes, with nudge to file PR |
 | No PR, clean, no commits | ShouldNudge | Yes, with nudge to file PR |
 | On main/master | Allow | Yes |
+
+Coding invocations are one assignment per process, not non-interactive. A live
+dev or reviewer continues to consume durable inbox guidance through the
+validated tmux pane for that exact invocation; stale targets are rejected and
+never redirected to the root pane. After the dev publishes its PR or the
+reviewer submits its verdict, the process exits without waiting for
+merge-ready. `resume_pr` starts the next invocation in the same owner
+worktree/branch/PR and exposes pending guidance at startup.
 
 ## Event Handlers
 

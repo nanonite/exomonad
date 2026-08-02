@@ -71,6 +71,7 @@ main = do
   assertAppendVerdictAllowsNewHeadSha
   assertAppendVerdictRecordsAuthorAndHeadSha
   assertDevNeedsHumanDirectionAfterOneFixRound
+  assertPublishedDevPhasesExit
   assertReviewApprovedAfterFixRoundTransitionsToApproved
   assertReviewApprovedFromUnderReviewRoundZero
   assertFixesPushedFromChangesRequestedYieldsRoundOne
@@ -376,7 +377,15 @@ assertDevNeedsHumanDirectionAfterOneFixRound = do
   case transition (DevUnderReview 9 1) (ReviewReceivedEv 9 "still wrong") of
     Transitioned (DevNeedsHumanDirection 9 _) -> pure ()
     other -> fail $ "expected DevNeedsHumanDirection after first fix round, got " <> showDevTransition other
-  assertBlocks "needs human direction" (canExit @DevPhase @DevEvent (DevNeedsHumanDirection 9 "still wrong"))
+  assertClean "needs human direction exits for TL resume" (canExit @DevPhase @DevEvent (DevNeedsHumanDirection 9 "still wrong"))
+
+assertPublishedDevPhasesExit :: IO ()
+assertPublishedDevPhasesExit = do
+  assertClean "PR-filed invocation exits after handoff" (canExit @DevPhase @DevEvent (DevPRFiled 9 "https://forgejo/pr/9"))
+  assertClean "under-review invocation exits after handoff" (canExit @DevPhase @DevEvent (DevUnderReview 9 1))
+  assertClean "approved invocation exits while watcher owns CI" (canExit @DevPhase @DevEvent (DevApproved 9))
+  assertClean "CI-triggered invocation exits while watcher owns CI" (canExit @DevPhase @DevEvent (DevCITriggered 9 "main.feature"))
+  assertClean "CI-blocked invocation exits for TL decision" (canExit @DevPhase @DevEvent (DevCIBlocked 9 "failure"))
 
 -- Intended semantics: after the dev has pushed a fix (round_ >= 1), an
 -- approval verdict must transition to DevApproved, NOT DevNeedsHumanDirection.
@@ -419,7 +428,7 @@ assertApprovedCanExitOnWatcherMergeReady = do
   case transition (DevApproved 9) (MergeReadyEv 9 "success" "main.feature") of
     Transitioned DevDone -> pure ()
     other -> fail $ "expected DevDone after watcher merge-ready, got " <> showDevTransition other
-  assertBlocks "approved waiting for watcher merge-ready" (canExit @DevPhase @DevEvent (DevApproved 9))
+  assertClean "approved invocation exits without merge-ready" (canExit @DevPhase @DevEvent (DevApproved 9))
 
 assertCITriggeredMergeReadyTransitionsToDoneAndExits :: IO ()
 assertCITriggeredMergeReadyTransitionsToDoneAndExits = do
@@ -429,7 +438,7 @@ assertCITriggeredMergeReadyTransitionsToDoneAndExits = do
   case transition (DevCITriggered 9 "main.feature") (MergeReadyEv 9 "success" "main.feature") of
     Transitioned DevDone -> pure ()
     other -> fail $ "expected DevDone after MergeReadyEv from CITriggered, got " <> showDevTransition other
-  assertBlocks "ci triggered waiting for result" (canExit @DevPhase @DevEvent (DevCITriggered 9 "main.feature"))
+  assertClean "ci-triggered invocation exits without waiting" (canExit @DevPhase @DevEvent (DevCITriggered 9 "main.feature"))
   assertClean "done exits cleanly" (canExit @DevPhase @DevEvent DevDone)
 
 assertCIFailureBlocksAfterTrigger :: IO ()
@@ -437,7 +446,7 @@ assertCIFailureBlocksAfterTrigger = do
   case transition (DevCITriggered 9 "main.feature") (CIBlockedEv 9 "failure" "main.feature") of
     Transitioned (DevCIBlocked 9 "failure") -> pure ()
     other -> fail $ "expected DevCIBlocked after failed CI, got " <> showDevTransition other
-  assertBlocks "ci blocked terminal" (canExit @DevPhase @DevEvent (DevCIBlocked 9 "failure"))
+  assertClean "ci-blocked invocation exits for TL decision" (canExit @DevPhase @DevEvent (DevCIBlocked 9 "failure"))
 
 assertMergeReadyReviewNotifiesParent :: IO ()
 assertMergeReadyReviewNotifiesParent = do
@@ -612,6 +621,10 @@ assertAcceptanceCriteriaContract = do
   assertContains "rendered handoff done criteria" "Preserve this issue bullet verbatim" renderedReviewHandoff
   assertContains "leaf prompt heading" heading (Prompt.render Prompt.leafProfile)
   assertContains "leaf prompt Definition of Done" "Definition-of-Done" (Prompt.render Prompt.leafProfile)
+  assertContains "leaf prompt one assignment" "one assignment" (Prompt.render Prompt.leafProfile)
+  assertContains "leaf prompt exact live pane" "validated tmux pane" (Prompt.render Prompt.leafProfile)
+  assertContains "leaf prompt resume invocation" "resume_pr" (Prompt.render Prompt.leafProfile)
+  assertBool "leaf prompt does not wait for merge-ready" (not ("Stop only after merge-ready" `T.isInfixOf` Prompt.render Prompt.leafProfile))
 
 assertReviewerAcceptanceCriteriaGuidance :: IO ()
 assertReviewerAcceptanceCriteriaGuidance = do

@@ -2030,6 +2030,66 @@ mod tests {
     }
 
     #[test]
+    fn test_build_agent_command_covers_all_coding_runtimes() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        for agent_type in [
+            AgentType::Claude,
+            AgentType::Gemini,
+            AgentType::Shoal,
+            AgentType::OpenCode,
+            AgentType::Codex,
+        ] {
+            let command = ACS::build_agent_command(
+                agent_type,
+                Some(prompt),
+                None,
+                &empty_env(),
+                Path::new("/tmp/test"),
+                None,
+                false,
+                None,
+            );
+
+            assert!(
+                command.starts_with(agent_type.command()),
+                "{agent_type:?} command must start with its configured harness: {command}"
+            );
+            assert!(
+                command.contains("$(cat '/tmp/test-prompt.txt')"),
+                "{agent_type:?} command must receive the assignment prompt: {command}"
+            );
+            assert!(
+                !command.contains("--print"),
+                "{agent_type:?} must keep its interactive stdin path for live guidance: {command}"
+            );
+        }
+
+        let gemini = ACS::build_agent_command(
+            AgentType::Gemini,
+            Some(prompt),
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            None,
+        );
+        assert!(gemini.contains("--prompt-interactive"));
+
+        let opencode = ACS::build_agent_command(
+            AgentType::OpenCode,
+            Some(prompt),
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            None,
+        );
+        assert!(opencode.contains("run --interactive"));
+    }
+
+    #[test]
     fn test_build_agent_command_opencode_no_prompt() {
         let cmd = ACS::build_agent_command(
             AgentType::OpenCode,

@@ -9,6 +9,8 @@ Call `check_inbox` at the start of each task and after completing each major ste
 
 You implement a focused spec. One change, one PR.
 
+Each live process handles one assignment: receive the task, implement it, publish the authoritative result, and exit cleanly. One-shot means one assignment per process, not non-interactive execution. While the process is alive, continue consuming durable inbox guidance delivered through the validated tmux target for that exact invocation; stale targets are rejected and never redirected to the root pane.
+
 Read CLAUDE.md first. Follow the spec exactly — the anti-patterns section is mandatory reading.
 
 ## PR body contract
@@ -26,13 +28,13 @@ Before every new or updated `file_pr` call, make the PR body contain the literal
 6. `file_pr` to create/update the PR — title must use conventional commit format:
    `feat:`, `fix:`, `refactor:`, `docs:`, or `chore:`. PRs are squash-merged;
    the title becomes the commit message on master.
-7. `notify_parent` with a status update that the PR is filed and awaiting review
-8. **IDLE: After `notify_parent`, STOP. End your turn. Do not generate any further output.
+7. `notify_parent` with a status update that the PR is filed.
+8. **Exit after `notify_parent`.** Do not wait for reviewer approval, CI, merge-ready, or merge. The watcher owns those authoritative state-machine inputs and notifies the TL.
+   Do not generate any further output.
    Do not check CI. Do not poll git. Do not print status updates. Do not loop.**
    The watcher delivers reviewer comments and merge-ready signals directly into this pane —
    your next turn begins only when a message is injected. Polling burns tokens for nothing.
-9. When a message arrives: act on it (fix review comments, push, re-run verify). Then STOP again.
-10. Stop only after the watcher injects `[MERGE READY]`; the parent TL merges after that.
+9. If guidance arrives before this invocation exits, consume it through the durable inbox and exact validated tmux target. If guidance arrives after exit, the TL uses `resume_pr` to start a fresh invocation in the same owner worktree, branch, and PR; pending inbox guidance is visible at startup.
 
 ## Forgejo Interaction
 
@@ -42,5 +44,6 @@ When you need to query or interact with Forgejo (e.g. checking PR status, CI res
 
 - Never modify files outside your spec
 - Never make architectural decisions — if the spec is ambiguous, follow the simplest interpretation
+- Do not create a new owner, branch, or stacked PR for review fixes; use the existing owner through `resume_pr`.
 - If stuck after 3+ failed fix attempts, `notify_parent` with failure status explaining what you tried
 - Do not spin on the same error — escalate

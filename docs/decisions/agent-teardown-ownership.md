@@ -36,26 +36,29 @@ has a dev-leaf calling `close_self`** — and that is correct.
 
 ### Why dev-leaves must not self-close
 
-The convergence loop requires the leaf to stay alive after filing its PR: the
-watcher injects reviewer feedback (`ChangesRequested`) into the leaf's pane, and
-the leaf fixes and pushes. The `DevPhase` stop hook enforces this — `canExit`
-returns `MustBlock`/blocking for `DevApproved` (waiting for watcher merge-ready),
-`DevCITriggered`, `DevCIBlocked`, and `DevNeedsHumanDirection`; only `DevDone`
-exits cleanly. A leaf that self-closed its window would orphan the PR and break
-the loop. `close_self` bypasses `canExit` entirely, so exposing it to a dev-leaf
-would be a foot-gun that defeats the stop-hook gating.
+The review loop must keep the issue-owned worktree and PR alive, but it does not
+require the coding process to remain alive after its one assignment. The watcher
+persists review feedback and routes it through the exact live pane when an
+invocation exists; otherwise the durable inbox is consumed by the next
+`resume_pr` invocation. The `DevPhase` stop hook blocks an active
+`ChangesRequested` repair, while published, approved, CI, and escalated states
+can exit cleanly. A later repair uses a fresh invocation in the same owner
+worktree, branch, and PR. A leaf that self-closed its window would still bypass
+orchestration-owned cleanup, so `close_self` remains inappropriate for dev
+ownership.
 
 ## Decision
 
 **Triad teardown is orchestration-owned.** An agent does not, in general, tear
 itself down.
 
-1. **Dev-leaves never self-close.** A leaf that has handed off work *idles* with
-   its window alive (the `FINISHING` state in `session_status`). It is disposed
-   by the TL — `dispose_leaf`, `close_issue_and_cleanup`, or the `IssueClosed`
-   event path (see [agent-lifecycle-invariants](agent-lifecycle-invariants.md)) —
-   or reaped by the orphan reconciler on session-age timeout. `chainlink session
-   end` is telemetry (handoff notes + work-state), not process termination.
+1. **Dev-leaves do not self-dispose resources.** A coding process exits after
+   its authoritative handoff, while the issue-owned worktree, PR, and watcher
+   records remain. The TL owns resource disposal through `dispose_leaf`,
+   `close_issue_and_cleanup`, or the `IssueClosed` event path (see
+   [agent-lifecycle-invariants](agent-lifecycle-invariants.md)); the orphan
+   reconciler remains a safety net. `chainlink session end` records telemetry
+   and handoff notes; it does not replace orchestration cleanup.
 
 2. **`close_self` is justified only for ephemeral workers.** A worker pane has no
    PR, no worktree, and no review loop to protect, so self-cleanup on
@@ -71,10 +74,9 @@ itself down.
 
 ## Consequences
 
-- A leaf left in `FINISHING` (window alive, work done) is **not** the leaf's bug
-  — it is the TL's missing disposal. This is also why such leaves surface as
-  stale rows in `session_status` (window-liveness view) while the PR/issue view
-  has moved on.
+- A completed coding process may have no live window while the issue-owned PR
+  remains pending. `resume_pr` recreates only the process invocation in the
+  existing owner worktree, branch, and PR; it does not create a second owner.
 - The reconciler remains the safety net for leaves the TL forgets to dispose;
   it reaps externally and informs the TL, never the leaf.
 - There is no general-purpose `shutdown` MCP tool. `close_self` remains an

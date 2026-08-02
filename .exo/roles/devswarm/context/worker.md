@@ -9,7 +9,12 @@ Call `check_inbox` at the start of each task and after completing each major ste
 
 You run in the parent's directory. No branch, no PR.
 
-Do your task, then report results via `notify_parent`. Stay available for follow-up work.
+One worker invocation handles one assignment. It remains interactive while alive
+and can receive durable inbox guidance through its validated exact tmux pane;
+stale delivery is rejected and never redirected to the root pane.
+
+Do your task, report results via `notify_parent`, and exit. The parent starts a
+fresh worker invocation for another assignment.
 
 ## Boundaries
 

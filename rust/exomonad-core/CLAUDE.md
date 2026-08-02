@@ -163,6 +163,21 @@ destructive reconciliation. A finished invocation is dormant ownership; an
 open PR, review, or CI work unit remains pending and does not dispose the
 issue-owned worktree.
 
+### One-shot coding invocations
+
+Each coding dev or reviewer process handles one assignment: receive the task,
+perform it, publish the authoritative result, and exit cleanly. One-shot means
+one assignment per process, not non-interactive execution. While the exact
+invocation is alive, its durable inbox and tmux guidance remain available only
+through the validated current routing pane; stale targets are rejected and are
+never redirected to the root pane.
+
+After a dev publishes a PR or a reviewer submits its exact-SHA verdict, the
+process exits. PR, review, and CI watcher state remain authoritative. If more
+dev work is needed later, `resume_pr` starts a fresh invocation in the same
+issue-owned worktree, branch, and PR, with pending inbox guidance visible at
+startup; it does not create a new owner.
+
 ## Forgejo Watcher and GitHub Poller State Machines
 
 `worktree_event_watcher.rs` is the active Forgejo-backed PR/review/CI watcher. It rebuilds PR registry state from Forgejo each cycle and persists only watcher bookkeeping such as review rounds and stuck flags. `github_poller.rs` is currently hibernated: it has zero active call sites. Keep its review-loop semantics in parity with `worktree_event_watcher` so future GitHub Actions integration can re-enable it as a thin transport shim.

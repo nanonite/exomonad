@@ -39,7 +39,7 @@
 <tr><th>Role</th><th>Model</th><th>Spawns</th><th>Files PR</th><th>Merges PR</th><th>Lifecycle</th></tr>
 <tr><td><code>root</code></td><td>Opus</td><td>yes</td><td>no</td><td>yes</td><td>persistent (TL window)</td></tr>
 <tr><td><code>tl</code></td><td>Opus</td><td>yes</td><td>yes</td><td>yes</td><td>per-subtree</td></tr>
-<tr><td><code>dev</code></td><td>Codex / Gemini / OpenCode</td><td>no</td><td>yes</td><td>no</td><td>per-spec, exits at merge-ready</td></tr>
+<tr><td><code>dev</code></td><td>Codex / Gemini / OpenCode</td><td>no</td><td>yes</td><td>no</td><td>one assignment per invocation, exits after handoff</td></tr>
 <tr><td><code>reviewer</code></td><td>Codex / Gemini</td><td>no</td><td>no</td><td>no</td><td>ephemeral per review round</td></tr>
 <tr><td><code>worker</code></td><td>Codex / Gemini</td><td>no</td><td>no</td><td>no</td><td>ephemeral, same-worktree edits</td></tr>
 </table>
@@ -266,7 +266,7 @@ sequenceDiagram
 <tr><td><code>CommitsPushed</code></td><td>SHA change outside changes-requested window</td><td><code>CommitsPushedEv</code> -&gt; round++</td><td><code>ReviewerCommitsPushedEv</code></td></tr>
 <tr><td><code>ReviewTimeout</code></td><td>no reviewer response within <code>reviewer_max_wait_seconds</code></td><td>log only</td><td><code>ReviewerTimedOutEv</code> -&gt; Done</td></tr>
 <tr><td><code>MergeReady</code></td><td>reviewer approval AND CI success/neutral both seen</td><td><code>MergeReadyEv</code> -&gt; Dev sends <code>[MERGE READY]</code> to TL</td><td><code>ReviewerMergeReadyEv</code> -&gt; Done</td></tr>
-<tr><td><code>Stuck</code></td><td>rounds exceed <code>reviewer_max_rounds</code></td><td>inject "stay alive, wait for TL"</td><td><code>ReviewerStuckEv</code> -&gt; Done</td></tr>
+<tr><td><code>Stuck</code></td><td>rounds exceed <code>reviewer_max_rounds</code></td><td>notify TL; use <code>resume_pr</code> for repair</td><td><code>ReviewerStuckEv</code> -&gt; Done</td></tr>
 <tr><td><code>RateLimited</code></td><td>rate-limit hit</td><td>log only</td><td>log only</td></tr>
 <tr><td><code>DevNotPushing</code> / <code>ReviewerNotResponding</code> / <code>ReviewerNeverStarted</code> / <code>ReviewDevFailed</code></td><td>health probes</td><td>log only (escalated by watcher to chainlink <code>review-stuck</code>)</td><td>n/a</td></tr>
 </table>
@@ -294,7 +294,7 @@ flowchart TD
 <tr><td><code>reviewer_not_responding</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
 <tr><td><code>reviewer_never_started</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
 <tr><td><code>dev_failed</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
-<tr><td><code>Stuck</code> (rounds exceeded)</td><td>inject "wait for TL", dev moves to <code>DevNeedsHumanDirection</code></td></tr>
+<tr><td><code>Stuck</code> (rounds exceeded)</td><td>notify TL; a later repair uses <code>resume_pr</code>, dev moves to <code>DevNeedsHumanDirection</code></td></tr>
 </table>
 
 <hr/>
