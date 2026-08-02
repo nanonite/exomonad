@@ -224,6 +224,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Publish verified PR heads to watcher orchestration (#582)
+- Normalize coding harnesses to one-shot execution (#581)
+- Define one-shot leaf invocation lifecycle and persistence (#580)
 - list_agents reports stale is_alive/last_check_inbox_at for resumed agents (reporting only) (#576)
 - orphan_reconciler kills resumed dev-workers on age alone, no activity check (#575)
 - Reviewer lacks structured Definition-of-Done; TL currently injects it ad hoc (#577)
