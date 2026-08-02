@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Commit verified resume_pr lifecycle fix (#589)
 - Fix all-dev installation so the project compiles (#586)
 - Dev-worker liveness registry goes stale for resumed/active agents (#574)
 - fix: review_message_keeps_follow_up_on_existing_chainlink_work_item test fails on main (#573)

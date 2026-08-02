@@ -597,6 +597,17 @@ impl<
             format!("{} {}", env_prefix, agent_command)
         };
 
+        let full_command =
+            if let Some(exit_status_file) = env_vars.get("EXOMONAD_INVOCATION_EXIT_FILE") {
+                let escaped_path = Self::escape_for_shell_command(exit_status_file);
+                format!(
+                    "{}; status=$?; printf '%s\\n' \"$status\" > {}; exit \"$status\"",
+                    full_command, escaped_path
+                )
+            } else {
+                full_command
+            };
+
         // Wrap in nix develop shell if flake.nix exists in cwd
         if cwd.join("flake.nix").exists() {
             info!("Wrapping agent command in nix develop shell");
@@ -820,6 +831,54 @@ impl<
             })??;
 
         info!(name, "tmux kill-window successful");
+        Ok(())
+    }
+
+    pub(crate) async fn verify_tmux_window_startup(
+        &self,
+        window_id: &super::tmux_ipc::WindowId,
+    ) -> Result<()> {
+        let tmux = self.tmux()?;
+        let ready = timeout(
+            super::INVOCATION_STARTUP_TIMEOUT,
+            tmux.wait_for_window(window_id, super::INVOCATION_STARTUP_TIMEOUT),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::Error::new(TimeoutError {
+                message: format!(
+                    "tmux startup readiness timed out after {}s",
+                    super::INVOCATION_STARTUP_TIMEOUT.as_secs()
+                ),
+            })
+        })??;
+        if matches!(
+            super::tmux_ipc::classify_window_startup(ready),
+            super::tmux_ipc::WindowStartupStatus::ExitedBeforeReady
+        ) {
+            anyhow::bail!(
+                "tmux window {} exited before startup readiness was confirmed",
+                window_id
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn kill_tmux_window_id(
+        &self,
+        window_id: &super::tmux_ipc::WindowId,
+    ) -> Result<()> {
+        let tmux = self.tmux()?;
+        timeout(TMUX_TIMEOUT, tmux.kill_window(window_id))
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(TimeoutError {
+                    message: format!(
+                        "tmux kill-window timed out after {}s",
+                        TMUX_TIMEOUT.as_secs()
+                    ),
+                })
+            })??;
         Ok(())
     }
 
@@ -2102,6 +2161,29 @@ mod tests {
             None,
         );
         assert_eq!(cmd, "opencode");
+    }
+
+    #[test]
+    fn test_build_agent_command_records_exit_status_when_requested() {
+        let mut env = HashMap::new();
+        env.insert(
+            "EXOMONAD_INVOCATION_EXIT_FILE".to_string(),
+            "/tmp/exomonad-exit-code".to_string(),
+        );
+        let command = ACS::build_agent_command(
+            AgentType::Codex,
+            None,
+            None,
+            &env,
+            Path::new("/tmp/test"),
+            None,
+            false,
+            None,
+        );
+
+        assert!(command.contains("status=$?"));
+        assert!(command.contains("/tmp/exomonad-exit-code"));
+        assert!(command.ends_with("exit \"$status\""));
     }
 
     #[test]

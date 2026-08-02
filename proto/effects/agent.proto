@@ -445,6 +445,31 @@ message SpawnLeafSubtreeRequest {
 
 message SpawnLeafSubtreeResponse {
   AgentInfo agent = 1;
+  // Host-verified process handoff metadata. Empty for legacy callers that do
+  // not request a leaf invocation result.
+  InvocationHandoff invocation = 2;
+}
+
+// Evidence for a process invocation started for an issue-owned leaf.
+message InvocationHandoff {
+  // UUID of the current invocation generation.
+  string invocation_id = 1;
+  // spawn, resume_pr, or review.
+  string trigger = 2;
+  // Runtime selected by the host.
+  string runtime = 3;
+  // Actual branch retained by the issue owner.
+  string branch_name = 4;
+  // Exact target kind: window or pane.
+  string target_type = 5;
+  // Stable tmux target ID (@N or %N). Never a root/display-name fallback.
+  string target_id = 6;
+  // True only when this request created a new invocation generation.
+  bool fresh = 7;
+  // True only after the host confirmed the exact target remained alive.
+  bool ready = 8;
+  // started, already_running, startup_failed, or exited_early.
+  string outcome = 9;
 }
 
 

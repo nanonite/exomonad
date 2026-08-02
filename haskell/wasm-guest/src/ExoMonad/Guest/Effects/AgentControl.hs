@@ -97,7 +97,15 @@ data SpawnResult = SpawnResult
     tabName :: Text,
     issueTitle :: Text,
     agentTypeResult :: Text,
-    paneId :: Maybe Text
+    paneId :: Maybe Text,
+    invocationId :: Maybe Text,
+    invocationTrigger :: Maybe Text,
+    invocationRuntime :: Maybe Text,
+    routingTargetType :: Maybe Text,
+    routingTargetId :: Maybe Text,
+    invocationFresh :: Maybe Bool,
+    invocationReady :: Maybe Bool,
+    invocationOutcome :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -110,17 +118,49 @@ instance FromJSON SpawnResult where
       <*> v .: "issue_title"
       <*> v .: "agent_type"
       <*> v .:? "pane_id"
+      <*> v .:? "invocation_id"
+      <*> v .:? "invocation_trigger"
+      <*> v .:? "invocation_runtime"
+      <*> v .:? "routing_target_type"
+      <*> v .:? "routing_target_id"
+      <*> v .:? "invocation_fresh"
+      <*> v .:? "invocation_ready"
+      <*> v .:? "invocation_outcome"
 
 instance ToJSON SpawnResult where
-  toJSON (SpawnResult w b t i a p) =
-    object
-      [ "worktree_path" .= w,
-        "branch_name" .= b,
-        "tab_name" .= t,
-        "issue_title" .= i,
-        "agent_type" .= a,
-        "pane_id" .= p
-      ]
+  toJSON
+    ( SpawnResult
+        w
+        b
+        t
+        i
+        a
+        p
+        invocationId
+        invocationTrigger
+        invocationRuntime
+        routingTargetType
+        routingTargetId
+        invocationFresh
+        invocationReady
+        invocationOutcome
+      ) =
+      object
+        [ "worktree_path" .= w,
+          "branch_name" .= b,
+          "tab_name" .= t,
+          "issue_title" .= i,
+          "agent_type" .= a,
+          "pane_id" .= p,
+          "invocation_id" .= invocationId,
+          "invocation_trigger" .= invocationTrigger,
+          "invocation_runtime" .= invocationRuntime,
+          "routing_target_type" .= routingTargetType,
+          "routing_target_id" .= routingTargetId,
+          "invocation_fresh" .= invocationFresh,
+          "invocation_ready" .= invocationReady,
+          "invocation_outcome" .= invocationOutcome
+        ]
 
 -- ============================================================================
 -- Effect type
@@ -276,9 +316,27 @@ runAgentControlSuspend = interpret $ \case
     result <- suspendEffect @Agent.AgentSpawnLeafSubtree req
     pure $ case result of
       Left err -> Left err
-      Right resp -> case PA.spawnLeafSubtreeResponseAgent resp of
-        Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "ResumePr succeeded but no agent info returned"))))
-        Just info -> Right (protoAgentInfoToSpawnResult info)
+      Right resp -> case (PA.spawnLeafSubtreeResponseAgent resp, PA.spawnLeafSubtreeResponseInvocation resp) of
+        (Nothing, _) -> Left (resumeHandoffError "ResumePr succeeded but no agent info returned")
+        (Just _, Nothing) -> Left (resumeHandoffError "ResumePr succeeded but no invocation handoff metadata returned")
+        (Just info, Just handoff)
+          | not (PA.invocationHandoffFresh handoff) ->
+              Left (resumeHandoffError "ResumePr returned an already-running invocation; no fresh process was started")
+          | not (PA.invocationHandoffReady handoff) ->
+              Left (resumeHandoffError "ResumePr returned an invocation that was not ready on its exact tmux target")
+          | otherwise ->
+              Right
+                ( (protoAgentInfoToSpawnResult info)
+                    { invocationId = Just (toText (PA.invocationHandoffInvocationId handoff)),
+                      invocationTrigger = Just (toText (PA.invocationHandoffTrigger handoff)),
+                      invocationRuntime = Just (toText (PA.invocationHandoffRuntime handoff)),
+                      routingTargetType = Just (toText (PA.invocationHandoffTargetType handoff)),
+                      routingTargetId = Just (toText (PA.invocationHandoffTargetId handoff)),
+                      invocationFresh = Just (PA.invocationHandoffFresh handoff),
+                      invocationReady = Just (PA.invocationHandoffReady handoff),
+                      invocationOutcome = Just (toText (PA.invocationHandoffOutcome handoff))
+                    }
+                )
   SpawnWorkerC cfg -> do
     let req =
           PA.SpawnWorkerRequest
@@ -343,5 +401,17 @@ protoAgentInfoToSpawnResult info =
         _ -> "unknown",
       paneId =
         let value = toText (PA.agentInfoPaneId info)
-         in if T.null value then Nothing else Just value
+         in if T.null value then Nothing else Just value,
+      invocationId = Nothing,
+      invocationTrigger = Nothing,
+      invocationRuntime = Nothing,
+      routingTargetType = Nothing,
+      routingTargetId = Nothing,
+      invocationFresh = Nothing,
+      invocationReady = Nothing,
+      invocationOutcome = Nothing
     }
+
+resumeHandoffError :: Text -> EffectError
+resumeHandoffError message =
+  EffectError (Just (EffectErrorKindInvalidInput (InvalidInput (fromText message))))

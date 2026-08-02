@@ -369,6 +369,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_shot_exit_tombstones_routing_and_preserves_exit_code() {
+        let dir = tempdir().expect("tempdir");
+        let expected_routing = routing();
+        expected_routing.write_to_dir(dir.path()).await.unwrap();
+        let started = start_invocation(
+            dir.path(),
+            AgentType::Codex,
+            InvocationTrigger::Spawn,
+            expected_routing.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("start invocation");
+
+        let result = finish_invocation_and_tombstone(
+            dir.path(),
+            &expected_routing,
+            InvocationStatus::Exited,
+            Some(0),
+        )
+        .await
+        .expect("finish one-shot invocation");
+        let InvocationFinishResult::Finished(finished) = result else {
+            panic!("expected finished invocation");
+        };
+        assert_eq!(finished.invocation_id, started.invocation_id);
+        assert_eq!(finished.status, InvocationStatus::Exited);
+        assert_eq!(finished.exit_code, Some(0));
+        assert!(!finished.is_live());
+        assert!(dir.path().join("exited_at").exists());
+        assert!(!dir.path().join("routing.json").exists());
+    }
+
+    #[tokio::test]
+    async fn rejected_startup_does_not_create_running_invocation_record() {
+        let dir = tempdir().expect("tempdir");
+        assert!(!dir.path().join(INVOCATION_FILENAME).exists());
+        assert!(matches!(
+            crate::services::tmux_ipc::classify_window_startup(false),
+            crate::services::tmux_ipc::WindowStartupStatus::ExitedBeforeReady
+        ));
+        assert!(read_invocation(dir.path()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn missing_and_malformed_records_are_conservative() {
         let dir = tempdir().expect("tempdir");
         assert!(read_invocation_conservatively(dir.path()).await.is_none());

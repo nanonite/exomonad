@@ -117,6 +117,20 @@ pub struct WindowInfo {
     pub pane_id: PaneId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowStartupStatus {
+    Ready,
+    ExitedBeforeReady,
+}
+
+pub(crate) fn classify_window_startup(window_exists: bool) -> WindowStartupStatus {
+    if window_exists {
+        WindowStartupStatus::Ready
+    } else {
+        WindowStartupStatus::ExitedBeforeReady
+    }
+}
+
 /// tmux CLI wrapper for a specific session.
 #[derive(Debug, Clone)]
 pub struct TmuxIpc {
@@ -756,6 +770,25 @@ impl TmuxIpc {
         Ok(status.success())
     }
 
+    /// Wait for a newly-created window to remain addressable during startup.
+    ///
+    /// `tmux new-window` reports success before the command launched in the
+    /// window has necessarily survived its first scheduling turn.  A bounded
+    /// probe catches commands that fail immediately without turning a spawn
+    /// into an unbounded wait.
+    pub async fn wait_for_window(&self, window_id: &WindowId, max_wait: Duration) -> Result<bool> {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            if self.window_exists(window_id).await? {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn pane_exists(&self, pane_id: &PaneId) -> Result<bool> {
         let status = Command::new("tmux")
             .args(["display-message", "-t", pane_id.as_str(), "-p", ""])
@@ -849,6 +882,15 @@ mod tests {
     fn test_pane_id_rejects_non_digits() {
         assert!(PaneId::parse("%abc").is_err());
         assert!(PaneId::parse("%1a").is_err());
+    }
+
+    #[test]
+    fn test_startup_status_rejects_dead_and_accepts_live_target() {
+        assert_eq!(
+            classify_window_startup(false),
+            WindowStartupStatus::ExitedBeforeReady
+        );
+        assert_eq!(classify_window_startup(true), WindowStartupStatus::Ready);
     }
 
     #[test]

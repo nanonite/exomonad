@@ -390,7 +390,22 @@ impl EffectHandler for MockAgentHandler {
                     pane_id: String::new(),
                     ..Default::default()
                 };
-                Ok(SpawnLeafSubtreeResponse { agent: Some(agent) }.encode_to_vec())
+                let invocation = (req.resume_pr_number != 0).then(|| InvocationHandoff {
+                    invocation_id: "invocation-test-1".into(),
+                    trigger: "resume_pr".into(),
+                    runtime: "gemini".into(),
+                    branch_name: "main.test-leaf".into(),
+                    target_type: "window".into(),
+                    target_id: "@42".into(),
+                    fresh: true,
+                    ready: true,
+                    outcome: "started".into(),
+                });
+                Ok(SpawnLeafSubtreeResponse {
+                    agent: Some(agent),
+                    invocation,
+                }
+                .encode_to_vec())
             }
             "agent.spawn_worker" => {
                 let req = SpawnWorkerRequest::decode(payload)
@@ -1255,6 +1270,32 @@ async fn wasm_spawn_leaf_roundtrip() {
     .await;
 
     assert_tool_success(&output, "spawn_leaf");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_resume_pr_reports_verified_fresh_invocation_handoff() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "resume_pr",
+        json!({
+            "pr_number": 42,
+            "task": "Apply the requested review fix",
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "resume_pr");
+    assert_eq!(output["result"]["invocation"]["trigger"], "resume_pr");
+    assert_eq!(output["result"]["invocation"]["runtime"], "gemini");
+    assert_eq!(output["result"]["invocation"]["target_type"], "window");
+    assert_eq!(output["result"]["invocation"]["target_id"], "@42");
+    assert_eq!(output["result"]["invocation"]["fresh"], true);
+    assert_eq!(output["result"]["invocation"]["ready"], true);
+    assert_eq!(output["result"]["invocation"]["outcome"], "started");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

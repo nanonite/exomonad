@@ -1,5 +1,10 @@
 use super::*;
 
+fn resume_spawn_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn parse_git_status_paths(stdout: &str) -> Vec<String> {
     stdout
         .lines()
@@ -622,7 +627,7 @@ impl<
                 .await?;
 
             // Store window_id for message delivery and cleanup
-            let routing = RoutingInfo::window(window_id);
+            let routing = RoutingInfo::window(window_id.clone());
             let effective_birth = self.effective_birth_branch(Some(caller_bb));
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
@@ -1666,6 +1671,11 @@ impl<
         caller_bb: &BirthBranch,
     ) -> Result<SpawnResult> {
         info!(branch_name = %options.branch_name, timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_leaf_subtree");
+        let _resume_spawn_guard = if options.expected_agent_name.is_some() {
+            Some(resume_spawn_lock().lock().await)
+        } else {
+            None
+        };
 
         let result = timeout(SPAWN_TIMEOUT, async {
             self.resolve_tmux_session()?;
@@ -1971,6 +1981,13 @@ impl<
             // Open tmux window (not pane)
             // Task already includes leaf completion protocol — rendered by Haskell Prompt builder.
             let agent_config_dir = self.project_dir().join(".exo").join("agents").join(agent_name.as_str());
+            let agent_config_preexisting = agent_config_dir.exists();
+            fs::create_dir_all(&agent_config_dir).await?;
+            env_vars.insert(
+                "EXOMONAD_INVOCATION_EXIT_FILE".to_string(),
+                agent_config_dir.join("exit_code").display().to_string(),
+            );
+            let _ = fs::remove_file(agent_config_dir.join("exit_code")).await;
             let window_id = match self.new_tmux_window(
                 &display_name,
                 &worktree_path,
@@ -1982,7 +1999,9 @@ impl<
                 Ok(wid) => wid,
                 Err(e) => {
                     warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
-                    let _ = fs::remove_dir_all(&agent_config_dir).await;
+                    if !agent_config_preexisting {
+                        let _ = fs::remove_dir_all(&agent_config_dir).await;
+                    }
                     if remove_worktree_on_spawn_failure && worktree_path.exists() {
                         let git_wt = self.git_wt().clone();
                         let path = worktree_path.clone();
@@ -1992,8 +2011,34 @@ impl<
                 }
             };
 
+            if let Err(error) = self.verify_tmux_window_startup(&window_id).await {
+                warn!(
+                    name = %identity.slug(),
+                    window = %window_id,
+                    %error,
+                    "tmux window exited before invocation startup readiness"
+                );
+                if let Err(cleanup_error) = self.kill_tmux_window_id(&window_id).await {
+                    warn!(
+                        window = %window_id,
+                        error = %cleanup_error,
+                        "Failed to clean up failed leaf tmux window"
+                    );
+                }
+                if !agent_config_preexisting {
+                    let _ = fs::remove_dir_all(&agent_config_dir).await;
+                }
+                if remove_worktree_on_spawn_failure && worktree_path.exists() {
+                    let git_wt = self.git_wt().clone();
+                    let path = worktree_path.clone();
+                    let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
+                }
+                return Err(error);
+            }
+
             // Store window_id for message delivery and cleanup
-            let routing = RoutingInfo::window(window_id);
+            let routing = RoutingInfo::window(window_id.clone());
+            let expected_routing = routing.clone();
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
                 slug: Slug::try_from_str(identity.slug())
@@ -2010,7 +2055,8 @@ impl<
             } else {
                 InvocationTrigger::Spawn
             };
-            self.finalize_spawn_with_invocation(
+            if let Err(error) = self
+                .finalize_spawn_with_invocation(
                 &agent_name,
                 routing,
                 Some(identity_record),
@@ -2021,7 +2067,67 @@ impl<
                     head_sha: options.start_point.clone(),
                 },
             )
-                .await?;
+                .await
+            {
+                warn!(
+                    name = %identity.slug(),
+                    window = %window_id,
+                    %error,
+                    "Failed to persist leaf invocation metadata"
+                );
+                if let Err(cleanup_error) = self.kill_tmux_window_id(&window_id).await {
+                    warn!(
+                        window = %window_id,
+                        error = %cleanup_error,
+                        "Failed to clean up leaf tmux window after metadata failure"
+                    );
+                }
+                if !agent_config_preexisting {
+                    let _ = fs::remove_dir_all(&agent_config_dir).await;
+                }
+                if remove_worktree_on_spawn_failure && worktree_path.exists() {
+                    let git_wt = self.git_wt().clone();
+                    let path = worktree_path.clone();
+                    let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
+                }
+                return Err(error);
+            }
+
+            if let Err(error) = self.verify_tmux_window_startup(&window_id).await {
+                warn!(
+                    name = %identity.slug(),
+                    window = %window_id,
+                    %error,
+                    "leaf invocation exited before spawn could report success"
+                );
+                match crate::services::agent_control::finish_invocation_and_tombstone(
+                    &agent_config_dir,
+                    &expected_routing,
+                    InvocationStatus::Failed,
+                    None,
+                )
+                .await
+                {
+                    Ok(InvocationFinishResult::IgnoredStale) => {
+                        warn!(name = %identity.slug(), "Preserved newer invocation after startup failure")
+                    }
+                    Ok(InvocationFinishResult::Finished(_))
+                    | Ok(InvocationFinishResult::Missing) => {}
+                    Err(cleanup_error) => warn!(
+                        name = %identity.slug(),
+                        error = %cleanup_error,
+                        "Failed to finish failed leaf invocation"
+                    ),
+                }
+                if let Err(cleanup_error) = self.kill_tmux_window_id(&window_id).await {
+                    warn!(
+                        window = %window_id,
+                        error = %cleanup_error,
+                        "Failed to clean up leaf tmux window after startup failure"
+                    );
+                }
+                return Err(error);
+            }
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: worktree_path.clone(),

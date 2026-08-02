@@ -13,10 +13,10 @@ use crate::effects::{
 
 use super::non_empty;
 use crate::services::agent_control::{
-    finish_invocation_and_tombstone, slugify, AgentControlService, AgentIdentity, AgentInfo,
-    AgentType as ServiceAgentType, ClaudeSpawnFlags, InvocationFinishResult, InvocationStatus,
-    SpawnGeminiTeammateOptions, SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions,
-    SpawnWorkerOptions, Topology,
+    finish_invocation_and_tombstone, read_invocation, slugify, AgentControlService, AgentIdentity,
+    AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags, InvocationFinishResult,
+    InvocationRecord, InvocationStatus, InvocationTrigger, SpawnGeminiTeammateOptions,
+    SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
 };
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
@@ -1419,6 +1419,7 @@ impl<
 
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
+            invocation: None,
         })
     }
 
@@ -2319,12 +2320,52 @@ impl<
             expected_agent_name: Some(owner.agent_name.clone()),
             invocation_pr_number: Some(req.resume_pr_number),
         };
+        let owner_dir = self
+            .ctx
+            .project_dir()
+            .join(".exo/agents")
+            .join(owner.agent_name.as_str());
+        let previous_invocation = read_invocation(&owner_dir).await.effect_err("agent")?;
         let result = self
             .service
             .spawn_leaf_subtree(&options, &ctx.birth_branch)
             .await
             .effect_err_preserve("agent")?;
-        let agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
+        let invocation = read_invocation(&owner_dir)
+            .await
+            .effect_err("agent")?
+            .ok_or_else(|| {
+                EffectError::invalid_input(format!(
+                    "PR #{} resume failed: host did not persist a fresh invocation",
+                    req.resume_pr_number
+                ))
+            })?;
+        let fresh = invocation_is_fresh(previous_invocation.as_ref(), &invocation);
+        if !fresh {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} owner is already running invocation {}; resume_pr did not create a fresh invocation",
+                req.resume_pr_number, invocation.invocation_id
+            )));
+        }
+        let target_alive = self.service.routing_liveness(&owner_dir).await == Some(true);
+        if !invocation.is_live() || !target_alive {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} resume failed: {} target {} was not live at readiness confirmation",
+                req.resume_pr_number,
+                invocation_status_label(invocation.status),
+                invocation_target_label(&invocation)
+            )));
+        }
+        let mut agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
+        agent_info.alive = true;
+        agent_info.is_alive = true;
+        let invocation_handoff = invocation_handoff_to_proto(
+            &invocation,
+            &result.branch_name,
+            true,
+            target_alive,
+            "started",
+        );
 
         if result.agent_type == ServiceAgentType::Claude {
             self.register_claude_team_child(
@@ -2348,6 +2389,7 @@ impl<
         );
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
+            invocation: Some(invocation_handoff),
         })
     }
     async fn reject_orphan_pr_spawn(&self, req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
@@ -3254,6 +3296,62 @@ fn leaf_subtree_result_to_proto(
     })
 }
 
+fn invocation_status_label(status: InvocationStatus) -> &'static str {
+    match status {
+        InvocationStatus::Running => "running",
+        InvocationStatus::Exited => "exited_early",
+        InvocationStatus::Failed => "startup_failed",
+        InvocationStatus::Killed => "killed",
+        InvocationStatus::TimedOut => "timed_out",
+    }
+}
+
+fn invocation_is_fresh(previous: Option<&InvocationRecord>, current: &InvocationRecord) -> bool {
+    previous.is_none_or(|record| record.invocation_id != current.invocation_id)
+}
+
+fn invocation_target_label(invocation: &InvocationRecord) -> String {
+    if let Some(window_id) = invocation.routing.window_id.as_ref() {
+        return format!("window {window_id}");
+    }
+    if let Some(pane_id) = invocation.routing.pane_id.as_ref() {
+        return format!("pane {pane_id}");
+    }
+    "unresolved target".to_string()
+}
+
+fn invocation_handoff_to_proto(
+    invocation: &InvocationRecord,
+    branch_name: &str,
+    fresh: bool,
+    ready: bool,
+    outcome: &str,
+) -> InvocationHandoff {
+    let (target_type, target_id) = if let Some(window_id) = invocation.routing.window_id.as_ref() {
+        ("window", window_id.to_string())
+    } else if let Some(pane_id) = invocation.routing.pane_id.as_ref() {
+        ("pane", pane_id.to_string())
+    } else {
+        ("none", String::new())
+    };
+    InvocationHandoff {
+        invocation_id: invocation.invocation_id.clone(),
+        trigger: match invocation.trigger {
+            InvocationTrigger::Spawn => "spawn",
+            InvocationTrigger::ResumePr => "resume_pr",
+            InvocationTrigger::Review => "review",
+        }
+        .to_string(),
+        runtime: invocation.runtime.suffix().to_string(),
+        branch_name: branch_name.to_string(),
+        target_type: target_type.to_string(),
+        target_id,
+        fresh,
+        ready,
+        outcome: outcome.to_string(),
+    }
+}
+
 fn spawn_result_branch_name(
     result: &crate::services::agent_control::SpawnResult,
 ) -> EffectResult<&str> {
@@ -3448,6 +3546,36 @@ mod tests {
             "unrelated-fix-opencode",
             "m7-3a-fixture-oracle-opencode"
         ));
+    }
+
+    #[test]
+    fn repeated_resume_requires_a_new_invocation_generation() {
+        let current = InvocationRecord {
+            invocation_id: "invocation-2".to_string(),
+            runtime: ServiceAgentType::Codex,
+            trigger: InvocationTrigger::ResumePr,
+            routing: RoutingInfo::window(
+                crate::services::tmux_ipc::WindowId::parse("@43").unwrap(),
+            ),
+            started_at: 2,
+            ended_at: None,
+            status: InvocationStatus::Running,
+            exit_code: None,
+            pr_number: Some(7),
+            head_sha: Some("abc123".to_string()),
+        };
+        let same_generation = InvocationRecord {
+            invocation_id: current.invocation_id.clone(),
+            ..current.clone()
+        };
+        let previous = InvocationRecord {
+            invocation_id: "invocation-1".to_string(),
+            ..current.clone()
+        };
+
+        assert!(!invocation_is_fresh(Some(&same_generation), &current));
+        assert!(invocation_is_fresh(Some(&previous), &current));
+        assert!(invocation_is_fresh(None, &current));
     }
 
     #[test]

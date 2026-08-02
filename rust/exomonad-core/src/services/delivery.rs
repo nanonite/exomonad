@@ -26,7 +26,10 @@ pub enum DeliveryResult {
 }
 
 fn routing_tmux_target(routing: &serde_json::Value) -> Option<String> {
-    routing["pane_id"].as_str().map(ToOwned::to_owned)
+    routing["pane_id"]
+        .as_str()
+        .or_else(|| routing["window_id"].as_str())
+        .map(ToOwned::to_owned)
 }
 
 fn agent_type_from_key(agent_key: &str) -> crate::services::AgentType {
@@ -61,11 +64,7 @@ async fn mark_agent_exited(agent_dir: &std::path::Path, expected_target: &str) {
         );
         return;
     };
-    if routing
-        .pane_id
-        .as_ref()
-        .is_none_or(|pane_id| pane_id.as_str() != expected_target)
-    {
+    if !routing_matches_tmux_target(&routing, expected_target) {
         warn!(
             path = %agent_dir.display(),
             expected_target,
@@ -87,6 +86,17 @@ async fn mark_agent_exited(agent_dir: &std::path::Path, expected_target: &str) {
             "failed to finish invocation; preserving stale agent routing"
         ),
     }
+}
+
+fn routing_matches_tmux_target(routing: &RoutingInfo, expected_target: &str) -> bool {
+    routing
+        .pane_id
+        .as_ref()
+        .is_some_and(|pane_id| pane_id.as_str() == expected_target)
+        || routing
+            .window_id
+            .as_ref()
+            .is_some_and(|window_id| window_id.as_str() == expected_target)
 }
 
 async fn tmux_target_alive(target: &str) -> Result<bool, String> {
@@ -1797,13 +1807,29 @@ mod tests {
     }
 
     #[test]
-    fn test_routing_tmux_target_ignores_stale_window_ids() {
+    fn test_routing_tmux_target_uses_exact_window_id_for_leaf_delivery() {
         let routing = serde_json::json!({
             "window_id": "@7",
             "parent_tab": "TL"
         });
 
-        assert_eq!(routing_tmux_target(&routing), None);
+        assert_eq!(routing_tmux_target(&routing), Some("@7".to_string()));
+    }
+
+    #[test]
+    fn test_exit_reconciliation_matches_window_or_pane_generation() {
+        let window_routing = RoutingInfo::window(
+            crate::services::tmux_ipc::WindowId::parse("@7").expect("valid window id"),
+        );
+        assert!(routing_matches_tmux_target(&window_routing, "@7"));
+        assert!(!routing_matches_tmux_target(&window_routing, "%7"));
+
+        let pane_routing = RoutingInfo::pane(
+            crate::services::tmux_ipc::PaneId::parse("%42").expect("valid pane id"),
+            "TL",
+        );
+        assert!(routing_matches_tmux_target(&pane_routing, "%42"));
+        assert!(!routing_matches_tmux_target(&pane_routing, "@7"));
     }
 
     #[tokio::test]

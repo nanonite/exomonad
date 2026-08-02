@@ -358,15 +358,28 @@ impl<
                     let path = entry.path();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-                    // Check for .mcp.json (Claude) or .gemini/settings.json (Gemini)
+                    // Agent configs are the discovery markers; routing.json and
+                    // invocation metadata remain the liveness authority.
                     let is_claude = path.join(".mcp.json").exists();
                     let is_gemini = path.join(".gemini/settings.json").exists();
+                    let is_shoal = path.join(".exo/mcp.json").exists();
+                    let is_opencode = path.join("opencode.json").exists();
+                    let is_codex = path.join(".codex/config.toml").exists();
 
-                    if is_claude || is_gemini {
-                        let agent_type = if is_claude {
+                    if is_claude || is_gemini || is_shoal || is_opencode || is_codex {
+                        let inferred_type = AgentType::from_dir_name(name);
+                        let agent_type = if is_gemini {
+                            AgentType::Gemini
+                        } else if is_shoal {
+                            AgentType::Shoal
+                        } else if is_opencode {
+                            AgentType::OpenCode
+                        } else if is_codex {
+                            AgentType::Codex
+                        } else if is_claude && inferred_type == AgentType::Gemini {
                             AgentType::Claude
                         } else {
-                            AgentType::Gemini
+                            inferred_type
                         };
                         let suffix = format!("-{}", agent_type.suffix());
                         let slug_str = name.strip_suffix(&suffix).unwrap_or(name);
@@ -429,42 +442,45 @@ impl<
                 let path = entry.path();
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-                // Workers are currently Gemini-only
-                if name.ends_with("-gemini") {
-                    let base_name = name.strip_suffix("-gemini").unwrap_or(name);
+                let agent_type = AgentType::from_dir_name(name);
+                let Some(base_name) = ["-claude", "-gemini", "-shoal", "-opencode", "-codex"]
+                    .iter()
+                    .find_map(|suffix| name.strip_suffix(suffix))
+                else {
+                    continue;
+                };
 
-                    // Skip if this is actually a worktree-based agent (leaf subtree or teammate)
-                    // found by the worktree scan.
-                    if agents
-                        .iter()
-                        .any(|a| a.slug.as_ref().map(|s| s.as_str()) == Some(base_name))
-                    {
-                        continue;
-                    }
-
-                    let display_name = format!("{} {}", AgentType::Gemini.emoji(), base_name);
-
-                    // Liveness: for workers, they might be panes in a window.
-                    // Currently list_agents only sees windows.
-                    let display_alive = windows.iter().any(|t| t == &display_name);
-                    let has_tab = self.routing_liveness(&path).await.unwrap_or(display_alive);
-                    let last_activity_at = self.activity_marker(&path).await;
-
-                    agents.push(AgentInfo {
-                        internal_name: AgentName::try_from_str(name)
-                            .expect("validated string input is non-empty"),
-                        has_tab,
-                        topology: Topology::SharedDir,
-                        agent_dir: Some(path.clone()),
-                        slug: Some(
-                            AgentName::try_from_str(base_name)
-                                .expect("validated string input is non-empty"),
-                        ),
-                        agent_type: Some(AgentType::Gemini),
-                        pr: None,
-                        last_activity_at,
-                    });
+                // Skip if this is actually a worktree-based agent (leaf subtree or teammate)
+                // found by the worktree scan.
+                if agents
+                    .iter()
+                    .any(|a| a.slug.as_ref().map(|s| s.as_str()) == Some(base_name))
+                {
+                    continue;
                 }
+
+                let display_name = format!("{} {}", agent_type.emoji(), base_name);
+
+                // Liveness: for workers, they might be panes in a window.
+                // Currently list_agents only sees windows.
+                let display_alive = windows.iter().any(|t| t == &display_name);
+                let has_tab = self.routing_liveness(&path).await.unwrap_or(display_alive);
+                let last_activity_at = self.activity_marker(&path).await;
+
+                agents.push(AgentInfo {
+                    internal_name: AgentName::try_from_str(name)
+                        .expect("validated string input is non-empty"),
+                    has_tab,
+                    topology: Topology::SharedDir,
+                    agent_dir: Some(path.clone()),
+                    slug: Some(
+                        AgentName::try_from_str(base_name)
+                            .expect("validated string input is non-empty"),
+                    ),
+                    agent_type: Some(agent_type),
+                    pr: None,
+                    last_activity_at,
+                });
             }
         }
         Ok(())

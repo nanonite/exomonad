@@ -47,6 +47,8 @@ pub(crate) use std::sync::Arc;
 
 pub(crate) const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const TMUX_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const INVOCATION_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const INVOCATION_MONITOR_INTERVAL: Duration = Duration::from_millis(200);
 pub(crate) const LAST_ACTIVITY_FILE: &str = "last_activity_at";
 
 /// Push the parent branch to the remote so child PRs can reference it as
@@ -1023,7 +1025,7 @@ impl<
             ));
         }
         routing.write_to_dir(&agent_config_dir).await?;
-        invocation::start_invocation(
+        let invocation = invocation::start_invocation(
             &agent_config_dir,
             metadata.runtime,
             metadata.trigger,
@@ -1038,6 +1040,15 @@ impl<
                     agent = %agent_name,
                     %error,
                     "Failed to clear previous invocation tombstone"
+                );
+            }
+        }
+        if let Err(error) = fs::remove_file(agent_config_dir.join("exit_code")).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    agent = %agent_name,
+                    %error,
+                    "Failed to clear previous invocation exit code"
                 );
             }
         }
@@ -1063,7 +1074,104 @@ impl<
             }
         }
 
+        self.monitor_invocation(agent_config_dir.clone(), invocation);
+
         Ok(agent_config_dir)
+    }
+
+    /// Reconcile a tmux-owned invocation as soon as its exact target exits.
+    ///
+    /// The invocation ID and routing target are captured from the same record
+    /// that was persisted at startup.  `finish_invocation_and_tombstone`
+    /// rejects a later generation, so a delayed monitor cannot retire a fresh
+    /// `resume_pr` invocation.
+    fn monitor_invocation(&self, agent_dir: PathBuf, invocation: InvocationRecord) {
+        if invocation.routing.window_id.is_none() && invocation.routing.pane_id.is_none() {
+            return;
+        }
+        let Ok(tmux) = self.tmux() else {
+            warn!(
+                path = %agent_dir.display(),
+                "Skipping invocation monitor because tmux is not configured"
+            );
+            return;
+        };
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(INVOCATION_MONITOR_INTERVAL);
+            let mut consecutive_errors = 0u8;
+            loop {
+                ticker.tick().await;
+                match crate::services::tmux_ipc::routing_target_alive(&invocation.routing, &tmux)
+                    .await
+                {
+                    Ok(true) => {
+                        consecutive_errors = 0;
+                    }
+                    Ok(false) => {
+                        let exit_code = tokio::fs::read_to_string(agent_dir.join("exit_code"))
+                            .await
+                            .ok()
+                            .and_then(|value| value.trim().parse::<i32>().ok());
+                        let status = match exit_code {
+                            Some(0) | None => InvocationStatus::Exited,
+                            Some(_) => InvocationStatus::Failed,
+                        };
+                        match invocation::finish_invocation_and_tombstone(
+                            &agent_dir,
+                            &invocation.routing,
+                            status,
+                            exit_code,
+                        )
+                        .await
+                        {
+                            Ok(InvocationFinishResult::IgnoredStale) => {
+                                info!(
+                                    path = %agent_dir.display(),
+                                    invocation_id = %invocation.invocation_id,
+                                    "Ignored exit from stale invocation generation"
+                                );
+                            }
+                            Ok(InvocationFinishResult::Finished(_))
+                            | Ok(InvocationFinishResult::Missing) => {
+                                info!(
+                                    path = %agent_dir.display(),
+                                    invocation_id = %invocation.invocation_id,
+                                    "Reconciled exited tmux invocation"
+                                );
+                            }
+                            Err(error) => {
+                                warn!(
+                                    path = %agent_dir.display(),
+                                    invocation_id = %invocation.invocation_id,
+                                    %error,
+                                    "Failed to reconcile exited tmux invocation"
+                                );
+                            }
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        warn!(
+                            path = %agent_dir.display(),
+                            invocation_id = %invocation.invocation_id,
+                            consecutive_errors,
+                            %error,
+                            "Could not verify tmux invocation liveness"
+                        );
+                        if consecutive_errors >= 5 {
+                            warn!(
+                                path = %agent_dir.display(),
+                                invocation_id = %invocation.invocation_id,
+                                "Stopping invocation monitor after repeated tmux errors"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Refresh lifecycle activity for an already-live agent.

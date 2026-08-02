@@ -59,7 +59,7 @@ instance FromJSON ResumePrArgs where
 
 resumePrDescription :: Text
 resumePrDescription =
-  "Resume an existing open, unmerged PR by number. The host re-fetches its head SHA and resolves the exact owning agent, branch, and runtime. Provide the task summary plus optional read_first, steps, verify, boundary, context, and done_criteria fields for a complete review-fix handoff. On the resumed owner's next `file_pr` call, preserve or update the PR body with the literal heading `## Acceptance Criteria` and copy every issue Definition-of-Done bullet verbatim beneath it; use done_criteria as the handoff source and do not silently drop or paraphrase the heading. Never provide a leaf name or agent type. For closed or unrecoverable PRs, use the human-approved replace_close_pr workflow."
+  "Resume an existing open, unmerged PR by number. The host re-fetches its head SHA, resolves the exact owning agent, branch, and runtime, starts a fresh invocation, and verifies its exact tmux target is ready before reporting success. An already-running owner is an explicit failure, not a fresh resume. Provide the task summary plus optional read_first, steps, verify, boundary, context, and done_criteria fields for a complete review-fix handoff. On the resumed owner's next `file_pr` call, preserve or update the PR body with the literal heading `## Acceptance Criteria` and copy every issue Definition-of-Done bullet verbatim beneath it; use done_criteria as the handoff source and do not silently drop or paraphrase the heading. Never provide a leaf name or agent type. For closed or unrecoverable PRs, use the human-approved replace_close_pr workflow."
 
 resumePrSchema :: Aeson.Object
 resumePrSchema =
@@ -117,7 +117,8 @@ resumePrCore args
                         "pr_number" .= rpaPrNumber args,
                         "head_branch" .= lazyText (PA.watcherPrStateResponseHeadBranch state),
                         "head_sha" .= lazyText (PA.watcherPrStateResponseHeadSha state),
-                        "agent" .= agent
+                        "agent" .= agent,
+                        "invocation" .= resumeInvocationValue agent
                       ]
 
 instance MCPTool ResumePr where
@@ -146,3 +147,16 @@ renderResumePrTask args =
 
 lazyText :: TL.Text -> Text
 lazyText = TL.toStrict
+
+resumeInvocationValue :: AC.SpawnResult -> Aeson.Value
+resumeInvocationValue agent =
+  object
+    [ "invocation_id" .= AC.invocationId agent,
+      "trigger" .= AC.invocationTrigger agent,
+      "runtime" .= AC.invocationRuntime agent,
+      "target_type" .= AC.routingTargetType agent,
+      "target_id" .= AC.routingTargetId agent,
+      "fresh" .= AC.invocationFresh agent,
+      "ready" .= AC.invocationReady agent,
+      "outcome" .= AC.invocationOutcome agent
+    ]

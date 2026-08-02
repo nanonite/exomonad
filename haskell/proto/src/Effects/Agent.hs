@@ -5928,8 +5928,11 @@ instance (HsJSONPB.ToJSON SpawnLeafSubtreeRequest) where
 instance (HsJSONPB.FromJSON SpawnLeafSubtreeRequest) where
   parseJSON = HsJSONPB.parseJSONPB
 
-newtype SpawnLeafSubtreeResponse
-  = SpawnLeafSubtreeResponse {spawnLeafSubtreeResponseAgent :: (Hs.Maybe Effects.Agent.AgentInfo)}
+data SpawnLeafSubtreeResponse
+  = SpawnLeafSubtreeResponse
+      { spawnLeafSubtreeResponseAgent :: (Hs.Maybe Effects.Agent.AgentInfo),
+        spawnLeafSubtreeResponseInvocation :: (Hs.Maybe Effects.Agent.InvocationHandoff)
+      }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
 instance (Hs.NFData SpawnLeafSubtreeResponse)
@@ -5942,16 +5945,26 @@ instance (HsProtobuf.HasDefault SpawnLeafSubtreeResponse)
 instance (HsProtobuf.Message SpawnLeafSubtreeResponse) where
   encodeMessage
     _
-    SpawnLeafSubtreeResponse {spawnLeafSubtreeResponseAgent} =
-      ( HsProtobuf.encodeMessageField
-          (HsProtobuf.FieldNumber 1)
-          ( ( Hs.coerce
-                @(Hs.Maybe Effects.Agent.AgentInfo)
-                @(HsProtobuf.Nested Effects.Agent.AgentInfo)
+    SpawnLeafSubtreeResponse {spawnLeafSubtreeResponseAgent, spawnLeafSubtreeResponseInvocation} =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            ( ( Hs.coerce
+                  @(Hs.Maybe Effects.Agent.AgentInfo)
+                  @(HsProtobuf.Nested Effects.Agent.AgentInfo)
+              )
+                spawnLeafSubtreeResponseAgent
             )
-              spawnLeafSubtreeResponseAgent
-          )
-      )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            ( ( Hs.coerce
+                  @(Hs.Maybe Effects.Agent.InvocationHandoff)
+                  @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+              )
+                spawnLeafSubtreeResponseInvocation
+            )
+        )
   decodeMessage _ =
     Hs.pure SpawnLeafSubtreeResponse
       <*> ( ( HsProtobuf.coerceOver
@@ -5960,8 +5973,14 @@ instance (HsProtobuf.Message SpawnLeafSubtreeResponse) where
             )
               ( HsProtobuf.at
                   HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 1)
+              (HsProtobuf.FieldNumber 1)
               )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+                @(Hs.Maybe Effects.Agent.InvocationHandoff)
+            )
+              (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 2))
           )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
@@ -5972,20 +5991,35 @@ instance (HsProtobuf.Message SpawnLeafSubtreeResponse) where
         (HsProtobufAST.Single "agent")
         []
         ""
+    , HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "InvocationHandoff"))
+        )
+        (HsProtobufAST.Single "invocation")
+        []
+        ""
     ]
 
 instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeResponse) where
-  toJSONPB (SpawnLeafSubtreeResponse f1) =
+  toJSONPB (SpawnLeafSubtreeResponse f1 f2) =
     HsJSONPB.object
       [ "agent"
           .= ( ( Hs.coerce
                    @(Hs.Maybe Effects.Agent.AgentInfo)
                    @(HsProtobuf.Nested Effects.Agent.AgentInfo)
                )
-                 f1
+             f1
+             ),
+        "invocation"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.InvocationHandoff)
+                   @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+               )
+                 f2
              )
       ]
-  toEncodingPB (SpawnLeafSubtreeResponse f1) =
+  toEncodingPB (SpawnLeafSubtreeResponse f1 f2) =
     HsJSONPB.pairs
       [ "agent"
           .= ( ( Hs.coerce
@@ -5993,6 +6027,13 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeResponse) where
                    @(HsProtobuf.Nested Effects.Agent.AgentInfo)
                )
                  f1
+             ),
+        "invocation"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.InvocationHandoff)
+                   @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+               )
+                 f2
              )
       ]
 
@@ -6008,6 +6049,12 @@ instance (HsJSONPB.FromJSONPB SpawnLeafSubtreeResponse) where
                   )
                     (obj .: "agent")
                 )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+                      @(Hs.Maybe Effects.Agent.InvocationHandoff)
+                  )
+                    (obj .: "invocation")
+                )
       )
 
 instance (HsJSONPB.ToJSON SpawnLeafSubtreeResponse) where
@@ -6015,6 +6062,233 @@ instance (HsJSONPB.ToJSON SpawnLeafSubtreeResponse) where
   toEncoding = HsJSONPB.toAesonEncoding
 
 instance (HsJSONPB.FromJSON SpawnLeafSubtreeResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data InvocationHandoff
+  = InvocationHandoff
+      { invocationHandoffInvocationId :: Hs.Text,
+        invocationHandoffTrigger :: Hs.Text,
+        invocationHandoffRuntime :: Hs.Text,
+        invocationHandoffBranchName :: Hs.Text,
+        invocationHandoffTargetType :: Hs.Text,
+        invocationHandoffTargetId :: Hs.Text,
+        invocationHandoffFresh :: Hs.Bool,
+        invocationHandoffReady :: Hs.Bool,
+        invocationHandoffOutcome :: Hs.Text
+      }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData InvocationHandoff)
+
+instance (HsProtobuf.Named InvocationHandoff) where
+  nameOf _ = Hs.fromString "InvocationHandoff"
+
+instance (HsProtobuf.HasDefault InvocationHandoff)
+
+instance (HsProtobuf.Message InvocationHandoff) where
+  encodeMessage
+    _
+    InvocationHandoff
+      { invocationHandoffInvocationId,
+        invocationHandoffTrigger,
+        invocationHandoffRuntime,
+        invocationHandoffBranchName,
+        invocationHandoffTargetType,
+        invocationHandoffTargetId,
+        invocationHandoffFresh,
+        invocationHandoffReady,
+        invocationHandoffOutcome
+      } =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffInvocationId)
+        )
+        ( Hs.mappend
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 2)
+                ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffTrigger)
+            )
+            ( Hs.mappend
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 3)
+                    ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffRuntime)
+                )
+                ( Hs.mappend
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 4)
+                        ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffBranchName)
+                    )
+                    ( Hs.mappend
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 5)
+                            ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffTargetType)
+                        )
+                        ( Hs.mappend
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 6)
+                                ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffTargetId)
+                            )
+                            ( Hs.mappend
+                                (HsProtobuf.encodeMessageField (HsProtobuf.FieldNumber 7) invocationHandoffFresh)
+                                ( Hs.mappend
+                                    (HsProtobuf.encodeMessageField (HsProtobuf.FieldNumber 8) invocationHandoffReady)
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 9)
+                                        ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffOutcome)
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+  decodeMessage _ =
+    Hs.pure InvocationHandoff
+      <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+            (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 1)))
+      <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+            (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 2)))
+      <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+            (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 3)))
+      <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+            (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 4)))
+      <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+            (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 5)))
+      <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+            (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 6)))
+      <*> (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 7))
+      <*> (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 8))
+      <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+            (HsProtobuf.at HsProtobuf.decodeMessageField (HsProtobuf.FieldNumber 9)))
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim (HsProtobufAST.Named (HsProtobufAST.Single "string")))
+        (HsProtobufAST.Single "invocation_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim (HsProtobufAST.Named (HsProtobufAST.Single "string")))
+        (HsProtobufAST.Single "trigger")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim (HsProtobufAST.Named (HsProtobufAST.Single "string")))
+        (HsProtobufAST.Single "runtime")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim (HsProtobufAST.Named (HsProtobufAST.Single "string")))
+        (HsProtobufAST.Single "branch_name")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim (HsProtobufAST.Named (HsProtobufAST.Single "string")))
+        (HsProtobufAST.Single "target_type")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim (HsProtobufAST.Named (HsProtobufAST.Single "string")))
+        (HsProtobufAST.Single "target_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim (HsProtobufAST.Named (HsProtobufAST.Single "bool")))
+        (HsProtobufAST.Single "fresh")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim (HsProtobufAST.Named (HsProtobufAST.Single "bool")))
+        (HsProtobufAST.Single "ready")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        (HsProtobufAST.Prim (HsProtobufAST.Named (HsProtobufAST.Single "string")))
+        (HsProtobufAST.Single "outcome")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB InvocationHandoff) where
+  toJSONPB
+    InvocationHandoff
+      { invocationHandoffInvocationId,
+        invocationHandoffTrigger,
+        invocationHandoffRuntime,
+        invocationHandoffBranchName,
+        invocationHandoffTargetType,
+        invocationHandoffTargetId,
+        invocationHandoffFresh,
+        invocationHandoffReady,
+        invocationHandoffOutcome
+      } =
+      HsJSONPB.object
+        [ "invocation_id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffInvocationId),
+          "trigger" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffTrigger),
+          "runtime" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffRuntime),
+          "branch_name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffBranchName),
+          "target_type" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffTargetType),
+          "target_id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffTargetId),
+          "fresh" .= invocationHandoffFresh,
+          "ready" .= invocationHandoffReady,
+          "outcome" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffOutcome)
+        ]
+  toEncodingPB
+    InvocationHandoff
+      { invocationHandoffInvocationId,
+        invocationHandoffTrigger,
+        invocationHandoffRuntime,
+        invocationHandoffBranchName,
+        invocationHandoffTargetType,
+        invocationHandoffTargetId,
+        invocationHandoffFresh,
+        invocationHandoffReady,
+        invocationHandoffOutcome
+      } =
+      HsJSONPB.pairs
+        [ "invocation_id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffInvocationId),
+          "trigger" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffTrigger),
+          "runtime" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffRuntime),
+          "branch_name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffBranchName),
+          "target_type" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffTargetType),
+          "target_id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffTargetId),
+          "fresh" .= invocationHandoffFresh,
+          "ready" .= invocationHandoffReady,
+          "outcome" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) invocationHandoffOutcome)
+        ]
+
+instance (HsJSONPB.FromJSONPB InvocationHandoff) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "InvocationHandoff"
+      ( \obj ->
+          Hs.pure InvocationHandoff
+            <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text) (obj .: "invocation_id"))
+            <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text) (obj .: "trigger"))
+            <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text) (obj .: "runtime"))
+            <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text) (obj .: "branch_name"))
+            <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text) (obj .: "target_type"))
+            <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text) (obj .: "target_id"))
+            <*> (obj .: "fresh")
+            <*> (obj .: "ready")
+            <*> ((HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text) (obj .: "outcome"))
+      )
+
+instance (HsJSONPB.ToJSON InvocationHandoff) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON InvocationHandoff) where
   parseJSON = HsJSONPB.parseJSONPB
 
 newtype CloseSelfRequest
