@@ -21,6 +21,7 @@ pub enum DeliveryResult {
     Teams,
     Uds,
     Tmux,
+    Durable,
     Failed,
 }
 
@@ -231,6 +232,7 @@ pub enum DeliveryMethod {
     TeamsInbox,
     Uds,
     Tmux,
+    DurableInbox,
 }
 
 /// Outcome of a routed message delivery.
@@ -272,6 +274,10 @@ impl DeliveryOutcome {
                 method: DeliveryMethod::Tmux,
                 recipient: agent,
             },
+            DeliveryResult::Durable => DeliveryOutcome::Delivered {
+                method: DeliveryMethod::DurableInbox,
+                recipient: agent,
+            },
         }
     }
 
@@ -291,6 +297,7 @@ impl DeliveryOutcome {
                 DeliveryMethod::TeamsInbox => "teams_inbox",
                 DeliveryMethod::Uds => "unix_socket",
                 DeliveryMethod::Tmux => "tmux_stdin",
+                DeliveryMethod::DurableInbox => "durable_inbox",
             },
             DeliveryOutcome::Failed { .. } => "failed",
         }
@@ -498,13 +505,19 @@ async fn deliver_to_agent_for(
             if !record_inbox_delivery(ctx, agent_key, from, message, summary).await {
                 return DeliveryResult::Failed;
             }
-            deliver_via_tmux(ctx.project_dir(), agent_key, tmux_target, from, message).await
+            match deliver_via_tmux(ctx.project_dir(), agent_key, tmux_target, from, message).await {
+                DeliveryResult::Failed => DeliveryResult::Durable,
+                result => result,
+            }
         }
         MessageDeliveryPath::MailboxOnly => {
             if !record_inbox_delivery(ctx, agent_key, from, message, summary).await {
                 return DeliveryResult::Failed;
             }
-            deliver_to_agent_mailbox(ctx, agent_key, from, message, summary).await
+            match deliver_to_agent_mailbox(ctx, agent_key, from, message, summary).await {
+                DeliveryResult::Failed => DeliveryResult::Durable,
+                result => result,
+            }
         }
     }
 }
@@ -560,7 +573,8 @@ fn delivery_method_from_result(result: DeliveryResult) -> DeliveryMethod {
     match result {
         DeliveryResult::Teams => DeliveryMethod::TeamsInbox,
         DeliveryResult::Uds => DeliveryMethod::Uds,
-        DeliveryResult::Tmux | DeliveryResult::Failed => DeliveryMethod::Tmux,
+        DeliveryResult::Tmux => DeliveryMethod::Tmux,
+        DeliveryResult::Durable | DeliveryResult::Failed => DeliveryMethod::DurableInbox,
     }
 }
 
@@ -1112,9 +1126,34 @@ async fn deliver_via_tmux(
     // Resolve the current pane from the display name. Window and pane indexes
     // are session-local and can become stale after a restart; the display name
     // is the stable identity supplied by AgentResolver.
-    let current_target = current_tmux_pane_target(tmux_target)
-        .await
-        .unwrap_or_else(|| tmux_target.to_string());
+    let Some(current_target) = current_tmux_pane_target(tmux_target).await else {
+        warn!(
+            agent = %agent_key,
+            target = %tmux_target,
+            "refusing tmux delivery because the exact current pane cannot be resolved"
+        );
+        return DeliveryResult::Failed;
+    };
+    match tmux_target_alive(&current_target).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(
+                agent = %agent_key,
+                target = %current_target,
+                "refusing tmux delivery because the exact current pane is stale"
+            );
+            return DeliveryResult::Failed;
+        }
+        Err(error) => {
+            warn!(
+                agent = %agent_key,
+                target = %current_target,
+                %error,
+                "refusing tmux delivery because pane liveness could not be verified"
+            );
+            return DeliveryResult::Failed;
+        }
+    }
     enqueue_tmux_delivery(
         agent_key,
         &current_target,
@@ -1442,7 +1481,10 @@ pub async fn deliver_to_agent(
     }
 
     // Fall back to tmux STDIN injection
-    deliver_via_tmux(project_dir, agent_key, tmux_target, from, message).await
+    match deliver_via_tmux(project_dir, agent_key, tmux_target, from, message).await {
+        DeliveryResult::Failed => DeliveryResult::Durable,
+        result => result,
+    }
 }
 
 #[cfg(test)]

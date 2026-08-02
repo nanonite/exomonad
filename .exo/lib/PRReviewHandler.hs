@@ -45,14 +45,14 @@ tlPRReviewEventHandlers =
     }
 
 prReviewHandler :: PRReviewEvent -> Eff Effects EventAction
-prReviewHandler (ReviewReceived n comments_ reviewBranch authorBranch) = do
+prReviewHandler (ReviewReceived n comments_ _reviewBranch _authorBranch) = do
   logHandler $ "Review received on PR #" <> T.pack (show n)
   currentBranch <- getCurrentBranch
-  phase <- applyEvent @DevPhase @DevEvent currentBranch DevSpawned (ReviewReceivedEv n comments_)
-  pure $ reviewRequestAction n comments_ reviewBranch authorBranch phase
-prReviewHandler (ReviewCommented n comments_ reviewBranch authorBranch) = do
+  void $ applyEvent @DevPhase @DevEvent currentBranch DevSpawned (ReviewReceivedEv n comments_)
+  pure NoAction
+prReviewHandler (ReviewCommented n _comments_ _reviewBranch _authorBranch) = do
   logHandler $ "Comment-only review received on PR #" <> T.pack (show n)
-  pure (NotifyParentAction (Tpl.reviewCommentedForParent n reviewBranch authorBranch comments_) n)
+  pure NoAction
 prReviewHandler (ReviewApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved (reviewer agent)"
   branch <- getCurrentBranch
@@ -76,11 +76,11 @@ prReviewHandler (CommitsPushed n ci) = do
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CommitsPushedEv n ci)
   pure NoAction
-prReviewHandler (ReviewerRequestedChanges n comments_ reviewBranch authorBranch) = do
+prReviewHandler (ReviewerRequestedChanges n comments_ _reviewBranch _authorBranch) = do
   logHandler $ "Reviewer requested changes on PR #" <> T.pack (show n)
   branch <- getCurrentBranch
-  phase <- applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
-  pure $ reviewRequestAction n comments_ reviewBranch authorBranch phase
+  void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
+  pure NoAction
 prReviewHandler (RateLimited remaining secs) = do
   logHandler $ "Rate limited: " <> T.pack (show remaining) <> " retries, " <> T.pack (show secs) <> "s until reset"
   pure NoAction
@@ -111,7 +111,7 @@ prReviewHandler (MergeReady n ci branch_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " merge ready, CI: " <> ci
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (MergeReadyEv n ci branch_)
-  pure (NotifyParentAction (Tpl.mergeReady n ci branch_) n)
+  pure NoAction
 prReviewHandler (DevNotPushing n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " dev leaf stopped pushing fixes"
   pure NoAction
@@ -221,13 +221,13 @@ ciStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerAppro
     then do
       branch <- getCurrentBranch
       void $ applyEvent @DevPhase @DevEvent branch DevSpawned (MergeReadyEv n status_ branch_)
-      pure (NotifyParentAction (Tpl.mergeReady n status_ branch_) n)
+      pure NoAction
     else
       if mergeBlockedOnCI && status_ == "failure"
         then do
           branch <- getCurrentBranch
           void $ applyEvent @DevPhase @DevEvent branch DevSpawned (CIBlockedEv n status_ branch_)
-          pure $ NotifyParentAction ("[CI BLOCKED: PR #" <> T.pack (show n) <> "] CI finished with status " <> status_ <> " on " <> branch_ <> ". The TL owns the next decision and may use resume_pr.") n
+          pure NoAction
         else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
 
 tlCiStatusHandler :: CIStatusEvent -> Eff Effects EventAction
@@ -236,18 +236,6 @@ tlCiStatusHandler (CIStatusEvent n status_ branch_ mergeBlockedOnCI _reviewerApp
   if (mergeBlockedOnCI || mergeReady_) && status_ `elem` ["success", "neutral"]
     then pure (InjectMessage (Tpl.mergeReady n status_ branch_))
     else pure (InjectMessage (Tpl.ciStatus n status_ branch_))
-
-reviewRequestAction :: Int -> Text -> Text -> Maybe Text -> Maybe DevPhase -> EventAction
-reviewRequestAction n comments_ reviewBranch authorBranch phase =
-  NotifyParentAction
-    ( Tpl.reviewReceivedForParent n reviewBranch authorBranch comments_
-        <> stuckSuffix phase
-    )
-    n
-  where
-    stuckSuffix (Just (DevNeedsHumanDirection _ reason)) =
-      "\n\nReview loop needs human direction: " <> reason <> ". The TL must use resume_pr for the next invocation."
-    stuckSuffix _ = ""
 
 -- | Helper to log handler entry.
 logHandler :: Text -> Eff Effects ()

@@ -99,6 +99,12 @@ enum PendingAction {
         branch: String,
         head_sha: String,
     },
+    NotifyParentRepair {
+        head_sha: String,
+        round: u32,
+        outcome: String,
+        context: String,
+    },
 }
 
 struct PendingPrActions {
@@ -307,6 +313,7 @@ struct WatchState {
     reviewer_spawned: bool,
     reviewer_disposed: bool,
     reviewer_attempt: Option<ReviewerAttempt>,
+    parent_handoff_fingerprint: Option<String>,
     review_approved_at: Option<Instant>,
     ci_mergeable_at: Option<Instant>,
     merge_ready_notified: bool,
@@ -380,6 +387,8 @@ struct WatcherPrState {
     ci_blocked_notified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reviewer_attempt: Option<ReviewerAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_handoff_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -444,6 +453,7 @@ impl WatchState {
             reviewer_spawned: false,
             reviewer_disposed: false,
             reviewer_attempt: None,
+            parent_handoff_fingerprint: None,
             review_approved_at: None,
             ci_mergeable_at: if matches!(ci_status, CIStatus::Success | CIStatus::Neutral) {
                 Some(Instant::now())
@@ -466,6 +476,7 @@ impl WatchState {
         self.reviewer_spawned = false;
         self.reviewer_disposed = false;
         self.reviewer_attempt = None;
+        self.parent_handoff_fingerprint = None;
         self.review_approved_at = None;
         self.ci_mergeable_at = None;
         self.ci_triggered_sha = None;
@@ -524,9 +535,31 @@ const REVIEW_HANDOFF_INSTRUCTIONS: &str = concat!(
     "2. State the root cause of each requested change.\n",
     "3. Propose the concrete solution, naming exact files/lines and expected behavior.\n",
     "4. Build a complete repair task with ROOT CAUSE, PROPOSED SOLUTION, READ FIRST, STEPS, VERIFY, BOUNDARY, and DONE CRITERIA sections.\n",
-    "5. For this existing open PR, call `resume_pr` with the PR number and complete task. Do not call `spawn_leaf`, create a sibling branch, create a new Chainlink issue, or close the owning issue.\n",
+    "5. For repair, call `resume_pr` for this existing open PR with the verified head SHA as `expected_head_sha`. A changed SHA is stale and must be re-read before retrying. Do not call `spawn_leaf`, create a sibling branch, create a new Chainlink issue, or close the owning issue.\n",
     "The resumed leaf must commit/push the fix, end its Chainlink session, and report the verification results to its parent.",
 );
+
+fn parent_repair_handoff_fingerprint(
+    outcome: &str,
+    head_sha: &str,
+    round: u32,
+    context: &str,
+) -> String {
+    format!("{outcome}\0{head_sha}\0{round}\0{context}")
+}
+
+fn parent_repair_handoff_message(
+    pr_number: u64,
+    branch: &str,
+    head_sha: &str,
+    round: u32,
+    outcome: &str,
+    context: &str,
+) -> String {
+    format!(
+        "[REPAIR HANDOFF] PR #{pr_number} on branch {branch}\nVerified PublishedHead SHA: {head_sha}\nReview round: {round}\nOutcome: {outcome}\n\n{context}\n\nTL owns the next decision. If repair is required, call `resume_pr` for PR #{pr_number} with expected_head_sha=\"{head_sha}\" and the complete repair task. A changed head is stale: re-read the current verified SHA before retrying. Reuse the existing issue-owned worktree, branch, and PR; never spawn a sibling leaf or create a replacement PR.\n\n{REVIEW_HANDOFF_INSTRUCTIONS}"
+    )
+}
 
 fn review_parent_message(
     pr_number: u64,
@@ -1673,6 +1706,7 @@ where
                         old_state.reviewer_spawned = false;
                         old_state.reviewer_disposed = false;
                         old_state.reviewer_attempt = None;
+                        old_state.parent_handoff_fingerprint = None;
                         old_state.stuck = false;
                     }
                     if let Some(attempt_id) = claim_reviewer_attempt(
@@ -1725,6 +1759,8 @@ where
                     new_state.rounds = persisted.rounds;
                     new_state.stuck = persisted.stuck || persisted.needs_human_review;
                     new_state.reviewer_attempt = persisted.reviewer_attempt.clone();
+                    new_state.parent_handoff_fingerprint =
+                        persisted.parent_handoff_fingerprint.clone();
                     if new_state
                         .reviewer_attempt
                         .as_ref()
@@ -1874,7 +1910,7 @@ where
         }
 
         for pending in pending_actions {
-            for action in pending.actions {
+            for action in pending.actions.iter().cloned() {
                 match action {
                     PendingAction::WasmEvent {
                         event_type,
@@ -1897,8 +1933,6 @@ where
                         );
                         let requests_merge_ready_delivery =
                             requests_merge_ready_parent_delivery(event_type, &payload);
-                        let is_review_feedback = is_review_feedback_event(event_type, &payload);
-
                         // Reviewers are ephemeral: they submit their Forgejo verdict and exit.
                         // Review events have one delivery target, the PR owner's dev leaf. A
                         // subsequent review round is started by the watcher-owned
@@ -1914,7 +1948,7 @@ where
                                 payload,
                             )
                             .await;
-                        let delivery_confirmed = match response {
+                        let _delivery_confirmed = match response {
                             Ok(Some(response)) => {
                                 let confirmed = self
                                     .handle_event_action(
@@ -1955,18 +1989,6 @@ where
                                 false
                             }
                         };
-                        if is_review_feedback && !delivery_confirmed {
-                            if let Err(error) = self
-                                .reset_review_delivery_fingerprint(pending.pr_number)
-                                .await
-                            {
-                                warn!(
-                                    pr_number = pending.pr_number,
-                                    %error,
-                                    "Failed to reset undelivered review fingerprint"
-                                );
-                            }
-                        }
                     }
                     PendingAction::EmitEvent {
                         status,
@@ -2019,6 +2041,24 @@ where
                         head_sha,
                     } => {
                         info!(pr_number, branch = %branch, head_sha = %head_sha, "Manual CI trigger is disabled until Forgejo integration is configured");
+                    }
+                    PendingAction::NotifyParentRepair {
+                        head_sha,
+                        round,
+                        outcome,
+                        context,
+                    } => {
+                        let delivered = self
+                            .deliver_parent_repair_handoff(
+                                &pending, &head_sha, round, &outcome, &context,
+                            )
+                            .await;
+                        if delivered && outcome == "merge_ready" {
+                            self.mark_merge_ready_notified(pending.pr_number).await;
+                        } else if !delivered {
+                            self.reset_parent_handoff(pending.pr_number, &head_sha, &outcome)
+                                .await;
+                        }
                     }
                 }
             }
@@ -2087,6 +2127,7 @@ where
                 entry.ci_triggered_sha = watch_state.ci_triggered_sha.clone();
                 entry.ci_blocked_notified = watch_state.ci_blocked_notified;
                 entry.reviewer_attempt = watch_state.reviewer_attempt.clone();
+                entry.parent_handoff_fingerprint = watch_state.parent_handoff_fingerprint.clone();
             }
         }
         drop(runtime_state);
@@ -2099,23 +2140,102 @@ where
         Ok(())
     }
 
-    async fn reset_review_delivery_fingerprint(&self, pr_number: u64) -> Result<()> {
-        let mut runtime_state = self.state.prs.lock().await;
-        if let Some(watch_state) = runtime_state.get_mut(&pr_number) {
-            watch_state.last_review_fingerprint = None;
+    async fn deliver_parent_repair_handoff(
+        &self,
+        pending: &PendingPrActions,
+        head_sha: &str,
+        round: u32,
+        outcome: &str,
+        context: &str,
+    ) -> bool {
+        let parent_session_id = pending
+            .branch
+            .as_str()
+            .rsplit_once('.')
+            .map(|(parent, _)| crate::services::delivery::canonical_parent_recipient(parent))
+            .unwrap_or_else(|| "root".to_string());
+        let parent_name = AgentName::try_from_str(&parent_session_id)
+            .expect("canonical parent identity is non-empty");
+        let parent_tab = crate::services::delivery::resolve_tab_name_for_agent(
+            &parent_name,
+            Some(self.ctx.agent_resolver()),
+        );
+        let message = parent_repair_handoff_message(
+            pending.pr_number,
+            pending.branch.as_str(),
+            head_sha,
+            round,
+            outcome,
+            context,
+        );
+        let source = AgentName::try_from_str(&pending.agent_name)
+            .expect("review owner identity is non-empty");
+        let result = crate::services::delivery::notify_parent_delivery(
+            &*self.ctx,
+            &source,
+            &parent_session_id,
+            &parent_tab,
+            crate::services::delivery::NotifyStatus::Success,
+            &message,
+            Some("SHA-scoped parent repair handoff"),
+            "watcher_parent_repair_handoff",
+        )
+        .await;
+        if matches!(result, crate::services::delivery::DeliveryResult::Failed) {
+            warn!(
+                pr_number = pending.pr_number,
+                parent = %parent_session_id,
+                head_sha,
+                outcome,
+                "Failed to durably deliver parent repair handoff"
+            );
+            false
+        } else {
+            info!(
+                pr_number = pending.pr_number,
+                parent = %parent_session_id,
+                head_sha,
+                outcome,
+                "Delivered durable parent repair handoff"
+            );
+            true
         }
-        drop(runtime_state);
+    }
 
-        let mut state = self.read_watcher_state().await.unwrap_or_default();
-        let changed = state
-            .prs
-            .get_mut(&pr_number)
-            .and_then(|pr_state| pr_state.last_review_fingerprint.take())
-            .is_some();
-        if changed {
-            self.write_watcher_state(&state).await?;
+    async fn reset_parent_handoff(&self, pr_number: u64, head_sha: &str, outcome: &str) {
+        let mut runtime = self.state.prs.lock().await;
+        let Some(state) = runtime.get_mut(&pr_number) else {
+            return;
+        };
+        state.parent_handoff_fingerprint = None;
+        match outcome {
+            "changes_requested" | "commented" => {
+                state.last_review_fingerprint = None;
+            }
+            "stuck" => {
+                state.last_review_fingerprint = None;
+                state.stuck = false;
+            }
+            "timeout" => state.notified_parent_timeout = false,
+            "ci_blocked" => {
+                state.ci_blocked_notified = false;
+                state.last_ci_status = CIStatus::Unknown;
+                state.stuck = false;
+            }
+            "merge_ready" => state.merge_ready_notified = false,
+            "approved" => {}
+            _ => warn!(
+                pr_number,
+                outcome, "Unknown parent handoff outcome during retry reset"
+            ),
         }
-        Ok(())
+        drop(runtime);
+        if let Err(error) = self
+            .persist_runtime_pr_state(&[(pr_number, head_sha.to_string())], &[])
+            .await
+        {
+            warn!(pr_number, %error, "Failed to persist parent handoff retry state");
+        }
     }
 
     async fn detect_merged(
@@ -2746,6 +2866,7 @@ fn compute_pr_actions_with_context(
         old_state.ci_triggered_sha = None;
         old_state.ci_blocked_notified = false;
         old_state.stuck = false;
+        old_state.parent_handoff_fingerprint = None;
         old_state.first_seen = Instant::now();
         merge_ready_now = false;
         if was_changes_requested {
@@ -2775,10 +2896,21 @@ fn compute_pr_actions_with_context(
     if ci_changed
         && ci_status == CIStatus::Failure
         && old_state.review_approved_at.is_some()
-        && !old_state.ci_blocked_notified
+        && (!old_state.ci_blocked_notified
+            || old_state.parent_handoff_fingerprint.as_deref().is_none())
     {
         old_state.stuck = true;
         old_state.ci_blocked_notified = true;
+        let context = format!(
+            "CI finished with status {} for the verified PR head.",
+            ci_status.as_str()
+        );
+        old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
+            "ci_blocked",
+            pr_sha,
+            old_state.rounds,
+            &context,
+        ));
         pending_actions.push(PendingAction::WriteRegistryStuck {
             pr_number: pr_number.as_u64(),
             rounds: old_state.rounds,
@@ -2805,6 +2937,12 @@ fn compute_pr_actions_with_context(
                 "branch": branch,
             }),
         });
+        pending_actions.push(PendingAction::NotifyParentRepair {
+            head_sha: pr_sha.to_string(),
+            round: old_state.rounds,
+            outcome: "ci_blocked".to_string(),
+            context,
+        });
     }
 
     let terminal_parent_notified =
@@ -2825,8 +2963,11 @@ fn compute_pr_actions_with_context(
         r.state == ForgejoReviewVerdict::Approved || r.body.to_lowercase().contains("approved")
     });
     if approved && old_state.last_review_state != ForgejoReviewVerdict::Approved {
-        let approved_round =
-            approved_review_round(old_state.rounds, observed_request_change_rounds);
+        let approved_round = if old_state.last_review_state == ForgejoReviewVerdict::Approved {
+            old_state.rounds
+        } else {
+            approved_review_round(old_state.rounds, observed_request_change_rounds)
+        };
         old_state.rounds = approved_round;
         pending_actions.push(PendingAction::WriteRegistryRounds {
             pr_number: pr_number.as_u64(),
@@ -2835,6 +2976,13 @@ fn compute_pr_actions_with_context(
         old_state.last_review_state = ForgejoReviewVerdict::Approved;
         old_state.notified_parent_approved = true;
         old_state.review_approved_at = Some(now);
+        let context = "Forgejo reviewer approval is recorded for this verified head; CI and the watcher remain authoritative before merge.";
+        old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
+            "approved",
+            pr_sha,
+            old_state.rounds,
+            context,
+        ));
         let merge_ready_now = !old_state.merge_ready_notified
             && signals_within_merge_ready_window(
                 old_state.review_approved_at,
@@ -2850,6 +2998,12 @@ fn compute_pr_actions_with_context(
                 "branch": branch,
             }),
         });
+        pending_actions.push(PendingAction::NotifyParentRepair {
+            head_sha: pr_sha.to_string(),
+            round: old_state.rounds,
+            outcome: "approved".to_string(),
+            context: context.to_string(),
+        });
         if merge_ready_now {
             emitted_merge_ready_notification = true;
             pending_actions.push(PendingAction::WasmEvent {
@@ -2860,6 +3014,22 @@ fn compute_pr_actions_with_context(
                     "ci_status": ci_status.as_str(),
                     "branch": branch,
                 }),
+            });
+            let context = format!(
+                "Reviewer approval and CI status {} are both satisfied for this verified head.",
+                ci_status.as_str()
+            );
+            old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
+                "merge_ready",
+                pr_sha,
+                old_state.rounds,
+                &context,
+            ));
+            pending_actions.push(PendingAction::NotifyParentRepair {
+                head_sha: pr_sha.to_string(),
+                round: old_state.rounds,
+                outcome: "merge_ready".to_string(),
+                context,
             });
         } else if old_state.ci_triggered_sha.as_deref() != Some(pr_sha) {
             old_state.ci_triggered_sha = Some(pr_sha.to_string());
@@ -2898,6 +3068,12 @@ fn compute_pr_actions_with_context(
         let message = format_message(comments, reviews);
         if old_state.rounds >= max_rounds {
             old_state.stuck = true;
+            old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
+                "stuck",
+                pr_sha,
+                old_state.rounds,
+                &message,
+            ));
             pending_actions.push(PendingAction::WriteRegistryStuck {
                 pr_number: pr_number.as_u64(),
                 rounds: old_state.rounds,
@@ -2915,7 +3091,19 @@ fn compute_pr_actions_with_context(
                     ci_status,
                 ),
             });
+            pending_actions.push(PendingAction::NotifyParentRepair {
+                head_sha: pr_sha.to_string(),
+                round: old_state.rounds,
+                outcome: "stuck".to_string(),
+                context: message,
+            });
         } else {
+            old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
+                "changes_requested",
+                pr_sha,
+                old_state.rounds,
+                &message,
+            ));
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
                 payload: serde_json::json!({
@@ -2929,6 +3117,12 @@ fn compute_pr_actions_with_context(
                         ForgejoReviewVerdict::ChangesRequested,
                     ),
                 }),
+            });
+            pending_actions.push(PendingAction::NotifyParentRepair {
+                head_sha: pr_sha.to_string(),
+                round: old_state.rounds,
+                outcome: "changes_requested".to_string(),
+                context: message.clone(),
             });
             pending_actions.push(PendingAction::WriteRegistryRounds {
                 pr_number: pr_number.as_u64(),
@@ -2957,6 +3151,12 @@ fn compute_pr_actions_with_context(
         old_state.last_review_state = ForgejoReviewVerdict::Commented;
         old_state.last_review_fingerprint = commented_fingerprint;
         let message = format_message(comments, reviews);
+        old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
+            "commented",
+            pr_sha,
+            old_state.rounds,
+            &message,
+        ));
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
             payload: serde_json::json!({
@@ -2971,12 +3171,27 @@ fn compute_pr_actions_with_context(
                 ),
             }),
         });
+        pending_actions.push(PendingAction::NotifyParentRepair {
+            head_sha: pr_sha.to_string(),
+            round: old_state.rounds,
+            outcome: "commented".to_string(),
+            context: message,
+        });
     }
 
     if !approved && !changes_requested && observed_request_change_rounds > old_state.rounds {
         old_state.rounds = observed_request_change_rounds;
         if old_state.rounds >= max_rounds {
             old_state.stuck = true;
+            let context = format!(
+                "Review loop reached the maximum of {max_rounds} rounds without convergence."
+            );
+            old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
+                "stuck",
+                pr_sha,
+                old_state.rounds,
+                &context,
+            ));
             pending_actions.push(PendingAction::WriteRegistryStuck {
                 pr_number: pr_number.as_u64(),
                 rounds: old_state.rounds,
@@ -2993,6 +3208,12 @@ fn compute_pr_actions_with_context(
                     max_wait_seconds,
                     ci_status,
                 ),
+            });
+            pending_actions.push(PendingAction::NotifyParentRepair {
+                head_sha: pr_sha.to_string(),
+                round: old_state.rounds,
+                outcome: "stuck".to_string(),
+                context,
             });
         } else {
             pending_actions.push(PendingAction::WriteRegistryRounds {
@@ -3033,6 +3254,16 @@ fn compute_pr_actions_with_context(
     }
 
     if merge_ready_now && !emitted_merge_ready_notification {
+        let context = format!(
+            "Reviewer approval and CI status {} are both satisfied for this verified head.",
+            ci_status.as_str()
+        );
+        old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
+            "merge_ready",
+            pr_sha,
+            old_state.rounds,
+            &context,
+        ));
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
             payload: serde_json::json!({
@@ -3042,15 +3273,30 @@ fn compute_pr_actions_with_context(
                 "branch": branch,
             }),
         });
+        pending_actions.push(PendingAction::NotifyParentRepair {
+            head_sha: pr_sha.to_string(),
+            round: old_state.rounds,
+            outcome: "merge_ready".to_string(),
+            context,
+        });
     }
 
-    if !old_state.notified_parent_timeout
+    if (!old_state.notified_parent_timeout
+        || old_state.parent_handoff_fingerprint.as_deref().is_none())
         && !old_state.merge_ready_notified
         && old_state.first_seen.elapsed() > Duration::from_secs(max_wait_seconds)
     {
         let classification =
             classify_review_stall(old_state, reviewer_registered, forgejo_review_present);
         old_state.notified_parent_timeout = true;
+        let context =
+            format!("Review timed out after {max_wait_seconds} seconds ({classification:?}).");
+        old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
+            "timeout",
+            pr_sha,
+            old_state.rounds,
+            &context,
+        ));
         pending_actions.push(PendingAction::FileHumanEscalation {
             pr_number: pr_number.as_u64(),
             classification,
@@ -3063,6 +3309,12 @@ fn compute_pr_actions_with_context(
                 max_wait_seconds,
                 ci_status,
             ),
+        });
+        pending_actions.push(PendingAction::NotifyParentRepair {
+            head_sha: pr_sha.to_string(),
+            round: old_state.rounds,
+            outcome: "timeout".to_string(),
+            context,
         });
     }
 
@@ -3274,14 +3526,6 @@ fn requests_merge_ready_parent_delivery(event_type: &str, payload: &serde_json::
             .unwrap_or(false),
         _ => false,
     }
-}
-
-fn is_review_feedback_event(event_type: &str, payload: &serde_json::Value) -> bool {
-    event_type == "pr_review"
-        && matches!(
-            value_str(payload, "kind"),
-            Some("review_received") | Some("reviewer_requested_changes") | Some("review_commented")
-        )
 }
 
 fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
