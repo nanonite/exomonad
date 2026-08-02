@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- fix: tmux liveness probes always report alive (wedges resume_pr and spawn) (#593)
 - Commit verified resume_pr lifecycle fix (#589)
 - Fix all-dev installation so the project compiles (#586)
 - Dev-worker liveness registry goes stale for resumed/active agents (#574)

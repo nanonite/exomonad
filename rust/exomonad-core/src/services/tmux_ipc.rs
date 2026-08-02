@@ -162,6 +162,24 @@ fn normalize_for_capture(text: &str) -> String {
     text.replace('\r', "")
 }
 
+fn session_missing(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("can't find session") || stderr.contains("no server running")
+}
+
+fn listing_contains_id(listing: &str, target: &str) -> bool {
+    listing.lines().any(|line| line.trim() == target)
+}
+
+fn pane_listing_contains_id(listing: &str, session_name: &str, pane_id: &str) -> bool {
+    listing.lines().any(|line| {
+        let Some((row_session, row_pane)) = line.split_once('\t') else {
+            return false;
+        };
+        row_session == session_name && row_pane.trim() == pane_id
+    })
+}
+
 impl TmuxIpc {
     pub fn new(session_name: &str) -> Self {
         Self {
@@ -762,12 +780,40 @@ impl TmuxIpc {
     // -- Query --
 
     pub async fn window_exists(&self, window_id: &WindowId) -> Result<bool> {
-        let status = Command::new("tmux")
-            .args(["display-message", "-t", window_id.as_str(), "-p", ""])
-            .status()
+        let output = Command::new("tmux")
+            .args([
+                "list-windows",
+                "-t",
+                &self.session_name,
+                "-F",
+                "#{window_id}",
+            ])
+            .output()
             .await
-            .context("Failed to run tmux display-message")?;
-        Ok(status.success())
+            .context("Failed to run tmux list-windows")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if session_missing(&stderr) {
+                debug!(
+                    session = %self.session_name,
+                    window = %window_id,
+                    exists = false,
+                    "tmux window probe found no session"
+                );
+                return Ok(false);
+            }
+            warn!(
+                session = %self.session_name,
+                window = %window_id,
+                error = %stderr,
+                "tmux window probe failed"
+            );
+            anyhow::bail!("tmux list-windows failed: {}", stderr.trim());
+        }
+        let exists =
+            listing_contains_id(&String::from_utf8_lossy(&output.stdout), window_id.as_str());
+        debug!(session = %self.session_name, window = %window_id, exists, "Probed tmux window liveness");
+        Ok(exists)
     }
 
     /// Wait for a newly-created window to remain addressable during startup.
@@ -790,12 +836,37 @@ impl TmuxIpc {
     }
 
     pub async fn pane_exists(&self, pane_id: &PaneId) -> Result<bool> {
-        let status = Command::new("tmux")
-            .args(["display-message", "-t", pane_id.as_str(), "-p", ""])
-            .status()
+        let output = Command::new("tmux")
+            .args(["list-panes", "-a", "-F", "#{session_name}\t#{pane_id}"])
+            .output()
             .await
-            .context("Failed to run tmux display-message")?;
-        Ok(status.success())
+            .context("Failed to run tmux list-panes")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if session_missing(&stderr) {
+                debug!(
+                    session = %self.session_name,
+                    pane = %pane_id,
+                    exists = false,
+                    "tmux pane probe found no session"
+                );
+                return Ok(false);
+            }
+            warn!(
+                session = %self.session_name,
+                pane = %pane_id,
+                error = %stderr,
+                "tmux pane probe failed"
+            );
+            anyhow::bail!("tmux list-panes failed: {}", stderr.trim());
+        }
+        let exists = pane_listing_contains_id(
+            &String::from_utf8_lossy(&output.stdout),
+            &self.session_name,
+            pane_id.as_str(),
+        );
+        debug!(session = %self.session_name, pane = %pane_id, exists, "Probed tmux pane liveness");
+        Ok(exists)
     }
 }
 
@@ -822,6 +893,31 @@ mod tests {
         assert_eq!(qualify_tmux_target("session-a", "%5"), "%5");
         assert_eq!(qualify_tmux_target("session-a", "@4"), "session-a:@4");
         assert_eq!(qualify_tmux_target("session-a", "TL.0"), "session-a:TL.0");
+    }
+
+    #[test]
+    fn test_session_missing_accepts_expected_tmux_errors_only() {
+        assert!(session_missing("can't find session: workspace"));
+        assert!(session_missing(
+            "no server running on /tmp/tmux-1000/default"
+        ));
+        assert!(!session_missing("usage: tmux list-windows"));
+    }
+
+    #[test]
+    fn test_window_listing_matches_only_the_exact_window_id() {
+        let listing = "@3\n@42\n";
+        assert!(listing_contains_id(listing, "@42"));
+        assert!(!listing_contains_id(listing, "@4"));
+        assert!(!listing_contains_id(listing, "%42"));
+    }
+
+    #[test]
+    fn test_pane_listing_matches_session_and_exact_pane_id() {
+        let listing = "workspace\t%7\nother\t%8\nworkspace\t%42\n";
+        assert!(pane_listing_contains_id(listing, "workspace", "%42"));
+        assert!(!pane_listing_contains_id(listing, "workspace", "%8"));
+        assert!(!pane_listing_contains_id(listing, "other", "%42"));
     }
 
     #[test]
