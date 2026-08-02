@@ -224,6 +224,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Make reviewer orchestration durable and SHA-scoped (#583)
 - Publish verified PR heads to watcher orchestration (#582)
 - Normalize coding harnesses to one-shot execution (#581)
 - Define one-shot leaf invocation lifecycle and persistence (#580)
