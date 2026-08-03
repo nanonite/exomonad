@@ -222,11 +222,7 @@ targetField row =
         else pane
 
 lifecycleField :: KM.KeyMap Value -> Text
-lifecycleField row =
-  let status = textField "lifecycle_status" row
-   in if T.null status
-        then if boolField "pane_alive" row then "LIVE" else "DEAD"
-        else status
+lifecycleField = textField "lifecycle_status"
 
 isStale :: Value -> Bool
 isStale row = valueBool "pane_alive" row && valueWord "age_mins" row >= 60

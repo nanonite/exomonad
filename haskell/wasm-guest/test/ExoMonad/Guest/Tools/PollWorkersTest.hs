@@ -21,7 +21,11 @@ pollWorkersTests =
       testCase "missing routing is distinguished from a dead target" $ do
         let table = renderWorkersTable [unroutedRow]
         assertContains "NO-ROUTING-RECORDED" table
-        assertContains "no persisted routing target" (pollWorkersNote [unroutedRow])
+        assertContains "no persisted routing target" (pollWorkersNote [unroutedRow]),
+      testCase "missing lifecycle status is not inferred from tmux state" $ do
+        let table = renderWorkersTable [missingLifecycleRow]
+        assertDoesNotContain "  LIVE" table
+        assertDoesNotContain "  DEAD" table
     ]
 
 retiredWindowRow :: Value
@@ -29,6 +33,20 @@ retiredWindowRow = workerRow "@17" "RETIRED(exit_code=0)" False
 
 unroutedRow :: Value
 unroutedRow = workerRow "" "NO-ROUTING-RECORDED" False
+
+missingLifecycleRow :: Value
+missingLifecycleRow =
+  object
+    [ "name" .= ("issue-715-opencode" :: Text),
+      "role" .= ("dev" :: Text),
+      "active_issue" .= ("715" :: Text),
+      "issue_status" .= ("closed" :: Text),
+      "chainlink_session_state" .= ("issue_closed" :: Text),
+      "window_id" .= ("@18" :: Text),
+      "pane_id" .= ("%18" :: Text),
+      "pane_alive" .= True,
+      "age_mins" .= (2 :: Int)
+    ]
 
 workerRow :: Text -> Text -> Bool -> Value
 workerRow windowId lifecycleStatus alive =
@@ -48,3 +66,7 @@ workerRow windowId lifecycleStatus alive =
 assertContains :: Text -> Text -> IO ()
 assertContains needle haystack =
   assertBool ("expected output to contain " <> T.unpack needle) (needle `T.isInfixOf` haystack)
+
+assertDoesNotContain :: Text -> Text -> IO ()
+assertDoesNotContain needle haystack =
+  assertBool ("expected output not to contain " <> T.unpack needle) (not (needle `T.isInfixOf` haystack))
