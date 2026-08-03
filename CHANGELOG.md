@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- fix: check-fmt and proto-check are mutually exclusive on generated Haskell proto (#597)
 - fix: OpenCode/Codex agents never learn check_inbox and get role context at an unread path (#596)
 - fix: agent routing has two stores with opposite lifetimes (blank pane + stale window id) (#595)
 - fix: window existence is not process liveness (dead runtime keeps window alive) (#594)

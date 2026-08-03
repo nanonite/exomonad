@@ -57,21 +57,23 @@ wasm-guest-test:
     @nix develop .#wasm --command bash -c 'export PATH=$PWD/.gemini/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build wasm-guest:wasm-guest-tests'
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
-# Run tests: Rust unit tests, cargo check, WASM build, guest tests, proto freshness
+# Run tests: formatting, Rust tests/check, WASM build/tests, proto freshness
 test:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> [1/6] Rust unit tests..."
+    echo ">>> [1/7] Formatting checks..."
+    just check-fmt
+    echo ">>> [2/7] Rust unit tests..."
     just rust-test
-    echo ">>> [2/6] Rust check (all targets)..."
+    echo ">>> [3/7] Rust check (all targets)..."
     nix develop --command cargo check --workspace --all-targets
-    echo ">>> [3/6] WASM build..."
+    echo ">>> [4/7] WASM build..."
     just wasm-all
-    echo ">>> [4/6] Role hook tests..."
+    echo ">>> [5/7] Role hook tests..."
     just role-hook-tests
-    echo ">>> [5/6] WASM guest tests..."
+    echo ">>> [6/7] WASM guest tests..."
     just wasm-guest-test
-    echo ">>> [6/6] Proto freshness check..."
+    echo ">>> [7/7] Proto freshness check..."
     just proto-check
     echo ">>> All checks passed."
 
@@ -79,12 +81,15 @@ test:
 proto-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> Regenerating proto to check for drift..."
-    just proto-gen
-    if ! git diff --quiet haskell/proto/src/ rust/exomonad-proto/src/; then
+    temp_root=$(mktemp -d)
+    trap 'rm -rf "$temp_root"' EXIT
+    cp -a haskell/proto/src/. "$temp_root/"
+    echo ">>> Regenerating proto into a temporary tree to check for drift..."
+    PROTO_OUTPUT_ROOT="$temp_root" nix develop --command ./proto-codegen/generate.sh
+    nix develop --command cargo build -p exomonad-proto
+    if ! diff -ru haskell/proto/src "$temp_root"; then
         echo "ERROR: Generated proto files are out of date."
         echo "Run 'just proto-gen' and commit the results."
-        git diff --stat haskell/proto/src/ rust/exomonad-proto/src/
         exit 1
     fi
     echo ">>> Proto files are up to date."
@@ -205,9 +210,8 @@ proto-gen-haskell:
 proto-gen-rust:
     nix develop --command cargo build -p exomonad-proto
 
-# Full proto regeneration (includes formatting so proto-check passes)
+# Full proto regeneration (the generator formats its Haskell output)
 proto-gen: proto-gen-haskell proto-gen-rust
-    nix develop --command bash -c 'cd haskell && ormolu --mode inplace --ghc-opt -XImportQualifiedPost $(find proto/src -name "*.hs")'
     @echo "Proto generation complete. Don't forget to commit haskell/proto/src/"
 
 # Verify proto changes don't break wire format

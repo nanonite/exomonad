@@ -13,6 +13,15 @@ All Haskell packages live here.
 | `vendor/proto3-runtime/` | Vendored protobuf runtime |
 | `vendor/ginger/` | Vendored typed Jinja templates |
 
+### Generated proto formatting
+
+`proto-codegen/generate.sh` is the source of truth for checked-in Haskell proto
+types. It runs Ormolu as its final generation step, so generated output is
+formatted at birth and remains covered by `just check-fmt`. Do not hand-format
+generated files as a separate repair; regenerate them instead. `just proto-check`
+renders into a temporary output tree and compares it with the worktree without
+modifying tracked files.
+
 ## Design Patterns
 
 - **Algebraic effects**: freer-simple `Eff` with coroutine-based yield/resume
