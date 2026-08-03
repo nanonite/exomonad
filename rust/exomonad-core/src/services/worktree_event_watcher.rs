@@ -3368,6 +3368,9 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
         ForgejoReviewState::Approved => ForgejoReviewVerdict::Approved,
         ForgejoReviewState::ChangesRequested => ForgejoReviewVerdict::ChangesRequested,
         ForgejoReviewState::Commented => ForgejoReviewVerdict::Commented,
+        ForgejoReviewState::PendingReview if !obs.comments.is_empty() => {
+            ForgejoReviewVerdict::Commented
+        }
         ForgejoReviewState::PendingReview => ForgejoReviewVerdict::None,
     };
 
@@ -5462,6 +5465,52 @@ mod tests {
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].body, "A comment-only review body");
         assert_eq!(reviews[0].review_id, Some(42));
+    }
+
+    #[test]
+    fn test_comment_only_observation_aggregates_to_commented_emits_actions_without_disposal() {
+        let mut observation = test_observation("abc");
+        observation.comments = vec![test_comment("Consider this inline suggestion")];
+
+        let (reviews, verdict) = obs_to_review_parts(&observation);
+        let review_state = aggregate_review_state(&reviews);
+
+        assert_eq!(verdict, ForgejoReviewVerdict::Commented);
+        assert_eq!(review_state, ForgejoReviewState::Commented);
+
+        let branch = BranchName::try_from_str("main.feat-gemini")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Gemini, "abc");
+        let actions = compute_pr_actions(
+            &mut state,
+            PRNumber::new(1),
+            "abc",
+            &observation.comments,
+            &reviews,
+            CIStatus::Unknown,
+            false,
+            branch.as_str(),
+            &format_review_message,
+            5,
+        );
+
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "review_commented"
+                    && payload["comments"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("Consider this inline suggestion"))
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::NotifyParentRepair { outcome, .. } if outcome == "commented"
+        )));
+        assert!(
+            !review_state_disposes_reviewer(&review_state),
+            "comment-only observations must not reach reviewer disposal"
+        );
     }
 
     // ---------------------------------------------------------------------------
