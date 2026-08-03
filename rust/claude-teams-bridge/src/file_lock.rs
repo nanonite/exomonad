@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 /// Metadata written into lock files for stale detection.
@@ -108,19 +108,47 @@ pub fn fsync_dir(dir: &Path) -> io::Result<()> {
 
 /// Attempt to create the lock file atomically via `O_CREAT|O_EXCL`.
 fn try_create_lock(lock_path: &Path, ttl: Duration) -> io::Result<()> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(lock_path)?;
-
     let metadata = LockMetadata {
         pid: std::process::id(),
         created_at: chrono::Utc::now().to_rfc3339(),
         ttl_seconds: ttl.as_secs(),
     };
-    serde_json::to_writer(&file, &metadata).map_err(io::Error::other)?;
-    file.sync_all()?;
-    Ok(())
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary_lock_path = lock_path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        lock_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lock"),
+        std::process::id(),
+        suffix
+    ));
+
+    let file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_lock_path)
+    {
+        Ok(file) => file,
+        Err(error) => return Err(error),
+    };
+
+    let result = (|| {
+        serde_json::to_writer(&file, &metadata).map_err(io::Error::other)?;
+        file.sync_all()?;
+
+        // Claim the canonical path only after the metadata is complete. A
+        // contender therefore sees either no lock or a readable lock, never
+        // the empty intermediate file that would otherwise be mistaken for a
+        // stale lock and deleted while its owner is writing.
+        fs::hard_link(&temporary_lock_path, lock_path)
+    })();
+
+    let _ = fs::remove_file(&temporary_lock_path);
+    result
 }
 
 /// Check if an existing lock is stale (mtime > TTL or PID dead). Break if so.

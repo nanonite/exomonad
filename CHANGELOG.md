@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- fix: intermittent rust-test failure is unidentifiable because fail-fast discards the test name (#599)
 - fix: derive runtime-protocol tool manifest from Haskell role configs instead of mirroring it (#598)
 - fix: check-fmt and proto-check are mutually exclusive on generated Haskell proto (#597)
 - fix: OpenCode/Codex agents never learn check_inbox and get role context at an unread path (#596)

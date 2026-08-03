@@ -260,6 +260,17 @@ Tests that require a directory outside any git repository must use
 The dev shell pins nix-created `TMPDIR` values back to a system temp directory,
 while helpers still validate this precondition when tests run directly.
 
+### Diagnosing Rust test failures
+
+`just rust-test` runs the workspace library tests with `--no-fail-fast`, so a
+failure reports every failing test name before the command exits. Nextest writes
+the live JUnit report to `target/nextest/default/junit.xml`; when the recipe
+fails, it preserves a uniquely named copy under
+`target/nextest/failures/junit-*.xml` and prints that path. Read the preserved
+report before starting another run, because the live report is overwritten by
+the next invocation. Do not add retries, ignore a failing test, or weaken test
+semantics without identifying the failure mechanism first.
+
 ## Design Decisions
 
 | Decision | Rationale |

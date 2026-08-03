@@ -26,7 +26,23 @@ lint:
 
 # Run fast Rust tests only
 rust-test:
-    nix develop --command cargo nextest run --workspace --lib
+    #!/usr/bin/env bash
+    set -uo pipefail
+    junit_path="target/nextest/default/junit.xml"
+    if nix develop --command cargo nextest run --workspace --lib --no-fail-fast; then
+        exit 0
+    fi
+    failure_dir="target/nextest/failures"
+    mkdir -p "$failure_dir"
+    failure_report=$(mktemp "$failure_dir/junit-XXXXXX.xml")
+    if [ -f "$junit_path" ]; then
+        cp "$junit_path" "$failure_report"
+        echo "Rust test failure JUnit report preserved at $failure_report" >&2
+    else
+        rm -f "$failure_report"
+        echo "Rust tests failed; JUnit report was not found at $junit_path" >&2
+    fi
+    exit 1
 
 # Run native Haskell tests
 haskell-test:

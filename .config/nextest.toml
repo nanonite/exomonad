@@ -3,7 +3,9 @@ failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 [profile.default.junit]
-path = "target/nextest/default/junit.xml"
+# Paths are relative to nextest's store/profile directory, which is
+# target/nextest/default for the default profile.
+path = "junit.xml"
 
 [[profile.default.overrides]]
 filter = "test(wasm_integration)"
