@@ -4,6 +4,7 @@ fn generate_opencode_agent_settings(
     agent_name: &str,
     role: &str,
     extra_mcp_servers: &HashMap<String, serde_json::Value>,
+    role_context: &str,
     effort: Option<&str>,
 ) -> serde_json::Value {
     let mut mcp_servers = serde_json::Map::new();
@@ -18,11 +19,12 @@ fn generate_opencode_agent_settings(
         mcp_servers.insert(name.clone(), config.clone());
     }
 
-    let instructions = match role {
-        "root" | "tl" => serde_json::json!([super::spawn::ROOT_CONTEXT_RELATIVE_PATH]),
-        "worker" => serde_json::json!([super::spawn::OPENCODE_WORKER_INSTRUCTIONS]),
-        _ => serde_json::json!([super::spawn::OPENCODE_DEV_INSTRUCTIONS]),
+    let protocol = match role {
+        "root" | "tl" => "",
+        "worker" => super::spawn::OPENCODE_WORKER_INSTRUCTIONS,
+        _ => super::spawn::OPENCODE_DEV_INSTRUCTIONS,
     };
+    let instructions = serde_json::json!([format!("{protocol}\n\n{role_context}")]);
 
     let mut settings = serde_json::json!({
         "mcp": mcp_servers,
@@ -58,6 +60,32 @@ impl<
             + 'static,
     > AgentControlService<C>
 {
+    pub(crate) fn runtime_role_context(&self, role: &crate::domain::Role) -> Result<String> {
+        let context_path =
+            resolve_role_context_path(self.project_dir(), self.wasm_name.as_str(), role.as_str())
+                .ok_or_else(|| {
+                anyhow!(
+                    "Missing role context for {} at .exo/roles/{}/context/{}.md",
+                    role,
+                    self.wasm_name,
+                    role
+                )
+            })?;
+        let context = crate::services::agent_control::load_role_context(
+            self.project_dir(),
+            self.wasm_name.as_str(),
+            role.as_str(),
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "Failed to read role context for {} from {}",
+                role,
+                context_path.display()
+            )
+        })?;
+        Ok(context.replace("{{spawn_agent_type}}", self.spawn_agent_type.suffix()))
+    }
+
     fn effort_for_role(&self, role: &str) -> Option<&str> {
         if role == "reviewer" {
             self.reviewer_effort()
@@ -1016,10 +1044,12 @@ impl<
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote .exo/mcp.json for Shoal agent");
             }
             AgentType::OpenCode => {
+                let role_context = self.runtime_role_context(role)?;
                 let opencode_config = generate_opencode_agent_settings(
                     agent_name,
                     role.as_str(),
                     &self.extra_mcp_servers,
+                    &role_context,
                     self.effort_for_role(role.as_str()),
                 );
                 fs::write(
@@ -1056,17 +1086,22 @@ impl<
         let codex_dir = dir.join(".codex");
         fs::create_dir_all(&codex_dir).await?;
 
+        let role_context = self.runtime_role_context(role)?;
         let instructions = match role.as_str() {
-            "tl" | "root" => crate::services::agent_control::load_role_context(
-                self.project_dir(),
-                self.wasm_name.as_str(),
-                "root",
-            )
-            .map(|protocol| format!("{protocol}\n\n{}", super::spawn::CODEX_TL_RUNTIME_NOTES))
-            .unwrap_or_else(|| super::spawn::CODEX_TL_RUNTIME_NOTES.to_string()),
-            "worker" => super::spawn::CODEX_WORKER_INSTRUCTIONS.to_string(),
-            "reviewer" => super::spawn::CODEX_REVIEWER_INSTRUCTIONS.to_string(),
-            _ => super::spawn::CODEX_DEV_INSTRUCTIONS.to_string(),
+            "tl" | "root" => {
+                format!("{role_context}\n\n{}", super::spawn::CODEX_TL_RUNTIME_NOTES)
+            }
+            "worker" => format!(
+                "{}\n\n{role_context}",
+                super::spawn::CODEX_WORKER_INSTRUCTIONS
+            ),
+            "reviewer" => {
+                format!(
+                    "{}\n\n{role_context}",
+                    super::spawn::CODEX_REVIEWER_INSTRUCTIONS
+                )
+            }
+            _ => format!("{}\n\n{role_context}", super::spawn::CODEX_DEV_INSTRUCTIONS),
         };
         let configured_effort = self.effort_for_role(role.as_str());
         let config = crate::codex_config::render_codex_config_with_effort(
@@ -1616,8 +1651,9 @@ mod tests {
 
         assert!(instructions.contains("# ExoMonad Dev Agent Protocol"));
         assert!(instructions.contains("file_pr"));
+        assert!(instructions.contains("check_inbox"));
         assert!(!instructions.contains("# ExoMonad Worker Agent Protocol"));
-        assert!(!instructions.contains("chainlink_session_work"));
+        assert!(instructions.contains("chainlink_session_work"));
     }
 
     #[tokio::test]
@@ -1646,8 +1682,33 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("# ExoMonad Dev Agent Protocol"));
+        assert!(parsed["instructions"][0]
+            .as_str()
+            .unwrap()
+            .contains("Call `check_inbox`"));
         assert!(agent_dir.join(".exo/opencode-plugin/index.ts").exists());
         assert!(agent_dir.join(".exo/opencode-plugin/package.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_opencode_context_missing_fails_config_generation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let service = AgentControlService::new(test_services(project_dir.clone()));
+        let agent_dir = project_dir.join("missing-context-agent");
+        fs::create_dir_all(&agent_dir).await.unwrap();
+
+        let error = service
+            .write_agent_mcp_config(
+                &project_dir,
+                &agent_dir,
+                AgentType::OpenCode,
+                &crate::domain::Role::shoal(),
+            )
+            .await
+            .expect_err("missing role context must fail OpenCode config generation");
+
+        assert!(error.to_string().contains("Missing role context"));
     }
 
     #[test]
@@ -1751,8 +1812,10 @@ mod tests {
         assert!(instructions.contains("request_changes"));
         assert!(instructions.contains("no network access"));
         assert!(instructions.contains("watcher reads Forgejo reviews"));
+        assert!(instructions.contains("Call `check_inbox`"));
         assert!(!instructions.contains("notify_parent"));
-        assert!(!instructions.to_lowercase().contains("curl"));
+        let lower = instructions.to_lowercase();
+        assert!(!lower.contains("curl -") && !lower.contains("curl http"));
         assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
         assert!(codex_home.join("config.toml").exists());
@@ -1794,6 +1857,7 @@ mod tests {
         assert!(instructions.contains("# ExoMonad Worker Agent Protocol"));
         assert!(instructions.contains("chainlink_session_work"));
         assert!(instructions.contains("chainlink_session_end"));
+        assert!(instructions.contains("Call `check_inbox`"));
         assert!(!instructions.contains("chainlink_issue_close"));
         assert!(!instructions.contains("chainlink_agent_init"));
         assert!(!instructions.contains("# ExoMonad Dev Agent Protocol"));

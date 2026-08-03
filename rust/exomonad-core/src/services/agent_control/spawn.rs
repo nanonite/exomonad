@@ -275,6 +275,18 @@ These names are MCP tools exposed inside your agent tool interface. They are not
 - notify_parent: Send a message to your parent TL when context calls for direct handoff. Use status 'success' for completed handoffs and 'failure' if you are stuck and cannot proceed. Never use send_message with recipient 'parent'; 'parent' is a reserved alias resolved only by notify_parent.
 - send_tmux_message: Send a message by injecting it into another agent tmux pane.
 - send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
+- check_inbox: Drain durable inbox guidance at the start of the assignment and after each major step. Unread mail piggybacks on MCP tool results and is authoritative TL direction.
+- task_list: List tasks assigned to this agent.
+- task_get: Read an assigned task.
+- task_update: Update an assigned task.
+- chainlink_session_start: Start the Chainlink session.
+- chainlink_session_status: Read Chainlink session status.
+- chainlink_issue_show: Read the assigned Chainlink issue.
+- chainlink_issue_comment: Post progress on the assigned Chainlink issue.
+- chainlink_subissue_create: Create a subissue when the task requires decomposition.
+- chainlink_session_work: Mark the assigned Chainlink issue as active work.
+- chainlink_session_end: End the Chainlink session with handoff notes.
+- chainlink_subissue_close: Close a completed subissue.
 
 ## Workflow
 1. Read the spec carefully. Re-read any files mentioned before editing.
@@ -311,6 +323,11 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 - notify_parent: Send a direct message to your parent TL when needed. Never use send_message with recipient 'parent'; 'parent' is a reserved alias resolved only by notify_parent.
 - send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
 - send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
+- check_inbox: Drain durable inbox guidance at the start of the assignment and after each major step. Unread mail piggybacks on MCP tool results and is authoritative parent direction.
+- task_list: List tasks assigned to this agent.
+- task_get: Read an assigned task.
+- task_update: Update an assigned task.
+- chainlink_issue_show: Read the assigned Chainlink issue.
 
 ## Workflow
 1. Read the prompt carefully and use the issue ID provided by the TL.
@@ -344,6 +361,18 @@ While this invocation is alive, continue consuming durable inbox guidance delive
 - notify_parent: Send a message to your parent TL when context calls for direct handoff. Use status 'success' for completed handoffs and 'failure' if you are stuck and cannot proceed. Never use send_message with recipient 'parent'; 'parent' is a reserved alias resolved only by notify_parent.
 - send_tmux_message: Send a message by injecting it into another agent tmux pane.
 - send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
+- check_inbox: Drain durable inbox guidance at the start of the assignment and after each major step. Unread mail piggybacks on MCP tool results and is authoritative TL direction.
+- task_list: List tasks assigned to this agent.
+- task_get: Read an assigned task.
+- task_update: Update an assigned task.
+- chainlink_session_start: Start the Chainlink session.
+- chainlink_session_status: Read Chainlink session status.
+- chainlink_issue_show: Read the assigned Chainlink issue.
+- chainlink_issue_comment: Post progress on the assigned Chainlink issue.
+- chainlink_subissue_create: Create a subissue when the task requires decomposition.
+- chainlink_session_work: Mark the assigned Chainlink issue as active work.
+- chainlink_session_end: End the Chainlink session with handoff notes.
+- chainlink_subissue_close: Close a completed subissue.
 
 ## Workflow
 1. Read the spec carefully. Re-read any files mentioned before editing.
@@ -379,6 +408,11 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 - notify_parent: Send a direct message to your parent TL when needed. Never use send_message with recipient 'parent'; 'parent' is a reserved alias resolved only by notify_parent.
 - send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
 - send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
+- check_inbox: Drain durable inbox guidance at the start of the assignment and after each major step. Unread mail piggybacks on MCP tool results and is authoritative parent direction.
+- task_list: List tasks assigned to this agent.
+- task_get: Read an assigned task.
+- task_update: Update an assigned task.
+- chainlink_issue_show: Read the assigned Chainlink issue.
 
 ## Workflow
 1. Read the prompt carefully and use the issue ID provided by the TL.
@@ -440,6 +474,8 @@ This reviewer process handles one exact PR/SHA assignment. Submit one authoritat
 - approve_pr: Submit an approved Forgejo PR review.
 - request_changes: Submit a request-changes Forgejo PR review.
 - post_review_comment: Submit a comment-only Forgejo PR review.
+- check_inbox: Drain durable inbox guidance at the start of the review and after each major step. Unread mail piggybacks on MCP tool results and is authoritative TL direction.
+- list_agents: Inspect the assigned agent tree and routing state.
 
 ## Workflow
 1. Read the task prompt for the PR number, PR branch, base branch, and author.
@@ -972,7 +1008,24 @@ impl<
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
         effort: Option<&str>,
     ) -> serde_json::Value {
-        Self::generate_opencode_settings(agent_name, role, extra_mcp_servers, effort, None)
+        Self::generate_opencode_settings(agent_name, role, extra_mcp_servers, effort, None, None)
+    }
+
+    pub fn generate_opencode_tl_settings_with_role_context(
+        agent_name: &str,
+        role: &str,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+        effort: Option<&str>,
+        role_context: &str,
+    ) -> serde_json::Value {
+        Self::generate_opencode_settings(
+            agent_name,
+            role,
+            extra_mcp_servers,
+            effort,
+            None,
+            Some(role_context),
+        )
     }
 
     /// Generate root OpenCode settings that load the canonical root protocol.
@@ -988,6 +1041,7 @@ impl<
             extra_mcp_servers,
             effort,
             Some(context_path),
+            None,
         )
     }
 
@@ -997,6 +1051,7 @@ impl<
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
         effort: Option<&str>,
         context_path: Option<&Path>,
+        role_context: Option<&str>,
     ) -> serde_json::Value {
         let mut mcp_servers = serde_json::Map::new();
         mcp_servers.insert(
@@ -1012,14 +1067,17 @@ impl<
 
         // instructions must be an array per OpenCode's schema. Root settings
         // contain a path so the harness reads the canonical protocol itself.
-        let instructions = match context_path {
-            Some(path) => serde_json::json!([path.to_string_lossy()]),
+        let mut instructions = match context_path {
+            Some(path) => vec![path.to_string_lossy().into_owned()],
             None => match role {
-                "root" | "tl" => serde_json::json!([ROOT_CONTEXT_RELATIVE_PATH]),
-                "worker" => serde_json::json!([OPENCODE_WORKER_INSTRUCTIONS]),
-                _ => serde_json::json!([OPENCODE_DEV_INSTRUCTIONS]),
+                "root" | "tl" => vec![ROOT_CONTEXT_RELATIVE_PATH.to_string()],
+                "worker" => vec![OPENCODE_WORKER_INSTRUCTIONS.to_string()],
+                _ => vec![OPENCODE_DEV_INSTRUCTIONS.to_string()],
             },
         };
+        if let Some(role_context) = role_context {
+            instructions.push(role_context.to_string());
+        }
         let mut settings = serde_json::json!({
             "mcp": mcp_servers,
             "instructions": instructions,
@@ -1219,10 +1277,13 @@ impl<
                     // Write worker-specific opencode.json so the worker gets
                     // its own role/name (not the caller's root config, which
                     // lacks notify_parent and other worker tools).
-                    let worker_config = Self::generate_opencode_tl_settings(
+                    let role_context = self.runtime_role_context(&role)?;
+                    let worker_config = Self::generate_opencode_tl_settings_with_role_context(
                         agent_name.as_str(),
                         "worker",
                         &self.extra_mcp_servers,
+                        None,
+                        &role_context,
                     );
                     let opencode_json_path = agent_config_dir.join("opencode.json");
                     fs::write(&opencode_json_path, serde_json::to_string_pretty(&worker_config)?).await?;
@@ -1386,54 +1447,44 @@ impl<
             let default_tl = crate::domain::Role::tl();
             let role = options.role.as_ref().unwrap_or(&default_tl);
 
-            // Copy role context into worktree.
-            // Must be a copy, not a symlink — symlinks escape the worktree boundary
-            // and cause Claude Code to discover parent context files.
-            if let Some(context_src) = self.resolve_role_context(role) {
-                let spawn_type = self.spawn_agent_type.suffix();
-                match agent_type {
-                    AgentType::Claude => {
-                        let rules_dir = worktree_path.join(".claude/rules");
-                        let _ = fs::create_dir_all(&rules_dir).await;
-                        let dest = rules_dir.join("exomonad_role.md");
-                        let _ = fs::remove_file(&dest).await;
-                        match Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type).await {
-                            Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into worktree"),
-                            Err(e) => warn!(role = %role, error = %e, "Failed to copy role context (non-fatal)"),
-                        }
-                    }
-                    AgentType::Gemini => {
-                        let dest_dir = worktree_path.join(format!(".exo/roles/{}/context", self.wasm_name));
-                        let _ = fs::create_dir_all(&dest_dir).await;
-                        let dest = dest_dir.join(format!("{}.md", role));
-                        let _ = fs::remove_file(&dest).await;
-                        match fs::copy(&context_src, &dest).await {
-                            Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into Gemini worktree"),
-                            Err(e) => warn!(role = %role, error = %e, "Failed to copy Gemini role context (non-fatal)"),
-                        }
-                    }
-                    AgentType::OpenCode => {
-                        let rules_dir = worktree_path.join(".claude/rules");
-                        let _ = fs::create_dir_all(&rules_dir).await;
-                        let dest = rules_dir.join("exomonad_role.md");
-                        let _ = fs::remove_file(&dest).await;
-                        match Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type).await {
-                            Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into OpenCode worktree"),
-                            Err(e) => warn!(role = %role, error = %e, "Failed to copy OpenCode role context (non-fatal)"),
-                        }
-                    }
-                    AgentType::Codex => {
-                        let dest_dir = worktree_path.join(".codex");
-                        let _ = fs::create_dir_all(&dest_dir).await;
-                        let dest = dest_dir.join("exomonad_role.md");
-                        let _ = fs::remove_file(&dest).await;
-                        match Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type).await {
-                            Ok(_) => info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into Codex worktree"),
-                            Err(e) => warn!(role = %role, error = %e, "Failed to copy Codex role context (non-fatal)"),
-                        }
-                    }
-                    AgentType::Shoal | AgentType::Process => {}
+            // Validate role context before spawning. Claude and Gemini consume a
+            // copied file; OpenCode and Codex receive the same content inline in
+            // their runtime instruction settings below.
+            let context_src = self.resolve_role_context(role).ok_or_else(|| {
+                anyhow!(
+                    "Missing role context for {} at .exo/roles/{}/context/{}.md",
+                    role,
+                    self.wasm_name,
+                    role
+                )
+            })?;
+            let spawn_type = self.spawn_agent_type.suffix();
+            match agent_type {
+                AgentType::Claude => {
+                    let rules_dir = worktree_path.join(".claude/rules");
+                    fs::create_dir_all(&rules_dir).await?;
+                    let dest = rules_dir.join("exomonad_role.md");
+                    let _ = fs::remove_file(&dest).await;
+                    Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type)
+                        .await
+                        .with_context(|| {
+                            format!("Failed to copy Claude role context to {}", dest.display())
+                        })?;
+                    info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into worktree");
                 }
+                AgentType::Gemini => {
+                    let dest_dir = worktree_path.join(format!(".exo/roles/{}/context", self.wasm_name));
+                    fs::create_dir_all(&dest_dir).await?;
+                    let dest = dest_dir.join(format!("{}.md", role));
+                    let _ = fs::remove_file(&dest).await;
+                    Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type)
+                        .await
+                        .with_context(|| {
+                            format!("Failed to copy Gemini role context to {}", dest.display())
+                        })?;
+                    info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into Gemini worktree");
+                }
+                AgentType::OpenCode | AgentType::Codex | AgentType::Shoal | AgentType::Process => {}
             }
 
             let session_branch = BranchName::try_from_str(branch_name.as_str()).expect("validated string input is non-empty");
@@ -1494,10 +1545,13 @@ impl<
                     }
                 }
                 AgentType::OpenCode => {
-                    let opencode_config = Self::generate_opencode_tl_settings(
+                    let role_context = self.runtime_role_context(role)?;
+                    let opencode_config = Self::generate_opencode_tl_settings_with_role_context(
                         agent_name.as_str(),
                         role.as_str(),
                         &self.extra_mcp_servers,
+                        None,
+                        &role_context,
                     );
                     fs::write(
                         worktree_path.join("opencode.json"),
@@ -2400,6 +2454,83 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DEV_PROTOCOL_TOOLS: &[&str] = &[
+        "file_pr",
+        "notify_parent",
+        "send_tmux_message",
+        "send_mailbox_message",
+        "check_inbox",
+        "task_list",
+        "task_get",
+        "task_update",
+        "chainlink_session_start",
+        "chainlink_session_status",
+        "chainlink_issue_show",
+        "chainlink_issue_comment",
+        "chainlink_subissue_create",
+        "chainlink_session_work",
+        "chainlink_session_end",
+        "chainlink_subissue_close",
+    ];
+    const WORKER_PROTOCOL_TOOLS: &[&str] = &[
+        "chainlink_session_start",
+        "chainlink_session_work",
+        "chainlink_issue_comment",
+        "chainlink_session_end",
+        "notify_parent",
+        "send_tmux_message",
+        "send_mailbox_message",
+        "check_inbox",
+        "task_list",
+        "task_get",
+        "task_update",
+        "chainlink_issue_show",
+    ];
+    const REVIEWER_PROTOCOL_TOOLS: &[&str] = &[
+        "approve_pr",
+        "request_changes",
+        "post_review_comment",
+        "check_inbox",
+        "list_agents",
+    ];
+
+    #[test]
+    fn test_runtime_protocols_list_every_granted_mcp_tool() {
+        // These manifests mirror the Tools records in the Haskell role configs.
+        // Keeping the grant list beside the embedded protocols makes a newly
+        // granted tool fail this test until every runtime protocol names it.
+        for (role, protocol, tools) in [
+            (
+                "OpenCode dev",
+                OPENCODE_DEV_INSTRUCTIONS,
+                DEV_PROTOCOL_TOOLS,
+            ),
+            ("Codex dev", CODEX_DEV_INSTRUCTIONS, DEV_PROTOCOL_TOOLS),
+            (
+                "OpenCode worker",
+                OPENCODE_WORKER_INSTRUCTIONS,
+                WORKER_PROTOCOL_TOOLS,
+            ),
+            (
+                "Codex worker",
+                CODEX_WORKER_INSTRUCTIONS,
+                WORKER_PROTOCOL_TOOLS,
+            ),
+            (
+                "Codex reviewer",
+                CODEX_REVIEWER_INSTRUCTIONS,
+                REVIEWER_PROTOCOL_TOOLS,
+            ),
+        ] {
+            for tool in tools {
+                assert!(
+                    protocol.contains(&format!("- {tool}:")),
+                    "{role} protocol does not mention granted MCP tool {tool}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_opencode_dev_instructions_clarify_mcp_tools_are_not_shell_commands() {
