@@ -30,7 +30,7 @@ impl<
             }
         };
         if agent_dir.join("exit_code").exists() {
-            warn!(
+            debug!(
                 path = %agent_dir.display(),
                 "Agent runtime exit marker is present; treating routing as dead"
             );

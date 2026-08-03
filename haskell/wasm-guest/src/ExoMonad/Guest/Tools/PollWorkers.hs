@@ -9,6 +9,8 @@ module ExoMonad.Guest.Tools.PollWorkers
     pollWorkersDescription,
     pollWorkersSchema,
     pollWorkersCore,
+    renderWorkersTable,
+    pollWorkersNote,
   )
 where
 
@@ -158,7 +160,7 @@ filterSelected (Just names) agents = filter ((`elem` nub names) . strictField PS
 renderWorkersTable :: [Value] -> Text
 renderWorkersTable rows =
   T.unlines $
-    renderRow ["AGENT", "ROLE", "ISSUE", "PANE", "ALIVE", "AGE", "SESSION", "ISSUE_STATUS"]
+    renderRow ["AGENT", "ROLE", "ISSUE", "TARGET", "ALIVE", "AGE", "STATUS", "SESSION", "ISSUE_STATUS"]
       : map renderWorkerRow rows
 
 renderWorkerRow :: Value -> Text
@@ -167,9 +169,10 @@ renderWorkerRow (Object row) =
     [ textField "name" row,
       textField "role" row,
       dashIfEmpty (textField "active_issue" row),
-      dashIfEmpty (textField "pane_id" row),
+      targetField row,
       if boolField "pane_alive" row then "yes" else "NO",
       numberField "age_mins" row <> "m",
+      lifecycleField row,
       textField "chainlink_session_state" row,
       dashIfEmpty (textField "issue_status" row)
     ]
@@ -178,13 +181,15 @@ renderWorkerRow _ = ""
 renderRow :: [Text] -> Text
 renderRow fields = T.intercalate "  " (zipWith pad widths fields)
   where
-    widths = [34, 9, 7, 10, 6, 6, 27, 12]
+    widths = [34, 9, 7, 10, 6, 6, 24, 27, 12]
 
 pad :: Int -> Text -> Text
 pad width value = value <> T.replicate (max 0 (width - T.length value)) " "
 
 pollWorkersNote :: [Value] -> Text
 pollWorkersNote rows
+  | any isUnrouted rows = "Some agents have no persisted routing target. Inspect their lifecycle status before waiting or respawning."
+  | any isRetired rows = "Some agents have retired routing targets. Inspect their exit status before waiting or respawning."
   | any isDead rows = "Some workers have dead tmux targets. Re-spec, close_worker_pane, or respawn instead of waiting silently."
   | any isStale rows = "Some workers have been alive for 60+ minutes. Inspect Chainlink issue/session state before idling again."
   | otherwise = ""
@@ -200,7 +205,28 @@ staleWorkerName row
   | otherwise = Nothing
 
 isDead :: Value -> Bool
-isDead row = not (valueBool "pane_alive" row)
+isDead row = not (valueBool "pane_alive" row) && not (isRetired row || isUnrouted row)
+
+isRetired :: Value -> Bool
+isRetired row = "RETIRED" `T.isPrefixOf` valueText "lifecycle_status" row
+
+isUnrouted :: Value -> Bool
+isUnrouted row = valueText "lifecycle_status" row == "NO-ROUTING-RECORDED"
+
+targetField :: KM.KeyMap Value -> Text
+targetField row =
+  let pane = textField "pane_id" row
+      window = textField "window_id" row
+   in if T.null pane
+        then dashIfEmpty window
+        else pane
+
+lifecycleField :: KM.KeyMap Value -> Text
+lifecycleField row =
+  let status = textField "lifecycle_status" row
+   in if T.null status
+        then if boolField "pane_alive" row then "LIVE" else "DEAD"
+        else status
 
 isStale :: Value -> Bool
 isStale row = valueBool "pane_alive" row && valueWord "age_mins" row >= 60

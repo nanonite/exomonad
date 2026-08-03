@@ -150,6 +150,7 @@ test-suite wasm-guest-tests
     main-is:          Main.hs
     other-modules:
         ExoMonad.Guest.Tools.Chainlink.PureTest
+        ExoMonad.Guest.Tools.PollWorkersTest
         ExoMonad.Guest.Tools.ResumePrTest
     build-depends:
         wasm-guest:wasm-guest-internal,
