@@ -141,6 +141,16 @@ This asymmetry is intentional — only the `notify_parent` relationship has a we
   pane ID and exit code. An agent with neither routing snapshot nor invocation routing
   reports `NO-ROUTING-RECORDED`, which is distinct from a retired target.
 
+## Runtime protocol tool coverage
+
+The OpenCode and Codex runtime protocol text is embedded in
+`services/agent_control/spawn.rs`, but its tool coverage is verified against the
+compiled Haskell role configuration. The WASM integration test calls
+`handle_list_tools` for `dev`, `worker`, and `reviewer` and checks every returned
+tool name against each corresponding runtime protocol. Do not add a second Rust
+tool manifest: update the Haskell role configuration and the runtime protocol
+together, then run `just test-cargo-all` after rebuilding WASM.
+
 ### Ownership versus invocation
 
 The canonical owner remains one Chainlink issue → one agent identity → one

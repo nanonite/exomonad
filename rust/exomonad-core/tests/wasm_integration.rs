@@ -106,6 +106,67 @@ async fn list_tool_names(runtime: &exomonad_core::Runtime, role: &str) -> BTreeS
         .collect()
 }
 
+fn missing_protocol_tools(protocol: &str, tool_names: &BTreeSet<String>) -> Vec<String> {
+    tool_names
+        .iter()
+        .filter(|tool| !protocol.contains(&format!("- {tool}:")))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn protocol_tool_guard_reports_a_missing_tool() {
+    let mut tools = BTreeSet::new();
+    tools.insert("present_tool".to_string());
+    tools.insert("missing_tool".to_string());
+
+    assert_eq!(
+        missing_protocol_tools("- present_tool: available", &tools),
+        vec!["missing_tool"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn runtime_protocols_list_every_wasm_granted_mcp_tool() {
+    let runtime = build_test_runtime().await;
+
+    for (label, role, protocol) in [
+        (
+            "OpenCode dev",
+            "dev",
+            exomonad_core::services::agent_control::OPENCODE_DEV_INSTRUCTIONS,
+        ),
+        (
+            "Codex dev",
+            "dev",
+            exomonad_core::services::agent_control::CODEX_DEV_INSTRUCTIONS,
+        ),
+        (
+            "OpenCode worker",
+            "worker",
+            exomonad_core::services::agent_control::OPENCODE_WORKER_INSTRUCTIONS,
+        ),
+        (
+            "Codex worker",
+            "worker",
+            exomonad_core::services::agent_control::CODEX_WORKER_INSTRUCTIONS,
+        ),
+        (
+            "Codex reviewer",
+            "reviewer",
+            exomonad_core::services::agent_control::CODEX_REVIEWER_INSTRUCTIONS,
+        ),
+    ] {
+        let tools = list_tool_names(&runtime, role).await;
+        let missing = missing_protocol_tools(protocol, &tools);
+        assert!(
+            missing.is_empty(),
+            "{label} protocol does not mention WASM-granted MCP tools: {missing:?}"
+        );
+    }
+}
+
 fn assert_tools_present(role: &str, names: &BTreeSet<String>, expected: &[&str]) {
     for tool in expected {
         assert!(
