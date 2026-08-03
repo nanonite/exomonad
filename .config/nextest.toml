@@ -7,10 +7,17 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 # target/nextest/default for the default profile.
 path = "junit.xml"
 
+[test-groups]
+# wasm_integration uses serial_test for shared WASM runtime state. Nextest runs
+# each test in a separate process, so the target needs an explicit cross-process
+# semaphore to preserve that serialization in the aggregate workspace run.
+wasm-integration = { max-threads = 1 }
+
 [[profile.default.overrides]]
-filter = "test(wasm_integration)"
+filter = "binary_id(exomonad-core::wasm_integration)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 retries = 1
+test-group = "wasm-integration"
 
 [[profile.default.overrides]]
 filter = "test(live_teams_e2e)"

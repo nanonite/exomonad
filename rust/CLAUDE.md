@@ -271,6 +271,16 @@ report before starting another run, because the live report is overwritten by
 the next invocation. Do not add retries, ignore a failing test, or weaken test
 semantics without identifying the failure mechanism first.
 
+`just rust-test` is the fast library-only loop. `just rust-test-all` runs the
+full workspace, including all native `tests/*.rs` targets, with the same
+non-fail-fast output and JUnit preservation. The aggregate `just test` gate runs
+the full target set after `wasm-all`, so the WASM integration target has its
+plugin available. New Rust test targets must be reachable from `just test`.
+
+The `wasm_integration` target is assigned to a one-permit nextest group because
+its tests share WASM runtime state and use `serial_test`; the group makes that
+serialization work across nextest's process-per-test execution model.
+
 The Teams bridge lock publishes complete metadata through a temporary file and
 an atomic hard-link claim. Lock acquisition reclaims only temporary artifacts
 whose recorded owner PID is dead; artifacts belonging to live PIDs are retained.

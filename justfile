@@ -24,12 +24,16 @@ check-fmt:
 lint:
     nix develop --command hlint haskell
 
-# Run fast Rust tests only
-rust-test:
+# Run Rust tests; include integration targets when requested.
+rust-test all_targets="false":
     #!/usr/bin/env bash
     set -uo pipefail
+    nextest_args=(--workspace --no-fail-fast)
+    if [ "{{all_targets}}" != "true" ]; then
+        nextest_args+=(--lib)
+    fi
     junit_path="target/nextest/default/junit.xml"
-    if nix develop --command cargo nextest run --workspace --lib --no-fail-fast; then
+    if nix develop --command cargo nextest run "${nextest_args[@]}"; then
         exit 0
     fi
     failure_dir="target/nextest/failures"
@@ -51,9 +55,9 @@ haskell-test:
 # Run fast tests only (Rust unit tests)
 test-fast: rust-test
 
-# Run every Rust test target through the dev shell
+# Run every Rust test target through the diagnostic-preserving runner
 rust-test-all:
-    nix develop --command cargo nextest run --workspace
+    just rust-test true
 
 # Run every Rust test target through the dev shell
 test-cargo-all: rust-test-all
@@ -73,18 +77,18 @@ wasm-guest-test:
     @nix develop .#wasm --command bash -c 'export PATH=$PWD/.gemini/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build wasm-guest:wasm-guest-tests'
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
-# Run tests: formatting, Rust tests/check, WASM build/tests, proto freshness
+# Run tests: formatting, Rust check, WASM build/tests, Rust tests, proto freshness
 test:
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/7] Formatting checks..."
     just check-fmt
-    echo ">>> [2/7] Rust unit tests..."
-    just rust-test
-    echo ">>> [3/7] Rust check (all targets)..."
+    echo ">>> [2/7] Rust check (all targets)..."
     nix develop --command cargo check --workspace --all-targets
-    echo ">>> [4/7] WASM build..."
+    echo ">>> [3/7] WASM build..."
     just wasm-all
+    echo ">>> [4/7] Rust tests (all targets)..."
+    just rust-test-all
     echo ">>> [5/7] Role hook tests..."
     just role-hook-tests
     echo ">>> [6/7] WASM guest tests..."

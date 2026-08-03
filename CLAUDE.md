@@ -569,6 +569,10 @@ just e2e-messaging         # Teams inbox delivery pipeline
 just e2e-oc-rewrite        # BeforeModel/AfterModel PII rewriting
 ```
 
+`just rust-test` is the fast library-only Rust loop. `just test` runs the full
+Rust workspace test set, including native integration targets, after building
+the WASM plugins. New Rust tests must be reachable from `just test`.
+
 ### E2E Test Pattern
 
 All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
