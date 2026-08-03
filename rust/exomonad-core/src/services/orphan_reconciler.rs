@@ -1,15 +1,16 @@
 use crate::domain::RoutingInfo;
 use crate::services::agent_control::{
-    finish_invocation_and_tombstone, read_invocation, InvocationFinishResult, InvocationStatus,
+    finish_invocation_and_tombstone, read_invocation, InvocationFinishResult, InvocationRecord,
+    InvocationStatus,
 };
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::git_worktree::GitWorktreeService;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub async fn run_orphan_reconciler(
     project_dir: Arc<std::path::PathBuf>,
@@ -263,32 +264,8 @@ async fn reconcile_session_timeouts(
         }
 
         let agent_dir = agents_dir.join(&slug);
-        let routing_path = agent_dir.join("routing.json");
-        if !routing_path.exists() {
-            warn!(
-                agent = %slug,
-                "Skipping session timeout because routing.json is missing"
-            );
-            continue;
-        }
-        if agent_dir.join("exited_at").exists() {
-            if let Some(session) = tmux_session {
-                let _ = kill_agent_window(session, &agent_dir, &slug, None).await;
-            }
-            let _ = tokio::fs::remove_file(&routing_path).await;
-            info!(agent = %slug, "Cleaned routing for exited agent");
-            continue;
-        }
-        match read_invocation(&agent_dir).await {
-            Ok(Some(invocation)) if !invocation.is_live() => {
-                info!(
-                    agent = %slug,
-                    invocation_id = %invocation.invocation_id,
-                    "Skipping timeout for a dormant invocation-owned worktree"
-                );
-                continue;
-            }
-            Ok(Some(_)) | Ok(None) => {}
+        let invocation = match read_invocation(&agent_dir).await {
+            Ok(invocation) => invocation,
             Err(error) => {
                 warn!(
                     agent = %slug,
@@ -297,6 +274,44 @@ async fn reconcile_session_timeouts(
                 );
                 continue;
             }
+        };
+        let routing = match read_effective_routing(&agent_dir, invocation.as_ref()).await {
+            Ok(routing) => routing,
+            Err(error) => {
+                warn!(
+                    agent = %slug,
+                    %error,
+                    "Skipping session timeout because no routing target was recorded"
+                );
+                continue;
+            }
+        };
+        if agent_dir.join("exited_at").exists() {
+            if let Some(session) = tmux_session {
+                let _ = kill_agent_window(session, &agent_dir, &slug, &routing).await;
+            }
+            info!(
+                agent = %slug,
+                "Retained routing snapshot for exited agent"
+            );
+            continue;
+        }
+        if let Some(invocation) = invocation.as_ref() {
+            if !invocation.is_live() {
+                info!(
+                    agent = %slug,
+                    invocation_id = %invocation.invocation_id,
+                    "Skipping timeout for a dormant invocation-owned worktree"
+                );
+                continue;
+            }
+        }
+        if !routing.has_delivery_target() {
+            warn!(
+                agent = %slug,
+                "Skipping session timeout because routing has no delivery target"
+            );
+            continue;
         }
         let spawned_at = match tokio::fs::read_to_string(agent_dir.join("spawned_at")).await {
             Ok(s) => match s.trim().parse::<u64>() {
@@ -336,8 +351,8 @@ async fn reconcile_session_timeouts(
             continue;
         };
 
-        let expected_routing = RoutingInfo::read_from_dir(&agent_dir).await.ok();
-        match verify_routing_liveness(&agent_dir, session).await {
+        let expected_routing = routing;
+        match verify_routing_liveness(&expected_routing, session).await {
             RoutingLiveness::Live => {
                 info!(
                     agent = %slug,
@@ -347,27 +362,25 @@ async fn reconcile_session_timeouts(
                     "Session timeout: killing verified live agent"
                 );
                 let was_alive =
-                    kill_agent_window(session, &agent_dir, &slug, expected_routing.as_ref()).await;
-                if let Some(routing) = expected_routing.as_ref() {
-                    match finish_invocation_and_tombstone(
-                        &agent_dir,
-                        routing,
-                        InvocationStatus::TimedOut,
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(InvocationFinishResult::IgnoredStale) => {
-                            warn!(agent = %slug, "Preserved newer invocation after stale timeout")
-                        }
-                        Ok(InvocationFinishResult::Finished(_))
-                        | Ok(InvocationFinishResult::Missing) => {}
-                        Err(error) => warn!(
-                            agent = %slug,
-                            %error,
-                            "Failed to finish timed-out invocation; preserving routing"
-                        ),
+                    kill_agent_window(session, &agent_dir, &slug, &expected_routing).await;
+                match finish_invocation_and_tombstone(
+                    &agent_dir,
+                    &expected_routing,
+                    InvocationStatus::TimedOut,
+                    None,
+                )
+                .await
+                {
+                    Ok(InvocationFinishResult::IgnoredStale) => {
+                        warn!(agent = %slug, "Preserved newer invocation after stale timeout")
                     }
+                    Ok(InvocationFinishResult::Finished(_))
+                    | Ok(InvocationFinishResult::Missing) => {}
+                    Err(error) => warn!(
+                        agent = %slug,
+                        %error,
+                        "Failed to finish timed-out invocation; preserving routing"
+                    ),
                 }
                 notify_tl_about_agent(
                     project_dir,
@@ -380,26 +393,24 @@ async fn reconcile_session_timeouts(
                 .await;
             }
             RoutingLiveness::Dead => {
-                if let Some(routing) = expected_routing.as_ref() {
-                    match finish_invocation_and_tombstone(
-                        &agent_dir,
-                        routing,
-                        InvocationStatus::Exited,
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(InvocationFinishResult::IgnoredStale) => {
-                            warn!(agent = %slug, "Preserved newer invocation after stale exit")
-                        }
-                        Ok(InvocationFinishResult::Finished(_))
-                        | Ok(InvocationFinishResult::Missing) => {}
-                        Err(error) => warn!(
-                            agent = %slug,
-                            %error,
-                            "Failed to finish dead invocation; preserving routing"
-                        ),
+                match finish_invocation_and_tombstone(
+                    &agent_dir,
+                    &expected_routing,
+                    InvocationStatus::Exited,
+                    None,
+                )
+                .await
+                {
+                    Ok(InvocationFinishResult::IgnoredStale) => {
+                        warn!(agent = %slug, "Preserved newer invocation after stale exit")
                     }
+                    Ok(InvocationFinishResult::Finished(_))
+                    | Ok(InvocationFinishResult::Missing) => {}
+                    Err(error) => warn!(
+                        agent = %slug,
+                        %error,
+                        "Failed to finish dead invocation; preserving routing"
+                    ),
                 }
                 info!(
                     agent = %slug,
@@ -447,11 +458,7 @@ fn timeout_due(age_secs: u64, limit_secs: u64) -> bool {
     age_secs > limit_secs
 }
 
-async fn verify_routing_liveness(agent_dir: &Path, session: &str) -> RoutingLiveness {
-    let routing = match crate::domain::RoutingInfo::read_from_dir(agent_dir).await {
-        Ok(routing) => routing,
-        Err(error) => return RoutingLiveness::Unverifiable(error.to_string()),
-    };
+async fn verify_routing_liveness(routing: &RoutingInfo, session: &str) -> RoutingLiveness {
     if !routing.has_delivery_target() {
         return RoutingLiveness::Unverifiable(
             "routing.json has no window_id or pane_id".to_string(),
@@ -459,10 +466,42 @@ async fn verify_routing_liveness(agent_dir: &Path, session: &str) -> RoutingLive
     }
 
     let tmux = crate::services::tmux_ipc::TmuxIpc::new(session);
-    match crate::services::tmux_ipc::routing_target_alive(&routing, &tmux).await {
+    match crate::services::tmux_ipc::routing_target_alive(routing, &tmux).await {
         Ok(true) => RoutingLiveness::Live,
         Ok(false) => RoutingLiveness::Dead,
         Err(error) => RoutingLiveness::Unverifiable(error.to_string()),
+    }
+}
+
+async fn read_effective_routing(
+    agent_dir: &Path,
+    invocation: Option<&InvocationRecord>,
+) -> Result<RoutingInfo> {
+    match RoutingInfo::read_from_dir(agent_dir).await {
+        Ok(routing) => Ok(routing),
+        Err(routing_error) => {
+            if let Some(invocation) = invocation {
+                if invocation.routing.has_delivery_target() {
+                    if agent_dir.join("routing.json").exists() {
+                        warn!(
+                            path = %agent_dir.display(),
+                            %routing_error,
+                            "Using invocation routing because routing.json is unreadable"
+                        );
+                    } else {
+                        debug!(
+                            path = %agent_dir.display(),
+                            %routing_error,
+                            "Using invocation routing because routing.json is unavailable"
+                        );
+                    }
+                    return Ok(invocation.routing.clone());
+                }
+            }
+            Err(anyhow!(
+                "routing.json is unavailable and invocation metadata has no delivery target: {routing_error}"
+            ))
+        }
     }
 }
 
@@ -470,16 +509,23 @@ async fn kill_agent_window(
     session: &str,
     agent_dir: &std::path::Path,
     slug: &str,
-    expected_routing: Option<&RoutingInfo>,
+    expected_routing: &RoutingInfo,
 ) -> bool {
-    let routing = match crate::domain::RoutingInfo::read_from_dir(agent_dir).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(agent = %slug, error = %e, "Could not read routing.json for timeout kill (non-fatal)");
+    let invocation = match read_invocation(agent_dir).await {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            warn!(agent = %slug, %error, "Could not read invocation for timeout kill (non-fatal)");
+            None
+        }
+    };
+    let routing = match read_effective_routing(agent_dir, invocation.as_ref()).await {
+        Ok(routing) => routing,
+        Err(error) => {
+            warn!(agent = %slug, %error, "Could not read routing for timeout kill (non-fatal)");
             return false;
         }
     };
-    if expected_routing.is_some_and(|expected| expected != &routing) {
+    if expected_routing != &routing {
         warn!(agent = %slug, "Skipping kill for a replaced invocation routing target");
         return false;
     }
@@ -699,5 +745,46 @@ mod tests {
             .unwrap(),
             Some("issue-313-first".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn missing_routing_uses_invocation_snapshot_for_timeout_reconciliation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent_dir = temp_dir.path().join("agent");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let routing = RoutingInfo::window(
+            crate::services::tmux_ipc::WindowId::parse("@17").expect("valid window id"),
+        );
+        routing.write_to_dir(&agent_dir).await.unwrap();
+        let invocation = crate::services::agent_control::start_invocation(
+            &agent_dir,
+            crate::services::AgentType::Codex,
+            crate::services::agent_control::InvocationTrigger::ResumePr,
+            routing.clone(),
+            Some(715),
+            Some("abc123".to_string()),
+        )
+        .await
+        .unwrap();
+        tokio::fs::remove_file(agent_dir.join("routing.json"))
+            .await
+            .unwrap();
+
+        let effective = read_effective_routing(&agent_dir, Some(&invocation))
+            .await
+            .unwrap();
+
+        assert_eq!(effective, routing);
+    }
+
+    #[tokio::test]
+    async fn missing_routing_without_invocation_is_explicitly_unverifiable() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let error = read_effective_routing(temp_dir.path(), None)
+            .await
+            .expect_err("missing routing should not be treated as live");
+
+        assert!(error.to_string().contains("routing.json is unavailable"));
     }
 }

@@ -1564,7 +1564,13 @@ impl<
             .iter()
             .filter(|info| agent_matches_filter(info, filter_type.as_deref()))
         {
-            let is_alive = agent_is_alive(info);
+            let routing_snapshot = read_agent_routing_snapshot(info.agent_dir.as_deref()).await;
+            let is_alive = agent_is_alive(info)
+                && !routing_snapshot.retired
+                && routing_snapshot
+                    .routing
+                    .as_ref()
+                    .is_some_and(RoutingInfo::has_delivery_target);
             if req.filter_alive_only && !is_alive {
                 continue;
             }
@@ -1597,6 +1603,9 @@ impl<
                     last_check_inbox_at,
                     last_activity_at,
                     is_alive,
+                    last_known_routing: routing_snapshot.routing,
+                    routing_retired: routing_snapshot.retired,
+                    routing_exit_code: routing_snapshot.exit_code,
                 },
             ));
         }
@@ -3050,7 +3059,7 @@ async fn tombstone_agent_dir_with_routing(agent_dir: &Path, routing: &RoutingInf
     {
         Ok(InvocationFinishResult::IgnoredStale) => false,
         Ok(InvocationFinishResult::Finished(_)) | Ok(InvocationFinishResult::Missing) => {
-            info!(path = %agent_dir.display(), "removed agent routing after exit");
+            info!(path = %agent_dir.display(), "retired agent routing after exit");
             true
         }
         Err(error) => {
@@ -3381,6 +3390,50 @@ struct AgentListMetadata {
     last_check_inbox_at: i64,
     last_activity_at: u64,
     is_alive: bool,
+    last_known_routing: Option<RoutingInfo>,
+    routing_retired: bool,
+    routing_exit_code: Option<i32>,
+}
+
+#[derive(Debug, Default)]
+struct AgentRoutingSnapshot {
+    routing: Option<RoutingInfo>,
+    retired: bool,
+    exit_code: Option<i32>,
+}
+
+async fn read_agent_routing_snapshot(agent_dir: Option<&Path>) -> AgentRoutingSnapshot {
+    let Some(agent_dir) = agent_dir else {
+        return AgentRoutingSnapshot::default();
+    };
+
+    let invocation = match read_invocation(agent_dir).await {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            warn!(path = %agent_dir.display(), %error, "Ignoring malformed invocation metadata while listing agents");
+            None
+        }
+    };
+    let routing = RoutingInfo::read_from_dir(agent_dir)
+        .await
+        .ok()
+        .or_else(|| invocation.as_ref().map(|record| record.routing.clone()));
+    let exit_code = invocation
+        .as_ref()
+        .and_then(|record| record.exit_code)
+        .or_else(|| {
+            std::fs::read_to_string(agent_dir.join("exit_code"))
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+        });
+    let retired = agent_dir.join("exited_at").exists()
+        || invocation.as_ref().is_some_and(|record| !record.is_live());
+
+    AgentRoutingSnapshot {
+        routing,
+        retired,
+        exit_code,
+    }
 }
 
 fn service_info_to_proto(
@@ -3409,12 +3462,31 @@ fn service_info_to_proto(
         agent_type,
         role: 0,
         alive: metadata.is_alive,
-        mux_window: String::new(),
-        error: String::new(),
+        mux_window: metadata
+            .last_known_routing
+            .as_ref()
+            .and_then(|routing| routing.window_id.as_ref())
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        error: if metadata.last_known_routing.is_none() {
+            "no routing recorded".to_string()
+        } else if metadata.routing_retired {
+            match metadata.routing_exit_code {
+                Some(exit_code) => format!("retired routing (exit_code={exit_code})"),
+                None => "retired routing".to_string(),
+            }
+        } else {
+            String::new()
+        },
         pr_number: info.pr.as_ref().map(|p| p.number as i32).unwrap_or(0),
         pr_url: info.pr.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
         topology: info.topology.to_proto(),
-        pane_id: String::new(),
+        pane_id: metadata
+            .last_known_routing
+            .as_ref()
+            .and_then(|routing| routing.pane_id.as_ref())
+            .map(ToString::to_string)
+            .unwrap_or_default(),
         birth_branch: metadata.birth_branch,
         has_unread: metadata.has_unread,
         last_check_inbox_at: metadata.last_check_inbox_at,
@@ -3619,6 +3691,9 @@ mod tests {
                 last_check_inbox_at: 0,
                 last_activity_at: 1_700_000_000,
                 is_alive: agent_is_alive(&info),
+                last_known_routing: None,
+                routing_retired: false,
+                routing_exit_code: None,
             },
         );
 
@@ -3628,7 +3703,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tombstone_agent_by_pane_removes_routing_and_writes_exited_at() {
+    async fn list_metadata_reports_retired_last_known_routing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let routing =
+            RoutingInfo::window(crate::services::tmux_ipc::WindowId::parse("@17").unwrap());
+        let agent_dir = temp_dir.path().join("agent");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        routing.write_to_dir(&agent_dir).await.unwrap();
+        crate::services::agent_control::start_invocation(
+            &agent_dir,
+            ServiceAgentType::OpenCode,
+            InvocationTrigger::ResumePr,
+            routing.clone(),
+            Some(715),
+            Some("abc123".to_string()),
+        )
+        .await
+        .unwrap();
+        tokio::fs::remove_file(agent_dir.join("routing.json"))
+            .await
+            .unwrap();
+        finish_invocation_and_tombstone(&agent_dir, &routing, InvocationStatus::Exited, Some(0))
+            .await
+            .unwrap();
+
+        let snapshot = read_agent_routing_snapshot(Some(&agent_dir)).await;
+        assert_eq!(
+            snapshot
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.window_id.as_ref())
+                .map(ToString::to_string),
+            Some("@17".to_string())
+        );
+        assert!(snapshot.retired);
+        assert_eq!(snapshot.exit_code, Some(0));
+
+        let info = AgentInfo {
+            internal_name: AgentName::try_from_str("issue-715-opencode").unwrap(),
+            has_tab: true,
+            topology: Topology::WorktreePerAgent,
+            agent_dir: Some(agent_dir),
+            slug: None,
+            agent_type: Some(ServiceAgentType::OpenCode),
+            pr: None,
+            last_activity_at: None,
+        };
+        let proto = service_info_to_proto(
+            &info,
+            AgentListMetadata {
+                birth_branch: "main.issue-715-opencode".to_string(),
+                has_unread: false,
+                last_check_inbox_at: 0,
+                last_activity_at: 0,
+                is_alive: false,
+                last_known_routing: snapshot.routing,
+                routing_retired: snapshot.retired,
+                routing_exit_code: snapshot.exit_code,
+            },
+        );
+
+        assert_eq!(proto.mux_window, "@17");
+        assert_eq!(proto.error, "retired routing (exit_code=0)");
+        assert!(!proto.is_alive);
+    }
+
+    #[tokio::test]
+    async fn list_metadata_distinguishes_agents_without_routing_history() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshot = read_agent_routing_snapshot(Some(temp_dir.path())).await;
+        assert!(snapshot.routing.is_none());
+        assert!(!snapshot.retired);
+        assert_eq!(snapshot.exit_code, None);
+
+        let info = AgentInfo {
+            internal_name: AgentName::try_from_str("legacy-opencode").unwrap(),
+            has_tab: false,
+            topology: Topology::WorktreePerAgent,
+            agent_dir: Some(temp_dir.path().to_path_buf()),
+            slug: None,
+            agent_type: Some(ServiceAgentType::OpenCode),
+            pr: None,
+            last_activity_at: None,
+        };
+        let proto = service_info_to_proto(
+            &info,
+            AgentListMetadata {
+                birth_branch: String::new(),
+                has_unread: false,
+                last_check_inbox_at: 0,
+                last_activity_at: 0,
+                is_alive: false,
+                last_known_routing: snapshot.routing,
+                routing_retired: snapshot.retired,
+                routing_exit_code: snapshot.exit_code,
+            },
+        );
+
+        assert!(proto.mux_window.is_empty());
+        assert!(proto.pane_id.is_empty());
+        assert_eq!(proto.error, "no routing recorded");
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_agent_by_pane_retires_routing_and_writes_exited_at() {
         let temp_dir = tempfile::tempdir().unwrap();
         let project_dir = temp_dir.path();
         let agent_dir = project_dir.join(".exo/agents/worker-opencode");
@@ -3641,7 +3819,7 @@ mod tests {
 
         assert!(tombstone_agent_by_pane(project_dir, "%42").await);
         assert!(agent_dir.join("exited_at").exists());
-        assert!(!agent_dir.join("routing.json").exists());
+        assert!(agent_dir.join("routing.json").exists());
     }
 
     fn test_forgejo_pr() -> ForgejoPullRequest {
@@ -3789,9 +3967,9 @@ mod tests {
         tombstone_reviewer_agent_dirs(dir.path(), 7).await;
 
         assert!(matching_agent.join("exited_at").exists());
-        assert!(!matching_agent.join("routing.json").exists());
+        assert!(matching_agent.join("routing.json").exists());
         assert!(forced_matching_agent.join("exited_at").exists());
-        assert!(!forced_matching_agent.join("routing.json").exists());
+        assert!(forced_matching_agent.join("routing.json").exists());
         assert!(!other_pr_agent.join("exited_at").exists());
         assert!(other_pr_agent.join("routing.json").exists());
         assert!(!other_agent.join("exited_at").exists());

@@ -321,7 +321,11 @@ async fn list_agent_statuses(
             work_units.get(&name),
         )
         .await;
-        if include_dead || status.window_alive || status.lifecycle_status.starts_with("WAITING-ON-")
+        if include_dead
+            || status.window_alive
+            || status.lifecycle_status.starts_with("WAITING-ON-")
+            || status.lifecycle_status.starts_with("RETIRED")
+            || status.lifecycle_status == "NO-ROUTING-RECORDED"
         {
             agents.push(status);
         }
@@ -378,6 +382,20 @@ async fn agent_status_from_dir(
     work_unit: Option<&SessionWorkUnit>,
 ) -> AgentStatus {
     let routing = RoutingInfo::read_from_dir(agent_dir).await.ok();
+    let invocation = match read_invocation(agent_dir).await {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            warn!(
+                path = %agent_dir.display(),
+                %error,
+                "Treating agent with malformed invocation metadata as dormant"
+            );
+            None
+        }
+    };
+    let display_routing = routing
+        .as_ref()
+        .or_else(|| invocation.as_ref().map(|record| &record.routing));
     let identity = read_identity(agent_dir).await;
     let birth_branch = match identity.as_ref() {
         Some(record) => record.birth_branch.to_string(),
@@ -392,34 +410,38 @@ async fn agent_status_from_dir(
         .await
         .and_then(|value| value.parse::<u64>().ok());
     let age_mins = spawned_at.map(age_mins_since).unwrap_or(0);
-    let window_id = routing
-        .as_ref()
+    let window_id = display_routing
         .and_then(|routing| routing.window_id.as_ref())
         .map(ToString::to_string)
         .unwrap_or_default();
-    let pane_id = routing
-        .as_ref()
+    let pane_id = display_routing
         .and_then(|routing| routing.pane_id.as_ref())
         .map(ToString::to_string)
         .unwrap_or_default();
-    let window_alive = match read_invocation(agent_dir).await {
-        Ok(Some(invocation)) if invocation.is_live() => {
+    let exit_code = invocation.as_ref().and_then(|record| record.exit_code);
+    let exit_code = match exit_code {
+        Some(exit_code) => Some(exit_code),
+        None => read_trimmed(agent_dir.join("exit_code"))
+            .await
+            .and_then(|value| value.parse().ok()),
+    };
+    let window_alive = match invocation.as_ref() {
+        Some(invocation) if invocation.is_live() => {
             routing_alive(Some(&invocation.routing), tmux).await
         }
-        Ok(Some(_)) => false,
-        Ok(None) => routing_alive(routing.as_ref(), tmux).await,
-        Err(error) => {
-            warn!(
-                path = %agent_dir.display(),
-                %error,
-                "Treating agent with malformed invocation metadata as dormant"
-            );
-            false
-        }
+        Some(_) => false,
+        None => routing_alive(routing.as_ref(), tmux).await,
     };
-    let role = infer_role(name, routing.as_ref(), &birth_branch);
-    let lifecycle_status =
-        derive_lifecycle_status(window_alive, &issue, worktree_present, work_unit);
+    let role = infer_role(name, display_routing, &birth_branch);
+    let retired = invocation.as_ref().is_some_and(|record| !record.is_live())
+        || agent_dir.join("exited_at").exists();
+    let lifecycle_status = if display_routing.is_none() {
+        "NO-ROUTING-RECORDED".to_string()
+    } else if retired {
+        retired_lifecycle_status(exit_code)
+    } else {
+        derive_lifecycle_status(window_alive, &issue, worktree_present, work_unit)
+    };
 
     AgentStatus {
         name: name.to_string(),
@@ -585,6 +607,13 @@ fn derive_lifecycle_status(
     }
 }
 
+fn retired_lifecycle_status(exit_code: Option<i32>) -> String {
+    match exit_code {
+        Some(exit_code) => format!("RETIRED(exit_code={exit_code})"),
+        None => "RETIRED".to_string(),
+    }
+}
+
 async fn routing_alive(routing: Option<&RoutingInfo>, tmux: Option<&TmuxIpc>) -> bool {
     let Some(tmux) = tmux else {
         return false;
@@ -646,7 +675,8 @@ mod tests {
     use crate::domain::{AgentName, BirthBranch};
     use crate::effects::{EffectContext, EffectHandler};
     use crate::services::agent_control::{
-        finish_invocation, start_invocation, InvocationStatus, InvocationTrigger,
+        finish_invocation, finish_invocation_and_tombstone, start_invocation, InvocationStatus,
+        InvocationTrigger,
     };
     use crate::services::tmux_ipc::WindowId;
     use crate::services::Services;
@@ -713,7 +743,7 @@ mod tests {
 
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "feature-codex");
-        assert_eq!(agents[0].lifecycle_status, "ORPHAN");
+        assert_eq!(agents[0].lifecycle_status, "NO-ROUTING-RECORDED");
     }
 
     #[tokio::test]
@@ -738,7 +768,7 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "feature-codex");
         assert!(!agents[0].window_alive);
-        assert_eq!(agents[0].lifecycle_status, "WAITING-ON-CI");
+        assert_eq!(agents[0].lifecycle_status, "NO-ROUTING-RECORDED");
     }
 
     #[tokio::test]
@@ -784,7 +814,41 @@ mod tests {
 
         assert_eq!(agents.len(), 1);
         assert!(!agents[0].window_alive);
-        assert_eq!(agents[0].lifecycle_status, "WAITING-ON-CI");
+        assert_eq!(agents[0].lifecycle_status, "RETIRED(exit_code=0)");
+    }
+
+    #[tokio::test]
+    async fn retired_invocation_without_routing_file_reports_last_known_target() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent_dir = temp_dir.path().join(".exo/agents/issue-715-opencode");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let routing = RoutingInfo::window(WindowId::parse("@17").unwrap());
+        routing.write_to_dir(&agent_dir).await.unwrap();
+        let _invocation = start_invocation(
+            &agent_dir,
+            crate::services::AgentType::OpenCode,
+            InvocationTrigger::ResumePr,
+            routing.clone(),
+            Some(715),
+            Some("abc123".to_string()),
+        )
+        .await
+        .unwrap();
+        tokio::fs::remove_file(agent_dir.join("routing.json"))
+            .await
+            .unwrap();
+        finish_invocation_and_tombstone(&agent_dir, &routing, InvocationStatus::Exited, Some(0))
+            .await
+            .unwrap();
+
+        let agents = list_agent_statuses(temp_dir.path(), None, true, &HashMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].window_id, "@17");
+        assert!(!agents[0].window_alive);
+        assert_eq!(agents[0].lifecycle_status, "RETIRED(exit_code=0)");
     }
 
     #[tokio::test]

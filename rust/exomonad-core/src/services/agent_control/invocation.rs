@@ -212,7 +212,9 @@ pub async fn finish_invocation(
 /// Finish and tombstone a routing target only when the current invocation
 /// still owns the exact routing record supplied by the exiting process.
 /// Missing records retain legacy cleanup behavior; malformed records are an
-/// error and therefore leave routing untouched.
+/// error and therefore leave routing untouched. The routing snapshot is
+/// retained as last-known metadata; `exited_at` and the terminal invocation
+/// status are the retirement markers used by liveness checks.
 pub async fn finish_invocation_and_tombstone(
     agent_dir: &Path,
     expected_routing: &RoutingInfo,
@@ -238,11 +240,6 @@ pub async fn finish_invocation_and_tombstone(
     };
     let exited_at = unix_timestamp().to_string();
     tokio::fs::write(agent_dir.join("exited_at"), exited_at).await?;
-    match tokio::fs::remove_file(agent_dir.join("routing.json")).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("failed to remove exited agent routing"),
-    }
     Ok(result)
 }
 
@@ -369,7 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_exit_tombstones_routing_and_preserves_exit_code() {
+    async fn one_shot_exit_retires_routing_and_preserves_exit_code() {
         let dir = tempdir().expect("tempdir");
         let expected_routing = routing();
         expected_routing.write_to_dir(dir.path()).await.unwrap();
@@ -400,7 +397,10 @@ mod tests {
         assert_eq!(finished.exit_code, Some(0));
         assert!(!finished.is_live());
         assert!(dir.path().join("exited_at").exists());
-        assert!(!dir.path().join("routing.json").exists());
+        assert_eq!(
+            RoutingInfo::read_from_dir(dir.path()).await.unwrap(),
+            expected_routing
+        );
     }
 
     #[tokio::test]

@@ -36,15 +36,24 @@ impl<
             );
             return Some(false);
         }
+        let routing_path = agent_dir.join("routing.json");
         let routing = match RoutingInfo::read_from_dir(agent_dir).await {
             Ok(routing) => routing,
             Err(error) => {
                 if let Some(invocation_routing) = invocation_routing.clone() {
-                    warn!(
-                        path = %agent_dir.display(),
-                        %error,
-                        "Using routing captured by current invocation metadata"
-                    );
+                    if routing_path.exists() {
+                        warn!(
+                            path = %agent_dir.display(),
+                            %error,
+                            "Using routing captured by current invocation metadata because routing.json is unreadable"
+                        );
+                    } else {
+                        debug!(
+                            path = %agent_dir.display(),
+                            %error,
+                            "Using routing captured by current invocation metadata because routing.json is unavailable"
+                        );
+                    }
                     invocation_routing
                 } else {
                     warn!(

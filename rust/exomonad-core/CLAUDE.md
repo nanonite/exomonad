@@ -130,7 +130,16 @@ This asymmetry is intentional — only the `notify_parent` relationship has a we
 - A successful resume of an already-live PR owner refreshes `.exo/agents/{agent}/last_activity_at` without rewriting `routing.json` or identity metadata.
 - `last_activity_at` is lifecycle/resume metadata and must not be reported as `last_check_inbox_at`; the latter is reserved for an explicit `check_inbox` drain.
 - Timeout reconciliation uses the newest activity marker before considering historical `spawned_at` age, then re-verifies the stable routing window/pane ID through tmux before any kill. Missing or unverifiable routing is handled conservatively.
-- Agent listing treats a valid routing target as the liveness source of truth, using display-name scans only for legacy entries without routing metadata.
+- Agent listing treats a valid routing target as the liveness source of truth, using
+  invocation routing as a legacy fallback and display-name scans only for entries
+  without persisted routing metadata.
+- `routing.json` is a retained last-known routing snapshot. It is written for a new
+  process attempt and remains readable after that attempt exits; `exited_at` and a
+  terminal `invocation.json` status are the retirement markers, so retained IDs are
+  history and never by themselves authorize delivery or liveness.
+- Status surfaces report retained routing as `RETIRED` with the last-known window or
+  pane ID and exit code. An agent with neither routing snapshot nor invocation routing
+  reports `NO-ROUTING-RECORDED`, which is distinct from a retired target.
 
 ### Ownership versus invocation
 

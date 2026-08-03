@@ -78,7 +78,7 @@ async fn mark_agent_exited(agent_dir: &std::path::Path, expected_target: &str) {
             info!(path = %agent_dir.display(), "ignored stale agent exit")
         }
         Ok(InvocationFinishResult::Finished(_)) | Ok(InvocationFinishResult::Missing) => {
-            info!(path = %agent_dir.display(), "removed stale agent routing")
+            info!(path = %agent_dir.display(), "retired stale agent routing")
         }
         Err(error) => warn!(
             path = %agent_dir.display(),
