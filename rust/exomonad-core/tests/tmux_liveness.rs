@@ -8,6 +8,7 @@
 use exomonad_core::domain::RoutingInfo;
 use exomonad_core::services::tmux_ipc::{routing_target_alive, PaneId, TmuxIpc, WindowId};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// A tmux session created for one test, torn down on drop.
 struct TestSession {
@@ -64,6 +65,44 @@ impl TestSession {
 
     fn ipc(&self) -> TmuxIpc {
         TmuxIpc::new(&self.name)
+    }
+
+    fn new_shell_window(&self, name: &str) -> WindowId {
+        let output = Command::new("tmux")
+            .args([
+                "new-window",
+                "-d",
+                "-t",
+                &self.name,
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-n",
+                name,
+            ])
+            .output()
+            .expect("tmux new-window");
+        assert!(output.status.success(), "tmux new-window failed");
+        WindowId::parse(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("tmux reported a valid window id")
+    }
+
+    fn set_remain_on_exit(&self, window_id: &WindowId) {
+        let target = format!("{}:{}", self.name, window_id);
+        let status = Command::new("tmux")
+            .args(["set-window-option", "-t", &target, "remain-on-exit", "on"])
+            .status()
+            .expect("tmux set-window-option");
+        assert!(status.success(), "tmux set-window-option failed");
+    }
+
+    fn exit_shell(&self, window_id: &WindowId) {
+        let target = format!("{}:{}", self.name, window_id);
+        let status = Command::new("tmux")
+            .args(["send-keys", "-t", &target, "exit", "Enter"])
+            .status()
+            .expect("tmux send-keys");
+        assert!(status.success(), "tmux send-keys failed");
     }
 }
 
@@ -232,4 +271,44 @@ async fn routing_target_alive_reports_true_for_current_routing() {
     assert!(routing_target_alive(&routing, &session.ipc())
         .await
         .expect("probe succeeds"));
+}
+
+#[tokio::test]
+async fn routing_target_process_alive_rejects_dead_command_in_retained_window() {
+    if !tmux_available() {
+        return;
+    }
+    let session = TestSession::create("exo-liveness-dead-command");
+    let window = session.new_shell_window("dead-command");
+    let routing = RoutingInfo::window(window.clone());
+    let ipc = session.ipc();
+
+    assert!(ipc.window_exists(&window).await.expect("probe succeeds"));
+    assert!(ipc
+        .routing_target_process_alive(&routing)
+        .await
+        .expect("process probe succeeds"));
+
+    session.set_remain_on_exit(&window);
+    session.exit_shell(&window);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            ipc.window_exists(&window).await.expect("probe succeeds"),
+            "the retained window must remain addressable"
+        );
+        if !ipc
+            .routing_target_process_alive(&routing)
+            .await
+            .expect("process probe succeeds")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dead pane was not observed in time"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

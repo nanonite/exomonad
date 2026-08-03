@@ -29,6 +29,13 @@ impl<
                 return Some(false);
             }
         };
+        if agent_dir.join("exit_code").exists() {
+            warn!(
+                path = %agent_dir.display(),
+                "Agent runtime exit marker is present; treating routing as dead"
+            );
+            return Some(false);
+        }
         let routing = match RoutingInfo::read_from_dir(agent_dir).await {
             Ok(routing) => routing,
             Err(error) => {
@@ -61,11 +68,20 @@ impl<
                 return Some(false);
             }
         };
+        let target_alive = crate::services::tmux_ipc::routing_target_alive(routing, &tmux)
+            .await
+            .unwrap_or_else(|error| {
+                warn!(path = %agent_dir.display(), error = %error, "Routing liveness check failed");
+                false
+            });
+        if !target_alive {
+            return Some(false);
+        }
         Some(
-            crate::services::tmux_ipc::routing_target_alive(routing, &tmux)
+            tmux.routing_target_process_alive(routing)
                 .await
                 .unwrap_or_else(|error| {
-                    warn!(path = %agent_dir.display(), error = %error, "Routing liveness check failed");
+                    warn!(path = %agent_dir.display(), error = %error, "Routing process liveness check failed");
                     false
                 }),
         )

@@ -180,6 +180,34 @@ fn pane_listing_contains_id(listing: &str, session_name: &str, pane_id: &str) ->
     })
 }
 
+fn pane_process_state(
+    listing: &str,
+    session_name: &str,
+    window_id: Option<&str>,
+    pane_id: Option<&str>,
+) -> Result<Option<bool>> {
+    for line in listing.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 4 || fields[0] != session_name {
+            continue;
+        }
+        let target_matches = match (window_id, pane_id) {
+            (Some(window), None) => fields[1] == window,
+            (None, Some(pane)) => fields[2] == pane,
+            _ => false,
+        };
+        if !target_matches {
+            continue;
+        }
+        return Ok(Some(match fields[3] {
+            "0" => true,
+            "1" => false,
+            state => anyhow::bail!("unexpected tmux pane_dead value: {state}"),
+        }));
+    }
+    Ok(None)
+}
+
 impl TmuxIpc {
     pub fn new(session_name: &str) -> Self {
         Self {
@@ -868,6 +896,63 @@ impl TmuxIpc {
         debug!(session = %self.session_name, pane = %pane_id, exists, "Probed tmux pane liveness");
         Ok(exists)
     }
+
+    /// Return whether the process in the exact routed pane is still alive.
+    ///
+    /// Unlike target existence, this treats a pane retained by tmux after its
+    /// command exits (`remain-on-exit`) as dead. The listing is session-scoped
+    /// so a server-global pane/window ID from another session cannot qualify.
+    pub async fn routing_target_process_alive(&self, routing: &RoutingInfo) -> Result<bool> {
+        let output = Command::new("tmux")
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_dead}",
+            ])
+            .output()
+            .await
+            .context("Failed to run tmux list-panes for process liveness")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if session_missing(&stderr) {
+                debug!(
+                    session = %self.session_name,
+                    routing = ?routing,
+                    alive = false,
+                    "tmux process probe found no session"
+                );
+                return Ok(false);
+            }
+            warn!(
+                session = %self.session_name,
+                routing = ?routing,
+                error = %stderr,
+                "tmux process probe failed"
+            );
+            anyhow::bail!(
+                "tmux list-panes for process liveness failed: {}",
+                stderr.trim()
+            );
+        }
+
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let state = if let Some(window_id) = &routing.window_id {
+            pane_process_state(&listing, &self.session_name, Some(window_id.as_str()), None)?
+        } else if let Some(pane_id) = &routing.pane_id {
+            pane_process_state(&listing, &self.session_name, None, Some(pane_id.as_str()))?
+        } else {
+            None
+        };
+        let alive = state.unwrap_or(false);
+        debug!(
+            session = %self.session_name,
+            routing = ?routing,
+            alive,
+            "Probed tmux process liveness"
+        );
+        Ok(alive)
+    }
 }
 
 /// Verify the live tmux target recorded for an agent.
@@ -918,6 +1003,27 @@ mod tests {
         assert!(pane_listing_contains_id(listing, "workspace", "%42"));
         assert!(!pane_listing_contains_id(listing, "workspace", "%8"));
         assert!(!pane_listing_contains_id(listing, "other", "%42"));
+    }
+
+    #[test]
+    fn test_pane_process_state_matches_exact_session_target() {
+        let listing = "workspace\t@3\t%7\t0\nother\t@3\t%8\t1\nworkspace\t@42\t%42\t1\n";
+        assert_eq!(
+            pane_process_state(listing, "workspace", Some("@3"), None).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            pane_process_state(listing, "workspace", Some("@42"), None).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            pane_process_state(listing, "workspace", None, Some("%8")).unwrap(),
+            None
+        );
+        assert_eq!(
+            pane_process_state(listing, "other", None, Some("%8")).unwrap(),
+            Some(false)
+        );
     }
 
     #[test]
