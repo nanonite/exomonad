@@ -271,6 +271,12 @@ report before starting another run, because the live report is overwritten by
 the next invocation. Do not add retries, ignore a failing test, or weaken test
 semantics without identifying the failure mechanism first.
 
+The Teams bridge lock publishes complete metadata through a temporary file and
+an atomic hard-link claim. Lock acquisition reclaims only temporary artifacts
+whose recorded owner PID is dead; artifacts belonging to live PIDs are retained.
+Successful claims are logged at debug level, while stale-lock breaks are logged
+at warn level with the recorded owner PID.
+
 ## Design Decisions
 
 | Decision | Rationale |
