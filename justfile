@@ -24,8 +24,12 @@ check-fmt:
 lint:
     nix develop --command hlint haskell
 
+# Check that fixture activity has not damaged the ExoMonad repository.
+test-repo-integrity:
+    bash scripts/check-repo-integrity.sh
+
 # Run Rust tests; include integration targets when requested.
-rust-test all_targets="false":
+rust-test all_targets="false": test-repo-integrity
     #!/usr/bin/env bash
     set -uo pipefail
     nextest_args=(--workspace --no-fail-fast)
