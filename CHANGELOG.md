@@ -236,6 +236,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- fix: per-agent git identity is written to shared config and clobbered by every spawn (#609)
 - feat: CI panel adds a PR column (#608)
 - feat: CI panel shows run start timestamp instead of age (#607)
 - feat: route reviewer comment events directly to the TL (#606)
