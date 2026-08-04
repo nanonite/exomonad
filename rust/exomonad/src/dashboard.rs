@@ -3,13 +3,13 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use exomonad_core::domain::{BranchName, CIStatus};
 use exomonad_core::services::forgejo::{
     ForgejoClient, ForgejoPullRequest, ForgejoPullRequestReview, ForgejoRunner, ForgejoWorkflowRun,
 };
-use exomonad_core::services::repo::{RepoInfo, get_repo_info};
+use exomonad_core::services::repo::{get_repo_info, RepoInfo};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -140,6 +140,7 @@ struct AgentRow {
 
 #[derive(Clone, Default)]
 struct CiRunRow {
+    pr: String,
     branch: String,
     status: String,
     name: String,
@@ -286,6 +287,7 @@ fn draw_agents(frame: &mut Frame, area: Rect, agents: &[AgentRow]) {
 fn draw_ci(frame: &mut Frame, area: Rect, runs: &[CiRunRow]) {
     let rows = runs.iter().map(|run| {
         Row::new([
+            Cell::from(run.pr.clone()),
             Cell::from(run.branch.clone()),
             Cell::from(run.status.clone()).style(state_style(&run.status)),
             Cell::from(run.name.clone()),
@@ -295,13 +297,14 @@ fn draw_ci(frame: &mut Frame, area: Rect, runs: &[CiRunRow]) {
     let table = Table::new(
         rows,
         [
+            Constraint::Percentage(10),
             Constraint::Percentage(28),
-            Constraint::Percentage(16),
-            Constraint::Percentage(42),
+            Constraint::Percentage(14),
+            Constraint::Percentage(34),
             Constraint::Percentage(14),
         ],
     )
-    .header(header(["branch", "status", "run", "started"]))
+    .header(header(["pr", "branch", "status", "run", "started"]))
     .block(Block::default().title("CI Status").borders(Borders::ALL));
     frame.render_widget(table, area);
 }
@@ -414,10 +417,8 @@ async fn collect_ci_runs(
     repo_info: &RepoInfo,
     prs: &[ForgejoPullRequest],
 ) -> Vec<CiRunRow> {
-    let mut branches = prs
-        .iter()
-        .map(|pr| pr.head_ref.as_str().to_string())
-        .collect::<BTreeSet<_>>();
+    let pr_numbers = pr_numbers_by_branch(prs);
+    let mut branches = pr_numbers.keys().cloned().collect::<BTreeSet<_>>();
     if branches.is_empty() {
         branches.insert(current_branch(repo_info.repo.as_str()));
     }
@@ -430,10 +431,19 @@ async fn collect_ci_runs(
             .list_workflow_runs_for_branch(&repo_info.owner, &repo_info.repo, &branch_name, 4)
             .await
             .unwrap_or_default();
-        rows.extend(runs.into_iter().map(|run| ci_run_row(&branch, run)));
+        rows.extend(
+            runs.into_iter()
+                .map(|run| ci_run_row(&branch, pr_numbers.get(&branch), run)),
+        );
     }
     rows.truncate(RUN_LIMIT);
     rows
+}
+
+fn pr_numbers_by_branch(prs: &[ForgejoPullRequest]) -> BTreeMap<String, String> {
+    prs.iter()
+        .map(|pr| (pr.head_ref.as_str().to_string(), pr.number.to_string()))
+        .collect()
 }
 
 async fn collect_runner_rows(client: &ForgejoClient) -> Vec<RunnerRow> {
@@ -473,7 +483,7 @@ fn review_state(reviews: &[ForgejoPullRequestReview]) -> String {
         .unwrap_or_else(|| "pending".to_string())
 }
 
-fn ci_run_row(branch: &str, run: ForgejoWorkflowRun) -> CiRunRow {
+fn ci_run_row(branch: &str, pr: Option<&String>, run: ForgejoWorkflowRun) -> CiRunRow {
     let status = run.conclusion.unwrap_or(run.status);
     let name = if run.display_title.is_empty() {
         run.name
@@ -481,6 +491,7 @@ fn ci_run_row(branch: &str, run: ForgejoWorkflowRun) -> CiRunRow {
         run.display_title
     };
     CiRunRow {
+        pr: pr.map(String::as_str).unwrap_or("-").to_string(),
         branch: branch.to_string(),
         status,
         name,
@@ -716,4 +727,56 @@ fn is_jsonl(path: &Path) -> bool {
 
 fn time_label(value: &str) -> String {
     value.get(11..19).unwrap_or(value).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn branch(value: &str) -> BranchName {
+        BranchName::try_from_str(value).expect("literal branch is valid")
+    }
+
+    fn pull_request(number: u64, head_ref: &str) -> ForgejoPullRequest {
+        ForgejoPullRequest {
+            number: exomonad_core::domain::PRNumber::new(number),
+            url: String::new(),
+            title: String::new(),
+            body: String::new(),
+            head_ref: branch(head_ref),
+            base_ref: branch("main"),
+            state: "open".to_string(),
+            merged: false,
+            head_sha: None,
+        }
+    }
+
+    fn workflow_run() -> ForgejoWorkflowRun {
+        ForgejoWorkflowRun {
+            name: "test".to_string(),
+            display_title: String::new(),
+            head_branch: None,
+            head_sha: None,
+            status: "success".to_string(),
+            conclusion: None,
+            created_at: Some("2026-08-03T12:34:56Z".to_string()),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn ci_run_pr_map_uses_pr_head_branch_and_number() {
+        let prs = vec![pull_request(608, "feature/dashboard")];
+        let map = pr_numbers_by_branch(&prs);
+
+        assert_eq!(map.get("feature/dashboard"), Some(&"608".to_string()));
+    }
+
+    #[test]
+    fn ci_run_row_uses_dash_when_branch_has_no_open_pr() {
+        let row = ci_run_row("feature/no-pr", None, workflow_run());
+
+        assert_eq!(row.pr, "-");
+        assert_eq!(row.started_at, "12:34:56");
+    }
 }
