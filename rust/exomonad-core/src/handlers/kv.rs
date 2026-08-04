@@ -195,6 +195,7 @@ mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch};
     use crate::effects::EffectContext;
+    use exomonad_test_support::{assert_fixture_git_root, ScrubGitRepositoryEnv};
 
     fn test_ctx() -> EffectContext {
         EffectContext {
@@ -321,41 +322,53 @@ mod tests {
         tokio::process::Command::new("git")
             .arg("init")
             .current_dir(dir.path())
+            .scrub_git_repository_env()
             .output()
             .await
             .unwrap();
+        assert_fixture_git_root(dir.path()).unwrap();
 
         // Configure git so we can commit
+        assert_fixture_git_root(dir.path()).unwrap();
         tokio::process::Command::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(dir.path())
+            .scrub_git_repository_env()
             .output()
             .await
             .unwrap();
+        assert_fixture_git_root(dir.path()).unwrap();
         tokio::process::Command::new("git")
             .args(["config", "user.name", "test"])
             .current_dir(dir.path())
+            .scrub_git_repository_env()
             .output()
             .await
             .unwrap();
 
         // Create main branch
         tokio::fs::write(dir.path().join("file"), "").await.unwrap();
+        assert_fixture_git_root(dir.path()).unwrap();
         tokio::process::Command::new("git")
             .args(["add", "file"])
             .current_dir(dir.path())
+            .scrub_git_repository_env()
             .output()
             .await
             .unwrap();
+        assert_fixture_git_root(dir.path()).unwrap();
         tokio::process::Command::new("git")
             .args(["commit", "-m", "init"])
             .current_dir(dir.path())
+            .scrub_git_repository_env()
             .output()
             .await
             .unwrap();
+        assert_fixture_git_root(dir.path()).unwrap();
         tokio::process::Command::new("git")
             .args(["branch", "-m", "main"])
             .current_dir(dir.path())
+            .scrub_git_repository_env()
             .output()
             .await
             .unwrap();

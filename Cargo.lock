@@ -1279,7 +1279,10 @@ dependencies = [
 name = "exomonad-test-support"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "serial_test",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
