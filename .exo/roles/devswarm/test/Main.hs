@@ -82,7 +82,7 @@ main = do
   assertMergeReadyReviewLeavesParentToWatcher
   assertMergeReadyCIStatusLeavesParentToWatcher
   assertReviewCommentedJSONAndHandler
-  assertRequestedChangesLeaveParentToWatcher
+  assertRequestedChangesDeliverOwnerReviewMessage
   assertTLReviewHandlerPreservesReviewMetadata
   assertReviewerFacingTextDoesNotMentionCopilot
   assertAcceptanceCriteriaContract
@@ -472,16 +472,28 @@ assertReviewCommentedJSONAndHandler = do
       assertEqual "comment-only review author branch" (Just "main.review-pr-9-codex") authorBranch
     other -> fail $ "comment-only review JSON roundtrip failed: " <> show other
   action <- runPRReviewEvent DevRole.config event
-  assertNoAction "comment-only review dev handler" action
+  case action of
+    InjectMessage message -> do
+      assertBool "comment-only review dev message includes PR" ("[REVIEW COMMENT] PR #9" `T.isInfixOf` message)
+      assertBool "comment-only review dev message includes body" ("Looks good, with one suggestion." `T.isInfixOf` message)
+    other -> fail $ "comment-only review dev handler should inject the review, got " <> show other
 
-assertRequestedChangesLeaveParentToWatcher :: IO ()
-assertRequestedChangesLeaveParentToWatcher = do
+assertRequestedChangesDeliverOwnerReviewMessage :: IO ()
+assertRequestedChangesDeliverOwnerReviewMessage = do
   reviewAction <- runPRReviewEvent DevRole.config (ReviewReceived 12 "Please update the timeout path." "main.feature-codex" (Just "main.review-pr-12-codex"))
-  assertNoAction "review received dev handler" reviewAction
+  assertReviewMessage "review received dev handler" "## Review on PR #12" "Please update the timeout path." reviewAction
 
   let event = ReviewerRequestedChanges 10 "Please fix the error path." "main.feature-codex" (Just "main.review-pr-10-codex")
   action <- runPRReviewEvent DevRole.config event
-  assertNoAction "requested-changes dev handler" action
+  assertReviewMessage "requested-changes dev handler" "## Review on PR #10" "Please fix the error path." action
+
+assertReviewMessage :: String -> Text -> Text -> EventAction -> IO ()
+assertReviewMessage label_ heading body action =
+  case action of
+    InjectMessage message -> do
+      assertBool (label_ <> " includes heading") (heading `T.isInfixOf` message)
+      assertBool (label_ <> " includes body") (body `T.isInfixOf` message)
+    other -> fail $ label_ <> " should inject the review, got " <> show other
 
 assertTLReviewHandlerPreservesReviewMetadata :: IO ()
 assertTLReviewHandlerPreservesReviewMetadata = do

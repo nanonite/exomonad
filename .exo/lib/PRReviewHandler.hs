@@ -24,9 +24,9 @@ import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
 import ExoMonad.Guest.Tools.Chainlink (chainlinkSessionStatusCore)
 import ExoMonad.Guest.Types (Effects)
 
--- | Dev-leaf PR review handling records feedback and notifies the owning TL.
--- The TL analyzes the review and resumes the existing PR owner with a complete
--- repair handoff; TL/root handling injects the same signal into its own pane.
+-- | Dev-leaf PR review handling records feedback and presents the review in the
+-- owning leaf's pane. The watcher also dispatches the event to the owning TL,
+-- whose handler produces the TL-facing repair guidance.
 prReviewEventHandlers :: EventHandlerConfig
 prReviewEventHandlers =
   defaultEventHandlers
@@ -49,10 +49,10 @@ prReviewHandler (ReviewReceived n comments_ _reviewBranch _authorBranch) = do
   logHandler $ "Review received on PR #" <> T.pack (show n)
   currentBranch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent currentBranch DevSpawned (ReviewReceivedEv n comments_)
-  pure NoAction
-prReviewHandler (ReviewCommented n _comments_ _reviewBranch _authorBranch) = do
+  pure (InjectMessage (Tpl.reviewReceived n comments_))
+prReviewHandler (ReviewCommented n comments_ _reviewBranch _authorBranch) = do
   logHandler $ "Comment-only review received on PR #" <> T.pack (show n)
-  pure NoAction
+  pure (InjectMessage (Tpl.reviewCommented n comments_))
 prReviewHandler (ReviewApproved n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " approved (reviewer agent)"
   branch <- getCurrentBranch
@@ -80,7 +80,7 @@ prReviewHandler (ReviewerRequestedChanges n comments_ _reviewBranch _authorBranc
   logHandler $ "Reviewer requested changes on PR #" <> T.pack (show n)
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
-  pure NoAction
+  pure (InjectMessage (Tpl.reviewReceived n comments_))
 prReviewHandler (RateLimited remaining secs) = do
   logHandler $ "Rate limited: " <> T.pack (show remaining) <> " retries, " <> T.pack (show secs) <> "s until reset"
   pure NoAction

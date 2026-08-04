@@ -563,19 +563,6 @@ fn parent_repair_handoff_message(
     )
 }
 
-fn review_parent_message(
-    pr_number: u64,
-    branch: &str,
-    review_kind: &str,
-    author_branch: Option<&str>,
-    comments: &str,
-) -> String {
-    let reviewer_branch = author_branch.unwrap_or("unknown");
-    format!(
-        "[REVIEW ACTION REQUIRED] PR #{pr_number} on branch {branch}\nReview kind: {review_kind}\nReviewer branch: {reviewer_branch}\n\n{comments}\n\nTL action: analyze this feedback and resume the existing PR owner with a complete repair task.\n\n{REVIEW_HANDOFF_INSTRUCTIONS}"
-    )
-}
-
 fn merge_ready_message(pr_number: u64, status: &str, branch: &str) -> String {
     format!(
         "[MERGE READY] PR #{pr_number} on branch {branch} has CI status {status} and reviewer approval. Merge with `merge_pr` tool."
@@ -689,26 +676,6 @@ fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventAction
     let kind = value_str(payload, "kind")?;
     let pr_number = value_u64(payload, "pr_number")?;
     match kind {
-        "review_received" | "reviewer_requested_changes" => {
-            Some(EventActionResponse::InjectMessage {
-                message: review_parent_message(
-                    pr_number,
-                    value_str(payload, "branch").unwrap_or("unknown"),
-                    "changes requested",
-                    value_str(payload, "author_branch"),
-                    value_str(payload, "comments")?,
-                ),
-            })
-        }
-        "review_commented" => Some(EventActionResponse::InjectMessage {
-            message: review_parent_message(
-                pr_number,
-                value_str(payload, "branch").unwrap_or("unknown"),
-                "comment-only",
-                value_str(payload, "author_branch"),
-                value_str(payload, "comments")?,
-            ),
-        }),
         "approved" | "reviewer_approved" => Some(EventActionResponse::InjectMessage {
             message: pr_ready_message(pr_number),
         }),
@@ -770,32 +737,6 @@ fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventAction
 fn native_leaf_pr_review_action(payload: &serde_json::Value) -> Option<EventActionResponse> {
     let kind = value_str(payload, "kind")?;
     match kind {
-        "review_received" | "reviewer_requested_changes" => {
-            let pr_number = value_u64(payload, "pr_number")?;
-            Some(EventActionResponse::NotifyParent {
-                message: review_parent_message(
-                    pr_number,
-                    value_str(payload, "branch").unwrap_or("unknown"),
-                    "changes requested",
-                    value_str(payload, "author_branch"),
-                    value_str(payload, "comments")?,
-                ),
-                pr_number: pr_number as i64,
-            })
-        }
-        "review_commented" => {
-            let pr_number = value_u64(payload, "pr_number")?;
-            Some(EventActionResponse::NotifyParent {
-                message: review_parent_message(
-                    pr_number,
-                    value_str(payload, "branch").unwrap_or("unknown"),
-                    "comment-only",
-                    value_str(payload, "author_branch"),
-                    value_str(payload, "comments")?,
-                ),
-                pr_number: pr_number as i64,
-            })
-        }
         "ci_triggered" => Some(EventActionResponse::InjectMessage {
             message: format!(
                 "[CI TRIGGERED] PR #{} on {}. Waiting for CI result.",
@@ -1935,62 +1876,86 @@ where
                         );
                         let requests_merge_ready_delivery =
                             requests_merge_ready_parent_delivery(event_type, &payload);
-                        // Reviewers are ephemeral: they submit their Forgejo verdict and exit.
-                        // Review events have one delivery target, the PR owner's dev leaf. A
-                        // subsequent review round is started by the watcher-owned
-                        // spawn_reviewer_for_pr state machine above; never inject an event into
-                        // the already-exited reviewer branch.
+                        let dispatch_to_parent =
+                            review_event_dispatches_to_parent(event_type, &payload);
+                        let mut event_targets = vec![(
+                            pending.branch.to_string(),
+                            pending.agent_type,
+                            pending.agent_role.clone(),
+                        )];
+                        if dispatch_to_parent {
+                            let (parent_branch, parent_agent_type) =
+                                self.parent_event_target(pending.branch.as_str()).await;
+                            event_targets.push((
+                                parent_branch,
+                                parent_agent_type,
+                                "tl".to_string(),
+                            ));
+                        }
 
-                        let response = self
-                            .call_handle_event_for_role(
-                                pending.branch.as_str(),
-                                pending.agent_type,
-                                &pending.agent_role,
-                                event_type,
-                                payload,
-                            )
-                            .await;
-                        let _delivery_confirmed = match response {
-                            Ok(Some(response)) => {
-                                let confirmed = self
-                                    .handle_event_action(
-                                        response,
-                                        pending.branch.as_str(),
-                                        pending.agent_type,
-                                    )
-                                    .await;
-                                if confirmed && requests_merge_ready_delivery {
-                                    self.mark_merge_ready_notified(pending.pr_number).await;
-                                }
-                                if confirmed {
-                                    if let Some(message) = release_message {
-                                        self.deliver_release_message(
-                                            pending.branch.as_str(),
-                                            pending.agent_type,
-                                            &message,
+                        // Reviewers are ephemeral: they submit their Forgejo verdict and exit.
+                        // Review events target the live PR owner and, for comments or requested
+                        // changes, the owner's parent TL. Never inject an event into the
+                        // already-exited reviewer branch.
+                        for (target_index, (target_branch, target_agent_type, target_role)) in
+                            event_targets.into_iter().enumerate()
+                        {
+                            let response = self
+                                .call_handle_event_for_role(
+                                    &target_branch,
+                                    target_agent_type,
+                                    &target_role,
+                                    event_type,
+                                    payload.clone(),
+                                )
+                                .await;
+                            match response {
+                                Ok(Some(response)) => {
+                                    let confirmed = self
+                                        .handle_event_action(
+                                            response,
+                                            &target_branch,
+                                            target_agent_type,
                                         )
                                         .await;
+                                    if confirmed
+                                        && target_index == 0
+                                        && requests_merge_ready_delivery
+                                    {
+                                        self.mark_merge_ready_notified(pending.pr_number).await;
+                                    }
+                                    if confirmed && target_index == 0 {
+                                        if let Some(message) = release_message.as_ref() {
+                                            self.deliver_release_message(
+                                                &target_branch,
+                                                target_agent_type,
+                                                message,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
-                                confirmed
+                                Ok(None) => {
+                                    warn!(
+                                        pr_number = pending.pr_number,
+                                        branch = %target_branch,
+                                        role = %target_role,
+                                        event_type,
+                                        "Event handler returned no action"
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        pr_number = pending.pr_number,
+                                        branch = %target_branch,
+                                        role = %target_role,
+                                        event_type,
+                                        %error,
+                                        "Event handler dispatch failed"
+                                    );
+                                }
                             }
-                            Ok(None) => {
-                                warn!(
-                                    pr_number = pending.pr_number,
-                                    event_type, "Event handler returned no action"
-                                );
-                                false
-                            }
-                            Err(error) => {
-                                warn!(
-                                    pr_number = pending.pr_number,
-                                    event_type,
-                                    %error,
-                                    "Event handler dispatch failed"
-                                );
-                                false
-                            }
-                        };
+                        }
                     }
                     PendingAction::EmitEvent {
                         status,
@@ -2150,12 +2115,7 @@ where
         outcome: &str,
         context: &str,
     ) -> bool {
-        let parent_session_id = pending
-            .branch
-            .as_str()
-            .rsplit_once('.')
-            .map(|(parent, _)| crate::services::delivery::canonical_parent_recipient(parent))
-            .unwrap_or_else(|| "root".to_string());
+        let (parent_session_id, _) = self.parent_event_target(pending.branch.as_str()).await;
         let parent_name = AgentName::try_from_str(&parent_session_id)
             .expect("canonical parent identity is non-empty");
         let parent_tab = crate::services::delivery::resolve_tab_name_for_agent(
@@ -2204,6 +2164,31 @@ where
         }
     }
 
+    async fn parent_event_target(&self, branch: &str) -> (String, AgentType) {
+        let parent_branch = branch
+            .rsplit_once('.')
+            .map(|(parent, _)| parent)
+            .unwrap_or(branch);
+        let parent_session_id =
+            crate::services::delivery::canonical_parent_recipient(parent_branch);
+        let parent_name = AgentName::try_from_str(&parent_session_id)
+            .expect("canonical parent identity is non-empty");
+        let parent_agent_type = {
+            let records = self.ctx.agent_resolver().records_ref().read().await;
+            records
+                .get(&parent_name)
+                .map(|record| record.agent_type)
+                .or_else(|| {
+                    records
+                        .values()
+                        .find(|record| record.birth_branch.as_str() == parent_branch)
+                        .map(|record| record.agent_type)
+                })
+                .unwrap_or(AgentType::Claude)
+        };
+        (parent_session_id, parent_agent_type)
+    }
+
     async fn reset_parent_handoff(&self, pr_number: u64, head_sha: &str, outcome: &str) {
         let mut runtime = self.state.prs.lock().await;
         let Some(state) = runtime.get_mut(&pr_number) else {
@@ -2211,9 +2196,6 @@ where
         };
         state.parent_handoff_fingerprint = None;
         match outcome {
-            "changes_requested" | "commented" => {
-                state.last_review_fingerprint = None;
-            }
             "stuck" => {
                 state.last_review_fingerprint = None;
                 state.stuck = false;
@@ -3100,12 +3082,6 @@ fn compute_pr_actions_with_context(
                 context: message,
             });
         } else {
-            old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
-                "changes_requested",
-                pr_sha,
-                old_state.rounds,
-                &message,
-            ));
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
                 payload: serde_json::json!({
@@ -3119,12 +3095,6 @@ fn compute_pr_actions_with_context(
                         ForgejoReviewVerdict::ChangesRequested,
                     ),
                 }),
-            });
-            pending_actions.push(PendingAction::NotifyParentRepair {
-                head_sha: pr_sha.to_string(),
-                round: old_state.rounds,
-                outcome: "changes_requested".to_string(),
-                context: message.clone(),
             });
             pending_actions.push(PendingAction::WriteRegistryRounds {
                 pr_number: pr_number.as_u64(),
@@ -3153,12 +3123,6 @@ fn compute_pr_actions_with_context(
         old_state.last_review_state = ForgejoReviewVerdict::Commented;
         old_state.last_review_fingerprint = commented_fingerprint;
         let message = format_message(comments, reviews);
-        old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
-            "commented",
-            pr_sha,
-            old_state.rounds,
-            &message,
-        ));
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
             payload: serde_json::json!({
@@ -3172,12 +3136,6 @@ fn compute_pr_actions_with_context(
                     ForgejoReviewVerdict::Commented,
                 ),
             }),
-        });
-        pending_actions.push(PendingAction::NotifyParentRepair {
-            head_sha: pr_sha.to_string(),
-            round: old_state.rounds,
-            outcome: "commented".to_string(),
-            context: message,
         });
     }
 
@@ -3522,6 +3480,15 @@ fn review_stall_diagnostic(
         ci_status: ci_status.to_string(),
     }
 }
+
+fn review_event_dispatches_to_parent(event_type: &str, payload: &serde_json::Value) -> bool {
+    event_type == "pr_review"
+        && matches!(
+            payload.get("kind").and_then(|value| value.as_str()),
+            Some("review_received") | Some("review_commented") | Some("reviewer_requested_changes")
+        )
+}
+
 fn requests_merge_ready_parent_delivery(event_type: &str, payload: &serde_json::Value) -> bool {
     match event_type {
         "pr_review" => payload.get("kind").and_then(|value| value.as_str()) == Some("merge_ready"),
@@ -3667,7 +3634,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_leaf_fallback_notifies_parent_for_review_received() {
+    fn test_native_leaf_fallback_does_not_duplicate_review_received_text() {
         let payload = serde_json::json!({
             "kind": "review_received",
             "pr_number": 42,
@@ -3676,20 +3643,11 @@ mod tests {
             "comments": "Fix the failing assertion",
         });
 
-        match native_event_action("pr_review", &payload, "dev") {
-            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
-                assert_eq!(pr_number, 42);
-                assert!(message.contains("PR #42 on branch main.feature-codex"));
-                assert!(message.contains("changes requested"));
-                assert!(message.contains("main.review-pr-42-claude"));
-                assert!(message.contains("Fix the failing assertion"));
-            }
-            other => panic!("expected NotifyParent fallback, got {other:?}"),
-        }
+        assert!(native_event_action("pr_review", &payload, "dev").is_none());
     }
 
     #[test]
-    fn test_native_leaf_fallback_notifies_parent_for_comment_only_review() {
+    fn test_native_leaf_fallback_does_not_duplicate_comment_only_review_text() {
         let payload = serde_json::json!({
             "kind": "review_commented",
             "pr_number": 43,
@@ -3698,14 +3656,7 @@ mod tests {
             "comments": "Consider the error path.",
         });
 
-        match native_event_action("pr_review", &payload, "dev") {
-            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
-                assert_eq!(pr_number, 43);
-                assert!(message.contains("comment-only"));
-                assert!(message.contains("Consider the error path."));
-            }
-            other => panic!("expected NotifyParent fallback, got {other:?}"),
-        }
+        assert!(native_event_action("pr_review", &payload, "dev").is_none());
     }
 
     #[test]
@@ -3804,7 +3755,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_tl_fallback_review_handoff_requires_resume_pr() {
+    fn test_native_tl_fallback_defers_review_handoff_to_haskell() {
         let payload = serde_json::json!({
             "kind": "reviewer_requested_changes",
             "pr_number": 56,
@@ -3812,15 +3763,7 @@ mod tests {
             "comments": "Fix the reviewed behavior.",
         });
 
-        match native_event_action("pr_review", &payload, "tl") {
-            Some(EventActionResponse::InjectMessage { message }) => {
-                assert!(message.contains("TL review-fix handoff"));
-                assert!(message.contains("resume_pr"));
-                assert!(message.contains("ROOT CAUSE"));
-                assert!(!message.contains("spawn a fresh dev leaf"));
-            }
-            other => panic!("expected TL review handoff, got {other:?}"),
-        }
+        assert!(native_event_action("pr_review", &payload, "tl").is_none());
     }
 
     #[test]
@@ -4203,6 +4146,10 @@ mod tests {
             PendingAction::WasmEvent { payload, .. }
                 if payload["kind"] == "ci_blocked" && payload["ci_status"] == "failure"
         )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::NotifyParentRepair { outcome, .. } if outcome == "ci_blocked"
+        )));
     }
     #[test]
     fn test_review_event_target_uses_pr_owner_not_ephemeral_reviewer() {
@@ -4216,6 +4163,28 @@ mod tests {
         assert_eq!(agent_type, AgentType::Gemini);
         assert_eq!(role, "dev");
         assert_ne!(branch.as_str(), "review-pr-1");
+    }
+
+    #[test]
+    fn test_review_comment_kinds_dispatch_to_owner_and_parent_roles() {
+        for kind in [
+            "review_received",
+            "review_commented",
+            "reviewer_requested_changes",
+        ] {
+            let payload = serde_json::json!({ "kind": kind });
+            assert!(
+                review_event_dispatches_to_parent("pr_review", &payload),
+                "{kind} should dispatch to the parent TL"
+            );
+        }
+
+        let approved = serde_json::json!({ "kind": "approved" });
+        assert!(!review_event_dispatches_to_parent("pr_review", &approved));
+        assert!(!review_event_dispatches_to_parent(
+            "ci_status",
+            &serde_json::json!({ "kind": "review_commented" })
+        ));
     }
 
     #[test]
@@ -4291,6 +4260,9 @@ mod tests {
 
         assert_eq!(review_received_count, 1);
         assert_eq!(emit_event_count, 1);
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, PendingAction::NotifyParentRepair { .. })));
         assert_eq!(state.pr_review_cycle_count, 2);
         assert_eq!(
             state.last_review_state,
@@ -4434,6 +4406,10 @@ mod tests {
             .iter()
             .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "approved")));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::NotifyParentRepair { outcome, .. } if outcome == "approved"
+        )));
         assert!(!actions
             .iter()
             .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
@@ -4511,6 +4487,14 @@ mod tests {
                 event_type: "pr_review",
                 payload,
             } if payload["kind"] == "merge_ready" && payload["ci_status"] == "success"
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::NotifyParentRepair { outcome, .. } if outcome == "approved"
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::NotifyParentRepair { outcome, .. } if outcome == "merge_ready"
         )));
         assert!(!state.merge_ready_notified);
     }
@@ -4825,23 +4809,6 @@ mod tests {
     }
 
     #[test]
-    fn review_message_keeps_follow_up_on_existing_chainlink_work_item() {
-        let message = review_parent_message(
-            7,
-            "main.feature",
-            "changes requested",
-            Some("review-pr-7"),
-            "Address the parser edge case",
-        );
-
-        assert!(message.contains("resume the existing PR owner"));
-        assert!(message.contains("call `resume_pr`"));
-        assert!(message.contains("Do not call `spawn_leaf`"));
-        assert!(message.contains("create a new Chainlink issue"));
-        assert!(!message.contains("spawn a fresh dev leaf"));
-    }
-
-    #[test]
     fn test_changes_requested_at_max_rounds_fires_stuck() {
         let branch = BranchName::try_from_str("main.feat-gemini")
             .expect("literal validated string is non-empty");
@@ -4886,6 +4853,10 @@ mod tests {
                 classification: ReviewStallKind::DevNotPushing,
                 ..
             },
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::NotifyParentRepair { outcome, .. } if outcome == "stuck"
         )));
     }
 
@@ -5496,7 +5467,7 @@ mod tests {
             5,
         );
 
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 1);
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WasmEvent { payload, .. }
@@ -5505,10 +5476,9 @@ mod tests {
                         .as_str()
                         .is_some_and(|message| message.contains("Consider this inline suggestion"))
         )));
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            PendingAction::NotifyParentRepair { outcome, .. } if outcome == "commented"
-        )));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, PendingAction::NotifyParentRepair { .. })));
         assert!(review_state_disposes_reviewer(&review_state));
     }
 

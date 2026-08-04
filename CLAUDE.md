@@ -315,6 +315,11 @@ The reviewer convergence loop is configured via `.exo/review-policy.toml`. To ov
 
 **Stuck state:** When a PR exceeds `reviewer_max_rounds` without convergence, the watcher fires the `Stuck` event. The parent TL receives `[STUCK: leaf-id]` and must re-decompose or escalate to a human. The PR cannot be auto-merged from this state.
 
+### Notification Vocabulary
+
+- `[REVIEW ACTION REQUIRED]` — reviewer comments and changes-requested events are delivered directly to the parent TL by `tlPrReviewHandler`; the live PR owner also receives the review event. These outcomes do not emit `[REPAIR HANDOFF]`.
+- `[REPAIR HANDOFF]` — retained for `approved` and `merge_ready` review outcomes. Existing `ci_blocked` and `stuck` handoffs remain authoritative and unchanged.
+
 ### Companion Agents
 
 Companion agents are persistent agents spawned alongside the root TL during `exomonad init`. Claude companions get their own git worktree at `.exo/companions/{name}/` on branch `companion/{name}`, providing isolated `.mcp.json` discovery via CWD — the same mechanism that makes `fork_wave` reliable.
@@ -650,7 +655,7 @@ The TL's workflow is: **decompose → spec → spawn → move on**. The TL does 
 
 **Alternative paths:**
 - **Reviewer approves** → watcher fires `handle_event(PRReview::ReviewerApproved)` → handler sends `[PR READY]` to TL → TL merges
-- **Reviewer requests changes** → watcher fires `handle_event(PRReview::ReviewerRequestedChanges)` → handler injects comments into leaf's pane → leaf fixes → pushes → reviewer re-checks
+- **Reviewer comments or requests changes** → watcher dispatches the review event to the live PR owner and the owning parent TL; the owner receives the review text, while `tlPrReviewHandler` sends the TL-facing `[REVIEW ACTION REQUIRED]` guidance → owner fixes → pushes → reviewer re-checks
 - **No reviewer response after timeout** → watcher fires `handle_event(PRReview::ReviewTimeout)` → handler sends `[REVIEW TIMEOUT]` to TL → TL merges if CI passes
 - **Leaf sends status updates** → `notify_parent` delivers `[from: leaf-id] message` to TL → informational, TL reads but does not auto-merge
 - **Leaf fails** → `notify_parent` with `failure` status → delivers `[FAILED: leaf-id] message` to TL → TL re-decomposes

@@ -249,7 +249,7 @@ ForgejoReviewVerdict::None ──(Forgejo review approves)──→ ForgejoRevie
 
 **Reviewer auto-spawn lifecycle:** The Forgejo watcher attempts reviewer spawn on first PR sighting and on every poll where `reviewer_spawned=false`, `reviewer_disposed=false`, and review rounds remain below policy. Failed spawn attempts keep `reviewer_spawned=false` so the next poll retries even when the head SHA is unchanged. A missing `reviewer_spawner` is a WARN because silent skips strand PRs without review.
 
-**Reviewer completion routing:** Reviewer agents submit Forgejo reviews directly and then exit. They do not call `notify_parent`; the watcher observes Forgejo verdicts and routes review events to the PR-owning dev leaf and TL. The watcher never injects review events back into the exited reviewer pane. When another review round is needed, the watcher explicitly spawns a fresh reviewer through its `reviewer_spawned`/`reviewer_disposed` state machine.
+**Reviewer completion routing:** Reviewer agents submit Forgejo reviews directly and then exit. They do not call `notify_parent`; the watcher observes Forgejo verdicts and routes review events to the live PR-owning dev leaf. For `review_received`, `review_commented`, and changes-requested review events, it dispatches the same event to the owning parent TL, whose `tlPrReviewHandler` constructs the TL-facing review guidance. The watcher never injects review events back into the exited reviewer pane. `[REPAIR HANDOFF]` remains for `approved` and `merge_ready`; existing `ci_blocked` and `stuck` handoffs remain unchanged. When another review round is needed, the watcher explicitly spawns a fresh reviewer through its `reviewer_spawned`/`reviewer_disposed` state machine.
 
 ### Event Dispatch Flow
 
