@@ -167,7 +167,9 @@ fn review_event_target(pr: &PrEntry) -> (BranchName, AgentType, String) {
 fn review_state_disposes_reviewer(review_state: &ForgejoReviewState) -> bool {
     matches!(
         review_state,
-        ForgejoReviewState::Approved | ForgejoReviewState::ChangesRequested
+        ForgejoReviewState::Approved
+            | ForgejoReviewState::ChangesRequested
+            | ForgejoReviewState::Commented
     )
 }
 
@@ -5468,7 +5470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_comment_only_observation_aggregates_to_commented_emits_actions_without_disposal() {
+    fn test_comment_only_observation_aggregates_to_commented_emits_actions_and_disposes() {
         let mut observation = test_observation("abc");
         observation.comments = vec![test_comment("Consider this inline suggestion")];
 
@@ -5507,10 +5509,7 @@ mod tests {
             action,
             PendingAction::NotifyParentRepair { outcome, .. } if outcome == "commented"
         )));
-        assert!(
-            !review_state_disposes_reviewer(&review_state),
-            "comment-only observations must not reach reviewer disposal"
-        );
+        assert!(review_state_disposes_reviewer(&review_state));
     }
 
     // ---------------------------------------------------------------------------
@@ -6442,6 +6441,118 @@ mod tests {
         assert!(watcher_log.contains(
             "terminal review observed for PR #1; disposing reviewer slugs: review-pr-1-codex"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_process_observations_disposes_commented_reviewer_once_across_polls_and_restart() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSpawner {
+            count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReviewerSpawner for CountingSpawner {
+            async fn spawn_reviewer_for_pr(
+                &self,
+                _pr: &crate::services::pr_registry::PrEntry,
+            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(Default::default())
+            }
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+
+        let reviewer_slug = "review-pr-1-codex";
+        tokio::fs::create_dir_all(temp_dir.path().join(".exo/worktrees").join(reviewer_slug))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(temp_dir.path().join(".exo/agents").join(reviewer_slug))
+            .await
+            .unwrap();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(
+            Arc::new(CountingSpawner {
+                count: call_count.clone(),
+            }),
+        );
+        let registry = test_registry(pr_with_reviewer(1, reviewer_slug, "review-pr-1"));
+
+        watcher
+            .process_observations(
+                &registry,
+                &HashMap::from([(1u64, test_observation("abc123"))]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        let mut commented = test_observation("abc123");
+        commented.review_state = ForgejoReviewState::Commented;
+        commented.reviews = vec![test_review("A comment", ForgejoReviewVerdict::Commented)];
+        commented.forgejo_review_present = true;
+        let observations = HashMap::from([(1u64, commented)]);
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        {
+            let state = watcher.state.prs.lock().await;
+            let state = state.get(&1).unwrap();
+            assert!(state.reviewer_disposed);
+            assert_eq!(
+                state.reviewer_attempt.as_ref().unwrap().phase,
+                ReviewerAttemptPhase::Commented
+            );
+        }
+
+        watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+        drop(watcher);
+
+        let mut restarted_services = crate::services::Services::test();
+        restarted_services.project_dir = temp_dir.path().to_path_buf();
+        let restarted_watcher = WorktreeEventWatcher::new(Arc::new(restarted_services))
+            .with_reviewer_spawner(Arc::new(CountingSpawner {
+                count: call_count.clone(),
+            }));
+        restarted_watcher
+            .process_observations(&registry, &observations)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "a COMMENT observation must not respawn its reviewer after restart"
+        );
+        let state = restarted_watcher.state.prs.lock().await;
+        assert!(state.get(&1).is_some_and(|state| {
+            state.reviewer_disposed
+                && state
+                    .reviewer_attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.phase == ReviewerAttemptPhase::Commented)
+        }));
+        drop(state);
+
+        let watcher_log = tokio::fs::read_to_string(temp_dir.path().join(".exo/logs/watcher.log"))
+            .await
+            .unwrap();
+        assert_eq!(
+            watcher_log
+                .matches("terminal review observed for PR #1; disposing reviewer slugs:")
+                .count(),
+            1,
+            "a COMMENT observation must dispose its reviewer only once per head SHA"
+        );
     }
 
     #[tokio::test]
