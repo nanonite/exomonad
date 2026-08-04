@@ -236,6 +236,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- feat: CI panel adds a PR column (#608)
+- feat: CI panel shows run start timestamp instead of age (#607)
+- feat: route reviewer comment events directly to the TL (#606)
+- fix: dispose the reviewer on a COMMENT verdict (#605)
+- test: establish comment-only review observation behavior (#604)
 - Update agent guidance for the one-shot invocation workflow (#587)
 - Add cross-provider one-shot lifecycle coverage and rollout controls (#585)
 - Route review feedback through parent repair handoffs (#584)
