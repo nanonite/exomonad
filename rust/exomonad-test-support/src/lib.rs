@@ -54,26 +54,46 @@ pub fn assert_fixture_git_root(fixture_root: &Path) -> Result<()> {
             fixture_root.display()
         )
     })?;
-    let output = std::process::Command::new("git")
+    let top_level_output = std::process::Command::new("git")
         .current_dir(&expected_root)
         .args(["rev-parse", "--show-toplevel"])
         .scrub_git_repository_env()
         .output()
         .context("failed to run scrubbed fixture git root check")?;
 
-    if !output.status.success() {
-        bail!(
-            "fixture git root check failed for {}: {}",
-            expected_root.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let resolved_root = String::from_utf8_lossy(&output.stdout);
-    let resolved_root = Path::new(resolved_root.trim());
+    let (resolved_path, resolved_label) = if top_level_output.status.success() {
+        (
+            String::from_utf8_lossy(&top_level_output.stdout)
+                .trim()
+                .to_string(),
+            "git-resolved fixture root",
+        )
+    } else {
+        let git_dir_output = std::process::Command::new("git")
+            .current_dir(&expected_root)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .scrub_git_repository_env()
+            .output()
+            .context("failed to run scrubbed bare fixture git root check")?;
+        if !git_dir_output.status.success() {
+            bail!(
+                "fixture git root check failed for {}: --show-toplevel: {}; --absolute-git-dir: {}",
+                expected_root.display(),
+                String::from_utf8_lossy(&top_level_output.stderr).trim(),
+                String::from_utf8_lossy(&git_dir_output.stderr).trim()
+            );
+        }
+        (
+            String::from_utf8_lossy(&git_dir_output.stdout)
+                .trim()
+                .to_string(),
+            "git-resolved fixture directory",
+        )
+    };
+    let resolved_root = Path::new(&resolved_path);
     let resolved_root = fs::canonicalize(resolved_root).with_context(|| {
         format!(
-            "failed to canonicalize git-resolved fixture root {}",
+            "failed to canonicalize {resolved_label} {}",
             resolved_root.display()
         )
     })?;
@@ -87,6 +107,30 @@ pub fn assert_fixture_git_root(fixture_root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Initialize a standalone bare test repository with the scrubbed Git environment.
+pub fn init_bare_fixture_git_repository(fixture_root: &Path) -> Result<()> {
+    fs::create_dir_all(fixture_root).with_context(|| {
+        format!(
+            "failed to create bare fixture repository directory {}",
+            fixture_root.display()
+        )
+    })?;
+    let output = std::process::Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .current_dir(fixture_root)
+        .scrub_git_repository_env()
+        .output()
+        .context("failed to initialize bare fixture git repository")?;
+    if !output.status.success() {
+        bail!(
+            "bare fixture git init failed at {}: {}",
+            fixture_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    assert_fixture_git_root(fixture_root)
 }
 
 /// Initialize a standalone test repository with the scrubbed Git environment.
@@ -251,6 +295,14 @@ mod tests {
         let error =
             assert_fixture_git_root(&nested).expect_err("parent repository must be rejected");
         assert!(error.to_string().contains("escaped its fixture directory"));
+    }
+
+    #[test]
+    fn fixture_git_root_guard_accepts_bare_repository() {
+        let bare = tempdir_outside_any_repo();
+        init_bare_fixture_git_repository(bare.path()).unwrap();
+
+        run_fixture_git_command(bare.path(), &["config", "core.bare"]).unwrap();
     }
 
     #[test]

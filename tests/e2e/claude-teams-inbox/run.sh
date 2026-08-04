@@ -7,6 +7,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
+# shellcheck source=../lib/git-fixture.sh
+source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
 SESSION="e2e-claude-teams-$(date +%s)-$$"
 
 log() {
@@ -165,6 +167,7 @@ done
 
 mkdir -p "$HOME/.cache/exomonad-e2e"
 WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/claude-teams.XXXXXXXX")"
+e2e_git_use_fixture_root "$WORK_DIR"
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
 MOCK_LOG="$WORK_DIR/mock-github.log"

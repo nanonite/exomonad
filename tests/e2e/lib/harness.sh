@@ -11,6 +11,9 @@ E2E_HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$E2E_HARNESS_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 
+# shellcheck source=git-fixture.sh
+source "$E2E_HARNESS_DIR/git-fixture.sh"
+
 E2E_CACHE_ROOT="${E2E_CACHE_ROOT:-$HOME/.cache/exomonad-e2e}"
 E2E_SOCKET_WAIT_ATTEMPTS="${E2E_SOCKET_WAIT_ATTEMPTS:-40}"
 E2E_SOCKET_WAIT_SECONDS="${E2E_SOCKET_WAIT_SECONDS:-0.5}"
@@ -76,6 +79,7 @@ e2e_create_work_dir() {
     REPO_DIR="$WORK_DIR/repo"
     SERVER_LOG="$WORK_DIR/server.log"
     export WORK_DIR REPO_DIR SERVER_LOG
+    e2e_git_use_fixture_root "$WORK_DIR"
     e2e_log "Work dir: $WORK_DIR"
 }
 

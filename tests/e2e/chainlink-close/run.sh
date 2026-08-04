@@ -9,6 +9,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
+# shellcheck source=../lib/git-fixture.sh
+source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
 
 echo ">>> [Phase 0] Checking preconditions..."
 
@@ -60,6 +62,7 @@ echo ">>> [Phase 1] Creating temp environment..."
 
 mkdir -p "$HOME/.cache/exomonad-e2e"
 WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/close.XXXXXXXX")"
+e2e_git_use_fixture_root "$WORK_DIR"
 echo "  Work dir: $WORK_DIR"
 
 cleanup() {

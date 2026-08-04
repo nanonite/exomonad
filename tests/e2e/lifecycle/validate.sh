@@ -6,6 +6,12 @@ EXOMONAD_BIN="${2:?exomonad binary required}"
 RESULT_FILE="${3:?result file required}"
 SERVER_LOG="${4:-}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# shellcheck source=../lib/git-fixture.sh
+source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+e2e_git_use_fixture_root "$REPO_DIR"
+
 WORKER_NAME="lifecycle-worker"
 WORKER_AUTHOR="exomonad-$WORKER_NAME <$WORKER_NAME@exomonad.local>"
 failures=()

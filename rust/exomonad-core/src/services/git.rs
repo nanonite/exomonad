@@ -286,6 +286,7 @@ fn select_remote(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exomonad_test_support::{init_fixture_git_repository, run_fixture_git_command};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
@@ -487,14 +488,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("git command should run")
-        };
-        run(&["init", "-q", "-b", "main"]);
+        init_fixture_git_repository(dir).unwrap();
+        let run = |args: &[&str]| run_fixture_git_command(dir, args).unwrap();
         run(&["commit", "--allow-empty", "-q", "-m", "init"]);
         run(&[
             "remote",

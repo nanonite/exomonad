@@ -2454,6 +2454,9 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exomonad_test_support::{
+        assert_fixture_git_root, init_fixture_git_repository, ScrubGitRepositoryEnv,
+    };
 
     #[test]
     fn test_opencode_dev_instructions_clarify_mcp_tools_are_not_shell_commands() {
@@ -2514,9 +2517,11 @@ mod tests {
     }
 
     async fn run_git_test_command(worktree: &Path, args: &[&str]) {
+        assert_fixture_git_root(worktree).unwrap();
         let output = Command::new("git")
             .args(args)
             .current_dir(worktree)
+            .scrub_git_repository_env()
             .output()
             .await
             .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
@@ -2528,7 +2533,7 @@ mod tests {
     }
 
     async fn init_test_repo(worktree: &Path) {
-        run_git_test_command(worktree, &["init", "-q"]).await;
+        init_fixture_git_repository(worktree).unwrap();
         run_git_test_command(worktree, &["config", "user.email", "test@example.com"]).await;
         run_git_test_command(worktree, &["config", "user.name", "Test User"]).await;
     }

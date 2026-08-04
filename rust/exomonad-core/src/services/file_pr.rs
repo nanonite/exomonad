@@ -307,7 +307,10 @@ pub async fn file_pr_async(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exomonad_test_support::tempdir_outside_any_repo;
+    use exomonad_test_support::{
+        assert_fixture_git_root, run_fixture_git_command, tempdir_outside_any_repo,
+        ScrubGitRepositoryEnv,
+    };
 
     // =========================================================================
     // resolve_base_branch tests
@@ -535,35 +538,17 @@ mod tests {
         assert!(Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir)
+            .scrub_git_repository_env()
             .status()?
             .success());
-        assert!(Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
-            .status()?
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir)
-            .status()?
-            .success());
+        assert_fixture_git_root(dir)?;
+        run_fixture_git_command(dir, &["config", "user.email", "test@example.com"])?;
+        run_fixture_git_command(dir, &["config", "user.name", "Test"])?;
         std::fs::write(dir.join("README.md"), "test")?;
-        assert!(Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(dir)
-            .status()?
-            .success());
-        assert!(Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(dir)
-            .status()?
-            .success());
+        run_fixture_git_command(dir, &["add", "README.md"])?;
+        run_fixture_git_command(dir, &["commit", "-m", "init"])?;
 
-        assert!(Command::new("git")
-            .args(["checkout", "-b", "feature-branch"])
-            .current_dir(dir)
-            .status()?
-            .success());
+        run_fixture_git_command(dir, &["checkout", "-b", "feature-branch"])?;
         let git_wt = Arc::new(GitWorktreeService::new(dir.to_path_buf()));
 
         let input = FilePRInput {
@@ -601,36 +586,18 @@ mod tests {
         assert!(Command::new("git")
             .args(["init", "-b", "main"])
             .current_dir(dir)
+            .scrub_git_repository_env()
             .status()?
             .success());
-        assert!(Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
-            .status()?
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir)
-            .status()?
-            .success());
+        assert_fixture_git_root(dir)?;
+        run_fixture_git_command(dir, &["config", "user.email", "test@example.com"])?;
+        run_fixture_git_command(dir, &["config", "user.name", "Test"])?;
         std::fs::write(dir.join("README.md"), "test")?;
-        assert!(Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(dir)
-            .status()?
-            .success());
-        assert!(Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(dir)
-            .status()?
-            .success());
+        run_fixture_git_command(dir, &["add", "README.md"])?;
+        run_fixture_git_command(dir, &["commit", "-m", "init"])?;
 
         // Create a dot-separated branch (ExoMonad convention)
-        assert!(Command::new("git")
-            .args(["checkout", "-b", "main.feat-a-gemini"])
-            .current_dir(dir)
-            .status()?
-            .success());
+        run_fixture_git_command(dir, &["checkout", "-b", "main.feat-a-gemini"])?;
 
         let git_wt = Arc::new(GitWorktreeService::new(dir.to_path_buf()));
         let bookmark = git_wt.get_workspace_bookmark(dir)?;

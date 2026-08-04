@@ -1184,6 +1184,7 @@ dependencies = [
  "duct",
  "exomonad-core",
  "exomonad-proto",
+ "exomonad-test-support",
  "futures-util",
  "http-body-util",
  "hyper",

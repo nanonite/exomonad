@@ -4,6 +4,11 @@ set -euo pipefail
 TIMEOUT_SECONDS="${CHAINLINK_CODEX_E2E_TIMEOUT_SECONDS:-480}"
 POLL_SECONDS=5
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# shellcheck source=../lib/git-fixture.sh
+source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+
 failures=()
 
 log() {
@@ -21,7 +26,7 @@ wait_for() {
     local deadline=$((SECONDS + TIMEOUT_SECONDS))
 
     while (( SECONDS < deadline )); do
-        if bash -c "$command"; then
+        if (eval "$command"); then
             log "OK: $label"
             return 0
         fi
@@ -110,6 +115,7 @@ fi
 REPO_DIR="${1:?repo dir required}"
 SESSION="${2:?tmux session required}"
 RESULT_FILE="${3:?result file required}"
+e2e_git_use_fixture_root "$REPO_DIR"
 
 validate_codex_config() {
     local label="$1"

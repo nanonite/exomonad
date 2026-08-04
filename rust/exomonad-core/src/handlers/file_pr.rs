@@ -340,8 +340,8 @@ mod tests {
     use crate::domain::{AgentName, BirthBranch};
     use crate::effects::{EffectContext, FilePrEffects};
     use crate::services::Services;
+    use exomonad_test_support::{init_fixture_git_repository, run_fixture_git_command};
     use std::path::PathBuf;
-    use std::process::Command;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -529,21 +529,17 @@ Reviewer-Agent: review-pr-7-codex"
     #[tokio::test]
     async fn submit_review_uses_reviewer_forgejo_token() {
         let tmp = tempfile::tempdir().unwrap();
-        Command::new("git")
-            .arg("init")
-            .current_dir(tmp.path())
-            .status()
-            .unwrap();
-        Command::new("git")
-            .args([
+        init_fixture_git_repository(tmp.path()).unwrap();
+        run_fixture_git_command(
+            tmp.path(),
+            &[
                 "remote",
                 "add",
                 "origin",
                 "https://forgejo.local/owner/repo.git",
-            ])
-            .current_dir(tmp.path())
-            .status()
-            .unwrap();
+            ],
+        )
+        .unwrap();
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))

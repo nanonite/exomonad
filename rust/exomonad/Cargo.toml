@@ -55,5 +55,6 @@ shell-escape = "0.1"
 [dev-dependencies]
 assert_cmd = "2.0"
 duct = { workspace = true }
+exomonad-test-support = { path = "../exomonad-test-support", version = "0.1.0" }
 predicates = "3.0"
 serde_yaml = "0.9"

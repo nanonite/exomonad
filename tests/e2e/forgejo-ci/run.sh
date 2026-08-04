@@ -2,10 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# shellcheck source=../lib/git-fixture.sh
+source "$ROOT_DIR/tests/e2e/lib/git-fixture.sh"
 FORGEJO_DIR="$ROOT_DIR/forgejo"
 WORK_DIR="$ROOT_DIR/.e2e-work/forgejo-ci"
 LOG_DIR="$WORK_DIR/logs"
 mkdir -p "$WORK_DIR" "$LOG_DIR"
+e2e_git_use_fixture_root "$WORK_DIR"
 
 cd "$FORGEJO_DIR"
 docker compose up -d

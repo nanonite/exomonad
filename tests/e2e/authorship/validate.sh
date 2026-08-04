@@ -5,6 +5,12 @@ REPO_DIR="${1:?repo dir required}"
 EXOMONAD_BIN="${2:?exomonad binary required}"
 RESULT_FILE="${3:?result file required}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# shellcheck source=../lib/git-fixture.sh
+source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+e2e_git_use_fixture_root "$REPO_DIR"
+
 WORKER_EMAIL="authorship-worker@example.com"
 TL_EMAIL="tl@example.com"
 failures=()
@@ -134,7 +140,7 @@ PY
 assert_command_runs() {
     local label="$1"
     local command="$2"
-    if (cd "$REPO_DIR" && bash -c "$command" >/dev/null); then
+    if (cd "$REPO_DIR" && eval "$command" >/dev/null); then
         log "OK: $label"
     else
         record_failure "$label command failed after hook allow"

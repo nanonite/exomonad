@@ -6,6 +6,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# shellcheck source=../lib/git-fixture.sh
+source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
 EXOMONAD_BIN="${EXOMONAD_BIN:-$PROJECT_ROOT/target/debug/exomonad}"
 
 for command_name in curl git python3 tmux; do
@@ -20,6 +22,7 @@ if [[ ! -x "$EXOMONAD_BIN" ]]; then
 fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/exomonad-orphan-pr-guard.XXXXXXXX")"
+e2e_git_use_fixture_root "$WORK_DIR"
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
 CODEX_HOME_DIR="$WORK_DIR/codex-home"

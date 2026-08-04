@@ -820,7 +820,9 @@ impl GitWorktreeService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use exomonad_test_support::{
+        init_bare_fixture_git_repository, init_fixture_git_repository, run_fixture_git_command,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -911,11 +913,7 @@ mod tests {
     #[test]
     fn configured_remote_returns_none_when_unset() {
         let temp = TempDir::new().expect("failed to create temp dir");
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(temp.path())
-            .output()
-            .expect("git init failed");
+        init_fixture_git_repository(temp.path()).expect("git init failed");
 
         assert_eq!(configured_remote(temp.path()), None);
     }
@@ -923,16 +921,12 @@ mod tests {
     #[test]
     fn configured_remote_returns_configured_value() {
         let temp = TempDir::new().expect("failed to create temp dir");
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(temp.path())
-            .output()
-            .expect("git init failed");
-        std::process::Command::new("git")
-            .args(["config", "--local", "exomonad.remote", "forgejo"])
-            .current_dir(temp.path())
-            .output()
-            .expect("git config failed");
+        init_fixture_git_repository(temp.path()).expect("git init failed");
+        run_fixture_git_command(
+            temp.path(),
+            &["config", "--local", "exomonad.remote", "forgejo"],
+        )
+        .expect("git config failed");
 
         assert_eq!(configured_remote(temp.path()), Some("forgejo".to_string()));
     }
@@ -941,69 +935,42 @@ mod tests {
         let temp = TempDir::new().expect("failed to create temp dir");
         let repo_dir = temp.path();
 
-        let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(args)
-                .current_dir(repo_dir)
-                .status()
-                .expect("failed to run git command");
-            assert!(status.success(), "git command failed: {:?}", args);
-        };
-
-        run(&["init"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test User"]);
-        run(&["commit", "--allow-empty", "-m", "Initial commit"]);
+        init_fixture_git_repository(repo_dir).expect("failed to initialize test repository");
+        run_fixture_git_command(repo_dir, &["config", "user.email", "test@example.com"])
+            .expect("failed to configure test repository email");
+        run_fixture_git_command(repo_dir, &["config", "user.name", "Test User"])
+            .expect("failed to configure test repository name");
+        run_fixture_git_command(
+            repo_dir,
+            &["commit", "--allow-empty", "-m", "Initial commit"],
+        )
+        .expect("failed to create test repository commit");
 
         let service = GitWorktreeService::new(repo_dir.to_path_buf());
         (temp, service)
     }
 
     fn get_default_branch(repo_dir: &std::path::Path) -> String {
-        let output = Command::new("git")
-            .args(["branch", "--show-current"])
-            .current_dir(repo_dir)
-            .output()
+        let output = run_fixture_git_command(repo_dir, &["branch", "--show-current"])
             .expect("failed to get default branch");
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     fn git_config_value(repo_dir: &std::path::Path, key: &str) -> Option<String> {
-        let output = Command::new("git")
-            .args(["config", "--get", key])
-            .current_dir(repo_dir)
-            .output()
-            .expect("failed to read git config");
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let output = run_fixture_git_command(repo_dir, &["config", "--get", key]).ok()?;
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     fn git_local_config_value(repo_dir: &std::path::Path, key: &str) -> Option<String> {
-        let output = Command::new("git")
-            .args(["config", "--local", "--get", key])
-            .current_dir(repo_dir)
-            .output()
-            .expect("failed to read local git config");
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let output =
+            run_fixture_git_command(repo_dir, &["config", "--local", "--get", key]).ok()?;
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     fn run_git(repo_dir: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(repo_dir)
-            .output()
-            .expect("failed to run git command");
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
+        run_fixture_git_command(repo_dir, args).unwrap_or_else(|error| {
+            panic!("git {args:?} failed: {error}");
+        });
     }
 
     #[test]
@@ -1100,10 +1067,7 @@ mod tests {
             .unwrap();
 
         let at_ref = String::from_utf8_lossy(
-            &Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(temp.path())
-                .output()
+            &run_fixture_git_command(temp.path(), &["rev-parse", "HEAD"])
                 .expect("failed to resolve reviewer revision")
                 .stdout,
         )
@@ -1205,7 +1169,7 @@ mod tests {
     #[test]
     fn worktree_creation_rejects_bare_or_unsafe_repositories() {
         let bare = TempDir::new().expect("failed to create bare repo directory");
-        run_git(bare.path(), &["init", "--bare"]);
+        init_bare_fixture_git_repository(bare.path()).expect("bare git init failed");
         let bare_service = GitWorktreeService::new(bare.path().to_path_buf());
         let branch = BranchName::try_from_str("main.agent-gemini")
             .expect("validated string input is non-empty");
@@ -1216,6 +1180,7 @@ mod tests {
         assert!(error.to_string().contains("core.bare must be false"));
 
         let (unsafe_repo, unsafe_service) = init_test_repo();
+        let unsafe_default_branch = get_default_branch(unsafe_repo.path());
         run_git(
             unsafe_repo.path(),
             &[
@@ -1229,7 +1194,7 @@ mod tests {
             .create_workspace(
                 &unsafe_repo.path().join("worktree"),
                 &branch,
-                &BranchName::try_from_str(get_default_branch(unsafe_repo.path()).as_str())
+                &BranchName::try_from_str(unsafe_default_branch.as_str())
                     .expect("validated string input is non-empty"),
             )
             .expect_err("unsafe core.worktree must reject worktree creation");
@@ -1240,23 +1205,10 @@ mod tests {
     fn test_create_workspace_from_revision_preserves_source_head() {
         let (temp, service) = init_test_repo();
         std::fs::write(temp.path().join("source.txt"), "old PR head\n").unwrap();
-        let status = Command::new("git")
-            .args(["add", "source.txt"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let status = Command::new("git")
-            .args(["commit", "-m", "source head"])
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
+        run_git(temp.path(), &["add", "source.txt"]);
+        run_git(temp.path(), &["commit", "-m", "source head"]);
         let sha = String::from_utf8_lossy(
-            &Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(temp.path())
-                .output()
+            &run_fixture_git_command(temp.path(), &["rev-parse", "HEAD"])
                 .unwrap()
                 .stdout,
         )
@@ -1271,10 +1223,7 @@ mod tests {
             .unwrap();
 
         let head = String::from_utf8_lossy(
-            &Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&worktree_path)
-                .output()
+            &run_fixture_git_command(&worktree_path, &["rev-parse", "HEAD"])
                 .unwrap()
                 .stdout,
         )
@@ -1314,20 +1263,14 @@ mod tests {
 
         service.create_bookmark(temp.path(), &branch, None).unwrap();
 
-        let output = Command::new("git")
-            .args(["branch", "--list", "test-branch"])
-            .current_dir(temp.path())
-            .output()
-            .unwrap();
+        let output =
+            run_fixture_git_command(temp.path(), &["branch", "--list", "test-branch"]).unwrap();
         assert!(String::from_utf8_lossy(&output.stdout).contains("test-branch"));
 
         service.delete_bookmark(&branch).unwrap();
 
-        let output = Command::new("git")
-            .args(["branch", "--list", "test-branch"])
-            .current_dir(temp.path())
-            .output()
-            .unwrap();
+        let output =
+            run_fixture_git_command(temp.path(), &["branch", "--list", "test-branch"]).unwrap();
         assert!(!String::from_utf8_lossy(&output.stdout).contains("test-branch"));
     }
 
@@ -1431,24 +1374,16 @@ mod tests {
 
         // Create a bare "remote"
         let run_bare = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(bare.path())
-                .status()
-                .expect("git failed")
+            assert_eq!(args, &["init", "--bare"]);
+            init_bare_fixture_git_repository(bare.path()).expect("bare git init failed");
         };
         run_bare(&["init", "--bare"]);
 
         // Create working repo with a forge remote pointing at the bare repo
         let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(args)
-                .current_dir(work_dir)
-                .status()
-                .expect("git failed");
-            assert!(status.success(), "git {:?} failed", args);
+            run_git(work_dir, args);
         };
-        run(&["init"]);
+        init_fixture_git_repository(work_dir).expect("git init failed");
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test User"]);
         run(&["commit", "--allow-empty", "-m", "Initial commit"]);
@@ -1470,23 +1405,15 @@ mod tests {
         let work_dir = work.path();
 
         let run_bare = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(bare.path())
-                .status()
-                .expect("git failed")
+            assert_eq!(args, &["init", "--bare"]);
+            init_bare_fixture_git_repository(bare.path()).expect("bare git init failed");
         };
         run_bare(&["init", "--bare"]);
 
         let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(args)
-                .current_dir(work_dir)
-                .status()
-                .expect("git failed");
-            assert!(status.success(), "git {:?} failed", args);
+            run_git(work_dir, args);
         };
-        run(&["init"]);
+        init_fixture_git_repository(work_dir).expect("git init failed");
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test User"]);
         run(&["commit", "--allow-empty", "-m", "Initial commit"]);

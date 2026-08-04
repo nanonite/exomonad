@@ -2516,6 +2516,9 @@ fn gemini_hooks() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exomonad_test_support::{
+        assert_fixture_git_root, init_fixture_git_repository, run_fixture_git_command,
+    };
 
     #[test]
     fn root_protocol_loader_prefers_local_sentinel_and_strips_frontmatter() {
@@ -2715,17 +2718,9 @@ mod tests {
 
     fn init_temp_git_repo(remotes: &[(&str, &str)]) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        init_fixture_git_repository(tmp.path()).unwrap();
         for (name, url) in remotes {
-            std::process::Command::new("git")
-                .args(["remote", "add", name, url])
-                .current_dir(tmp.path())
-                .output()
-                .unwrap();
+            run_fixture_git_command(tmp.path(), &["remote", "add", name, url]).unwrap();
         }
         tmp
     }
@@ -2765,11 +2760,9 @@ mod tests {
         configure_forgejo_remote(tmp.path(), "http://localhost:3000", "token-123", "forgejo")
             .unwrap();
 
-        let forgejo_url = std::process::Command::new("git")
-            .args(["remote", "get-url", "forgejo"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        assert_fixture_git_root(tmp.path()).unwrap();
+        let forgejo_url =
+            run_fixture_git_command(tmp.path(), &["remote", "get-url", "forgejo"]).unwrap();
         let forgejo_url = String::from_utf8_lossy(&forgejo_url.stdout)
             .trim()
             .to_string();
@@ -2778,11 +2771,8 @@ mod tests {
             "http://forgejo_pat:token-123@localhost:3000/goya/repo.git"
         );
 
-        let origin_url = std::process::Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
+        let origin_url =
+            run_fixture_git_command(tmp.path(), &["remote", "get-url", "origin"]).unwrap();
         let origin_url = String::from_utf8_lossy(&origin_url.stdout)
             .trim()
             .to_string();

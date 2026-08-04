@@ -27,11 +27,14 @@ import argparse
 import datetime
 import json
 import os
+from pathlib import Path
 import re
 import signal
-import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from git_fixture import run_fixture_git
 
 
 def mock_author(login, uid=1):
@@ -79,9 +82,7 @@ def resolve_sha(branch):
     remote_dir = os.environ.get("REMOTE_DIR")
     if remote_dir:
         try:
-            result = subprocess.run(
-                ["git", "-C", remote_dir, "rev-parse", branch],
-                capture_output=True, text=True, timeout=5)
+            result = run_fixture_git(["rev-parse", branch], fixture_root=remote_dir)
             if result.returncode == 0:
                 return result.stdout.strip()
         except Exception:
@@ -95,9 +96,7 @@ def git_output(*args):
     if not remote_dir:
         return None
     try:
-        result = subprocess.run(
-            ["git", "-C", remote_dir, *args],
-            capture_output=True, text=True, timeout=5)
+        result = run_fixture_git(args, fixture_root=remote_dir)
         if result.returncode == 0:
             return result.stdout
     except Exception:

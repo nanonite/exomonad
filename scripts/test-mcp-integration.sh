@@ -6,11 +6,14 @@ WORK_DIR=$(mktemp -d)
 trap 'kill "$SERVER_PID" 2>/dev/null; rm -rf "$WORK_DIR"' EXIT
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../tests/e2e/lib/git-fixture.sh
+source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
 WASM_SRC="$PROJECT_ROOT/.exo/wasm"
 if [ ! -d "$WASM_SRC" ]; then
     echo "WASM not built. Run: just wasm-all" >&2
     exit 1
 fi
+e2e_git_use_fixture_root "$WORK_DIR"
 
 mkdir -p "$WORK_DIR/.exo"
 ln -s "$WASM_SRC" "$WORK_DIR/.exo/wasm"

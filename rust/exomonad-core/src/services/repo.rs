@@ -164,6 +164,9 @@ fn normalize_remote_url(url: &str) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exomonad_test_support::{
+        assert_fixture_git_root, init_fixture_git_repository, ScrubGitRepositoryEnv,
+    };
 
     #[test]
     fn test_select_remote_prefers_origin() {
@@ -227,16 +230,13 @@ mod tests {
 
     async fn init_repo_with_remotes(remotes: &[(&str, &str)]) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        Command::new("git")
-            .arg("init")
-            .current_dir(tmp.path())
-            .output()
-            .await
-            .unwrap();
+        init_fixture_git_repository(tmp.path()).unwrap();
         for (name, url) in remotes {
+            assert_fixture_git_root(tmp.path()).unwrap();
             Command::new("git")
                 .args(["remote", "add", name, url])
                 .current_dir(tmp.path())
+                .scrub_git_repository_env()
                 .output()
                 .await
                 .unwrap();
@@ -265,9 +265,11 @@ mod tests {
             ("forgejo", "http://localhost:3000/goya/repo.git"),
         ])
         .await;
+        assert_fixture_git_root(tmp.path()).unwrap();
         Command::new("git")
             .args(["config", "--local", "exomonad.remote", "forgejo"])
             .current_dir(tmp.path())
+            .scrub_git_repository_env()
             .output()
             .await
             .unwrap();
@@ -290,9 +292,11 @@ mod tests {
     async fn configured_remote_returns_configured_value() {
         let tmp =
             init_repo_with_remotes(&[("forgejo", "http://localhost:3000/goya/repo.git")]).await;
+        assert_fixture_git_root(tmp.path()).unwrap();
         Command::new("git")
             .args(["config", "--local", "exomonad.remote", "forgejo"])
             .current_dir(tmp.path())
+            .scrub_git_repository_env()
             .output()
             .await
             .unwrap();
