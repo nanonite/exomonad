@@ -3,13 +3,13 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use exomonad_core::domain::{BranchName, CIStatus};
 use exomonad_core::services::forgejo::{
     ForgejoClient, ForgejoPullRequest, ForgejoPullRequestReview, ForgejoRunner, ForgejoWorkflowRun,
 };
-use exomonad_core::services::repo::{get_repo_info, RepoInfo};
+use exomonad_core::services::repo::{RepoInfo, get_repo_info};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const EVENT_LIMIT: usize = 12;
 const PR_LIMIT: usize = 12;
@@ -143,7 +143,7 @@ struct CiRunRow {
     branch: String,
     status: String,
     name: String,
-    elapsed: String,
+    started_at: String,
 }
 
 #[derive(Clone, Default)]
@@ -289,7 +289,7 @@ fn draw_ci(frame: &mut Frame, area: Rect, runs: &[CiRunRow]) {
             Cell::from(run.branch.clone()),
             Cell::from(run.status.clone()).style(state_style(&run.status)),
             Cell::from(run.name.clone()),
-            Cell::from(run.elapsed.clone()),
+            Cell::from(run.started_at.clone()),
         ])
     });
     let table = Table::new(
@@ -301,7 +301,7 @@ fn draw_ci(frame: &mut Frame, area: Rect, runs: &[CiRunRow]) {
             Constraint::Percentage(14),
         ],
     )
-    .header(header(["branch", "status", "run", "age"]))
+    .header(header(["branch", "status", "run", "started"]))
     .block(Block::default().title("CI Status").borders(Borders::ALL));
     frame.render_widget(table, area);
 }
@@ -484,7 +484,12 @@ fn ci_run_row(branch: &str, run: ForgejoWorkflowRun) -> CiRunRow {
         branch: branch.to_string(),
         status,
         name,
-        elapsed: elapsed_label(run.created_at.as_deref().or(run.updated_at.as_deref())),
+        started_at: time_label(
+            run.created_at
+                .as_deref()
+                .or(run.updated_at.as_deref())
+                .unwrap_or("-"),
+        ),
     }
 }
 
@@ -711,23 +716,4 @@ fn is_jsonl(path: &Path) -> bool {
 
 fn time_label(value: &str) -> String {
     value.get(11..19).unwrap_or(value).to_string()
-}
-
-fn elapsed_label(value: Option<&str>) -> String {
-    let Some(value) = value else {
-        return "-".to_string();
-    };
-    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(value) else {
-        return "-".to_string();
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let then = ts.timestamp().max(0) as u64;
-    let elapsed = now.as_secs().saturating_sub(then);
-    if elapsed < 90 {
-        format!("{elapsed}s")
-    } else {
-        format!("{}m", elapsed / 60)
-    }
 }
