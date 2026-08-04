@@ -58,6 +58,12 @@ pub struct GitWorktreeService {
     project_dir: PathBuf,
 }
 
+#[derive(Debug)]
+struct ExistingWorktree {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
 pub(crate) fn headless_git_command() -> std::process::Command {
     let mut command = std::process::Command::new("git");
     apply_headless_git_env(&mut command);
@@ -128,9 +134,294 @@ fn configured_remote(workspace_path: &Path) -> Option<String> {
     }
 }
 
+fn last_branch_segment(branch: &str) -> Option<&str> {
+    branch
+        .rsplit('.')
+        .next()
+        .filter(|segment| !segment.is_empty())
+}
+
 impl GitWorktreeService {
     pub fn new(project_dir: PathBuf) -> Self {
         Self { project_dir }
+    }
+
+    fn prepare_repository_for_worktrees(&self) -> Result<(), WorktreeError> {
+        self.validate_repository(&self.project_dir)?;
+        let worktrees = self.list_worktrees()?;
+        let main_path = worktrees
+            .first()
+            .map(|worktree| worktree.path.clone())
+            .ok_or_else(|| WorktreeError::GitError {
+                message: "refusing to create a worktree: repository has no main worktree"
+                    .to_string(),
+            })?;
+        self.validate_repository(&main_path)?;
+
+        let main_path = self.canonical_path(&main_path, "main worktree")?;
+        let actual_root = self.git_path(&main_path, &["rev-parse", "--show-toplevel"])?;
+        let actual_root = self.canonical_path(Path::new(&actual_root), "repository root")?;
+        if actual_root != main_path {
+            let configured_worktree = self
+                .local_config_value(&main_path, "core.worktree")?
+                .unwrap_or_else(|| "<unset>".to_string());
+            return Err(WorktreeError::GitError {
+                message: format!(
+                    "refusing to enable worktreeConfig: core.worktree={configured_worktree:?} does not resolve to the main worktree"
+                ),
+            });
+        }
+
+        if !self
+            .local_config_value(&main_path, "extensions.worktreeConfig")?
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        {
+            self.set_local_config(&main_path, "extensions.worktreeConfig", "true")?;
+            info!(path = %main_path.display(), "Enabled git worktree-specific configuration");
+        }
+
+        self.migrate_worktree_identities(&main_path, &worktrees)
+    }
+
+    fn validate_repository(&self, path: &Path) -> Result<(), WorktreeError> {
+        let bare = self.git_output(path, &["rev-parse", "--is-bare-repository"])?;
+        if !bare.status.success() {
+            return Err(WorktreeError::GitError {
+                message: format!(
+                    "failed to validate repository at {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&bare.stderr).trim()
+                ),
+            });
+        }
+
+        let bare_value = String::from_utf8_lossy(&bare.stdout).trim().to_string();
+        let configured_bare = self.local_config_value(path, "core.bare")?;
+        if bare_value != "false"
+            || configured_bare.as_deref().is_some_and(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "false" | "0" | "no" | "off"
+                )
+            })
+        {
+            return Err(WorktreeError::GitError {
+                message: format!(
+                    "refusing to create a worktree: core.bare must be false (repository at {} reports {})",
+                    path.display(),
+                    configured_bare.unwrap_or(bare_value)
+                ),
+            });
+        }
+
+        let inside = self.git_output(path, &["rev-parse", "--is-inside-work-tree"])?;
+        if !inside.status.success() || String::from_utf8_lossy(&inside.stdout).trim() != "true" {
+            let configured_worktree = self
+                .local_config_value(path, "core.worktree")?
+                .unwrap_or_else(|| "<unset>".to_string());
+            return Err(WorktreeError::GitError {
+                message: format!(
+                    "refusing to create a worktree: core.worktree={configured_worktree:?} does not describe a safe non-bare worktree"
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn list_worktrees(&self) -> Result<Vec<ExistingWorktree>, WorktreeError> {
+        let output = self.git_output(&self.project_dir, &["worktree", "list", "--porcelain"])?;
+        if !output.status.success() {
+            return Err(WorktreeError::GitError {
+                message: format!(
+                    "failed to list git worktrees: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+
+        let mut worktrees = Vec::new();
+        let mut current = None;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                if let Some(worktree) = current.take() {
+                    worktrees.push(worktree);
+                }
+                current = Some(ExistingWorktree {
+                    path: PathBuf::from(path),
+                    branch: None,
+                });
+            } else if let Some(branch) = line.strip_prefix("branch ") {
+                if let Some(worktree) = current.as_mut() {
+                    worktree.branch = Some(
+                        branch
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(branch)
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        if let Some(worktree) = current {
+            worktrees.push(worktree);
+        }
+
+        if worktrees.is_empty() {
+            return Err(WorktreeError::GitError {
+                message: "failed to list git worktrees: no main worktree was reported".to_string(),
+            });
+        }
+        Ok(worktrees)
+    }
+
+    fn migrate_worktree_identities(
+        &self,
+        main_path: &Path,
+        worktrees: &[ExistingWorktree],
+    ) -> Result<(), WorktreeError> {
+        for worktree in worktrees {
+            if !worktree.path.exists() {
+                warn!(path = %worktree.path.display(), "Skipping missing git worktree during identity migration");
+                continue;
+            }
+
+            let worktree_path = self.canonical_path(&worktree.path, "live worktree")?;
+            if worktree_path == main_path {
+                continue;
+            }
+
+            let identity_name = worktree
+                .branch
+                .as_deref()
+                .and_then(last_branch_segment)
+                .or_else(|| {
+                    worktree
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .filter(|name| !name.is_empty())
+                });
+            let Some(identity_name) = identity_name else {
+                warn!(path = %worktree.path.display(), "Skipping git worktree without an identity-bearing branch or path");
+                continue;
+            };
+
+            self.set_worktree_identity(&worktree.path, identity_name)?;
+            info!(path = %worktree.path.display(), identity = %identity_name, "Migrated git worktree identity");
+        }
+
+        self.unset_clobbered_shared_identity(main_path)
+    }
+
+    fn unset_clobbered_shared_identity(&self, main_path: &Path) -> Result<(), WorktreeError> {
+        for (key, pattern) in [
+            ("user.name", r"^exomonad-.*$"),
+            ("user.email", r"^.*@exomonad\.local$"),
+        ] {
+            let output = self.git_output(
+                main_path,
+                &["config", "--local", "--unset-all", key, pattern],
+            )?;
+            if output.status.success() {
+                info!(key, "Removed legacy shared git identity configuration");
+            } else if !matches!(output.status.code(), Some(1) | Some(5)) {
+                return Err(WorktreeError::GitError {
+                    message: format!(
+                        "git config --local --unset-all {key} failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn set_worktree_identity(&self, path: &Path, identity_name: &str) -> Result<(), WorktreeError> {
+        let git_user_name = format!("exomonad-{identity_name}");
+        let git_user_email = format!("{identity_name}@exomonad.local");
+        for (key, value) in [
+            ("user.name", git_user_name.as_str()),
+            ("user.email", git_user_email.as_str()),
+        ] {
+            let output = self.git_output(path, &["config", "--worktree", key, value])?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                error!(key, stderr = %stderr, "git config --worktree failed");
+                return Err(WorktreeError::GitError {
+                    message: format!("git config --worktree {key} failed: {}", stderr.trim()),
+                });
+            }
+        }
+        info!(path = %path.display(), user_name = %git_user_name, user_email = %git_user_email, "Set worktree git identity");
+        Ok(())
+    }
+
+    fn local_config_value(&self, path: &Path, key: &str) -> Result<Option<String>, WorktreeError> {
+        let output = self.git_output(path, &["config", "--local", "--get", key])?;
+        if output.status.success() {
+            return Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            ));
+        }
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+        Err(WorktreeError::GitError {
+            message: format!(
+                "git config --local --get {key} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        })
+    }
+
+    fn set_local_config(&self, path: &Path, key: &str, value: &str) -> Result<(), WorktreeError> {
+        let output = self.git_output(path, &["config", "--local", key, value])?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(WorktreeError::GitError {
+            message: format!(
+                "git config --local {key} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        })
+    }
+
+    fn git_path(&self, path: &Path, args: &[&str]) -> Result<String, WorktreeError> {
+        let output = self.git_output(path, args)?;
+        if !output.status.success() {
+            return Err(WorktreeError::GitError {
+                message: format!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn git_output(
+        &self,
+        path: &Path,
+        args: &[&str],
+    ) -> Result<std::process::Output, WorktreeError> {
+        headless_git_command()
+            .args(args)
+            .current_dir(path)
+            .output()
+            .map_err(|error| WorktreeError::GitError {
+                message: format!("failed to run git {}: {error}", args.join(" ")),
+            })
+    }
+
+    fn canonical_path(&self, path: &Path, description: &str) -> Result<PathBuf, WorktreeError> {
+        std::fs::canonicalize(path).map_err(|error| WorktreeError::GitError {
+            message: format!(
+                "failed to resolve {description} {}: {error}",
+                path.display()
+            ),
+        })
     }
 
     /// Create a new git worktree with a new branch based on a given base.
@@ -207,6 +498,7 @@ impl GitWorktreeService {
         base_ref: &str,
         create_branch: bool,
     ) -> Result<(), WorktreeError> {
+        self.prepare_repository_for_worktrees()?;
         info!(path = %path.display(), branch = %branch, base = %base_ref, "Creating git worktree");
 
         let mut command = headless_git_command();
@@ -238,31 +530,7 @@ impl GitWorktreeService {
             .rsplit('.')
             .next()
             .unwrap_or(branch.as_str());
-        let git_user_name = format!("exomonad-{}", agent_name);
-        let git_user_email = format!("{}@exomonad.local", agent_name);
-
-        for (key, value) in [
-            ("user.name", git_user_name.as_str()),
-            ("user.email", git_user_email.as_str()),
-        ] {
-            let out = headless_git_command()
-                .args(["config", "--local", key, value])
-                .current_dir(path)
-                .output()
-                .map_err(|e| WorktreeError::GitError {
-                    message: format!("Failed to set git config {}: {}", key, e),
-                })?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                error!(key, stderr = %stderr, "git config --local failed");
-                return Err(WorktreeError::GitError {
-                    message: format!("git config --local {} failed: {}", key, stderr),
-                });
-            }
-        }
-        info!(user_name = %git_user_name, user_email = %git_user_email, "Set worktree git identity");
-
-        Ok(())
+        self.set_worktree_identity(path, agent_name)
     }
 
     /// Create a detached-HEAD worktree at the tip of an existing branch or ref.
@@ -276,6 +544,7 @@ impl GitWorktreeService {
         at_ref: &str,
         identity_name: &str,
     ) -> Result<(), WorktreeError> {
+        self.prepare_repository_for_worktrees()?;
         info!(path = %path.display(), at_ref, "Creating detached reviewer worktree");
 
         let output = headless_git_command()
@@ -298,23 +567,7 @@ impl GitWorktreeService {
             return Err(self.parse_git_stderr(&stderr));
         }
 
-        let git_user_name = format!("exomonad-{}", identity_name);
-        let git_user_email = format!("{}@exomonad.local", identity_name);
-        for (key, value) in [
-            ("user.name", git_user_name.as_str()),
-            ("user.email", git_user_email.as_str()),
-        ] {
-            let out = headless_git_command()
-                .args(["config", "--local", key, value])
-                .current_dir(path)
-                .output()
-                .map_err(|e| WorktreeError::GitError {
-                    message: format!("Failed to set git config {}: {}", key, e),
-                })?;
-            if !out.status.success() {
-                warn!(key, stderr = %String::from_utf8_lossy(&out.stderr), "git config --local failed in reviewer worktree (non-fatal)");
-            }
-        }
+        self.set_worktree_identity(path, identity_name)?;
         info!(path = %path.display(), at_ref, "Reviewer worktree created (detached HEAD)");
         Ok(())
     }
@@ -715,6 +968,44 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    fn git_config_value(repo_dir: &std::path::Path, key: &str) -> Option<String> {
+        let output = Command::new("git")
+            .args(["config", "--get", key])
+            .current_dir(repo_dir)
+            .output()
+            .expect("failed to read git config");
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn git_local_config_value(repo_dir: &std::path::Path, key: &str) -> Option<String> {
+        let output = Command::new("git")
+            .args(["config", "--local", "--get", key])
+            .current_dir(repo_dir)
+            .output()
+            .expect("failed to read local git config");
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn run_git(repo_dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_dir)
+            .output()
+            .expect("failed to run git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn test_create_workspace_happy_path() {
         let (temp, service) = init_test_repo();
@@ -731,6 +1022,218 @@ mod tests {
 
         assert!(worktree_path.exists());
         assert!(worktree_path.join(".git").exists());
+    }
+
+    #[test]
+    fn worktree_identities_are_isolated_and_shared_remote_is_preserved() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        run_git(
+            temp.path(),
+            &["config", "--local", "exomonad.remote", "forgejo"],
+        );
+
+        let branch_a = format!("{default_branch}.dev-one-gemini");
+        let path_a = temp.path().join("dev-one-gemini");
+        service
+            .create_workspace(
+                &path_a,
+                &BranchName::try_from_str(branch_a.as_str())
+                    .expect("validated string input is non-empty"),
+                &base,
+            )
+            .unwrap();
+        assert_eq!(
+            git_config_value(&path_a, "user.name").as_deref(),
+            Some("exomonad-dev-one-gemini")
+        );
+        assert_eq!(configured_remote(&path_a).as_deref(), Some("forgejo"));
+
+        let branch_b = format!("{default_branch}.dev-two-opencode");
+        let path_b = temp.path().join("dev-two-opencode");
+        service
+            .create_workspace(
+                &path_b,
+                &BranchName::try_from_str(branch_b.as_str())
+                    .expect("validated string input is non-empty"),
+                &base,
+            )
+            .unwrap();
+
+        assert_eq!(
+            git_config_value(&path_a, "user.name").as_deref(),
+            Some("exomonad-dev-one-gemini")
+        );
+        assert_eq!(
+            git_config_value(&path_b, "user.name").as_deref(),
+            Some("exomonad-dev-two-opencode")
+        );
+        assert_eq!(configured_remote(&path_a).as_deref(), Some("forgejo"));
+        assert_eq!(configured_remote(&path_b).as_deref(), Some("forgejo"));
+        assert_eq!(
+            git_config_value(temp.path(), "user.name").as_deref(),
+            Some("Test User")
+        );
+        assert_eq!(
+            git_config_value(temp.path(), "exomonad.remote").as_deref(),
+            Some("forgejo")
+        );
+    }
+
+    #[test]
+    fn detached_reviewer_identity_is_distinct_from_dev_identity() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        let dev_branch = format!("{default_branch}.dev-leaf-gemini");
+        let dev_path = temp.path().join("dev-leaf-gemini");
+        service
+            .create_workspace(
+                &dev_path,
+                &BranchName::try_from_str(dev_branch.as_str())
+                    .expect("validated string input is non-empty"),
+                &base,
+            )
+            .unwrap();
+
+        let at_ref = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(temp.path())
+                .output()
+                .expect("failed to resolve reviewer revision")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let reviewer_path = temp.path().join("review-pr-609-claude");
+        service
+            .create_workspace_detached(&reviewer_path, &at_ref, "review-pr-609-claude")
+            .unwrap();
+
+        assert_eq!(
+            git_config_value(&dev_path, "user.name").as_deref(),
+            Some("exomonad-dev-leaf-gemini")
+        );
+        assert_eq!(
+            git_config_value(&reviewer_path, "user.name").as_deref(),
+            Some("exomonad-review-pr-609-claude")
+        );
+        assert_ne!(
+            git_config_value(&dev_path, "user.name"),
+            git_config_value(&reviewer_path, "user.name")
+        );
+        assert_eq!(
+            git_config_value(temp.path(), "user.name").as_deref(),
+            Some("Test User")
+        );
+    }
+
+    #[test]
+    fn existing_worktrees_are_migrated_and_shared_legacy_identity_is_removed() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let existing_branch = format!("{default_branch}.existing-dev-gemini");
+        let existing_path = temp.path().join("existing-dev-gemini");
+        run_git(
+            temp.path(),
+            &["config", "--local", "user.name", "exomonad-legacy-agent"],
+        );
+        run_git(
+            temp.path(),
+            &[
+                "config",
+                "--local",
+                "user.email",
+                "legacy-agent@exomonad.local",
+            ],
+        );
+        let existing_path_string = existing_path.to_string_lossy().to_string();
+        run_git(
+            temp.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                existing_branch.as_str(),
+                existing_path_string.as_str(),
+                default_branch.as_str(),
+            ],
+        );
+
+        let new_branch = format!("{default_branch}.new-dev-opencode");
+        let new_path = temp.path().join("new-dev-opencode");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        service
+            .create_workspace(
+                &new_path,
+                &BranchName::try_from_str(new_branch.as_str())
+                    .expect("validated string input is non-empty"),
+                &base,
+            )
+            .unwrap();
+
+        assert_eq!(
+            git_config_value(&existing_path, "user.name").as_deref(),
+            Some("exomonad-existing-dev-gemini")
+        );
+        assert_eq!(
+            git_config_value(&existing_path, "user.email").as_deref(),
+            Some("existing-dev-gemini@exomonad.local")
+        );
+        assert_eq!(
+            git_local_config_value(temp.path(), "user.name"),
+            None,
+            "legacy shared user.name must be removed from the main config"
+        );
+        assert_eq!(
+            git_local_config_value(temp.path(), "user.email"),
+            None,
+            "legacy shared user.email must be removed from the main config"
+        );
+        assert_eq!(
+            git_config_value(temp.path(), "extensions.worktreeConfig").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn worktree_creation_rejects_bare_or_unsafe_repositories() {
+        let bare = TempDir::new().expect("failed to create bare repo directory");
+        run_git(bare.path(), &["init", "--bare"]);
+        let bare_service = GitWorktreeService::new(bare.path().to_path_buf());
+        let branch = BranchName::try_from_str("main.agent-gemini")
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str("main").expect("validated string input is non-empty");
+        let error = bare_service
+            .create_workspace(&bare.path().join("worktree"), &branch, &base)
+            .expect_err("bare repositories must not create linked worktrees");
+        assert!(error.to_string().contains("core.bare must be false"));
+
+        let (unsafe_repo, unsafe_service) = init_test_repo();
+        run_git(
+            unsafe_repo.path(),
+            &[
+                "config",
+                "--local",
+                "core.worktree",
+                "/tmp/not-the-repository",
+            ],
+        );
+        let error = unsafe_service
+            .create_workspace(
+                &unsafe_repo.path().join("worktree"),
+                &branch,
+                &BranchName::try_from_str(get_default_branch(unsafe_repo.path()).as_str())
+                    .expect("validated string input is non-empty"),
+            )
+            .expect_err("unsafe core.worktree must reject worktree creation");
+        assert!(error.to_string().contains("core.worktree"));
     }
 
     #[test]
