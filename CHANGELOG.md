@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- fix: has_pending_work reports dead agents as alive, blocking shutdown convergence (#619)
 - Add Rust integration tests to the aggregate test gate (#601)
 - Fix lost inbox writes under concurrent delivery (#600)
 - fix: intermittent rust-test failure is unidentifiable because fail-fast discards the test name (#599)

@@ -1564,13 +1564,7 @@ impl<
             .iter()
             .filter(|info| agent_matches_filter(info, filter_type.as_deref()))
         {
-            let routing_snapshot = read_agent_routing_snapshot(info.agent_dir.as_deref()).await;
-            let is_alive = agent_is_alive(info)
-                && !routing_snapshot.retired
-                && routing_snapshot
-                    .routing
-                    .as_ref()
-                    .is_some_and(RoutingInfo::has_delivery_target);
+            let (is_alive, routing_snapshot) = resolve_agent_liveness(info).await;
             if req.filter_alive_only && !is_alive {
                 continue;
             }
@@ -3384,25 +3378,36 @@ fn service_agent_type_to_proto(at: ServiceAgentType) -> i32 {
     }
 }
 
-struct AgentListMetadata {
-    birth_branch: String,
-    has_unread: bool,
-    last_check_inbox_at: i64,
-    last_activity_at: u64,
-    is_alive: bool,
-    last_known_routing: Option<RoutingInfo>,
-    routing_retired: bool,
-    routing_exit_code: Option<i32>,
+pub(crate) struct AgentListMetadata {
+    pub(crate) birth_branch: String,
+    pub(crate) has_unread: bool,
+    pub(crate) last_check_inbox_at: i64,
+    pub(crate) last_activity_at: u64,
+    pub(crate) is_alive: bool,
+    pub(crate) last_known_routing: Option<RoutingInfo>,
+    pub(crate) routing_retired: bool,
+    pub(crate) routing_exit_code: Option<i32>,
 }
 
 #[derive(Debug, Default)]
-struct AgentRoutingSnapshot {
-    routing: Option<RoutingInfo>,
-    retired: bool,
-    exit_code: Option<i32>,
+pub(crate) struct AgentRoutingSnapshot {
+    pub(crate) routing: Option<RoutingInfo>,
+    pub(crate) retired: bool,
+    pub(crate) exit_code: Option<i32>,
 }
 
-async fn read_agent_routing_snapshot(agent_dir: Option<&Path>) -> AgentRoutingSnapshot {
+pub(crate) async fn resolve_agent_liveness(info: &AgentInfo) -> (bool, AgentRoutingSnapshot) {
+    let routing_snapshot = read_agent_routing_snapshot(info.agent_dir.as_deref()).await;
+    let is_alive = agent_is_alive(info)
+        && !routing_snapshot.retired
+        && routing_snapshot
+            .routing
+            .as_ref()
+            .is_some_and(RoutingInfo::has_delivery_target);
+    (is_alive, routing_snapshot)
+}
+
+pub(crate) async fn read_agent_routing_snapshot(agent_dir: Option<&Path>) -> AgentRoutingSnapshot {
     let Some(agent_dir) = agent_dir else {
         return AgentRoutingSnapshot::default();
     };
@@ -3436,7 +3441,7 @@ async fn read_agent_routing_snapshot(agent_dir: Option<&Path>) -> AgentRoutingSn
     }
 }
 
-fn service_info_to_proto(
+pub(crate) fn service_info_to_proto(
     info: &AgentInfo,
     metadata: AgentListMetadata,
 ) -> exomonad_proto::effects::agent::AgentInfo {
@@ -3749,6 +3754,8 @@ mod tests {
             pr: None,
             last_activity_at: None,
         };
+        let (is_alive, _) = resolve_agent_liveness(&info).await;
+        assert!(!is_alive);
         let proto = service_info_to_proto(
             &info,
             AgentListMetadata {
@@ -3766,6 +3773,35 @@ mod tests {
         assert_eq!(proto.mux_window, "@17");
         assert_eq!(proto.error, "retired routing (exit_code=0)");
         assert!(!proto.is_alive);
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_liveness_rejects_retired_routing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let routing =
+            RoutingInfo::window(crate::services::tmux_ipc::WindowId::parse("@23").unwrap());
+        let agent_dir = temp_dir.path().join("retired-agent");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        routing.write_to_dir(&agent_dir).await.unwrap();
+        tokio::fs::write(agent_dir.join("exited_at"), "1")
+            .await
+            .unwrap();
+
+        let info = AgentInfo {
+            internal_name: AgentName::try_from_str("retired-opencode").unwrap(),
+            has_tab: true,
+            topology: Topology::WorktreePerAgent,
+            agent_dir: Some(agent_dir),
+            slug: None,
+            agent_type: Some(ServiceAgentType::OpenCode),
+            pr: None,
+            last_activity_at: None,
+        };
+
+        let (is_alive, snapshot) = resolve_agent_liveness(&info).await;
+
+        assert!(snapshot.retired);
+        assert!(!is_alive);
     }
 
     #[tokio::test]

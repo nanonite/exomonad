@@ -63,9 +63,10 @@ pub fn orchestration_handlers(
     let tasks_dir = dirs::home_dir().unwrap_or_default().join(".claude/tasks");
 
     vec![
-        Box::new(AgentHandler::new(agent_control, services.clone())),
+        Box::new(AgentHandler::new(agent_control.clone(), services.clone())),
         Box::new(InboxHandler::new(services.clone())),
         Box::new(LifecycleHandler::with_shutdown_signal(
+            agent_control,
             services.clone(),
             shutdown_signal,
         )),
