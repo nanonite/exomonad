@@ -5,6 +5,7 @@
 //! concern so every consumer can make the same availability decision.
 
 pub mod adapters;
+pub mod renderer;
 
 use adapters::{
     AgentInboxSummary, AgentSummary, ChainlinkIssue, ChainlinkIssueDetail, ChainlinkSession,
@@ -38,4 +39,12 @@ pub struct BriefInputs {
     pub unread_summary: SectionData<Vec<AgentInboxSummary>>,
     pub agents: SectionData<Vec<AgentSummary>>,
     pub open_prs: SectionData<Vec<PrSummary>>,
+}
+
+/// The subset of continuation state that belongs to one child agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSlice {
+    pub agent_id: String,
+    pub issue_id: i64,
+    pub pr_number: Option<u64>,
 }

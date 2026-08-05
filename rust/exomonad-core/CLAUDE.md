@@ -152,6 +152,14 @@ not configured or a source call fails. Every adapter uses `SectionData`, whose
 only outcomes are `Available` and `Unavailable { reason }`; an empty successful
 source is still `Available(vec![])`.
 
+`services/continuation/renderer.rs` is the pure deterministic markdown renderer
+for root/TL and child continuation briefs. It keeps the fixed section order,
+sorts every source collection explicitly, renders unavailable sources with their
+reasons, scopes child feedback by agent and issue, and enforces the 4096-byte
+cap by dropping the lowest-importance, oldest ledger rows first. `render_tl`
+and `render_child` do not perform I/O or model calls; Wave 3 owns their
+SessionStart and task-injection call sites.
+
 ## Agent Resume and Liveness Contract
 
 - A successful resume of an already-live PR owner refreshes `.exo/agents/{agent}/last_activity_at` without rewriting `routing.json` or identity metadata.
