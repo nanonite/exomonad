@@ -46,6 +46,7 @@ import ExoMonad.Guest.Tools.CloseReviewerWindow (CloseReviewerWindow (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
 import ExoMonad.Guest.Tools.Lifecycle (HasPendingWork (..), ShutdownServer (..))
+import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
@@ -200,6 +201,9 @@ data Tools mode = Tools
     sessionStatus :: mode :- SessionStatus,
     pollWorkers :: mode :- PollWorkers,
     checkInbox :: mode :- CheckInbox,
+    memoryAppend :: mode :- MemoryAppend,
+    memoryList :: mode :- MemoryList,
+    continuationBrief :: mode :- ContinuationBrief,
     listAgents :: mode :- ListAgents,
     hasPendingWork :: mode :- HasPendingWork,
     shutdownServer :: mode :- ShutdownServer,
@@ -252,6 +256,9 @@ config =
             sessionStatus = mkHandler @SessionStatus,
             pollWorkers = mkHandler @PollWorkers,
             checkInbox = mkHandler @CheckInbox,
+            memoryAppend = mkHandler @MemoryAppend,
+            memoryList = mkHandler @MemoryList,
+            continuationBrief = mkHandler @ContinuationBrief,
             listAgents = mkHandler @ListAgents,
             hasPendingWork = mkHandler @HasPendingWork,
             shutdownServer = mkHandler @ShutdownServer,

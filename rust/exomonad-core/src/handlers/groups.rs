@@ -12,7 +12,7 @@ use crate::services::Services;
 use super::{
     AgentHandler, CoordinationHandler, EventHandler, FilePRHandler, ForgejoAsGitHubHandler,
     FsHandler, GitHandler, GitHubHandler, InboxHandler, KvHandler, LifecycleHandler, LogHandler,
-    MergePRHandler, ProcessHandler, SessionHandler, TasksHandler,
+    MemoryHandler, MergePRHandler, ProcessHandler, SessionHandler, TasksHandler,
 };
 
 /// Core handlers every consumer needs: logging, key-value store, filesystem.
@@ -65,6 +65,11 @@ pub fn orchestration_handlers(
     vec![
         Box::new(AgentHandler::new(agent_control.clone(), services.clone())),
         Box::new(InboxHandler::new(services.clone())),
+        Box::new(MemoryHandler::new(
+            services.clone(),
+            agent_control.clone(),
+            services.agent_resolver.clone(),
+        )),
         Box::new(LifecycleHandler::with_shutdown_signal(
             agent_control,
             services.clone(),

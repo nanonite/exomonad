@@ -76,6 +76,7 @@ library wasm-guest-internal
         ExoMonad.Guest.Tools.PollWorkers
         ExoMonad.Guest.Tools.Events
         ExoMonad.Guest.Tools.Inbox
+        ExoMonad.Guest.Tools.Memory
         ExoMonad.Guest.Tools.Agents
         ExoMonad.Guest.Tools.Lifecycle
         ExoMonad.Guest.Tools.Tasks
@@ -123,6 +124,7 @@ library wasm-guest-internal
         ExoMonad.Effects.Coordination
         ExoMonad.Effects.Events
         ExoMonad.Effects.Inbox
+        ExoMonad.Effects.Memory
         ExoMonad.Effects.Lifecycle
         ExoMonad.Effects.Session
         ExoMonad.Effects.Tasks

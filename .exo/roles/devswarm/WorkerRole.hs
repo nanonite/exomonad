@@ -23,6 +23,7 @@ import ExoMonad.Guest.Tools.Events
     notifyParentSchema,
   )
 import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
+import ExoMonad.Guest.Tools.Memory (MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.Tasks
   ( TaskGetArgs,
     TaskListArgs,
@@ -100,6 +101,8 @@ data Tools mode = Tools
     sendTmuxMessage :: mode :- SendTmuxMessage,
     sendMailboxMessage :: mode :- SendMailboxMessage,
     checkInbox :: mode :- CheckInbox,
+    memoryAppend :: mode :- MemoryAppend,
+    memoryList :: mode :- MemoryList,
     taskList :: mode :- WorkerTaskList,
     taskGet :: mode :- WorkerTaskGet,
     taskUpdate :: mode :- WorkerTaskUpdate,
@@ -121,6 +124,8 @@ config =
             sendTmuxMessage = mkHandler @SendTmuxMessage,
             sendMailboxMessage = mkHandler @SendMailboxMessage,
             checkInbox = mkHandler @CheckInbox,
+            memoryAppend = mkHandler @MemoryAppend,
+            memoryList = mkHandler @MemoryList,
             taskList = mkHandler @WorkerTaskList,
             taskGet = mkHandler @WorkerTaskGet,
             taskUpdate = mkHandler @WorkerTaskUpdate,

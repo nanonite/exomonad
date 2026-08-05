@@ -33,6 +33,7 @@ import ExoMonad.Guest.Tools.Events
   )
 import ExoMonad.Guest.Tools.FilePR (FilePRArgs, FilePROutput (..), filePRCore, filePRDescription, filePRSchema)
 import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
+import ExoMonad.Guest.Tools.Memory (MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.Tasks
   ( TaskGetArgs,
     TaskListArgs,
@@ -135,6 +136,8 @@ data Tools mode = Tools
     sendTmuxMessage :: mode :- SendTmuxMessage,
     sendMailboxMessage :: mode :- SendMailboxMessage,
     checkInbox :: mode :- CheckInbox,
+    memoryAppend :: mode :- MemoryAppend,
+    memoryList :: mode :- MemoryList,
     taskList :: mode :- DevTaskList,
     taskGet :: mode :- DevTaskGet,
     taskUpdate :: mode :- DevTaskUpdate,
@@ -160,6 +163,8 @@ config =
             sendTmuxMessage = mkHandler @SendTmuxMessage,
             sendMailboxMessage = mkHandler @SendMailboxMessage,
             checkInbox = mkHandler @CheckInbox,
+            memoryAppend = mkHandler @MemoryAppend,
+            memoryList = mkHandler @MemoryList,
             taskList = mkHandler @DevTaskList,
             taskGet = mkHandler @DevTaskGet,
             taskUpdate = mkHandler @DevTaskUpdate,

@@ -15,6 +15,7 @@ These are defined in `ExoMonad.Effects.*` and interpreted by the Rust host.
 - `FS`: File system access.
 - `Agent`: Agent lifecycle management.
 - `Process`: Ad-hoc process execution (run commands with args, env, timeout).
+- `Memory`: Append-only session-memory ledger and continuation brief rendering.
 
 ## MCP Tools
 
@@ -47,6 +48,16 @@ The guest exports MCP tools that agents can call. These are defined in `ExoMonad
 - **`task_update`**: Update task status, owner, or activeForm. Structural fields (subject, description, blocks, blockedBy) are never overwritten.
 
 Available in dev and worker roles. Enables Gemini agents to coordinate via the same task list that Claude Code's native TaskCreate/TaskList/TaskUpdate tools use.
+
+### Memory Tools (`ExoMonad.Guest.Tools.Memory`)
+
+- **`memory_append`**: Appends a validated semantic fact. The ledger is append-only and accepts the closed session-memory kind set.
+- **`memory_list`**: Lists current-run records with optional kind, issue, importance, and limit filters.
+- **`continuation_brief`**: Requests the deterministic root/TL continuation brief. It is withheld from dev and worker roles.
+
+The guest performs argument parsing and yields `memory.*` effects; Rust owns the
+ledger, adapters, and renderer. No guest tool performs filesystem, database,
+Chainlink, or Forgejo I/O.
 
 ### Defining MCP Tools (`ExoMonad.Guest.Tool.Class`)
 
@@ -91,6 +102,7 @@ The SDK (`wasm-guest`) exports **core I/O functions** and **shared descriptions/
 | `Tools.Spawn` | `forkWaveCore`, `spawnGeminiCore`, `spawnWorkerToolCore`, `spawnLeafSubtreeCore`, `spawnWorkersCore`, descriptions/schemas, render functions | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnWorker`, `RootForkWave`, `RootSpawnLeaf`, `RootSpawnWorker` |
 | `Tools.SpawnCodex` | `handleSpawnCodex`, `spawnCodexDescription`, `spawnCodexSchema`, `SpawnCodex` | `TLSpawnCodex`, `RootSpawnCodex` |
 | `Tools.Tasks` | `taskListCore`, `taskGetCore`, `taskUpdateCore`, descriptions/schemas | `DevTaskList`, `DevTaskGet`, `DevTaskUpdate`, `WorkerTaskList`, `WorkerTaskGet`, `WorkerTaskUpdate` |
+| `Tools.Memory` | `memoryAppendCore`, `memoryListCore`, `continuationBriefCore`, schemas and descriptions | `RootRole`, `TLRole`, `DevRole`, `WorkerRole` (brief only root/TL) |
 
 `SendTmuxMessage / SendMailboxMessage` is the only tool with an `MCPTool` instance in the SDK (no state transitions needed).
 

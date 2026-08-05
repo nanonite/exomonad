@@ -527,6 +527,9 @@ All tools implemented in Haskell WASM (`haskell/wasm-guest/src/ExoMonad/Guest/To
 | `file_pr` | tl, dev | Create/update PR (auto-detects base branch from naming) |
 | `merge_pr` | root, tl | Merge child PR (gh merge + git fetch) |
 | `notify_parent` | tl, dev, worker | Send message to parent agent. Auto-routed via Teams inbox (primary) or tmux STDIN (fallback) |
+| `memory_append` | root, tl, dev, worker | Append a validated semantic fact to the append-only session-memory ledger |
+| `memory_list` | root, tl, dev, worker | List current-run session-memory records with optional filters |
+| `continuation_brief` | root, tl | Render the deterministic continuation brief for the current root/TL session |
 | `send_message` | all | Send message to another exomonad-spawned agent (routes via Teams inbox, UDS, or tmux) |
 | `task_list` | dev, worker | List tasks from the shared Claude Code task list (auto-resolves team from TeamRegistry) |
 | `task_get` | dev, worker | Get a task by ID from the shared task list |

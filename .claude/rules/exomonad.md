@@ -20,6 +20,9 @@ Use exomonad MCP tools for orchestration. Git and GitHub operations use `git` an
 | `file_pr` | tl, dev | Create/update PR (base branch auto-detected from branch naming) |
 | `merge_pr` | root, tl | Merge a child's PR |
 | `notify_parent` | tl, dev, worker | Send message to parent agent |
+| `memory_append` | root, tl, dev, worker | Append a validated semantic fact to the append-only session-memory ledger |
+| `memory_list` | root, tl, dev, worker | List current-run session-memory records with optional filters |
+| `continuation_brief` | root, tl | Render the deterministic continuation brief |
 | `send_message` | all | Send message to any exomonad-spawned agent |
 | `task_list` | dev, worker | List tasks from the shared task list |
 | `task_get` | dev, worker | Get a task by ID |

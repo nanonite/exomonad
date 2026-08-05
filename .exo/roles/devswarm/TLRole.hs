@@ -53,6 +53,7 @@ import ExoMonad.Guest.Tools.Events
   )
 import ExoMonad.Guest.Tools.FilePR (FilePRArgs, FilePROutput (..), filePRCore, filePRDescription, filePRSchema)
 import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
+import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
@@ -262,6 +263,9 @@ data Tools mode = Tools
     sessionStatus :: mode :- SessionStatus,
     pollWorkers :: mode :- PollWorkers,
     checkInbox :: mode :- CheckInbox,
+    memoryAppend :: mode :- MemoryAppend,
+    memoryList :: mode :- MemoryList,
+    continuationBrief :: mode :- ContinuationBrief,
     listAgents :: mode :- ListAgents,
     pr :: mode :- TLFilePR,
     mergePr :: mode :- TLMergePR,
@@ -314,6 +318,9 @@ config =
             sessionStatus = mkHandler @SessionStatus,
             pollWorkers = mkHandler @PollWorkers,
             checkInbox = mkHandler @CheckInbox,
+            memoryAppend = mkHandler @MemoryAppend,
+            memoryList = mkHandler @MemoryList,
+            continuationBrief = mkHandler @ContinuationBrief,
             listAgents = mkHandler @ListAgents,
             pr = mkHandler @TLFilePR,
             mergePr = mkHandler @TLMergePR,
