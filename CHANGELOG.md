@@ -238,6 +238,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- feat: inject continuation brief at root/TL SessionStart (#625)
 - feat: memory effect handler + memory_* MCP tools in Haskell WASM (#624)
 - feat: ContinuationBriefRenderer (deterministic markdown) (#623)
 - feat: chainlink + forgejo state adapters for the continuation brief (#622)
