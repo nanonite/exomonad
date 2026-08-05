@@ -31,6 +31,7 @@ pub mod resilience;
 pub mod review_policy;
 pub mod secrets;
 mod session_memory;
+mod session_memory_capture;
 pub mod supervisor_registry;
 pub mod synthetic_members;
 pub mod tmux_events;
@@ -56,6 +57,7 @@ pub use self::secrets::Secrets;
 pub use self::session_memory::{
     MemoryFilter, MemoryKind, MemoryRecordRow, NewMemoryRecord, SessionMemoryService,
 };
+pub use self::session_memory_capture::{capture_memory, MemoryCapture};
 pub use self::supervisor_registry::SupervisorRegistry;
 pub use self::worktree_event_watcher::WatcherRuntimeState;
 use claude_teams_bridge::TeamRegistry;
