@@ -18,8 +18,8 @@ use crate::handlers::agent::{
 };
 use crate::services::agent_control::{AgentControlService, AgentInfo};
 use crate::services::{
-    HasAgentResolver, HasGitHubClient, HasGitWorktreeService, HasInboxStore, HasProjectDir,
-    HasTeamRegistry,
+    capture_memory, HasAgentResolver, HasGitHubClient, HasGitWorktreeService, HasInboxStore,
+    HasProjectDir, HasSessionMemory, HasTeamRegistry, MemoryCapture, MemoryKind,
 };
 
 /// Handles root lifecycle effects used for idle convergence.
@@ -36,6 +36,7 @@ impl<
             + HasGitWorktreeService
             + HasInboxStore
             + HasProjectDir
+            + HasSessionMemory
             + HasTeamRegistry
             + 'static,
     > LifecycleHandler<C>
@@ -76,6 +77,7 @@ impl<
             + HasGitWorktreeService
             + HasInboxStore
             + HasProjectDir
+            + HasSessionMemory
             + HasTeamRegistry
             + 'static,
     > EffectHandler for LifecycleHandler<C>
@@ -101,6 +103,7 @@ impl<
             + HasGitWorktreeService
             + HasInboxStore
             + HasProjectDir
+            + HasSessionMemory
             + HasTeamRegistry
             + 'static,
     > LifecycleEffects for LifecycleHandler<C>
@@ -135,36 +138,73 @@ impl<
     async fn shutdown_server(
         &self,
         _req: ServerShutdownEffect,
-        _ctx: &crate::effects::EffectContext,
+        ctx: &crate::effects::EffectContext,
     ) -> EffectResult<ServerShutdownResult> {
-        let (_, alive_agents) = self.collect_live_non_root_agents().await?;
+        let (total_scanned, alive_agents) = self.collect_live_non_root_agents().await?;
         if !alive_agents.is_empty() {
             let error = live_agent_error(&alive_agents);
             warn!(
                 agents = %alive_agent_names(&alive_agents),
                 "Refusing server shutdown while agents are alive"
             );
-            return Ok(ServerShutdownResult {
+            let result = ServerShutdownResult {
                 success: false,
                 error,
                 message: String::new(),
-            });
+            };
+            capture_shutdown_refusal(
+                ctx,
+                self.ctx.as_ref(),
+                total_scanned,
+                alive_agents.len(),
+                "agents_alive",
+                &result.error,
+            );
+            return Ok(result);
         }
 
         let Some(shutdown_signal) = &self.shutdown_signal else {
-            return Ok(ServerShutdownResult {
+            let result = ServerShutdownResult {
                 success: false,
                 error: "Server shutdown signal is not wired into the lifecycle handler".to_string(),
                 message: String::new(),
-            });
+            };
+            capture_shutdown_refusal(
+                ctx,
+                self.ctx.as_ref(),
+                total_scanned,
+                0,
+                "signal_unwired",
+                &result.error,
+            );
+            return Ok(result);
         };
 
         shutdown_signal.notify_waiters();
-        Ok(ServerShutdownResult {
+        let result = ServerShutdownResult {
             success: true,
             error: String::new(),
             message: "Server shutting down".to_string(),
-        })
+        };
+        capture_memory(
+            ctx,
+            self.ctx.as_ref(),
+            MemoryCapture {
+                issue_id: None,
+                kind: MemoryKind::SessionSummary,
+                importance: 60,
+                summary: format!(
+                    "Server shutdown requested: state=shutting_down, scanned={total_scanned}, alive=0"
+                ),
+                detail: Some("state=shutting_down".to_string()),
+                metadata: Some(serde_json::json!({
+                    "state": "shutting_down",
+                    "total_scanned": total_scanned,
+                    "alive_agents": 0,
+                })),
+            },
+        );
+        Ok(result)
     }
 }
 
@@ -318,12 +358,42 @@ fn live_agent_error(alive_agents: &[LiveAgent]) -> String {
     )
 }
 
+fn capture_shutdown_refusal<C: HasSessionMemory>(
+    ctx: &crate::effects::EffectContext,
+    services: &C,
+    total_scanned: usize,
+    alive_agents: usize,
+    reason: &str,
+    error: &str,
+) {
+    capture_memory(
+        ctx,
+        services,
+        MemoryCapture {
+            issue_id: None,
+            kind: MemoryKind::Blocker,
+            importance: 80,
+            summary: format!(
+                "Server shutdown refused: state=shutdown_refused, reason={reason}, alive={alive_agents}"
+            ),
+            detail: Some(error.to_string()),
+            metadata: Some(serde_json::json!({
+                "state": "shutdown_refused",
+                "reason": reason,
+                "total_scanned": total_scanned,
+                "alive_agents": alive_agents,
+            })),
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch, RoutingInfo, Slug};
     use crate::services::agent_control::{AgentType, Topology};
     use crate::services::agent_resolver::AgentIdentityRecord;
+    use crate::services::{MemoryFilter, MemoryKind};
 
     fn record(name: &str) -> AgentIdentityRecord {
         AgentIdentityRecord {
@@ -528,8 +598,11 @@ exit 64
             async move { signal.notified().await }
         });
         tokio::task::yield_now().await;
-        let handler =
-            LifecycleHandler::with_shutdown_signal(agent_control, services, Arc::clone(&signal));
+        let handler = LifecycleHandler::with_shutdown_signal(
+            agent_control,
+            services.clone(),
+            Arc::clone(&signal),
+        );
         let ctx = effect_context(temp_dir.path());
 
         let result = handler
@@ -543,6 +616,16 @@ exit 64
             .await
             .expect("shutdown waiter is notified")
             .expect("shutdown waiter task succeeds");
+        let records = services
+            .session_memory
+            .list(MemoryFilter::default())
+            .expect("memory records should be readable");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, MemoryKind::SessionSummary);
+        assert!(records[0]
+            .metadata_json
+            .as_deref()
+            .is_some_and(|metadata| metadata.contains("\"state\":\"shutting_down\"")));
     }
 
     #[tokio::test]
@@ -601,9 +684,12 @@ exit 64
             Arc::new(AgentControlService::new(services.clone()).with_tmux_session(session.clone()));
         let chainlink_bin = stub_chainlink(temp_dir.path(), "[]").await;
         let signal = Arc::new(Notify::new());
-        let handler =
-            LifecycleHandler::with_shutdown_signal(agent_control, services, Arc::clone(&signal))
-                .with_chainlink_bin(chainlink_bin);
+        let handler = LifecycleHandler::with_shutdown_signal(
+            agent_control,
+            services.clone(),
+            Arc::clone(&signal),
+        )
+        .with_chainlink_bin(chainlink_bin);
         let ctx = effect_context(temp_dir.path());
 
         let result = handler
@@ -624,6 +710,16 @@ exit 64
             .expect("shutdown handler succeeds");
         assert!(!shutdown.success);
         assert_eq!(shutdown.error, "1 agent(s) still alive: [leaf-a]");
+        let records = services
+            .session_memory
+            .list(MemoryFilter::default())
+            .expect("memory records should be readable");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, MemoryKind::Blocker);
+        assert!(records[0]
+            .metadata_json
+            .as_deref()
+            .is_some_and(|metadata| metadata.contains("\"state\":\"shutdown_refused\"")));
     }
 
     #[tokio::test]

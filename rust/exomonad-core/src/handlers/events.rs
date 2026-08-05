@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::services::{
-    HasAgentResolver, HasEventLog, HasEventQueue, HasInboxStore, HasProjectDir,
-    HasSupervisorRegistry, HasTeamRegistry,
+    capture_memory, HasAgentResolver, HasEventLog, HasEventQueue, HasInboxStore, HasProjectDir,
+    HasSessionMemory, HasSupervisorRegistry, HasTeamRegistry, MemoryCapture, MemoryKind,
 };
 
 fn structural_parent_session_id(
@@ -92,6 +92,45 @@ fn is_parent_alias(address: &Address) -> bool {
     matches!(address, Address::Agent(name) if name.as_str() == "parent")
 }
 
+fn capture_parent_notification<C: HasSessionMemory>(
+    ctx: &crate::effects::EffectContext,
+    services: &C,
+    agent_id: &crate::domain::AgentName,
+    parent_session_id: &str,
+    status: crate::services::delivery::NotifyStatus,
+    message: &str,
+    delivery_result: crate::services::delivery::DeliveryResult,
+) {
+    let kind = match status {
+        crate::services::delivery::NotifyStatus::Success => MemoryKind::ChildHandoff,
+        crate::services::delivery::NotifyStatus::Failure
+        | crate::services::delivery::NotifyStatus::Stuck => MemoryKind::Blocker,
+    };
+    let summary = match kind {
+        MemoryKind::ChildHandoff => format!("Child handoff reported to parent {parent_session_id}"),
+        MemoryKind::Blocker => format!("Child blocker reported to parent {parent_session_id}"),
+        _ => unreachable!("notification capture only uses handoff or blocker kinds"),
+    };
+
+    capture_memory(
+        ctx,
+        services,
+        MemoryCapture {
+            issue_id: None,
+            kind,
+            importance: if kind == MemoryKind::Blocker { 80 } else { 60 },
+            summary,
+            detail: Some(message.to_string()),
+            metadata: Some(serde_json::json!({
+                "parent": parent_session_id,
+                "status": status.as_str(),
+                "delivery": format!("{delivery_result:?}"),
+                "agent": agent_id.as_str(),
+            })),
+        },
+    );
+}
+
 impl<C: HasSupervisorRegistry> EventHandler<C> {
     async fn lookup_supervisor(
         &self,
@@ -122,6 +161,7 @@ impl<
             + HasEventQueue
             + HasInboxStore
             + HasProjectDir
+            + HasSessionMemory
             + HasSupervisorRegistry
             + 'static,
     > EffectHandler for EventHandler<C>
@@ -148,6 +188,7 @@ impl<
             + HasEventQueue
             + HasInboxStore
             + HasProjectDir
+            + HasSessionMemory
             + HasSupervisorRegistry
             + 'static,
     > EventEffects for EventHandler<C>
@@ -285,7 +326,7 @@ impl<
             };
 
             let status = crate::services::delivery::NotifyStatus::parse(&req.status);
-            crate::services::delivery::notify_parent_delivery(
+            let delivery_result = crate::services::delivery::notify_parent_delivery(
                 &*self.ctx,
                 &agent_id,
                 &parent_session_id,
@@ -296,6 +337,15 @@ impl<
                 "agent",
             )
             .await;
+            capture_parent_notification(
+                ctx,
+                self.ctx.as_ref(),
+                &agent_id,
+                &parent_session_id,
+                status,
+                &req.message,
+                delivery_result,
+            );
             return Ok(NotifyParentResponse { ack: true });
         }
 
@@ -315,7 +365,7 @@ impl<
             );
 
             let status = crate::services::delivery::NotifyStatus::parse(&req.status);
-            crate::services::delivery::notify_parent_delivery(
+            let delivery_result = crate::services::delivery::notify_parent_delivery(
                 &*self.ctx,
                 &agent_id,
                 parent_session_id,
@@ -326,6 +376,15 @@ impl<
                 "agent",
             )
             .await;
+            capture_parent_notification(
+                ctx,
+                self.ctx.as_ref(),
+                &agent_id,
+                parent_session_id,
+                status,
+                &req.message,
+                delivery_result,
+            );
             return Ok(NotifyParentResponse { ack: true });
         }
 
@@ -350,7 +409,7 @@ impl<
         );
 
         let status = crate::services::delivery::NotifyStatus::parse(&req.status);
-        crate::services::delivery::notify_parent_delivery(
+        let delivery_result = crate::services::delivery::notify_parent_delivery(
             &*self.ctx,
             &agent_id,
             &parent_session_id,
@@ -361,6 +420,15 @@ impl<
             "agent",
         )
         .await;
+        capture_parent_notification(
+            ctx,
+            self.ctx.as_ref(),
+            &agent_id,
+            &parent_session_id,
+            status,
+            &req.message,
+            delivery_result,
+        );
 
         Ok(NotifyParentResponse { ack: true })
     }
@@ -481,6 +549,7 @@ mod tests {
     use crate::domain::{AgentName, BirthBranch, Slug};
     use crate::services::agent_control::{AgentType, Topology};
     use crate::services::agent_resolver::AgentIdentityRecord;
+    use crate::services::{MemoryFilter, SessionMemoryService};
     use std::path::PathBuf;
 
     #[test]
@@ -685,6 +754,114 @@ mod tests {
             .drain_unread("parent")
             .expect("parent inbox drain should succeed");
         assert!(parent_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notify_parent_captures_successful_child_handoff() {
+        let services = Arc::new(crate::services::Services::test());
+        let handler = EventHandler::new(services.clone(), None);
+        let ctx = test_ctx("worker-gemini", "main.worker-gemini");
+
+        let response = crate::effects::EventEffects::notify_parent(
+            &handler,
+            NotifyParentRequest {
+                agent_id: "".to_string(),
+                status: "success".to_string(),
+                message: "finished the assigned work".to_string(),
+                override_recipient: proto_agent_address("root"),
+            },
+            &ctx,
+        )
+        .await
+        .expect("notify_parent should succeed");
+
+        assert!(response.ack);
+        let records = services
+            .session_memory
+            .list(MemoryFilter::default())
+            .expect("memory records should be readable");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, MemoryKind::ChildHandoff);
+        assert_eq!(
+            records[0].detail.as_deref(),
+            Some("finished the assigned work")
+        );
+        assert!(records[0]
+            .metadata_json
+            .as_deref()
+            .is_some_and(|metadata| metadata.contains("\"parent\":\"root\"")));
+    }
+
+    #[tokio::test]
+    async fn notify_parent_captures_explicit_failure_as_blocker() {
+        let services = Arc::new(crate::services::Services::test());
+        let handler = EventHandler::new(services.clone(), None);
+        let ctx = test_ctx("worker-gemini", "main.worker-gemini");
+
+        let response = crate::effects::EventEffects::notify_parent(
+            &handler,
+            NotifyParentRequest {
+                agent_id: "".to_string(),
+                status: "failure".to_string(),
+                message: "the implementation is blocked".to_string(),
+                override_recipient: proto_agent_address("root"),
+            },
+            &ctx,
+        )
+        .await
+        .expect("notify_parent should preserve its response on failure status");
+
+        assert!(response.ack);
+        let records = services
+            .session_memory
+            .list(MemoryFilter::default())
+            .expect("memory records should be readable");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, MemoryKind::Blocker);
+        assert_eq!(
+            records[0].detail.as_deref(),
+            Some("the implementation is blocked")
+        );
+        assert!(records[0]
+            .metadata_json
+            .as_deref()
+            .is_some_and(|metadata| metadata.contains("\"status\":\"failure\"")));
+    }
+
+    #[tokio::test]
+    async fn notify_parent_ignores_memory_append_failure() {
+        use rusqlite::Connection;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let memory = Arc::new(
+            SessionMemoryService::open(temp_dir.path()).expect("memory service should open"),
+        );
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        services.session_memory = Arc::clone(&memory);
+        let services = Arc::new(services);
+        let handler = EventHandler::new(services, None);
+        let ctx = test_ctx("worker-gemini", "main.worker-gemini");
+        let lock = Connection::open(memory.db_path()).expect("second database connection opens");
+        lock.execute_batch("BEGIN EXCLUSIVE")
+            .expect("exclusive lock should be acquired");
+
+        let response = crate::effects::EventEffects::notify_parent(
+            &handler,
+            NotifyParentRequest {
+                agent_id: "".to_string(),
+                status: "success".to_string(),
+                message: "delivery remains authoritative".to_string(),
+                override_recipient: proto_agent_address("root"),
+            },
+            &ctx,
+        )
+        .await
+        .expect("capture failure must not fail notify_parent");
+
+        assert!(response.ack);
+        lock.execute_batch("ROLLBACK")
+            .expect("exclusive lock should be released");
     }
 
     #[test]
