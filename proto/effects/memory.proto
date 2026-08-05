@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package exomonad.effects.memory;
+
+// Semantic categories for append-only session-memory records.
+enum MemoryKind {
+  MEMORY_KIND_UNSPECIFIED = 0;
+  ORIGINAL_PLAN = 1;
+  WAVE_PLAN = 2;
+  SPAWNED_CHILD = 3;
+  CHILD_HANDOFF = 4;
+  BLOCKER = 5;
+  DECISION = 6;
+  REVIEW_FEEDBACK = 7;
+  FIX_DIRECTION = 8;
+  MERGE_RESULT = 9;
+  CI_RESULT = 10;
+  NEXT_ACTION = 11;
+  HUMAN_CLARIFICATION = 12;
+  SESSION_SUMMARY = 13;
+}
+
+// A durable semantic fact in the session-memory ledger.
+message MemoryRecord {
+  int64 id = 1;
+  string run_id = 2;
+  string agent_id = 3;
+  string birth_branch = 4;
+  optional int64 issue_id = 5;
+  MemoryKind kind = 6;
+  int32 importance = 7;
+  string summary = 8;
+  optional string detail = 9;
+  int64 created_at = 10;
+  optional int64 supersedes_id = 11;
+  optional string metadata_json = 12;
+}
+
+// Append carries the record fields supplied by the caller. The ledger assigns
+// id and created_at when the record is persisted.
+message MemoryAppendRequest {
+  string run_id = 1;
+  string agent_id = 2;
+  string birth_branch = 3;
+  optional int64 issue_id = 4;
+  MemoryKind kind = 5;
+  int32 importance = 6;
+  string summary = 7;
+  optional string detail = 8;
+  optional int64 supersedes_id = 9;
+  optional string metadata_json = 10;
+}
+
+message MemoryAppendResponse {
+  int64 id = 1;
+}
+
+// Filters for listing records. An unset optional filter does not constrain the
+// result; limit zero means the service default.
+message MemoryListRequest {
+  string run_id = 1;
+  string agent_id = 2;
+  optional int64 issue_id = 3;
+  MemoryKind kind = 4;
+  int32 min_importance = 5;
+  int32 limit = 6;
+}
+
+message MemoryListResponse {
+  repeated MemoryRecord records = 1;
+}
