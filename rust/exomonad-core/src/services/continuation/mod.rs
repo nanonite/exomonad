@@ -5,6 +5,7 @@
 //! concern so every consumer can make the same availability decision.
 
 pub mod adapters;
+pub mod composer;
 pub mod renderer;
 
 use adapters::{

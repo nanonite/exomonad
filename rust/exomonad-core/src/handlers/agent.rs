@@ -19,6 +19,7 @@ use crate::services::agent_control::{
     SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
 };
 use crate::services::agent_resources::dispose_agent_resources;
+use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
 use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
 #[cfg(test)]
 use crate::services::pr_registry::PrRegistry;
@@ -37,8 +38,8 @@ use tracing::{info, warn};
 
 use crate::services::{
     HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient, HasGitHubClient,
-    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSupervisorRegistry, HasTeamRegistry,
-    HasWatcherRuntimeState,
+    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSessionMemory, HasSupervisorRegistry,
+    HasTeamRegistry, HasWatcherRuntimeState,
 };
 
 /// Agent effect handler.
@@ -57,6 +58,7 @@ impl<
             + HasProjectDir
             + HasGitWorktreeService
             + HasInboxStore
+            + HasSessionMemory
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
@@ -284,6 +286,7 @@ impl<
             + HasProjectDir
             + HasGitWorktreeService
             + HasInboxStore
+            + HasSessionMemory
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
@@ -532,6 +535,7 @@ impl<
             + HasProjectDir
             + HasGitWorktreeService
             + HasInboxStore
+            + HasSessionMemory
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
@@ -1891,6 +1895,7 @@ impl<
             + HasProjectDir
             + HasGitWorktreeService
             + HasInboxStore
+            + HasSessionMemory
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
@@ -2197,6 +2202,7 @@ impl<
             + HasProjectDir
             + HasGitWorktreeService
             + HasInboxStore
+            + HasSessionMemory
             + HasSupervisorRegistry
             + HasClaudeSessionRegistry
             + HasEventLog
@@ -2310,6 +2316,15 @@ impl<
             )));
         }
 
+        let continuation_prefix = resume_pr_prefix(
+            self.ctx.as_ref(),
+            &self.service,
+            &ctx.birth_branch,
+            req.resume_pr_number,
+            head_sha,
+            owner,
+        )
+        .await;
         let options = SpawnLeafOptions {
             task: req.task.clone(),
             branch_name: owner.slug.to_string(),
@@ -2323,6 +2338,7 @@ impl<
             expected_agent_name: Some(owner.agent_name.clone()),
             invocation_pr_number: Some(req.resume_pr_number),
         };
+        let options = with_resume_task(options, continuation_prefix.as_deref());
         let owner_dir = self
             .ctx
             .project_dir()
@@ -2480,6 +2496,13 @@ fn validate_resume_request(req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
         ));
     }
     Ok(())
+}
+
+fn with_resume_task(options: SpawnLeafOptions, prefix: Option<&str>) -> SpawnLeafOptions {
+    SpawnLeafOptions {
+        task: prefix_task(prefix, &options.task),
+        ..options
+    }
 }
 
 fn ensure_replaceable_unmerged_pr(
@@ -3623,6 +3646,54 @@ mod tests {
             "unrelated-fix-opencode",
             "m7-3a-fixture-oracle-opencode"
         ));
+    }
+
+    #[test]
+    fn resume_task_composition_preserves_spawn_options_fields() {
+        let options = SpawnLeafOptions {
+            task: "original task".to_string(),
+            branch_name: "owner-slug".to_string(),
+            role: Some(crate::domain::Role::dev()),
+            agent_type: ServiceAgentType::Gemini,
+            claude_flags: ClaudeSpawnFlags {
+                permission_mode: Some(crate::domain::PermissionMode::Default),
+                allowed_tools: vec!["Read".to_string()],
+                disallowed_tools: vec!["Bash".to_string()],
+            },
+            standalone_repo: false,
+            allowed_dirs: vec!["docs".to_string()],
+            start_point: Some("head-sha".to_string()),
+            base_branch: Some("main".to_string()),
+            expected_agent_name: Some(
+                AgentName::try_from_str("owner-slug-gemini")
+                    .expect("literal is a valid agent name"),
+            ),
+            invocation_pr_number: Some(104),
+        };
+        let composed = with_resume_task(options.clone(), Some("continuation"));
+
+        assert_eq!(composed.task, "continuation\n\noriginal task");
+        assert_eq!(composed.branch_name, options.branch_name);
+        assert_eq!(composed.role, options.role);
+        assert_eq!(composed.agent_type, options.agent_type);
+        assert_eq!(
+            composed.claude_flags.permission_mode,
+            options.claude_flags.permission_mode
+        );
+        assert_eq!(
+            composed.claude_flags.allowed_tools,
+            options.claude_flags.allowed_tools
+        );
+        assert_eq!(
+            composed.claude_flags.disallowed_tools,
+            options.claude_flags.disallowed_tools
+        );
+        assert_eq!(composed.standalone_repo, options.standalone_repo);
+        assert_eq!(composed.allowed_dirs, options.allowed_dirs);
+        assert_eq!(composed.start_point, options.start_point);
+        assert_eq!(composed.base_branch, options.base_branch);
+        assert_eq!(composed.expected_agent_name, options.expected_agent_name);
+        assert_eq!(composed.invocation_pr_number, options.invocation_pr_number);
     }
 
     #[test]

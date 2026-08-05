@@ -345,7 +345,8 @@ What you can do with exomonad right now, end-to-end.
 Spawn heterogeneous agent teams as a recursive tree:
 
 - **`fork_wave`** — Fork N parallel agents (Claude, Codex, or OpenCode), each in its own worktree. Agent type defaults to server config; set `agent_type` explicitly to override. Claude agents inherit context via `--fork-session`; Codex and OpenCode agents require context injected via the task spec (no team messaging support). Requires clean git state (committed and pushed).
-- **`spawn_leaf`** — Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields (steps, verify, boundary, context, read_first).
+- **`spawn_leaf`** — Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields (steps, verify, boundary, context, read_first). Continuation context is prefixed automatically when available, while the caller's task remains verbatim after a blank-line separator.
+- **`resume_pr`** — Resume the existing issue-owned PR worktree and invocation after review or CI feedback. Continuation context is prefixed automatically and review feedback is scoped to the exact current PR head SHA.
 - **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
 - **`spawn_codex`** — Spawn a Codex leaf agent in its own worktree+branch. Files PR when done.
 
@@ -522,7 +523,8 @@ All tools implemented in Haskell WASM (`haskell/wasm-guest/src/ExoMonad/Guest/To
 | Tool | Role | Description |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel agents, each in its own worktree. Agent type defaults to server config; supported explicit runtimes include Claude, OpenCode, and Codex. Context inheritance is runtime-specific. |
-| `spawn_leaf` | root, tl | Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields: steps, verify, boundary, context, read_first. |
+| `spawn_leaf` | root, tl | Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields: steps, verify, boundary, context, read_first. Continuation context is prefixed automatically when available. |
+| `resume_pr` | root, tl | Resume an existing issue-owned PR worktree and invocation with continuation context prefixed automatically; review feedback is scoped to the exact current PR head SHA. |
 | `spawn_opencode` | root, tl | Spawn OpenCode agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
 | `spawn_codex` | root, tl | Spawn Codex agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |
 | `spawn_worker` | root, tl | Spawn an ephemeral worker in a tmux pane (no branch, no PR). Just name + task. |

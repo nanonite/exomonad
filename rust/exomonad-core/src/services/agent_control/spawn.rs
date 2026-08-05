@@ -540,6 +540,8 @@ impl<
             + super::super::HasAgentResolver
             + super::super::HasProjectDir
             + super::super::HasGitWorktreeService
+            + super::super::HasInboxStore
+            + super::super::HasSessionMemory
             + 'static,
     > AgentControlService<C>
 {
@@ -637,17 +639,31 @@ impl<
                 "https://github.com/{}/{}/issues/{}",
                 options.owner, options.repo, issue_id
             );
-            let initial_prompt = Self::build_initial_prompt(
+            let original_prompt = Self::build_initial_prompt(
                 &issue_id,
                 &issue.title,
                 &issue.body,
                 &issue.labels,
                 &issue_url,
             );
+            let continuation_prefix = crate::services::continuation::composer::child_spawn_prefix(
+                self.ctx.as_ref(),
+                self,
+                caller_bb,
+                &agent_name,
+                i64::try_from(issue_number.as_u64())
+                    .context("issue number exceeds continuation ledger range")?,
+            )
+            .await;
+            let initial_prompt = crate::services::continuation::composer::prefix_task(
+                continuation_prefix.as_deref(),
+                &original_prompt,
+            );
 
             tracing::info!(
                 issue_id,
                 prompt_length = initial_prompt.len(),
+                prefix_length = continuation_prefix.as_ref().map_or(0, String::len),
                 "Built initial prompt for agent"
             );
 
@@ -1960,7 +1976,8 @@ impl<
 
             // If an open PR already exists for this branch (re-spawn after worktree loss),
             // inject PR context so the leaf resumes instead of filing a new PR.
-            if let Some(forgejo) = self.ctx.forgejo_client() {
+            if options.expected_agent_name.is_none() {
+                if let Some(forgejo) = self.ctx.forgejo_client() {
                 if let Ok(repo_info) =
                     crate::services::repo::get_repo_info(effective_project_dir).await
                 {
@@ -2034,6 +2051,7 @@ impl<
                         task.push_str(&resume_context);
                     }
                 }
+            }
             }
 
             if options.standalone_repo && !options.allowed_dirs.is_empty() {
@@ -2423,6 +2441,8 @@ impl<
             + crate::services::HasAgentResolver
             + crate::services::HasProjectDir
             + crate::services::HasGitWorktreeService
+            + crate::services::HasInboxStore
+            + crate::services::HasSessionMemory
             + 'static,
     > crate::services::ReviewerSpawner for AgentControlService<C>
 {
