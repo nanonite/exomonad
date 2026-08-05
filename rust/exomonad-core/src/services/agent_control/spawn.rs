@@ -276,6 +276,8 @@ These names are MCP tools exposed inside your agent tool interface. They are not
 - send_tmux_message: Send a message by injecting it into another agent tmux pane.
 - send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 - check_inbox: Drain durable inbox guidance at the start of the assignment and after each major step. Unread mail piggybacks on MCP tool results and is authoritative TL direction.
+- memory_append: Append a durable session-memory record through the host ledger.
+- memory_list: List durable session-memory records for the current run with optional semantic filters.
 - task_list: List tasks assigned to this agent.
 - task_get: Read an assigned task.
 - task_update: Update an assigned task.
@@ -324,6 +326,8 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 - send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
 - send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
 - check_inbox: Drain durable inbox guidance at the start of the assignment and after each major step. Unread mail piggybacks on MCP tool results and is authoritative parent direction.
+- memory_append: Append a durable session-memory record through the host ledger.
+- memory_list: List durable session-memory records for the current run with optional semantic filters.
 - task_list: List tasks assigned to this agent.
 - task_get: Read an assigned task.
 - task_update: Update an assigned task.
@@ -362,6 +366,8 @@ While this invocation is alive, continue consuming durable inbox guidance delive
 - send_tmux_message: Send a message by injecting it into another agent tmux pane.
 - send_mailbox_message: Send a message through Claude Teams inbox when mailbox support is available.
 - check_inbox: Drain durable inbox guidance at the start of the assignment and after each major step. Unread mail piggybacks on MCP tool results and is authoritative TL direction.
+- memory_append: Append a durable session-memory record through the host ledger.
+- memory_list: List durable session-memory records for the current run with optional semantic filters.
 - task_list: List tasks assigned to this agent.
 - task_get: Read an assigned task.
 - task_update: Update an assigned task.
@@ -409,6 +415,8 @@ Complete the narrow task assigned by your parent TL. Report completion through t
 - send_tmux_message: Send messages to other agents through tmux when explicitly instructed.
 - send_mailbox_message: Send messages through Claude Teams inbox when mailbox support is available.
 - check_inbox: Drain durable inbox guidance at the start of the assignment and after each major step. Unread mail piggybacks on MCP tool results and is authoritative parent direction.
+- memory_append: Append a durable session-memory record through the host ledger.
+- memory_list: List durable session-memory records for the current run with optional semantic filters.
 - task_list: List tasks assigned to this agent.
 - task_get: Read an assigned task.
 - task_update: Update an assigned task.

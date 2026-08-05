@@ -61,6 +61,9 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 | `has_pending_work` | x | | | | |
 | `shutdown_server` | x | | | | |
 | `task_list` / `task_get` / `task_update` | | | x | | x |
+| `memory_append` | x | x | x | | x |
+| `memory_list` | x | x | x | | x |
+| `continuation_brief` | x | x | | | |
 | `approve_pr` | | | | x | |
 | `request_changes` | | | | x | |
 | `post_review_comment` | | | | x | |
