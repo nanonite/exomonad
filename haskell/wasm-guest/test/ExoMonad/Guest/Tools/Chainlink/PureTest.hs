@@ -3,6 +3,14 @@ module ExoMonad.Guest.Tools.Chainlink.PureTest (pureTests) where
 import Data.Aeson (decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Lazy qualified as TL
+import ExoMonad.Effects.Memory qualified as Memory
+import ExoMonad.Guest.Tools.Chainlink
+  ( ChainlinkIssueCreateOutput (..),
+    chainlinkIssueCommentMemoryRequest,
+    chainlinkIssueCreateMemoryRequest,
+    chainlinkSessionEndMemoryRequest,
+  )
 import ExoMonad.Guest.Tools.Chainlink.Pure
 import ExoMonad.Types (sessionStartAdditionalContext)
 import Test.Tasty (TestTree, testGroup)
@@ -75,6 +83,33 @@ pureTests =
       testCase "buildSessionEndArgs: with notes" $
         buildSessionEndArgs (ChainlinkSessionEndArgs (Just "Implemented the feature"))
           @=? ["session", "end", "--notes", "Implemented the feature"],
+      -- Semantic session-memory capture requests
+      testCase "issue create capture records issue reference and wave plan" $ do
+        let request =
+              chainlinkIssueCreateMemoryRequest
+                (ChainlinkIssueCreateArgs "Add ledger capture" Nothing Nothing Nothing)
+                (ChainlinkIssueCreateOutput 630)
+        Memory.memoryAppendRequestIssueId request @=? 630
+        Memory.memoryAppendRequestKind request @=? 2
+        TL.toStrict (Memory.memoryAppendRequestSummary request)
+          @=? "Created Chainlink issue #630: Add ledger capture",
+      testCase "issue comment capture records decision and bounded comment" $ do
+        let comment = T.replicate 5000 "comment"
+            request = chainlinkIssueCommentMemoryRequest (ChainlinkIssueCommentArgs 630 comment)
+        Memory.memoryAppendRequestIssueId request @=? 630
+        Memory.memoryAppendRequestKind request @=? 6
+        T.length (TL.toStrict (Memory.memoryAppendRequestDetail request)) @=? 4096,
+      testCase "session end capture is a child handoff" $ do
+        let request = chainlinkSessionEndMemoryRequest (ChainlinkSessionEndArgs (Just "Continue with the next wave"))
+        fmap Memory.memoryAppendRequestKind request @=? Just 4
+        fmap (TL.toStrict . Memory.memoryAppendRequestDetail) request
+          @=? Just "Continue with the next wave",
+      testCase "session end capture classifies explicit blockers" $ do
+        let request = chainlinkSessionEndMemoryRequest (ChainlinkSessionEndArgs (Just "FAILED: CI is unavailable"))
+        fmap Memory.memoryAppendRequestKind request @=? Just 5,
+      testCase "session end capture is a no-op without notes" $ do
+        chainlinkSessionEndMemoryRequest (ChainlinkSessionEndArgs Nothing) @=? Nothing
+        chainlinkSessionEndMemoryRequest (ChainlinkSessionEndArgs (Just "   ")) @=? Nothing,
       -- buildCloseArgs
       testCase "buildCloseArgs: basic" $
         buildCloseArgs (ChainlinkIssueCloseArgs 42 Nothing False)

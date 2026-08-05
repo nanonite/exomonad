@@ -12,6 +12,7 @@ module ExoMonad.Guest.Tools.Chainlink
     chainlinkIssueCreateSchema,
     ChainlinkIssueCreateArgs (..),
     ChainlinkIssueCreateOutput (..),
+    chainlinkIssueCreateMemoryRequest,
 
     -- * Session Start
     ChainlinkSessionStart (..),
@@ -38,6 +39,7 @@ module ExoMonad.Guest.Tools.Chainlink
     chainlinkIssueCommentDescription,
     chainlinkIssueCommentSchema,
     ChainlinkIssueCommentArgs (..),
+    chainlinkIssueCommentMemoryRequest,
 
     -- * Subissue Create
     ChainlinkSubissueCreate (..),
@@ -59,6 +61,7 @@ module ExoMonad.Guest.Tools.Chainlink
     chainlinkSessionEndDescription,
     chainlinkSessionEndSchema,
     ChainlinkSessionEndArgs (..),
+    chainlinkSessionEndMemoryRequest,
 
     -- * Issue Close
     ChainlinkIssueClose (..),
@@ -133,7 +136,7 @@ where
 import Control.Monad.Freer (Eff)
 import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.!=), (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
-import Data.Int (Int32)
+import Data.Int (Int32, Int64)
 import Data.Map qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -144,6 +147,7 @@ import Data.Word (Word64)
 import Effects.Git qualified as Git
 import Effects.Process qualified as Proc
 import ExoMonad.Effects.Git (GitGetStatus)
+import ExoMonad.Effects.Memory qualified as Memory
 import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
@@ -173,6 +177,59 @@ runChainlink cmdArgs = do
 
 exitCodeToText :: Int32 -> Text
 exitCodeToText = T.pack . show
+
+captureSummaryLimit :: Int
+captureSummaryLimit = 200
+
+captureDetailLimit :: Int
+captureDetailLimit = 4096
+
+boundedCaptureSummary :: Text -> Text
+boundedCaptureSummary = T.take captureSummaryLimit
+
+boundedCaptureDetail :: Text -> Text
+boundedCaptureDetail = T.take captureDetailLimit
+
+memoryKindCode :: Memory.MemoryKind -> Int32
+memoryKindCode kind =
+  case kind of
+    Memory.MemoryKindMEMORY_KIND_UNSPECIFIED -> 0
+    Memory.MemoryKindORIGINAL_PLAN -> 1
+    Memory.MemoryKindWAVE_PLAN -> 2
+    Memory.MemoryKindSPAWNED_CHILD -> 3
+    Memory.MemoryKindCHILD_HANDOFF -> 4
+    Memory.MemoryKindBLOCKER -> 5
+    Memory.MemoryKindDECISION -> 6
+    Memory.MemoryKindREVIEW_FEEDBACK -> 7
+    Memory.MemoryKindFIX_DIRECTION -> 8
+    Memory.MemoryKindMERGE_RESULT -> 9
+    Memory.MemoryKindCI_RESULT -> 10
+    Memory.MemoryKindNEXT_ACTION -> 11
+    Memory.MemoryKindHUMAN_CLARIFICATION -> 12
+    Memory.MemoryKindSESSION_SUMMARY -> 13
+
+mkMemoryAppendRequest :: Memory.MemoryKind -> Maybe Int -> Text -> Maybe Text -> Memory.MemoryAppendRequest
+mkMemoryAppendRequest kind issueId summary detail =
+  Memory.MemoryAppendRequest
+    { Memory.memoryAppendRequestRunId = "",
+      Memory.memoryAppendRequestAgentId = "",
+      Memory.memoryAppendRequestBirthBranch = "",
+      Memory.memoryAppendRequestIssueId = maybe 0 (fromIntegral :: Int -> Int64) issueId,
+      Memory.memoryAppendRequestKind = memoryKindCode kind,
+      Memory.memoryAppendRequestImportance = 50,
+      Memory.memoryAppendRequestSummary = TL.fromStrict (boundedCaptureSummary summary),
+      Memory.memoryAppendRequestDetail = maybe "" (TL.fromStrict . boundedCaptureDetail) detail,
+      Memory.memoryAppendRequestSupersedesId = 0,
+      Memory.memoryAppendRequestMetadataJson = ""
+    }
+
+appendMemoryRequestFailOpen :: Memory.MemoryAppendRequest -> Eff Effects ()
+appendMemoryRequestFailOpen request = do
+  _ <- suspendEffect @Memory.MemoryAppend request
+  pure ()
+
+appendOptionalMemoryRequestFailOpen :: Maybe Memory.MemoryAppendRequest -> Eff Effects ()
+appendOptionalMemoryRequestFailOpen = maybe (pure ()) appendMemoryRequestFailOpen
 
 --------------------------------------------------------------------------------
 -- Issue Create
@@ -204,6 +261,18 @@ instance FromJSON ChainlinkIssueCreateOutput
 
 instance ToJSON ChainlinkIssueCreateOutput
 
+chainlinkIssueCreateMemoryRequest :: ChainlinkIssueCreateArgs -> ChainlinkIssueCreateOutput -> Memory.MemoryAppendRequest
+chainlinkIssueCreateMemoryRequest args output =
+  mkMemoryAppendRequest
+    Memory.MemoryKindWAVE_PLAN
+    (Just (cicoIssueId output))
+    ( "Created Chainlink issue #"
+        <> T.pack (show (cicoIssueId output))
+        <> ": "
+        <> cicaTitle args
+    )
+    Nothing
+
 chainlinkIssueCreateDescription :: Text
 chainlinkIssueCreateDescription =
   "Create a new chainlink issue. Returns the created issue ID. Use this to track work items, bugs, features, and tasks in the project's chainlink tracker."
@@ -227,7 +296,10 @@ chainlinkIssueCreateCore args = do
       | Proc.runResponseExitCode resp == 0 ->
           case parseIssueId (TL.toStrict (Proc.runResponseStdout resp)) of
             Just issueId ->
-              pure $ Right (ChainlinkIssueCreateOutput issueId)
+              do
+                let output = ChainlinkIssueCreateOutput issueId
+                appendMemoryRequestFailOpen (chainlinkIssueCreateMemoryRequest args output)
+                pure $ Right output
             Nothing ->
               pure $ Left ("could not parse issue ID from output: " <> TL.toStrict (Proc.runResponseStdout resp))
       | otherwise ->
@@ -412,6 +484,16 @@ instance ToJSON ChainlinkIssueCommentArgs where
         "message" .= cicMessage args
       ]
 
+chainlinkIssueCommentMemoryRequest :: ChainlinkIssueCommentArgs -> Memory.MemoryAppendRequest
+chainlinkIssueCommentMemoryRequest args =
+  mkMemoryAppendRequest
+    Memory.MemoryKindDECISION
+    (Just (cicIssueId args))
+    ( "Commented on Chainlink issue #"
+        <> T.pack (show (cicIssueId args))
+    )
+    (Just (cicMessage args))
+
 chainlinkIssueCommentDescription :: Text
 chainlinkIssueCommentDescription =
   "Add a comment to a chainlink issue. Use this to report progress, ask questions, or provide updates on a task."
@@ -431,7 +513,9 @@ chainlinkIssueCommentCore args = do
     Left err -> pure $ Left ("chainlink comment failed: " <> err)
     Right resp
       | Proc.runResponseExitCode resp == 0 ->
-          pure $ Right (ChainlinkIssueCommentOutput True)
+          do
+            appendMemoryRequestFailOpen (chainlinkIssueCommentMemoryRequest args)
+            pure $ Right (ChainlinkIssueCommentOutput True)
       | otherwise ->
           pure $
             Left $
@@ -589,6 +673,19 @@ instance ToJSON ChainlinkSessionEndArgs where
       [ "notes" .= cseNotes args
       ]
 
+chainlinkSessionEndMemoryRequest :: ChainlinkSessionEndArgs -> Maybe Memory.MemoryAppendRequest
+chainlinkSessionEndMemoryRequest args = do
+  notes <- cseNotes args
+  let trimmed = T.strip notes
+  if T.null trimmed
+    then Nothing
+    else
+      let normalized = T.toUpper trimmed
+          isBlocker = "BLOCKED" `T.isPrefixOf` normalized || "FAILED" `T.isPrefixOf` normalized
+          kind = if isBlocker then Memory.MemoryKindBLOCKER else Memory.MemoryKindCHILD_HANDOFF
+          summary = if isBlocker then "Chainlink session ended with a blocker" else "Chainlink session handoff recorded"
+       in Just (mkMemoryAppendRequest kind Nothing summary (Just trimmed))
+
 chainlinkSessionEndDescription :: Text
 chainlinkSessionEndDescription =
   "End the current chainlink session with optional notes. Use this when you finish working on a task to record what was done."
@@ -607,7 +704,9 @@ chainlinkSessionEndCore args = do
     Left err -> pure $ Left ("chainlink session end failed: " <> err)
     Right resp
       | Proc.runResponseExitCode resp == 0 ->
-          pure $ Right ()
+          do
+            appendOptionalMemoryRequestFailOpen (chainlinkSessionEndMemoryRequest args)
+            pure $ Right ()
       | otherwise ->
           pure $
             Left $
