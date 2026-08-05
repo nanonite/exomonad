@@ -116,6 +116,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Add fail-open automatic memory capture helper (#629)
 - Make dev leaf harnesses one-shot (#579)
 - Add structured TL review-fix handoffs for existing PRs (#567)
 - Add reviewer round limit override to exomonad init (#566)
