@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Update memory tool documentation and runtime protocol contracts (#628)
 - fix: has_pending_work reports dead agents as alive, blocking shutdown convergence (#619)
 - Add Rust integration tests to the aggregate test gate (#601)
 - Fix lost inbox writes under concurrent delivery (#600)
@@ -237,6 +238,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- feat: memory effect handler + memory_* MCP tools in Haskell WASM (#624)
 - feat: ContinuationBriefRenderer (deterministic markdown) (#623)
 - feat: chainlink + forgejo state adapters for the continuation brief (#622)
 - feat: session memory proto + SessionMemoryService (append-only ledger) (#621)
