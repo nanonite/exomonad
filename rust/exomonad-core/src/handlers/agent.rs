@@ -37,9 +37,9 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::services::{
-    HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient, HasGitHubClient,
-    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSessionMemory, HasSupervisorRegistry,
-    HasTeamRegistry, HasWatcherRuntimeState,
+    capture_memory, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient,
+    HasGitHubClient, HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSessionMemory,
+    HasSupervisorRegistry, HasTeamRegistry, HasWatcherRuntimeState, MemoryCapture, MemoryKind,
 };
 
 /// Agent effect handler.
@@ -306,6 +306,72 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<Vec<u8>> {
         dispatch_agent_effect(self, effect_type, payload, ctx).await
+    }
+}
+
+/// Bounded, non-empty-line summary of a repair task for the memory ledger.
+/// Never captures the full task text — only its first non-empty line, capped.
+fn concise_task_summary(task: &str) -> String {
+    task.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
+/// Build the bounded `spawned_child` memory capture for a successful spawn.
+/// `branch` is empty for shared-directory workers, which have no branch.
+fn spawned_child_capture(
+    agent_id: &str,
+    agent_type_suffix: &str,
+    branch: &str,
+    spawn_type: &str,
+) -> MemoryCapture {
+    let summary = if branch.is_empty() {
+        format!("Spawned {spawn_type} {agent_id} ({agent_type_suffix})")
+    } else {
+        format!("Spawned {spawn_type} {agent_id} on branch {branch}")
+    };
+    MemoryCapture {
+        issue_id: None,
+        kind: MemoryKind::SpawnedChild,
+        importance: 60,
+        summary,
+        detail: None,
+        metadata: Some(serde_json::json!({
+            "agent_id": agent_id,
+            "agent_type": agent_type_suffix,
+            "branch": branch,
+            "spawn_type": spawn_type,
+        })),
+    }
+}
+
+/// Build the bounded `fix_direction` memory capture for a successful `resume_pr`.
+fn resume_fix_direction_capture(
+    pr_number: u64,
+    head_sha: &str,
+    owner: &str,
+    branch: &str,
+    task: &str,
+) -> MemoryCapture {
+    MemoryCapture {
+        issue_id: None,
+        kind: MemoryKind::FixDirection,
+        importance: 80,
+        summary: format!(
+            "Resumed PR #{pr_number} (owner {owner}): {}",
+            concise_task_summary(task)
+        ),
+        detail: None,
+        metadata: Some(serde_json::json!({
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "owner": owner,
+            "branch": branch,
+        })),
     }
 }
 
@@ -714,6 +780,12 @@ impl<
             self.register_child_supervisor(agent_info.id.as_str(), ctx)
                 .await;
         }
+
+        capture_memory(
+            ctx,
+            self.ctx.as_ref(),
+            spawned_child_capture(&agent_info.id, options.agent_type.suffix(), "", "worker"),
+        );
 
         Ok(SpawnWorkerResponse {
             agent: Some(agent_info),
@@ -1420,6 +1492,17 @@ impl<
             self.register_child_supervisor(agent_info.id.as_str(), ctx)
                 .await;
         }
+
+        capture_memory(
+            ctx,
+            self.ctx.as_ref(),
+            spawned_child_capture(
+                &agent_info.id,
+                options.agent_type.suffix(),
+                &agent_info.branch_name,
+                "leaf_subtree",
+            ),
+        );
 
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
@@ -2406,6 +2489,19 @@ impl<
             owner = %owner.agent_name,
             "Resumed exact existing PR owner"
         );
+
+        capture_memory(
+            ctx,
+            self.ctx.as_ref(),
+            resume_fix_direction_capture(
+                req.resume_pr_number,
+                head_sha,
+                owner.agent_name.as_str(),
+                head_branch,
+                &req.task,
+            ),
+        );
+
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
             invocation: Some(invocation_handoff),
@@ -3601,6 +3697,142 @@ mod tests {
         assert_eq!(referenced_pr_number("Implement issue #104"), None);
         assert_eq!(referenced_pr_number("Fix PR #"), None);
         assert_eq!(referenced_pr_number("Fix PR #104foo"), None);
+    }
+
+    #[test]
+    fn concise_task_summary_skips_blank_lines_and_bounds_length() {
+        assert_eq!(
+            concise_task_summary("\n\n  fix the flaky test\nmore"),
+            "fix the flaky test"
+        );
+        assert_eq!(concise_task_summary(""), "");
+        let long_line = "x".repeat(500);
+        assert_eq!(concise_task_summary(&long_line).chars().count(), 160);
+    }
+
+    #[test]
+    fn spawned_child_capture_reports_branch_when_present() {
+        let capture =
+            spawned_child_capture("leaf-1-gemini", "gemini", "main.leaf-1", "leaf_subtree");
+        assert_eq!(capture.kind, MemoryKind::SpawnedChild);
+        assert!(capture.summary.contains("leaf-1-gemini"));
+        assert!(capture.summary.contains("main.leaf-1"));
+        let metadata = capture.metadata.expect("metadata present");
+        assert_eq!(metadata["agent_id"], "leaf-1-gemini");
+        assert_eq!(metadata["agent_type"], "gemini");
+        assert_eq!(metadata["branch"], "main.leaf-1");
+        assert_eq!(metadata["spawn_type"], "leaf_subtree");
+    }
+
+    #[test]
+    fn spawned_child_capture_omits_branch_for_workers() {
+        let capture = spawned_child_capture("worker-1-gemini", "gemini", "", "worker");
+        assert!(capture.summary.contains("worker-1-gemini"));
+        assert!(!capture.summary.contains("branch"));
+        let metadata = capture.metadata.expect("metadata present");
+        assert_eq!(metadata["branch"], "");
+        assert_eq!(metadata["spawn_type"], "worker");
+    }
+
+    #[test]
+    fn resume_fix_direction_capture_bounds_task_text_and_carries_references() {
+        let capture = resume_fix_direction_capture(
+            104,
+            "abc123",
+            "leaf-1-gemini",
+            "main.leaf-1",
+            "address review feedback\nwith extra detail",
+        );
+        assert_eq!(capture.kind, MemoryKind::FixDirection);
+        assert!(capture.summary.contains("PR #104"));
+        assert!(capture.summary.contains("leaf-1-gemini"));
+        assert!(capture.summary.contains("address review feedback"));
+        assert!(!capture.summary.contains("with extra detail"));
+        let metadata = capture.metadata.expect("metadata present");
+        assert_eq!(metadata["pr_number"], 104);
+        assert_eq!(metadata["head_sha"], "abc123");
+        assert_eq!(metadata["owner"], "leaf-1-gemini");
+        assert_eq!(metadata["branch"], "main.leaf-1");
+    }
+
+    fn memory_test_context() -> crate::effects::EffectContext {
+        crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("leaf-1-gemini").expect("literal is valid"),
+            birth_branch: BirthBranch::try_from_str("main.leaf-1").expect("literal is valid"),
+            working_dir: std::path::PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn spawn_and_resume_captures_append_bounded_records_on_success() {
+        let handler = test_handler();
+        let ctx = memory_test_context();
+
+        let spawned_id = capture_memory(
+            &ctx,
+            handler.ctx.as_ref(),
+            spawned_child_capture("leaf-1-gemini", "gemini", "main.leaf-1", "leaf_subtree"),
+        );
+        assert!(spawned_id.is_some());
+
+        let fix_id = capture_memory(
+            &ctx,
+            handler.ctx.as_ref(),
+            resume_fix_direction_capture(
+                104,
+                "abc123",
+                "leaf-1-gemini",
+                "main.leaf-1",
+                "address review feedback",
+            ),
+        );
+        assert!(fix_id.is_some());
+
+        let records = handler
+            .ctx
+            .session_memory()
+            .list(crate::services::MemoryFilter::default())
+            .expect("list succeeds");
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|r| r.kind == MemoryKind::SpawnedChild));
+        assert!(records.iter().any(|r| r.kind == MemoryKind::FixDirection));
+    }
+
+    #[test]
+    fn spawn_and_resume_captures_are_fail_open_on_append_failure() {
+        let handler = test_handler();
+        let ctx = memory_test_context();
+
+        // An out-of-range importance is rejected by the ledger's append
+        // validation; capture_memory must swallow that failure and return
+        // None rather than surface it to the caller.
+        let mut invalid_spawned =
+            spawned_child_capture("leaf-1-gemini", "gemini", "main.leaf-1", "leaf_subtree");
+        invalid_spawned.importance = 101;
+        assert_eq!(
+            capture_memory(&ctx, handler.ctx.as_ref(), invalid_spawned),
+            None
+        );
+
+        let mut invalid_fix = resume_fix_direction_capture(
+            104,
+            "abc123",
+            "leaf-1-gemini",
+            "main.leaf-1",
+            "address review feedback",
+        );
+        invalid_fix.importance = 101;
+        assert_eq!(
+            capture_memory(&ctx, handler.ctx.as_ref(), invalid_fix),
+            None
+        );
+
+        let records = handler
+            .ctx
+            .session_memory()
+            .list(crate::services::MemoryFilter::default())
+            .expect("list succeeds");
+        assert!(records.is_empty());
     }
 
     fn resume_request() -> SpawnLeafSubtreeRequest {
