@@ -1,5 +1,6 @@
 use crate::effects::{dispatch_merge_pr_effect, EffectResult, MergePrEffects, ResultExt};
 use crate::services::merge_pr;
+use crate::services::{capture_memory, MemoryCapture, MemoryKind};
 use async_trait::async_trait;
 use exomonad_proto::effects::merge_pr::*;
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use tracing::instrument;
 
 use crate::services::{
     HasCiStatusMap, HasEventLog, HasForgejoClient, HasGitWorktreeService, HasProjectDir,
+    HasSessionMemory,
 };
 
 pub struct MergePRHandler<C> {
@@ -19,6 +21,7 @@ impl<
             + HasGitWorktreeService
             + HasProjectDir
             + HasCiStatusMap
+            + HasSessionMemory
             + 'static,
     > MergePRHandler<C>
 {
@@ -34,6 +37,7 @@ impl<
             + HasGitWorktreeService
             + HasProjectDir
             + HasCiStatusMap
+            + HasSessionMemory
             + 'static,
     > crate::effects::EffectHandler for MergePRHandler<C>
 {
@@ -58,6 +62,7 @@ impl<
             + HasGitWorktreeService
             + HasProjectDir
             + HasCiStatusMap
+            + HasSessionMemory
             + 'static,
     > MergePrEffects for MergePRHandler<C>
 {
@@ -115,6 +120,17 @@ impl<
                     }),
                 );
             }
+            capture_memory(
+                ctx,
+                self.ctx.as_ref(),
+                merge_pr_capture(
+                    pr_number.as_u64(),
+                    strategy.as_str(),
+                    "success",
+                    result.git_fetched,
+                    result.branch_name.as_str(),
+                ),
+            );
         } else {
             tracing::info!(
                 otel.name = "pr.merge_failed",
@@ -140,6 +156,30 @@ impl<
             git_fetched: result.git_fetched,
             branch_name: result.branch_name.to_string(),
         })
+    }
+}
+
+fn merge_pr_capture(
+    pr_number: u64,
+    strategy: &str,
+    status: &str,
+    git_fetched: bool,
+    branch_name: &str,
+) -> MemoryCapture {
+    MemoryCapture {
+        issue_id: None,
+        kind: MemoryKind::MergeResult,
+        importance: 80,
+        summary: format!("Merged PR #{pr_number} with {strategy} ({status})"),
+        detail: None,
+        metadata: Some(serde_json::json!({
+            "record_type": "merge_pr",
+            "pr_number": pr_number,
+            "strategy": strategy,
+            "status": status,
+            "git_fetched": git_fetched,
+            "branch": branch_name,
+        })),
     }
 }
 
@@ -195,6 +235,45 @@ mod tests {
         assert!(response.message.contains("42"));
         assert!(response.git_fetched);
         assert_eq!(response.branch_name, "main.fix-auth-gemini");
+    }
+
+    #[test]
+    fn merge_pr_capture_records_merge_result() {
+        let capture = merge_pr_capture(42, "squash", "success", true, "main.fix-auth-codex");
+
+        assert_eq!(capture.kind, MemoryKind::MergeResult);
+        assert!(capture.summary.contains("Merged PR #42"));
+        assert!(capture.summary.contains("squash"));
+        let metadata = capture.metadata.expect("metadata present");
+        assert_eq!(metadata["record_type"], "merge_pr");
+        assert_eq!(metadata["pr_number"], 42);
+        assert_eq!(metadata["strategy"], "squash");
+        assert_eq!(metadata["status"], "success");
+        assert_eq!(metadata["git_fetched"], true);
+        assert_eq!(metadata["branch"], "main.fix-auth-codex");
+    }
+
+    #[test]
+    fn merge_pr_capture_appends_and_remains_fail_open() {
+        let services = Arc::new(Services::test());
+        let ctx = test_ctx();
+        let record_id = capture_memory(
+            &ctx,
+            services.as_ref(),
+            merge_pr_capture(42, "squash", "success", true, "main.fix-auth-codex"),
+        );
+        assert!(record_id.is_some());
+
+        let mut invalid = merge_pr_capture(43, "merge", "success", false, "main.other-codex");
+        invalid.importance = 101;
+        assert_eq!(capture_memory(&ctx, services.as_ref(), invalid), None);
+
+        let records = services
+            .session_memory
+            .list(crate::services::MemoryFilter::default())
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, MemoryKind::MergeResult);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::effects::{
 use crate::services::file_pr::{self, FilePRInput};
 use crate::services::pr_registry::{publish_verified_head, PublishedHead};
 use crate::services::repo;
+use crate::services::{capture_memory, MemoryCapture, MemoryKind};
 use async_trait::async_trait;
 use exomonad_proto::effects::file_pr::*;
 use std::sync::Arc;
@@ -17,7 +18,10 @@ use tracing::instrument;
 
 use crate::services::{
     HasEventLog, HasForgejoClient, HasForgejoReviewerClient, HasGitWorktreeService, HasProjectDir,
+    HasSessionMemory,
 };
+
+const FILE_PR_CAPTURE_TITLE_CHARS: usize = 120;
 
 /// File PR effect handler.
 ///
@@ -33,6 +37,7 @@ impl<
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
+            + HasSessionMemory
             + 'static,
     > FilePRHandler<C>
 {
@@ -48,6 +53,7 @@ impl<
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
+            + HasSessionMemory
             + 'static,
     > EffectHandler for FilePRHandler<C>
 {
@@ -72,6 +78,7 @@ impl<
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
+            + HasSessionMemory
             + 'static,
     > FilePrEffects for FilePRHandler<C>
 {
@@ -183,6 +190,19 @@ impl<
             event_type
         );
 
+        capture_memory(
+            ctx,
+            self.ctx.as_ref(),
+            file_pr_capture(
+                output.pr_number.as_u64(),
+                output.head_branch.as_str(),
+                output.base_branch.as_str(),
+                &output.head_sha,
+                &input.title,
+                output.created,
+            ),
+        );
+
         if let Some(log) = self.ctx.event_log() {
             if let Err(e) = log.append(
                 event_type,
@@ -290,6 +310,43 @@ impl<
             .map(|pr| forgejo_pr_response(&pr))
             .unwrap_or_default())
     }
+}
+
+fn file_pr_capture(
+    pr_number: u64,
+    head_branch: &str,
+    base_branch: &str,
+    head_sha: &str,
+    title: &str,
+    created: bool,
+) -> MemoryCapture {
+    let bounded_title = bounded_single_line(title, FILE_PR_CAPTURE_TITLE_CHARS);
+    let action = if created { "Filed" } else { "Updated" };
+    MemoryCapture {
+        issue_id: None,
+        kind: MemoryKind::SpawnedChild,
+        importance: 70,
+        summary: format!("{action} PR #{pr_number} on {head_branch}: {bounded_title}"),
+        detail: None,
+        metadata: Some(serde_json::json!({
+            "record_type": "file_pr",
+            "pr_number": pr_number,
+            "head_branch": head_branch,
+            "base_branch": base_branch,
+            "head_sha": head_sha,
+            "title": bounded_title,
+            "created": created,
+        })),
+    }
+}
+
+fn bounded_single_line(value: &str, max_chars: usize) -> String {
+    let line = value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("untitled PR");
+    line.chars().take(max_chars).collect()
 }
 
 fn normalized_review_event(event: &str) -> EffectResult<&'static str> {
@@ -414,6 +471,68 @@ mod tests {
         assert_eq!(response.head_branch, "main.fix-auth-gemini");
         assert_eq!(response.base_branch, "main");
         assert!(response.created);
+    }
+
+    #[test]
+    fn file_pr_capture_records_bounded_pr_reference() {
+        let capture = file_pr_capture(
+            42,
+            "main.fix-auth-codex",
+            "main",
+            "abc123",
+            &format!("{}\nraw body should not appear", "x".repeat(180)),
+            true,
+        );
+
+        assert_eq!(capture.kind, MemoryKind::SpawnedChild);
+        assert!(capture.summary.contains("Filed PR #42"));
+        assert!(capture.summary.contains("main.fix-auth-codex"));
+        assert!(!capture.summary.contains("raw body"));
+        let metadata = capture.metadata.expect("metadata present");
+        assert_eq!(metadata["record_type"], "file_pr");
+        assert_eq!(metadata["pr_number"], 42);
+        assert_eq!(metadata["head_branch"], "main.fix-auth-codex");
+        assert_eq!(metadata["base_branch"], "main");
+        assert_eq!(metadata["head_sha"], "abc123");
+        assert_eq!(metadata["created"], true);
+        assert_eq!(metadata["title"].as_str().unwrap().chars().count(), 120);
+    }
+
+    #[test]
+    fn file_pr_capture_appends_and_remains_fail_open() {
+        let services = Arc::new(Services::test());
+        let ctx = test_ctx("main.fix-auth-codex");
+        let record_id = capture_memory(
+            &ctx,
+            services.as_ref(),
+            file_pr_capture(
+                42,
+                "main.fix-auth-codex",
+                "main",
+                "abc123",
+                "Fix auth",
+                true,
+            ),
+        );
+        assert!(record_id.is_some());
+
+        let mut invalid = file_pr_capture(
+            43,
+            "main.fix-auth-codex",
+            "main",
+            "def456",
+            "Fix auth",
+            false,
+        );
+        invalid.importance = 101;
+        assert_eq!(capture_memory(&ctx, services.as_ref(), invalid), None);
+
+        let records = services
+            .session_memory
+            .list(crate::services::MemoryFilter::default())
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, MemoryKind::SpawnedChild);
     }
 
     #[test]

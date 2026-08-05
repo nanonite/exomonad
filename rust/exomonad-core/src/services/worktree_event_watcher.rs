@@ -9,8 +9,9 @@ use crate::services::pr_registry::{
 use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
-    CiStatusMap, HasAgentResolver, HasEventLog, HasEventQueue, HasForgejoClient,
-    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasTeamRegistry, ReviewerSpawner,
+    capture_memory, CiStatusMap, HasAgentResolver, HasEventLog, HasEventQueue, HasForgejoClient,
+    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSessionMemory, HasTeamRegistry,
+    MemoryCapture, MemoryKind, ReviewerSpawner,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -27,6 +28,8 @@ use uuid::Uuid;
 type PluginMap = Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>;
 const DEFAULT_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(600);
+const WATCHER_CAPTURE_TEXT_CHARS: usize = 160;
+const WATCHER_CAPTURE_SHA_CHARS: usize = 80;
 
 fn inbox_poke_message(unread_count: usize) -> String {
     format!(
@@ -114,6 +117,8 @@ struct PendingPrActions {
     agent_type: AgentType,
     agent_name: String,
     agent_role: String,
+    head_sha: String,
+    issue_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -871,6 +876,7 @@ where
         + HasGitWorktreeService
         + HasInboxStore
         + HasProjectDir
+        + HasSessionMemory
         + 'static,
 {
     pub fn new(ctx: Arc<C>) -> Self {
@@ -1817,6 +1823,10 @@ where
                         agent_type,
                         agent_name: agent_name.clone(),
                         agent_role,
+                        head_sha: obs.head_sha.clone(),
+                        issue_id: pr
+                            .chainlink_issue_id
+                            .and_then(|issue_id| i64::try_from(issue_id).ok()),
                     });
                 }
             }
@@ -1854,6 +1864,7 @@ where
 
         for pending in pending_actions {
             for action in pending.actions.iter().cloned() {
+                self.capture_pending_memory(&pending, &action);
                 match action {
                     PendingAction::WasmEvent {
                         event_type,
@@ -2220,6 +2231,22 @@ where
         {
             warn!(pr_number, %error, "Failed to persist parent handoff retry state");
         }
+    }
+
+    fn capture_pending_memory(&self, pending: &PendingPrActions, action: &PendingAction) {
+        let Some(capture) = watcher_action_capture(pending, action) else {
+            return;
+        };
+        let Some(ctx) = watcher_effect_context(pending) else {
+            warn!(
+                pr_number = pending.pr_number,
+                agent_name = %pending.agent_name,
+                branch = %pending.branch,
+                "Skipping watcher memory capture due to invalid owner context"
+            );
+            return;
+        };
+        capture_memory(&ctx, self.ctx.as_ref(), capture);
     }
 
     async fn detect_merged(
@@ -3535,6 +3562,224 @@ fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
     ))
 }
 
+fn watcher_action_capture(
+    pending: &PendingPrActions,
+    action: &PendingAction,
+) -> Option<MemoryCapture> {
+    match action {
+        PendingAction::WasmEvent {
+            event_type,
+            payload,
+        } => watcher_wasm_event_capture(pending, event_type, payload),
+        PendingAction::NotifyParentRepair {
+            head_sha,
+            round,
+            outcome,
+            context,
+        } => watcher_repair_handoff_capture(pending, head_sha, *round, outcome, context),
+        _ => None,
+    }
+}
+
+fn watcher_wasm_event_capture(
+    pending: &PendingPrActions,
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> Option<MemoryCapture> {
+    if event_type == "ci_status" {
+        return watcher_ci_capture(pending, payload);
+    }
+    if event_type != "pr_review" {
+        return None;
+    }
+    if value_str(payload, "kind") == Some("ci_blocked") {
+        return watcher_ci_capture(pending, payload);
+    }
+    watcher_review_capture(pending, payload)
+}
+
+fn watcher_review_capture(
+    pending: &PendingPrActions,
+    payload: &serde_json::Value,
+) -> Option<MemoryCapture> {
+    let kind = value_str(payload, "kind")?;
+    let verdict = review_capture_verdict(kind)?;
+    let pr_number = value_u64(payload, "pr_number").unwrap_or(pending.pr_number);
+    let head_sha = capture_sha(payload, &pending.head_sha);
+    let feedback_summary = review_feedback_summary(kind, payload);
+
+    Some(MemoryCapture {
+        issue_id: pending.issue_id,
+        kind: MemoryKind::ReviewFeedback,
+        importance: 85,
+        summary: format!("Review {verdict} for PR #{pr_number}: {feedback_summary}"),
+        detail: None,
+        metadata: Some(serde_json::json!({
+            "record_type": "watcher_review",
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "verdict": verdict,
+            "event_kind": kind,
+            "branch": bounded_capture_line(pending.branch.as_str(), WATCHER_CAPTURE_TEXT_CHARS),
+            "feedback_summary": feedback_summary,
+        })),
+    })
+}
+
+fn watcher_repair_handoff_capture(
+    pending: &PendingPrActions,
+    head_sha: &str,
+    round: u32,
+    outcome: &str,
+    context: &str,
+) -> Option<MemoryCapture> {
+    let verdict = match outcome {
+        "stuck" => "stuck",
+        "timeout" => "timeout",
+        _ => return None,
+    };
+    let feedback_summary = bounded_capture_line(context, WATCHER_CAPTURE_TEXT_CHARS);
+    let feedback_summary = if feedback_summary.is_empty() {
+        format!("Review handoff outcome {verdict}")
+    } else {
+        feedback_summary
+    };
+
+    Some(MemoryCapture {
+        issue_id: pending.issue_id,
+        kind: MemoryKind::ReviewFeedback,
+        importance: 85,
+        summary: format!(
+            "Review {verdict} for PR #{}: {feedback_summary}",
+            pending.pr_number
+        ),
+        detail: None,
+        metadata: Some(serde_json::json!({
+            "record_type": "watcher_review",
+            "pr_number": pending.pr_number,
+            "head_sha": head_sha.chars().take(WATCHER_CAPTURE_SHA_CHARS).collect::<String>(),
+            "verdict": verdict,
+            "event_kind": outcome,
+            "round": round,
+            "branch": bounded_capture_line(pending.branch.as_str(), WATCHER_CAPTURE_TEXT_CHARS),
+            "feedback_summary": feedback_summary,
+        })),
+    })
+}
+
+fn watcher_ci_capture(
+    pending: &PendingPrActions,
+    payload: &serde_json::Value,
+) -> Option<MemoryCapture> {
+    let status = value_str(payload, "status").or_else(|| value_str(payload, "ci_status"))?;
+    let pr_number = value_u64(payload, "pr_number").unwrap_or(pending.pr_number);
+    let branch = value_str(payload, "branch").unwrap_or(pending.branch.as_str());
+    let head_sha = capture_sha(payload, &pending.head_sha);
+    let diagnosis = ci_diagnosis(status, payload);
+
+    Some(MemoryCapture {
+        issue_id: pending.issue_id,
+        kind: MemoryKind::CiResult,
+        importance: 75,
+        summary: format!("CI {status} for PR #{pr_number} on {branch}: {diagnosis}"),
+        detail: None,
+        metadata: Some(serde_json::json!({
+            "record_type": "watcher_ci",
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "status": bounded_capture_line(status, WATCHER_CAPTURE_TEXT_CHARS),
+            "branch": bounded_capture_line(branch, WATCHER_CAPTURE_TEXT_CHARS),
+            "diagnosis": diagnosis,
+            "merge_blocked_on_ci": payload
+                .get("merge_blocked_on_ci")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            "merge_ready": payload
+                .get("merge_ready")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        })),
+    })
+}
+
+fn watcher_effect_context(pending: &PendingPrActions) -> Option<crate::effects::EffectContext> {
+    Some(crate::effects::EffectContext {
+        agent_name: AgentName::try_from_str(pending.agent_name.as_str()).ok()?,
+        birth_branch: BirthBranch::try_from_str(pending.branch.as_str()).ok()?,
+        working_dir: crate::services::agent_control::resolve_working_dir(pending.branch.as_str()),
+    })
+}
+
+fn review_capture_verdict(kind: &str) -> Option<&'static str> {
+    match kind {
+        "review_received" | "reviewer_requested_changes" => Some("changes_requested"),
+        "review_commented" => Some("commented"),
+        "approved" | "reviewer_approved" => Some("approved"),
+        "timeout" => Some("timeout"),
+        "stuck" => Some("stuck"),
+        _ => None,
+    }
+}
+
+fn review_feedback_summary(kind: &str, payload: &serde_json::Value) -> String {
+    let fallback = match kind {
+        "approved" | "reviewer_approved" => "Reviewer approved the verified head",
+        "review_received" | "reviewer_requested_changes" => {
+            "Reviewer requested changes on the verified head"
+        }
+        "review_commented" => "Reviewer commented on the verified head",
+        "timeout" => "Review timed out before a terminal verdict",
+        "stuck" => "Review loop stopped without convergence",
+        _ => "Review event observed for the verified head",
+    };
+    value_str(payload, "comments")
+        .map(|comments| bounded_capture_line(comments, WATCHER_CAPTURE_TEXT_CHARS))
+        .filter(|comments| !comments.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn ci_diagnosis(status: &str, payload: &serde_json::Value) -> String {
+    let merge_blocked = payload
+        .get("merge_blocked_on_ci")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let merge_ready = payload
+        .get("merge_ready")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    match (status, merge_blocked, merge_ready) {
+        ("failure", true, _) => "CI failed and is blocking merge".to_string(),
+        ("failure", false, _) => "CI failed for the verified PR head".to_string(),
+        ("success" | "neutral", _, true) => {
+            "CI is mergeable and reviewer approval is present".to_string()
+        }
+        ("success" | "neutral", _, false) => "CI is mergeable for the verified PR head".to_string(),
+        ("pending", _, _) => "CI is still running for the verified PR head".to_string(),
+        ("unknown", _, _) => "CI status is unknown for the verified PR head".to_string(),
+        _ => "CI status changed for the verified PR head".to_string(),
+    }
+}
+
+fn capture_sha(payload: &serde_json::Value, fallback: &str) -> String {
+    value_str(payload, "review_sha")
+        .or_else(|| value_str(payload, "head_sha"))
+        .unwrap_or(fallback)
+        .chars()
+        .take(WATCHER_CAPTURE_SHA_CHARS)
+        .collect()
+}
+
+fn bounded_capture_line(value: &str, max_chars: usize) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 fn format_review_message(comments: &[ForgejoReviewComment], reviews: &[ForgejoReview]) -> String {
     let mut msg = String::new();
 
@@ -3904,6 +4149,174 @@ mod tests {
             commit_id: None,
         }
     }
+
+    fn test_pending_pr_actions() -> PendingPrActions {
+        PendingPrActions {
+            pr_number: 42,
+            actions: Vec::new(),
+            branch: BranchName::try_from_str("main.feat-gemini")
+                .expect("literal validated string is non-empty"),
+            agent_type: AgentType::Gemini,
+            agent_name: "feat-gemini".to_string(),
+            agent_role: "dev".to_string(),
+            head_sha: "abc123".to_string(),
+            issue_id: Some(632),
+        }
+    }
+
+    #[test]
+    fn watcher_review_capture_records_bounded_feedback() {
+        let pending = test_pending_pr_actions();
+        let action = PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": "review_received",
+                "pr_number": 42,
+                "comments": format!("{}\nraw second line must not appear", "x".repeat(220)),
+            }),
+        };
+
+        let capture = watcher_action_capture(&pending, &action).expect("review capture");
+
+        assert_eq!(capture.issue_id, Some(632));
+        assert_eq!(capture.kind, MemoryKind::ReviewFeedback);
+        assert!(capture
+            .summary
+            .contains("Review changes_requested for PR #42"));
+        assert!(!capture.summary.contains("raw second line"));
+        let metadata = capture.metadata.expect("metadata present");
+        assert_eq!(metadata["record_type"], "watcher_review");
+        assert_eq!(metadata["pr_number"], 42);
+        assert_eq!(metadata["head_sha"], "abc123");
+        assert_eq!(metadata["verdict"], "changes_requested");
+        assert_eq!(metadata["event_kind"], "review_received");
+        assert_eq!(metadata["branch"], "main.feat-gemini");
+        assert_eq!(
+            metadata["feedback_summary"]
+                .as_str()
+                .expect("feedback summary string")
+                .chars()
+                .count(),
+            WATCHER_CAPTURE_TEXT_CHARS
+        );
+    }
+
+    #[test]
+    fn watcher_ci_capture_records_bounded_diagnosis() {
+        let pending = test_pending_pr_actions();
+        let action = PendingAction::WasmEvent {
+            event_type: "ci_status",
+            payload: serde_json::json!({
+                "pr_number": 42,
+                "status": "failure",
+                "branch": "main.feat-gemini",
+                "merge_blocked_on_ci": true,
+                "merge_ready": false,
+            }),
+        };
+
+        let capture = watcher_action_capture(&pending, &action).expect("ci capture");
+
+        assert_eq!(capture.kind, MemoryKind::CiResult);
+        assert!(capture.summary.contains("CI failure for PR #42"));
+        let metadata = capture.metadata.expect("metadata present");
+        assert_eq!(metadata["record_type"], "watcher_ci");
+        assert_eq!(metadata["pr_number"], 42);
+        assert_eq!(metadata["head_sha"], "abc123");
+        assert_eq!(metadata["status"], "failure");
+        assert_eq!(metadata["diagnosis"], "CI failed and is blocking merge");
+        assert_eq!(metadata["merge_blocked_on_ci"], true);
+    }
+
+    #[test]
+    fn watcher_ci_blocked_pr_review_event_records_ci_result() {
+        let pending = test_pending_pr_actions();
+        let action = PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": "ci_blocked",
+                "pr_number": 42,
+                "ci_status": "failure",
+                "branch": "main.feat-gemini",
+            }),
+        };
+
+        let capture = watcher_action_capture(&pending, &action).expect("ci blocked capture");
+
+        assert_eq!(capture.kind, MemoryKind::CiResult);
+        let metadata = capture.metadata.expect("metadata present");
+        assert_eq!(metadata["status"], "failure");
+        assert_eq!(metadata["diagnosis"], "CI failed for the verified PR head");
+    }
+
+    #[test]
+    fn watcher_timeout_handoff_records_review_feedback() {
+        let pending = test_pending_pr_actions();
+        let action = PendingAction::NotifyParentRepair {
+            head_sha: "abc123".to_string(),
+            round: 2,
+            outcome: "timeout".to_string(),
+            context: format!("{}\nraw second line must not appear", "t".repeat(220)),
+        };
+
+        let capture = watcher_action_capture(&pending, &action).expect("timeout capture");
+
+        assert_eq!(capture.kind, MemoryKind::ReviewFeedback);
+        assert!(capture.summary.contains("Review timeout for PR #42"));
+        assert!(!capture.summary.contains("raw second line"));
+        let metadata = capture.metadata.expect("metadata present");
+        assert_eq!(metadata["verdict"], "timeout");
+        assert_eq!(metadata["event_kind"], "timeout");
+        assert_eq!(metadata["round"], 2);
+        assert_eq!(
+            metadata["feedback_summary"]
+                .as_str()
+                .expect("feedback summary string")
+                .chars()
+                .count(),
+            WATCHER_CAPTURE_TEXT_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_capture_appends_and_remains_fail_open() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        let services = Arc::new(services);
+        let watcher = WorktreeEventWatcher::new(services.clone());
+        let pending = test_pending_pr_actions();
+        let action = PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": "review_commented",
+                "pr_number": 42,
+                "comments": "Consider tightening the assertion",
+            }),
+        };
+
+        watcher.capture_pending_memory(&pending, &action);
+
+        let mut invalid = watcher_action_capture(&pending, &action).expect("review capture");
+        invalid.importance = 101;
+        assert_eq!(
+            capture_memory(
+                &watcher_effect_context(&pending).expect("valid watcher context"),
+                services.as_ref(),
+                invalid,
+            ),
+            None
+        );
+
+        let records = services
+            .session_memory
+            .list(crate::services::MemoryFilter::default())
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, MemoryKind::ReviewFeedback);
+        assert_eq!(records[0].issue_id, Some(632));
+    }
+
     // ---------------------------------------------------------------------------
     // compute_pr_actions tests
     // ---------------------------------------------------------------------------
