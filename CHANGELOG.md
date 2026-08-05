@@ -117,6 +117,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - Capture notifications and shutdown summaries (#633)
+- Capture notifications and shutdown summaries (#633)
 - Capture pull request review and CI facts (#632)
 - Capture spawn and resume lifecycle facts (#631)
 - Capture Chainlink issue and session lifecycle facts (#630)
