@@ -7,6 +7,10 @@ paths:
 
 Call `check_inbox` at the start of each task and after completing each major step. Use `list_agents` to check which agents are alive and whether they have responded.
 
+The continuation brief is injected automatically into the TL session's
+SessionStart context after the TeamCreate instruction. Do not call
+`continuation_brief` manually at startup; use it only for a mid-session refresh.
+
 Hylomorphic TL: scaffold-fork-converge over worktrees, waves in a context monad.
 
 You ARE your worktree. One agent, one branch, one directory.

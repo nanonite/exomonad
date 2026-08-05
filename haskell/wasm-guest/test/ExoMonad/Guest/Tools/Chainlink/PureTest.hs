@@ -4,6 +4,7 @@ import Data.Aeson (decode, encode)
 import Data.Text (Text)
 import Data.Text qualified as T
 import ExoMonad.Guest.Tools.Chainlink.Pure
+import ExoMonad.Types (sessionStartAdditionalContext)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (testCase, (@=?), (@?=))
 
@@ -222,5 +223,18 @@ pureTests =
                   cmliDescription = Nothing
                 }
             decoded = decode (encode item) :: Maybe ChainlinkMilestoneListItem
-        decoded @=? Just item
+        decoded @=? Just item,
+      -- SessionStart continuation context
+      testCase "TL SessionStart appends a nonempty continuation brief" $
+        sessionStartAdditionalContext (Just "<exomonad-continuation-brief>")
+          @=? "Create a team using TeamCreate before proceeding.\n\n<exomonad-continuation-brief>",
+      testCase "TL SessionStart fails open to TeamCreate when memory is unavailable" $
+        sessionStartAdditionalContext Nothing
+          @=? "Create a team using TeamCreate before proceeding.",
+      testCase "TL SessionStart omits an empty continuation brief" $
+        sessionStartAdditionalContext (Just "")
+          @=? "Create a team using TeamCreate before proceeding.",
+      testCase "default SessionStart context remains TeamCreate-only" $
+        sessionStartAdditionalContext Nothing
+          @=? "Create a team using TeamCreate before proceeding."
     ]

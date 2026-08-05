@@ -79,7 +79,7 @@ import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodex
 import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
 import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
-import ExoMonad.Types (Effects, HookConfig (..), defaultSessionStartHook, teamRegistrationPostToolUse)
+import ExoMonad.Types (Effects, HookConfig (..), teamRegistrationPostToolUse, tlSessionStartHook)
 import HookPolicy (preToolUseWithImplementationBlock)
 import PRReviewHandler (tlPRReviewEventHandlers)
 import TLPhase (ChildHandle (..), TLEvent (..), TLPhase (..))
@@ -294,7 +294,7 @@ config =
             postToolUse = teamRegistrationPostToolUse,
             onStop = \_ -> pure allowStopResponse,
             onSubagentStop = \_ -> pure allowStopResponse,
-            onSessionStart = defaultSessionStartHook,
+            onSessionStart = tlSessionStartHook,
             beforeModel = \_ -> pure (BeforeModelAllow Nothing),
             afterModel = \_ -> pure (AfterModelAllow Nothing)
           },

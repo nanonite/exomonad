@@ -13,6 +13,8 @@ module ExoMonad.Types
     ChainlinkDbPathState (..),
     validateChainlinkDbEnv,
     defaultSessionStartHook,
+    tlSessionStartHook,
+    sessionStartAdditionalContext,
     teamRegistrationPostToolUse,
     andThenPostToolUse,
   )
@@ -29,6 +31,7 @@ import Data.Text.Lazy qualified as TL
 import ExoMonad.Effects.KV (CleanupStalePhasesRequest (..), KVCleanupStalePhases)
 import ExoMonad.Effects.Log (LogError, LogInfo)
 import ExoMonad.Effects.Log qualified as Log
+import ExoMonad.Effects.Memory qualified as Memory
 import ExoMonad.Effects.Session qualified as Session
 import ExoMonad.Guest.Effects.FileSystem qualified as FS
 import ExoMonad.Guest.Events (EventHandlerConfig, defaultEventHandlers)
@@ -163,6 +166,40 @@ checkChainlinkDbEnv hookInput =
       issuesState <- readPathState (T.pack (T.unpack dbPath </> "issues.db"))
       pure $ validateChainlinkDbEnv (Just dbPath) dbState issuesState
 
+teamCreateInstruction :: Text
+teamCreateInstruction = "Create a team using TeamCreate before proceeding."
+
+-- | Run the shared SessionStart validation and registration prologue.
+sessionStartPrologue :: HookInput -> Eff Effects (Either Text ())
+sessionStartPrologue hookInput = do
+  chainlinkDbCheck <- checkChainlinkDbEnv hookInput
+  case chainlinkDbCheck of
+    Left message -> pure $ Left message
+    Right () -> do
+      let claudeUuid = case hiTranscriptPath hookInput >>= extractUuidFromTranscriptPath of
+            Just uuid -> uuid
+            Nothing -> hiSessionId hookInput
+      void $
+        suspendEffect_ @Session.SessionRegisterClaudeId
+          (Session.RegisterClaudeSessionRequest {Session.registerClaudeSessionRequestClaudeSessionId = TL.fromStrict claudeUuid})
+      void $ suspendEffect_ @KVCleanupStalePhases (CleanupStalePhasesRequest {})
+      pure $ Right ()
+
+sessionStartAllowResponse :: Text -> HookOutput
+sessionStartAllowResponse context =
+  HookOutput
+    { continue_ = True,
+      stopReason = Nothing,
+      suppressOutput = Nothing,
+      systemMessage = Nothing,
+      hookSpecificOutput = Just $ SessionStartOutput {ssAdditionalContext = Just context}
+    }
+
+sessionStartAdditionalContext :: Maybe Text -> Text
+sessionStartAdditionalContext maybeBrief = case maybeBrief of
+  Just brief | not (T.null brief) -> teamCreateInstruction <> "\n\n" <> brief
+  _ -> teamCreateInstruction
+
 -- | Default SessionStart hook: first validates the Chainlink DB anchor, then
 -- registers Claude conversation UUID and instructs Claude to create a team.
 -- Team name registration happens in PostToolUse (teamRegistrationPostToolUse)
@@ -173,26 +210,33 @@ checkChainlinkDbEnv hookInput =
 -- to the .jsonl file needed for --resume --fork-session.
 defaultSessionStartHook :: HookInput -> Eff Effects HookOutput
 defaultSessionStartHook hookInput = do
-  chainlinkDbCheck <- checkChainlinkDbEnv hookInput
-  case chainlinkDbCheck of
+  prologue <- sessionStartPrologue hookInput
+  case prologue of
+    Left message -> pure $ sessionStartDenyResponse message
+    Right () -> pure $ sessionStartAllowResponse teamCreateInstruction
+
+-- | Root/TL SessionStart hook. The continuation brief is optional: a missing
+-- or failed memory effect leaves the existing team-creation instruction
+-- intact so a degraded memory service cannot prevent session startup.
+tlSessionStartHook :: HookInput -> Eff Effects HookOutput
+tlSessionStartHook hookInput = do
+  prologue <- sessionStartPrologue hookInput
+  case prologue of
     Left message -> pure $ sessionStartDenyResponse message
     Right () -> do
-      let claudeUuid = case hiTranscriptPath hookInput >>= extractUuidFromTranscriptPath of
-            Just uuid -> uuid
-            Nothing -> hiSessionId hookInput
-      void $
-        suspendEffect_ @Session.SessionRegisterClaudeId
-          (Session.RegisterClaudeSessionRequest {Session.registerClaudeSessionRequestClaudeSessionId = TL.fromStrict claudeUuid})
-      void $ suspendEffect_ @KVCleanupStalePhases (CleanupStalePhasesRequest {})
-      let instruction = "Create a team using TeamCreate before proceeding."
-      pure $
-        HookOutput
-          { continue_ = True,
-            stopReason = Nothing,
-            suppressOutput = Nothing,
-            systemMessage = Nothing,
-            hookSpecificOutput = Just $ SessionStartOutput {ssAdditionalContext = Just instruction}
-          }
+      briefResult <- suspendEffect @Memory.MemoryBrief Memory.MemoryBriefRequest
+      maybeBrief <- case briefResult of
+        Left err -> do
+          void $
+            suspendEffect_ @Log.LogError
+              ( Log.ErrorRequest
+                  { Log.errorRequestMessage = TL.fromStrict $ "[SessionStart] memory.brief failed: " <> T.pack (show err),
+                    Log.errorRequestFields = ""
+                  }
+              )
+          pure Nothing
+        Right response -> pure $ Just (TL.toStrict (Memory.memoryBriefResponseMarkdown response))
+      pure $ sessionStartAllowResponse (sessionStartAdditionalContext maybeBrief)
 
 -- | PostToolUse hook that registers the team after TeamCreate completes.
 -- Extracts the auto-generated team name from TeamCreate's tool_response

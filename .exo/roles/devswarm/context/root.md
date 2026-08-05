@@ -7,6 +7,10 @@ paths:
 
 Call `check_inbox` at the start of each task and after completing each major step. Use `list_agents` to check which agents are alive and whether they have responded.
 
+The continuation brief is injected automatically into the root session's
+SessionStart context after the TeamCreate instruction. Do not call
+`continuation_brief` manually at startup; use it only for a mid-session refresh.
+
 ## Idle / Shutdown Convergence
 
 If `check_inbox` returns empty 20 times in a row with no new work spawned, call `has_pending_work`. If it reports no open issues and no live agents, call `shutdown_server` and stop - the run is complete. If it reports pending work, reset your counter and continue idling normally. Do not busy-loop calling `check_inbox`. The counter is in-context only; do not add state or config for it.

@@ -497,8 +497,10 @@ Claude Code → exomonad hook pre-tool-use (reads stdin JSON)
 **Session Start:**
 ```
 Claude Code starts → exomonad hook session-start
-→ WASM yields SessionRegister effect with claude_session_id
+→ WASM validates CHAINLINK_DB and yields SessionRegister plus stale-phase cleanup effects
 → Server stores in ClaudeSessionRegistry
+→ root/TL WASM hooks yield memory.brief and append a nonempty continuation brief
+  after the TeamCreate instruction; unavailable memory fails open with the instruction alone
 → fork_wave uses this ID for --fork-session
 ```
 
