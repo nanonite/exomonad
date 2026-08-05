@@ -50,6 +50,7 @@ Handlers and delivery functions are generic over a context `C` bounded by capabi
 |-------|----------|
 | `HasTeamRegistry` | `&TeamRegistry` |
 | `HasAgentResolver` | `&AgentResolver` |
+| `HasSessionMemory` | `&SessionMemoryService` |
 | `HasEventQueue` | `&EventQueue` |
 | `HasEventLog` | `Option<&EventLog>` |
 | `HasProjectDir` | `&Path` |
@@ -124,6 +125,16 @@ Durable inbox writes canonicalize recipient keys at the single `record_inbox_del
 This asymmetry is intentional — only the `notify_parent` relationship has a well-defined parent to resolve. Both paths fail loudly rather than orphan a message under the literal key.
 
 `check_inbox` resolves a bare agent key through the `AgentResolver` slug table before exact-name fallback. This lets a root context whose runtime identity is `root` drain mail stored under the canonical suffixed agent name such as `root-claude`, preventing unread poke loops.
+
+### Session memory ledger
+
+`SessionMemoryService` is the append-only SQLite ledger for durable semantic
+session facts. It lives at `.exo/memory.db`, uses the same `Mutex<Connection>`
+and migration lifecycle as `InboxStore`, and exposes typed append, filtered list,
+and latest-by-kind reads. `MemoryKind` is a closed enum; unknown stored values
+fail during decoding, while append validation rejects invalid summaries, detail
+sizes, importance values, and predecessor references. There are no update or
+delete APIs; tests may use the test-only `clear_all` helper.
 
 ## Agent Resume and Liveness Contract
 

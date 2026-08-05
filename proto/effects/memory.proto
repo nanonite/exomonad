@@ -69,3 +69,8 @@ message MemoryListRequest {
 message MemoryListResponse {
   repeated MemoryRecord records = 1;
 }
+
+service MemoryEffects {
+  rpc Append(MemoryAppendRequest) returns (MemoryAppendResponse);
+  rpc List(MemoryListRequest) returns (MemoryListResponse);
+}

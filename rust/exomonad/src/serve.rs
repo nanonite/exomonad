@@ -1118,6 +1118,9 @@ Run `exomonad recompile` first to build it.",
     let agent_resolver =
         Arc::new(exomonad_core::services::AgentResolver::load(project_dir.clone()).await);
     let inbox_store = Arc::new(exomonad_core::services::InboxStore::open(&project_dir)?);
+    let session_memory = Arc::new(exomonad_core::services::SessionMemoryService::open(
+        &project_dir,
+    )?);
 
     // JSONL event log (parallel to OTel span events, queryable via DuckDB/kaizen)
     let event_log = match exomonad_core::services::EventLog::open(project_dir.join(".exo/logs")) {
@@ -1158,6 +1161,7 @@ Run `exomonad recompile` first to build it.",
         claude_session_registry,
         agent_resolver: agent_resolver.clone(),
         inbox_store: inbox_store.clone(),
+        session_memory: session_memory.clone(),
         event_queue: event_queue.clone(),
         mutex_registry,
         git_wt,
@@ -1367,6 +1371,7 @@ Run `exomonad recompile` first to build it.",
         run_id: run_id.clone(),
         agent_resolver: agent_resolver.clone(),
         inbox_store: inbox_store.clone(),
+        session_memory,
     };
 
     let forgejo_ci_state = exomonad_core::services::forgejo_ci::ForgejoCiWebhookState {

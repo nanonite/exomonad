@@ -29,6 +29,7 @@ pub mod repo;
 pub mod resilience;
 pub mod review_policy;
 pub mod secrets;
+mod session_memory;
 pub mod supervisor_registry;
 pub mod synthetic_members;
 pub mod tmux_events;
@@ -51,6 +52,9 @@ pub use self::github::GitHubClient;
 pub use self::inbox_store::{InboxMessageRecord, InboxPokeCandidate, InboxStore};
 pub use self::mutex_registry::MutexRegistry;
 pub use self::secrets::Secrets;
+pub use self::session_memory::{
+    MemoryFilter, MemoryKind, MemoryRecordRow, NewMemoryRecord, SessionMemoryService,
+};
 pub use self::supervisor_registry::SupervisorRegistry;
 pub use self::worktree_event_watcher::WatcherRuntimeState;
 use claude_teams_bridge::TeamRegistry;
@@ -70,6 +74,9 @@ pub trait HasAgentResolver: Send + Sync {
 }
 pub trait HasInboxStore: Send + Sync {
     fn inbox_store(&self) -> &Arc<InboxStore>;
+}
+pub trait HasSessionMemory: Send + Sync {
+    fn session_memory(&self) -> &Arc<SessionMemoryService>;
 }
 pub trait HasEventQueue: Send + Sync {
     fn event_queue(&self) -> &EventQueue;
@@ -158,6 +165,7 @@ pub struct Services {
     pub claude_session_registry: Arc<ClaudeSessionRegistry>,
     pub agent_resolver: Arc<AgentResolver>,
     pub inbox_store: Arc<InboxStore>,
+    pub session_memory: Arc<SessionMemoryService>,
     pub event_queue: Arc<EventQueue>,
     pub mutex_registry: Arc<MutexRegistry>,
     pub git_wt: Arc<GitWorktreeService>,
@@ -191,6 +199,11 @@ impl HasAgentResolver for Services {
 impl HasInboxStore for Services {
     fn inbox_store(&self) -> &Arc<InboxStore> {
         &self.inbox_store
+    }
+}
+impl HasSessionMemory for Services {
+    fn session_memory(&self) -> &Arc<SessionMemoryService> {
+        &self.session_memory
     }
 }
 impl HasEventQueue for Services {
@@ -269,6 +282,7 @@ impl Services {
             claude_session_registry: Arc::new(ClaudeSessionRegistry::new()),
             agent_resolver: Arc::new(AgentResolver::empty()),
             inbox_store: Arc::new(InboxStore::open_in_memory().unwrap()),
+            session_memory: Arc::new(SessionMemoryService::open_in_memory().unwrap()),
             event_queue: Arc::new(EventQueue::new()),
             mutex_registry: Arc::new(MutexRegistry::new()),
             git_wt: Arc::new(GitWorktreeService::new(PathBuf::from("."))),
