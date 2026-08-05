@@ -136,6 +136,22 @@ fail during decoding, while append validation rejects invalid summaries, detail
 sizes, importance values, and predecessor references. There are no update or
 delete APIs; tests may use the test-only `clear_all` helper.
 
+### Continuation adapters
+
+`services/continuation/adapters.rs` gathers typed state for the continuation
+brief. `ChainlinkAdapter` shells out through `chainlink --json` with
+`CHAINLINK_DB` set to the current project's `.chainlink/issues.db`; it never
+opens Chainlink's database directly. `InboxAdapter` reads unread counts and
+last-check timestamps without calling notification-draining APIs.
+
+`AgentAdapter` obtains the discovered agent list from `AgentControlService` and
+uses the shared `resolve_agent_liveness` predicate from `AgentHandler`, so
+tmux presence, retirement markers, and delivery-target requirements stay in one
+place. `ForgejoAdapter` returns an explicit unavailable section when Forgejo is
+not configured or a source call fails. Every adapter uses `SectionData`, whose
+only outcomes are `Available` and `Unavailable { reason }`; an empty successful
+source is still `Available(vec![])`.
+
 ## Agent Resume and Liveness Contract
 
 - A successful resume of an already-live PR owner refreshes `.exo/agents/{agent}/last_activity_at` without rewriting `routing.json` or identity metadata.

@@ -5,6 +5,7 @@ pub mod agent_resources;
 pub mod claude_session_registry;
 pub mod command;
 pub mod complexity_classifier;
+pub mod continuation;
 pub mod delivery;
 pub mod event_log;
 pub mod event_queue;
