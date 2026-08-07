@@ -426,6 +426,14 @@ e2e-chainlink-env-failsafe:
 check-e2e-chainlink-env-failsafe:
     bash -n tests/e2e/chainlink-env-failsafe/run.sh
 
+# Run live continuation-brief root SessionStart E2E
+e2e-continuation-brief:
+    ./tests/e2e/continuation-brief/run.sh
+
+# Check continuation-brief E2E harness without launching the server
+check-e2e-continuation-brief:
+    bash -n tests/e2e/continuation-brief/run.sh
+
 # Check Chainlink timer/session role scoping without launching agents
 check-e2e-chainlink-timer-role-scope:
     bash -n tests/e2e/chainlink-timer-role-scope/validate.sh
