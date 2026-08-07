@@ -283,6 +283,7 @@ fn service_kind(value: i32) -> EffectResult<MemoryKind> {
         ProtoMemoryKind::NextAction => MemoryKind::NextAction,
         ProtoMemoryKind::HumanClarification => MemoryKind::HumanClarification,
         ProtoMemoryKind::SessionSummary => MemoryKind::SessionSummary,
+        ProtoMemoryKind::TurnEnd => MemoryKind::TurnEnd,
     })
 }
 
@@ -302,6 +303,7 @@ fn proto_kind(kind: MemoryKind) -> i32 {
         MemoryKind::NextAction => ProtoMemoryKind::NextAction as i32,
         MemoryKind::HumanClarification => ProtoMemoryKind::HumanClarification as i32,
         MemoryKind::SessionSummary => ProtoMemoryKind::SessionSummary as i32,
+        MemoryKind::TurnEnd => ProtoMemoryKind::TurnEnd as i32,
     }
 }
 
@@ -394,6 +396,14 @@ mod tests {
         let response = MemoryListResponse::decode(list.as_slice()).unwrap();
         assert_eq!(response.records.len(), 1);
         assert_eq!(response.records[0].summary, "recorded decision");
+    }
+
+    #[test]
+    fn turn_end_kind_round_trips_through_wire_mapping() {
+        assert_eq!(
+            service_kind(proto_kind(crate::services::MemoryKind::TurnEnd)).unwrap(),
+            crate::services::MemoryKind::TurnEnd
+        );
     }
 
     #[tokio::test]

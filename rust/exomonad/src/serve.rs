@@ -13,7 +13,10 @@ use axum::{
     Json, Router,
 };
 use exomonad_core::protocol::Runtime as HookRuntime;
-use exomonad_core::services::{git, tmux_events, HasGitWorktreeService};
+use exomonad_core::services::{
+    capture_memory, git, tmux_events, HasGitWorktreeService, MemoryCapture, MemoryFilter,
+    MemoryKind,
+};
 use exomonad_core::{
     AgentName, BirthBranch, ClaudePreToolUseOutput, HookEnvelope, HookEventType, HookInput,
     InternalAfterModelOutput, InternalBeforeModelOutput, InternalStopHookOutput, PluginManager,
@@ -109,10 +112,200 @@ pub struct HookState {
     pub plugins: Arc<tokio::sync::RwLock<HashMap<AgentName, Arc<PluginManager>>>>,
     pub registry: Arc<exomonad_core::effects::EffectRegistry>,
     pub wasm_path: PathBuf,
+    pub project_dir: PathBuf,
     pub tmux_session: String,
     pub default_role: Role,
     pub event_log: Option<Arc<exomonad_core::services::EventLog>>,
     pub agent_resolver: Arc<exomonad_core::services::AgentResolver>,
+    pub inbox_store: Arc<exomonad_core::services::InboxStore>,
+    pub session_memory: Arc<exomonad_core::services::SessionMemoryService>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnEndCounts {
+    backlog_ready_count: usize,
+    pending_children: usize,
+    unread_inbox: usize,
+}
+
+fn parse_ready_count(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| line.trim_start().starts_with('#'))
+        .count()
+}
+
+async fn query_ready_count(project_dir: &StdPath, chainlink_db: Option<&str>) -> usize {
+    let default_db = project_dir.join(".chainlink");
+    let db_path = chainlink_db.map(PathBuf::from).unwrap_or(default_db);
+    let output = tokio::process::Command::new("chainlink")
+        .args(["ready"])
+        .current_dir(project_dir)
+        .env("CHAINLINK_DB", db_path)
+        .output()
+        .await;
+
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_ready_count(&String::from_utf8_lossy(&output.stdout))
+        }
+        Ok(output) => {
+            warn!(status = ?output.status.code(), "TurnEnd ready-count query failed; using zero");
+            0
+        }
+        Err(error) => {
+            warn!(error = %error, "TurnEnd ready-count query could not start; using zero");
+            0
+        }
+    }
+}
+
+fn pending_child_count(
+    records: &[exomonad_core::services::AgentIdentityRecord],
+    agent_name: &AgentName,
+    birth_branch: &BirthBranch,
+) -> usize {
+    records
+        .iter()
+        .filter(|record| record.agent_name != *agent_name && record.parent_branch == *birth_branch)
+        .count()
+}
+
+fn latest_memory_was_spawned(
+    memory: &exomonad_core::services::SessionMemoryService,
+    agent_name: &AgentName,
+) -> bool {
+    memory
+        .list(MemoryFilter {
+            agent_id: Some(agent_name.to_string()),
+            ..Default::default()
+        })
+        .ok()
+        .and_then(|records| records.last().map(|record| record.kind))
+        == Some(MemoryKind::SpawnedChild)
+}
+
+fn asked_human(input: &HookInput, output: &InternalStopHookOutput) -> bool {
+    input
+        .reason
+        .as_deref()
+        .into_iter()
+        .chain(output.reason.as_deref())
+        .any(|reason| {
+            let reason = reason.to_ascii_lowercase();
+            reason.contains("human")
+                || reason.contains("clarif")
+                || reason.contains("asked for")
+                || reason.contains("ask the")
+                || reason.contains("request")
+        })
+}
+
+fn turn_end_reason(
+    event_type: HookEventType,
+    runtime: HookRuntime,
+    input: &HookInput,
+    output: &InternalStopHookOutput,
+    counts: TurnEndCounts,
+    spawned_child: bool,
+) -> &'static str {
+    if runtime == HookRuntime::Codex || event_type == HookEventType::SubagentStop {
+        return "exited";
+    }
+    if asked_human(input, output) {
+        return "asked_human";
+    }
+    if counts.backlog_ready_count > 0 && spawned_child {
+        return "spawned_and_idle";
+    }
+    if counts.pending_children > 0 {
+        return "waiting_on_children";
+    }
+    if counts.backlog_ready_count > 0 {
+        return "stopped_backlog_nonempty";
+    }
+    "asked_human"
+}
+
+async fn collect_turn_end_counts(
+    state: &HookState,
+    agent_name: &AgentName,
+    birth_branch: &BirthBranch,
+    chainlink_db: Option<&str>,
+) -> TurnEndCounts {
+    let backlog_ready_count = query_ready_count(&state.project_dir, chainlink_db).await;
+    let records = state.agent_resolver.all().await;
+    let pending_children = pending_child_count(&records, agent_name, birth_branch);
+    let unread_inbox = state
+        .inbox_store
+        .unread_count(agent_name.as_str())
+        .unwrap_or_else(|error| {
+            warn!(agent = %agent_name, error = %error, "TurnEnd inbox count failed; using zero");
+            0
+        });
+    TurnEndCounts {
+        backlog_ready_count,
+        pending_children,
+        unread_inbox,
+    }
+}
+
+async fn emit_turn_end_memory(
+    params: &HookQueryParams,
+    state: &HookState,
+    input: &HookInput,
+    output: &InternalStopHookOutput,
+    agent_name: &AgentName,
+    birth_branch: &BirthBranch,
+) {
+    let counts = collect_turn_end_counts(
+        state,
+        agent_name,
+        birth_branch,
+        params.chainlink_db.as_deref(),
+    )
+    .await;
+    let spawned_child = latest_memory_was_spawned(&state.session_memory, agent_name);
+    let reason = turn_end_reason(
+        params.event,
+        params.runtime,
+        input,
+        output,
+        counts,
+        spawned_child,
+    );
+    let identity = state.agent_resolver.get(agent_name).await;
+    let agent_type = identity
+        .as_ref()
+        .map(|record| record.agent_type.suffix().to_string())
+        .unwrap_or_else(|| params.runtime.to_string());
+    let context = exomonad_core::effects::EffectContext {
+        agent_name: agent_name.clone(),
+        birth_branch: birth_branch.clone(),
+        working_dir: exomonad_core::services::agent_control::resolve_working_dir(
+            birth_branch.as_str(),
+        ),
+    };
+    capture_memory(
+        &context,
+        &state.session_memory,
+        MemoryCapture {
+            issue_id: None,
+            kind: MemoryKind::TurnEnd,
+            importance: 50,
+            summary: format!("Turn ended: {reason}"),
+            detail: None,
+            metadata: Some(serde_json::json!({
+                "reason": reason,
+                "backlog_ready_count": counts.backlog_ready_count,
+                "pending_children": counts.pending_children,
+                "unread_inbox": counts.unread_inbox,
+                "agent_type": agent_type,
+                "model": identity.as_ref().and_then(|record| record.model.clone()),
+                "effort": identity.as_ref().and_then(|record| record.effort.clone()),
+            })),
+        },
+    );
 }
 
 // ============================================================================
@@ -580,6 +773,21 @@ pub async fn handle_hook_inner(
                         "reason": internal_output.reason,
                     }),
                 );
+            }
+
+            if matches!(
+                event_type,
+                HookEventType::Stop | HookEventType::AfterAgent | HookEventType::SubagentStop
+            ) {
+                emit_turn_end_memory(
+                    params,
+                    state,
+                    &hook_input,
+                    &internal_output,
+                    &agent_name_for_hook,
+                    &birth_branch_for_hook,
+                )
+                .await;
             }
 
             // Emit StopHookBlocked tmux event
@@ -1383,10 +1591,13 @@ Run `exomonad recompile` first to build it.",
         plugins: plugins.clone(),
         registry: rt_registry.clone(),
         wasm_path: wasm_path.clone(),
+        project_dir: project_dir.clone(),
         tmux_session: config.tmux_session.clone(),
         default_role: config.role.clone(),
         event_log: event_log.clone(),
         agent_resolver: agent_resolver.clone(),
+        inbox_store: inbox_store.clone(),
+        session_memory: app_state.session_memory.clone(),
     };
 
     let cors = CorsLayer::new()
@@ -1525,6 +1736,86 @@ mod tests {
             notified_at: None,
             read_at: None,
         }
+    }
+
+    #[test]
+    fn ready_count_ignores_headers_and_diagnostics() {
+        let output = "Ready issues (no blockers):\n  #12 high task\nwarning: ignored";
+        assert_eq!(parse_ready_count(output), 1);
+    }
+
+    #[test]
+    fn turn_end_reason_distinguishes_backlog_states() {
+        let input: HookInput =
+            serde_json::from_str(r#"{"session_id":"session","hook_event_name":"Stop"}"#).unwrap();
+        let output = InternalStopHookOutput {
+            decision: StopDecision::Allow,
+            reason: None,
+        };
+        let counts = TurnEndCounts {
+            backlog_ready_count: 2,
+            pending_children: 0,
+            unread_inbox: 0,
+        };
+        assert_eq!(
+            turn_end_reason(
+                HookEventType::Stop,
+                HookRuntime::Claude,
+                &input,
+                &output,
+                counts,
+                false,
+            ),
+            "stopped_backlog_nonempty"
+        );
+        assert_eq!(
+            turn_end_reason(
+                HookEventType::Stop,
+                HookRuntime::Claude,
+                &input,
+                &output,
+                counts,
+                true,
+            ),
+            "spawned_and_idle"
+        );
+    }
+
+    #[test]
+    fn turn_end_reason_marks_codex_and_subagents_as_exited() {
+        let input: HookInput =
+            serde_json::from_str(r#"{"session_id":"session","hook_event_name":"Stop"}"#).unwrap();
+        let output = InternalStopHookOutput {
+            decision: StopDecision::Allow,
+            reason: None,
+        };
+        let counts = TurnEndCounts {
+            backlog_ready_count: 0,
+            pending_children: 1,
+            unread_inbox: 0,
+        };
+        assert_eq!(
+            turn_end_reason(
+                HookEventType::Stop,
+                HookRuntime::Codex,
+                &input,
+                &output,
+                counts,
+                false,
+            ),
+            "exited"
+        );
+        assert_eq!(
+            turn_end_reason(
+                HookEventType::SubagentStop,
+                HookRuntime::Claude,
+                &input,
+                &output,
+                counts,
+                false,
+            ),
+            "exited"
+        );
     }
 
     #[test]

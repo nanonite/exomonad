@@ -24,6 +24,7 @@ pub enum MemoryKind {
     NextAction,
     HumanClarification,
     SessionSummary,
+    TurnEnd,
 }
 
 impl Default for MemoryKind {
@@ -33,7 +34,7 @@ impl Default for MemoryKind {
 }
 
 impl MemoryKind {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Unspecified,
         Self::OriginalPlan,
         Self::WavePlan,
@@ -48,6 +49,7 @@ impl MemoryKind {
         Self::NextAction,
         Self::HumanClarification,
         Self::SessionSummary,
+        Self::TurnEnd,
     ];
 
     fn as_str(self) -> &'static str {
@@ -66,6 +68,7 @@ impl MemoryKind {
             Self::NextAction => "next_action",
             Self::HumanClarification => "human_clarification",
             Self::SessionSummary => "session_summary",
+            Self::TurnEnd => "turn_end",
         }
     }
 }

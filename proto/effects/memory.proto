@@ -18,6 +18,7 @@ enum MemoryKind {
   NEXT_ACTION = 11;
   HUMAN_CLARIFICATION = 12;
   SESSION_SUMMARY = 13;
+  TURN_END = 14;
 }
 
 // A durable semantic fact in the session-memory ledger.

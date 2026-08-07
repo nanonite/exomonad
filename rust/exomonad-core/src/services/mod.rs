@@ -209,6 +209,12 @@ impl HasSessionMemory for Services {
         &self.session_memory
     }
 }
+
+impl HasSessionMemory for Arc<SessionMemoryService> {
+    fn session_memory(&self) -> &Arc<SessionMemoryService> {
+        self
+    }
+}
 impl HasEventQueue for Services {
     fn event_queue(&self) -> &EventQueue {
         &self.event_queue

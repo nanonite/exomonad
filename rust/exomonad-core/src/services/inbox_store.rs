@@ -282,7 +282,7 @@ impl InboxStore {
         Ok(())
     }
 
-    pub fn has_unread(&self, agent_id: &str) -> Result<bool> {
+    pub fn unread_count(&self, agent_id: &str) -> Result<usize> {
         let normalized_agent_id = normalize_agent_id(agent_id);
         let conn = self.connection()?;
         let count: i64 = conn
@@ -292,7 +292,11 @@ impl InboxStore {
                 |row| row.get(0),
             )
             .context("failed to query unread inbox count")?;
-        Ok(count > 0)
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    pub fn has_unread(&self, agent_id: &str) -> Result<bool> {
+        Ok(self.unread_count(agent_id)? > 0)
     }
 
     pub fn last_check_inbox_at(&self, agent_id: &str) -> Result<Option<i64>> {
@@ -562,6 +566,8 @@ mod tests {
             .unwrap();
         assert!(id > 0);
 
+        assert_eq!(store.unread_count("worker-1").unwrap(), 1);
+
         let first_peek = store.peek_unnotified("worker-1").unwrap();
         assert_eq!(first_peek.len(), 1);
         assert_eq!(first_peek[0].from_agent, "root");
@@ -573,6 +579,7 @@ mod tests {
         let drained = store.drain_unread("worker-1").unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].id, id);
+        assert_eq!(store.unread_count("worker-1").unwrap(), 0);
         assert!(!store.has_unread("worker-1").unwrap());
         assert!(store.last_check_inbox_at("worker-1").unwrap().is_some());
     }
