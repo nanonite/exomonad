@@ -6350,6 +6350,8 @@ mod tests {
                 working_dir: std::path::PathBuf::from(".exo/worktrees/review-pr-1-codex"),
                 display_name: "review-pr-1-codex".to_string(),
                 topology: crate::services::agent_control::Topology::WorktreePerAgent,
+                model: None,
+                effort: None,
             })
             .await
             .unwrap();

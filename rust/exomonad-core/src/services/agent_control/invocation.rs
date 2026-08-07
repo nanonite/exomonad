@@ -30,6 +30,8 @@ pub struct InvocationMetadata {
     pub trigger: InvocationTrigger,
     pub pr_number: Option<u64>,
     pub head_sha: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +60,10 @@ pub struct InvocationRecord {
     pub pr_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 impl InvocationRecord {
@@ -67,6 +73,7 @@ impl InvocationRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum InvocationFinishResult {
     Finished(InvocationRecord),
     IgnoredStale,
@@ -156,6 +163,8 @@ pub async fn start_invocation(
         exit_code: None,
         pr_number,
         head_sha,
+        model: None,
+        effort: None,
     };
     write_atomic(agent_dir, &record).await?;
     crate::services::lifecycle::record_invocation_started(agent_dir, &record);
@@ -163,6 +172,46 @@ pub async fn start_invocation(
         path = %invocation_path(agent_dir).display(),
         invocation_id = %record.invocation_id,
         trigger = ?record.trigger,
+        "Started agent invocation"
+    );
+    Ok(record)
+}
+
+/// Start a process attempt with the effective model and effort selected for it.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_invocation_with_provenance(
+    agent_dir: &Path,
+    runtime: AgentType,
+    trigger: InvocationTrigger,
+    routing: RoutingInfo,
+    pr_number: Option<u64>,
+    head_sha: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<InvocationRecord> {
+    let _guard = mutation_lock().lock().await;
+    let record = InvocationRecord {
+        invocation_id: Uuid::new_v4().to_string(),
+        runtime,
+        trigger,
+        routing,
+        started_at: unix_timestamp(),
+        ended_at: None,
+        status: InvocationStatus::Running,
+        exit_code: None,
+        pr_number,
+        head_sha,
+        model,
+        effort,
+    };
+    write_atomic(agent_dir, &record).await?;
+    crate::services::lifecycle::record_invocation_started(agent_dir, &record);
+    info!(
+        path = %invocation_path(agent_dir).display(),
+        invocation_id = %record.invocation_id,
+        trigger = ?record.trigger,
+        model = ?record.model,
+        effort = ?record.effort,
         "Started agent invocation"
     );
     Ok(record)
@@ -275,6 +324,31 @@ mod tests {
         assert!(!persisted.invocation_id.is_empty());
         assert!(persisted.is_live());
         assert!(dir.path().join(INVOCATION_FILENAME).exists());
+    }
+
+    #[tokio::test]
+    async fn invocation_record_persists_model_and_effort_provenance() {
+        let dir = tempdir().expect("tempdir");
+        let record = start_invocation_with_provenance(
+            dir.path(),
+            AgentType::Codex,
+            InvocationTrigger::ResumePr,
+            routing(),
+            Some(580),
+            Some("abc123".to_string()),
+            Some("gpt-5.6-luna".to_string()),
+            Some("xhigh".to_string()),
+        )
+        .await
+        .expect("start invocation");
+
+        let persisted = read_invocation(dir.path())
+            .await
+            .expect("read invocation")
+            .expect("record exists");
+        assert_eq!(persisted, record);
+        assert_eq!(persisted.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(persisted.effort.as_deref(), Some("xhigh"));
     }
 
     #[tokio::test]

@@ -204,18 +204,36 @@ identity, not a second workflow owner and not a stacked-PR abstraction.
       "status": "running",
       "exit_code": null,
       "pr_number": 580,
-      "head_sha": "abc123"
+      "head_sha": "abc123",
+      "model": "gpt-5.6-luna",
+      "effort": "xhigh"
     }
 
 runtime, trigger, routing, started_at, and status are required. ended_at,
-exit_code, pr_number, and head_sha are optional. Starting resume_pr or a
+exit_code, pr_number, head_sha, model, and effort are optional. model and
+effort describe the current process attempt; identity.json retains the
+owner's original model and effort so a resume cannot erase historical
+provenance. Starting resume_pr or a
 SHA-scoped reviewer replaces only this record and records the exact current
 tmux window/pane. Finishing must supply the invocation ID (or matching
 routing) and cannot change a newer record. Missing or malformed records are
 legacy metadata: status and cleanup paths log the condition and avoid
 destructive reconciliation. A finished invocation is dormant ownership; an
 open PR, review, or CI work unit remains pending and does not dispose the
-issue-owned worktree.
+issue-owned worktree. Spawned-child memory records and structured
+agent.spawned/agent.resumed events carry the same bounded model, effort,
+topology, branch, and spawn-type provenance. Prompts and secrets are never
+copied into these provenance fields.
+
+### Harness selection guardrail
+
+A coding spawn inherits the configured worker harness. Retrying or calling
+resume_pr stays on that harness and the existing owner identity. An explicit
+cross-harness request is rejected with agent.stuck guidance unless the human
+has set EXOMONAD_ALLOW_HARNESS_SWITCH=1; approved switches are audited with
+from/to harness, reason, policy source, model, and effort. No-op, no-commit, or
+no-PR failure handoffs also emit bounded agent.stuck guidance for the parent
+to steer or escalate.
 
 ### One-shot coding invocations
 

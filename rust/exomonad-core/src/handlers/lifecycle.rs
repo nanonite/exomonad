@@ -405,6 +405,8 @@ mod tests {
             working_dir: ".exo/worktrees/feature".into(),
             display_name: "feature".to_string(),
             topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
         }
     }
 

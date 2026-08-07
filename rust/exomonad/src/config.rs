@@ -990,6 +990,21 @@ context = ["CLAUDE.md", ".exo/rules/reviewer.md"]
     }
 
     #[test]
+    fn test_reviewer_config_accepts_luna_codex_with_xhigh() {
+        let content = r#"
+[reviewer]
+agent_type = "codex"
+model = "gpt-5.6-luna"
+effort_level = "xhigh"
+"#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        let reviewer = raw.reviewer.unwrap();
+        assert_eq!(reviewer.agent_type, AgentType::Codex);
+        assert_eq!(reviewer.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(reviewer.effort_level, Some(EffortLevel::XHigh));
+    }
+
+    #[test]
     fn test_reviewer_config_invalid_agent_type_rejected() {
         let content = "[reviewer]\nagent_type = \"invalid\"\n";
         let result: Result<RawConfig, _> = toml::from_str(content);
@@ -1009,13 +1024,14 @@ context = ["CLAUDE.md", ".exo/rules/reviewer.md"]
 }
 
 /// Public effort levels accepted by supported harnesses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize, Serialize)]
 pub enum EffortLevel {
     #[value(name = "low")]
     #[serde(rename = "low")]
     Low,
     #[value(name = "medium")]
     #[serde(rename = "medium")]
+    #[default]
     Medium,
     #[value(name = "high")]
     #[serde(rename = "high")]
@@ -1026,12 +1042,6 @@ pub enum EffortLevel {
     #[value(name = "max")]
     #[serde(rename = "max")]
     Max,
-}
-
-impl Default for EffortLevel {
-    fn default() -> Self {
-        Self::Medium
-    }
 }
 
 impl std::fmt::Display for EffortLevel {
@@ -1145,6 +1155,10 @@ mod effort_tests {
         assert_eq!(cli.level, EffortLevel::High);
         assert_eq!(cli.source, EffortSource::Cli);
 
+        let xhigh = resolve_effort_setting(Some(EffortLevel::XHigh), Some(EffortLevel::High), None);
+        assert_eq!(xhigh.level, EffortLevel::XHigh);
+        assert_eq!(xhigh.source, EffortSource::Cli);
+
         let local = resolve_effort_setting(None, Some(EffortLevel::Low), Some(EffortLevel::Max));
         assert_eq!(local.level, EffortLevel::Low);
         assert_eq!(local.source, EffortSource::Config);
@@ -1167,5 +1181,6 @@ mod effort_tests {
         assert_eq!(raw.tl_effort_level, Some(EffortLevel::High));
         assert_eq!(raw.worker_effort_level, Some(EffortLevel::Low));
         assert_eq!(raw.reviewer.unwrap().effort_level, Some(EffortLevel::XHigh));
+        assert!(EffortLevel::from_str("extra-high", false).is_err());
     }
 }

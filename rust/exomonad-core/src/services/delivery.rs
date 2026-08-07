@@ -1626,6 +1626,8 @@ mod tests {
                 working_dir: PathBuf::from(format!(".exo/worktrees/{agent_value}")),
                 display_name: agent_value.to_string(),
                 topology: Topology::WorktreePerAgent,
+                model: None,
+                effort: None,
             })
             .await
             .expect("identity registration should succeed");

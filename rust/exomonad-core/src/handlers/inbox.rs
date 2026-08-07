@@ -144,6 +144,8 @@ mod tests {
                 working_dir: std::path::PathBuf::from("."),
                 display_name: "root".to_string(),
                 topology: Topology::SharedDir,
+                model: None,
+                effort: None,
             })
             .await
             .expect("identity registration should succeed");
@@ -181,6 +183,8 @@ mod tests {
                 working_dir: std::path::PathBuf::from("."),
                 display_name: "root".to_string(),
                 topology: Topology::SharedDir,
+                model: None,
+                effort: None,
             })
             .await
             .expect("bare root registration should succeed");
@@ -198,6 +202,8 @@ mod tests {
                 working_dir: std::path::PathBuf::from("."),
                 display_name: "root".to_string(),
                 topology: Topology::SharedDir,
+                model: None,
+                effort: None,
             })
             .await
             .expect("canonical root registration should succeed");

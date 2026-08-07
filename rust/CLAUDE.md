@@ -131,6 +131,16 @@ selected role supports them. Effort precedence is CLI > local config > global
 config > medium default. OpenCode uses effort as a
 model-aware `--variant`, and `--worker-model` applies to OpenCode.
 Gemini and Shoal accept the shared setting but log that it is ignored.
+Codex passes the resolved effort as model_reasoning_effort, including xhigh,
+after model capability validation. Worker model selection applies to OpenCode
+and Codex command generation.
+
+Coding spawns stay on the configured worker harness. An explicit
+cross-harness coding request requires human approval through
+EXOMONAD_ALLOW_HARNESS_SWITCH=1; otherwise the host emits structured
+agent.stuck guidance. resume_pr always reuses the persisted owner harness,
+worktree, branch, and PR.
+
 
 ### Running
 ```bash

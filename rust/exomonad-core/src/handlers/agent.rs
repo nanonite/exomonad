@@ -241,6 +241,76 @@ impl<
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn enforce_harness_switch_policy(
+        &self,
+        ctx: &crate::effects::EffectContext,
+        operation: &str,
+        configured: ServiceAgentType,
+        requested: AgentType,
+        effective: ServiceAgentType,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> EffectResult<()> {
+        match harness_switch_decision(
+            configured,
+            requested,
+            effective,
+            harness_switch_approval_enabled(),
+        ) {
+            Ok(Some(policy_source)) => {
+                if let Some(log) = self.ctx.event_log() {
+                    let _ = log.append(
+                        "agent.harness_switch",
+                        ctx.agent_name.as_ref(),
+                        &serde_json::json!({
+                            "operation": operation,
+                            "from_harness": configured.suffix(),
+                            "to_harness": effective.suffix(),
+                            "reason": "explicit agent_type override",
+                            "approver": policy_source,
+                            "policy_source": policy_source,
+                            "model": model,
+                            "effort": effort,
+                        }),
+                    );
+                }
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(message) => {
+                if let Some(log) = self.ctx.event_log() {
+                    let _ = log.append(
+                        "agent.stuck",
+                        ctx.agent_name.as_ref(),
+                        &serde_json::json!({
+                            "operation": operation,
+                            "kind": "harness_switch_disallowed",
+                            "configured_harness": configured.suffix(),
+                            "requested_harness": effective.suffix(),
+                            "guidance_required": true,
+                            "model": model,
+                            "effort": effort,
+                            "policy": "configured_worker_harness",
+                        }),
+                    );
+                }
+                capture_memory(
+                    ctx,
+                    self.ctx.as_ref(),
+                    harness_switch_stuck_capture(
+                        operation,
+                        configured,
+                        effective,
+                        model.as_deref(),
+                        effort.as_deref(),
+                    ),
+                );
+                Err(EffectError::invalid_input(message))
+            }
+        }
+    }
+
     async fn ensure_tl_spawn_preflight(
         &self,
         ctx: &crate::effects::EffectContext,
@@ -328,6 +398,9 @@ fn spawned_child_capture(
     agent_type_suffix: &str,
     branch: &str,
     spawn_type: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    topology: &str,
 ) -> MemoryCapture {
     let summary = if branch.is_empty() {
         format!("Spawned {spawn_type} {agent_id} ({agent_type_suffix})")
@@ -345,17 +418,24 @@ fn spawned_child_capture(
             "agent_type": agent_type_suffix,
             "branch": branch,
             "spawn_type": spawn_type,
+            "model": model,
+            "effort": effort,
+            "topology": topology,
         })),
     }
 }
 
 /// Build the bounded `fix_direction` memory capture for a successful `resume_pr`.
+#[allow(clippy::too_many_arguments)]
 fn resume_fix_direction_capture(
     pr_number: u64,
     head_sha: &str,
     owner: &str,
     branch: &str,
     task: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    topology: &str,
 ) -> MemoryCapture {
     MemoryCapture {
         issue_id: None,
@@ -371,6 +451,9 @@ fn resume_fix_direction_capture(
             "head_sha": head_sha,
             "owner": owner,
             "branch": branch,
+            "model": model,
+            "effort": effort,
+            "topology": topology,
         })),
     }
 }
@@ -488,6 +571,69 @@ fn proto_agent_type_label(t: AgentType) -> &'static str {
         AgentType::Opencode => "opencode",
         AgentType::Codex => "codex",
         AgentType::Unspecified => "unspecified",
+    }
+}
+
+const HARNESS_SWITCH_APPROVAL_ENV: &str = "EXOMONAD_ALLOW_HARNESS_SWITCH";
+
+fn harness_switch_approval_enabled() -> bool {
+    std::env::var(HARNESS_SWITCH_APPROVAL_ENV)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn harness_switch_decision(
+    configured: ServiceAgentType,
+    requested: AgentType,
+    effective: ServiceAgentType,
+    approved: bool,
+) -> Result<Option<&'static str>, String> {
+    if requested == AgentType::Unspecified || effective == configured {
+        return Ok(None);
+    }
+    if approved {
+        return Ok(Some(HARNESS_SWITCH_APPROVAL_ENV));
+    }
+    Err(format!(
+        "[STUCK: harness-switch] configured worker harness '{}' cannot be replaced by '{}' for this {}. Retry with the configured harness or obtain explicit human approval via {}=1; no automatic cross-harness fallback is allowed.",
+        configured.suffix(),
+        effective.suffix(),
+        "coding assignment",
+        HARNESS_SWITCH_APPROVAL_ENV,
+    ))
+}
+
+fn harness_switch_stuck_capture(
+    operation: &str,
+    configured: ServiceAgentType,
+    requested: ServiceAgentType,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> MemoryCapture {
+    MemoryCapture {
+        issue_id: None,
+        kind: MemoryKind::Blocker,
+        importance: 90,
+        summary: format!(
+            "[STUCK: harness-switch] {operation} kept configured {} instead of switching to {}",
+            configured.suffix(),
+            requested.suffix()
+        ),
+        detail: None,
+        metadata: Some(serde_json::json!({
+            "operation": operation,
+            "configured_harness": configured.suffix(),
+            "requested_harness": requested.suffix(),
+            "guidance_required": true,
+            "model": model,
+            "effort": effort,
+            "policy": "configured_worker_harness",
+        })),
     }
 }
 
@@ -617,10 +763,22 @@ impl<
     ) -> EffectResult<SpawnResponse> {
         self.ensure_tl_spawn_preflight(ctx).await?;
         let issue_number = parse_issue_number(&req.issue)?;
+        let requested_agent_type = req.agent_type();
+        let effective_agent_type = convert_agent_type(requested_agent_type)?;
+        self.enforce_harness_switch_policy(
+            ctx,
+            "spawn",
+            self.service.default_spawn_agent_type(),
+            requested_agent_type,
+            effective_agent_type,
+            self.service
+                .effective_model_for(effective_agent_type, "tl", None),
+            self.service.effective_effort_for("tl", None),
+        )?;
         let options = SpawnOptions {
             owner: parse_owner(&req.owner)?,
             repo: parse_repo(&req.repo)?,
-            agent_type: convert_agent_type(req.agent_type())?,
+            agent_type: effective_agent_type,
             subrepo: non_empty(req.subrepo).map(PathBuf::from),
             base_branch: non_empty(req.base_branch).map(|s| {
                 BirthBranch::try_from_str(s.as_str()).expect("validated string input is non-empty")
@@ -644,7 +802,17 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnBatchResponse> {
         self.ensure_tl_spawn_preflight(ctx).await?;
-        let agent_type = convert_agent_type(req.agent_type())?;
+        let requested_agent_type = req.agent_type();
+        let agent_type = convert_agent_type(requested_agent_type)?;
+        self.enforce_harness_switch_policy(
+            ctx,
+            "spawn_batch",
+            self.service.default_spawn_agent_type(),
+            requested_agent_type,
+            agent_type,
+            self.service.effective_model_for(agent_type, "tl", None),
+            self.service.effective_effort_for("tl", None),
+        )?;
         let mut agents = Vec::new();
         let mut errors = Vec::new();
 
@@ -683,11 +851,23 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnGeminiTeammateResponse> {
         self.ensure_tl_spawn_preflight(ctx).await?;
+        let requested_agent_type = req.agent_type();
+        let effective_agent_type = convert_agent_type(requested_agent_type)?;
+        self.enforce_harness_switch_policy(
+            ctx,
+            "spawn_gemini_teammate",
+            self.service.default_spawn_agent_type(),
+            requested_agent_type,
+            effective_agent_type,
+            self.service
+                .effective_model_for(effective_agent_type, "dev", None),
+            self.service.effective_effort_for("dev", None),
+        )?;
         let options = SpawnGeminiTeammateOptions {
             name: AgentName::try_from_str(req.name.as_str())
                 .expect("validated string input is non-empty"),
             prompt: req.prompt.clone(),
-            agent_type: convert_agent_type(req.agent_type())?,
+            agent_type: effective_agent_type,
             subrepo: non_empty(req.subrepo).map(PathBuf::from),
             base_branch: non_empty(req.base_branch).map(|s| {
                 BirthBranch::try_from_str(s.as_str()).expect("validated string input is non-empty")
@@ -715,6 +895,19 @@ impl<
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
             convert_agent_type_or_default(requested_agent_type, default_type);
+        let model = self
+            .service
+            .effective_model_for(effective_agent_type, "worker", None);
+        let effort = self.service.effective_effort_for("worker", None);
+        self.enforce_harness_switch_policy(
+            ctx,
+            "spawn_worker",
+            default_type,
+            requested_agent_type,
+            effective_agent_type,
+            model.clone(),
+            effort.clone(),
+        )?;
         info!(
             requested_agent_type = proto_agent_type_label(requested_agent_type),
             default_agent_type = default_type.suffix(),
@@ -741,6 +934,19 @@ impl<
             .effect_err_preserve("agent")?;
 
         let agent_info = worker_result_to_proto(&req.name, &result);
+        let provenance = self.ctx.agent_resolver().get(&result.agent_name).await;
+        let model = provenance
+            .as_ref()
+            .and_then(|record| record.model.clone())
+            .or(model);
+        let effort = provenance
+            .as_ref()
+            .and_then(|record| record.effort.clone())
+            .or(effort);
+        let topology = provenance
+            .as_ref()
+            .map(|record| format!("{:?}", record.topology).to_lowercase())
+            .unwrap_or_else(|| "unknown".to_string());
 
         tracing::info!(
             otel.name = "agent.spawned",
@@ -748,6 +954,9 @@ impl<
             agent_type = %AgentType::try_from(agent_info.agent_type).map(|t| format!("{:?}", t)).unwrap_or_else(|_| "unknown".to_string()),
             branch = %agent_info.branch_name,
             spawn_type = "worker",
+            model = ?model,
+            effort = ?effort,
+            topology = %topology,
             "[event] agent.spawned"
         );
         if let Some(log) = self.ctx.event_log() {
@@ -759,6 +968,9 @@ impl<
                     "agent_type": format!("{:?}", options.agent_type).to_lowercase(),
                     "spawn_type": "worker",
                     "branch": agent_info.branch_name,
+                    "model": model,
+                    "effort": effort,
+                    "topology": topology,
                 }),
             );
         }
@@ -784,7 +996,15 @@ impl<
         capture_memory(
             ctx,
             self.ctx.as_ref(),
-            spawned_child_capture(&agent_info.id, options.agent_type.suffix(), "", "worker"),
+            spawned_child_capture(
+                &agent_info.id,
+                options.agent_type.suffix(),
+                "",
+                "worker",
+                model.as_deref(),
+                effort.as_deref(),
+                &topology,
+            ),
         );
 
         Ok(SpawnWorkerResponse {
@@ -833,6 +1053,24 @@ impl<
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
             convert_agent_type_or_default(requested_agent_type, default_type);
+        let role_name = if req.role.trim().is_empty() {
+            "tl"
+        } else {
+            req.role.as_str()
+        };
+        let model = self
+            .service
+            .effective_model_for(effective_agent_type, role_name, None);
+        let effort = self.service.effective_effort_for(role_name, None);
+        self.enforce_harness_switch_policy(
+            ctx,
+            "spawn_subtree",
+            default_type,
+            requested_agent_type,
+            effective_agent_type,
+            model.clone(),
+            effort.clone(),
+        )?;
         info!(
             requested_agent_type = proto_agent_type_label(requested_agent_type),
             default_agent_type = default_type.suffix(),
@@ -872,6 +1110,19 @@ impl<
             .effect_err_preserve("agent")?;
 
         let agent_info = subtree_result_to_proto(&req.branch_name, &result)?;
+        let provenance = self.ctx.agent_resolver().get(&result.agent_name).await;
+        let model = provenance
+            .as_ref()
+            .and_then(|record| record.model.clone())
+            .or(model);
+        let effort = provenance
+            .as_ref()
+            .and_then(|record| record.effort.clone())
+            .or(effort);
+        let topology = provenance
+            .as_ref()
+            .map(|record| format!("{:?}", record.topology).to_lowercase())
+            .unwrap_or_else(|| "unknown".to_string());
 
         tracing::info!(
             otel.name = "agent.spawned",
@@ -879,6 +1130,9 @@ impl<
             agent_type = %AgentType::try_from(agent_info.agent_type).map(|t| format!("{:?}", t)).unwrap_or_else(|_| "unknown".to_string()),
             branch = %agent_info.branch_name,
             spawn_type = "subtree",
+            model = ?model,
+            effort = ?effort,
+            topology = %topology,
             "[event] agent.spawned"
         );
         if let Some(log) = self.ctx.event_log() {
@@ -888,9 +1142,26 @@ impl<
                 &serde_json::json!({
                     "child_agent": agent_info.id, "agent_type": format!("{:?}", options.agent_type), "spawn_type": "subtree",
                     "branch": agent_info.branch_name,
+                    "model": model,
+                    "effort": effort,
+                    "topology": topology,
                 }),
             );
         }
+
+        capture_memory(
+            ctx,
+            self.ctx.as_ref(),
+            spawned_child_capture(
+                &agent_info.id,
+                options.agent_type.suffix(),
+                &agent_info.branch_name,
+                "subtree",
+                model.as_deref(),
+                effort.as_deref(),
+                &topology,
+            ),
+        );
 
         if options.agent_type == ServiceAgentType::Claude {
             let child_identity = crate::services::agent_control::AgentIdentity::new(
@@ -1426,6 +1697,19 @@ impl<
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
             convert_agent_type_or_default(requested_agent_type, default_type);
+        let model = self
+            .service
+            .effective_model_for(effective_agent_type, "dev", None);
+        let effort = self.service.effective_effort_for("dev", None);
+        self.enforce_harness_switch_policy(
+            ctx,
+            "spawn_leaf_subtree",
+            default_type,
+            requested_agent_type,
+            effective_agent_type,
+            model.clone(),
+            effort.clone(),
+        )?;
         info!(
             requested_agent_type = proto_agent_type_label(requested_agent_type),
             default_agent_type = default_type.suffix(),
@@ -1458,6 +1742,19 @@ impl<
             .effect_err_preserve("agent")?;
 
         let agent_info = leaf_subtree_result_to_proto(&req.branch_name, &result)?;
+        let provenance = self.ctx.agent_resolver().get(&result.agent_name).await;
+        let model = provenance
+            .as_ref()
+            .and_then(|record| record.model.clone())
+            .or(model);
+        let effort = provenance
+            .as_ref()
+            .and_then(|record| record.effort.clone())
+            .or(effort);
+        let topology = provenance
+            .as_ref()
+            .map(|record| format!("{:?}", record.topology).to_lowercase())
+            .unwrap_or_else(|| "unknown".to_string());
 
         tracing::info!(
             otel.name = "agent.spawned",
@@ -1465,12 +1762,18 @@ impl<
             agent_type = %AgentType::try_from(agent_info.agent_type).map(|t| format!("{:?}", t)).unwrap_or_else(|_| "unknown".to_string()),
             branch = %agent_info.branch_name,
             spawn_type = "leaf_subtree",
+            model = ?model,
+            effort = ?effort,
+            topology = %topology,
             "[event] agent.spawned"
         );
         if let Some(log) = self.ctx.event_log() {
             let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &serde_json::json!({
                 "child_agent": agent_info.id, "agent_type": format!("{:?}", options.agent_type), "spawn_type": "leaf_subtree",
                 "branch": agent_info.branch_name,
+                "model": model,
+                "effort": effort,
+                "topology": topology,
             }));
         }
 
@@ -1501,6 +1804,9 @@ impl<
                 options.agent_type.suffix(),
                 &agent_info.branch_name,
                 "leaf_subtree",
+                model.as_deref(),
+                effort.as_deref(),
+                &topology,
             ),
         );
 
@@ -2482,13 +2788,36 @@ impl<
                 .await;
         }
 
+        let model = invocation.model.clone().or_else(|| owner.model.clone());
+        let effort = invocation.effort.clone().or_else(|| owner.effort.clone());
+        let topology = format!("{:?}", owner.topology).to_lowercase();
         info!(
             pr_number = req.resume_pr_number,
             head_branch,
             head_sha,
             owner = %owner.agent_name,
+            model = ?model,
+            effort = ?effort,
+            topology = %topology,
             "Resumed exact existing PR owner"
         );
+        if let Some(log) = self.ctx.event_log() {
+            let _ = log.append(
+                "agent.resumed",
+                ctx.agent_name.as_ref(),
+                &serde_json::json!({
+                    "child_agent": owner.agent_name,
+                    "agent_type": owner.agent_type.suffix(),
+                    "branch": head_branch,
+                    "spawn_type": "resume_pr",
+                    "pr_number": req.resume_pr_number,
+                    "head_sha": head_sha,
+                    "model": model,
+                    "effort": effort,
+                    "topology": topology,
+                }),
+            );
+        }
 
         capture_memory(
             ctx,
@@ -2499,6 +2828,9 @@ impl<
                 owner.agent_name.as_str(),
                 head_branch,
                 &req.task,
+                model.as_deref(),
+                effort.as_deref(),
+                &topology,
             ),
         );
 
@@ -3712,8 +4044,15 @@ mod tests {
 
     #[test]
     fn spawned_child_capture_reports_branch_when_present() {
-        let capture =
-            spawned_child_capture("leaf-1-gemini", "gemini", "main.leaf-1", "leaf_subtree");
+        let capture = spawned_child_capture(
+            "leaf-1-gemini",
+            "gemini",
+            "main.leaf-1",
+            "leaf_subtree",
+            Some("gpt-5.6-luna"),
+            Some("xhigh"),
+            "worktree_per_agent",
+        );
         assert_eq!(capture.kind, MemoryKind::SpawnedChild);
         assert!(capture.summary.contains("leaf-1-gemini"));
         assert!(capture.summary.contains("main.leaf-1"));
@@ -3722,16 +4061,30 @@ mod tests {
         assert_eq!(metadata["agent_type"], "gemini");
         assert_eq!(metadata["branch"], "main.leaf-1");
         assert_eq!(metadata["spawn_type"], "leaf_subtree");
+        assert_eq!(metadata["model"], "gpt-5.6-luna");
+        assert_eq!(metadata["effort"], "xhigh");
+        assert_eq!(metadata["topology"], "worktree_per_agent");
     }
 
     #[test]
     fn spawned_child_capture_omits_branch_for_workers() {
-        let capture = spawned_child_capture("worker-1-gemini", "gemini", "", "worker");
+        let capture = spawned_child_capture(
+            "worker-1-gemini",
+            "gemini",
+            "",
+            "worker",
+            None,
+            None,
+            "shared_dir",
+        );
         assert!(capture.summary.contains("worker-1-gemini"));
         assert!(!capture.summary.contains("branch"));
         let metadata = capture.metadata.expect("metadata present");
         assert_eq!(metadata["branch"], "");
         assert_eq!(metadata["spawn_type"], "worker");
+        assert!(metadata["model"].is_null());
+        assert!(metadata["effort"].is_null());
+        assert_eq!(metadata["topology"], "shared_dir");
     }
 
     #[test]
@@ -3742,6 +4095,9 @@ mod tests {
             "leaf-1-gemini",
             "main.leaf-1",
             "address review feedback\nwith extra detail",
+            Some("gpt-5.6-luna"),
+            Some("xhigh"),
+            "worktree_per_agent",
         );
         assert_eq!(capture.kind, MemoryKind::FixDirection);
         assert!(capture.summary.contains("PR #104"));
@@ -3753,6 +4109,9 @@ mod tests {
         assert_eq!(metadata["head_sha"], "abc123");
         assert_eq!(metadata["owner"], "leaf-1-gemini");
         assert_eq!(metadata["branch"], "main.leaf-1");
+        assert_eq!(metadata["model"], "gpt-5.6-luna");
+        assert_eq!(metadata["effort"], "xhigh");
+        assert_eq!(metadata["topology"], "worktree_per_agent");
     }
 
     fn memory_test_context() -> crate::effects::EffectContext {
@@ -3771,7 +4130,15 @@ mod tests {
         let spawned_id = capture_memory(
             &ctx,
             handler.ctx.as_ref(),
-            spawned_child_capture("leaf-1-gemini", "gemini", "main.leaf-1", "leaf_subtree"),
+            spawned_child_capture(
+                "leaf-1-gemini",
+                "gemini",
+                "main.leaf-1",
+                "leaf_subtree",
+                Some("gpt-5.6-luna"),
+                Some("xhigh"),
+                "worktree_per_agent",
+            ),
         );
         assert!(spawned_id.is_some());
 
@@ -3784,6 +4151,9 @@ mod tests {
                 "leaf-1-gemini",
                 "main.leaf-1",
                 "address review feedback",
+                Some("gpt-5.6-luna"),
+                Some("xhigh"),
+                "worktree_per_agent",
             ),
         );
         assert!(fix_id.is_some());
@@ -3806,8 +4176,15 @@ mod tests {
         // An out-of-range importance is rejected by the ledger's append
         // validation; capture_memory must swallow that failure and return
         // None rather than surface it to the caller.
-        let mut invalid_spawned =
-            spawned_child_capture("leaf-1-gemini", "gemini", "main.leaf-1", "leaf_subtree");
+        let mut invalid_spawned = spawned_child_capture(
+            "leaf-1-gemini",
+            "gemini",
+            "main.leaf-1",
+            "leaf_subtree",
+            Some("gpt-5.6-luna"),
+            Some("xhigh"),
+            "worktree_per_agent",
+        );
         invalid_spawned.importance = 101;
         assert_eq!(
             capture_memory(&ctx, handler.ctx.as_ref(), invalid_spawned),
@@ -3820,6 +4197,9 @@ mod tests {
             "leaf-1-gemini",
             "main.leaf-1",
             "address review feedback",
+            None,
+            None,
+            "worktree_per_agent",
         );
         invalid_fix.importance = 101;
         assert_eq!(
@@ -3943,6 +4323,8 @@ mod tests {
             exit_code: None,
             pr_number: Some(7),
             head_sha: Some("abc123".to_string()),
+            model: Some("gpt-5.6-luna".to_string()),
+            effort: Some("xhigh".to_string()),
         };
         let same_generation = InvocationRecord {
             invocation_id: current.invocation_id.clone(),
@@ -3976,6 +4358,68 @@ mod tests {
             convert_agent_type_or_default(AgentType::Claude, ServiceAgentType::OpenCode),
             ServiceAgentType::Claude
         );
+    }
+
+    #[test]
+    fn same_harness_retry_is_allowed_without_switch_approval() {
+        assert_eq!(
+            harness_switch_decision(
+                ServiceAgentType::OpenCode,
+                AgentType::Opencode,
+                ServiceAgentType::OpenCode,
+                false,
+            )
+            .expect("same harness should be allowed"),
+            None
+        );
+        assert_eq!(
+            harness_switch_decision(
+                ServiceAgentType::OpenCode,
+                AgentType::Unspecified,
+                ServiceAgentType::OpenCode,
+                false,
+            )
+            .expect("configured default should be allowed"),
+            None
+        );
+    }
+
+    #[test]
+    fn cross_harness_switch_requires_explicit_approval() {
+        let error = harness_switch_decision(
+            ServiceAgentType::OpenCode,
+            AgentType::Claude,
+            ServiceAgentType::Claude,
+            false,
+        )
+        .expect_err("unapproved cross-harness switch must be blocked");
+        assert!(error.contains("[STUCK: harness-switch]"));
+        assert!(error.contains(HARNESS_SWITCH_APPROVAL_ENV));
+    }
+
+    #[test]
+    fn approved_cross_harness_switch_has_auditable_policy_source() {
+        assert_eq!(
+            harness_switch_decision(
+                ServiceAgentType::OpenCode,
+                AgentType::Claude,
+                ServiceAgentType::Claude,
+                true,
+            )
+            .expect("approved switch should be allowed"),
+            Some(HARNESS_SWITCH_APPROVAL_ENV)
+        );
+        let capture = harness_switch_stuck_capture(
+            "spawn_worker",
+            ServiceAgentType::OpenCode,
+            ServiceAgentType::Claude,
+            Some("gpt-5.6-luna"),
+            Some("xhigh"),
+        );
+        let metadata = capture.metadata.expect("stuck metadata");
+        assert_eq!(metadata["guidance_required"], true);
+        assert_eq!(metadata["model"], "gpt-5.6-luna");
+        assert_eq!(metadata["effort"], "xhigh");
     }
 
     #[test]

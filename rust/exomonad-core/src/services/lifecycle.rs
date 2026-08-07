@@ -493,6 +493,8 @@ mod tests {
             exit_code: Some(0),
             pr_number: Some(585),
             head_sha: Some("sha".to_string()),
+            model: Some("gpt-5.6-luna".to_string()),
+            effort: Some("xhigh".to_string()),
         };
         let telemetry = LifecycleTelemetry::from_invocation(&record, "finished");
         let value = serde_json::to_value(telemetry).expect("telemetry JSON");
@@ -531,6 +533,8 @@ mod tests {
             exit_code: None,
             pr_number: None,
             head_sha: None,
+            model: None,
+            effort: None,
         };
         record_invocation_started(&agent_dir, &record);
         let files = fs::read_dir(root.path().join(".exo/events"))

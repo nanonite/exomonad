@@ -92,7 +92,32 @@ fn is_parent_alias(address: &Address) -> bool {
     matches!(address, Address::Agent(name) if name.as_str() == "parent")
 }
 
-fn capture_parent_notification<C: HasSessionMemory>(
+fn silent_noop_handoff(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "no commit",
+        "no pr",
+        "no pull request",
+        "no-op",
+        "no changes",
+        "could not proceed",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn bounded_handoff_reason(message: &str) -> String {
+    message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn capture_parent_notification<C: HasSessionMemory + HasEventLog>(
     ctx: &crate::effects::EffectContext,
     services: &C,
     agent_id: &crate::domain::AgentName,
@@ -111,6 +136,28 @@ fn capture_parent_notification<C: HasSessionMemory>(
         MemoryKind::Blocker => format!("Child blocker reported to parent {parent_session_id}"),
         _ => unreachable!("notification capture only uses handoff or blocker kinds"),
     };
+
+    if matches!(
+        status,
+        crate::services::delivery::NotifyStatus::Failure
+            | crate::services::delivery::NotifyStatus::Stuck
+    ) && silent_noop_handoff(message)
+    {
+        if let Some(log) = services.event_log() {
+            let _ = log.append(
+                "agent.stuck",
+                agent_id.as_ref(),
+                &serde_json::json!({
+                    "kind": "silent_noop_handoff",
+                    "parent": parent_session_id,
+                    "status": status.as_str(),
+                    "reason": bounded_handoff_reason(message),
+                    "guidance_required": true,
+                    "retry_policy": "same_harness_or_resume_pr",
+                }),
+            );
+        }
+    }
 
     capture_memory(
         ctx,
@@ -603,6 +650,8 @@ mod tests {
                 working_dir: PathBuf::from(format!(".exo/worktrees/{}", case.agent_name)),
                 display_name: case.agent_name.to_string(),
                 topology: case.topology,
+                model: None,
+                effort: None,
             })
             .await
             .expect("identity registration should succeed");
@@ -756,6 +805,17 @@ mod tests {
         assert!(parent_messages.is_empty());
     }
 
+    #[test]
+    fn silent_noop_handoff_requires_guidance() {
+        assert!(silent_noop_handoff("No commit or PR was created"));
+        assert!(silent_noop_handoff("worker exited: no-op"));
+        assert!(!silent_noop_handoff("Committed and opened PR #12"));
+        assert_eq!(
+            bounded_handoff_reason("  no commit was created\nfull task details"),
+            "no commit was created"
+        );
+    }
+
     #[tokio::test]
     async fn notify_parent_captures_successful_child_handoff() {
         let services = Arc::new(crate::services::Services::test());
@@ -881,6 +941,8 @@ mod tests {
             working_dir: PathBuf::from(".exo/worktrees/chainlink-codex-tl-codex"),
             display_name: "🤖 chainlink-codex-worker-codex".to_string(),
             topology: Topology::SharedDir,
+            model: None,
+            effort: None,
         };
 
         assert_eq!(

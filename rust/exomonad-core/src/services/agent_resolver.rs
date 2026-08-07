@@ -35,6 +35,12 @@ pub struct AgentIdentityRecord {
     pub display_name: String,
     /// Workspace topology.
     pub topology: Topology,
+    /// Model selected for the owner invocation, when configured.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Effort selected for the owner invocation, when configured.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 const IDENTITY_FILENAME: &str = "identity.json";
@@ -339,6 +345,8 @@ mod tests {
             working_dir: PathBuf::from(format!(".exo/worktrees/{}/", name)),
             display_name: format!("🤖 {}", name),
             topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
         }
     }
 
@@ -354,6 +362,8 @@ mod tests {
             working_dir: PathBuf::from("."),
             display_name: format!("💎 {}", name),
             topology: Topology::SharedDir,
+            model: None,
+            effort: None,
         }
     }
 
@@ -372,6 +382,25 @@ mod tests {
             )
             .await;
         assert_eq!(got, Some(record));
+    }
+
+    #[tokio::test]
+    async fn identity_persists_model_and_effort_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let resolver = AgentResolver::load(tmp.path().to_path_buf()).await;
+        let mut record = test_record("feature-a-claude", "feature-a", "main.feature-a-claude");
+        record.model = Some("gpt-5.6-luna".to_owned());
+        record.effort = Some("xhigh".to_owned());
+
+        resolver.register(record.clone()).await.unwrap();
+
+        let identity_path = tmp
+            .path()
+            .join(".exo/agents/feature-a-claude/identity.json");
+        let contents = tokio::fs::read_to_string(identity_path).await.unwrap();
+        assert!(contents.contains("\"model\": \"gpt-5.6-luna\""));
+        assert!(contents.contains("\"effort\": \"xhigh\""));
+        assert_eq!(resolver.get(&record.agent_name).await, Some(record));
     }
 
     #[tokio::test]

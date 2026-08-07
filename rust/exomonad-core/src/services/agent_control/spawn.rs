@@ -56,7 +56,7 @@ async fn find_existing_leaf_worktree_by_slug(
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
     for (name, path) in candidates {
         let identity = AgentIdentity::from_internal_name(&name);
-        if identity.slug() == slug {
+        if normalize_agent_slug(identity.slug()) == normalize_agent_slug(slug) {
             return Ok(Some((identity, path)));
         }
     }
@@ -585,7 +585,7 @@ impl<
             let issue = github.get_issue(&repo, issue_number).await?;
 
             // Generate slug and agent identity
-            let slug = slugify(&issue.title);
+            let slug = normalize_agent_slug(&issue.title);
             let identity =
                 AgentIdentity::new(format!("gh-{}-{}", issue_id, slug), options.agent_type);
             let agent_name = identity.internal_name();
@@ -626,6 +626,8 @@ impl<
                 AgentType::Codex => crate::domain::Role::dev(),
                 AgentType::Process => unreachable!("Process agents are not spawned via effects"),
             };
+            let model = self.effective_model_for(options.agent_type, role.as_str(), None);
+            let effort = self.effective_effort_for(role.as_str(), None);
             self.write_agent_mcp_config(
                 &effective_project_dir,
                 &agent_dir,
@@ -700,6 +702,8 @@ impl<
                 working_dir: agent_dir.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,
+                model: model.clone(),
+                effort: effort.clone(),
             };
             self.finalize_spawn(&agent_name, routing, Some(identity_record))
                 .await?;
@@ -781,7 +785,10 @@ impl<
             let effective_project_dir = self.effective_project_dir(options.subrepo.as_deref())?;
 
             // Sanitize name and construct typed identity
-            let identity = AgentIdentity::new(slugify(options.name.as_str()), options.agent_type);
+            let identity = AgentIdentity::new(
+                normalize_agent_slug(options.name.as_str()),
+                options.agent_type,
+            );
             let agent_name = identity.internal_name();
             let display_name = identity.display_name();
 
@@ -837,6 +844,8 @@ impl<
                 .await?;
 
             let role = crate::domain::Role::dev();
+            let model = self.effective_model_for(options.agent_type, role.as_str(), None);
+            let effort = self.effective_effort_for(role.as_str(), None);
             let mut env_vars = self.common_spawn_env(&agent_name, &branch_name, &role);
 
             // Write per-agent MCP config into the worktree
@@ -882,6 +891,8 @@ impl<
                 working_dir: worktree_path.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,
+                model: model.clone(),
+                effort: effort.clone(),
             };
             self.finalize_spawn(&agent_name, routing, Some(identity_record))
                 .await?;
@@ -1219,7 +1230,7 @@ impl<
             ensure_clean_spawn_worktree(&absolute_worktree).await?;
 
             // Sanitize name and construct typed identity
-            let identity = AgentIdentity::new(slugify(options.name.as_str()), agent_type);
+            let identity = AgentIdentity::new(normalize_agent_slug(options.name.as_str()), agent_type);
             let agent_name = identity.internal_name();
             let display_name = identity.display_name();
             let agents_dir = self.project_dir().join(".exo").join("agents");
@@ -1264,6 +1275,8 @@ impl<
             }
 
             let role = crate::domain::Role::worker();
+            let model = self.effective_model_for(agent_type, role.as_str(), None);
+            let effort = self.effective_effort_for(role.as_str(), None);
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             let session_branch = BranchName::try_from_str(parent_bb.as_str()).expect("validated string input is non-empty");
             let mut env_vars = self.common_spawn_env(&agent_name, &session_branch, &role);
@@ -1320,7 +1333,7 @@ impl<
                         &agent_config_dir,
                         &role,
                         &agent_name,
-                        None,
+                        model.as_deref(),
                         &self.extra_mcp_servers,
                     )
                     .await?;
@@ -1364,6 +1377,8 @@ impl<
                 working_dir: ctx.working_dir.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::SharedDir,
+                model: model.clone(),
+                effort: effort.clone(),
             };
             self.finalize_spawn(&agent_name, routing, Some(identity_record))
                 .await?;
@@ -1415,7 +1430,7 @@ impl<
 
             // Sanitize branch name and construct typed identity
             let agent_type = options.agent_type;
-            let identity = AgentIdentity::new(slugify(&options.branch_name), agent_type);
+            let identity = AgentIdentity::new(normalize_agent_slug(&options.branch_name), agent_type);
             let agent_name = identity.internal_name();
             let display_name = identity.display_name();
             let child_birth = effective_birth.child(agent_name.as_str());
@@ -1470,6 +1485,8 @@ impl<
 
             let default_tl = crate::domain::Role::tl();
             let role = options.role.as_ref().unwrap_or(&default_tl);
+            let model = self.effective_model_for(agent_type, role.as_str(), options.model.as_deref());
+            let effort = self.effective_effort_for(role.as_str(), options.effort.as_deref());
 
             // Validate role context before spawning. Claude and Gemini consume a
             // copied file; OpenCode and Codex receive the same content inline in
@@ -1698,6 +1715,8 @@ impl<
                 working_dir: worktree_path.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,
+                model: model.clone(),
+                effort: effort.clone(),
             };
             let trigger = if options
                 .role
@@ -1717,6 +1736,8 @@ impl<
                     trigger,
                     pr_number: options.invocation_pr_number,
                     head_sha: options.invocation_head_sha.clone(),
+                    model: model.clone(),
+                    effort: effort.clone(),
                 },
             )
                 .await?;
@@ -1774,7 +1795,7 @@ impl<
                 .context("effective birth branch was empty")?;
 
             // Sanitize branch name and construct typed identity
-            let slug = slugify(&options.branch_name);
+            let slug = normalize_agent_slug(&options.branch_name);
             let slug_key = Slug::try_from_str(&slug).context("generated agent slug was empty")?;
             let mut agent_type = options.agent_type;
             let mut identity = AgentIdentity::new(slug.clone(), agent_type);
@@ -1784,17 +1805,32 @@ impl<
             let mut existing_identity_record = None;
 
             if let Some(expected_agent_name) = options.expected_agent_name.as_ref() {
-                if expected_agent_name != &agent_name {
+                let expected_identity = AgentIdentity::from_internal_name(expected_agent_name.as_str());
+                if normalize_agent_slug(expected_identity.slug()) != slug {
                     return Err(anyhow!(
-                        "resolved resume identity {} does not match slug/runtime {}",
+                        "resolved resume identity {} does not match slug {}",
                         expected_agent_name,
-                        agent_name
+                        slug
                     ));
                 }
+                identity = expected_identity;
+                agent_type = identity.agent_type();
                 agent_name = expected_agent_name.clone();
+                display_name = identity.display_name();
                 worktree_path = self.worktree_base.join(agent_name.as_str());
             } else if !options.standalone_repo && !worktree_path.exists() {
-                if let Some(record) = self.agent_resolver().lookup_by_slug(&slug_key).await {
+                let record = if let Some(record) =
+                    self.agent_resolver().lookup_by_slug(&slug_key).await
+                {
+                    Some(record)
+                } else {
+                    self.agent_resolver()
+                        .all()
+                        .await
+                        .into_iter()
+                        .find(|record| normalize_agent_slug(record.slug.as_str()) == slug)
+                };
+                if let Some(record) = record {
                     if record.topology == Topology::WorktreePerAgent {
                         let record_worktree =
                             resolve_identity_working_dir(effective_project_dir, &record.working_dir);
@@ -1821,6 +1857,7 @@ impl<
                     }
                 }
             }
+            let prior_identity = self.agent_resolver().get(&agent_name).await;
 
             let existing_branch = if !options.standalone_repo && worktree_path.exists() {
                 self.git_wt()
@@ -1960,6 +1997,18 @@ impl<
 
             let default_dev = crate::domain::Role::dev();
             let role = options.role.as_ref().unwrap_or(&default_dev);
+            let model = self.effective_model_for(agent_type, role.as_str(), None);
+            let effort = self.effective_effort_for(role.as_str(), None);
+            let identity_model = existing_identity_record
+                .as_ref()
+                .and_then(|record| record.model.clone())
+                .or_else(|| prior_identity.as_ref().and_then(|record| record.model.clone()))
+                .or_else(|| model.clone());
+            let identity_effort = existing_identity_record
+                .as_ref()
+                .and_then(|record| record.effort.clone())
+                .or_else(|| prior_identity.as_ref().and_then(|record| record.effort.clone()))
+                .or_else(|| effort.clone());
             let mut env_vars = self.common_spawn_env(&agent_name, &branch_name, role);
             self.write_agent_mcp_config(effective_project_dir, &worktree_path, agent_type, role)
                 .await?;
@@ -2129,6 +2178,8 @@ impl<
                 working_dir: worktree_path.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,
+                model: identity_model.clone(),
+                effort: identity_effort.clone(),
             };
             let trigger = if options.expected_agent_name.is_some() {
                 InvocationTrigger::ResumePr
@@ -2145,6 +2196,8 @@ impl<
                     trigger,
                     pr_number: options.invocation_pr_number,
                     head_sha: options.start_point.clone(),
+                    model: model.clone(),
+                    effort: effort.clone(),
                 },
             )
                 .await

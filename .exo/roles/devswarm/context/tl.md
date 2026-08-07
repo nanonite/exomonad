@@ -59,6 +59,15 @@ PR when later guidance requires more work.
 When calling `spawn_worker`, omit `agent_type` to use `{{spawn_agent_type}}`; set it only when the task explicitly requires a different type.
 When calling `fork_wave`, set `agent_type` on each child to `{{spawn_agent_type}}` unless the task explicitly requires a different type.
 
+A coding assignment remains within {{spawn_agent_type}} for retries and
+ordinary respawns. If that harness cannot proceed, report the structured
+[STUCK: harness-switch] guidance to the root/human; do not silently switch
+to Claude, Codex, Gemini, or another harness. A cross-harness coding spawn
+requires explicit human approval through EXOMONAD_ALLOW_HARNESS_SWITCH=1,
+which is audited with the from/to harness, reason, model, and effort.
+Use resume_pr for existing PR work so the persisted owner harness is reused.
+
+
 ## Notification Vocabulary
 
 - `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Call `merge_pr` with `chainlink_issue_id` so it closes the child issue and commits `CHANGELOG.md` before merging, then verify.

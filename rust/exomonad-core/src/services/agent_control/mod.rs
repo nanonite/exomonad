@@ -12,8 +12,9 @@ mod spawn;
 
 pub use invocation::{
     finish_invocation, finish_invocation_and_tombstone, read_invocation,
-    read_invocation_conservatively, start_invocation, InvocationFinishResult, InvocationMetadata,
-    InvocationRecord, InvocationStatus, InvocationTrigger, INVOCATION_FILENAME,
+    read_invocation_conservatively, start_invocation, start_invocation_with_provenance,
+    InvocationFinishResult, InvocationMetadata, InvocationRecord, InvocationStatus,
+    InvocationTrigger, INVOCATION_FILENAME,
 };
 pub use spawn::{
     CODEX_DEV_INSTRUCTIONS, CODEX_REVIEWER_INSTRUCTIONS, CODEX_TL_RUNTIME_NOTES,
@@ -903,6 +904,39 @@ impl<
         self.reviewer_effort.as_deref()
     }
 
+    /// Resolve the model that the requested harness will actually receive.
+    pub(crate) fn effective_model_for(
+        &self,
+        agent_type: AgentType,
+        role: &str,
+        override_model: Option<&str>,
+    ) -> Option<String> {
+        override_model
+            .filter(|model| !model.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                if role == "reviewer" {
+                    self.reviewer_model.clone()
+                } else if matches!(agent_type, AgentType::OpenCode | AgentType::Codex) {
+                    self.spawn_agent_model.clone()
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Resolve the effort that the requested harness will actually receive.
+    pub(crate) fn effective_effort_for(
+        &self,
+        role: &str,
+        override_effort: Option<&str>,
+    ) -> Option<String> {
+        override_effort
+            .filter(|effort| !effort.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| self.effort_for_role(role).map(str::to_string))
+    }
+
     /// Set the agent type for the reviewer.
     pub fn with_reviewer_agent_type(mut self, agent_type: AgentType) -> Self {
         self.reviewer_agent_type = agent_type;
@@ -992,6 +1026,8 @@ impl<
             .as_ref()
             .map(|record| record.agent_type)
             .unwrap_or_else(|| AgentType::from_dir_name(agent_name.as_str()));
+        let model = identity.as_ref().and_then(|record| record.model.clone());
+        let effort = identity.as_ref().and_then(|record| record.effort.clone());
         self.finalize_spawn_with_invocation(
             agent_name,
             routing,
@@ -1001,6 +1037,8 @@ impl<
                 trigger: InvocationTrigger::Spawn,
                 pr_number: None,
                 head_sha: None,
+                model,
+                effort,
             },
         )
         .await
@@ -1025,13 +1063,15 @@ impl<
             ));
         }
         routing.write_to_dir(&agent_config_dir).await?;
-        let invocation = invocation::start_invocation(
+        let invocation = invocation::start_invocation_with_provenance(
             &agent_config_dir,
             metadata.runtime,
             metadata.trigger,
             routing,
             metadata.pr_number,
             metadata.head_sha,
+            metadata.model,
+            metadata.effort,
         )
         .await?;
         if let Err(error) = fs::remove_file(agent_config_dir.join("exited_at")).await {
@@ -1388,6 +1428,25 @@ pub fn slugify(title: &str) -> String {
         .collect()
 }
 
+/// Remove accumulated harness markers from a human-facing slug.
+///
+/// Agent directories and branches retain one final runtime suffix, but a
+/// resumed or respawned agent must never turn a multi-harness slug into a new
+/// semantic slug.
+pub fn normalize_agent_slug(value: &str) -> String {
+    const HARNESS_SUFFIXES: [&str; 6] =
+        ["claude", "gemini", "shoal", "opencode", "codex", "process"];
+    let mut normalized = slugify(value);
+    while let Some((prefix, suffix)) = normalized.rsplit_once('-') {
+        if !prefix.is_empty() && HARNESS_SUFFIXES.contains(&suffix) {
+            normalized = prefix.to_string();
+        } else {
+            break;
+        }
+    }
+    normalized
+}
+
 /// Extract issue ID from an agent name slug, e.g. "issue-26-loader-alias-fallback-codex" → Some(26).
 pub(crate) fn issue_id_from_agent_name(slug: &str) -> Option<u64> {
     let rest = slug.strip_prefix("issue-")?;
@@ -1435,6 +1494,17 @@ mod tests {
         assert_eq!(slugify("Fix the Bug"), "fix-the-bug");
         assert_eq!(slugify("Add new feature!"), "add-new-feature");
         assert_eq!(slugify("CamelCase"), "camelcase");
+    }
+
+    #[test]
+    fn test_normalize_agent_slug_removes_accumulated_harnesses() {
+        assert_eq!(
+            normalize_agent_slug("Fix the Bug-codex-opencode"),
+            "fix-the-bug"
+        );
+        assert_eq!(normalize_agent_slug("feature-codex"), "feature");
+        assert_eq!(normalize_agent_slug("codex"), "codex");
+        assert_eq!(normalize_agent_slug("feature"), "feature");
     }
 
     #[test]
@@ -1582,6 +1652,8 @@ mod tests {
             working_dir: PathBuf::from("."),
             display_name: AgentType::Codex.tab_display_name("issue-65-divergence-investigation"),
             topology: Topology::SharedDir,
+            model: None,
+            effort: None,
         };
         let pane_id = tmux_ipc::PaneId::parse("%42").unwrap();
         let agent_dir = service

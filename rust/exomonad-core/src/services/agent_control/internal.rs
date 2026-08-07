@@ -86,7 +86,7 @@ impl<
         Ok(context.replace("{{spawn_agent_type}}", self.spawn_agent_type.suffix()))
     }
 
-    fn effort_for_role(&self, role: &str) -> Option<&str> {
+    pub(crate) fn effort_for_role(&self, role: &str) -> Option<&str> {
         if role == "reviewer" {
             self.reviewer_effort()
         } else {
@@ -767,7 +767,7 @@ impl<
         };
 
         let model = model_override.or_else(|| match agent_type {
-            AgentType::OpenCode => self.spawn_agent_model(),
+            AgentType::OpenCode | AgentType::Codex => self.spawn_agent_model(),
             _ => None,
         });
         let full_command = Self::build_agent_command_with_effort(
@@ -930,7 +930,7 @@ impl<
         };
 
         let model = match agent_type {
-            AgentType::OpenCode => self.spawn_agent_model(),
+            AgentType::OpenCode | AgentType::Codex => self.spawn_agent_model(),
             _ => None,
         };
         let full_command = Self::build_agent_command_with_effort(
@@ -1061,12 +1061,17 @@ impl<
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json and plugin for OpenCode agent");
             }
             AgentType::Codex => {
+                let model = if role.as_str() == "reviewer" {
+                    self.reviewer_model.as_deref()
+                } else {
+                    self.spawn_agent_model()
+                };
                 self.write_codex_config_files(
                     agent_dir,
                     role,
                     &AgentName::try_from_str(agent_name)
                         .expect("validated string input is non-empty"),
-                    None,
+                    model,
                     &self.extra_mcp_servers,
                 )
                 .await?;
@@ -1820,6 +1825,38 @@ mod tests {
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.2"));
         assert!(codex_home.join("config.toml").exists());
         assert!(!agent_dir.join(".codex/hooks.json").exists());
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_codex_reviewer_config_preserves_luna_xhigh() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let codex_home = project_dir.join("codex-home");
+        std::env::set_var("CODEX_HOME", &codex_home);
+        let services = test_services(project_dir.clone());
+        let service = AgentControlService::new(services)
+            .with_reviewer_model(Some("gpt-5.6-luna".to_string()))
+            .with_reviewer_effort(Some("xhigh".to_string()));
+        let agent_dir = project_dir.join("reviewer-luna-agent");
+
+        service
+            .write_agent_mcp_config(
+                &project_dir,
+                &agent_dir,
+                AgentType::Codex,
+                &crate::domain::Role::reviewer(),
+            )
+            .await
+            .unwrap();
+
+        let config = tokio::fs::read_to_string(agent_dir.join(".codex/config.toml"))
+            .await
+            .unwrap();
+        let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.6-luna"));
+        assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("xhigh"));
         std::env::remove_var("CODEX_HOME");
     }
 

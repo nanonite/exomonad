@@ -118,6 +118,21 @@ Workers are ephemeral pane agents with no PR. When a worker reports a blocker vi
 
 **Never wait silently** for a stuck worker. Either steer it, escalate to the human, or re-spec.
 
+### Harness and no-op guardrails
+
+Keep coding retries and respawns on the configured worker harness. A
+[STUCK: harness-switch] event means the configured harness could not
+proceed; surface it to the human/root and request guidance instead of
+unilaterally selecting another harness. resume_pr is the same-owner repair
+path and preserves the persisted harness, model, effort, worktree, branch, and
+PR. An explicit cross-harness coding request is permitted only with the human
+approval flag EXOMONAD_ALLOW_HARNESS_SWITCH=1 and is audited.
+
+No-commit, no-PR, and no-op failure handoffs emit durable agent.stuck
+guidance. Retry the same harness with a narrower task or escalate the exact
+failure to the human; do not silently replace the worker.
+
+
 ## Fixing an Existing PR's CI/Review Problem
 
 - **DO NOT** call `spawn_leaf` with a new, unrelated `name` to fix another PR's CI failure, review comments, or merge conflicts. A new name always creates a disconnected sibling branch from the caller's branch, often targeting `main`, rather than continuing the target PR.

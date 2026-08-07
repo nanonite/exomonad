@@ -3042,6 +3042,18 @@ mod tests {
     }
 
     #[test]
+    fn codex_luna_root_command_preserves_xhigh() {
+        let command = build_codex_root_command_with_effort(
+            Path::new("/tmp/exomonad"),
+            Some("gpt-5.6-luna"),
+            Some("xhigh"),
+            None,
+        );
+
+        assert!(command.contains("--model gpt-5.6-luna -c model_reasoning_effort=\"xhigh\""));
+    }
+
+    #[test]
     fn claude_root_command_uses_initial_prompt() {
         let command = build_claude_root_command(Some("sonnet"), Some("Spawn the worker"));
 
