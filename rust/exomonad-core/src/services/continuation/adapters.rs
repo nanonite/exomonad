@@ -132,7 +132,6 @@ impl ChainlinkAdapter {
     pub async fn issues(&self) -> SectionData<Vec<ChainlinkIssue>> {
         self.fetch_json(&["issue", "list", "--json"])
             .await
-            .and_then(parse_json)
             .into_section()
     }
 
@@ -140,18 +139,17 @@ impl ChainlinkAdapter {
         let id = id.to_string();
         self.fetch_json(&["issue", "show", &id, "--json"])
             .await
-            .and_then(parse_json)
             .into_section()
     }
 
     pub async fn sessions(&self) -> SectionData<Vec<ChainlinkSession>> {
-        self.fetch_json(&["session", "status", "--json"])
+        self.fetch_json::<Value>(&["session", "status", "--json"])
             .await
-            .and_then(|json| parse_sessions(&json))
+            .and_then(parse_sessions_value)
             .into_section()
     }
 
-    async fn fetch_json(&self, args: &[&str]) -> Result<String, String> {
+    async fn fetch_json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T, String> {
         let command_line = std::iter::once("chainlink")
             .chain(args.iter().copied())
             .collect::<Vec<_>>()
@@ -384,8 +382,7 @@ fn ci_state(statuses: &[crate::services::forgejo::ForgejoCommitStatus]) -> Strin
     CIStatus::Neutral.to_string()
 }
 
-fn parse_sessions(json: &str) -> Result<Vec<ChainlinkSession>, String> {
-    let value = serde_json::from_str::<Value>(json).map_err(|error| error.to_string())?;
+fn parse_sessions_value(value: Value) -> Result<Vec<ChainlinkSession>, String> {
     let records = match value {
         Value::Array(records) => records,
         record @ Value::Object(_) => vec![record],
@@ -428,10 +425,6 @@ fn json_i64(value: &Value) -> Option<i64> {
 
 fn json_string(value: Option<&Value>) -> Option<String> {
     value.and_then(|value| value.as_str().map(str::to_string))
-}
-
-fn parse_json<T: DeserializeOwned>(json: String) -> Result<T, String> {
-    serde_json::from_str(&json).map_err(|error| error.to_string())
 }
 
 fn decode_json_output<T: DeserializeOwned>(
@@ -497,21 +490,28 @@ mod tests {
 
     #[test]
     fn chainlink_issue_fixture_parses() {
-        let issues: Vec<ChainlinkIssue> = parse_json(ISSUE_LIST_JSON.to_string()).unwrap();
+        let issues: Vec<ChainlinkIssue> = serde_json::from_str(ISSUE_LIST_JSON).unwrap();
         assert_eq!(issues[0].id, 622);
         assert_eq!(issues[0].priority, "high");
     }
 
     #[test]
+    fn structured_chainlink_output_decodes_at_command_boundary() {
+        let issues = decode_json_output::<Vec<ChainlinkIssue>>(0, ISSUE_LIST_JSON, "")
+            .expect("structured issue output should decode");
+        assert_eq!(issues[0].title, "Adapters");
+    }
+
+    #[test]
     fn chainlink_issue_detail_fixture_parses() {
-        let detail: ChainlinkIssueDetail = parse_json(ISSUE_DETAIL_JSON.to_string()).unwrap();
+        let detail: ChainlinkIssueDetail = serde_json::from_str(ISSUE_DETAIL_JSON).unwrap();
         assert_eq!(detail.labels, vec!["session-memory"]);
         assert_eq!(detail.comments[0].content, "ready");
     }
 
     #[test]
     fn chainlink_session_fixture_parses() {
-        let sessions = parse_sessions(SESSION_JSON).unwrap();
+        let sessions = parse_sessions_value(serde_json::from_str(SESSION_JSON).unwrap()).unwrap();
         assert_eq!(sessions[0].session_id, Some(139));
         assert_eq!(sessions[0].active_issue_id, Some(622));
         assert_eq!(sessions[0].handoff_notes.as_deref(), Some("continue"));
