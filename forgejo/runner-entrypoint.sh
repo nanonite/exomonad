@@ -4,6 +4,11 @@ set -eu
 CONFIG_PATH="${FORGEJO_RUNNER_CONFIG:-/data/runner-config.yml}"
 ACT_TMPFS_OPTION="--tmpfs /var/run/act"
 ACT_VAR_RUN_OPTION="--volume forgejo-act-var-run:/var/run"
+# Shared, persistent Nix store cache across job containers. Avoids re-fetching
+# packages (and re-hitting flaky upstream mirrors, e.g. the CoCoALib source
+# used by the Creusot/why3/cvc5 toolchain) on every job. Content-addressed by
+# Nix, so sharing it does not change build outputs or reproducibility.
+ACT_NIX_STORE_OPTION="--volume beast-rs-nix-store:/nix"
 FORGEJO_HOST="${FORGEJO_RUNNER_JOB_FORGEJO_HOST:-forgejo}"
 
 if [ ! -f "$CONFIG_PATH" ]; then
@@ -18,7 +23,7 @@ else
   FORGEJO_HOST_OPTION=""
 fi
 
-options="$ACT_VAR_RUN_OPTION"
+options="$ACT_VAR_RUN_OPTION $ACT_NIX_STORE_OPTION"
 if [ -n "$FORGEJO_HOST_OPTION" ]; then
   options="$options $FORGEJO_HOST_OPTION"
 fi
