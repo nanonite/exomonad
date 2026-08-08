@@ -276,6 +276,32 @@ impl HasWatcherRuntimeState for Services {
     }
 }
 
+#[cfg(debug_assertions)]
+impl Services {
+    /// Construct isolated services for the opt-in debug benchmark harness.
+    pub fn benchmark(project_dir: PathBuf) -> anyhow::Result<Self> {
+        Ok(Self {
+            project_dir: project_dir.clone(),
+            github_client: None,
+            forgejo_client: None,
+            forgejo_reviewer_client: None,
+            event_log: None,
+            team_registry: Arc::new(TeamRegistry::new()),
+            supervisor_registry: Arc::new(SupervisorRegistry::new()),
+            claude_session_registry: Arc::new(ClaudeSessionRegistry::new()),
+            agent_resolver: Arc::new(AgentResolver::empty()),
+            inbox_store: Arc::new(InboxStore::open(&project_dir)?),
+            session_memory: Arc::new(SessionMemoryService::open(&project_dir)?),
+            event_queue: Arc::new(EventQueue::new()),
+            mutex_registry: Arc::new(MutexRegistry::new()),
+            git_wt: Arc::new(GitWorktreeService::new(project_dir)),
+            opencode_worker_model: None,
+            ci_status_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            watcher_runtime_state: Arc::new(WatcherRuntimeState::new()),
+        })
+    }
+}
+
 #[cfg(test)]
 impl Services {
     /// Construct a Services with empty/default registries for testing.

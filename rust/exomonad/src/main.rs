@@ -8,6 +8,8 @@
 
 mod app_state;
 mod dashboard;
+#[cfg(debug_assertions)]
+mod experiment_harness;
 mod init;
 mod logging;
 mod mcp_stdio;
@@ -156,7 +158,12 @@ enum Commands {
     /// Run MCP server on Unix domain socket (.exo/server.sock)
     ///
     /// Loads WASM from file path (not embedded) with hot reload on change.
-    Serve,
+    Serve {
+        /// Run the deterministic TL autonomy benchmark without Forgejo.
+        #[cfg(debug_assertions)]
+        #[arg(long)]
+        mock_watcher: bool,
+    },
 
     /// Run stdio MCP proxy (stdin/stdout ↔ UDS server)
     McpStdio {
@@ -255,7 +262,14 @@ async fn main() -> Result<()> {
             .await;
         }
 
-        Commands::Serve => {
+        Commands::Serve {
+            #[cfg(debug_assertions)]
+            mock_watcher,
+        } => {
+            #[cfg(debug_assertions)]
+            if mock_watcher {
+                return experiment_harness::run(&config).await;
+            }
             return serve::run(&config).await;
         }
 

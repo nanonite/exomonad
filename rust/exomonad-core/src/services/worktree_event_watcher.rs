@@ -1555,6 +1555,65 @@ where
         Ok(observations)
     }
 
+    /// Process one synthetic Forgejo observation for the debug-only autonomy harness.
+    ///
+    /// The observation uses the same publication and transition validation as a live
+    /// poll cycle, but never contacts Forgejo. Release builds omit this entry point.
+    #[cfg(debug_assertions)]
+    pub async fn process_mock_observation(
+        &self,
+        pr: PrEntry,
+        review_state: ForgejoReviewState,
+        forgejo_review_present: bool,
+        ci_status: CIStatus,
+    ) -> Result<Vec<u64>> {
+        let head_sha = pr
+            .last_head_sha
+            .clone()
+            .filter(|sha| !sha.trim().is_empty())
+            .context("mock watcher PR must include a non-empty head SHA")?;
+        let branch = BranchName::try_from_str(&pr.head_branch)?;
+        let ci_status = if self.ci_source_configured() {
+            self.ci_status_map
+                .read()
+                .await
+                .get(&(branch, head_sha.clone()))
+                .cloned()
+                .unwrap_or(ci_status)
+        } else {
+            ci_status
+        };
+        let publication = PublishedHead {
+            pr_number: pr.number,
+            head_branch: pr.head_branch.clone(),
+            base_branch: pr.base_branch.clone(),
+            head_sha: head_sha.clone(),
+            author_agent: Some(pr.author_agent.clone()),
+            author_role: Some(pr.author_role.clone()),
+            invocation_id: None,
+            invocation_trigger: Some("debug_mock_watcher".to_string()),
+            invocation_runtime: None,
+        };
+        let pr_number = pr.number;
+        let mut registry = PrRegistry::default();
+        registry.prs.insert(pr_number, pr);
+        let mut observations = HashMap::new();
+        observations.insert(
+            pr_number,
+            Observation {
+                publication: Some(publication),
+                head_sha,
+                review_state,
+                comments: Vec::new(),
+                reviews: Vec::new(),
+                changes_requested_rounds: 0,
+                ci_status,
+                forgejo_review_present,
+            },
+        );
+        self.process_observations(&registry, &observations).await
+    }
+
     async fn process_observations(
         &self,
         registry: &crate::services::pr_registry::PrRegistry,

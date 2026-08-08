@@ -148,3 +148,8 @@ opencode-*.md
 
 .lolearn
 .gemini
+
+# Debug-only TL autonomy benchmark raw outputs
+/experiments/tl-autonomy/*/*
+!/experiments/tl-autonomy/*/REPORT.md
+!/experiments/tl-autonomy/*/ANALYSIS.json
