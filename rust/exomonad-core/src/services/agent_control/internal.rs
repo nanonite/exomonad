@@ -424,7 +424,7 @@ impl<
         env_vars: HashMap<String, String>,
     ) -> Result<super::tmux_ipc::WindowId> {
         self.new_tmux_window_inner(
-            name, cwd, agent_type, prompt, env_vars, None, None, None, None,
+            name, cwd, agent_type, prompt, env_vars, None, None, None, None, None,
         )
         .await
     }
@@ -745,6 +745,20 @@ impl<
         Ok(path)
     }
 
+    fn default_model_for_spawn(&self, agent_type: AgentType, role: Option<&str>) -> Option<&str> {
+        if role == Some("reviewer") {
+            None
+        } else if matches!(agent_type, AgentType::OpenCode | AgentType::Codex) {
+            self.spawn_agent_model()
+        } else {
+            None
+        }
+    }
+
+    fn default_effort_for_spawn(&self, role: Option<&str>) -> Option<&str> {
+        self.effort_for_role(role.unwrap_or("worker"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new_tmux_window_inner(
         &self,
@@ -755,6 +769,7 @@ impl<
         env_vars: HashMap<String, String>,
         fork_session_id: Option<&str>,
         claude_flags: Option<&ClaudeSpawnFlags>,
+        role: Option<&str>,
         model_override: Option<&str>,
         effort_override: Option<&str>,
     ) -> Result<super::tmux_ipc::WindowId> {
@@ -766,10 +781,7 @@ impl<
             None => None,
         };
 
-        let model = model_override.or_else(|| match agent_type {
-            AgentType::OpenCode | AgentType::Codex => self.spawn_agent_model(),
-            _ => None,
-        });
+        let model = model_override.or_else(|| self.default_model_for_spawn(agent_type, role));
         let full_command = Self::build_agent_command_with_effort(
             agent_type,
             prompt_file.as_deref(),
@@ -779,7 +791,7 @@ impl<
             claude_flags,
             self.yolo,
             model,
-            effort_override.or_else(|| self.effort_for_role("worker")),
+            effort_override.or_else(|| self.default_effort_for_spawn(role)),
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let tmux = self.tmux()?;
@@ -1779,6 +1791,32 @@ mod tests {
         services.project_dir = project_dir;
         services.git_wt = git_wt;
         Arc::new(services)
+    }
+
+    #[test]
+    fn reviewer_spawn_defaults_do_not_inherit_worker_settings() {
+        let service = AgentControlService::new(test_services(PathBuf::from(".")))
+            .with_spawn_agent_model(Some("opencode-go/deepseek-v4-pro".to_string()))
+            .with_spawn_agent_effort(Some("low".to_string()))
+            .with_reviewer_effort(Some("high".to_string()));
+
+        assert_eq!(
+            service.default_model_for_spawn(AgentType::Codex, Some("reviewer")),
+            None
+        );
+        assert_eq!(
+            service.default_model_for_spawn(AgentType::OpenCode, Some("reviewer")),
+            None
+        );
+        assert_eq!(
+            service.default_model_for_spawn(AgentType::Codex, Some("dev")),
+            Some("opencode-go/deepseek-v4-pro")
+        );
+        assert_eq!(
+            service.default_effort_for_spawn(Some("reviewer")),
+            Some("high")
+        );
+        assert_eq!(service.default_effort_for_spawn(Some("dev")), Some("low"));
     }
 
     #[tokio::test]

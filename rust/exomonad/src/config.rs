@@ -6,6 +6,8 @@ use exomonad_core::services::AgentType;
 use exomonad_core::Role;
 
 pub const REVIEWER_MAX_ROUNDS_ENV: &str = "EXOMONAD_REVIEWER_MAX_ROUNDS";
+pub const REVIEWER_MODEL_ENV: &str = "EXOMONAD_REVIEWER_MODEL";
+pub const REVIEWER_EFFORT_ENV: &str = "EXOMONAD_REVIEWER_EFFORT_LEVEL";
 
 pub fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
     let parsed = value
@@ -26,6 +28,25 @@ fn parse_agent_type_env(s: &str) -> Option<AgentType> {
         "shoal" => Some(AgentType::Shoal),
         _ => None,
     }
+}
+
+fn parse_effort_level_env(value: &str) -> Result<Option<EffortLevel>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let level = match value.to_ascii_lowercase().as_str() {
+        "low" => EffortLevel::Low,
+        "medium" => EffortLevel::Medium,
+        "high" => EffortLevel::High,
+        "xhigh" => EffortLevel::XHigh,
+        "max" => EffortLevel::Max,
+        _ => return Err(anyhow::anyhow!(
+            "Invalid {REVIEWER_EFFORT_ENV} value `{value}`. Expected low, medium, high, xhigh, or max."
+        )),
+    };
+    Ok(Some(level))
 }
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -101,7 +122,8 @@ pub struct ReviewerConfig {
     pub effort_level: Option<EffortLevel>,
     /// Model string passed to the reviewer agent
     /// (e.g. "claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5").
-    /// `None` means the agent picks its own default.
+    /// `None` means the harness picks its own native default; it must never
+    /// inherit a worker or TL model.
     pub model: Option<String>,
     /// Context file paths injected into the reviewer's session.
     #[serde(default)]
@@ -539,7 +561,18 @@ impl Config {
                 reviewer.agent_type = agent_type;
             }
         }
-        let reviewer_effort_level = resolve_effort_setting(None, reviewer.effort_level, None);
+        if let Ok(model) = std::env::var(REVIEWER_MODEL_ENV) {
+            if !model.trim().is_empty() {
+                reviewer.model = Some(model);
+            }
+        }
+        let reviewer_effort_override = std::env::var(REVIEWER_EFFORT_ENV)
+            .ok()
+            .map(|value| parse_effort_level_env(&value))
+            .transpose()?
+            .flatten();
+        let reviewer_effort_level =
+            resolve_effort_setting(reviewer_effort_override, reviewer.effort_level, None);
 
         Ok(Self {
             project_dir,
@@ -1182,5 +1215,16 @@ mod effort_tests {
         assert_eq!(raw.worker_effort_level, Some(EffortLevel::Low));
         assert_eq!(raw.reviewer.unwrap().effort_level, Some(EffortLevel::XHigh));
         assert!(EffortLevel::from_str("extra-high", false).is_err());
+    }
+
+    #[test]
+    fn reviewer_effort_environment_values_are_strictly_parsed() {
+        assert_eq!(
+            super::parse_effort_level_env(" HIGH ").unwrap(),
+            Some(EffortLevel::High)
+        );
+        assert_eq!(super::parse_effort_level_env(" ").unwrap(), None);
+        let error = super::parse_effort_level_env("turbo").unwrap_err();
+        assert!(error.to_string().contains(REVIEWER_EFFORT_ENV));
     }
 }

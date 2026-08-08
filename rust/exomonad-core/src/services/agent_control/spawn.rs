@@ -1638,8 +1638,9 @@ impl<
                         env_vars,
                         None, // no fork_session for OpenCode
                         None, // no claude_flags
-                        options.model.as_deref(),
-                        options.effort.as_deref(),
+                        Some(role.as_str()),
+                        model.as_deref(),
+                        effort.as_deref(),
                     )
                     .await
                     .map_err(|e| {
@@ -1658,8 +1659,9 @@ impl<
                         env_vars,
                         fork_id,
                         None,
-                        options.model.as_deref(),
-                        options.effort.as_deref(),
+                        Some(role.as_str()),
+                        model.as_deref(),
+                        effort.as_deref(),
                     )
                     .await
                     .map_err(|e| {
@@ -1679,8 +1681,9 @@ impl<
                         env_vars,
                         fork_id,
                         Some(&options.claude_flags),
-                        options.model.as_deref(),
-                        options.effort.as_deref(),
+                        Some(role.as_str()),
+                        model.as_deref(),
+                        effort.as_deref(),
                     )
                     .await
                     .map_err(|e| {

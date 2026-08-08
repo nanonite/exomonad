@@ -1,6 +1,9 @@
 use crate::uds_client;
 use anyhow::{Context, Result};
-use exomonad::config::{Config, EffortLevel, ResolvedEffort, REVIEWER_MAX_ROUNDS_ENV};
+use exomonad::config::{
+    Config, EffortLevel, ResolvedEffort, REVIEWER_EFFORT_ENV, REVIEWER_MAX_ROUNDS_ENV,
+    REVIEWER_MODEL_ENV,
+};
 use exomonad_core::services::AgentType;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -890,6 +893,35 @@ fn set_reviewer_max_rounds_environment(session: &str, value: Option<u32>) -> Res
     Ok(())
 }
 
+fn agent_configuration_environment(config: &Config) -> String {
+    let mut parts = Vec::new();
+    if let Some(model) = &config.opencode.tl_model {
+        parts.push(format!(
+            "EXOMONAD_TL_MODEL={}",
+            shell_escape::escape(model.clone().into())
+        ));
+    }
+    if let Some(model) = &config.opencode.worker_model {
+        parts.push(format!(
+            "EXOMONAD_WORKER_MODEL={}",
+            shell_escape::escape(model.clone().into())
+        ));
+    }
+    if let Some(model) = &config.reviewer.model {
+        parts.push(format!(
+            "{}={}",
+            REVIEWER_MODEL_ENV,
+            shell_escape::escape(model.clone().into())
+        ));
+    }
+    parts.push(format!(
+        "{}={}",
+        REVIEWER_EFFORT_ENV,
+        shell_escape::escape(config.reviewer_effort_level.level.to_string().into())
+    ));
+    format!(" {}", parts.join(" "))
+}
+
 /// Run the init command: create or attach to tmux session.
 pub async fn run(
     session_override: Option<String>,
@@ -1638,20 +1670,7 @@ pub async fn run(
         }
     }
 
-    let model_env = {
-        let mut parts = Vec::new();
-        if let Some(m) = &config.opencode.tl_model {
-            parts.push(format!("EXOMONAD_TL_MODEL={}", m));
-        }
-        if let Some(m) = &config.opencode.worker_model {
-            parts.push(format!("EXOMONAD_WORKER_MODEL={}", m));
-        }
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", parts.join(" "))
-        }
-    };
+    let model_env = agent_configuration_environment(&config);
     let verbose_prefix = if verbose {
         "RUST_LOG=info EXOMONAD_HOOK_TRACE=1 EXOMONAD_CHAINLINK_TRACE=1 "
     } else {
@@ -2666,6 +2685,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_configuration_environment_propagates_reviewer_settings() {
+        let mut config = Config::default();
+        config.opencode.tl_model = Some("opencode/tl model".to_string());
+        config.opencode.worker_model = Some("opencode/worker".to_string());
+        config.reviewer.model = Some("openai/reviewer model".to_string());
+        config.reviewer_effort_level = ResolvedEffort::from_cli(EffortLevel::XHigh);
+
+        let environment = agent_configuration_environment(&config);
+
+        assert!(environment.contains("EXOMONAD_TL_MODEL='opencode/tl model'"));
+        assert!(environment.contains("EXOMONAD_WORKER_MODEL=opencode/worker"));
+        assert!(environment.contains("EXOMONAD_REVIEWER_MODEL='openai/reviewer model'"));
+        assert!(environment.contains("EXOMONAD_REVIEWER_EFFORT_LEVEL=xhigh"));
+
+        config.reviewer.model = None;
+        let default_environment = agent_configuration_environment(&config);
+        assert!(!default_environment.contains(REVIEWER_MODEL_ENV));
+        assert!(default_environment.contains("EXOMONAD_REVIEWER_EFFORT_LEVEL=xhigh"));
+    }
+
+    #[test]
     fn watcher_dashboard_window_detection_uses_window_name() {
         assert!(has_watcher_dashboard_window(["Server", "Watcher", "TL"]));
         assert!(!has_watcher_dashboard_window(["Server", "TL"]));
@@ -2938,6 +2978,19 @@ mod tests {
         assert!(validate_codex_model_name("gpt-5.2-codex").is_ok());
         assert!(validate_codex_model_name("opencode-go/deepseek-v4-flash").is_err());
         assert!(validate_codex_model_name("claude-sonnet-4-6").is_err());
+    }
+
+    #[tokio::test]
+    async fn reviewer_validation_rejects_cross_harness_model() {
+        let error = validate_reviewer_model_for_harness(
+            AgentType::Codex,
+            Some("opencode-go/deepseek-v4-pro"),
+            Some("high"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Codex model"));
     }
 
     #[test]
