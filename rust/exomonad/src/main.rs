@@ -9,6 +9,8 @@
 mod app_state;
 mod dashboard;
 #[cfg(debug_assertions)]
+mod experiment_analysis;
+#[cfg(debug_assertions)]
 mod experiment_harness;
 mod init;
 mod logging;

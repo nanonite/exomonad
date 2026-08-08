@@ -226,6 +226,7 @@ pub async fn run(config: &Config) -> Result<()> {
             .collect(),
     };
     write_json(&run_dir.join("manifest.json"), &run_manifest).await?;
+    crate::experiment_analysis::analyze_run(&run_dir).await?;
     println!("TL autonomy mock benchmark complete: {}", run_dir.display());
     Ok(())
 }
