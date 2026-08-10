@@ -22,12 +22,15 @@ from .schema import (
     Verdict,
     validate,
 )
+from .store import CorruptCheckpoint, DEFAULT_ROOT, ResumeState, RunStore, checkpoint, create, load, resume
 from .write import ConcurrentWrite, MutationError, StateReadError, WriteHooks, apply
 
 __all__ = [
     "BUDGET_KEYS",
     "BudgetLedger",
     "ConcurrentWrite",
+    "CorruptCheckpoint",
+    "DEFAULT_ROOT",
     "EVENT_KEYS",
     "EventCursor",
     "FSM_KEYS",
@@ -40,6 +43,8 @@ __all__ = [
     "LockTimeout",
     "RUN_KEYS",
     "RunState",
+    "RunStore",
+    "ResumeState",
     "RunLock",
     "SCHEMA_VERSION",
     "SLICE_KEYS",
@@ -51,6 +56,10 @@ __all__ = [
     "Verdict",
     "WriteHooks",
     "apply",
+    "checkpoint",
+    "create",
+    "load",
     "owner_is_stale",
+    "resume",
     "validate",
 ]

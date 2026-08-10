@@ -15,6 +15,14 @@ The runtime creates per-run state under `.exo/tl-loop/<run_id>/`. That directory
 is runtime state, not Python source, and must never be used as the package code
 location.
 
+## Checkpoint and resume layout
+
+Each run is persisted at `.exo/tl-loop/<run_id>/run.json`; the shared writer
+lock is `.exo/tl-loop/run.lock`. `tl_loop.state.store.resume()` reconstructs
+the FSM, slice map, budget ledger, and event-log replay offset from that file.
+Resume treats the checkpoint and event log as authoritative and performs no
+server or network query.
+
 ## FSM parity fixture
 
 `tl_loop/fsm/` is a pure port of `.exo/roles/devswarm/TLPhase.hs`. The golden

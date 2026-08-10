@@ -54,8 +54,13 @@ def apply(
     *,
     lock_timeout: float = 5.0,
     hooks: WriteHooks | None = None,
+    initial: Document | None = None,
 ) -> Document:
-    """Apply one validated mutation through the only run-state write path."""
+    """Apply one validated mutation through the only run-state write path.
+
+    ``initial`` is used only to publish a new run atomically. Existing runs
+    always follow the revisioned compare-and-swap path below.
+    """
     if not callable(mutator):
         raise TypeError("run-state mutator must be callable")
     directory = Path(run_dir)
@@ -63,6 +68,29 @@ def apply(
     lock_path = directory.parent / "run.lock"
 
     with RunLock(lock_path, timeout=lock_timeout):
+        if _is_missing(target):
+            if initial is None:
+                observed = _read_valid_snapshot(target)
+            else:
+                validate(initial)
+                candidate_value = mutator(copy.deepcopy(initial))
+                if not isinstance(candidate_value, dict):
+                    raise MutationError("run-state mutator must return an object")
+                candidate = copy.deepcopy(candidate_value)
+                candidate["revision"] = initial["revision"]
+                validate(candidate)
+                temporary = _write_temp(directory, candidate)
+                try:
+                    if hooks and hooks.before_rename:
+                        hooks.before_rename()
+                    _create_atomically(temporary, target, directory)
+                except BaseException:
+                    _remove_temp(temporary)
+                    raise
+                return candidate
+        if initial is not None:
+            raise FileExistsError(f"run state already exists: {target}")
+
         observed = _read_valid_snapshot(target)
         candidate_value = mutator(copy.deepcopy(observed.document))
         if not isinstance(candidate_value, dict):
@@ -85,6 +113,14 @@ def apply(
             _remove_temp(temporary)
             raise
         return candidate
+
+
+def _is_missing(target: Path) -> bool:
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return True
+    return False
 
 
 def _read_valid_snapshot(target: Path) -> _Snapshot:
@@ -165,6 +201,25 @@ def _replace_atomically(temporary: Path, target: Path, directory: Path) -> None:
                 raise
     finally:
         os.close(descriptor)
+
+
+def _create_atomically(temporary: Path, target: Path, directory: Path) -> None:
+    try:
+        os.link(temporary, target)
+    except FileExistsError as error:
+        raise ConcurrentWrite(f"run state appeared before creation: {target}") from error
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            try:
+                os.fsync(descriptor)
+            except OSError as error:
+                if error.errno not in {errno.EINVAL, errno.EPERM, errno.EACCES, errno.ENOTSUP}:
+                    raise
+        finally:
+            os.close(descriptor)
+    finally:
+        _remove_temp(temporary)
 
 
 def _remove_temp(temporary: Path) -> None:
