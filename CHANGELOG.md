@@ -249,6 +249,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Implement the immutable ExoMonad ledger and rebuildable analysis importer (#643)
 - Freeze ExoMonad observability contracts and implementation gates (#642)
 - Document ExoMonad session logging mechanisms and events (#636)
 - feat: prefix continuation context onto spawn_leaf and resume_pr tasks (#626)
