@@ -1,0 +1,179 @@
+"""Closed-key and cross-field validation coverage for TL run state."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import cast
+
+from tl_loop.state.schema import SchemaError, validate
+
+
+def test_valid_run_state_document_is_accepted() -> None:
+    validate(_valid_document())
+
+
+def test_unknown_keys_are_rejected_at_every_nesting_level() -> None:
+    cases: list[tuple[str, dict[str, object]]] = []
+
+    root = _valid_document()
+    root["unknown"] = True
+    cases.append(("run", root))
+
+    fsm = _valid_document()
+    cast(dict[str, object], fsm["fsm"])["unknown"] = True
+    cases.append(("run.fsm", fsm))
+
+    slice_state = _valid_document()
+    _slice(slice_state, "slice-a")["unknown"] = True
+    cases.append(("run.slices['slice-a']", slice_state))
+
+    budgets = _valid_document()
+    cast(dict[str, object], budgets["budgets"])["unknown"] = True
+    cases.append(("run.budgets", budgets))
+
+    ledger = _valid_document()
+    cast(dict[str, object], cast(dict[str, object], ledger["budgets"])["ledger"])["unknown"] = True
+    cases.append(("run.budgets.ledger", ledger))
+
+    gates = _valid_document()
+    cast(list[dict[str, object]], gates["gates"])[0]["unknown"] = True
+    cases.append(("run.gates[0]", gates))
+
+    events = _valid_document()
+    cast(dict[str, object], events["events"])["unknown"] = True
+    cases.append(("run.events", events))
+
+    for path, document in cases:
+        _assert_rejected(document, path)
+
+
+def test_enum_values_are_closed() -> None:
+    phase = _valid_document()
+    cast(dict[str, object], phase["fsm"])["phase"] = "unknown-phase"
+    _assert_rejected(phase, "run.fsm.phase")
+
+    status = _valid_document()
+    _slice(status, "slice-a")["status"] = "unknown-status"
+    _assert_rejected(status, "run.slices['slice-a'].status")
+
+    verdict = _valid_document()
+    _slice(verdict, "slice-a")["verdict"] = "maybe"
+    _assert_rejected(verdict, "run.slices['slice-a'].verdict")
+
+    gate = _valid_document()
+    cast(list[dict[str, object]], gate["gates"])[0]["status"] = "unknown-gate"
+    _assert_rejected(gate, "run.gates[0].status")
+
+
+def test_wrong_types_are_rejected_with_qualified_paths() -> None:
+    document = _valid_document()
+    document["revision"] = False
+    cast(dict[str, object], document["events"])["last_consumed_offset"] = "zero"
+    errors = _rejection(document)
+    assert "run.revision" in errors
+    assert "run.events.last_consumed_offset" in errors
+
+
+def test_unknown_version_is_rejected_without_migration() -> None:
+    document = _valid_document()
+    document["version"] = 99
+    _assert_rejected(document, "run.version")
+
+
+def test_overlapping_non_terminal_paths_are_rejected() -> None:
+    document = _valid_document()
+    _slice(document, "slice-a")["paths"] = ["src/shared/main.py"]
+    slices = cast(dict[str, object], document["slices"])
+    slices["slice-b"] = _slice_record(
+        "slice-b",
+        paths=["src/shared/*.py"],
+    )
+    _assert_rejected(document, "run.slices['slice-b'].paths")
+
+
+def test_terminal_slice_paths_do_not_conflict_with_active_ownership() -> None:
+    document = _valid_document()
+    slices = cast(dict[str, object], document["slices"])
+    slices["slice-b"] = _slice_record(
+        "slice-b",
+        status="merged",
+        paths=["src/a.py"],
+    )
+    validate(document)
+
+
+def test_dependencies_must_exist_and_be_acyclic() -> None:
+    document = _valid_document()
+    _slice(document, "slice-a")["depends_on"] = ["slice-b"]
+    _assert_rejected(document, "unknown slice 'slice-b'")
+
+    cyclic = _valid_document()
+    slices = cast(dict[str, object], cyclic["slices"])
+    _slice(cyclic, "slice-a")["depends_on"] = ["slice-b"]
+    slices["slice-b"] = _slice_record("slice-b", depends_on=["slice-a"], paths=["src/b.py"])
+    _assert_rejected(cyclic, "depends_on cycle")
+
+
+def test_waiting_ids_must_reference_slices_without_duplicates() -> None:
+    unknown = _valid_document()
+    cast(dict[str, object], unknown["fsm"])["waiting"] = ["missing"]
+    _assert_rejected(unknown, "run.fsm.waiting[0]")
+
+    duplicate = _valid_document()
+    cast(dict[str, object], duplicate["fsm"])["waiting"] = ["slice-a", "slice-a"]
+    _assert_rejected(duplicate, "run.fsm.waiting")
+
+
+def _valid_document() -> dict[str, object]:
+    return {
+        "version": 1,
+        "revision": 0,
+        "run_id": "run-1",
+        "fsm": {"phase": "tl_planning", "waiting": []},
+        "slices": {"slice-a": _slice_record("slice-a")},
+        "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
+        "gates": [{"name": "plan", "status": "pending"}],
+        "events": {"last_consumed_offset": 0},
+    }
+
+
+def _slice_record(
+    slice_id: str,
+    *,
+    status: str = "pending",
+    paths: list[str] | None = None,
+    depends_on: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "id": slice_id,
+        "status": status,
+        "paths": paths or [f"src/{slice_id}.py"],
+        "depends_on": depends_on or [],
+        "base_ref": None,
+        "test_plan": ["just tl-loop-test"],
+        "agent_type": None,
+        "model": None,
+        "branch": None,
+        "worktree": None,
+        "pr_number": None,
+        "reviewed_head": None,
+        "attempts": 0,
+        "verdict": None,
+    }
+
+
+def _slice(document: dict[str, object], slice_id: str) -> dict[str, object]:
+    slices = cast(dict[str, object], document["slices"])
+    return cast(dict[str, object], slices[slice_id])
+
+
+def _assert_rejected(document: dict[str, object], expected: str) -> None:
+    assert expected in _rejection(document)
+
+
+def _rejection(document: dict[str, object]) -> str:
+    try:
+        validate(deepcopy(document))
+    except SchemaError as error:
+        return str(error)
+    raise AssertionError("expected SchemaError")

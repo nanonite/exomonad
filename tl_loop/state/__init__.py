@@ -1,1 +1,45 @@
-"""Durable controller state models."""
+"""Durable TL run-state schema and persistence boundaries."""
+
+from .schema import (
+    BUDGET_KEYS,
+    EVENT_KEYS,
+    FSM_KEYS,
+    GATE_KEYS,
+    LEDGER_KEYS,
+    RUN_KEYS,
+    SCHEMA_VERSION,
+    SLICE_KEYS,
+    BudgetLedger,
+    EventCursor,
+    FSMState,
+    GateState,
+    GateStatus,
+    RunState,
+    SchemaError,
+    SliceState,
+    SliceStatus,
+    Verdict,
+    validate,
+)
+
+__all__ = [
+    "BUDGET_KEYS",
+    "BudgetLedger",
+    "EVENT_KEYS",
+    "EventCursor",
+    "FSM_KEYS",
+    "FSMState",
+    "GATE_KEYS",
+    "GateState",
+    "GateStatus",
+    "LEDGER_KEYS",
+    "RUN_KEYS",
+    "RunState",
+    "SCHEMA_VERSION",
+    "SLICE_KEYS",
+    "SchemaError",
+    "SliceState",
+    "SliceStatus",
+    "Verdict",
+    "validate",
+]
