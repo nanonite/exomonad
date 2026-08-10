@@ -1,0 +1,14 @@
+name: CI
+
+on: push
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run retired-provider gate
+        run: |
+          just check-no-$(printf 'ge%s' mini)

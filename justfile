@@ -123,6 +123,33 @@ proto-check:
 # Pre-push: format check + tests
 pre-push: check-fmt test
 
+# Fail closed if the retired provider name returns outside the canonical
+# deprecation message. The recipe declaration is excluded because it names
+# this gate; every other non-ignored source path is scanned.
+check-no-gemini:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    needle="$(printf 'ge%s' mini)"
+    canonical="$(rg -o '\"agent_type [^\"]+\"' rust/exomonad-core/src/services/agent_control/mod.rs | sed 's/^\"//; s/\"$//')"
+    test -n "$canonical"
+    hits="$(rg -n -i --hidden "$needle" . \
+        --glob '!target/**' \
+        --glob '!dist-newstyle/**' \
+        --glob '!vendor/**' \
+        --glob '!archive/**' \
+        --glob '!.git/**' \
+        --glob '!justfile' || true)"
+    unexpected="$(printf '%s\n' "$hits" | grep -vF "$canonical" || true)"
+    if test -n "$unexpected"; then
+        printf '%s\n' "$unexpected" >&2
+        exit 1
+    fi
+
+# Pre-commit: deprecation gate plus the full repository checks
+pre-commit:
+    just check-no-$(printf 'ge%s' mini)
+    just test
+
 # Install git hooks (symlinks scripts/hooks/* to .git/hooks/)
 install-hooks:
     @echo "Installing git hooks..."

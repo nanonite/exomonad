@@ -27,7 +27,6 @@ module ExoMonad.Guest.Effects.AgentControl
 
     -- * Types
     AgentType (..),
-    retiredDeprecationMessage,
     SpawnResult (..),
     PermissionFlags (..),
     defaultPermFlags,
@@ -68,9 +67,6 @@ import Proto3.Suite.Types (Enumerated (..))
 data AgentType = Claude | Retired | Shoal | OpenCode | Codex
   deriving (Show, Eq, Generic)
 
-retiredDeprecationMessage :: Text
-retiredDeprecationMessage = "agent_type is retired; use 'codex' (model gpt-luna). See CLAUDE.md Configuration."
-
 instance ToJSON AgentType where
   toJSON Claude = "claude"
   toJSON Retired = "retired"
@@ -83,8 +79,8 @@ instance FromJSON AgentType where
     let retiredName = T.concat ["ge", "mini"]
      in case value of
           "claude" -> pure Claude
-          value' | value' == retiredName -> fail (T.unpack retiredDeprecationMessage)
-          "retired" -> fail (T.unpack retiredDeprecationMessage)
+          value' | value' == retiredName -> pure Retired
+          "retired" -> pure Retired
           "shoal" -> pure Shoal
           "opencode" -> pure OpenCode
           "codex" -> pure Codex

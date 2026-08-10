@@ -720,6 +720,7 @@ fn sanitize_session_name(name: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exomonad_core::services::agent_control::AGENT_TYPE_DEPRECATION_MESSAGE;
 
     #[test]
     fn test_raw_config_parse_local() {
@@ -993,6 +994,18 @@ mod tests {
         "#;
         let raw: RawConfig = toml::from_str(content).unwrap();
         assert_eq!(raw.spawn_agent_type, Some(AgentType::OpenCode));
+    }
+
+    #[test]
+    fn test_spawn_agent_type_retired_fails_during_config_load() {
+        let retired = ["ge", "mini"].concat();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        std::fs::write(&path, format!("spawn_agent_type = \"{retired}\"\n")).unwrap();
+
+        let error = Config::load_raw(&path).expect_err("retired spawn harness must fail closed");
+        let error_text = format!("{error:#}");
+        assert!(error_text.contains(AGENT_TYPE_DEPRECATION_MESSAGE));
     }
 
     // ── Reviewer config tests ──────────────────────────────────────────────

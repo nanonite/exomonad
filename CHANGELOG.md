@@ -251,6 +251,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- M0.6 Fail-closed retired-provider deprecation + CI grep gate (#664)
 - M0.4 Sweep retired harness references out of prompts, rules and docs (#663)
 - M0.3 Retire Codex runtime paths in the Rust host (#662)
 - M0.2 Retire Codex spawn paths in the Haskell WASM guest (#661)
