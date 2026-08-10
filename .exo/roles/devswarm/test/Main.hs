@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Main where
 
@@ -144,7 +145,8 @@ goldenRow (phase, event) =
   Aeson.object
     [ "phase" Aeson..= Aeson.toJSON phase,
       "event" Aeson..= eventJSON event,
-      "result" Aeson..= transitionJSON phase event
+      "result" Aeson..= transitionJSON phase event,
+      "stop" Aeson..= stopDecisionJSON phase
     ]
 
 transitionJSON :: TLPhase -> TLEvent -> Value
@@ -165,6 +167,28 @@ legalTransition (TLMerging _ _) (PRMerged _ _) = True
 legalTransition _ (PRMerged _ _) = False
 legalTransition _ AllChildrenDone = True
 legalTransition _ (OwnPRFiled _ _ _) = True
+
+stopDecisionJSON :: TLPhase -> Value
+stopDecisionJSON phase =
+  case StateMachine.canExit @TLPhase @TLEvent phase of
+    MustBlock _ ->
+      Aeson.object
+        [ "decision" Aeson..= ("block" :: Text),
+          "waiting" Aeson..= False,
+          "terminal" Aeson..= False
+        ]
+    ShouldNudge _ ->
+      Aeson.object
+        [ "decision" Aeson..= ("allow" :: Text),
+          "waiting" Aeson..= True,
+          "terminal" Aeson..= False
+        ]
+    Clean ->
+      Aeson.object
+        [ "decision" Aeson..= ("allow" :: Text),
+          "waiting" Aeson..= False,
+          "terminal" Aeson..= True
+        ]
 
 cross :: [a] -> [b] -> [(a, b)]
 cross left right = [(x, y) | x <- left, y <- right]

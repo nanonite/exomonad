@@ -24,6 +24,7 @@ from .phase import (
     TLWaiting,
 )
 from .transition import IllegalTransition, transition
+from .terminal import is_terminal, is_waiting
 
 __all__ = [
     "AllChildrenDone",
@@ -47,4 +48,6 @@ __all__ = [
     "TLMerging",
     "TLWaiting",
     "transition",
+    "is_terminal",
+    "is_waiting",
 ]

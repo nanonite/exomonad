@@ -21,6 +21,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -31,7 +36,12 @@
       "phase": {
         "phase": "tl_planning"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -45,6 +55,11 @@
       "result": {
         "message": "a: timed out",
         "phase": "tl_failed"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -56,7 +71,12 @@
       "phase": {
         "phase": "tl_planning"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -67,6 +87,11 @@
       },
       "result": {
         "phase": "tl_done"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -83,6 +108,11 @@
         "phase": "tl_pr_filed",
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -106,6 +136,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -116,7 +151,12 @@
       "phase": {
         "phase": "tl_dispatching"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
+      }
     },
     {
       "event": {
@@ -130,6 +170,11 @@
       "result": {
         "message": "a: timed out",
         "phase": "tl_failed"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -141,7 +186,12 @@
       "phase": {
         "phase": "tl_dispatching"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
+      }
     },
     {
       "event": {
@@ -152,6 +202,11 @@
       },
       "result": {
         "phase": "tl_done"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -168,6 +223,11 @@
         "phase": "tl_pr_filed",
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -213,6 +273,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -244,6 +309,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -270,6 +340,11 @@
       "result": {
         "message": "a: timed out",
         "phase": "tl_failed"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -302,6 +377,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -325,6 +405,11 @@
       },
       "result": {
         "phase": "tl_done"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -353,6 +438,11 @@
         "phase": "tl_pr_filed",
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -389,6 +479,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -412,7 +507,12 @@
         "phase": "tl_merging",
         "pr_number": 7
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
+      }
     },
     {
       "event": {
@@ -439,6 +539,11 @@
       "result": {
         "message": "a: timed out",
         "phase": "tl_failed"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -472,6 +577,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -496,6 +606,11 @@
       },
       "result": {
         "phase": "tl_done"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -525,6 +640,11 @@
         "phase": "tl_pr_filed",
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": false,
+        "waiting": true
       }
     },
     {
@@ -548,6 +668,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -558,7 +683,12 @@
       "phase": {
         "phase": "tl_all_merged"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -572,6 +702,11 @@
       "result": {
         "message": "a: timed out",
         "phase": "tl_failed"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -583,7 +718,12 @@
       "phase": {
         "phase": "tl_all_merged"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -594,6 +734,11 @@
       },
       "result": {
         "phase": "tl_done"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -610,6 +755,11 @@
         "phase": "tl_pr_filed",
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -635,6 +785,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "block",
+        "terminal": false,
+        "waiting": false
       }
     },
     {
@@ -647,7 +802,12 @@
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "block",
+        "terminal": false,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -663,6 +823,11 @@
       "result": {
         "message": "a: timed out",
         "phase": "tl_failed"
+      },
+      "stop": {
+        "decision": "block",
+        "terminal": false,
+        "waiting": false
       }
     },
     {
@@ -676,7 +841,12 @@
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "block",
+        "terminal": false,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -689,6 +859,11 @@
       },
       "result": {
         "phase": "tl_done"
+      },
+      "stop": {
+        "decision": "block",
+        "terminal": false,
+        "waiting": false
       }
     },
     {
@@ -707,6 +882,11 @@
         "phase": "tl_pr_filed",
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
+      },
+      "stop": {
+        "decision": "block",
+        "terminal": false,
+        "waiting": false
       }
     },
     {
@@ -730,6 +910,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -740,7 +925,12 @@
       "phase": {
         "phase": "tl_done"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -754,6 +944,11 @@
       "result": {
         "message": "a: timed out",
         "phase": "tl_failed"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -765,7 +960,12 @@
       "phase": {
         "phase": "tl_done"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -776,6 +976,11 @@
       },
       "result": {
         "phase": "tl_done"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -792,6 +997,11 @@
         "phase": "tl_pr_filed",
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -816,6 +1026,11 @@
           }
         },
         "phase": "tl_waiting"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -827,7 +1042,12 @@
         "message": "child failed",
         "phase": "tl_failed"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -842,6 +1062,11 @@
       "result": {
         "message": "a: timed out",
         "phase": "tl_failed"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -854,7 +1079,12 @@
         "message": "child failed",
         "phase": "tl_failed"
       },
-      "result": "illegal"
+      "result": "illegal",
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
+      }
     },
     {
       "event": {
@@ -866,6 +1096,11 @@
       },
       "result": {
         "phase": "tl_done"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     },
     {
@@ -883,6 +1118,11 @@
         "phase": "tl_pr_filed",
         "pr_number": 12,
         "url": "https://forgejo.example/pulls/12"
+      },
+      "stop": {
+        "decision": "allow",
+        "terminal": true,
+        "waiting": false
       }
     }
   ],
