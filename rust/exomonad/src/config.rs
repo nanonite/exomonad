@@ -30,6 +30,18 @@ fn parse_agent_type_env(s: &str) -> Option<AgentType> {
     }
 }
 
+fn resolve_spawn_agent_type(
+    environment: Option<&str>,
+    local: Option<AgentType>,
+    global: Option<AgentType>,
+) -> AgentType {
+    environment
+        .and_then(parse_agent_type_env)
+        .or(local)
+        .or(global)
+        .unwrap_or_default()
+}
+
 fn parse_effort_level_env(value: &str) -> Result<Option<EffortLevel>> {
     let value = value.trim();
     if value.is_empty() {
@@ -455,13 +467,12 @@ impl Config {
             .or(local_raw.root_agent_type)
             .unwrap_or(AgentType::Claude);
 
-        // Resolve spawn_agent_type: env > local > global > default (Gemini)
-        let spawn_agent_type = std::env::var("EXOMONAD_SPAWN_AGENT_TYPE")
-            .ok()
-            .and_then(|s| parse_agent_type_env(&s))
-            .or(local_raw.spawn_agent_type)
-            .or(global_raw.spawn_agent_type)
-            .unwrap_or(AgentType::Gemini);
+        // Resolve spawn_agent_type: env > local > global > default (Codex)
+        let spawn_agent_type = resolve_spawn_agent_type(
+            std::env::var("EXOMONAD_SPAWN_AGENT_TYPE").ok().as_deref(),
+            local_raw.spawn_agent_type,
+            global_raw.spawn_agent_type,
+        );
 
         let tl_effort_level =
             resolve_effort_setting(None, local_raw.tl_effort_level, global_raw.tl_effort_level);
@@ -635,7 +646,7 @@ impl Default for Config {
             wasm_dir: PathBuf::from(".exo/wasm"),
             root_agent_type: AgentType::Claude,
             tl_effort_level: ResolvedEffort::MEDIUM_DEFAULT,
-            spawn_agent_type: AgentType::Gemini,
+            spawn_agent_type: AgentType::default(),
             worker_effort_level: ResolvedEffort::MEDIUM_DEFAULT,
             reviewer_effort_level: ResolvedEffort::MEDIUM_DEFAULT,
             flake_ref: None,
@@ -769,7 +780,13 @@ mod tests {
         assert_eq!(config.project_dir, PathBuf::from("."));
         assert_eq!(config.role, Role::tl());
         assert_eq!(config.root_agent_type, AgentType::Claude);
+        assert_eq!(config.spawn_agent_type, AgentType::Codex);
         assert_eq!(config.port, 7433);
+    }
+
+    #[test]
+    fn test_spawn_agent_type_defaults_to_codex_when_config_omits_field() {
+        assert_eq!(resolve_spawn_agent_type(None, None, None), AgentType::Codex);
     }
 
     #[test]

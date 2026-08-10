@@ -2,9 +2,9 @@
 
 ## problem summary
 
-when `exomonad init` starts an opencode tl, spawned workers default to gemini because:
+when `exomonad init` starts an opencode tl, spawned workers default to codex because:
 1. the role context template (`tl.md`) is static — no instruction about which agent type to use
-2. `spawn_worker` proto default is `UNSPECIFIED` → gemini
+2. `spawn_worker` proto default is `UNSPECIFIED` → the configured spawn harness
 3. no session-level "profile" flows down the spawn tree
 
 sub-tl worktrees also lose root workspace context (chainlink tasks, agent.md) because
@@ -21,7 +21,7 @@ add field to `RawConfig` and `Config`:
 spawn_agent_type = "opencode"  # agent type for spawn_worker and fork_wave children
 ```
 
-resolution order: `local.spawn_agent_type > global.spawn_agent_type > AgentType::Gemini`
+resolution order: `local.spawn_agent_type > global.spawn_agent_type > AgentType::Codex`
 
 propagate the value into `AgentControlService` alongside the existing `root_agent_type`.
 
@@ -36,7 +36,7 @@ propagate the value into `AgentControlService` alongside the existing `root_agen
 | `--opencode` | opencode | opencode |
 | `--claude-code` | claude | claude |
 | `--tl=X --worker=Y` | x | y |
-| _(default)_ | claude | gemini (unchanged) |
+| _(default)_ | claude | codex |
 
 `--opencode` sets both fields. `--claude-code` sets both. `--tl`/`--worker` set each independently.
 

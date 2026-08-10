@@ -1,4 +1,5 @@
 default_role = "tl"
+spawn_agent_type = "codex"
 project_dir = "."
 tmux_session = "EXOMONAD"
 port = 7433

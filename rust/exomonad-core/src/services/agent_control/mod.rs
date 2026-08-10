@@ -249,9 +249,6 @@ pub enum AgentType {
     Claude,
 
     /// Gemini CLI (spawns with `gemini --prompt-interactive '...'`).
-    ///
-    /// Default agent type.
-    #[default]
     Gemini,
 
     /// Custom binary agent (e.g., shoal-agent).
@@ -261,6 +258,7 @@ pub enum AgentType {
     OpenCode,
 
     /// OpenAI Codex CLI.
+    #[default]
     Codex,
 
     /// Plain long-running process (no MCP, no agent identity, no worktree).
@@ -815,7 +813,7 @@ impl<
             birth_branch: BirthBranch::try_from_str("unset")
                 .expect("literal validated string is non-empty"),
             yolo: false,
-            spawn_agent_type: AgentType::Gemini,
+            spawn_agent_type: AgentType::default(),
             spawn_agent_model: None,
             spawn_agent_effort: None,
             wasm_name: "devswarm".to_string(),
@@ -1529,7 +1527,7 @@ mod tests {
 
     #[test]
     fn test_agent_type_default() {
-        assert_eq!(AgentType::default(), AgentType::Gemini);
+        assert_eq!(AgentType::default(), AgentType::Codex);
     }
 
     #[test]

@@ -224,7 +224,7 @@ wasm_dir = ".exo/wasm"       # project-local (default), override for shared inst
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
 model = "sonnet"             # optional — passed as --model flag to root TL agent
 root_agent_type = "claude"   # claude | gemini | opencode | codex
-spawn_agent_type = "gemini"  # harness for workers, leaves, and companions
+spawn_agent_type = "codex"   # default harness for workers, leaves, and companions
 # CLI flags override these values. Omitted effort is medium.
 tl_effort_level = "medium"
 worker_effort_level = "medium"
