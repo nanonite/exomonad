@@ -23,6 +23,16 @@ the FSM, slice map, budget ledger, and event-log replay offset from that file.
 Resume treats the checkpoint and event log as authoritative and performs no
 server or network query.
 
+## Ledger-backed event projection
+
+The immutable ledger at `.exo/ledger/segments/` is the TL loop's event storage
+layer. `tl_loop/events/envelope.py` is a read-only typed projection of Rust's
+`LedgerEvent`; it does not create an `events.log`, compatibility log, or any
+other second durable event path. The loop never writes ledger segments. Its
+closed event kinds map only onto event types already present in the
+observability allowlist, and absent review head SHAs remain absent for the
+server-emission findings tracked by M2.7.
+
 ## FSM parity fixture
 
 `tl_loop/fsm/` is a pure port of `.exo/roles/devswarm/TLPhase.hs`. The golden
