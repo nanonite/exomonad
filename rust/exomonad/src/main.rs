@@ -14,6 +14,7 @@ mod experiment_analysis;
 mod experiment_harness;
 mod init;
 mod logging;
+mod logs;
 mod mcp_stdio;
 mod models;
 mod new;
@@ -27,6 +28,7 @@ use urlencoding::encode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use exomonad_core::protocol::{Runtime as HookRuntime, ServiceRequest};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use exomonad_core::{
@@ -157,6 +159,12 @@ enum Commands {
         role: Option<String>,
     },
 
+    /// Import legacy or immutable session logs into the rebuildable analysis store
+    Logs {
+        #[command(subcommand)]
+        command: LogsCommands,
+    },
+
     /// Run MCP server on Unix domain socket (.exo/server.sock)
     ///
     /// Loads WASM from file path (not embedded) with hot reload on change.
@@ -223,6 +231,25 @@ enum Commands {
     Shutdown,
 }
 
+#[derive(Subcommand)]
+enum LogsCommands {
+    /// Import explicit source paths without modifying the source files
+    Import {
+        /// Source file or directory. May be repeated.
+        #[arg(long, value_name = "PATH", required = true)]
+        source: Vec<PathBuf>,
+        /// Input format: auto, jsonl, sqlite, or text.
+        #[arg(long, default_value = "auto")]
+        format: String,
+        /// Inspect sources and report counts without writing atlas.db.
+        #[arg(long)]
+        dry_run: bool,
+        /// Rebuild all derived rows from the selected sources.
+        #[arg(long)]
+        rebuild: bool,
+    },
+}
+
 // Main
 // ============================================================================
 
@@ -262,6 +289,23 @@ async fn main() -> Result<()> {
                 config.flake_ref.as_deref(),
             )
             .await;
+        }
+
+        Commands::Logs {
+            command:
+                LogsCommands::Import {
+                    source,
+                    format,
+                    dry_run,
+                    rebuild,
+                },
+        } => {
+            let project_dir = if config.project_dir.is_absolute() {
+                config.project_dir.clone()
+            } else {
+                std::env::current_dir()?.join(&config.project_dir)
+            };
+            return logs::run(&project_dir, source, format, dry_run, rebuild);
         }
 
         Commands::Serve {

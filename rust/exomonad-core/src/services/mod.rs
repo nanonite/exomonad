@@ -2,6 +2,7 @@ pub mod agent_control;
 pub mod agent_inbox;
 pub mod agent_resolver;
 pub mod agent_resources;
+pub mod analysis_import;
 pub mod claude_session_registry;
 pub mod command;
 pub mod complexity_classifier;
@@ -17,6 +18,7 @@ pub mod forgejo_ci;
 pub mod git;
 pub mod git_worktree;
 pub mod github;
+pub mod immutable_ledger;
 pub mod inbox_store;
 pub mod inbox_watcher;
 pub mod lifecycle;
@@ -44,6 +46,9 @@ pub use self::agent_control::{
     AgentInfo, AgentType, BatchCleanupResult, BatchSpawnResult, SpawnOptions, SpawnResult,
 };
 pub use self::agent_resolver::{AgentIdentityRecord, AgentResolver};
+pub use self::analysis_import::{
+    import_sources, AnalysisStore, ImportOptions, ImportSummary, SourceFormat,
+};
 pub use self::claude_session_registry::ClaudeSessionRegistry;
 pub use self::event_log::EventLog;
 pub use self::event_queue::EventQueue;
@@ -51,6 +56,7 @@ pub use self::filesystem::FileSystemService;
 pub use self::forgejo::ForgejoClient;
 pub use self::git_worktree::GitWorktreeService;
 pub use self::github::GitHubClient;
+pub use self::immutable_ledger::{LedgerEvent, LedgerRecord, LedgerWriter};
 pub use self::inbox_store::{InboxMessageRecord, InboxPokeCandidate, InboxStore};
 pub use self::mutex_registry::MutexRegistry;
 pub use self::secrets::Secrets;
