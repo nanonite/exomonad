@@ -56,6 +56,18 @@ rust-test all_targets="false": test-repo-integrity
 haskell-test:
     nix develop --command cabal test all
 
+# Run the programmatic TL controller smoke tests
+tl-loop-test:
+    python3 -m pytest -q tl_loop/tests
+
+# Lint the programmatic TL controller
+tl-loop-lint:
+    ruff check tl_loop
+
+# Type-check the programmatic TL controller
+tl-loop-typecheck:
+    mypy tl_loop
+
 # Run fast tests only (Rust unit tests)
 test-fast: rust-test
 
@@ -81,8 +93,8 @@ wasm-guest-test:
     @nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build wasm-guest:wasm-guest-tests'
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
-# Run tests: formatting, Rust check, WASM build/tests, Rust tests, proto freshness
-test:
+# Run tests: Python checks, formatting, Rust check, WASM build/tests, Rust tests, proto freshness
+test: tl-loop-test tl-loop-lint
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/8] Observability contract checks..."
@@ -146,6 +158,7 @@ check-no-gemini:
     fi
 
 # Pre-commit: deprecation gate plus the full repository checks
+# `test` includes the TL-loop smoke test and lint checks.
 pre-commit:
     just check-no-$(printf 'ge%s' mini)
     just test

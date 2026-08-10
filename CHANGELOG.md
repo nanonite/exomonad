@@ -118,6 +118,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M1.1 Scaffold the tl_loop Python package and its build harness (#665)
 - Implement ExoMonad append-only observability and Failure Atlas measurement (#641)
 - Adopt append-only ExoMonad evidence ledger (#640)
 - Improve ExoMonad orchestration measurement plan (#639)

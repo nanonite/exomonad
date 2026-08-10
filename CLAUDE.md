@@ -763,6 +763,7 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 │   ├── exomonad/CLAUDE.md  ← MCP server + hook handler (binary)
 │   ├── exomonad-core/CLAUDE.md ← Unified library: framework, handlers, services, protocol, UI types
 │   └── exomonad-proto/     ← Proto-generated types (prost) for FFI + effects
+├── tl_loop/CLAUDE.md          ← Programmatic TL controller (FSM + Rust UDS client boundary)
 ├── tests/e2e/                 ← E2E tests (see § E2E Test Pattern)
 │   ├── messaging/             ← Teams inbox delivery test
 │   └── hook-rewrite/          ← PII rewriting hooks test
@@ -781,6 +782,7 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 | Understand shared protocol types | `rust/exomonad-core/` (protocol/) |
 | Work with external service clients | `rust/exomonad-core/` (services/external/) |
 | Work on WASM guest (MCP tools) | `haskell/wasm-guest/CLAUDE.md` |
+| Work on the programmatic TL controller | `tl_loop/CLAUDE.md` |
 | Add or modify E2E tests | `CLAUDE.md` § E2E Test Pattern + `tests/e2e/messaging/` as reference |
 | Understand architectural decisions | `docs/decisions/` |
 | See role tool matrix, hook rules, state machines, PR review flow | `docs/architecture/agent-system.md` |
