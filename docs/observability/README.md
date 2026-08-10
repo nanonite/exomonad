@@ -26,6 +26,13 @@ The registry permits sensitive evidence in local L1, L2, and L3 layers. The L4 c
 step is the share boundary: it selects allowlisted dimensions and must not emit raw
 payloads, transcripts, reasoning, paths, secrets, or stable source identifiers.
 
+## Retired harness aggregation
+
+Effective 2026-08-10, historical rows from the retired harness remain compilable but
+aggregate under `provider`, `runtime`, and `harness` as `other`. This preserves the
+interpretation of Failure Atlas artifacts produced before the allowlist change; historical
+ledger segments and atlas databases are unchanged.
+
 
 ## Runtime MVP-B paths
 
@@ -105,7 +112,7 @@ caller must fail unless a preregistered controlled contrast is valid.
 ## Compatibility smoke matrix
 
 The Phase 0 fixture gate covers a mixed session containing Claude, Codex,
-Gemini, and a custom Python loop, plus resume/retry delivery, review/merge,
+and a custom Python loop, plus resume/retry delivery, review/merge,
 partial-sink/gap, state reconstruction/correction, and privacy-boundary cases.
 These fixtures exercise the shared normalized event graph rather than
 transcript-specific adapters. Run the full local handoff checks with:

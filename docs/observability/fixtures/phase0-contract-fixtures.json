@@ -6,7 +6,7 @@
     {
       "scenario_id": "multi_harness_session",
       "session_id": "fixture-session-001",
-      "harnesses": ["claude", "codex", "gemini", "python-loop"],
+      "harnesses": ["claude", "codex", "python-loop"],
       "events": ["agent.spawned", "agent.invocation.started", "tool.called", "agent.invocation.finished"]
     },
     {

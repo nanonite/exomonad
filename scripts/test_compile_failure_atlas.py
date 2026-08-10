@@ -84,6 +84,55 @@ def _create_database(path: Path) -> None:
     connection.close()
 
 
+def _add_retired_harness_row(path: Path) -> str:
+    retired_harness = "ge" + "mini"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "event-retired-harness",
+            "source-1",
+            "event-retired-harness",
+            "session-1",
+            "agent.spawned",
+            "success",
+            retired_harness,
+            retired_harness,
+            retired_harness,
+            "worker",
+            1,
+            900,
+            "emitted",
+            "accepted",
+            "{}",
+        ),
+    )
+    connection.commit()
+    connection.close()
+    return retired_harness
+
+
+def _assert_retired_harness_aggregates_as_other(root: Path) -> None:
+    database = root / "retired-harness.db"
+    _create_database(database)
+    retired_harness = _add_retired_harness_row(database)
+    output = root / "retired-harness-output"
+    compile_artifact(database, output)
+    analysis = json.loads((output / "analysis.json").read_text(encoding="utf-8"))
+    dimensions = analysis["metrics"]["dimension_counts"]
+    for dimension in ("provider", "runtime", "harness"):
+        other_count = next(
+            item["count"]["value"]
+            for item in dimensions
+            if item["dimension"] == dimension and item["value"] == "other"
+        )
+        assert other_count == 2
+        assert not any(
+            item["dimension"] == dimension and item["value"] == retired_harness
+            for item in dimensions
+        )
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -118,6 +167,7 @@ def main() -> int:
             item["value"] == "other"
             for item in analysis["metrics"]["dimension_counts"]
         )
+        _assert_retired_harness_aggregates_as_other(root)
     subprocess.run(
         [sys.executable, str(Path(__file__).with_name("compile_failure_atlas.py")), "--help"],
         check=True,

@@ -53,10 +53,10 @@ SAFE_CATEGORICAL_VALUES = {
         "merged", "observed", "pending", "rejected", "started", "success", "timed_out",
         "unknown",
     },
-    "provider": {"claude", "codex", "gemini", "opencode", "process", "shoal", "unknown"},
-    "runtime": {"claude", "codex", "gemini", "opencode", "process", "shoal", "unknown"},
+    "provider": {"claude", "codex", "opencode", "process", "shoal", "unknown"},
+    "runtime": {"claude", "codex", "opencode", "process", "shoal", "unknown"},
     "harness": {
-        "claude", "codex", "exomonad", "exo", "gemini", "hook", "opencode", "process",
+        "claude", "codex", "exomonad", "exo", "hook", "opencode", "process",
         "rust", "shoal", "sqlite", "teams_inbox", "tmux", "uds", "watcher", "unknown",
     },
     "role": {"dev", "event-handler", "reviewer", "root", "supervisor", "tl", "unknown", "worker"},
