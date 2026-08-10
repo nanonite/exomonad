@@ -1,0 +1,1153 @@
+{
+  "tools": [
+    {
+      "description": "Fork any number of parallel agents. Each starts in a worktree branched off your branch. Children inherit your full context window by default when supported (fork_session defaults to true). Set fork_session: false for children that need a fresh start. Requires clean git state (committed and pushed). Claude Code parents should create a team using TeamCreate before spawning Claude Code children.",
+      "inputSchema": {
+        "properties": {
+          "children": {
+            "description": "Array of children to spawn, each with a slug and task",
+            "items": {
+              "properties": {
+                "agent_type": {
+                  "description": "Agent type for the child: 'claude' (default), 'opencode', or 'codex'. OpenCode and Codex children get TL role and can spawn their own children.",
+                  "enum": [
+                    "claude",
+                    "shoal",
+                    "opencode",
+                    "codex"
+                  ],
+                  "type": "string"
+                },
+                "fork_session": {
+                  "description": "Inherit parent conversation context via --fork-session (default: true). Set false to start the child with a fresh context window.",
+                  "type": "boolean"
+                },
+                "slug": {
+                  "description": "Branch name suffix (will be prefixed with current branch)",
+                  "type": "string"
+                },
+                "task": {
+                  "description": "One-line task description — the child inherits your full context, so keep it brief",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "slug",
+                "task"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "children"
+        ],
+        "type": "object"
+      },
+      "name": "fork_wave"
+    },
+    {
+      "description": "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). The TL worktree must be clean before spawning because dev-leaves fork from branch HEAD and cannot see uncommitted scaffold. Agent type defaults to the server config; pass agent_type only when this leaf needs a specific supported runtime. Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. Claude Code parents should create a team using TeamCreate before spawning Claude Code leaves. After spawning, return immediately.",
+      "inputSchema": {
+        "properties": {
+          "agent_type": {
+            "description": "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default.",
+            "enum": [
+              "claude",
+              "shoal",
+              "opencode",
+              "codex"
+            ],
+            "type": "string"
+          },
+          "boundary": {
+            "description": "DO NOT rules for known failure modes",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "context": {
+            "description": "Freeform context: code snippets, examples, patterns to follow",
+            "type": "string"
+          },
+          "name": {
+            "description": "Branch name suffix (e.g., 'fix-clippy' → 'main.fix-clippy')",
+            "type": "string"
+          },
+          "read_first": {
+            "description": "File paths to read before starting (CLAUDE.md, source patterns)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "steps": {
+            "description": "Numbered implementation steps with code snippets and exact file paths",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "task": {
+            "description": "What to build. Combined with steps/verify/boundary into structured spec",
+            "type": "string"
+          },
+          "verify": {
+            "description": "Exact verification commands (e.g., 'cargo test --workspace')",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "task"
+        ],
+        "type": "object"
+      },
+      "name": "spawn_leaf"
+    },
+    {
+      "description": "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch — no isolation, no PR, so the TL worktree must be clean before spawning. Commit the scaffold or discard throwaway output before retrying. Workers are sequential per TL tab; wait for the active worker handoff before spawning another worker, or use spawn_leaf for parallel PR work. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF — worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately.",
+      "inputSchema": {
+        "properties": {
+          "agent_type": {
+            "description": "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default.",
+            "enum": [
+              "claude",
+              "shoal",
+              "opencode",
+              "codex"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "Worker name (pane title, messaging identity)",
+            "type": "string"
+          },
+          "task": {
+            "description": "The full prompt. Everything the worker needs in one string",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "task"
+        ],
+        "type": "object"
+      },
+      "name": "spawn_worker"
+    },
+    {
+      "description": "Spawn only a reviewer for an existing open Forgejo PR. Returns already_active=true without spawning when a reviewer is still running, unless force=true.",
+      "inputSchema": {
+        "properties": {
+          "force": {
+            "description": "Spawn a fresh reviewer even if a reviewer for this PR is already active. Defaults to false.",
+            "type": "boolean"
+          },
+          "pr_number": {
+            "description": "Existing open PR number to review",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pr_number",
+          "force"
+        ],
+        "type": "object"
+      },
+      "name": "spawn_reviewer"
+    },
+    {
+      "description": "Clean all reviewer resources for an existing PR: kill reviewer windows, remove reviewer worktrees/config, delete legacy review files, and reset watcher state.",
+      "inputSchema": {
+        "properties": {
+          "pr_number": {
+            "description": "Existing PR number whose reviewer resources should be cleaned",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pr_number"
+        ],
+        "type": "object"
+      },
+      "name": "cleanup_reviewer_leaf"
+    },
+    {
+      "description": "Close reviewer tmux windows for a PR by matching window names containing review-pr-{pr_number}-. Use this as a manual fallback when reviewer cleanup leaves a stale reviewer window.",
+      "inputSchema": {
+        "properties": {
+          "pr_number": {
+            "description": "Existing PR number whose reviewer tmux window(s) should be closed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pr_number"
+        ],
+        "type": "object"
+      },
+      "name": "close_reviewer_window"
+    },
+    {
+      "description": "With human approval, reset the review cycle for an existing open and unmerged PR. Clears watcher flags, disposes reviewer resources, and lets the next watcher poll spawn a fresh reviewer without renaming or disposing the author worktree. For a closed PR, use replace_close_pr instead.",
+      "inputSchema": {
+        "properties": {
+          "pr_number": {
+            "description": "Open and unmerged PR number whose review cycle should be restarted after human approval",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pr_number"
+        ],
+        "type": "object"
+      },
+      "name": "restart_review"
+    },
+    {
+      "description": "With human approval, replace an open or closed and unmerged Forgejo PR while continuing the existing open Chainlink issue. Retires the old reviewer and author resources, preserves the old PR head SHA, and starts a fresh leaf and branch targeting the old PR base. This tool does not close the old PR; after verifying the replacement, explicitly reconcile or close it. Never use this for a merged PR.",
+      "inputSchema": {
+        "properties": {
+          "agent_type": {
+            "description": "Optional fresh leaf runtime: claude, retired, shoal, opencode, or codex",
+            "enum": [
+              "claude",
+              "shoal",
+              "opencode",
+              "codex"
+            ],
+            "type": "string"
+          },
+          "chainlink_issue_id": {
+            "description": "Positive open Chainlink issue id to continue",
+            "type": "integer"
+          },
+          "closed_pr_number": {
+            "description": "Target open or closed, unmerged Forgejo PR number to replace",
+            "type": "integer"
+          },
+          "human_approved": {
+            "description": "Required true value confirming the human approved this replacement",
+            "type": "boolean"
+          },
+          "new_leaf_name": {
+            "description": "Required fresh bare leaf slug; do not reuse the old slug",
+            "type": "string"
+          },
+          "old_leaf_name": {
+            "description": "Explicit old author leaf identity to retire",
+            "type": "string"
+          },
+          "operator_context": {
+            "description": "Optional human-approved context for the replacement",
+            "type": "string"
+          },
+          "replacement_task": {
+            "description": "Complete task for the fresh leaf, including acceptance criteria",
+            "type": "string"
+          }
+        },
+        "required": [
+          "chainlink_issue_id",
+          "closed_pr_number",
+          "old_leaf_name",
+          "new_leaf_name",
+          "replacement_task",
+          "human_approved"
+        ],
+        "type": "object"
+      },
+      "name": "replace_close_pr"
+    },
+    {
+      "description": "Resume an existing open, unmerged PR by number. The host re-fetches its head SHA, resolves the exact owning agent, branch, and runtime, starts a fresh invocation, and verifies its exact tmux target is ready before reporting success. An already-running owner is an explicit failure, not a fresh resume. Provide the task summary plus optional read_first, steps, verify, boundary, context, and done_criteria fields for a complete review-fix handoff. On the resumed owner's next `file_pr` call, preserve or update the PR body with the literal heading `## Acceptance Criteria` and copy every issue Definition-of-Done bullet verbatim beneath it; use done_criteria as the handoff source and do not silently drop or paraphrase the heading. Never provide a leaf name or agent type. For closed or unrecoverable PRs, use the human-approved replace_close_pr workflow.",
+      "inputSchema": {
+        "properties": {
+          "boundary": {
+            "description": "Constraints and anti-patterns for the repair",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "context": {
+            "description": "Reviewer analysis, root cause, proposed solution, and relevant snippets",
+            "type": "string"
+          },
+          "done_criteria": {
+            "description": "Issue Definition-of-Done bullets for the repair; the resumed owner must copy them verbatim beneath the literal `## Acceptance Criteria` heading in the next file_pr body",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pr_number": {
+            "description": "Existing open, unmerged PR number to resume",
+            "type": "integer"
+          },
+          "read_first": {
+            "description": "Exact files or documents the leaf must read before editing",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "steps": {
+            "description": "Concrete implementation steps for the repair",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "task": {
+            "description": "Task summary for the owning agent to continue on the existing PR",
+            "type": "string"
+          },
+          "verify": {
+            "description": "Exact commands the leaf must run before reporting completion",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "pr_number",
+          "task"
+        ],
+        "type": "object"
+      },
+      "name": "resume_pr"
+    },
+    {
+      "description": "Query live Forgejo PR review and CI state. Returns merge_ready and a blocker string so TL/root agents can diagnose stuck watcher notification paths before deciding whether to call merge_pr.",
+      "inputSchema": {
+        "properties": {
+          "pr_number": {
+            "description": "Existing PR number whose live Forgejo review and CI state should be inspected",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pr_number"
+        ],
+        "type": "object"
+      },
+      "name": "watcher_pr_state"
+    },
+    {
+      "description": "Close an ephemeral worker tmux pane by pane_id. Use the pane_id returned by spawn_worker after you have received the worker's final result or no longer need the worker pane.",
+      "inputSchema": {
+        "properties": {
+          "pane_id": {
+            "description": "Stable tmux pane id returned by spawn_worker, such as '%42'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pane_id"
+        ],
+        "type": "object"
+      },
+      "name": "close_worker_pane"
+    },
+    {
+      "description": "Fork a Codex leaf agent into its own worktree and tmux window. Gets dev role (files PR, cannot spawn children). After spawning, return immediately.",
+      "inputSchema": {
+        "properties": {
+          "agent_type": {
+            "description": "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default.",
+            "enum": [
+              "claude",
+              "shoal",
+              "opencode",
+              "codex"
+            ],
+            "type": "string"
+          },
+          "allowed_dirs": {
+            "description": "Directories from the parent project to be copied into the agent's context (only for standalone_repo).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "allowed_tools": {
+            "description": "Tool patterns to allow. Omit for no restriction.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "branch_name": {
+            "description": "Branch name suffix (will be prefixed with current branch)",
+            "type": "string"
+          },
+          "disallowed_tools": {
+            "description": "Tool patterns to disallow. Omit for no restriction.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "permission_mode": {
+            "description": "Permission mode for the agent. Omit for --dangerously-skip-permissions.",
+            "type": "string"
+          },
+          "standalone_repo": {
+            "description": "When true, creates a standalone git repo instead of a worktree for information isolation.",
+            "type": "boolean"
+          },
+          "task": {
+            "description": "Description of the sub-problem to solve",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task",
+          "branch_name"
+        ],
+        "type": "object"
+      },
+      "name": "spawn_codex"
+    },
+    {
+      "description": "List known ExoMonad agents with tmux liveness, Forgejo-aware work-unit status, issue, age, routing target, and birth branch. Pass include_dead=true to show stale registry entries whose windows or panes are gone.",
+      "inputSchema": {
+        "properties": {
+          "include_dead": {
+            "description": "Include agents whose tmux window or pane is confirmed dead. Defaults to false.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "include_dead"
+        ],
+        "type": "object"
+      },
+      "name": "session_status"
+    },
+    {
+      "description": "Poll spawned ExoMonad agents and workers for TL-owned liveness checks. Returns per-agent pane/window liveness, Chainlink session state, active issue status, age, routing target, and birth branch. Call once after spawning a wave or worker before idling; do not busy-wait.",
+      "inputSchema": {
+        "properties": {
+          "agents": {
+            "description": "Optional list of agent slugs to poll. Omit to poll all known spawned agents.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "include_dead": {
+            "description": "Include agents whose tmux target is confirmed dead. Defaults to true so stale routing is visible.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "include_dead"
+        ],
+        "type": "object"
+      },
+      "name": "poll_workers"
+    },
+    {
+      "description": "Check and mark as read the durable inbox messages addressed to the current agent. Returns message sender, content, summary, and creation time.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "check_inbox"
+    },
+    {
+      "description": "Append a durable session-memory record. Valid kind values: unspecified, original_plan, wave_plan, spawned_child, child_handoff, blocker, decision, review_feedback, fix_direction, merge_result, ci_result, next_action, human_clarification, session_summary. The ledger is append-only: records cannot be updated or deleted.",
+      "inputSchema": {
+        "properties": {
+          "append_args_detail": {
+            "type": "string"
+          },
+          "append_args_importance": {
+            "type": "integer"
+          },
+          "append_args_issue_id": {
+            "type": "integer"
+          },
+          "append_args_kind": {
+            "enum": [
+              "unspecified",
+              "original_plan",
+              "wave_plan",
+              "spawned_child",
+              "child_handoff",
+              "blocker",
+              "decision",
+              "review_feedback",
+              "fix_direction",
+              "merge_result",
+              "ci_result",
+              "next_action",
+              "human_clarification",
+              "session_summary"
+            ],
+            "type": "string"
+          },
+          "append_args_summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "append_args_kind",
+          "append_args_summary"
+        ],
+        "type": "object"
+      },
+      "name": "memory_append"
+    },
+    {
+      "description": "List durable session-memory records for the current run with optional semantic filters.",
+      "inputSchema": {
+        "properties": {
+          "list_args_issue_id": {
+            "type": "integer"
+          },
+          "list_args_kind": {
+            "enum": [
+              "unspecified",
+              "original_plan",
+              "wave_plan",
+              "spawned_child",
+              "child_handoff",
+              "blocker",
+              "decision",
+              "review_feedback",
+              "fix_direction",
+              "merge_result",
+              "ci_result",
+              "next_action",
+              "human_clarification",
+              "session_summary"
+            ],
+            "type": "string"
+          },
+          "list_args_limit": {
+            "type": "integer"
+          },
+          "list_args_min_importance": {
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "memory_list"
+    },
+    {
+      "description": "Render the deterministic continuation brief for the current root or TL session.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "continuation_brief"
+    },
+    {
+      "description": "List known ExoMonad agents with type, birth branch, unread inbox state, last inbox check time, and liveness. Optionally filter by agent type.",
+      "inputSchema": {
+        "properties": {
+          "filter_type": {
+            "description": "Optional agent type filter, such as claude, retired, opencode, codex, or shoal.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "list_agents"
+    },
+    {
+      "description": "Create or update a pull request for the current branch. Idempotent — safe to call multiple times (updates existing PR). Pushes the branch automatically. The PR body must contain the literal heading `## Acceptance Criteria`, followed by every bullet from the issue's Definition of Done copied verbatim. Preserve that heading and update its bullets when updating an existing PR; do not file a body without it. Base branch auto-detected from dot-separated naming (e.g. main.foo.bar targets main.foo).",
+      "inputSchema": {
+        "properties": {
+          "base_branch": {
+            "description": "Target branch. Auto-detected from dot-separated naming if omitted (main.foo.bar targets main.foo). Only set to override.",
+            "type": "string"
+          },
+          "body": {
+            "description": "PR body/description. Required: include the literal `## Acceptance Criteria` heading and copy every issue Definition-of-Done bullet verbatim beneath it; preserve/update this heading on later calls.",
+            "type": "string"
+          },
+          "title": {
+            "description": "PR title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "body"
+        ],
+        "type": "object"
+      },
+      "name": "file_pr"
+    },
+    {
+      "description": "Merge a GitHub pull request and fetch changes. Checks Forgejo reviewer status before merging: requires either a clean review (no change requests) or commits pushed after the latest review. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. Use force=true to bypass reviewer readiness (e.g., after [REVIEW TIMEOUT]). After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact.",
+      "inputSchema": {
+        "properties": {
+          "chainlink_issue_id": {
+            "description": "Optional Chainlink issue ID to close and commit CHANGELOG.md before merging",
+            "type": "integer"
+          },
+          "force": {
+            "description": "Skip Forgejo reviewer check and merge immediately (use after [REVIEW TIMEOUT])",
+            "type": "boolean"
+          },
+          "pr_number": {
+            "description": "PR number to merge",
+            "type": "integer"
+          },
+          "strategy": {
+            "description": "Merge strategy: squash (default), merge, or rebase",
+            "type": "string"
+          },
+          "working_dir": {
+            "description": "Working directory for git operations",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pr_number"
+        ],
+        "type": "object"
+      },
+      "name": "merge_pr"
+    },
+    {
+      "description": "Send a message to your parent agent. Use for status updates, progress reports, or failure escalation. Messages are delivered as-is with lightweight attribution. For PR-based workflows, the system auto-notifies your parent when Copilot approves — you don't need to signal completion yourself.",
+      "inputSchema": {
+        "properties": {
+          "message": {
+            "description": "The message to send. Be concise — one or two sentences.",
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "PR number if relevant. Helps parent locate the PR without searching.",
+            "type": "integer"
+          },
+          "status": {
+            "description": "'success' = normal message (status update, progress report). 'failure' = escalation, something went wrong.",
+            "enum": [
+              "success",
+              "failure"
+            ],
+            "type": "string"
+          },
+          "tasks_completed": {
+            "description": "Array of {what, how} pairs. 'what' = task description, 'how' = verification command that was run.",
+            "items": {
+              "properties": {
+                "how": {
+                  "description": "verification command that was run",
+                  "type": "string"
+                },
+                "what": {
+                  "description": "task description",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "what",
+                "how"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "notify_parent"
+    },
+    {
+      "description": "Send a message to an exomonad-spawned agent by injecting it into that agent's tmux pane. Use this for Codex, OpenCode, Retired, and any non-Claude runtime, or when you need to steer a live pane directly.",
+      "inputSchema": {
+        "properties": {
+          "content": {
+            "description": "The content of the message",
+            "type": "string"
+          },
+          "recipient": {
+            "description": "The name of the agent to receive the message",
+            "type": "string"
+          },
+          "summary": {
+            "description": "An optional summary of the message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "recipient",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "send_tmux_message"
+    },
+    {
+      "description": "Send a message through the Claude Teams inbox mailbox protocol. This only works when the current session has mailbox support configured and validated.",
+      "inputSchema": {
+        "properties": {
+          "content": {
+            "description": "The content of the message",
+            "type": "string"
+          },
+          "recipient": {
+            "description": "The name of the agent to receive the message",
+            "type": "string"
+          },
+          "summary": {
+            "description": "An optional summary of the message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "recipient",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "send_mailbox_message"
+    },
+    {
+      "description": "Create a new chainlink issue. Returns the created issue ID. Use this to track work items, bugs, features, and tasks in the project's chainlink tracker.",
+      "inputSchema": {
+        "properties": {
+          "description": {
+            "description": "Optional detailed description of the issue",
+            "type": "string"
+          },
+          "labels": {
+            "description": "Optional list of labels to apply (e.g. bug, feature, enhancement)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "priority": {
+            "description": "Optional priority: low, medium, high, critical (default: medium)",
+            "type": "string"
+          },
+          "title": {
+            "description": "Issue title — should be a concise, changelog-ready description of the work",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_issue_create"
+    },
+    {
+      "description": "Start a chainlink work session for the current agent. Call this before chainlink_session_work.",
+      "inputSchema": {},
+      "name": "chainlink_session_start"
+    },
+    {
+      "description": "Read the current Chainlink session status. Coordinators use this for work-state telemetry; it does not mutate issue state.",
+      "inputSchema": {},
+      "name": "chainlink_session_status"
+    },
+    {
+      "description": "Show details of a chainlink issue by ID. Returns the issue title, status, priority, and labels. Use this to inspect a task before working on it.",
+      "inputSchema": {
+        "properties": {
+          "issue_id": {
+            "description": "The numeric ID of the issue to view",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "issue_id"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_issue_show"
+    },
+    {
+      "description": "Add a comment to a chainlink issue. Use this to report progress, ask questions, or provide updates on a task.",
+      "inputSchema": {
+        "properties": {
+          "issue_id": {
+            "description": "The numeric ID of the issue to comment on",
+            "type": "integer"
+          },
+          "message": {
+            "description": "The comment text to add",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issue_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_issue_comment"
+    },
+    {
+      "description": "Create a new sub-issue under a parent chainlink issue. Returns the created sub-issue ID. Use this to break down tasks into smaller work items.",
+      "inputSchema": {
+        "properties": {
+          "labels": {
+            "description": "Optional list of labels to apply (e.g. bug, feature, enhancement)",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "parent_id": {
+            "description": "The numeric ID of the parent issue",
+            "type": "integer"
+          },
+          "priority": {
+            "description": "Optional priority: low, medium, high, critical (default: medium)",
+            "type": "string"
+          },
+          "title": {
+            "description": "Sub-issue title — should be a concise, changelog-ready description",
+            "type": "string"
+          }
+        },
+        "required": [
+          "parent_id",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_subissue_create"
+    },
+    {
+      "description": "Mark a chainlink issue as the current active work item. Use this to indicate which issue you are actively working on.",
+      "inputSchema": {
+        "properties": {
+          "issue_id": {
+            "description": "The numeric ID of the issue to mark as active work",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "issue_id"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_session_work"
+    },
+    {
+      "description": "End the current chainlink session with optional notes. Use this when you finish working on a task to record what was done.",
+      "inputSchema": {
+        "properties": {
+          "notes": {
+            "description": "Optional handoff notes describing what was accomplished during the session",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "chainlink_session_end"
+    },
+    {
+      "description": "Coordinator-only close tool. Use after the implementing agent ended its session and PR review, CI, and merge conditions are satisfied. This runs only `chainlink close`; it never touches Chainlink locks or agent identity.",
+      "inputSchema": {
+        "properties": {
+          "force": {
+            "type": "boolean"
+          },
+          "issue_id": {
+            "description": "The numeric ID of the issue to close",
+            "type": "integer"
+          },
+          "summary": {
+            "description": "Optional summary of what was completed. Defaults to \"Closed #<id>\" if omitted.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issue_id",
+          "force"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_issue_close"
+    },
+    {
+      "description": "Close a completed Chainlink issue and clean up the merged leaf. Refuses to run when the leaf has any filed PR that is not merged. Disposes the leaf worktree and reviewer worktrees for merged PRs owned by the leaf.",
+      "inputSchema": {
+        "properties": {
+          "issue_id": {
+            "description": "The Chainlink issue id to close",
+            "type": "integer"
+          },
+          "leaf_name": {
+            "description": "The leaf agent name / worktree slug to dispose, e.g. issue-335-close-cleanup-codex",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issue_id",
+          "leaf_name"
+        ],
+        "type": "object"
+      },
+      "name": "close_issue_and_cleanup"
+    },
+    {
+      "description": "Remove stale resources for an orphan agent whose tmux window or pane is no longer alive. Refuses to clean live agents. Use dry_run=true to inspect what would be removed.",
+      "inputSchema": {
+        "properties": {
+          "dry_run": {
+            "description": "When true, report what would be removed without removing it. Defaults to false.",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "Agent slug to clean up, as shown by session_status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "dry_run"
+        ],
+        "type": "object"
+      },
+      "name": "cleanup_orphan"
+    },
+    {
+      "description": "Safely dispose an orphan leaf after verifying its tmux window is dead, its worktree is clean, and its PR is merged or closed-unmerged. Use sweep=true for all orphan worktrees or dry_run=true to inspect without disposal.",
+      "inputSchema": {
+        "properties": {
+          "dry_run": {
+            "description": "Verify and report without disposing resources. Defaults to false.",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "Optional agent slug to verify and clean; required unless sweep=true.",
+            "type": "string"
+          },
+          "sweep": {
+            "description": "Verify and clean every orphan worktree. Defaults to false.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dry_run",
+          "sweep"
+        ],
+        "type": "object"
+      },
+      "name": "cleanup_leaf"
+    },
+    {
+      "description": "TL/SubTL-only timer start. Starts Chainlink timing for a coordinator-owned task lifecycle.",
+      "inputSchema": {
+        "properties": {
+          "issue_id": {
+            "description": "The numeric issue ID whose coordinator-owned lifecycle timer should start",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "issue_id"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_timer_start"
+    },
+    {
+      "description": "TL/SubTL-only timer stop. Stops the Chainlink timer for a specific coordinator-owned issue after validation and merge.",
+      "inputSchema": {
+        "properties": {
+          "issue_id": {
+            "description": "The numeric issue ID whose active timer should stop",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "issue_id"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_timer_stop"
+    },
+    {
+      "description": "TL/SubTL-only timer status. Shows active Chainlink timers, or one issue's timer when issue_id is provided.",
+      "inputSchema": {
+        "properties": {
+          "issue_id": {
+            "description": "Optional numeric issue ID whose active timer should be shown",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "chainlink_timer_status"
+    },
+    {
+      "description": "List chainlink issues with optional filters. Returns issues matching the given status, priority, labels, or milestone.",
+      "inputSchema": {
+        "properties": {
+          "labels": {
+            "description": "Optional list of labels to filter by",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "milestone": {
+            "description": "Optional milestone name to filter by",
+            "type": "string"
+          },
+          "priority": {
+            "description": "Optional priority filter: low, medium, high, critical",
+            "type": "string"
+          },
+          "status": {
+            "description": "Optional status filter: open, closed, in_progress, blocked",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "chainlink_issue_list"
+    },
+    {
+      "description": "Update a chainlink issue using the current chainlink CLI. status=in_progress marks active work; status=open reopens; status=closed closes; priority, labels, and milestone use their dedicated commands.",
+      "inputSchema": {
+        "properties": {
+          "issue_id": {
+            "description": "The numeric ID of the issue to update",
+            "type": "integer"
+          },
+          "labels": {
+            "description": "Optional labels to add",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "milestone": {
+            "description": "Optional milestone ID to assign",
+            "type": "string"
+          },
+          "priority": {
+            "description": "Optional new priority: low, medium, high, critical",
+            "type": "string"
+          },
+          "status": {
+            "description": "Optional status action: in_progress marks current work, open reopens, closed closes",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issue_id"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_issue_update"
+    },
+    {
+      "description": "Mark one issue as blocked by another. The child issue cannot proceed until the blocker issue is resolved.",
+      "inputSchema": {
+        "properties": {
+          "blocker_id": {
+            "description": "The numeric ID of the issue that is blocking progress",
+            "type": "integer"
+          },
+          "child_id": {
+            "description": "The numeric ID of the issue that is blocked",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "child_id",
+          "blocker_id"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_issue_block"
+    },
+    {
+      "description": "Relate two issues. Chainlink CLI does not support a positional relation type.",
+      "inputSchema": {
+        "properties": {
+          "issue1": {
+            "description": "The numeric ID of the first issue",
+            "type": "integer"
+          },
+          "issue2": {
+            "description": "The numeric ID of the second issue",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "issue1",
+          "issue2"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_issue_relate"
+    },
+    {
+      "description": "Show the falsification cascade for an issue — what downstream work would be affected if this issue's assumptions are wrong.",
+      "inputSchema": {
+        "properties": {
+          "issue_id": {
+            "description": "The numeric ID of the issue to cascade from",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "issue_id"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_issue_cascade"
+    },
+    {
+      "description": "Create a new milestone for grouping issues. Returns the created milestone ID.",
+      "inputSchema": {
+        "properties": {
+          "description": {
+            "description": "Optional description of the milestone's goals",
+            "type": "string"
+          },
+          "title": {
+            "description": "Milestone title (e.g. M1, M2, Alpha, Beta)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "chainlink_milestone_create"
+    },
+    {
+      "description": "List all milestones with their IDs, titles, and descriptions.",
+      "inputSchema": {},
+      "name": "chainlink_milestone_list"
+    }
+  ]
+}
