@@ -36,6 +36,8 @@ per-agent .exo/events and .exo/logs JSONL views remain compatibility inputs.
 
 .exo/sink-health.json is the durable fallback for accepted/rejected event counts,
 write failures, the last successful sequence, and complete/partial/unknown status.
+Its counters are tagged with the active session ID; health from another session is
+unknown and cannot classify the current session.
 It is local evidence and is imported into L2 as sink.health. Mutable session,
 memory, and inbox changes emit session.state_changed, memory.state_changed, and
 inbox.state_changed events into L1. Human-readable --verbose tracing does not
@@ -89,8 +91,10 @@ Run the local measurement pipeline with an explicit preregistration:
 It writes signals.json, incidents.json, adjudication.json, and
 measurement.json under .exo/analysis/measurement. Mechanical detectors are
 high-recall candidates; incidents are clusters; adjudication records judge
-model, prompt revision, label schema, seed, and Wilson intervals. Single-judge
-precision is marked provisional.
+model, prompt revision, label schema, seed, and Wilson intervals. Judge names are
+metadata only: provide independent per-judge labels with --labels labels.json.
+Without complete per-judge labels, precision remains pending and cannot be
+published; single-judge precision is marked provisional.
 
 The measurement gate requires session-level units, an explicit baseline and
 treatment, assignment method, fixed primary outcome/denominator, missingness

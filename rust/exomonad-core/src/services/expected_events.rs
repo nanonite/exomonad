@@ -1,6 +1,6 @@
 //! Versioned expected-event contracts and denominator reconciliation.
 
-use crate::services::{sequence_status, LedgerRecord};
+use crate::services::LedgerRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -44,6 +44,13 @@ pub struct DenominatorReport {
     pub rows: Vec<DenominatorRow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventObservation {
+    pub session_id: Option<String>,
+    pub event_type: String,
+    pub run_seq: Option<u64>,
+}
+
 pub fn load_contract() -> Result<ExpectedEventContract> {
     serde_json::from_str(CONTRACT_JSON).context("parse expected-event contract")
 }
@@ -51,6 +58,18 @@ pub fn load_contract() -> Result<ExpectedEventContract> {
 /// Reconcile required transitions by session, preserving missing outcomes as
 /// missing denominator rows rather than treating them as zero-valued success.
 pub fn reconcile(records: &[LedgerRecord]) -> Result<DenominatorReport> {
+    let observations = records
+        .iter()
+        .map(|record| EventObservation {
+            session_id: record.event.session_id.clone(),
+            event_type: record.event.event_type.clone(),
+            run_seq: record.event.run_seq,
+        })
+        .collect::<Vec<_>>();
+    reconcile_events(&observations)
+}
+
+pub fn reconcile_events(events: &[EventObservation]) -> Result<DenominatorReport> {
     let contract = load_contract()?;
     let mut rows = Vec::with_capacity(contract.rules.len());
     for rule in &contract.rules {
@@ -58,17 +77,16 @@ pub fn reconcile(records: &[LedgerRecord]) -> Result<DenominatorReport> {
         let mut observed = 0;
         let mut session_prerequisites = BTreeMap::<String, u64>::new();
         let mut session_required = BTreeMap::<String, u64>::new();
-        for record in records {
-            let session = record
-                .event
+        for event in events {
+            let session = event
                 .session_id
                 .as_deref()
                 .unwrap_or("<unknown>")
                 .to_string();
-            if record.event.event_type == rule.prerequisite_event {
+            if event.event_type == rule.prerequisite_event {
                 *session_prerequisites.entry(session.clone()).or_default() += 1;
             }
-            if required_matches(&rule.required_event, &record.event.event_type) {
+            if required_matches(&rule.required_event, &event.event_type) {
                 *session_required.entry(session).or_default() += 1;
             }
         }
@@ -87,7 +105,7 @@ pub fn reconcile(records: &[LedgerRecord]) -> Result<DenominatorReport> {
             missing: expected.saturating_sub(observed),
         });
     }
-    let completeness_status = match sequence_status(records) {
+    let completeness_status = match sequence_status_for_events(events) {
         "unknown" => "unknown",
         "partial" => "partial",
         "complete" if rows.iter().any(|row| row.missing > 0) => "partial",
@@ -100,6 +118,25 @@ pub fn reconcile(records: &[LedgerRecord]) -> Result<DenominatorReport> {
         completeness_status,
         rows,
     })
+}
+
+fn sequence_status_for_events(events: &[EventObservation]) -> &'static str {
+    let mut sequences = events
+        .iter()
+        .filter_map(|event| event.run_seq)
+        .collect::<Vec<_>>();
+    if sequences.is_empty() {
+        return "unknown";
+    }
+    sequences.sort_unstable();
+    if sequences
+        .windows(2)
+        .all(|window| window[1] == window[0].saturating_add(1))
+    {
+        "complete"
+    } else {
+        "partial"
+    }
 }
 
 fn required_matches(required: &str, event_type: &str) -> bool {

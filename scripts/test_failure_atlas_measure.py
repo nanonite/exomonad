@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
-from failure_atlas_measure import measure
+from failure_atlas_measure import _load_rows, detect, measure
 
 
 def _event(
@@ -128,11 +128,26 @@ def main() -> int:
         prereg = root / "preregistration.json"
         prereg.write_text(json.dumps(preregistration), encoding="utf-8")
         _create_database(database)
+        signals = detect(_load_rows(database))
+        labels = {
+            "judge-a": {
+                signal["signal_id"]: "confirmed" for signal in signals
+            },
+            "judge-b": {
+                signal["signal_id"]: (
+                    "not_confirmed" if index == 0 else "confirmed"
+                )
+                for index, signal in enumerate(signals)
+            },
+        }
+        labels_path = root / "labels.json"
+        labels_path.write_text(json.dumps(labels), encoding="utf-8")
         artifact = measure(
             database,
             root / "measurement",
             prereg,
             judge_models=["judge-a", "judge-b"],
+            labels_path=labels_path,
         )
         assert artifact["claim_gate"]["architecture_effect_claim_allowed"] is True
         assert artifact["effect"]["denominator"] == "complete_sessions"
@@ -141,7 +156,21 @@ def main() -> int:
         )
         assert adjudication["detectors"]
         assert adjudication["single_judge_precision_provisional"] is False
+        assert adjudication["status"] == "published"
+        assert adjudication["inter_judge_agreement"] < 1.0
         assert all("wilson_95" in row for row in adjudication["detectors"])
+        unlabelled = measure(
+            database,
+            root / "unlabelled",
+            None,
+            judge_models=["judge-a", "judge-b"],
+        )
+        unlabelled_adjudication = json.loads(
+            (root / "unlabelled/adjudication.json").read_text(encoding="utf-8")
+        )
+        assert unlabelled_adjudication["status"] != "published"
+        assert unlabelled_adjudication["inter_judge_agreement"] is None
+        assert unlabelled["claim_gate"]["architecture_effect_claim_allowed"] is False
         invalid = measure(database, root / "invalid", None)
         assert invalid["claim_gate"]["architecture_effect_claim_allowed"] is False
     print("Failure Atlas measurement pipeline smoke tests passed")

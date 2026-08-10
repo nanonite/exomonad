@@ -1337,8 +1337,11 @@ Run `exomonad recompile` first to build it.",
             Some(Arc::new(log))
         }
         Err(e) => {
-            let _ =
-                exomonad_core::services::sink_health::record_failure(&project_dir, &e.to_string());
+            let _ = exomonad_core::services::sink_health::record_failure(
+                &project_dir,
+                exomonad_core::services::sink_health::current_session_id(&project_dir).as_deref(),
+                &e.to_string(),
+            );
             warn!(error = %e, "Failed to open event log, JSONL logging disabled");
             None
         }

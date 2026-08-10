@@ -34,6 +34,36 @@ ALLOWLIST_COLUMNS = (
     "sink_status",
 )
 
+SAFE_CATEGORICAL_VALUES = {
+    "event_type": {
+        "agent.spawned", "agent.resumed", "agent.harness_switch", "agent.stuck",
+        "agent.notify_parent", "agent.sibling_merged", "agent.completed", "agent.stop_check",
+        "agent.invocation.started", "agent.invocation.finished", "agent.guidance.delivery",
+        "pr.filed", "pr.updated", "pr.published", "pr.replaced", "pr.merge_requested",
+        "pr.merged", "pr.merge_failed", "copilot.review", "ci.status_changed",
+        "event.dispatched", "event.dispatch_failed", "watcher.poll_cycle",
+        "watcher.pr_observation", "hook.stop", "tool.called", "message.delivery",
+        "message.consumed", "agent.message_sent", "agent_inbox.duplicates_dropped",
+        "agent_inbox.messages_abandoned", "session.state_changed", "memory.state_changed",
+        "inbox.state_changed", "event.superseded", "ledger.segment.dropped", "sink.health",
+        "custom",
+    },
+    "outcome": {
+        "accepted", "abandoned", "cancelled", "consumed", "emitted", "failed", "finished",
+        "merged", "observed", "pending", "rejected", "started", "success", "timed_out",
+        "unknown",
+    },
+    "provider": {"claude", "codex", "gemini", "opencode", "process", "shoal", "unknown"},
+    "runtime": {"claude", "codex", "gemini", "opencode", "process", "shoal", "unknown"},
+    "harness": {
+        "claude", "codex", "exomonad", "exo", "gemini", "hook", "opencode", "process",
+        "rust", "shoal", "sqlite", "teams_inbox", "tmux", "uds", "watcher", "unknown",
+    },
+    "role": {"dev", "event-handler", "reviewer", "root", "supervisor", "tl", "unknown", "worker"},
+    "lifecycle_state": {"accepted", "emitted", "legacy", "observed", "unknown"},
+    "sink_status": {"accepted", "complete", "failed", "partial", "unknown"},
+}
+
 DENYLIST_PATTERNS = {
     "url": re.compile(r"(?:https?://|git@|ssh://)", re.IGNORECASE),
     "path": re.compile(
@@ -70,16 +100,24 @@ def _database_hash(path: Path) -> str:
 
 def _read_allowlisted_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     columns = ", ".join(ALLOWLIST_COLUMNS)
-    query = f"SELECT {columns} FROM resolved_events"
-    try:
-        cursor = connection.execute(query)
-    except sqlite3.OperationalError:
-        query = (
-            f"SELECT {columns} FROM events e WHERE NOT EXISTS "
-            "(SELECT 1 FROM supersessions s WHERE s.superseded_event_id = e.event_id)"
-        )
-        cursor = connection.execute(query)
-    return [dict(zip(ALLOWLIST_COLUMNS, row)) for row in cursor.fetchall()]
+    query = f"SELECT session_id, {columns} FROM resolved_events"
+    cursor = connection.execute(query)
+    rows = []
+    for values in cursor.fetchall():
+        row = dict(zip(("session_id", *ALLOWLIST_COLUMNS), values))
+        for column in SAFE_CATEGORICAL_VALUES:
+            row[column] = _safe_category(column, row[column])
+        rows.append(row)
+    return rows
+
+
+def _safe_category(column: str, value: Any) -> str:
+    if value is None:
+        return "unknown"
+    normalized = str(value).strip().lower()
+    if column == "event_type" and normalized.startswith("custom."):
+        return "custom"
+    return normalized if normalized in SAFE_CATEGORICAL_VALUES[column] else "other"
 
 
 def _source_manifest(connection: sqlite3.Connection) -> tuple[str, dict[str, Any]]:
@@ -225,6 +263,16 @@ def _pointer_sample(rows: list[dict[str, Any]], limit: int = 20) -> list[dict[st
     return sample[:limit]
 
 
+def _complete_rows(
+    rows: list[dict[str, Any]], session_statuses: dict[str, str]
+) -> tuple[list[dict[str, Any]], int]:
+    complete_statuses = {"complete", "known"}
+    included = [
+        row for row in rows if session_statuses.get(row.get("session_id")) in complete_statuses
+    ]
+    return included, len(rows) - len(included)
+
+
 def _scan_projected(value: Any) -> dict[str, list[str]]:
     text = json.dumps(value, sort_keys=True)
     hits: dict[str, list[str]] = {}
@@ -245,6 +293,12 @@ def compile_artifact(database: Path, output_dir: Path, mode: str = "aggregate") 
         connection.row_factory = sqlite3.Row
         rows = _read_allowlisted_rows(connection)
         source_hash, source_summary = _source_manifest(connection)
+        session_statuses = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT session_id, completeness_status FROM sessions"
+            )
+        }
         completeness = [
             {"status": row[0], "count": row[1]}
             for row in connection.execute(
@@ -252,6 +306,7 @@ def compile_artifact(database: Path, output_dir: Path, mode: str = "aggregate") 
                 "GROUP BY completeness_status ORDER BY completeness_status"
             )
         ]
+    rows, excluded_incomplete_rows = _complete_rows(rows, session_statuses)
 
     method_hash = _sha256_bytes(Path(__file__).read_bytes())
     provenance = _provenance(source_hash, method_hash)
@@ -273,6 +328,10 @@ def compile_artifact(database: Path, output_dir: Path, mode: str = "aggregate") 
                 }
                 for item in completeness
             ],
+            "completeness_filter": {
+                "included_statuses": ["complete", "known"],
+                "excluded_incomplete_rows": excluded_incomplete_rows,
+            },
         },
         "sample": {"pointer_only_exemplars": _pointer_sample(rows)},
     }
@@ -296,6 +355,7 @@ def compile_artifact(database: Path, output_dir: Path, mode: str = "aggregate") 
         "contains_paths": False,
         "contains_secrets": False,
         "contains_raw_payload": False,
+        "bucketed_categorical_columns": sorted(SAFE_CATEGORICAL_VALUES),
         "denylist_hits": hits,
         "passed": not hits,
     }

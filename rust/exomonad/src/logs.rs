@@ -68,6 +68,7 @@ pub fn measure(
     output: PathBuf,
     require_ready: bool,
     judge_models: Vec<String>,
+    labels_path: Option<PathBuf>,
 ) -> Result<()> {
     let database = project_dir.join(".exo/analysis/atlas.db");
     let script =
@@ -89,6 +90,9 @@ pub fn measure(
     }
     if require_ready {
         command.arg("--require-ready");
+    }
+    if let Some(labels_path) = labels_path {
+        command.arg("--labels").arg(labels_path);
     }
     for judge_model in judge_models {
         command.arg("--judge-model").arg(judge_model);

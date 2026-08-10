@@ -33,6 +33,7 @@ def _create_database(path: Path) -> None:
             event_key TEXT PRIMARY KEY,
             source_id TEXT NOT NULL,
             event_id TEXT NOT NULL,
+            session_id TEXT,
             event_type TEXT NOT NULL,
             outcome TEXT,
             provider TEXT,
@@ -63,18 +64,22 @@ def _create_database(path: Path) -> None:
     )
     connection.execute(
         "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?)",
-        ("source-1", "jsonl", 512, "source-hash", 2, 0),
+        ("source-1", "jsonl", 512, "source-hash", 3, 0),
     )
     private_payload = json.dumps(fixture, sort_keys=True)
     rows = [
-        ("event-1", "source-1", "event-1", "agent.spawned", "success", "claude", "claude", "exo", "worker", 1, 500, "emitted", "accepted", private_payload),
-        ("event-2", "source-1", "event-2", "agent.invocation.finished", "success", "claude", "claude", "exo", "worker", 1, 1200, "emitted", "accepted", private_payload),
+        ("event-1", "source-1", "event-1", "session-1", "agent.spawned", "CLIENT_ORION_INTERNAL", "CLIENT_ORION_INTERNAL", "CLIENT_ORION_INTERNAL", "CLIENT_ORION_INTERNAL", "CLIENT_ORION_INTERNAL", 1, 500, "emitted", "accepted", private_payload),
+        ("event-2", "source-1", "event-2", "session-1", "agent.invocation.finished", "success", "claude", "claude", "exo", "worker", 1, 1200, "emitted", "accepted", private_payload),
+        ("event-3", "source-1", "event-3", "session-2", "agent.spawned", "failed", "claude", "claude", "exo", "worker", 1, 700, "emitted", "failed", private_payload),
     ]
     connection.executemany(
-        "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
-    connection.execute("INSERT INTO sessions VALUES (?, ?)", ("session-1", "complete"))
+    connection.executemany(
+        "INSERT INTO sessions VALUES (?, ?)",
+        [("session-1", "complete"), ("session-2", "partial")],
+    )
     connection.commit()
     connection.close()
 
@@ -101,9 +106,18 @@ def main() -> int:
             assert sensitive not in serialized
         assert "local_payload_json" not in serialized
         assert analysis["sample"]["pointer_only_exemplars"]
+        assert analysis["metrics"]["completeness_filter"]["excluded_incomplete_rows"] == 1
+        assert sum(
+            item["count"]["value"] for item in analysis["metrics"]["event_counts"]
+        ) == 2
         assert privacy["allowlist_first"] is True
         assert privacy["serialized_raw_rows"] is False
         assert privacy["passed"] is True
+        assert "CLIENT_ORION_INTERNAL" not in serialized
+        assert any(
+            item["value"] == "other"
+            for item in analysis["metrics"]["dimension_counts"]
+        )
     subprocess.run(
         [sys.executable, str(Path(__file__).with_name("compile_failure_atlas.py")), "--help"],
         check=True,

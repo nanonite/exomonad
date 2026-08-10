@@ -116,7 +116,10 @@ impl LifecycleEventKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LifecycleTelemetry {
     pub source_agent: Option<String>,
+    pub source: String,
     pub provider: String,
+    pub runtime: String,
+    pub harness: String,
     pub role: String,
     pub invocation_id: Option<String>,
     pub generation: Option<u64>,
@@ -135,7 +138,10 @@ impl LifecycleTelemetry {
     fn from_invocation(record: &InvocationRecord, outcome: &str) -> Self {
         Self {
             source_agent: None,
+            source: "lifecycle".to_string(),
             provider: record.runtime.suffix().to_string(),
+            runtime: record.runtime.suffix().to_string(),
+            harness: "exomonad".to_string(),
             role: role_for_trigger(record.trigger).to_string(),
             invocation_id: Some(record.invocation_id.clone()),
             generation: Some(record.generation),
@@ -160,9 +166,14 @@ impl LifecycleTelemetry {
     ) -> Self {
         Self {
             source_agent: Some(source_agent.to_string()),
+            source: "lifecycle".to_string(),
             provider: invocation
                 .map(|record| record.runtime.suffix().to_string())
                 .unwrap_or_else(|| provider.suffix().to_string()),
+            runtime: invocation
+                .map(|record| record.runtime.suffix().to_string())
+                .unwrap_or_else(|| provider.suffix().to_string()),
+            harness: "exomonad".to_string(),
             role: invocation
                 .map(|record| role_for_trigger(record.trigger).to_string())
                 .unwrap_or_else(|| "unknown".to_string()),

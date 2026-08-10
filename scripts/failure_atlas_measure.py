@@ -31,6 +31,7 @@ REQUIRED_CONFOUND_CONTROLS = (
     "repository_class",
     "topology_shape",
 )
+LABEL_SCHEMA = {"confirmed", "not_confirmed", "unknown"}
 
 
 def _hash_json(value: Any) -> str:
@@ -330,6 +331,71 @@ def _wilson(successes: int, total: int, z: float = 1.96) -> dict[str, float | No
     return {"low": max(0.0, centre - margin), "high": min(1.0, centre + margin)}
 
 
+def _load_judge_labels(
+    labels_path: Path | None, judge_models: list[str]
+) -> dict[str, dict[str, str]]:
+    labels = {judge: {} for judge in judge_models}
+    if labels_path is None:
+        return labels
+    raw = json.loads(labels_path.read_text(encoding="utf-8"))
+
+    def add(judge: str, signal_id: Any, label: Any) -> None:
+        if judge not in labels:
+            raise ValueError(f"labels contain unknown judge {judge!r}")
+        if not isinstance(signal_id, str) or not isinstance(label, str):
+            raise ValueError("each adjudication label needs string signal_id and label")
+        if label not in LABEL_SCHEMA:
+            raise ValueError(f"unsupported adjudication label {label!r}")
+        if signal_id in labels[judge]:
+            raise ValueError(f"duplicate adjudication label for {judge}:{signal_id}")
+        labels[judge][signal_id] = label
+
+    if isinstance(raw, dict):
+        judge_keys = set(raw).intersection(judge_models)
+        if judge_keys:
+            if judge_keys != set(raw):
+                raise ValueError("per-judge labels must name only configured judges")
+            for judge, entries in raw.items():
+                if isinstance(entries, dict):
+                    for signal_id, label in entries.items():
+                        add(judge, signal_id, label)
+                elif isinstance(entries, list):
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            raise ValueError("judge label lists must contain objects")
+                        add(judge, entry.get("signal_id"), entry.get("label"))
+                else:
+                    raise ValueError("each judge must map to labels or label records")
+        elif len(judge_models) == 1:
+            for signal_id, label in raw.items():
+                add(judge_models[0], signal_id, label)
+        else:
+            raise ValueError("multiple judges require a per-judge label mapping")
+    elif isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise ValueError("adjudication labels must contain objects")
+            judge = entry.get("judge")
+            if judge is None and len(judge_models) == 1:
+                judge = judge_models[0]
+            if not isinstance(judge, str):
+                raise ValueError("multiple judges require a judge field per label")
+            add(judge, entry.get("signal_id"), entry.get("label"))
+    else:
+        raise ValueError("adjudication labels must be an object or list")
+    return labels
+
+
+def _consensus(labels: list[str]) -> str:
+    known = [label for label in labels if label != "unknown"]
+    if not known:
+        return "unknown"
+    counts = {label: known.count(label) for label in LABEL_SCHEMA - {"unknown"}}
+    highest = max(counts.values())
+    winners = [label for label, count in counts.items() if count == highest]
+    return winners[0] if len(winners) == 1 else "unknown"
+
+
 def adjudicate(
     signals: list[dict[str, Any]],
     output_dir: Path,
@@ -339,11 +405,9 @@ def adjudicate(
     labels_path: Path | None = None,
 ) -> dict[str, Any]:
     judge_models = judge_models or ["rule-based-local-v1"]
-    labels = {}
-    if labels_path:
-        labels = json.loads(labels_path.read_text(encoding="utf-8"))
-        if isinstance(labels, list):
-            labels = {item["signal_id"]: item["label"] for item in labels}
+    if len(set(judge_models)) != len(judge_models):
+        raise ValueError("judge names must be unique")
+    judge_labels = _load_judge_labels(labels_path, judge_models)
     by_detector: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     for signal in signals:
         by_detector[signal["detector"]].append(signal)
@@ -355,12 +419,15 @@ def adjudicate(
             key=lambda signal: _hash_json([seed, detector, signal["signal_id"]]),
         )[:sample_size]
         detector_labels = []
+        complete_ratings = True
         for signal in chosen:
-            label = labels.get(
-                signal["signal_id"],
-                "confirmed" if signal["score"] >= 1 else "not_confirmed",
+            signal_labels = {
+                judge: judge_labels[judge].get(signal["signal_id"], "unknown")
+                for judge in judge_models
+            }
+            complete_ratings = complete_ratings and all(
+                label != "unknown" for label in signal_labels.values()
             )
-            signal_labels = {judge: label for judge in judge_models}
             samples.append(
                 {
                     "signal_id": signal["signal_id"],
@@ -369,24 +436,54 @@ def adjudicate(
                     "source_pointer": signal["source_pointer"],
                 }
             )
-            detector_labels.append(label)
-        confirmed = sum(label == "confirmed" for label in detector_labels)
-        total = len(detector_labels)
+            detector_labels.append(_consensus(list(signal_labels.values())))
+        known_labels = [label for label in detector_labels if label != "unknown"]
+        confirmed = sum(label == "confirmed" for label in known_labels)
+        total = len(known_labels)
+        if len(judge_models) > 1 and complete_ratings and labels_path is not None:
+            status = "published"
+        elif not known_labels:
+            status = "unadjudicated"
+        elif len(judge_models) == 1:
+            status = "provisional"
+        else:
+            status = "pending"
         summary.append(
             {
                 "detector": detector,
                 "n": total,
+                "sampled_n": len(chosen),
+                "unknown": len(detector_labels) - total,
                 "confirmed": confirmed,
                 "precision": None if total == 0 else confirmed / total,
                 "wilson_95": _wilson(confirmed, total),
-                "status": "not_applicable" if total == 0 else (
-                    "provisional" if len(judge_models) == 1 else "published"
-                ),
+                "status": status,
             }
         )
-    agreement = None
-    if len(judge_models) > 1 and samples:
-        agreement = 1.0
+    pair_agreements = []
+    for index, left_judge in enumerate(judge_models):
+        for right_judge in judge_models[index + 1 :]:
+            comparisons = [
+                sample["labels"][left_judge] == sample["labels"][right_judge]
+                for sample in samples
+                if sample["labels"][left_judge] != "unknown"
+                and sample["labels"][right_judge] != "unknown"
+            ]
+            if comparisons:
+                pair_agreements.append(sum(comparisons) / len(comparisons))
+    agreement = (
+        None if not pair_agreements else sum(pair_agreements) / len(pair_agreements)
+    )
+    non_empty_statuses = [row["status"] for row in summary if row["sampled_n"]]
+    adjudication_status = (
+        "published"
+        if non_empty_statuses and all(status == "published" for status in non_empty_statuses)
+        else "provisional"
+        if any(status == "provisional" for status in non_empty_statuses)
+        else "pending"
+        if non_empty_statuses
+        else "unadjudicated"
+    )
     artifact = {
         "schema_version": 1,
         "adjudication_revision": ADJUDICATION_REVISION,
@@ -394,8 +491,13 @@ def adjudicate(
         "prompt_revision": "adjudication-prompt-v1",
         "label_schema": ["confirmed", "not_confirmed", "unknown"],
         "sampling_seed": seed,
-        "method": "deterministic stratified sample by detector",
-        "single_judge_precision_provisional": len(judge_models) == 1,
+        "method": "deterministic stratified sample by detector with supplied per-judge labels",
+        "labels_provided": labels_path is not None,
+        "labels_path_hash": _hash_file(labels_path) if labels_path else None,
+        "independence_basis": "distinct judge label streams supplied by caller",
+        "status": adjudication_status,
+        "single_judge_precision_provisional": len(judge_models) == 1
+        and adjudication_status == "provisional",
         "inter_judge_agreement": agreement,
         "detectors": summary,
         "samples": samples,
@@ -477,6 +579,7 @@ def measure(
     preregistration_path: Path | None,
     require_ready: bool = False,
     judge_models: list[str] | None = None,
+    labels_path: Path | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = _load_rows(database)
@@ -501,7 +604,12 @@ def measure(
         "incident_revision": INCIDENT_REVISION,
         "incidents": incidents,
     })
-    adjudication = adjudicate(signals, output_dir, judge_models=judge_models)
+    adjudication = adjudicate(
+        signals,
+        output_dir,
+        judge_models=judge_models,
+        labels_path=labels_path,
+    )
     summaries = _session_summaries(rows)
     for session_id, status in session_statuses.items():
         if session_id in summaries:
@@ -538,7 +646,13 @@ def measure(
         }
     baseline = arm_stats(baseline_ids)
     treatment = arm_stats(treatment_ids)
-    ready = not prereg_errors and baseline["n"] > 0 and treatment["n"] > 0
+    adjudication_ready = adjudication["status"] == "published"
+    ready = (
+        not prereg_errors
+        and baseline["n"] > 0
+        and treatment["n"] > 0
+        and adjudication_ready
+    )
     effect = None
     if ready:
         absolute = treatment["rate"] - baseline["rate"]
@@ -572,7 +686,8 @@ def measure(
         "effect": effect,
         "claim_gate": {
             "architecture_effect_claim_allowed": ready,
-            "reason": "preregistered controlled contrast and complete arm denominators required"
+            "adjudication_ready": adjudication_ready,
+            "reason": "preregistered controlled contrast, complete arm denominators, and published independent adjudication required"
             if not ready
             else "measurement-ready gate passed",
             "provider_runtime_harness_groupby_is_causal": False,
@@ -580,7 +695,10 @@ def measure(
     }
     _write_json(output_dir / "measurement.json", artifact)
     if require_ready and not ready:
-        raise ValueError("measurement-ready gate failed: " + ", ".join(prereg_errors))
+        reasons = prereg_errors or []
+        if not adjudication_ready:
+            reasons = [*reasons, "published independent adjudication is required"]
+        raise ValueError("measurement-ready gate failed: " + ", ".join(reasons))
     return artifact
 
 
@@ -597,6 +715,7 @@ def main() -> int:
     parser.add_argument("--preregistration", type=Path)
     parser.add_argument("--require-ready", action="store_true")
     parser.add_argument("--judge-model", action="append")
+    parser.add_argument("--labels", "--labels-path", dest="labels_path", type=Path)
     args = parser.parse_args()
     try:
         result = measure(
@@ -605,6 +724,7 @@ def main() -> int:
             args.preregistration,
             args.require_ready,
             args.judge_model,
+            args.labels_path,
         )
         print(json.dumps({"measurement_ready": result["claim_gate"]["architecture_effect_claim_allowed"]}))
     except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as error:

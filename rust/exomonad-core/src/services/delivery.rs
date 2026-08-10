@@ -907,20 +907,6 @@ where
             );
 
             if success {
-                if let Ok(log) =
-                    crate::services::EventLog::open(message.project_dir.join(".exo/logs"))
-                {
-                    let _ = log.append(
-                        "message.consumed",
-                        &message.recipient,
-                        &serde_json::json!({
-                            "message_id": message.id,
-                            "recipient": message.recipient,
-                            "consumer": agent,
-                            "outcome": "consumed"
-                        }),
-                    );
-                }
                 GLOBAL_AGENT_INBOX
                     .complete_delivery(&agent, message.id, true)
                     .await;

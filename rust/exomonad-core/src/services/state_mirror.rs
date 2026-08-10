@@ -23,7 +23,11 @@ pub fn append_state_change(db_path: &Path, event_type: &str, data: Value) {
         Ok(log) => log,
         Err(error) => {
             if let Some(project_dir) = exo_dir.parent() {
-                let _ = super::sink_health::record_failure(project_dir, &error.to_string());
+                let _ = super::sink_health::record_failure(
+                    project_dir,
+                    super::sink_health::current_session_id(project_dir).as_deref(),
+                    &error.to_string(),
+                );
             }
             warn!(%error, event_type, "Failed to open state mirror event log");
             return;

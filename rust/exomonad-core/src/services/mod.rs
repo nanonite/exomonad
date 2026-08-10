@@ -58,8 +58,8 @@ pub use self::claude_session_registry::ClaudeSessionRegistry;
 pub use self::event_log::EventLog;
 pub use self::event_queue::EventQueue;
 pub use self::expected_events::{
-    load_contract, reconcile, DenominatorReport, DenominatorRow, ExpectedEventContract,
-    ExpectedEventRule,
+    load_contract, reconcile, reconcile_events, DenominatorReport, DenominatorRow,
+    EventObservation, ExpectedEventContract, ExpectedEventRule,
 };
 pub use self::filesystem::FileSystemService;
 pub use self::forgejo::ForgejoClient;

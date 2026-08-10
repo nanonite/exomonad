@@ -148,7 +148,8 @@ pub fn mark_server_started(project_dir: &Path, started_by: &str) -> Result<Sessi
         .map_err(|(_, error)| anyhow::anyhow!("lock session state: {error}"))?;
     let mut state = SessionState::read(project_dir)?.unwrap_or(state);
     state.last_server_started_at = Some(Utc::now().to_rfc3339());
-    state.completeness_status = sink_health::startup_status(project_dir);
+    state.completeness_status =
+        sink_health::startup_status(project_dir, Some(state.session_id.as_str()));
     write_atomic(project_dir, &state)?;
     append_state_change(
         &state_path(project_dir),
@@ -207,7 +208,7 @@ mod tests {
     #[test]
     fn startup_without_health_is_unknown_and_success_is_complete() -> Result<()> {
         let temp = TempDir::new()?;
-        assert_eq!(sink_health::startup_status(temp.path()), "unknown");
+        assert_eq!(sink_health::startup_status(temp.path(), None), "unknown");
         transition(temp.path(), SessionTransition::Fresh, "test")?;
         let state = mark_server_started(temp.path(), "test")?;
         assert_eq!(state.completeness_status, "complete");

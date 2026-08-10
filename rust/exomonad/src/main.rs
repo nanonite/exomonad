@@ -286,6 +286,9 @@ enum LogsCommands {
         /// Local judge model/coder; repeat for independent judges.
         #[arg(long = "judge-model")]
         judge_models: Vec<String>,
+        /// JSON file containing independent per-judge labels for the sampled signals.
+        #[arg(long)]
+        labels: Option<PathBuf>,
     },
 }
 
@@ -380,6 +383,7 @@ async fn main() -> Result<()> {
                     output,
                     require_ready,
                     judge_models,
+                    labels,
                 },
         } => {
             let project_dir = if config.project_dir.is_absolute() {
@@ -393,6 +397,7 @@ async fn main() -> Result<()> {
                 output,
                 require_ready,
                 judge_models,
+                labels,
             );
         }
 

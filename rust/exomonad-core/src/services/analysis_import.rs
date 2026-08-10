@@ -11,6 +11,7 @@ use rusqlite::{params, types::ValueRef, Connection, OpenFlags, OptionalExtension
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -307,6 +308,13 @@ fn import_one(
     }
     let transaction = connection.unchecked_transaction()?;
     transaction.execute(
+        "DELETE FROM supersessions
+         WHERE supersession_event_key IN (
+             SELECT event_key FROM events WHERE source_id = ?1
+         )",
+        params![source.source_id],
+    )?;
+    transaction.execute(
         "DELETE FROM events WHERE source_id = ?1",
         params![source.source_id],
     )?;
@@ -543,6 +551,7 @@ fn normalize_event(
 ) -> Result<NormalizedEvent> {
     let canonical = serde_json::to_string(&value).context("canonicalize imported event")?;
     let fallback_id = hash_bytes(format!("{}:{offset}:{canonical}", source.source_id).as_bytes());
+    let data = value.get("data").cloned().unwrap_or_else(|| value.clone());
     let event_id = string_field(&value, &["event_id", "id"]).unwrap_or(fallback_id);
     let event_type = string_field(&value, &["type", "event_type"])
         .or_else(|| {
@@ -561,7 +570,6 @@ fn normalize_event(
         }
     });
     let run_seq = number_field(&value, &["run_seq"]);
-    let data = value.get("data").cloned().unwrap_or_else(|| value.clone());
     Ok(NormalizedEvent {
         event_key: hash_bytes(format!("{}:{offset}:{canonical}", source.source_id).as_bytes()),
         source_id: source.source_id.clone(),
@@ -577,12 +585,12 @@ fn normalize_event(
         parent_agent_id: string_field(&value, &["parent_agent_id"]),
         invocation_id: string_field(&value, &["invocation_id"]),
         generation: number_field(&value, &["generation"]),
-        role: string_field(&value, &["role"]),
-        provider: string_field(&value, &["provider"]),
-        runtime: string_field(&value, &["runtime"]),
-        harness: string_field(&value, &["harness"]),
+        role: string_field_from_event(&value, &data, &["role"]),
+        provider: string_field_from_event(&value, &data, &["provider"]),
+        runtime: string_field_from_event(&value, &data, &["runtime"]),
+        harness: string_field_from_event(&value, &data, &["harness"]),
         event_type,
-        outcome: string_field(&value, &["outcome"]),
+        outcome: string_field_from_event(&value, &data, &["outcome"]),
         duration_ms: number_field(&value, &["duration_ms"]),
         attempt: number_field(&value, &["attempt"]),
         issue_number: number_field(&value, &["issue_number"]),
@@ -592,7 +600,7 @@ fn normalize_event(
         payload_class: string_field(&value, &["payload_class"])
             .unwrap_or_else(|| "local_sensitive".to_string()),
         lifecycle_state,
-        sink_status: string_field(&value, &["sink_status"]),
+        sink_status: string_field_from_event(&value, &data, &["sink_status"]),
         identity_confidence: if source.kind == "jsonl" && value.get("event_id").is_some() {
             "exact".to_string()
         } else {
@@ -739,14 +747,62 @@ fn insert_import_error(
 
 fn refresh_derived_tables(store: &AnalysisStore) -> Result<()> {
     let connection = store.connection()?;
-    connection.execute_batch(
-        "DELETE FROM sessions;
-         INSERT INTO sessions(session_id, first_event_time, last_event_time, event_count, completeness_status)
-         SELECT session_id, MIN(event_time), MAX(event_time), COUNT(*),
-                CASE WHEN SUM(CASE WHEN run_seq IS NULL THEN 1 ELSE 0 END) = 0
-                     THEN 'known' ELSE 'unknown' END
-         FROM resolved_events WHERE session_id IS NOT NULL GROUP BY session_id;",
+    let mut statement = connection.prepare(
+        "SELECT session_id, event_time, event_type, run_seq
+         FROM resolved_events
+         WHERE session_id IS NOT NULL
+         ORDER BY session_id, event_time",
     )?;
+    let mut rows = statement.query([])?;
+    let mut sessions = BTreeMap::<
+        String,
+        (
+            Option<String>,
+            Option<String>,
+            u64,
+            Vec<crate::services::EventObservation>,
+        ),
+    >::new();
+    while let Some(row) = rows.next()? {
+        let session_id: String = row.get(0)?;
+        let event_time: Option<String> = row.get(1)?;
+        let event_type: String = row.get(2)?;
+        let run_seq = row
+            .get::<_, Option<i64>>(3)?
+            .map(|value| u64::try_from(value).context("negative run_seq in L2"))
+            .transpose()?;
+        let entry = sessions
+            .entry(session_id)
+            .or_insert_with(|| (None, None, 0, Vec::new()));
+        if entry.0.is_none() {
+            entry.0 = event_time.clone();
+        }
+        entry.1 = event_time;
+        entry.2 = entry.2.saturating_add(1);
+        entry.3.push(crate::services::EventObservation {
+            session_id: None,
+            event_type,
+            run_seq,
+        });
+    }
+    drop(rows);
+    drop(statement);
+    connection.execute("DELETE FROM sessions", [])?;
+    for (session_id, (first_event_time, last_event_time, event_count, events)) in sessions {
+        let report = crate::services::reconcile_events(&events)?;
+        connection.execute(
+            "INSERT INTO sessions(
+                 session_id, first_event_time, last_event_time, event_count, completeness_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_id,
+                first_event_time,
+                last_event_time,
+                event_count as i64,
+                report.completeness_status,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -838,6 +894,10 @@ fn string_field(value: &Value, names: &[&str]) -> Option<String> {
             _ => None,
         })
     })
+}
+
+fn string_field_from_event(event: &Value, data: &Value, names: &[&str]) -> Option<String> {
+    string_field(event, names).or_else(|| string_field(data, names))
 }
 
 fn number_field(value: &Value, names: &[&str]) -> Option<u64> {
@@ -940,6 +1000,28 @@ mod tests {
     }
 
     #[test]
+    fn l2_completeness_reconciles_expected_events_and_sequence_gaps() -> Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("events.jsonl");
+        fs::write(
+            &source,
+            "{\"event_id\":\"start\",\"type\":\"agent.invocation.started\",\"session_id\":\"s1\",\"run_seq\":1}\n{\"event_id\":\"finish\",\"type\":\"agent.invocation.finished\",\"session_id\":\"s1\",\"run_seq\":3}\n",
+        )?;
+        import_sources(&options(temp.path(), source))?;
+
+        let connection = Connection::open(temp.path().join(".exo/analysis/atlas.db"))?;
+        assert_eq!(
+            connection.query_row(
+                "SELECT completeness_status FROM sessions WHERE session_id = 's1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "partial"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn changed_source_replaces_derived_rows_and_rebuild_is_deterministic() -> Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("events.jsonl");
@@ -968,6 +1050,43 @@ mod tests {
     }
 
     #[test]
+    fn changed_source_removes_supersession_rows_before_events() -> Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("events.jsonl");
+        let mut file = File::create(&source)?;
+        writeln!(file, "{}", r#"{"event_id":"e1","type":"custom.one"}"#)?;
+        file.sync_all()?;
+        import_sources(&options(temp.path(), source.clone()))?;
+        let mut file = File::create(&source)?;
+        writeln!(
+            file,
+            "{}",
+            r#"{"event_id":"e2","type":"event.superseded","superseded_event_id":"e1"}"#
+        )?;
+        file.sync_all()?;
+        import_sources(&options(temp.path(), source.clone()))?;
+        let mut file = File::create(&source)?;
+        writeln!(file, "{}", r#"{"event_id":"e3","type":"custom.three"}"#)?;
+        file.sync_all()?;
+        import_sources(&options(temp.path(), source))?;
+
+        let connection = Connection::open(temp.path().join(".exo/analysis/atlas.db"))?;
+        assert_eq!(
+            connection.query_row("SELECT event_id FROM events", [], |row| {
+                row.get::<_, String>(0)
+            })?,
+            "e3"
+        );
+        assert_eq!(
+            connection.query_row("SELECT COUNT(*) FROM supersessions", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
     fn auto_imports_sink_health_json_into_l2() -> Result<()> {
         let temp = TempDir::new()?;
         let health = temp.path().join(".exo/sink-health.json");
@@ -987,6 +1106,40 @@ mod tests {
             connection.query_row("SELECT event_type FROM events", [], |row| row
                 .get::<_, String>(0))?,
             "sink.health"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn imports_legacy_payload_provenance_when_envelope_fields_are_missing() -> Result<()> {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("events.jsonl");
+        fs::write(
+            &source,
+            r#"{"event_id":"e1","type":"agent.invocation.started","session_id":"s1","run_seq":1,"data":{"provider":"gemini","runtime":"gemini","harness":"exo","role":"dev"}}"#,
+        )?;
+        import_sources(&options(temp.path(), source))?;
+        let connection = Connection::open(temp.path().join(".exo/analysis/atlas.db"))?;
+        let provenance = connection.query_row(
+            "SELECT provider, runtime, harness, role FROM events WHERE event_id = 'e1'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            provenance,
+            (
+                Some("gemini".to_string()),
+                Some("gemini".to_string()),
+                Some("exo".to_string()),
+                Some("dev".to_string()),
+            )
         );
         Ok(())
     }

@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SinkHealth {
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub accepted_event_count: u64,
     pub rejected_event_count: u64,
     pub write_failure_count: u64,
@@ -22,6 +24,7 @@ pub struct SinkHealth {
 impl Default for SinkHealth {
     fn default() -> Self {
         Self {
+            session_id: None,
             accepted_event_count: 0,
             rejected_event_count: 0,
             write_failure_count: 0,
@@ -48,8 +51,17 @@ pub fn read(project_dir: &Path) -> Result<Option<SinkHealth>> {
     }
 }
 
-pub fn record_success(project_dir: &Path, run_seq: u64) -> Result<()> {
-    update(project_dir, |health| {
+pub fn current_session_id(project_dir: &Path) -> Option<String> {
+    let contents = fs::read_to_string(project_dir.join(".exo/session.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()?
+        .get("session_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+pub fn record_success(project_dir: &Path, session_id: Option<&str>, run_seq: u64) -> Result<()> {
+    update(project_dir, session_id, |health| {
         health.accepted_event_count = health.accepted_event_count.saturating_add(1);
         health.last_successful_seq = Some(run_seq);
         health.measurement_status = "complete".to_string();
@@ -57,8 +69,8 @@ pub fn record_success(project_dir: &Path, run_seq: u64) -> Result<()> {
     })
 }
 
-pub fn record_failure(project_dir: &Path, error: &str) -> Result<()> {
-    update(project_dir, |health| {
+pub fn record_failure(project_dir: &Path, session_id: Option<&str>, error: &str) -> Result<()> {
+    update(project_dir, session_id, |health| {
         health.rejected_event_count = health.rejected_event_count.saturating_add(1);
         health.write_failure_count = health.write_failure_count.saturating_add(1);
         health.measurement_status = "partial".to_string();
@@ -66,8 +78,9 @@ pub fn record_failure(project_dir: &Path, error: &str) -> Result<()> {
     })
 }
 
-pub fn startup_status(project_dir: &Path) -> String {
+pub fn startup_status(project_dir: &Path, session_id: Option<&str>) -> String {
     match read(project_dir) {
+        Ok(Some(health)) if health.session_id.as_deref() != session_id => "unknown".to_string(),
         Ok(Some(health)) if health.write_failure_count > 0 => "partial".to_string(),
         Ok(Some(_)) => "complete".to_string(),
         Ok(None) | Err(_) => "unknown".to_string(),
@@ -82,7 +95,7 @@ pub fn as_event_data(health: &SinkHealth) -> Value {
     })
 }
 
-fn update<F>(project_dir: &Path, mutate: F) -> Result<()>
+fn update<F>(project_dir: &Path, session_id: Option<&str>, mutate: F) -> Result<()>
 where
     F: FnOnce(&mut SinkHealth),
 {
@@ -105,6 +118,12 @@ where
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => SinkHealth::default(),
         Err(error) => return Err(error).with_context(|| format!("read {}", output_path.display())),
     };
+    if health.session_id.as_deref() != session_id {
+        health = SinkHealth {
+            session_id: session_id.map(str::to_string),
+            ..SinkHealth::default()
+        };
+    }
     mutate(&mut health);
     health.updated_at = Utc::now().to_rfc3339();
     let temporary = exo_dir.join(format!(".sink-health-{}.tmp", uuid::Uuid::new_v4()));
@@ -130,15 +149,26 @@ mod tests {
     #[test]
     fn health_counters_classify_success_and_failure() -> Result<()> {
         let temp = TempDir::new()?;
-        record_success(temp.path(), 4)?;
-        record_failure(temp.path(), "disk full")?;
+        record_success(temp.path(), Some("session-a"), 4)?;
+        record_failure(temp.path(), Some("session-a"), "disk full")?;
         let health = read(temp.path())?.context("health file")?;
+        assert_eq!(health.session_id.as_deref(), Some("session-a"));
         assert_eq!(health.accepted_event_count, 1);
         assert_eq!(health.rejected_event_count, 1);
         assert_eq!(health.write_failure_count, 1);
         assert_eq!(health.last_successful_seq, Some(4));
         assert_eq!(health.measurement_status, "partial");
         assert_ne!(health.last_error.as_deref(), Some("disk full"));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_health_is_unknown_for_a_new_session() -> Result<()> {
+        let temp = TempDir::new()?;
+        record_success(temp.path(), Some("session-a"), 4)?;
+        assert_eq!(startup_status(temp.path(), Some("session-b")), "unknown");
+        record_failure(temp.path(), Some("session-b"), "disk full")?;
+        assert_eq!(startup_status(temp.path(), Some("session-b")), "partial");
         Ok(())
     }
 }

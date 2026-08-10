@@ -37,6 +37,14 @@ pub struct LedgerEvent {
     pub session_id: Option<String>,
     pub invocation_id: Option<String>,
     pub generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub source: String,
     pub lifecycle_state: String,
     pub data: Value,
@@ -60,6 +68,10 @@ impl LedgerEvent {
             session_id: None,
             invocation_id: None,
             generation: None,
+            provider: None,
+            runtime: None,
+            harness: None,
+            role: None,
             source: "exomonad".to_string(),
             lifecycle_state: "emitted".to_string(),
             data,

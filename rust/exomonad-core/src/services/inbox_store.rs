@@ -181,18 +181,6 @@ impl InboxStore {
                     "notified_at": now
                 }),
             );
-            for message in &messages {
-                append_state_change(
-                    &self.db_path,
-                    "message.consumed",
-                    json!({
-                        "message_id": message.id,
-                        "from_agent": message.from_agent,
-                        "to_agent": message.to_agent,
-                        "read_at": now
-                    }),
-                );
-            }
         }
         Ok(messages)
     }
@@ -237,6 +225,20 @@ impl InboxStore {
                     "read_at": now
                 }),
             );
+            for message in &messages {
+                append_state_change(
+                    &self.db_path,
+                    "message.consumed",
+                    json!({
+                        "message_id": message.id,
+                        "from_agent": message.from_agent,
+                        "to_agent": message.to_agent,
+                        "consumer": normalized_agent_id,
+                        "outcome": "consumed",
+                        "read_at": now
+                    }),
+                );
+            }
         }
         Ok(messages)
     }
@@ -669,6 +671,14 @@ mod tests {
 
         let second_peek = store.peek_unnotified("worker-1").unwrap();
         assert!(second_peek.is_empty());
+        let consumed_after_peek = crate::services::LedgerWriter::open_project(dir.path())
+            .unwrap()
+            .read_events()
+            .unwrap()
+            .iter()
+            .filter(|record| record.event.event_type == "message.consumed")
+            .count();
+        assert_eq!(consumed_after_peek, 0);
 
         let drained = store.drain_unread("worker-1").unwrap();
         assert_eq!(drained.len(), 1);
@@ -676,6 +686,14 @@ mod tests {
         assert_eq!(store.unread_count("worker-1").unwrap(), 0);
         assert!(!store.has_unread("worker-1").unwrap());
         assert!(store.last_check_inbox_at("worker-1").unwrap().is_some());
+        let consumed_after_drain = crate::services::LedgerWriter::open_project(dir.path())
+            .unwrap()
+            .read_events()
+            .unwrap()
+            .iter()
+            .filter(|record| record.event.event_type == "message.consumed")
+            .count();
+        assert_eq!(consumed_after_drain, 1);
     }
 
     #[test]

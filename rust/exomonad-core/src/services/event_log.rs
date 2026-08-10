@@ -80,7 +80,11 @@ impl EventLog {
             session_id: self.session_id(),
             invocation_id: string_field(data, "invocation_id"),
             generation: data.get("generation").and_then(serde_json::Value::as_u64),
-            source: "rust".to_string(),
+            provider: string_field(data, "provider"),
+            runtime: string_field(data, "runtime"),
+            harness: string_field(data, "harness"),
+            role: string_field(data, "role"),
+            source: string_field(data, "source").unwrap_or_else(|| "rust".to_string()),
             lifecycle_state: string_field(data, "lifecycle_state")
                 .unwrap_or_else(|| "emitted".to_string()),
             data: data.clone(),
@@ -125,7 +129,9 @@ impl EventLog {
             self.record_failure(&error);
             return Err(error);
         }
-        if let Err(error) = sink_health::record_success(&self.project_dir, run_seq) {
+        if let Err(error) =
+            sink_health::record_success(&self.project_dir, self.session_id().as_deref(), run_seq)
+        {
             warn!(%error, "Event committed but sink-health fallback could not be updated");
         }
         Ok(event_id)
@@ -198,9 +204,11 @@ impl EventLog {
     }
 
     fn record_failure(&self, error: &io::Error) {
-        if let Err(health_error) =
-            sink_health::record_failure(&self.project_dir, &error.to_string())
-        {
+        if let Err(health_error) = sink_health::record_failure(
+            &self.project_dir,
+            self.session_id().as_deref(),
+            &error.to_string(),
+        ) {
             warn!(%health_error, "Event sink failed and fallback health could not be written");
         }
     }
@@ -241,7 +249,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = EventLog::open(dir.path().to_path_buf()).unwrap();
 
-        let data = serde_json::json!({"slug": "feature-a", "agent_type": "claude"});
+        let data = serde_json::json!({
+            "slug": "feature-a",
+            "agent_type": "claude",
+            "provider": "claude",
+            "runtime": "codex",
+            "harness": "exo",
+            "role": "worker",
+            "source": "lifecycle",
+        });
         let id = log.append("agent.spawned", "root", &data).unwrap();
         assert!(!id.is_empty());
 
@@ -258,6 +274,11 @@ mod tests {
         assert_eq!(records[0].event.event_id, id);
         assert_eq!(records[0].event.id, id);
         assert_eq!(records[0].event.run_seq, Some(1));
+        assert_eq!(records[0].event.provider.as_deref(), Some("claude"));
+        assert_eq!(records[0].event.runtime.as_deref(), Some("codex"));
+        assert_eq!(records[0].event.harness.as_deref(), Some("exo"));
+        assert_eq!(records[0].event.role.as_deref(), Some("worker"));
+        assert_eq!(records[0].event.source, "lifecycle");
     }
 
     #[test]

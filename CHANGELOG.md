@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix observability adjudication, completeness, privacy, provenance, messaging, health, and import integrity (#649)
 - Fix reviewer model and effort propagation across harnesses (#635)
 - Update memory tool documentation and runtime protocol contracts (#628)
 - fix: has_pending_work reports dead agents as alive, blocking shutdown convergence (#619)
