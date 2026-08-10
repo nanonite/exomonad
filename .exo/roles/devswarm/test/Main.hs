@@ -25,6 +25,7 @@ import Effects.Git qualified as Git
 import Effects.Kv qualified as KV
 import Effects.Log qualified as Log
 import ExoMonad.Guest.Effects.AgentControl (runAgentControlSuspend)
+import ExoMonad.Guest.Effects.AgentControl qualified as AgentControl
 import ExoMonad.Guest.Effects.FileSystem (runFileSystemSuspend)
 import ExoMonad.Guest.Events (CIStatusEvent (..), EventAction (..), EventHandlerConfig (..), PRReviewEvent (..))
 import ExoMonad.Guest.Events.Templates qualified as Tpl
@@ -36,6 +37,7 @@ import ExoMonad.Guest.Tool.Suspend.Types (EffectRequest (..))
 import ExoMonad.Guest.Tools.FilePR (filePRDescription, filePRSchema)
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), mergePRDescription, mergePRSchema)
 import ExoMonad.Guest.Tools.ResumePr (ResumePrArgs (..), renderResumePrTask, resumePrDescription, resumePrSchema)
+import ExoMonad.Guest.Tools.Spawn (forkWaveSchema, spawnLeafSchema, spawnWorkersSchema)
 import ExoMonad.Guest.Types (Effects, HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (ChainlinkDbPathState (..), HookConfig (..), RoleConfig (..), validateChainlinkDbEnv)
 import Proto3.Suite.Class (Message, toLazyByteString)
@@ -87,6 +89,7 @@ main = do
   assertReviewerFacingTextDoesNotMentionCopilot
   assertAcceptanceCriteriaContract
   assertReviewerAcceptanceCriteriaGuidance
+  assertSpawnSchemasRejectGemini
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -615,6 +618,21 @@ assertAcceptanceCriteriaContract = do
   assertContains "leaf prompt exact live pane" "validated tmux pane" (Prompt.render Prompt.leafProfile)
   assertContains "leaf prompt resume invocation" "resume_pr" (Prompt.render Prompt.leafProfile)
   assertBool "leaf prompt does not wait for merge-ready" (not ("Stop only after merge-ready" `T.isInfixOf` Prompt.render Prompt.leafProfile))
+
+assertSpawnSchemasRejectGemini :: IO ()
+assertSpawnSchemasRejectGemini = do
+  let schemaText schema = T.pack (BSL.unpack (Aeson.encode schema))
+      schemas =
+        [ ("fork_wave", schemaText forkWaveSchema),
+          ("spawn_leaf", schemaText spawnLeafSchema),
+          ("spawn_workers", schemaText spawnWorkersSchema)
+        ]
+  forM_ schemas $ \(toolName, schema) ->
+    assertBool (toolName <> " schema omits Gemini") (not ("gemini" `T.isInfixOf` schema))
+  let parsed = Aeson.fromJSON (Aeson.String "gemini") :: Aeson.Result AgentControl.AgentType
+  case parsed of
+    Aeson.Error message -> assertContains "Gemini parser rejection" "retired" (T.pack message)
+    Aeson.Success _ -> fail "Gemini parser unexpectedly accepted a spawn agent type"
 
 assertReviewerAcceptanceCriteriaGuidance :: IO ()
 assertReviewerAcceptanceCriteriaGuidance = do

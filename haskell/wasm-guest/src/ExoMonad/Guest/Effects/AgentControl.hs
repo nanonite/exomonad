@@ -27,6 +27,7 @@ module ExoMonad.Guest.Effects.AgentControl
 
     -- * Types
     AgentType (..),
+    geminiDeprecationMessage,
     SpawnResult (..),
     PermissionFlags (..),
     defaultPermFlags,
@@ -67,6 +68,9 @@ import Proto3.Suite.Types (Enumerated (..))
 data AgentType = Claude | Gemini | Shoal | OpenCode | Codex
   deriving (Show, Eq, Generic)
 
+geminiDeprecationMessage :: Text
+geminiDeprecationMessage = "agent_type 'gemini' is retired; use 'codex' (model gpt-luna). See CLAUDE.md Configuration."
+
 instance ToJSON AgentType where
   toJSON Claude = "claude"
   toJSON Gemini = "gemini"
@@ -77,7 +81,7 @@ instance ToJSON AgentType where
 instance FromJSON AgentType where
   parseJSON = withText "AgentType" $ \case
     "claude" -> pure Claude
-    "gemini" -> pure Gemini
+    "gemini" -> fail (T.unpack geminiDeprecationMessage)
     "shoal" -> pure Shoal
     "opencode" -> pure OpenCode
     "codex" -> pure Codex
@@ -87,7 +91,7 @@ instance JsonSchema AgentType where
   toSchema =
     object
       [ "type" .= ("string" :: Text),
-        "enum" .= (["claude", "gemini", "shoal", "opencode", "codex"] :: [Text])
+        "enum" .= (["claude", "shoal", "opencode", "codex"] :: [Text])
       ]
 
 -- | Result of spawning an agent.

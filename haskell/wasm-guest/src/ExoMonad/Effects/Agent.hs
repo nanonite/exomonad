@@ -9,7 +9,6 @@ module ExoMonad.Effects.Agent
   ( -- * Effect Types
     AgentSpawn,
     AgentSpawnBatch,
-    AgentSpawnGeminiTeammate,
     AgentSpawnWorker,
     AgentSpawnSubtree,
     AgentSpawnReviewer,
@@ -54,13 +53,6 @@ instance Effect AgentSpawnBatch where
   type Input AgentSpawnBatch = SpawnBatchRequest
   type Output AgentSpawnBatch = SpawnBatchResponse
   effectId = "agent.spawn_batch"
-
-data AgentSpawnGeminiTeammate
-
-instance Effect AgentSpawnGeminiTeammate where
-  type Input AgentSpawnGeminiTeammate = SpawnGeminiTeammateRequest
-  type Output AgentSpawnGeminiTeammate = SpawnGeminiTeammateResponse
-  effectId = "agent.spawn_gemini_teammate"
 
 data AgentSpawnWorker
 

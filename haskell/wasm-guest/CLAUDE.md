@@ -47,7 +47,7 @@ The guest exports MCP tools that agents can call. These are defined in `ExoMonad
 - **`task_get`**: Get a task by ID from the shared task list.
 - **`task_update`**: Update task status, owner, or activeForm. Structural fields (subject, description, blocks, blockedBy) are never overwritten.
 
-Available in dev and worker roles. Enables Gemini agents to coordinate via the same task list that Claude Code's native TaskCreate/TaskList/TaskUpdate tools use.
+Available in dev and worker roles. Enables agents to coordinate via the same task list that Claude Code's native TaskCreate/TaskList/TaskUpdate tools use.
 
 ### Memory Tools (`ExoMonad.Guest.Tools.Memory`)
 
@@ -99,7 +99,7 @@ The SDK (`wasm-guest`) exports **core I/O functions** and **shared descriptions/
 | `Tools.FilePR` | `filePRCore`, `filePRDescription`, `filePRSchema`, `FilePRArgs`, `FilePROutput` | `DevFilePR`, `TLFilePR` |
 | `Tools.Events` | `notifyParentCore`, `shutdownCore`, descriptions/schemas, `MCPTool SendTmuxMessage / SendMailboxMessage` | `DevNotifyParent`, `TLNotifyParent`, `WorkerNotifyParent` |
 | `Tools.MergePR` | `mergePRCore`, `mergePRRender`, description/schema, `extractAgentName` | `TLMergePR` |
-| `Tools.Spawn` | `forkWaveCore`, `spawnGeminiCore`, `spawnWorkerToolCore`, `spawnLeafSubtreeCore`, `spawnWorkersCore`, descriptions/schemas, render functions | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnWorker`, `RootForkWave`, `RootSpawnLeaf`, `RootSpawnWorker` |
+| `Tools.Spawn` | `forkWaveCore`, `spawnWorkerToolCore`, `spawnLeafSubtreeCore`, `spawnWorkersCore`, descriptions/schemas, render functions | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnWorker`, `RootForkWave`, `RootSpawnLeaf`, `RootSpawnWorker` |
 | `Tools.SpawnCodex` | `handleSpawnCodex`, `spawnCodexDescription`, `spawnCodexSchema`, `SpawnCodex` | `TLSpawnCodex`, `RootSpawnCodex` |
 | `Tools.Tasks` | `taskListCore`, `taskGetCore`, `taskUpdateCore`, descriptions/schemas | `DevTaskList`, `DevTaskGet`, `DevTaskUpdate`, `WorkerTaskList`, `WorkerTaskGet`, `WorkerTaskUpdate` |
 | `Tools.Memory` | `memoryAppendCore`, `memoryListCore`, `continuationBriefCore`, schemas and descriptions | `RootRole`, `TLRole`, `DevRole`, `WorkerRole` (brief only root/TL) |
