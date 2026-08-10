@@ -117,6 +117,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Implement ExoMonad append-only observability and Failure Atlas measurement (#641)
 - Adopt append-only ExoMonad evidence ledger (#640)
 - Improve ExoMonad orchestration measurement plan (#639)
 - Strengthen ExoMonad orchestration measurement discipline (#638)
