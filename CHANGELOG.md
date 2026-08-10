@@ -118,6 +118,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M1.4 Port TLPhase and TLEvent to Python as a pure transition function (#668)
 - M1.3 Typed effect-client methods for the TL tool surface (#667)
 - M1.2 UDS transport client for the exomonad server socket (#666)
 - M1.1 Scaffold the tl_loop Python package and its build harness (#665)
