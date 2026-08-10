@@ -68,6 +68,25 @@ tl-loop-lint:
 tl-loop-typecheck:
     mypy tl_loop
 
+# Regenerate the Haskell-sourced TL FSM parity fixture
+tl-loop-golden:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    nix develop .#wasm --command bash -c '
+        set -euo pipefail
+        export PATH="$PWD/.codex/tmp/bin:$PATH"
+        wasm32-wasi-cabal --project-file=cabal.project.wasm build role-hook-tests
+        wasm_path=$(find dist-newstyle -name role-hook-tests.wasm -type f -print -quit)
+        test -n "$wasm_path"
+        source_hash=$(git hash-object .exo/roles/devswarm/TLPhase.hs)
+        fixture_tmp=$(mktemp tl_loop/tests/.tl-phase-golden.XXXXXX)
+        trap '\''rm -f "$fixture_tmp"'\'' EXIT
+        wasmtime "$wasm_path" --tl-phase-golden "$source_hash" | jq -S . > "$fixture_tmp"
+        chmod 644 "$fixture_tmp"
+        mv "$fixture_tmp" tl_loop/tests/fixtures/tl_phase_golden.json
+        trap - EXIT
+    '
+
 # Run fast tests only (Rust unit tests)
 test-fast: rust-test
 

@@ -255,6 +255,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- M1.5 Golden parity test: Python FSM vs Haskell TLPhase (#669)
 - M0.6 Fail-closed retired-provider deprecation + CI grep gate (#664)
 - M0.4 Sweep retired harness references out of prompts, rules and docs (#663)
 - M0.3 Retire Codex runtime paths in the Rust host (#662)

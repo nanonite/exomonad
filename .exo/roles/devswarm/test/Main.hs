@@ -15,6 +15,7 @@ import Data.Aeson qualified as Aeson
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Lazy.Char8 qualified as BSL
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word8)
@@ -32,6 +33,7 @@ import ExoMonad.Guest.Events.Templates qualified as Tpl
 import ExoMonad.Guest.Prompt qualified as Prompt
 import ExoMonad.Guest.ReviewHandoff (ReviewFixTask (..), renderReviewFixTask, reviewHandoffInstructions)
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
+import ExoMonad.Guest.StateMachine qualified as StateMachine
 import ExoMonad.Guest.Tool.Class (ToolDefinition (tdDescription, tdName))
 import ExoMonad.Guest.Tool.Suspend.Types (EffectRequest (..))
 import ExoMonad.Guest.Tools.FilePR (filePRDescription, filePRSchema)
@@ -44,6 +46,8 @@ import Proto3.Suite.Class (Message, toLazyByteString)
 import ReviewerPhase (ReviewerEvent (..), ReviewerPhase (..))
 import ReviewerRole qualified
 import RootRole qualified
+import System.Environment (getArgs)
+import TLPhase (ChildHandle (..), TLEvent (..), TLPhase (..))
 import TLRole qualified
 import WorkerRole qualified
 
@@ -55,6 +59,13 @@ allowTools = ["Read", "Grep", "Bash", "spawn_leaf", "spawn_worker", "send_tmux_m
 
 main :: IO ()
 main = do
+  args <- getArgs
+  case args of
+    ["--tl-phase-golden", sourceHash] -> emitTLPhaseGolden (T.pack sourceHash)
+    _ -> runRoleHookTests
+
+runRoleHookTests :: IO ()
+runRoleHookTests = do
   assertRoleDeny "tl" TLRole.config
   assertRoleDeny "root" RootRole.config
   assertReviewerDenyImplementationTools
@@ -90,6 +101,81 @@ main = do
   assertAcceptanceCriteriaContract
   assertReviewerAcceptanceCriteriaGuidance
   assertSpawnSchemasPreserveRetiredBoundary
+
+emitTLPhaseGolden :: Text -> IO ()
+emitTLPhaseGolden sourceHash =
+  BL.putStr . Aeson.encode $
+    Aeson.object
+      [ "source_blob_hash" Aeson..= sourceHash,
+        "rows" Aeson..= map goldenRow (phaseSamples `cross` eventSamples)
+      ]
+
+phaseSamples :: [TLPhase]
+phaseSamples =
+  [ TLPlanning,
+    TLDispatching,
+    TLWaiting sampleChildren,
+    TLMerging 7 sampleChildren,
+    TLAllMerged,
+    TLPRFiled 12 "https://forgejo.example/pulls/12",
+    TLDone,
+    TLFailed "child failed"
+  ]
+
+eventSamples :: [TLEvent]
+eventSamples =
+  [ ChildSpawned (ChildHandle "c" "main.c" "codex"),
+    ChildCompleted "a",
+    ChildFailed "a" "timed out",
+    PRMerged 7 "a",
+    AllChildrenDone,
+    OwnPRFiled 12 "https://forgejo.example/pulls/12" "main.tl"
+  ]
+
+sampleChildren :: Map.Map Text ChildHandle
+sampleChildren =
+  Map.fromList
+    [ ("a", ChildHandle "a" "main.a" "codex"),
+      ("b", ChildHandle "b" "main.b" "claude")
+    ]
+
+goldenRow :: (TLPhase, TLEvent) -> Value
+goldenRow (phase, event) =
+  Aeson.object
+    [ "phase" Aeson..= Aeson.toJSON phase,
+      "event" Aeson..= eventJSON event,
+      "result" Aeson..= transitionJSON phase event
+    ]
+
+transitionJSON :: TLPhase -> TLEvent -> Value
+transitionJSON phase event
+  | not (legalTransition phase event) = Aeson.String "illegal"
+  | otherwise =
+      case StateMachine.transition phase event of
+        Transitioned result -> Aeson.toJSON result
+        InvalidTransition _ -> Aeson.String "illegal"
+
+legalTransition :: TLPhase -> TLEvent -> Bool
+legalTransition _ (ChildSpawned _) = True
+legalTransition (TLWaiting _) (ChildCompleted _) = True
+legalTransition _ (ChildCompleted _) = False
+legalTransition _ (ChildFailed _ _) = True
+legalTransition (TLWaiting _) (PRMerged _ _) = True
+legalTransition (TLMerging _ _) (PRMerged _ _) = True
+legalTransition _ (PRMerged _ _) = False
+legalTransition _ AllChildrenDone = True
+legalTransition _ (OwnPRFiled _ _ _) = True
+
+cross :: [a] -> [b] -> [(a, b)]
+cross left right = [(x, y) | x <- left, y <- right]
+
+eventJSON :: TLEvent -> Value
+eventJSON (ChildSpawned handle) = Aeson.object ["event" Aeson..= ("child_spawned" :: Text), "handle" Aeson..= handle]
+eventJSON (ChildCompleted slug) = Aeson.object ["event" Aeson..= ("child_completed" :: Text), "slug" Aeson..= slug]
+eventJSON (ChildFailed slug reason) = Aeson.object ["event" Aeson..= ("child_failed" :: Text), "slug" Aeson..= slug, "reason" Aeson..= reason]
+eventJSON (PRMerged prNumber slug) = Aeson.object ["event" Aeson..= ("pr_merged" :: Text), "pr_number" Aeson..= prNumber, "slug" Aeson..= slug]
+eventJSON AllChildrenDone = Aeson.object ["event" Aeson..= ("all_children_done" :: Text)]
+eventJSON (OwnPRFiled prNumber url branch) = Aeson.object ["event" Aeson..= ("own_pr_filed" :: Text), "pr_number" Aeson..= prNumber, "url" Aeson..= url, "branch" Aeson..= branch]
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =

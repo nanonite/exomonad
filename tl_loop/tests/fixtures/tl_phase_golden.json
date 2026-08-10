@@ -1,0 +1,890 @@
+{
+  "rows": [
+    {
+      "event": {
+        "event": "child_spawned",
+        "handle": {
+          "agent_type": "codex",
+          "branch": "main.c",
+          "slug": "c"
+        }
+      },
+      "phase": {
+        "phase": "tl_planning"
+      },
+      "result": {
+        "children": {
+          "c": {
+            "agent_type": "codex",
+            "branch": "main.c",
+            "slug": "c"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "child_completed",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_planning"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "child_failed",
+        "reason": "timed out",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_planning"
+      },
+      "result": {
+        "message": "a: timed out",
+        "phase": "tl_failed"
+      }
+    },
+    {
+      "event": {
+        "event": "pr_merged",
+        "pr_number": 7,
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_planning"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "all_children_done"
+      },
+      "phase": {
+        "phase": "tl_planning"
+      },
+      "result": {
+        "phase": "tl_done"
+      }
+    },
+    {
+      "event": {
+        "branch": "main.tl",
+        "event": "own_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "phase": {
+        "phase": "tl_planning"
+      },
+      "result": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      }
+    },
+    {
+      "event": {
+        "event": "child_spawned",
+        "handle": {
+          "agent_type": "codex",
+          "branch": "main.c",
+          "slug": "c"
+        }
+      },
+      "phase": {
+        "phase": "tl_dispatching"
+      },
+      "result": {
+        "children": {
+          "c": {
+            "agent_type": "codex",
+            "branch": "main.c",
+            "slug": "c"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "child_completed",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_dispatching"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "child_failed",
+        "reason": "timed out",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_dispatching"
+      },
+      "result": {
+        "message": "a: timed out",
+        "phase": "tl_failed"
+      }
+    },
+    {
+      "event": {
+        "event": "pr_merged",
+        "pr_number": 7,
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_dispatching"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "all_children_done"
+      },
+      "phase": {
+        "phase": "tl_dispatching"
+      },
+      "result": {
+        "phase": "tl_done"
+      }
+    },
+    {
+      "event": {
+        "branch": "main.tl",
+        "event": "own_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "phase": {
+        "phase": "tl_dispatching"
+      },
+      "result": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      }
+    },
+    {
+      "event": {
+        "event": "child_spawned",
+        "handle": {
+          "agent_type": "codex",
+          "branch": "main.c",
+          "slug": "c"
+        }
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_waiting"
+      },
+      "result": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          },
+          "c": {
+            "agent_type": "codex",
+            "branch": "main.c",
+            "slug": "c"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "child_completed",
+        "slug": "a"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_waiting"
+      },
+      "result": {
+        "children": {
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "child_failed",
+        "reason": "timed out",
+        "slug": "a"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_waiting"
+      },
+      "result": {
+        "message": "a: timed out",
+        "phase": "tl_failed"
+      }
+    },
+    {
+      "event": {
+        "event": "pr_merged",
+        "pr_number": 7,
+        "slug": "a"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_waiting"
+      },
+      "result": {
+        "children": {
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "all_children_done"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_waiting"
+      },
+      "result": {
+        "phase": "tl_done"
+      }
+    },
+    {
+      "event": {
+        "branch": "main.tl",
+        "event": "own_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_waiting"
+      },
+      "result": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      }
+    },
+    {
+      "event": {
+        "event": "child_spawned",
+        "handle": {
+          "agent_type": "codex",
+          "branch": "main.c",
+          "slug": "c"
+        }
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_merging",
+        "pr_number": 7
+      },
+      "result": {
+        "children": {
+          "c": {
+            "agent_type": "codex",
+            "branch": "main.c",
+            "slug": "c"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "child_completed",
+        "slug": "a"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_merging",
+        "pr_number": 7
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "child_failed",
+        "reason": "timed out",
+        "slug": "a"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_merging",
+        "pr_number": 7
+      },
+      "result": {
+        "message": "a: timed out",
+        "phase": "tl_failed"
+      }
+    },
+    {
+      "event": {
+        "event": "pr_merged",
+        "pr_number": 7,
+        "slug": "a"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_merging",
+        "pr_number": 7
+      },
+      "result": {
+        "children": {
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "all_children_done"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_merging",
+        "pr_number": 7
+      },
+      "result": {
+        "phase": "tl_done"
+      }
+    },
+    {
+      "event": {
+        "branch": "main.tl",
+        "event": "own_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "phase": {
+        "children": {
+          "a": {
+            "agent_type": "codex",
+            "branch": "main.a",
+            "slug": "a"
+          },
+          "b": {
+            "agent_type": "claude",
+            "branch": "main.b",
+            "slug": "b"
+          }
+        },
+        "phase": "tl_merging",
+        "pr_number": 7
+      },
+      "result": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      }
+    },
+    {
+      "event": {
+        "event": "child_spawned",
+        "handle": {
+          "agent_type": "codex",
+          "branch": "main.c",
+          "slug": "c"
+        }
+      },
+      "phase": {
+        "phase": "tl_all_merged"
+      },
+      "result": {
+        "children": {
+          "c": {
+            "agent_type": "codex",
+            "branch": "main.c",
+            "slug": "c"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "child_completed",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_all_merged"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "child_failed",
+        "reason": "timed out",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_all_merged"
+      },
+      "result": {
+        "message": "a: timed out",
+        "phase": "tl_failed"
+      }
+    },
+    {
+      "event": {
+        "event": "pr_merged",
+        "pr_number": 7,
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_all_merged"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "all_children_done"
+      },
+      "phase": {
+        "phase": "tl_all_merged"
+      },
+      "result": {
+        "phase": "tl_done"
+      }
+    },
+    {
+      "event": {
+        "branch": "main.tl",
+        "event": "own_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "phase": {
+        "phase": "tl_all_merged"
+      },
+      "result": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      }
+    },
+    {
+      "event": {
+        "event": "child_spawned",
+        "handle": {
+          "agent_type": "codex",
+          "branch": "main.c",
+          "slug": "c"
+        }
+      },
+      "phase": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "result": {
+        "children": {
+          "c": {
+            "agent_type": "codex",
+            "branch": "main.c",
+            "slug": "c"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "child_completed",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "child_failed",
+        "reason": "timed out",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "result": {
+        "message": "a: timed out",
+        "phase": "tl_failed"
+      }
+    },
+    {
+      "event": {
+        "event": "pr_merged",
+        "pr_number": 7,
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "all_children_done"
+      },
+      "phase": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "result": {
+        "phase": "tl_done"
+      }
+    },
+    {
+      "event": {
+        "branch": "main.tl",
+        "event": "own_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "phase": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "result": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      }
+    },
+    {
+      "event": {
+        "event": "child_spawned",
+        "handle": {
+          "agent_type": "codex",
+          "branch": "main.c",
+          "slug": "c"
+        }
+      },
+      "phase": {
+        "phase": "tl_done"
+      },
+      "result": {
+        "children": {
+          "c": {
+            "agent_type": "codex",
+            "branch": "main.c",
+            "slug": "c"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "child_completed",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_done"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "child_failed",
+        "reason": "timed out",
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_done"
+      },
+      "result": {
+        "message": "a: timed out",
+        "phase": "tl_failed"
+      }
+    },
+    {
+      "event": {
+        "event": "pr_merged",
+        "pr_number": 7,
+        "slug": "a"
+      },
+      "phase": {
+        "phase": "tl_done"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "all_children_done"
+      },
+      "phase": {
+        "phase": "tl_done"
+      },
+      "result": {
+        "phase": "tl_done"
+      }
+    },
+    {
+      "event": {
+        "branch": "main.tl",
+        "event": "own_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "phase": {
+        "phase": "tl_done"
+      },
+      "result": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      }
+    },
+    {
+      "event": {
+        "event": "child_spawned",
+        "handle": {
+          "agent_type": "codex",
+          "branch": "main.c",
+          "slug": "c"
+        }
+      },
+      "phase": {
+        "message": "child failed",
+        "phase": "tl_failed"
+      },
+      "result": {
+        "children": {
+          "c": {
+            "agent_type": "codex",
+            "branch": "main.c",
+            "slug": "c"
+          }
+        },
+        "phase": "tl_waiting"
+      }
+    },
+    {
+      "event": {
+        "event": "child_completed",
+        "slug": "a"
+      },
+      "phase": {
+        "message": "child failed",
+        "phase": "tl_failed"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "child_failed",
+        "reason": "timed out",
+        "slug": "a"
+      },
+      "phase": {
+        "message": "child failed",
+        "phase": "tl_failed"
+      },
+      "result": {
+        "message": "a: timed out",
+        "phase": "tl_failed"
+      }
+    },
+    {
+      "event": {
+        "event": "pr_merged",
+        "pr_number": 7,
+        "slug": "a"
+      },
+      "phase": {
+        "message": "child failed",
+        "phase": "tl_failed"
+      },
+      "result": "illegal"
+    },
+    {
+      "event": {
+        "event": "all_children_done"
+      },
+      "phase": {
+        "message": "child failed",
+        "phase": "tl_failed"
+      },
+      "result": {
+        "phase": "tl_done"
+      }
+    },
+    {
+      "event": {
+        "branch": "main.tl",
+        "event": "own_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      },
+      "phase": {
+        "message": "child failed",
+        "phase": "tl_failed"
+      },
+      "result": {
+        "phase": "tl_pr_filed",
+        "pr_number": 12,
+        "url": "https://forgejo.example/pulls/12"
+      }
+    }
+  ],
+  "source_blob_hash": "9f5a920449d615b3b30b1ef457eb2854974e27f8"
+}
