@@ -10,6 +10,7 @@ pub mod continuation;
 pub mod delivery;
 pub mod event_log;
 pub mod event_queue;
+pub mod expected_events;
 pub mod external;
 pub mod file_pr;
 pub mod filesystem;
@@ -21,6 +22,7 @@ pub mod github;
 pub mod immutable_ledger;
 pub mod inbox_store;
 pub mod inbox_watcher;
+pub mod ledger_retention;
 pub mod lifecycle;
 pub mod local;
 pub mod log;
@@ -55,12 +57,19 @@ pub use self::analysis_import::{
 pub use self::claude_session_registry::ClaudeSessionRegistry;
 pub use self::event_log::EventLog;
 pub use self::event_queue::EventQueue;
+pub use self::expected_events::{
+    load_contract, reconcile, DenominatorReport, DenominatorRow, ExpectedEventContract,
+    ExpectedEventRule,
+};
 pub use self::filesystem::FileSystemService;
 pub use self::forgejo::ForgejoClient;
 pub use self::git_worktree::GitWorktreeService;
 pub use self::github::GitHubClient;
-pub use self::immutable_ledger::{LedgerEvent, LedgerRecord, LedgerWriter};
+pub use self::immutable_ledger::{
+    resolve_superseded_events, sequence_status, LedgerEvent, LedgerRecord, LedgerWriter,
+};
 pub use self::inbox_store::{InboxMessageRecord, InboxPokeCandidate, InboxStore};
+pub use self::ledger_retention::{drop_expired_segments, SegmentDrop};
 pub use self::mutex_registry::MutexRegistry;
 pub use self::secrets::Secrets;
 pub use self::session_memory::{

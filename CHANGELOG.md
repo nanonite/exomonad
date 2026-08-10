@@ -249,6 +249,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Add ledger corrections retention delivery contracts and gap accounting (#645)
 - Add canonical sequencing sink health and mutable-state mirroring (#644)
 - Implement the immutable ExoMonad ledger and rebuildable analysis importer (#643)
 - Freeze ExoMonad observability contracts and implementation gates (#642)

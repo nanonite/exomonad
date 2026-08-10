@@ -75,11 +75,25 @@ impl InboxStore {
 
     pub fn clear_all(&self) -> Result<()> {
         let conn = self.connection()?;
+        let abandoned_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .context("count inbox messages before clear")?;
         conn.execute_batch(
             "DELETE FROM messages;
              DELETE FROM agent_inbox_meta;",
         )
         .context("failed to clear inbox")?;
+        if abandoned_count > 0 {
+            append_state_change(
+                &self.db_path,
+                "agent_inbox.messages_abandoned",
+                json!({
+                    "operation": "clear_all",
+                    "count": abandoned_count,
+                    "outcome": "abandoned"
+                }),
+            );
+        }
         append_state_change(
             &self.db_path,
             "inbox.state_changed",
@@ -115,6 +129,18 @@ impl InboxStore {
                 "content": content,
                 "summary": summary,
                 "created_at": created_at
+            }),
+        );
+        append_state_change(
+            &self.db_path,
+            "message.delivery",
+            json!({
+                "message_id": id,
+                "from_agent": from_agent,
+                "to_agent": normalized_to_agent,
+                "attempt": 1,
+                "outcome": "accepted",
+                "transport": "durable_inbox"
             }),
         );
         Ok(id)
@@ -155,6 +181,18 @@ impl InboxStore {
                     "notified_at": now
                 }),
             );
+            for message in &messages {
+                append_state_change(
+                    &self.db_path,
+                    "message.consumed",
+                    json!({
+                        "message_id": message.id,
+                        "from_agent": message.from_agent,
+                        "to_agent": message.to_agent,
+                        "read_at": now
+                    }),
+                );
+            }
         }
         Ok(messages)
     }

@@ -166,6 +166,14 @@ impl AnalysisStore {
                  superseded_event_id TEXT NOT NULL,
                  reason TEXT
              );
+             CREATE VIEW IF NOT EXISTS resolved_events AS
+             SELECT e.*
+             FROM events e
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM supersessions s
+                 WHERE s.superseded_event_id = e.event_id
+             );
              CREATE TABLE IF NOT EXISTS sessions (
                  session_id TEXT PRIMARY KEY,
                  first_event_time TEXT,
@@ -594,8 +602,22 @@ fn normalize_event(
             "event": value,
             "data": data,
         }))?,
-        superseded_event_id: string_field(&value, &["superseded_event_id"]),
-        supersession_reason: string_field(&value, &["supersession_reason"]),
+        superseded_event_id: string_field(&value, &["superseded_event_id", "old_event_id"])
+            .or_else(|| {
+                data.get("superseded_event_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                data.get("old_event_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+        supersession_reason: string_field(&value, &["supersession_reason"]).or_else(|| {
+            data.get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }),
     })
 }
 
@@ -723,7 +745,7 @@ fn refresh_derived_tables(store: &AnalysisStore) -> Result<()> {
          SELECT session_id, MIN(event_time), MAX(event_time), COUNT(*),
                 CASE WHEN SUM(CASE WHEN run_seq IS NULL THEN 1 ELSE 0 END) = 0
                      THEN 'known' ELSE 'unknown' END
-         FROM events WHERE session_id IS NOT NULL GROUP BY session_id;",
+         FROM resolved_events WHERE session_id IS NOT NULL GROUP BY session_id;",
     )?;
     Ok(())
 }

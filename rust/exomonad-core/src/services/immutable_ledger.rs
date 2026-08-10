@@ -14,6 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Default maximum size for one immutable JSONL segment.
@@ -82,6 +83,7 @@ pub struct LedgerRecord {
 pub struct LedgerWriter {
     segments_dir: PathBuf,
     segment_max_bytes: u64,
+    segment_max_age: Option<Duration>,
     lock: Mutex<()>,
 }
 
@@ -108,8 +110,16 @@ impl LedgerWriter {
         Ok(Self {
             segments_dir,
             segment_max_bytes: segment_max_bytes.max(1),
+            segment_max_age: None,
             lock: Mutex::new(()),
         })
+    }
+
+    /// Rotate before appending when the current segment has reached either
+    /// bound. Closed segments remain byte-for-byte untouched thereafter.
+    pub fn with_segment_max_age(mut self, max_age: Duration) -> Self {
+        self.segment_max_age = Some(max_age);
+        self
     }
 
     /// Append one complete JSON object followed by a newline.
@@ -134,12 +144,20 @@ impl LedgerWriter {
         let current_size = fs::metadata(&path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        let target =
-            if current_size > 0 && current_size + line.len() as u64 > self.segment_max_bytes {
-                self.next_segment_path()?
-            } else {
-                path
-            };
+        let age_expired = self.segment_max_age.is_some_and(|max_age| {
+            fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= max_age)
+        });
+        let target = if current_size > 0
+            && (current_size + line.len() as u64 > self.segment_max_bytes || age_expired)
+        {
+            self.next_segment_path()?
+        } else {
+            path
+        };
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -190,6 +208,12 @@ impl LedgerWriter {
         Ok(records)
     }
 
+    /// Replay the evidence stream with superseded observations hidden from
+    /// analysis readers. The correction event itself remains evidence.
+    pub fn read_resolved_events(&self) -> Result<Vec<LedgerRecord>> {
+        Ok(resolve_superseded_events(&self.read_events()?))
+    }
+
     fn current_segment_path(&self) -> Result<PathBuf> {
         Ok(self
             .segments()?
@@ -213,6 +237,46 @@ impl LedgerWriter {
         Ok(self
             .segments_dir
             .join(format!("segment-{next_index:012}.jsonl")))
+    }
+}
+
+/// Apply append-only corrections without mutating the original records.
+pub fn resolve_superseded_events(records: &[LedgerRecord]) -> Vec<LedgerRecord> {
+    let superseded = records
+        .iter()
+        .filter(|record| record.event.event_type == "event.superseded")
+        .filter_map(|record| {
+            let data = record.event.data.as_object()?;
+            data.get("superseded_event_id")
+                .or_else(|| data.get("old_event_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    records
+        .iter()
+        .filter(|record| !superseded.contains(&record.event.event_id))
+        .cloned()
+        .collect()
+}
+
+/// Return the deterministic sequence status for a replayed stream.
+pub fn sequence_status(records: &[LedgerRecord]) -> &'static str {
+    let mut sequences = records
+        .iter()
+        .filter_map(|record| record.event.run_seq)
+        .collect::<Vec<_>>();
+    if sequences.is_empty() {
+        return "unknown";
+    }
+    sequences.sort_unstable();
+    let contiguous = sequences
+        .windows(2)
+        .all(|window| window[1] == window[0].saturating_add(1));
+    if contiguous {
+        "complete"
+    } else {
+        "partial"
     }
 }
 
@@ -300,6 +364,46 @@ mod tests {
         for (path, snapshot) in segments.iter().zip(snapshots) {
             assert!(fs::read(path)?.starts_with(&snapshot));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn supersession_hides_only_the_corrected_observation() -> Result<()> {
+        let temp = TempDir::new()?;
+        let writer = LedgerWriter::open(temp.path().join("segments"))?;
+        let original = LedgerEvent::new("custom.observation", None, Value::String("old".into()));
+        writer.append(&original)?;
+        let segment = writer.segments()?.first().context("segment")?.clone();
+        let snapshot = fs::read(&segment)?;
+        let correction = LedgerEvent::new(
+            "event.superseded",
+            None,
+            serde_json::json!({
+                "superseded_event_id": original.event_id,
+                "reason": "corrected observation"
+            }),
+        );
+        writer.append(&correction)?;
+        let raw = writer.read_events()?;
+        let resolved = writer.read_resolved_events()?;
+        assert_eq!(raw.len(), 2);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].event.event_type, "event.superseded");
+        assert!(fs::read(segment)?.starts_with(&snapshot));
+        Ok(())
+    }
+
+    #[test]
+    fn sequence_gap_is_partial() -> Result<()> {
+        let temp = TempDir::new()?;
+        let writer = LedgerWriter::open(temp.path().join("segments"))?;
+        let mut first = LedgerEvent::new("custom.sequence", None, Value::Null);
+        first.run_seq = Some(1);
+        let mut third = LedgerEvent::new("custom.sequence", None, Value::Null);
+        third.run_seq = Some(3);
+        writer.append(&first)?;
+        writer.append(&third)?;
+        assert_eq!(sequence_status(&writer.read_events()?), "partial");
         Ok(())
     }
 }

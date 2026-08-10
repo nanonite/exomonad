@@ -248,6 +248,15 @@ enum LogsCommands {
         #[arg(long)]
         rebuild: bool,
     },
+    /// Drop closed immutable ledger segments according to local retention.
+    DropSegments {
+        /// Drop segments older than this many seconds.
+        #[arg(long, default_value_t = 2_592_000)]
+        older_than_seconds: u64,
+        /// Report fingerprints without deleting any segment.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 // Main
@@ -306,6 +315,21 @@ async fn main() -> Result<()> {
                 std::env::current_dir()?.join(&config.project_dir)
             };
             return logs::run(&project_dir, source, format, dry_run, rebuild);
+        }
+
+        Commands::Logs {
+            command:
+                LogsCommands::DropSegments {
+                    older_than_seconds,
+                    dry_run,
+                },
+        } => {
+            let project_dir = if config.project_dir.is_absolute() {
+                config.project_dir.clone()
+            } else {
+                std::env::current_dir()?.join(&config.project_dir)
+            };
+            return logs::drop_segments(&project_dir, older_than_seconds, dry_run);
         }
 
         Commands::Serve {

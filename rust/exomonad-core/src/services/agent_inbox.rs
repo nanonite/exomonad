@@ -114,6 +114,18 @@ fn dedup_key_for_message(from: &str, recipient: &str, body: &str) -> DedupKey {
     DedupKey::freeform(from, recipient, body)
 }
 
+fn append_inbox_event(
+    project_dir: &std::path::Path,
+    agent_id: &str,
+    event_type: &str,
+    data: serde_json::Value,
+) {
+    let Ok(log) = crate::services::EventLog::open(project_dir.join(".exo/logs")) else {
+        return;
+    };
+    let _ = log.append(event_type, agent_id, &data);
+}
+
 fn parse_pr_number(body: &str) -> Option<u64> {
     let (_, after) = body.split_once("PR #")?;
     parse_leading_u64(after)
@@ -200,6 +212,17 @@ impl AgentInbox {
         if queue.pending.contains(&message.dedup_key)
             || queue.recent.contains_key(&message.dedup_key)
         {
+            append_inbox_event(
+                &message.project_dir,
+                &message.recipient,
+                "agent_inbox.duplicates_dropped",
+                serde_json::json!({
+                    "recipient": message.recipient,
+                    "event_type": message.dedup_key.event_type,
+                    "scope_key": message.dedup_key.scope_key,
+                    "outcome": "dropped"
+                }),
+            );
             tracing::debug!(
                 recipient = %message.recipient,
                 event_type = %message.dedup_key.event_type,

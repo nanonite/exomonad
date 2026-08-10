@@ -40,3 +40,26 @@ It is local evidence and is imported into L2 as sink.health. Mutable session,
 memory, and inbox changes emit session.state_changed, memory.state_changed, and
 inbox.state_changed events into L1. Human-readable --verbose tracing does not
 control these structured events.
+
+## Runtime MVP-C paths
+
+Corrections are append-only event.superseded events. L2 exposes the
+rebuildable resolved_events view for readers that should exclude superseded
+observations while retaining every correction in the raw evidence.
+
+Closed ledger segments rotate by size or age. Retention is whole-segment only:
+
+    exomonad logs drop-segments --dry-run
+    exomonad logs drop-segments --older-than-seconds 2592000
+
+Dry runs return segment paths, byte counts, and SHA-256 fingerprints. A
+non-dry-run records ledger.segment.dropped in the surviving segment before
+dropping the expired file. The current segment is never eligible. Local
+crypto-shredding remains an optional deployment-level policy; the default
+retention operation drops complete segments.
+
+Durable delivery rows include message.delivery, message.consumed,
+agent_inbox.duplicates_dropped, and agent_inbox.messages_abandoned.
+expected-events.v1.json is embedded in the core and reconciled by session;
+missing required outcomes remain denominator gaps and produce partial or
+unknown completeness rather than zero-valued success.

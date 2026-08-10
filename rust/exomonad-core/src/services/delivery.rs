@@ -819,6 +819,20 @@ pub async fn notify_parent_delivery(
     )
     .await;
 
+    if let Some(log) = ctx.event_log() {
+        let _ = log.append(
+            "message.delivery",
+            agent_id.as_str(),
+            &serde_json::json!({
+                "from": agent_id,
+                "recipient": parent_session_id,
+                "method": format!("{:?}", delivery_method_from_result(delivery_result)),
+                "outcome": if delivery_result == DeliveryResult::Failed { "failed" } else { "success" },
+                "source": source,
+            }),
+        );
+    }
+
     delivery_result
 }
 
@@ -857,6 +871,21 @@ where
             let result = deliver_once(&inject, message.clone()).await;
             let success = result.is_ok();
 
+            let outcome = if success { "success" } else { "failed" };
+            let attempt_data = serde_json::json!({
+                "message_id": message.id,
+                "recipient": message.recipient,
+                "from": message.from,
+                "method": "agent_inbox_tmux",
+                "attempt": attempt,
+                "outcome": outcome,
+                "detail": message.detail,
+            });
+            if let Ok(log) = crate::services::EventLog::open(message.project_dir.join(".exo/logs"))
+            {
+                let _ = log.append("message.delivery", &message.from, &attempt_data);
+            }
+
             crate::services::lifecycle::record_guidance_delivery(
                 &message.project_dir,
                 &message.recipient,
@@ -878,6 +907,20 @@ where
             );
 
             if success {
+                if let Ok(log) =
+                    crate::services::EventLog::open(message.project_dir.join(".exo/logs"))
+                {
+                    let _ = log.append(
+                        "message.consumed",
+                        &message.recipient,
+                        &serde_json::json!({
+                            "message_id": message.id,
+                            "recipient": message.recipient,
+                            "consumer": agent,
+                            "outcome": "consumed"
+                        }),
+                    );
+                }
                 GLOBAL_AGENT_INBOX
                     .complete_delivery(&agent, message.id, true)
                     .await;
@@ -900,6 +943,20 @@ where
                     attempts = attempt,
                     "[metric] agent_inbox.messages_abandoned"
                 );
+                if let Ok(log) =
+                    crate::services::EventLog::open(message.project_dir.join(".exo/logs"))
+                {
+                    let _ = log.append(
+                        "agent_inbox.messages_abandoned",
+                        &message.recipient,
+                        &serde_json::json!({
+                            "message_id": message.id,
+                            "recipient": message.recipient,
+                            "attempts": attempt,
+                            "outcome": "abandoned"
+                        }),
+                    );
+                }
                 GLOBAL_AGENT_INBOX
                     .abandon_delivery(&agent, message.id)
                     .await;
