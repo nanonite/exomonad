@@ -12,7 +12,7 @@ Building and extending ExoMonad itself: the TL-to-worker orchestration framework
 - Implementing new PR workflow methods or ideology (e.g., local PR registry, merge gates, reviewer agent lifecycle)
 - Integrating Forgejo Actions and local watcher paths into exomonad's review and merge test suite
 - Extending or onboarding new agent types (OpenCode) so they fit within the exomonad effects and messaging workflow
-- Closing gaps in the messaging protocol mismatch: Claude Code has native Teams inbox; Gemini and OpenCode do not — bridging that is active work
+- Closing gaps in the messaging protocol mismatch: Claude Code has native Teams inbox; Codex and OpenCode do not — bridging that is active work
 - Using chainlink as the coordination layer: chainlink issues delegate work to worker agents, Claude Code reviews commits and writes markdown feedback, that feedback routes back through chainlink to the workers
 - Writing and maintaining documentation of architecture decisions — many of which currently live only in the operator's head
 

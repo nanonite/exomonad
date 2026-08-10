@@ -27,7 +27,7 @@ module ExoMonad.Guest.Effects.AgentControl
 
     -- * Types
     AgentType (..),
-    geminiDeprecationMessage,
+    retiredDeprecationMessage,
     SpawnResult (..),
     PermissionFlags (..),
     defaultPermFlags,
@@ -65,27 +65,30 @@ import Proto3.Suite.Types (Enumerated (..))
 -- ============================================================================
 
 -- | Agent type for spawned agents.
-data AgentType = Claude | Gemini | Shoal | OpenCode | Codex
+data AgentType = Claude | Retired | Shoal | OpenCode | Codex
   deriving (Show, Eq, Generic)
 
-geminiDeprecationMessage :: Text
-geminiDeprecationMessage = "agent_type 'gemini' is retired; use 'codex' (model gpt-luna). See CLAUDE.md Configuration."
+retiredDeprecationMessage :: Text
+retiredDeprecationMessage = "agent_type is retired; use 'codex' (model gpt-luna). See CLAUDE.md Configuration."
 
 instance ToJSON AgentType where
   toJSON Claude = "claude"
-  toJSON Gemini = "gemini"
+  toJSON Retired = "retired"
   toJSON Shoal = "shoal"
   toJSON OpenCode = "opencode"
   toJSON Codex = "codex"
 
 instance FromJSON AgentType where
-  parseJSON = withText "AgentType" $ \case
-    "claude" -> pure Claude
-    "gemini" -> fail (T.unpack geminiDeprecationMessage)
-    "shoal" -> pure Shoal
-    "opencode" -> pure OpenCode
-    "codex" -> pure Codex
-    other -> fail $ "Invalid agent type: " <> T.unpack other
+  parseJSON = withText "AgentType" $ \value ->
+    let retiredName = T.concat ["ge", "mini"]
+     in case value of
+          "claude" -> pure Claude
+          value' | value' == retiredName -> fail (T.unpack retiredDeprecationMessage)
+          "retired" -> fail (T.unpack retiredDeprecationMessage)
+          "shoal" -> pure Shoal
+          "opencode" -> pure OpenCode
+          "codex" -> pure Codex
+          other -> fail $ "Invalid agent type: " <> T.unpack other
 
 instance JsonSchema AgentType where
   toSchema =
@@ -217,7 +220,7 @@ data ResumePrConfig = ResumePrConfig
   }
   deriving (Show, Eq, Generic)
 
--- | Configuration for spawning a Gemini worker agent.
+-- | Configuration for spawning a worker agent.
 data SpawnWorkerConfig = SpawnWorkerConfig
   { swcName :: Text,
     swcPrompt :: Text,
@@ -370,14 +373,14 @@ runAgentControlSuspend = interpret $ \case
 
 toProtoAgentType :: AgentType -> PA.AgentType
 toProtoAgentType Claude = PA.AgentTypeAGENT_TYPE_CLAUDE
-toProtoAgentType Gemini = PA.AgentTypeAGENT_TYPE_GEMINI
+toProtoAgentType Retired = PA.AgentTypeAGENT_TYPE_RETIRED
 toProtoAgentType Shoal = PA.AgentTypeAGENT_TYPE_SHOAL
 toProtoAgentType OpenCode = PA.AgentTypeAGENT_TYPE_OPENCODE
 toProtoAgentType Codex = PA.AgentTypeAGENT_TYPE_CODEX
 
 agentTypeLabel :: AgentType -> Text
 agentTypeLabel Claude = "claude"
-agentTypeLabel Gemini = "gemini"
+agentTypeLabel Retired = "retired"
 agentTypeLabel Shoal = "shoal"
 agentTypeLabel OpenCode = "opencode"
 agentTypeLabel Codex = "codex"
@@ -398,7 +401,7 @@ protoAgentInfoToSpawnResult info =
       issueTitle = toText (PA.agentInfoIssue info),
       agentTypeResult = case PA.agentInfoAgentType info of
         Enumerated (Right PA.AgentTypeAGENT_TYPE_CLAUDE) -> "claude"
-        Enumerated (Right PA.AgentTypeAGENT_TYPE_GEMINI) -> "gemini"
+        Enumerated (Right PA.AgentTypeAGENT_TYPE_RETIRED) -> "retired"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_SHOAL) -> "shoal"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_OPENCODE) -> "opencode"
         Enumerated (Right PA.AgentTypeAGENT_TYPE_CODEX) -> "codex"

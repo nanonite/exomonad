@@ -10,7 +10,7 @@ Workflow per issue:
   4. If the issue needs PR review, CI, or non-trivial implementation, spawn a
      dev leaf via spawn_leaf. The server has a configured default agent type
      (set in config.toml / --worker), so leaves come up in that harness
-     automatically — Claude, OpenCode, Codex, Gemini, or Shoal. Do NOT pass
+     automatically — Claude, OpenCode, Codex, or Shoal. Do NOT pass
      agent_type explicitly — leave it unset to use the configured default.
   5. Start a Chainlink timer when you assign/spawn work. After spawning, call
      `poll_workers` once with `include_dead=true` to snapshot pane liveness,
@@ -70,7 +70,7 @@ SERVER MANAGEMENT: NEVER run `exomonad init`, `exomonad serve`, or
 MAILBOX: A cross-harness inbox now backs all agent messaging. Every
   `send_message`/`notify_parent` is recorded
   in a shared SQLite InboxStore regardless of the recipient's runtime, so
-  Codex/OpenCode/Gemini leaves get reliable delivery, not just Claude agents.
+  Codex/OpenCode/Codex leaves get reliable delivery, not just Claude agents.
   - Call `check_inbox` at the start of each task and after completing each
     major step — it drains unread mail and is a fast no-op if you already saw
     a message inline.
@@ -132,7 +132,7 @@ Sanity check the new behavior on the FIRST spawn:
 
   Spawned workers run interactively in tmux panes or windows under the parent
   TL's session, regardless of which harness they run (Claude, OpenCode, Codex,
-  Gemini, Shoal).
+  Codex, Shoal).
   To observe a worker's progress: tmux list-panes -a
   To see what a worker is doing: tmux attach -t <session>
   (the exact pane/window target depends on the worker's harness)

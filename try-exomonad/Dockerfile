@@ -95,18 +95,18 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Node.js 22 LTS (needed for Gemini CLI)
+# Node.js 22 LTS (needed for Codex CLI)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Gemini CLI (npm — no native installer yet)
-RUN npm install -g @google/gemini-cli
+# Codex CLI (npm — no native installer yet)
+RUN npm install -g @openai/codex
 
 # --------------------------------------------------------------------------
 # Non-root user (Claude Code refuses to run as root)
 # Ubuntu 24.04 ships a 'ubuntu' user at UID 1000. We need UID 1000 so
-# bind-mounted host files (~/.claude, ~/.gemini) are readable.
+# bind-mounted host files (~/.claude, ~/.codex) are readable.
 # --------------------------------------------------------------------------
 RUN userdel -r ubuntu 2>/dev/null; useradd -m -s /bin/bash -u 1000 exo
 RUN mkdir -p /tmp/runtime \

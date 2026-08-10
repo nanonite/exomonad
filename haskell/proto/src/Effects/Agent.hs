@@ -51,7 +51,7 @@ import Prelude qualified as Hs
 data AgentType
   = AgentTypeAGENT_TYPE_UNSPECIFIED
   | AgentTypeAGENT_TYPE_CLAUDE
-  | AgentTypeAGENT_TYPE_GEMINI
+  | AgentTypeAGENT_TYPE_RETIRED
   | AgentTypeAGENT_TYPE_SHOAL
   | AgentTypeAGENT_TYPE_OPENCODE
   | AgentTypeAGENT_TYPE_CODEX
@@ -75,14 +75,14 @@ instance (Hs.Ord AgentType) where
 instance (HsProtobuf.ProtoEnum AgentType) where
   toProtoEnumMay 0 = Hs.Just AgentTypeAGENT_TYPE_UNSPECIFIED
   toProtoEnumMay 1 = Hs.Just AgentTypeAGENT_TYPE_CLAUDE
-  toProtoEnumMay 2 = Hs.Just AgentTypeAGENT_TYPE_GEMINI
+  toProtoEnumMay 2 = Hs.Just AgentTypeAGENT_TYPE_RETIRED
   toProtoEnumMay 3 = Hs.Just AgentTypeAGENT_TYPE_SHOAL
   toProtoEnumMay 4 = Hs.Just AgentTypeAGENT_TYPE_OPENCODE
   toProtoEnumMay 5 = Hs.Just AgentTypeAGENT_TYPE_CODEX
   toProtoEnumMay _ = Hs.Nothing
   fromProtoEnum AgentTypeAGENT_TYPE_UNSPECIFIED = 0
   fromProtoEnum AgentTypeAGENT_TYPE_CLAUDE = 1
-  fromProtoEnum AgentTypeAGENT_TYPE_GEMINI = 2
+  fromProtoEnum AgentTypeAGENT_TYPE_RETIRED = 2
   fromProtoEnum AgentTypeAGENT_TYPE_SHOAL = 3
   fromProtoEnum AgentTypeAGENT_TYPE_OPENCODE = 4
   fromProtoEnum AgentTypeAGENT_TYPE_CODEX = 5
@@ -96,8 +96,8 @@ instance (HsJSONPB.FromJSONPB AgentType) where
     Hs.pure AgentTypeAGENT_TYPE_UNSPECIFIED
   parseJSONPB (HsJSONPB.String "AGENT_TYPE_CLAUDE") =
     Hs.pure AgentTypeAGENT_TYPE_CLAUDE
-  parseJSONPB (HsJSONPB.String "AGENT_TYPE_GEMINI") =
-    Hs.pure AgentTypeAGENT_TYPE_GEMINI
+  parseJSONPB (HsJSONPB.String "AGENT_TYPE_RETIRED") =
+    Hs.pure AgentTypeAGENT_TYPE_RETIRED
   parseJSONPB (HsJSONPB.String "AGENT_TYPE_SHOAL") =
     Hs.pure AgentTypeAGENT_TYPE_SHOAL
   parseJSONPB (HsJSONPB.String "AGENT_TYPE_OPENCODE") =

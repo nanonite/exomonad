@@ -109,7 +109,7 @@ agentTypeText value =
     Left code -> "unknown:" <> T.pack (show code)
     Right AgentProto.AgentTypeAGENT_TYPE_UNSPECIFIED -> "unspecified"
     Right AgentProto.AgentTypeAGENT_TYPE_CLAUDE -> "claude"
-    Right AgentProto.AgentTypeAGENT_TYPE_GEMINI -> "gemini"
+    Right AgentProto.AgentTypeAGENT_TYPE_RETIRED -> "retired"
     Right AgentProto.AgentTypeAGENT_TYPE_SHOAL -> "shoal"
     Right AgentProto.AgentTypeAGENT_TYPE_OPENCODE -> "opencode"
     Right AgentProto.AgentTypeAGENT_TYPE_CODEX -> "codex"

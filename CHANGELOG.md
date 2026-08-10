@@ -111,11 +111,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix: update root TL prompt sanity check for headless OpenCode ACP workers (#45)
 - Fix: remove --model from opencode serve, pass to opencode run --attach instead (#44)
 - Bug: --worker-model not forwarded from exomonad init to exomonad serve (#49)
-- Bug: fork_wave still spawns Gemini despite --worker=opencode (binary may predate fix) (#48)
+- Bug: fork_wave still spawns Codex despite --worker=opencode (binary may predate fix) (#48)
 - Fix: update root TL prompt sanity check for headless OpenCode ACP workers (#45)
 - fork_wave/spawn_subtree handler ignores config.spawn_agent_type (hardcodes Claude fallback) (#34)
-- spawn_worker handler ignores config.spawn_agent_type (hardcodes Gemini fallback) (#33)
-- Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
+- spawn_worker handler ignores config.spawn_agent_type (hardcodes Codex fallback) (#33)
+- Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
 - Implement ExoMonad append-only observability and Failure Atlas measurement (#641)
@@ -140,7 +140,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Wire and verify TL review recovery commands and operator guidance (#542)
 - Add explicit recovery workflows for same-PR restarts and closed-PR replacement (#539)
 - Add TL-approved closed-PR replacement workflow (#541)
-- `exomonad models codex` now queries `codex debug models` live instead of a hardcoded list; claude/gemini/codex-fugu disclaimers now explicitly state no discovery path is available (#532)
+- `exomonad models codex` now queries `codex debug models` live instead of a hardcoded list; claude/codex/codex-fugu disclaimers now explicitly state no discovery path is available (#532)
 - Add effort and Codex Fugu integration coverage (#531)
 - Improve effort and harness CLI guidance (#530)
 - Add Codex Fugu as a supported agent harness (#529)
@@ -242,7 +242,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Sibling merge notification**: Event when a sibling PR merges (rebase may be needed).
 - **Pragma corruption guard**: PreToolUse hook blocks edits that corrupt Haskell `#-}` LANGUAGE pragma closings.
 - **Bidirectional messaging**: `send_message` tool for arbitrary agent-to-agent messaging (routes via Teams inbox, ACP, UDS, or Zellij).
-- **ACP messaging**: Structured JSON-RPC messaging via Agent Client Protocol for Gemini agents.
+- **ACP messaging**: Structured JSON-RPC messaging via Agent Client Protocol for Codex agents.
 - **HTTP-over-UDS delivery**: `notify_parent` → POST to `.exo/agents/{name}/notify.sock` for custom binary agents.
 - **Coordination mutexes**: In-memory `MutexRegistry` with FIFO wait queues and TTL auto-expiry for parallel agents.
 - **KV store**: Persistent key-value store via `.exo/kv/` for cross-agent state.
@@ -251,10 +251,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
-- M0.3 Retire Gemini runtime paths in the Rust host (#662)
-- M0.2 Retire Gemini spawn paths in the Haskell WASM guest (#661)
-- M0.1 Flip default spawn harness from gemini to codex (#660)
-- M0.5 Remove Gemini from the observability allowlist and contract fixtures (#708)
+- M0.4 Sweep retired harness references out of prompts, rules and docs (#663)
+- M0.3 Retire Codex runtime paths in the Rust host (#662)
+- M0.2 Retire Codex spawn paths in the Haskell WASM guest (#661)
+- M0.1 Flip default spawn harness from codex to codex (#660)
+- M0.5 Remove Codex from the observability allowlist and contract fixtures (#708)
 - Integrate automatic startup legacy import and Failure Atlas compatibility (#648)
 - Validate detectors incidents adjudication and controlled contrasts (#647)
 - Compile privacy-safe sample and aggregate artifacts (#646)
@@ -385,8 +386,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - spawn_worker: add optional agent_type param (default to server spawn_agent_type) (#121)
 - Ignore local lolearn database (#150)
 - spawn_leaf: add optional agent_type param (default to server spawn_agent_type) (#120)
-- remove Gemini-specific language from all spawn tool docs and CLAUDE.md (#123)
-- Audit GeminiBeforeModel/GeminiAfterModel naming for spawn-agnosticism (#136)
+- remove Codex-specific language from all spawn tool docs and CLAUDE.md (#123)
+- Audit CodexBeforeModel/CodexAfterModel naming for spawn-agnosticism (#136)
 - Add HookRuntime::OpenCode to protocol (#129)
 - Investigate spindle event idempotency for persistent spindle.db across exomonad init sessions (#119)
 - exomonad init: auto-start spindle as companion using binary copy pattern (#117)
@@ -396,7 +397,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Verify file_pr pushes to tangled remote not origin (#115)
 - exomonad init: register repo with knot via docker exec + set tangled remote (#112)
 - Move tangled-knot dev scripts into tests/e2e/tangled-ci (#108)
-- Refactor e2e hook-rewrite: replace Gemini root with OpenCode (#53)
+- Refactor e2e hook-rewrite: replace Codex root with OpenCode (#53)
 - research: chainlink mcp server support (#30)
 - Test: chainlink_worker_status returns correct aggregated JSON (#71)
 - Expose chainlink_worker_status in TLRole.hs (#70)
@@ -414,7 +415,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Investigate existing RunProcess/ExecCommand effect in wasm-guest Effects/ (#61)
 - Create .exo/roles/devswarm/context/chainlink-worker.md (#58)
 - Create .exo/roles/devswarm/context/chainlink-tl.md (#57)
-- spawn_worker ignores agent_type: hardcodes AgentType::Gemini in Rust (#24)
+- spawn_worker ignores agent_type: hardcodes AgentType::Codex in Rust (#24)
 - Replace JSON-RPC HTTP client in opencode_acp.rs with opencode run --attach (#22)
 - Fix opencode_acp.rs: change 'opencode acp' to 'opencode serve' (#21)
 - Remove SpawnOpencodeC effect and spawnOpencodeCore from Haskell (#6)
@@ -435,7 +436,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [0.1.0] - 2026-02-24
 
 ### Added
-- Agent orchestration: `spawn_subtree` (Claude), `spawn_leaf_subtree` (Gemini), `spawn_workers` (Gemini panes)
+- Agent orchestration: `spawn_subtree` (Claude), `spawn_leaf_subtree` (Codex), `spawn_workers` (Codex panes)
 - PR workflow: `file_pr`, `merge_pr`, `notify_parent`
 - Haskell WASM effect system with typed effects and Rust host handlers
 - Hot reload for WASM tools in serve mode

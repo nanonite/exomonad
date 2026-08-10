@@ -31,7 +31,7 @@ PRs are tracked in Forgejo. Do NOT use `gh` commands — they will fail. The wor
 ## Agent Hierarchy
 
 - **TL (Tech Lead)**: Claude. Decomposes, specs, scaffolds, spawns, merges. Never implements directly.
-- **Dev (Leaf)**: Configured agent type (OpenCode, Gemini, Codex, etc. — set via `--worker` flag at init). Implements a focused spec, files PR via `file_pr` MCP. No spawning.
+- **Dev (Leaf)**: Configured agent type (OpenCode, Codex, or Shoal — set via `--worker` flag at init). Implements a focused spec, files PR via `file_pr` MCP. No spawning.
 - **Worker**: Ephemeral pane agent. Research or non-conflicting in-place edits. No branch, no PR.
 
 ## Harness and effort selection
@@ -40,7 +40,7 @@ PRs are tracked in Forgejo. Do NOT use `gh` commands — they will fail. The wor
 same fields are available in `.exo/config.toml` and `[reviewer]`. Effort resolves
 as CLI > local config > global config > medium default. Worker effort is inherited
 by forked TLs, leaves, ephemeral workers, and companions. OpenCode receives effort
-as a model-aware `--variant`; Gemini and Shoal log that effort is ignored.
+as a model-aware `--variant`; Codex and Shoal log that effort is ignored.
 
 ## The TL Protocol: Scaffold-Fork-Converge
 

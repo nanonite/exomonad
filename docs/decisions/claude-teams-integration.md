@@ -4,7 +4,7 @@
 
 ## Decision
 
-ExoMonad bridges Claude Code Teams and Gemini workers so that Claude agents use native `SendMessage` for ALL teammates — zero tool shadowing. Gemini workers appear as first-class team members from Claude's perspective.
+ExoMonad bridges Claude Code Teams and Codex workers so that Claude agents use native `SendMessage` for ALL teammates — zero tool shadowing. Codex workers appear as first-class team members from Claude's perspective.
 
 Claude Code Teams provides the orchestration UX (task lists, messaging, idle/shutdown). ExoMonad provides the infrastructure (heterogeneous agent support, typed effects, tmux multiplexing, delivery routing).
 
@@ -19,9 +19,9 @@ Claude Code Teams (UX layer)
 
 ExoMonad (infrastructure layer)
     ├── Synthetic member registration (config.json manipulation)
-    ├── Inbox watcher (inotify → tmux injection for Gemini workers)
+    ├── Inbox watcher (inotify → tmux injection for Codex workers)
     ├── Unified delivery (Teams inbox first, tmux fallback)
-    ├── Heterogeneous agent support (Claude + Gemini)
+    ├── Heterogeneous agent support (Claude + Codex)
     └── Hot-reloadable WASM policy
 ```
 
@@ -59,7 +59,7 @@ TL inbox name: `team-lead`.
     {
       "agentId": "rust-impl@exo-root",
       "name": "rust-impl",
-      "agentType": "gemini-worker",
+      "agentType": "codex-worker",
       "backendType": "exomonad",
       "tmuxPaneId": "synthetic"
     }
@@ -94,21 +94,21 @@ Individual JSON files per task. `.lock` and `.highwatermark` files in the direct
 
 ## Message Flows
 
-### Claude → Gemini (via InboxWatcher)
+### Claude → Codex (via InboxWatcher)
 
 ```
 Claude calls SendMessage(recipient="rust-impl", content="...")
   → Claude Code writes to ~/.claude/teams/{team}/inboxes/rust-impl.json
   → ExoMonad InboxWatcher (inotify) detects write
   → Looks up rust-impl in synthetic member registry
-  → Injects message text into Gemini's tmux pane via buffer injection
+  → Injects message text into Codex's tmux pane via buffer injection
   → Deferred Enter keypress (~100ms) to avoid Ink paste problem
 ```
 
-### Gemini → Claude (via delivery helper)
+### Codex → Claude (via delivery helper)
 
 ```
-Gemini calls notify_parent(status="success", message="...")
+Codex calls notify_parent(status="success", message="...")
   → ExoMonad resolves parent's team info from TeamRegistry
   → delivery::deliver_to_agent() tries Teams inbox first:
     → Appends to ~/.claude/teams/{team}/inboxes/team-lead.json
@@ -137,7 +137,7 @@ See [teams-roadmap.md](teams-roadmap.md) for consolidated open items (lock coord
 
 - Claude agents use native `SendMessage` for ALL teammates — no tool shadowing
 - ExoMonad is invisible transport between Claude Teams and tmux
-- Gemini workers appear as first-class teammates from Claude's perspective
+- Codex workers appear as first-class teammates from Claude's perspective
 - Filesystem is the message bus — simple, debuggable, no custom protocol
 - inotify dependency (Linux-only, acceptable — ExoMonad targets Linux)
-- ~100ms latency for Claude→Gemini messages (inotify debounce + injection delay)
+- ~100ms latency for Claude→Codex messages (inotify debounce + injection delay)

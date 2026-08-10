@@ -201,7 +201,7 @@ Add or derive these dimensions in the normalized store:
 | `invocation_id` | One provider/process invocation | Lifecycle events and provider launch metadata |
 | `generation` | Monotonic resume/retry generation within an agent/session | Assigned by the lifecycle store for each resume/retry; never derived from invocation ID; required for loop and escalation measurement |
 | `parent_agent_id` | Agent topology edge | Spawn/resume/lifecycle payload or inferred local relation |
-| `provider` | Claude, Codex, Gemini, OpenCode, Shoal, or process | Lifecycle/init configuration |
+| `provider` | Claude, Codex, OpenCode, Shoal, or process | Lifecycle/init configuration |
 | `runtime` | Provider runtime/hook protocol | Hook/MCP/init source |
 | `harness` | User-selected/custom harness identity | New explicit metadata field; unknown for legacy rows |
 | `source_session_id` | Upstream provider session/transcript identity | Local-only by default; hash if needed for deduplication |
@@ -625,7 +625,7 @@ Start with mechanical, cross-harness classes:
 | timing | span duration, poll cycle, retry/backoff, queue depth |
 | state | memory append, inbox state, issue closed, session summary |
 
-This lets Claude, Codex, Gemini, OpenCode, Shoal, custom harnesses, and Python loops
+This lets Claude, Codex, OpenCode, Shoal, custom harnesses, and Python loops
 contribute comparable rows without pretending their transcripts have the same format.
 
 ### Cross-agent graph
@@ -987,7 +987,7 @@ used, the bridge should:
 
 ### Multi-harness correctness
 
-- Replay equivalent workflows from Claude, Codex, Gemini, and a custom Python loop.
+- Replay equivalent workflows from Claude, Codex, and a custom Python loop.
 - Confirm the normalized graph retains provider/runtime/harness distinctions while
   producing comparable stage metrics.
 - Confirm parent/child ordering, monotonic generations, durable delivery retries,

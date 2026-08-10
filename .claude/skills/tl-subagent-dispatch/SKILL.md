@@ -9,15 +9,15 @@ description: Use when spawning subagents, monitoring their progress, or interven
 
 1. **Fire-and-forget execution.** TL decomposes, specs, spawns, and idles. Convergence is leaf + reviewer + event handlers, not TL.
 
-2. **Dispatch is heterogeneous.** Claude for decomposition, Gemini for implementation, reviewer agent for review.
+2. **Dispatch is heterogeneous.** Claude for decomposition, Codex for implementation, reviewer agent for review.
 
 ## Agent Types
 
 | Tool | Agent | Role | Use When |
 |------|-------|------|----------|
 | `fork_wave` | Claude | TL (can spawn children) | Multi-step work requiring sub-decomposition |
-| `spawn_leaf` (worktree) | Gemini | Dev (files PR) | Focused implementation in isolated worktree |
-| `spawn_leaf` (inline) | Gemini | Worker (ephemeral) | Investigation, hypothesis testing, no commits |
+| `spawn_leaf` (worktree) | Codex | Dev (files PR) | Focused implementation in isolated worktree |
+| `spawn_leaf` (inline) | Codex | Worker (ephemeral) | Investigation, hypothesis testing, no commits |
 
 ## Dispatch Protocol
 
@@ -96,7 +96,7 @@ After spawning, idle. Do not watch, poll, or narrate.
 That exploration belongs in a worker's spec. Spawn a worker to investigate.
 
 ### TL writes implementation code
-That belongs in a leaf's task. Gemini agents are smart enough.
+That belongs in a leaf's task. Codex agents are smart enough.
 
 ### TL manually reviews intermediate output
 Convergence is leaf + reviewer. TL only reviews at merge time.

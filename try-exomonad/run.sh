@@ -21,11 +21,11 @@ cd "$ROOT_DIR"
 # Full directory mounts (rw) — Claude Code writes settings, session history,
 # and projects metadata into ~/.claude/. The binary is at ~/.local/bin/claude
 # (outside ~/.claude/) so the mount doesn't clobber it.
-mkdir -p "$HOME/.claude" "$HOME/.gemini"
+mkdir -p "$HOME/.claude" "$HOME/.codex"
 
 MOUNTS=(
     -v "$HOME/.claude:/home/exo/.claude"
-    -v "$HOME/.gemini:/home/exo/.gemini"
+    -v "$HOME/.codex:/home/exo/.codex"
 )
 
 # Claude state file (auth tokens, onboarding flags, trust dialog state).

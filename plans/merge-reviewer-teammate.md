@@ -59,7 +59,7 @@ If no reviewer is registered, poller falls back to existing behavior: PR events 
 
 ### Spawn Event Routing
 
-When the TL spawns work agents (`fork_wave`/`spawn_gemini`), the reviewer needs to know about expected PRs. Undecided whether this should be:
+When the TL spawns work agents (`fork_wave`/`spawn_codex`), the reviewer needs to know about expected PRs. Undecided whether this should be:
 - **Server-side**: New event type fired automatically when spawn completes, auto-delivered to reviewer inbox
 - **TL-initiated**: TL explicitly messages reviewer after each wave ("Spawned wave 1: agent-a, agent-b, agent-c")
 - **Both**: Server fires structural event, TL adds commentary
@@ -133,7 +133,7 @@ Update `CLAUDE.md`: add `register_merge_reviewer` to tools table, add merge-revi
 
 ## Not in Scope (v2)
 
-- **Dedicated `reviewer` WASM role** with restricted tool set (only merge_pr, not fork_wave/spawn_gemini)
+- **Dedicated `reviewer` WASM role** with restricted tool set (only merge_pr, not fork_wave/spawn_codex)
 - **Auto-respawn** of reviewer if it dies
 - **Build verification** after merge (reviewer runs cargo check post-merge)
 - **Wave completion tracking** (reviewer detects "all PRs in wave N merged" and notifies TL)

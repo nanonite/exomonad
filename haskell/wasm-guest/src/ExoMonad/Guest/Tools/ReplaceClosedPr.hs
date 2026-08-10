@@ -67,7 +67,7 @@ replaceClosedPrSchema =
       ("old_leaf_name", "Explicit old author leaf identity to retire"),
       ("new_leaf_name", "Required fresh bare leaf slug; do not reuse the old slug"),
       ("replacement_task", "Complete task for the fresh leaf, including acceptance criteria"),
-      ("agent_type", "Optional fresh leaf runtime: claude, gemini, shoal, opencode, or codex"),
+      ("agent_type", "Optional fresh leaf runtime: claude, retired, shoal, opencode, or codex"),
       ("operator_context", "Optional human-approved context for the replacement"),
       ("human_approved", "Required true value confirming the human approved this replacement")
     ]
@@ -115,7 +115,7 @@ replaceClosedPrCore args
 
 toProtoAgentType :: AC.AgentType -> PA.AgentType
 toProtoAgentType AC.Claude = PA.AgentTypeAGENT_TYPE_CLAUDE
-toProtoAgentType AC.Gemini = PA.AgentTypeAGENT_TYPE_GEMINI
+toProtoAgentType AC.Retired = PA.AgentTypeAGENT_TYPE_RETIRED
 toProtoAgentType AC.Shoal = PA.AgentTypeAGENT_TYPE_SHOAL
 toProtoAgentType AC.OpenCode = PA.AgentTypeAGENT_TYPE_OPENCODE
 toProtoAgentType AC.Codex = PA.AgentTypeAGENT_TYPE_CODEX

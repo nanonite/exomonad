@@ -10,7 +10,7 @@ worktree and PR; it does not create a stacked PR or a second owner.
 | Provider | Assignment boundary | Live guidance | Dormant guidance | Authoritative result |
 | --- | --- | --- | --- | --- |
 | Claude | One assignment per process | Teams inbox, then the exact current pane | Durable inbox, shown on resume | PR/review/CI |
-| Gemini | One assignment per process | Exact current tmux pane | Durable inbox, shown on resume | PR/review/CI |
+| Codex | One assignment per process | Exact current tmux pane | Durable inbox, shown on resume | PR/review/CI |
 | Shoal | One assignment per process | UDS, then exact current pane | Durable inbox, shown on resume | PR/review/CI |
 | OpenCode | One assignment per process | Exact current tmux pane | Durable inbox, shown on resume | PR/review/CI |
 | Codex | One assignment per process | Exact current tmux pane | Durable inbox, shown on resume | PR/review/CI |

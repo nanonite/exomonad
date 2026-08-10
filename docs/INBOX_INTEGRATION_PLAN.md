@@ -4,7 +4,7 @@
 
 ExoMonad's current `send_message` / `notify_parent` tools use a delivery-first model: write to
 Claude Code's Teams inbox (Claude agents only) or inject via tmux STDIN. Non-Claude agents —
-Codex, OpenCode, Gemini, Shoal — have no reliable inbox. Messages sent to them are
+Codex, OpenCode, and Shoal — have no reliable inbox. Messages sent to them are
 fire-and-forget; if tmux injection misses, they're lost with no catch-up path.
 
 ## Solution

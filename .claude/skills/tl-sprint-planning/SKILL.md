@@ -9,7 +9,7 @@ description: Use when planning sprints, organizing parallel work, or dispatching
 
 1. **Parallel work that touches the same files creates rebase hell.** Always check for file collisions before dispatching parallel agents.
 
-2. **Waves are heterogeneous.** A single wave can mix Claude subtrees (expensive, architectural) and Gemini leaves (cheap, focused implementation), as long as files don't overlap.
+2. **Waves are heterogeneous.** A single wave can mix Claude subtrees (architectural) and Codex leaves (focused implementation), as long as files don't overlap.
 
 ## Sprint Planning Protocol
 
@@ -26,9 +26,9 @@ Before dispatch, classify each task:
 
 | Classification | Agent | Spawn Tool | Examples |
 |----------------|-------|------------|----------|
-| **Focused implementation** | Gemini leaf | `spawn_leaf` (worktree) | single feature, bug fix, docs |
+| **Focused implementation** | Codex leaf | `spawn_leaf` (worktree) | single feature, bug fix, docs |
 | **Multi-step decomposition** | Claude subtree | `fork_wave` | architecture, refactors requiring sub-spawns |
-| **Investigation / research** | Gemini worker | `spawn_leaf` (inline) | hypothesis testing, codebase exploration |
+| **Investigation / research** | Codex worker | `spawn_leaf` (inline) | hypothesis testing, codebase exploration |
 
 ### 3. Collision Check (CRITICAL)
 
@@ -52,7 +52,7 @@ Map files each task will touch across ALL agents:
 
 ```
 Wave N:
-├── Gemini leaves (parallel, 3-5x)
+├── Codex leaves (parallel, 3-5x)
 │   ├── proto-plumbing (proto/, exomonad-proto/)
 │   ├── docs-update (CLAUDE.md, haskell/CLAUDE.md)
 │   └── test-coverage (tests/)
@@ -105,9 +105,9 @@ When parallel PRs exist:
 gh issue list                # Available work
 
 # Dispatch
-spawn_leaf(isolation="worktree")  # Gemini in worktree, files PR
+spawn_leaf(isolation="worktree")  # Codex in worktree, files PR
 fork_wave                           # Claude in worktree, can sub-spawn
-spawn_leaf(isolation="inline")    # Gemini panes, ephemeral
+spawn_leaf(isolation="inline")    # Codex panes, ephemeral
 
 # Monitoring — idle until messages arrive
 # [PR READY] — Reviewer approved, merge

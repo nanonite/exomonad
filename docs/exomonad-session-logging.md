@@ -237,7 +237,7 @@ disabled; the default is enabled. Provider delivery contracts are:
 | --- | --- |
 | Claude | `teams_inbox` -> exact tmux -> durable inbox |
 | Shoal | UDS -> exact tmux -> durable inbox |
-| Gemini, OpenCode, Codex | exact tmux -> durable inbox |
+| Codex, OpenCode | exact tmux -> durable inbox |
 | External process | external process -> durable inbox |
 
 Process exit, inbox delivery, tmux injection, and watcher/Forgejo observations are
@@ -522,7 +522,7 @@ Keep the existing raw streams, then add a versioned envelope at ingestion or emi
   "agent_id": "agent",
   "birth_branch": "branch-at-creation",
   "role": "worker",
-  "provider": "claude|codex|gemini|opencode|process",
+  "provider": "claude|codex|opencode|process",
   "runtime": "optional-runtime-name",
   "harness": "optional-harness-name",
   "invocation_id": "optional",

@@ -5,8 +5,8 @@
 {-# LANGUAGE TypeOperators #-}
 
 -- | E2E test root role: minimal tools with PII rewriting hooks.
--- The Gemini root agent uses httpDevHooks for BeforeModel/AfterModel rewriting.
--- Only split message tools are needed (Gemini writes files via its native tools).
+-- The Codex root agent uses httpDevHooks for BeforeModel/AfterModel rewriting.
+-- Only split message tools are needed (Codex writes files via its native tools).
 module RootRole (config, Tools) where
 
 import ExoMonad

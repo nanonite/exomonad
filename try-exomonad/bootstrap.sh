@@ -21,8 +21,8 @@ if ! command -v claude &>/dev/null; then
     exit 1
 fi
 
-if ! command -v gemini &>/dev/null; then
-    echo "WARNING: gemini not found on PATH (Gemini agents will not work)" >&2
+if ! command -v codex &>/dev/null; then
+    echo "WARNING: codex not found on PATH (Codex agents will not work)" >&2
 fi
 
 # ---- Ensure Claude Code settings survive the ~/.claude/ mount ----

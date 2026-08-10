@@ -33,7 +33,7 @@ instance JsonSchema ToolPattern where
   toSchema = toSchema @Text
 
 -- | Claude Code permission rules. Only available for Claude agents (spawn_subtree),
--- not Gemini agents (spawn_leaf_subtree, spawn_workers).
+-- not Retired agents (spawn_leaf_subtree, spawn_workers).
 data ClaudePermissions = ClaudePermissions
   { cpAllow :: [ToolPattern],
     cpDeny :: [ToolPattern]

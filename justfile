@@ -73,12 +73,12 @@ test-wasm-integration:
 
 # Build and run the devswarm role-hook-tests WASM test suite
 role-hook-tests:
-    @nix develop .#wasm --command bash -c 'export PATH=$PWD/.gemini/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build role-hook-tests'
+    @nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build role-hook-tests'
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name role-hook-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
 # Build and run the wasm-guest test suite under wasmtime
 wasm-guest-test:
-    @nix develop .#wasm --command bash -c 'export PATH=$PWD/.gemini/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build wasm-guest:wasm-guest-tests'
+    @nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build wasm-guest:wasm-guest-tests'
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
 # Run tests: formatting, Rust check, WASM build/tests, Rust tests, proto freshness
@@ -132,9 +132,9 @@ install-hooks:
 
 # Build WASM role and install to .exo/wasm/
 wasm role="tl":
-    @nix develop .#wasm --command bash -c 'export PATH=$PWD/.gemini/tmp/bin:$PATH; if [ ! -d ~/.cabal/packages/hackage.haskell.org ]; then echo ">>> First-time WASM setup (populating cabal package index)..."; wasm32-wasi-cabal update --project-file=cabal.project.wasm; fi'
+    @nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; if [ ! -d ~/.cabal/packages/hackage.haskell.org ]; then echo ">>> First-time WASM setup (populating cabal package index)..."; wasm32-wasi-cabal update --project-file=cabal.project.wasm; fi'
     @echo ">>> Building wasm-guest-{{role}}..."
-    nix develop .#wasm --command bash -c 'export PATH=$PWD/.gemini/tmp/bin:$PATH; wasm32-wasi-cabal build --project-file=cabal.project.wasm wasm-guest-{{role}}'
+    nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; wasm32-wasi-cabal build --project-file=cabal.project.wasm wasm-guest-{{role}}'
     @echo ">>> Installing to .exo/wasm/..."
     mkdir -p .exo/wasm
     rm -f .exo/wasm/wasm-guest-{{role}}.wasm
@@ -151,7 +151,7 @@ wasm-all:
 # One-time WASM build environment setup (populates cabal package index)
 wasm-setup:
     @echo ">>> Setting up WASM build environment (one-time)..."
-    nix develop .#wasm --command bash -c 'export PATH=$PWD/.gemini/tmp/bin:$PATH; wasm32-wasi-cabal update --project-file=cabal.project.wasm'
+    nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; wasm32-wasi-cabal update --project-file=cabal.project.wasm'
     @echo ">>> Done. You can now run: just wasm-all"
 
 # Internal: shared install logic for release/dev builds.
@@ -453,10 +453,6 @@ check-e2e-mcp-tool-visibility:
 # Run live E2E Teams messaging test (requires active CC team "teams-e2e")
 live-teams-e2e:
     nix develop --command cargo nextest run -p claude-teams-bridge --test integration live_teams_e2e --run-ignored ignored-only --no-capture
-
-# Validate Gemini settings against schema
-validate-settings:
-    nix-shell -p python3Packages.jsonschema --run "python3 scripts/validate_json.py .gemini/settings.json schema/gemini-cli/settings.schema.json"
 
 # Validate the Phase 0 observability registries and synthetic fixtures
 validate-observability-contracts:

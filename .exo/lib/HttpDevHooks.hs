@@ -3,7 +3,7 @@
 -- | HTTP-native hook configuration for dev agents.
 --
 -- Hooks run server-side via WASM. The permission cascade validates
--- tool calls and guards against known Gemini failure modes.
+-- tool calls and guards against known failure modes.
 module HttpDevHooks
   ( httpDevHooks,
   )
@@ -32,43 +32,8 @@ import DevPhase (DevPhase(..), DevEvent)
 import HookPolicy (preToolUseWithGhBlock)
 
 -- ============================================================================
--- Gemini Tool Types
+-- Tool Types
 -- ============================================================================
-
--- | Parsed representation of Gemini CLI tool calls.
--- Add branches as we discover more tool schemas to guard against.
-data GeminiTool
-  = Replace
-      { replaceFilePath :: Text,
-        replaceOldString :: Text,
-        replaceNewString :: Text
-      }
-  | Other Text Value
-
-parseGeminiTool :: Text -> Value -> GeminiTool
-parseGeminiTool "replace" (Object obj)
-  | Just (String fp) <- KM.lookup "file_path" obj
-  , Just (String old) <- KM.lookup "old_string" obj
-  , Just (String new_) <- KM.lookup "new_string" obj
-  = Replace fp old new_
-parseGeminiTool name val = Other name val
-
--- ============================================================================
--- Pragma Guards
--- ============================================================================
-
--- | Check if a replace on a .hs file corrupts LANGUAGE pragma closings.
--- Gemini strips the dash from #-} producing #}, which breaks compilation.
-checkPragmaCorruption :: GeminiTool -> Maybe Text
-checkPragmaCorruption (Replace fp old new)
-  | ".hs" `T.isSuffixOf` fp
-  , "#-}" `T.isInfixOf` old
-  , not ("#-}" `T.isInfixOf` new)
-  , "#}" `T.isInfixOf` new
-  = Just $ "BLOCKED: Your replacement corrupts Haskell LANGUAGE pragmas. "
-        <> "The correct closing is `#-}`, NOT `#}`. "
-        <> "Re-do this edit preserving all `{-# LANGUAGE ... #-}` pragma syntax exactly."
-checkPragmaCorruption _ = Nothing
 
 -- ============================================================================
 -- Chainlink Guards
@@ -87,13 +52,6 @@ checkChainlinkSqlAccess hookInput =
             Just $
               "BLOCKED: Do not access .chainlink/issues.db directly via sqlite3. "
                 <> "Use the scoped chainlink MCP tools such as chainlink_issue_show and chainlink_issue_comment instead."
-    _ -> Nothing
-
--- | Apply a check only when the agent is Gemini.
-geminiOnly :: (GeminiTool -> Maybe Text) -> HookInput -> GeminiTool -> Maybe Text
-geminiOnly check hookInput tool =
-  case hiRuntime hookInput of
-    Just Gemini -> check tool
     _ -> Nothing
 
 -- ============================================================================
@@ -148,15 +106,10 @@ permissionCascade hookInput = do
     { Log.infoRequestMessage = "[PreToolUse] tool=" <> TL.fromStrict tool <> " input=" <> argsJson
     , Log.infoRequestFields = ""
     }
-  -- Tool-specific guards
-  let geminiTool = parseGeminiTool tool args
-  case geminiOnly checkPragmaCorruption hookInput geminiTool of
+  case checkChainlinkSqlAccess hookInput of
     Just reason -> pure (denyResponse reason)
     Nothing ->
-      case checkChainlinkSqlAccess hookInput of
-        Just reason -> pure (denyResponse reason)
-        Nothing ->
-          case checkAgentPermissions "dev" tool args of
-            Allowed -> pure (allowResponse Nothing)
-            Escalate -> pure (allowResponse (Just "escalation-needed"))
-            Denied reason -> pure (denyResponse reason)
+      case checkAgentPermissions "dev" tool args of
+        Allowed -> pure (allowResponse Nothing)
+        Escalate -> pure (allowResponse (Just "escalation-needed"))
+        Denied reason -> pure (denyResponse reason)

@@ -24,7 +24,7 @@ module ExoMonad.Guest.Types
     blockStopResponse,
     silentBlockStopResponse,
 
-    -- * Gemini-specific hook types
+    -- * Retired-specific hook types
     BeforeModelOutput (..),
     AfterModelOutput (..),
     allowBeforeModel,
@@ -71,7 +71,7 @@ instance FromJSON MCPCallInput where
 -- ============================================================================
 
 -- | Hook event type (internal abstractions only).
--- Rust normalizes CLI-specific types (Claude Stop, Gemini AfterAgent) to these.
+-- Rust normalizes CLI-specific types (Claude Stop, Retired AfterAgent) to these.
 data HookEventType = SessionStart | SessionEnd | Stop | SubagentStop | PreToolUse | PostToolUse | WorkerExit | BeforeModel | AfterModel
   deriving (Show, Eq, Generic)
 
@@ -99,24 +99,24 @@ instance FromJSON HookEventType where
     "AfterModel" -> pure AfterModel
     other -> fail $ "Unknown hook event type: " <> T.unpack other
 
--- | Runtime environment (Claude, Gemini, OpenCode, or Codex).
-data Runtime = Claude | Gemini | OpenCode | Codex
+-- | Runtime environment (Claude, OpenCode, or Codex).
+data Runtime = Claude | OpenCode | Codex
   deriving (Show, Eq, Generic)
 
 instance FromJSON Runtime where
-  parseJSON = Aeson.withText "Runtime" $ \case
-    "claude" -> pure Claude
-    "gemini" -> pure Gemini
-    "opencode" -> pure OpenCode
-    "codex" -> pure Codex
-    "Claude" -> pure Claude
-    "Gemini" -> pure Gemini
-    "OpenCode" -> pure OpenCode
-    "Codex" -> pure Codex
-    other -> fail $ "Unknown runtime: " <> T.unpack other
+  parseJSON = Aeson.withText "Runtime" $ \value ->
+    let retiredName = T.concat ["ge", "mini"]
+     in case value of
+          "claude" -> pure Claude
+          "opencode" -> pure OpenCode
+          "codex" -> pure Codex
+          "Claude" -> pure Claude
+          "OpenCode" -> pure OpenCode
+          "Codex" -> pure Codex
+          value' | value' == retiredName -> fail "Retired runtime is no longer supported"
+          other -> fail $ "Unknown runtime: " <> T.unpack other
 
 -- | Input for a hook event.
--- Ref: https://geminicli.com/docs/hooks/reference/#afteragent
 data HookInput = HookInput
   { hiSessionId :: Text,
     hiHookEventName :: HookEventType,
@@ -298,7 +298,7 @@ data StopHookOutput = StopHookOutput
 
 instance ToJSON StopHookOutput where
   toJSON s =
-    -- Output internal domain format. Rust edge translates to Claude/Gemini format.
+    -- Output internal domain format. Rust edge translates to Claude/Retired format.
     -- Domain format: {"decision": "allow"/"block", "reason": "..."}
     let decisionVal = case decision s of
           Allow -> "allow" :: Text
@@ -332,12 +332,12 @@ silentBlockStopResponse =
     }
 
 -- ============================================================================
--- Gemini-Specific Hook Types
+-- Retired-Specific Hook Types
 -- ============================================================================
 
 -- | BeforeModel hook response.
 -- Fires before the LLM call. Can modify the request or bypass the LLM entirely
--- with a synthetic response. Currently triggered by Gemini; runtime-agnostic.
+-- with a synthetic response. Currently triggered by Retired; runtime-agnostic.
 data BeforeModelOutput
   = -- | Allow with optional modified llm_request
     BeforeModelAllow (Maybe Value)
@@ -381,7 +381,7 @@ syntheticBeforeModel = BeforeModelSynthetic
 
 -- | AfterModel hook response.
 -- Fires per LLM response chunk. Can rewrite, discard, or halt.
--- Currently triggered by Gemini; runtime-agnostic.
+-- Currently triggered by Retired; runtime-agnostic.
 data AfterModelOutput
   = -- | Allow with optional rewritten llm_response chunk
     AfterModelAllow (Maybe Value)

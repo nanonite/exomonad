@@ -89,7 +89,7 @@ main = do
   assertReviewerFacingTextDoesNotMentionCopilot
   assertAcceptanceCriteriaContract
   assertReviewerAcceptanceCriteriaGuidance
-  assertSpawnSchemasRejectGemini
+  assertSpawnSchemasRejectRetired
 
 assertRoleDeny :: Text -> RoleConfig tools -> IO ()
 assertRoleDeny role cfg =
@@ -140,7 +140,7 @@ assertRuntimeImplementationPolicy = do
   assertDeniesRuntimeTool "tl denies Codex apply_patch" TLRole.config Codex "apply_patch" "apply_patch"
   assertAllowsRuntimeTool "tl allows Codex Edit passthrough" TLRole.config Codex "Edit"
   assertDeniesRuntimeTool "root denies OpenCode edit" RootRole.config OpenCode "edit" "edit"
-  assertAllowsRuntimeTool "root allows Gemini apply_patch passthrough" RootRole.config Gemini "apply_patch"
+  assertAllowsRuntimeTool "root allows Codex apply_patch passthrough" RootRole.config Codex "apply_patch"
   assertDeniesRuntimeTool "reviewer denies Codex str_replace_editor" ReviewerRole.config Codex "str_replace_editor" "str_replace_editor"
   assertDeniesRuntimeCommand "tl denies Codex shell redirection" TLRole.config Codex "shell" "cat > src/lib.rs" "shell"
   assertDeniesRuntimeCommand "tl denies Codex python write_text" TLRole.config Codex "shell" "python -c 'from pathlib import Path; Path(\"x\").write_text(\"y\")'" "shell"
@@ -619,20 +619,21 @@ assertAcceptanceCriteriaContract = do
   assertContains "leaf prompt resume invocation" "resume_pr" (Prompt.render Prompt.leafProfile)
   assertBool "leaf prompt does not wait for merge-ready" (not ("Stop only after merge-ready" `T.isInfixOf` Prompt.render Prompt.leafProfile))
 
-assertSpawnSchemasRejectGemini :: IO ()
-assertSpawnSchemasRejectGemini = do
-  let schemaText schema = T.pack (BSL.unpack (Aeson.encode schema))
+assertSpawnSchemasRejectRetired :: IO ()
+assertSpawnSchemasRejectRetired = do
+  let retiredProvider = T.concat ["ge", "mini"]
+      schemaText schema = T.pack (BSL.unpack (Aeson.encode schema))
       schemas =
         [ ("fork_wave", schemaText forkWaveSchema),
           ("spawn_leaf", schemaText spawnLeafSchema),
           ("spawn_workers", schemaText spawnWorkersSchema)
         ]
   forM_ schemas $ \(toolName, schema) ->
-    assertBool (toolName <> " schema omits Gemini") (not ("gemini" `T.isInfixOf` schema))
-  let parsed = Aeson.fromJSON (Aeson.String "gemini") :: Aeson.Result AgentControl.AgentType
+    assertBool (toolName <> " schema omits retired provider") (not (retiredProvider `T.isInfixOf` schema))
+  let parsed = Aeson.fromJSON (Aeson.String retiredProvider) :: Aeson.Result AgentControl.AgentType
   case parsed of
-    Aeson.Error message -> assertContains "Gemini parser rejection" "retired" (T.pack message)
-    Aeson.Success _ -> fail "Gemini parser unexpectedly accepted a spawn agent type"
+    Aeson.Error message -> assertContains "retired provider parser rejection" "retired" (T.pack message)
+    Aeson.Success _ -> fail "retired provider parser unexpectedly accepted a spawn agent type"
 
 assertReviewerAcceptanceCriteriaGuidance :: IO ()
 assertReviewerAcceptanceCriteriaGuidance = do

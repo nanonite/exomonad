@@ -5,7 +5,7 @@ set -euo pipefail
 # Validates the SQLite InboxStore path for non-Claude agents:
 # - send_tmux_message records durable unread mail
 # - successful MCP calls piggyback <unread-mail>
-# - check_inbox drains messages for a Gemini-shaped agent identity
+# - check_inbox drains messages for a Codex-shaped agent identity
 # - list_agents reports unread/read metadata
 # - watcher timeout poke injects a notification into the routed tmux pane
 
@@ -14,9 +14,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/harness.sh"
 
 SESSION="e2e-cross-harness-inbox"
-AGENT_NAME="cross-reader-gemini"
-SINK_NAME="cross-sink-gemini"
-MAIL_CONTENT="[E2E-INBOX-1] durable SQLite inbox message for Gemini agent"
+AGENT_NAME="cross-reader-codex"
+SINK_NAME="cross-sink-codex"
+MAIL_CONTENT="[E2E-INBOX-1] durable SQLite inbox message for Codex agent"
 MAIL_SUMMARY="durable inbox e2e"
 PIGGYBACK_TRIGGER="[E2E-INBOX-2] trigger piggyback response"
 POKE_TEXT="You have 1 unread message(s). Call check_inbox."
@@ -36,10 +36,10 @@ e2e_write_basic_config "$SESSION"
 cat >> .exo/config.toml <<'EOF'
 poll_interval = 1
 inbox_poke_interval = 1
-spawn_agent_type = "gemini"
+spawn_agent_type = "codex"
 EOF
 
-e2e_phase "Phase 2" "Seeding Gemini-shaped agent and tmux route..."
+e2e_phase "Phase 2" "Seeding Codex-shaped agent and tmux route..."
 tmux new-session -d -s "$SESSION" -n "TL" "bash --noprofile --norc"
 PANE_ID="$(tmux display-message -p -t "$SESSION:TL.0" "#{pane_id}")"
 
@@ -54,7 +54,7 @@ agent_dir = Path(".exo/agents") / agent
 identity = {
     "agent_name": agent,
     "slug": "cross-reader",
-    "agent_type": "gemini",
+    "agent_type": "codex",
     "birth_branch": "main",
     "parent_branch": "main",
     "working_dir": ".",
@@ -153,8 +153,8 @@ elif check == "list-unread":
     matches = [item for item in agents if item.get("agent_id") == agent]
     if not matches:
         fail(f"list_agents missing {agent}")
-    if matches[0].get("agent_type") != "gemini":
-        fail("list_agents did not report gemini agent type")
+    if matches[0].get("agent_type") != "codex":
+        fail("list_agents did not report codex agent type")
     if matches[0].get("has_unread") is not True:
         fail("list_agents did not report unread mail")
 elif check == "list-read":
@@ -214,7 +214,7 @@ PY
 e2e_log "InboxStore row recorded"
 
 e2e_phase "Phase 5" "Verifying list_agents unread metadata..."
-call_tool root root list_agents '{"filter_type":"gemini"}' "$WORK_DIR/list-unread.json"
+call_tool root root list_agents '{"filter_type":"codex"}' "$WORK_DIR/list-unread.json"
 assert_json "$WORK_DIR/list-unread.json" list-unread
 
 e2e_phase "Phase 6" "Verifying piggyback unread mail on non-Claude MCP call..."
@@ -232,7 +232,7 @@ assert_json "$WORK_DIR/piggyback.json" piggyback
 e2e_phase "Phase 7" "Verifying explicit check_inbox drains unread mail..."
 call_tool worker "$AGENT_NAME" check_inbox '{}' "$WORK_DIR/check-inbox.json"
 assert_json "$WORK_DIR/check-inbox.json" check-inbox
-call_tool root root list_agents '{"filter_type":"gemini"}' "$WORK_DIR/list-read.json"
+call_tool root root list_agents '{"filter_type":"codex"}' "$WORK_DIR/list-read.json"
 assert_json "$WORK_DIR/list-read.json" list-read
 
 e2e_phase "Phase 8" "Verifying watcher timeout poke reaches routed pane..."

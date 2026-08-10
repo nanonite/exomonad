@@ -8,7 +8,7 @@ Chainlink: #148
 
 ## Context
 
-Codex is supported as an ExoMonad-spawned agent runtime. It shares the same Rust host, Haskell WASM tool definitions, and hook dispatch path as Claude Code, Gemini, and OpenCode, but its local configuration model is different.
+Codex is supported as an ExoMonad-spawned agent runtime. It shares the same Rust host, Haskell WASM tool definitions, and hook dispatch path as Claude Code and OpenCode, but its local configuration model is different.
 
 Codex reads runtime configuration from `.codex/config.toml`. ExoMonad writes hook commands into each Codex agent's project config and seeds matching hook trust state in the active Codex user config (`$CODEX_HOME/config.toml` or `~/.codex/config.toml`). It does not need an OpenCode-style TypeScript plugin bridge.
 

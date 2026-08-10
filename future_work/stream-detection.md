@@ -28,7 +28,7 @@ watch_for:
 ## Architecture Options
 
 1. **Regex on terminal output** — Simple, fast, no LLM cost. Catches specific phrases.
-2. **Small classifier model** — Run a tiny model (or even a Gemini Flash call) on buffered output every N seconds. More semantic but costs tokens.
+2. **Small classifier model** — Run a tiny model (or even a Codex Flash call) on buffered output every N seconds. More semantic but costs tokens.
 3. **Heuristic rules** — Count tool call failures, track time-since-last-commit, detect repeated identical tool calls. No LLM needed.
 
 ## Interaction with Hylo Tree

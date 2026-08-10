@@ -57,7 +57,7 @@ Work flows back up the tree via PRs:
 
 | Node Type | Strategy | Rationale |
 |-----------|----------|-----------|
-| Worker (Gemini leaf) | Squash | Single logical change, clean history |
+| Worker (Codex leaf) | Squash | Single logical change, clean history |
 | Subtree (Claude) | Merge commit | Preserves child PR history |
 | Root → main | Squash | Clean main branch history |
 
@@ -73,8 +73,8 @@ Each level of the tree is one PR. The merge cascade is not automated — each pa
 ## Implementation
 
 - `fork_wave`: Creates worktree + tmux window for Claude agent (TL role, can spawn children). Depth-capped at 2.
-- `spawn_leaf`: Creates worktree + tmux window for Gemini agent (dev role, files PR).
-- `spawn_worker`: Creates Gemini pane in parent directory (ephemeral, no worktree, no branch).
+- `spawn_leaf`: Creates worktree + tmux window for Codex agent (dev role, files PR).
+- `spawn_worker`: Creates Codex pane in parent directory (ephemeral, no worktree, no branch).
 - `file_pr`: Creates PR with auto-detected base branch from dot-separated naming.
 - `merge_pr`: Merges child PR (`gh pr merge` + `git fetch`).
 

@@ -39,7 +39,7 @@ Root TL (you instruct this)
 │   ├── Sub-TL "alpha" (worktree 1) → spawn_worker × 1 (inline)
 │   │   └── worker: implement functions in src/alpha.py
 │   │   └── sub-TL commits, pushes, files PR to root
-│   └── Gemini leaf "beta" (worktree 2) → files PR to root
+│   └── Codex leaf "beta" (worktree 2) → files PR to root
 │       └── implement functions in src/beta.py
 └── Root merges both PRs
 ```
@@ -59,7 +59,7 @@ Once verified, proceed to Phase 1.
 
 ---
 
-### Phase 1: Fork sub-TL + spawn Gemini leaf (parallel)
+### Phase 1: Fork sub-TL + spawn Codex leaf (parallel)
 
 #### Step 1.1: Instruct root to fork + spawn
 
@@ -71,7 +71,7 @@ PHASE 1 — spawn TWO children in parallel:
 
 1. Use `fork_wave` with ONE child:
    slug: 'alpha'
-   task: 'You are sub-TL for alpha module. Use spawn_worker to create ONE ephemeral Gemini worker:
+   task: 'You are sub-TL for alpha module. Use spawn_worker to create ONE ephemeral Codex worker:
      Worker name: "write-alpha"
      Task: "Edit src/alpha.py to contain two functions: greet(name) that returns the string Hello followed by name, and farewell(name) that returns Goodbye followed by name"
    After the worker completes, commit with message "feat: alpha module", push, and file a PR with file_pr. Then IDLE.'
@@ -104,7 +104,7 @@ Poll `$MOCK_LOG` every 15 seconds for `POST .*/pulls` entries. Max wait: 5 minut
 
 Expected PRs (not necessarily in order):
 - main.alpha (from alpha sub-TL, targeting main)
-- main.beta (from Gemini leaf, targeting main)
+- main.beta (from Codex leaf, targeting main)
 
 #### Step 2.3: Post reviews on both PRs
 
@@ -128,7 +128,7 @@ Poll `$MOCK_LOG` every 15 seconds for `PUT .*/merge` entries. Max wait: 5 minute
 
 Expected merges (both via [FIXES PUSHED]):
 1. Root merges alpha PR (after alpha sub-TL addresses review + pushes fixes)
-2. Root merges beta PR (after Gemini leaf addresses review + pushes fixes)
+2. Root merges beta PR (after Codex leaf addresses review + pushes fixes)
 
 ---
 
@@ -142,16 +142,16 @@ Call `notify_parent` with:
   - Scaffold commit present on remote main?
 
   **Phase 1 (fork + spawn):**
-  - Sub-TL window created? Gemini leaf window created?
+  - Sub-TL window created? Codex leaf window created?
   - Worktrees at .exo/worktrees/?
   - Branches pushed to remote?
 
   **Phase 2 (activity + review cycle):**
   - alpha: Worker pane observed (write-alpha)?
-  - beta: Gemini leaf activity?
+  - beta: Codex leaf activity?
   - Total PRs created (expected: 2)
   - alpha review cycle: CHANGES_REQUESTED posted? Sub-TL pushed fixes? [FIXES PUSHED] delivered?
-  - beta review cycle: CHANGES_REQUESTED posted? Gemini pushed fixes? [FIXES PUSHED] delivered?
+  - beta review cycle: CHANGES_REQUESTED posted? Codex pushed fixes? [FIXES PUSHED] delivered?
   - Merges: both PRs merged via [FIXES PUSHED]?
 
   **Overall:** Total agents spawned, total PRs, total merges, failures.

@@ -38,7 +38,7 @@ Within a single TL's scope, work proceeds in waves. Wave N produces merged code.
 
 ### Branch Naming as Coordinate System
 
-`{parent}.{name}` (dot separator) encodes tree address, where `name = {slug}-{type}` (e.g., `auth-claude`, `oauth-provider-gemini`). `dev.auth-claude.oauth-provider-gemini` tells you: root is `dev`, first-level TL is `auth` (Claude), leaf is `oauth-provider` (Gemini). The last dot-segment IS the `AgentName` — one namespace, zero translation. PRs target the parent branch, not main — merged via recursive fold up the tree. The git DAG IS the computation trace.
+`{parent}.{name}` (dot separator) encodes tree address, where `name = {slug}-{type}` (e.g., `auth-claude`, `oauth-provider-codex`). `dev.auth-claude.oauth-provider-codex` tells you: root is `dev`, first-level TL is `auth` (Claude), leaf is `oauth-provider` (Codex). The last dot-segment IS the `AgentName` — one namespace, zero translation. PRs target the parent branch, not main — merged via recursive fold up the tree. The git DAG IS the computation trace.
 
 ---
 
@@ -123,7 +123,7 @@ if !status.success() {
 - **Server window**: Runs `exomonad serve` (the MCP server, binds to `.exo/server.sock`)
 - **TL window**: Runs `nix develop` (where you launch `claude` or work directly)
 
-The server must be running before Claude Code or Gemini can use MCP tools. Without it, every tool call fails. Init also writes `.mcp.json` (MCP server config) and `.claude/settings.local.json` (hooks and session settings).
+The server must be running before Claude Code or Codex can use MCP tools. Without it, every tool call fails. Init also writes `.mcp.json` (MCP server config) and `.claude/settings.local.json` (hooks and session settings).
 
 ```bash
 cd exomonad/                  # Run from the project root
@@ -154,9 +154,9 @@ exomonad shutdown                # Gracefully shut down the running server
 
 ### MCP Registration
 
-`exomonad init` automatically registers the Claude MCP server. For Gemini, register manually via stdio:
+`exomonad init` automatically registers the Claude MCP server. For Codex, register manually via stdio:
 ```bash
-gemini mcp add exomonad --command "exomonad mcp-stdio"
+codex mcp add exomonad --command "exomonad mcp-stdio"
 ```
 
 ### Zero-Config for Consuming Repos
@@ -223,7 +223,7 @@ shell_command = "nix develop" # environment wrapper for TL tab + server
 wasm_dir = ".exo/wasm"       # project-local (default), override for shared installs
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
 model = "sonnet"             # optional — passed as --model flag to root TL agent
-root_agent_type = "claude"   # claude | gemini | opencode | codex
+root_agent_type = "claude"   # claude | opencode | codex | shoal
 spawn_agent_type = "codex"   # default harness for workers, leaves, and companions
 # CLI flags override these values. Omitted effort is medium.
 tl_effort_level = "medium"
@@ -244,7 +244,7 @@ use_embedded_key = true  # true = use embedded key in opencode binary, false = u
 # tl_model/worker_model accept OpenCode model IDs; effort is sent as --variant.
 
 [reviewer]
-agent_type = "claude"     # claude | gemini | opencode | codex | shoal
+agent_type = "claude"     # claude | opencode | codex | shoal
 effort_level = "medium"  # reviewer-only override
 
 [extra_mcp_servers.notebooklm]
@@ -255,18 +255,20 @@ args = []
 # Companion agents spawned alongside the root TL during init.
 [[companions]]
 name = "sleeptime"
-agent_type = "claude"          # claude | gemini | opencode | codex | shoal | process
+agent_type = "claude"          # claude | opencode | codex | shoal | process
 role = "sleeptime"             # WASM role for MCP tools (default: "worker")
 command = "claude --dangerously-skip-permissions"
 task = "You are sleeptime"     # optional — omit for interactive session
 model = "haiku"                # optional — passed as --model flag to companion
 ```
 
+Gemini is retired; old configurations fail closed with: `agent_type 'gemini' is retired; use 'codex' (model gpt-luna). See CLAUDE.md Configuration.`
+
 **Role-specific harness and effort:** `--tl`, `--worker`, and `--reviewer` select the
 root, worker/companion, and reviewer harnesses independently. Effort precedence is
 CLI flag > local config > global config > medium default. Worker effort is inherited
 by forked TLs, leaves, ephemeral workers, and companions. OpenCode receives the
-resolved level as its model `--variant`; Gemini and Shoal log that effort is ignored.
+resolved level as its model `--variant`; Codex and Shoal log that effort is ignored.
 
 **Multiple git remotes:** By default, PR/CI operations (`file_pr`, `merge_pr`, the
 Forgejo watcher, and pushes) auto-detect the git remote to use, preferring one
@@ -291,7 +293,7 @@ automatically. Omit the flag to keep today's auto-detect behavior.
 
 The `SessionStart` hook is critical — it registers the Claude session UUID in `ClaudeSessionRegistry`, which `fork_wave` reads to pass `--resume <uuid> --fork-session` for context inheritance. Without it, spawned subtrees start with no context.
 
-Gemini agents get settings via `GEMINI_CLI_SYSTEM_SETTINGS_PATH` env var (NOT `.gemini/settings.json`).
+Codex agents use per-agent `.codex/config.toml` files for MCP and hook settings.
 
 **Claude Code settings help:** We have a Claude Code configuration specialist (preloaded with official documentation) available as an oracle for hook syntax, settings structure, MCP setup, and debugging.
 
@@ -330,7 +332,7 @@ Each Claude companion worktree contains:
 - `.exo/server.sock` — symlink to project root's server socket
 - `.git` — worktree git file pointing to the main repo
 
-Worktrees persist across `--recreate` (only the tmux session is torn down). Gemini/Shoal companions use their existing env-var/flag-based config approach.
+Worktrees persist across `--recreate` (only the tmux session is torn down). Codex/Shoal companions use their existing env-var/flag-based config approach.
 
 **Process companions** (`agent_type = "process"`) are plain long-running processes — no MCP config, no agent identity, no worktree, no hooks. Just a command in a tmux window. Use for mock servers, log tailers, or any background process that should live alongside the session.
 
@@ -350,7 +352,7 @@ Spawn heterogeneous agent teams as a recursive tree:
 - **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
 - **`spawn_codex`** — Spawn a Codex leaf agent in its own worktree+branch. Files PR when done.
 
-**Agent Types:** `Claude` (🤖), `Gemini` (💎), `OpenCode` (💻), `Codex` (🤖), `Shoal` (🌊). Codex agents use per-agent `.codex/config.toml` for MCP/instructions and a shared ExoMonad-managed hook block in the Codex user config for shell-native hooks. Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
+**Agent Types:** `Claude` (🤖), `OpenCode` (💻), `Codex` (🤖), `Shoal` (🌊). Codex agents use per-agent `.codex/config.toml` for MCP/instructions and a shared ExoMonad-managed hook block in the Codex user config for shell-native hooks. Shoal is for custom binary agents that connect via rmcp MCP client and receive notifications via HTTP-over-Unix-domain-socket at `.exo/agents/{name}/notify.sock`.
 
 **Multi-WASM:** The server loads multiple WASM modules from `.exo/wasm/`. Convention: if `wasm-guest-{role}.wasm` exists, it's used for that role; otherwise falls back to `wasm-guest-{wasm_name}.wasm` (default). Drop a WASM file, it's available.
 
@@ -373,7 +375,7 @@ Push-based parallel worker coordination via **Claude Code Teams inbox**:
 
 This is **native Claude Code Teams integration**. Messages from child agents arrive exactly like messages from Claude Code teammates — structured, attributed, and delivered through the official inbox mechanism. The TL doesn't poll, doesn't block, and doesn't parse raw text. It gets a proper teammate notification.
 
-Teams inbox registration and delivery are Claude Code-only. OpenCode, Codex, Gemini, and Shoal agents use their supported non-Teams delivery paths until those runtimes expose native team inbox support.
+Teams inbox registration and delivery are Claude Code-only. OpenCode, Codex, and Shoal agents use their supported non-Teams delivery paths until those runtimes expose native team inbox support.
 
 **Pipeline:** `notify_parent` → server resolves parent via `TeamRegistry` → `teams_mailbox::write_to_inbox()` → CC InboxPoller → `<teammate-message>` delivered to parent conversation.
 
@@ -401,7 +403,7 @@ Teams inbox registration and delivery are Claude Code-only. OpenCode, Codex, Gem
 | **Coordination mutexes** | Built. In-memory `MutexRegistry` with FIFO wait queues, TTL auto-expiry, idempotent acquire. Effect-only (`coordination.acquire_mutex`, `coordination.release_mutex`) — no MCP tool exposed. |
 | **Tempo observability** | **Built.** Grafana Tempo for lightweight trace storage (~100-200MB RAM). Agents query traces via `curl` + TraceQL against Tempo's HTTP API (port 3200). Optional Grafana UI at `http://localhost:3000`. |
 | **NotebookLM MCP** (optional) | **Vendored.** `vendor/notebooklm-mcp/` — stdio MCP server that automates Google NotebookLM via browser automation. Source-grounded, citation-backed answers from uploaded documentation. Opt-in via `extra_mcp_servers` in `config.toml`. |
-| **OpenCode hooks** (TypeScript plugin bridge) | **Built.** OpenCode agents get `tool.execute.before` / `tool.execute.after` / `event` hooks via a Bun TypeScript plugin written to `.exo/opencode-plugin/` at spawn time. The plugin shells out to `exomonad hook <event> --runtime opencode`, routing to the same WASM dispatch path as Claude Code and Gemini hooks. Enables role-based tool filtering and MCP call context steering (e.g. enforcing `file_pr` body format, `notify_parent` vocabulary). See `docs/decisions/opencode-hooks.md`. |
+| **OpenCode hooks** (TypeScript plugin bridge) | **Built.** OpenCode agents get `tool.execute.before` / `tool.execute.after` / `event` hooks via a Bun TypeScript plugin written to `.exo/opencode-plugin/` at spawn time. The plugin shells out to `exomonad hook <event> --runtime opencode`, routing to the same WASM dispatch path as Claude Code and Codex hooks. Enables role-based tool filtering and MCP call context steering (e.g. enforcing `file_pr` body format, `notify_parent` vocabulary). See `docs/decisions/opencode-hooks.md`. |
 | **Codex hooks and config** | **Built.** Codex agents share `.codex/config.toml`, the ExoMonad MCP server, developer instructions, optional model, extra MCP servers, shell hooks, and lifecycle dispatch. ExoMonad installs shared Codex hook commands for `PreToolUse`, `PostToolUse`, and `Stop` into the active Codex user config so spawned worktrees do not create new hook trust prompts. Hook commands call `exomonad hook <event> --runtime codex` and use the same WASM dispatch path as the other runtimes. See `docs/decisions/codex-integration.md` and `docs/decisions/codex-hook-wire-format.md`. |
 
 ### Tempo Observability
@@ -453,8 +455,8 @@ Human in tmux session
             ├── MCP tools via WASM (fork_wave, spawn_leaf, spawn_worker, etc.)
             └── Agent tree:
                 ├── worktree: dev.feature-a (TL role, can spawn children)
-                │   ├── worker: rust-impl (Gemini, in-place pane)
-                │   └── worker: haskell-impl (Gemini, in-place pane)
+                │   ├── worker: rust-impl (Codex, in-place pane)
+                │   └── worker: haskell-impl (Codex, in-place pane)
                 └── worktree: dev.feature-b (TL role)
                     └── ...
 ```
@@ -604,7 +606,7 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
 4. **`exomonad init`** — Last line of the script. Creates tmux session, starts server, spawns companions, attaches.
 
 **Companion roles:**
-- **Test subject** — The agent being tested (e.g., Gemini with dev role for hook rewriting)
+- **Test subject** — The agent being tested (e.g., Codex with dev role for hook rewriting)
 - **Testrunner** — Claude (haiku) companion with `testrunner` role. Observes results via bash (read-only), reports via `notify_parent`
 
 **Key conventions:**
@@ -643,16 +645,16 @@ Use sub-TLs to keep each context window sharp. If a task decomposes into more th
 
 ### Intelligence Gradient
 
-Claude (Opus) decomposes and dispatches. Gemini implements. Reviewer agent reviews. The TL never implements directly and never manually reviews intermediate output.
+Claude (Opus) decomposes and dispatches. Codex implements. Reviewer agent reviews. The TL never implements directly and never manually reviews intermediate output.
 
-**Cost model:** Opus tokens are 10-30x Gemini tokens. Every line of code the TL writes is expensive code. Every review cycle the TL performs is an expensive review cycle. The TL's job is producing specs sharp enough that the leaf + reviewer convergence loop handles quality without TL involvement.
+**Cost model:** Opus tokens are 10-30x Codex tokens. Every line of code the TL writes is expensive code. Every review cycle the TL performs is an expensive review cycle. The TL's job is producing specs sharp enough that the leaf + reviewer convergence loop handles quality without TL involvement.
 
 ### Fire-and-Forget Execution
 
 The TL's workflow is: **decompose → spec → spawn → move on**. The TL does not wait, poll, review intermediate output, or re-spec. It spawns all leaves it can, then idles until messages arrive.
 
 **Convergence is leaf + reviewer + event handlers, not TL:**
-1. TL writes spec, spawns leaf (Gemini), returns immediately
+1. TL writes spec, spawns leaf (Codex), returns immediately
 2. Leaf works → commits → files PR
 3. Worktree event watcher detects reviewer agent review comments → fires `handle_event(PRReview::ReviewReceived)` → handler injects comments into leaf's pane
 4. Leaf reads reviewer feedback, fixes, pushes
@@ -677,14 +679,14 @@ The TL's workflow is: **decompose → spec → spawn → move on**. The TL does 
 Since the TL doesn't iterate on specs, the v1 spec must be production-quality. Every spec follows this structure:
 
 ```
-1. ANTI-PATTERNS      — Known Gemini failure modes as explicit "DO NOT" rules (FIRST)
+1. ANTI-PATTERNS      — Known Codex failure modes as explicit "DO NOT" rules (FIRST)
 2. READ FIRST         — Exact files to read (CLAUDE.md, source files, proto files)
 3. STEPS              — Numbered, each step = one concrete action with code snippets
 4. VERIFY             — Exact build/test commands with env vars (PROTOC path, etc.)
 5. DONE CRITERIA      — What "done" looks like (tests pass, PR filed)
 ```
 
-**Anti-patterns section is mandatory and comes first.** These are known Gemini failure modes — front-load them so the agent reads them before touching code:
+**Anti-patterns section is mandatory and comes first.** These are known Codex failure modes — front-load them so the agent reads them before touching code:
 
 | Known Failure Mode | Anti-Pattern Rule |
 |---|---|
@@ -697,7 +699,7 @@ Since the TL doesn't iterate on specs, the v1 spec must be production-quality. E
 
 **Key rules:**
 - **One agent = one focused change.** If it touches >3 files or requires architectural decisions, split it.
-- **Include complete code.** Don't describe what to write — show the exact code. Gemini executes better from examples than descriptions.
+- **Include complete code.** Don't describe what to write — show the exact code. Codex executes better from examples than descriptions.
 - **Include exact commands.** Not "run the tests" but `PROTOC=/nix/store/... cargo test --workspace`.
 - **Name every file.** Not "update the proto" but "edit `proto/effects/agent.proto` AND `rust/exomonad-proto/proto/effects/agent.proto`".
 - **Specs are self-contained.** The leaf has no context from previous attempts. Every spec must stand alone with complete code snippets and full file paths.

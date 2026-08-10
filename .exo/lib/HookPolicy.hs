@@ -80,7 +80,6 @@ implementerToolsFor :: Runtime -> [Text]
 implementerToolsFor Claude = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
 implementerToolsFor Codex = ["apply_patch", "str_replace_editor", "edit_file"]
 implementerToolsFor OpenCode = ["edit", "write", "patch"]
-implementerToolsFor Gemini = []
 
 reviewerGitAuthorMutationMessage :: Text
 reviewerGitAuthorMutationMessage =
@@ -152,7 +151,6 @@ shellToolsFor :: Runtime -> [Text]
 shellToolsFor Claude = []
 shellToolsFor Codex = ["shell", "Bash"]
 shellToolsFor OpenCode = ["shell", "bash", "run_command"]
-shellToolsFor Gemini = []
 
 commandWritesFiles :: Text -> Bool
 commandWritesFiles cmd =

@@ -16,9 +16,9 @@ Run ExoMonad on any GitHub repository. One command, clean container, no setup.
 
 **Optional:**
 - `GITHUB_TOKEN` — enables `gh` CLI, PR workflows, agent spawning
-- Gemini CLI logged in on host — enables Gemini agent spawning
+- Codex CLI logged in on host — enables Codex agent spawning
 
-Auth is automatic: `~/.claude` and `~/.gemini` are mounted from the host, so the container reuses your existing subscriptions and credentials. No API keys needed.
+Auth is automatic: `~/.claude` and `~/.codex` are mounted from the host, so the container reuses your existing subscriptions and credentials. No API keys needed.
 
 ## What Happens
 
@@ -35,7 +35,7 @@ Auth is automatic: `~/.claude` and `~/.gemini` are mounted from the host, so the
 
 Once in the tmux session:
 - **TL window**: Run `claude` to start Claude Code with full MCP tool access
-- **Spawn agents**: Use `spawn_leaf_subtree` to fork Gemini workers into worktrees
+- **Spawn agents**: Use `spawn_leaf_subtree` to fork Codex workers into worktrees
 - **File PRs**: Agents call `file_pr` to create pull requests
 - **Coordinate**: `notify_parent` delivers messages between agents via Teams inbox
 
@@ -74,7 +74,7 @@ Expected. The WASM is pre-built — roles are only needed for WASM compilation, 
 Host (your machine)
   ├── ~/.claude/                  ──mount──►  /home/exo/.claude/     (auth + cache)
   ├── ~/.claude.json              ──mount──►  /home/exo/.claude.json (config)
-  ├── ~/.gemini/                  ──mount──►  /home/exo/.gemini/     (auth + cache)
+  ├── ~/.codex/                  ──mount──►  /home/exo/.codex/     (auth + cache)
   └── docker run -it exomonad-try
         └── Container (Ubuntu 24.04, user: exo)
               ├── /usr/local/bin/exomonad     (Rust binary, built in Docker)

@@ -218,7 +218,7 @@ hookHandler config = do
 
     handleStopHook :: HookInput -> (HookInput -> Eff Effects StopHookOutput) -> IO Value
     handleStopHook hookInput hook = do
-      -- Extract agent ID from hook input or fallback to current working directory (e.g., "gh-453-gemini")
+      -- Extract agent ID from hook input or fallback to current working directory (e.g., "gh-453-retired")
       cwd <- getCurrentDirectory
       let agentId = fromMaybe (T.pack $ takeFileName cwd) (hiAgentId hookInput)
 
@@ -240,15 +240,7 @@ hookHandler config = do
           -- Run the hook from config (using Freer effects)
           result <- runHookEff (hook hookInput)
 
-          -- Check if runtime is Gemini and override Block to Allow
-          -- Fix for infinite loop: Gemini agents retry forever on block
-          let isGemini = hiRuntime hookInput == Just Gemini
-          let finalResult = case result of
-                Done rawResult ->
-                  if isGemini && decision rawResult == Block
-                    then Done (rawResult {decision = Allow, reason = Nothing})
-                    else Done rawResult
-                Suspend k req -> Suspend k req
+          let finalResult = result
 
           -- Log the decision
           case finalResult of

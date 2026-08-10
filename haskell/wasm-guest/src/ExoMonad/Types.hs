@@ -62,9 +62,9 @@ data HookConfig = HookConfig
     onSubagentStop :: HookInput -> Eff Effects StopHookOutput,
     -- | Called on session start. Default: registers Claude session ID for fork-session.
     onSessionStart :: HookInput -> Eff Effects HookOutput,
-    -- | Gemini BeforeModel hook. Can bypass the LLM with a synthetic response.
+    -- | BeforeModel hook. Can bypass the LLM with a synthetic response.
     beforeModel :: HookInput -> Eff Effects BeforeModelOutput,
-    -- | Gemini AfterModel hook. Fires per LLM response chunk, enables rewriting.
+    -- | AfterModel hook. Fires per LLM response chunk, enables rewriting.
     afterModel :: HookInput -> Eff Effects AfterModelOutput
   }
 

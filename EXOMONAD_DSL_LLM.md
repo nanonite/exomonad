@@ -209,7 +209,7 @@ data HookInput = HookInput
   , hiToolResponse      :: Maybe Value      -- PostToolUse only
   , hiAgentId           :: Maybe Text
   , hiExomonadSessionId :: Maybe Text       -- Parent session ID
-  , hiRuntime           :: Maybe Runtime    -- Claude or Gemini
+  , hiRuntime           :: Maybe Runtime    -- Claude or Codex
   , hiCwd               :: Maybe Text
   , hiTranscriptPath    :: Maybe Text
   }

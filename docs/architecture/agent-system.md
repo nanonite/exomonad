@@ -21,9 +21,9 @@ Five roles. Each agent is `worktree + context-window + actor`, born and torn dow
 |------|-------|--------|----------|-----------|-----------|
 | `root` | Opus | yes | no | yes | persistent (TL window) |
 | `tl` | Opus | yes | yes | yes | per-subtree |
-| `dev` | Codex / Gemini / OpenCode | no | yes | no | one assignment per invocation, exits after handoff |
-| `reviewer` | Codex / Gemini / OpenCode | no | no | no | ephemeral per review round |
-| `worker` | Codex / Gemini / OpenCode | no | no | no | ephemeral, same-worktree edits |
+| `dev` | Codex / OpenCode | no | yes | no | one assignment per invocation, exits after handoff |
+| `reviewer` | Codex / OpenCode | no | no | no | ephemeral per review round |
+| `worker` | Codex / OpenCode | no | no | no | ephemeral, same-worktree edits |
 
 ---
 
@@ -110,7 +110,7 @@ Authority summary: **issue decomposition and lifecycle authority lives at the TL
 
 ### Messaging inboxes
 
-Message delivery is serialized per recipient. Claude Code uses its native Teams inbox and InboxPoller. Codex, Gemini tmux fallback, OpenCode, and future runtimes without a native inbox route through ExoMonad's per-agent FIFO inbox with one consumer task per agent; see [cross-runtime-message-inbox.md](../decisions/cross-runtime-message-inbox.md).
+Message delivery is serialized per recipient. Claude Code uses its native Teams inbox and InboxPoller. Codex tmux fallback, OpenCode, and future runtimes without a native inbox route through ExoMonad's per-agent FIFO inbox with one consumer task per agent; see [cross-runtime-message-inbox.md](../decisions/cross-runtime-message-inbox.md).
 
 **Reserved alias `parent`.** The literal string `parent` is not an agent name — it is a reserved alias meaning "the caller's parent". To reach your parent, call `notify_parent`; never address a message to the literal recipient `parent`. The two delivery entrypoints treat it differently, on purpose: `notify_parent` accepts `parent` as a sentinel and resolves it to the real parent agent before delivery, while `send_message` **rejects** it (peer messaging requires a concrete agent name). No inbox row is ever written under `to_agent = "parent"`.
 

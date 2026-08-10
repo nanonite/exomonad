@@ -16,7 +16,7 @@ result/
 .bv/
 docker/orchestrator/ssh-keys/
 docker/claude-agent/orchestrator.pub
-.gemini-clipboard/
+.codex-clipboard/
 result
 
 # WASM freeze files
@@ -102,7 +102,7 @@ tests/integration/external-consumer/.exo/wasm/
 
 # Jujutsu state
 .jj/
-.gemini/settings.json
+.codex/settings.json
 
 # Local lolearn database
 .lolearn/knowledge.db
@@ -147,7 +147,7 @@ opencode-*.md
 
 
 .lolearn
-.gemini
+.codex
 
 # Debug-only TL autonomy benchmark raw outputs
 /experiments/tl-autonomy/*/*

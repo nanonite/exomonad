@@ -2,7 +2,7 @@
 
 ## Context
 
-ExoMonad's hook system gives Claude Code and Gemini agents behavioral guardrails and context steering at tool call boundaries. Claude Code hooks work via `settings.local.json` + `exomonad hook <event>` shell commands. Gemini hooks work the same way via `settings.json`. Both ultimately call `exomonad hook <event> --runtime <runtime>` which reads JSON stdin, forwards to the WASM server, and returns a `HookEnvelope`.
+ExoMonad's hook system gives Claude Code and Codex agents behavioral guardrails and context steering at tool call boundaries. Claude Code hooks work via `settings.local.json` + `exomonad hook <event>` shell commands. Codex hooks work the same way via its project configuration. Both ultimately call `exomonad hook <event> --runtime <runtime>` which reads JSON stdin, forwards to the WASM server, and returns a `HookEnvelope`.
 
 OpenCode agents were excluded from hooks because OpenCode doesn't support the shell-command-in-JSON-config model. The `opencode.json` configuration has no `hooks` key.
 

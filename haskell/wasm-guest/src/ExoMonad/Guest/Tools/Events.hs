@@ -209,7 +209,7 @@ sendMessageAddress args =
     }
 
 sendTmuxMessageDescription :: Text
-sendTmuxMessageDescription = "Send a message to an exomonad-spawned agent by injecting it into that agent's tmux pane. Use this for Codex, OpenCode, Gemini, and any non-Claude runtime, or when you need to steer a live pane directly."
+sendTmuxMessageDescription = "Send a message to an exomonad-spawned agent by injecting it into that agent's tmux pane. Use this for Codex, OpenCode, Retired, and any non-Claude runtime, or when you need to steer a live pane directly."
 
 sendMailboxMessageDescription :: Text
 sendMailboxMessageDescription = "Send a message through the Claude Teams inbox mailbox protocol. This only works when the current session has mailbox support configured and validated."

@@ -12,7 +12,7 @@ The nemotron-port run exposed message pile-up in non-Claude runtimes: several me
 
 The root cause is that the tmux injection lock serializes injection calls, not message consumption. It can prevent two writes from happening at the same instant, but it cannot prove the runtime has accepted, processed, and returned to an idle prompt before the next message arrives. Codex multi-line input mode made this worse by breaking the absence heuristic from #314: the pasted payload could disappear from the visible buffer without the runtime having actually consumed the submitted message.
 
-This is a harness-agnosticism failure. Claude Code has a native Teams inbox and InboxPoller, so delivery is serialized by the harness. Codex, Gemini, OpenCode, and future tmux-backed runtimes need the same guarantee from ExoMonad instead of relying on runtime-specific input quirks.
+This is a harness-agnosticism failure. Claude Code has a native Teams inbox and InboxPoller, so delivery is serialized by the harness. Codex, OpenCode, and future tmux-backed runtimes need the same guarantee from ExoMonad instead of relying on runtime-specific input quirks.
 
 ## Decision
 
@@ -33,7 +33,7 @@ The inbox belongs to message delivery, not to agent phase state. Runtime-specifi
 |---------|--------------|----------|-------|
 | Claude Code | Teams inbox (`~/.claude/teams/{team}/inboxes/`) | InboxPoller (native) | Already serialized; ExoMonad path unchanged |
 | Codex | ExoMonad `AgentInbox` | ExoMonad consumer task | Tmux injection; multi-line input mode needs positive-signal verification |
-| Gemini | ExoMonad `AgentInbox` | ExoMonad consumer task | Tmux injection fallback until a runtime-native mailbox is available |
+| Codex | ExoMonad `AgentInbox` | ExoMonad consumer task | Tmux injection fallback until a runtime-native mailbox is available |
 | OpenCode | ExoMonad `AgentInbox` | ExoMonad consumer task | Stub until OpenCode integration matures |
 
 ## Out Of Scope

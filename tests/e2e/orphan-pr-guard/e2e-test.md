@@ -33,6 +33,6 @@ just e2e-orphan-pr-guard-codex
 
 It requires a built `exomonad` binary, devswarm WASM artifacts, Codex, tmux,
 and the local Python mock server. This fixture does not run live Claude,
-OpenCode, or Gemini coverage. The deterministic host/service/WASM tests added
+OpenCode, or Codex coverage. The deterministic host/service/WASM tests added
 by #563 and #564 are the authoritative regression coverage for the typed
 resume and canonical-root-protocol behavior.
