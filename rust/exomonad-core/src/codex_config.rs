@@ -196,6 +196,7 @@ fn update_codex_user_config(
     let lock_path = parent.join(".exomonad-config.lock");
     let lock_file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(lock_path)?;
     let _lock = lock_exclusive(lock_file)?;

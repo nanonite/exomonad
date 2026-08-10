@@ -409,7 +409,7 @@ mod tests {
             .unwrap()
             .parse::<usize>()
             .unwrap();
-        assert_eq!(length, body.as_bytes().len());
+        assert_eq!(length, body.len());
         assert_eq!(serde_json::from_str::<Value>(body).unwrap(), msg);
     }
 

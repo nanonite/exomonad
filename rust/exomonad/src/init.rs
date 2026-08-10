@@ -697,7 +697,7 @@ fn parse_opencode_model_catalog(
         let id = object
             .get("id")
             .and_then(Value::as_str)
-            .or_else(|| label.as_deref());
+            .or(label.as_deref());
         let provider = object.get("providerID").and_then(Value::as_str);
         let variants: std::collections::BTreeSet<String> = object
             .get("variants")
@@ -923,6 +923,8 @@ fn agent_configuration_environment(config: &Config) -> String {
 }
 
 /// Run the init command: create or attach to tmux session.
+// The CLI exposes these independent initialization options as separate flags.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     session_override: Option<String>,
     recreate: bool,
@@ -2693,12 +2695,14 @@ mod tests {
     #[test]
     fn append_init_invocation_log_records_resolved_worker_type() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.tmux_session = "RustDebuggerRepo".to_string();
-        config.root_agent_type = AgentType::Claude;
-        config.spawn_agent_type = AgentType::OpenCode;
+        let mut config = Config {
+            tmux_session: "RustDebuggerRepo".to_string(),
+            root_agent_type: AgentType::Claude,
+            spawn_agent_type: AgentType::OpenCode,
+            model: Some("sonnet".to_string()),
+            ..Config::default()
+        };
         config.reviewer.agent_type = AgentType::Codex;
-        config.model = Some("sonnet".to_string());
         config.opencode.worker_model = Some("opencode-go/deepseek-v4-pro".to_string());
 
         append_init_invocation_log(

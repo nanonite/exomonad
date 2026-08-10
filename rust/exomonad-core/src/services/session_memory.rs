@@ -10,8 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_LIST_LIMIT: usize = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MemoryKind {
+    #[default]
     Unspecified,
     OriginalPlan,
     WavePlan,
@@ -27,12 +28,6 @@ pub enum MemoryKind {
     HumanClarification,
     SessionSummary,
     TurnEnd,
-}
-
-impl Default for MemoryKind {
-    fn default() -> Self {
-        Self::Unspecified
-    }
 }
 
 impl MemoryKind {

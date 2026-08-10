@@ -4847,7 +4847,7 @@ mod tests {
         let identity = AgentIdentity::new("fresh-leaf".to_string(), ServiceAgentType::Codex);
         let branch = BirthBranch::try_from_str("release/2026")
             .unwrap()
-            .child(&identity.internal_name().to_string());
+            .child(identity.internal_name().as_ref());
         assert_eq!(branch.to_string(), "release/2026.fresh-leaf-codex");
         assert_ne!(branch.to_string(), "old-pr-head");
     }

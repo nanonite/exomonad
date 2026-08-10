@@ -57,9 +57,10 @@ pub struct CiPolicy {
     pub gate: CiGate,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CiGate {
+    #[default]
     Auto,
     On,
     Off,
@@ -68,12 +69,6 @@ pub enum CiGate {
 impl Default for CiPolicy {
     fn default() -> Self {
         Self { gate: CiGate::Auto }
-    }
-}
-
-impl Default for CiGate {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 
@@ -187,16 +182,20 @@ mod tests {
 
     #[test]
     fn test_path_triggers_external_proto() {
-        let mut p = ReviewPolicy::default();
-        p.external_review_paths = vec!["proto/**".to_string()];
+        let p = ReviewPolicy {
+            external_review_paths: vec!["proto/**".to_string()],
+            ..ReviewPolicy::default()
+        };
         assert!(p.path_triggers_external_review("proto/exomonad.proto"));
         assert!(!p.path_triggers_external_review("rust/main.rs"));
     }
 
     #[test]
     fn test_path_triggers_empty_when_no_patterns() {
-        let mut p = ReviewPolicy::default();
-        p.external_review_paths = vec![];
+        let p = ReviewPolicy {
+            external_review_paths: Vec::new(),
+            ..ReviewPolicy::default()
+        };
         assert!(!p.path_triggers_external_review("proto/exomonad.proto"));
     }
 

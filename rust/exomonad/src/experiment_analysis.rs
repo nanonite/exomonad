@@ -28,7 +28,7 @@ struct CellManifest {
 
 #[derive(Debug)]
 struct MetricRow {
-    seed: u64,
+    _seed: u64,
     worker_condition: String,
     ticket_count: usize,
     worker_failures: usize,
@@ -111,7 +111,7 @@ fn parse_metrics(contents: &str) -> Result<Vec<MetricRow>> {
                 bail!("metrics row has {} fields, expected 13", fields.len());
             }
             Ok(MetricRow {
-                seed: fields[0].parse()?,
+                _seed: fields[0].parse()?,
                 worker_condition: fields[1].to_string(),
                 ticket_count: fields[2].parse()?,
                 worker_failures: fields[4].parse()?,
@@ -400,7 +400,7 @@ mod tests {
         );
         let rows = parse_metrics(csv).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].seed, 1);
+        assert_eq!(rows[0]._seed, 1);
         assert_eq!(rows[0].turn_end_reason, "exited");
     }
 

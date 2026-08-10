@@ -424,9 +424,8 @@ mod tests {
             "main.tl-auth-claude.fix-oauth-gemini",
         ];
         for case in &cases {
-            let head =
-                BranchName::try_from_str(*case).expect("validated string input is non-empty");
-            let expected = BirthBranch::try_from_str(*case)
+            let head = BranchName::try_from_str(case).expect("validated string input is non-empty");
+            let expected = BirthBranch::try_from_str(case)
                 .expect("validated string input is non-empty")
                 .parent()
                 .map(|p| {

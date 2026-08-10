@@ -17,26 +17,30 @@ struct MockServer {
 impl MockServer {
     /// Start mock_github.py on an ephemeral port.
     fn start() -> Self {
-        let port = pick_free_port();
         let mock_script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/mock_github.py");
 
-        let child = Command::new("python3")
-            .args([mock_script.to_str().unwrap(), "--port", &port.to_string()])
-            .env("MOCK_LOG", "/dev/null")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to start mock_github.py");
+        for _ in 0..8 {
+            let port = pick_free_port();
+            let port_arg = port.to_string();
+            let mut child = Command::new("python3")
+                .args([mock_script.to_str().unwrap(), "--port", &port_arg])
+                .env("MOCK_LOG", "/dev/null")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("Failed to start mock_github.py");
 
-        // Wait until the server is listening
-        for _ in 0..40 {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return Self { child, port };
+            for _ in 0..40 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Self { child, port };
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        panic!("mock_github.py did not start within 2s on port {}", port);
+        panic!("mock_github.py did not start after retrying eight ports");
     }
 
     fn base_url(&self) -> String {
@@ -46,7 +50,7 @@ impl MockServer {
     fn octocrab(&self) -> octocrab::Octocrab {
         OctocrabBuilder::new()
             .personal_token("test-token".to_string())
-            .base_uri(&self.base_url())
+            .base_uri(self.base_url())
             .unwrap()
             .build()
             .unwrap()

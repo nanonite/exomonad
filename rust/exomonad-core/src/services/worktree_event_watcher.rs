@@ -2891,6 +2891,9 @@ fn compute_pr_actions(
     )
 }
 
+// The watcher state machine keeps these independent observations explicit so
+// each callsite documents which persisted and live signals it supplied.
+#[allow(clippy::too_many_arguments)]
 fn compute_pr_actions_with_context(
     old_state: &mut WatchState,
     pr_number: PRNumber,

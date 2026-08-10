@@ -438,7 +438,7 @@ fn mock_pr(number: u64, branch: String, head_sha: String) -> PrEntry {
 }
 
 fn scripted_failure(seed: u64, ticket_index: usize) -> bool {
-    (seed.wrapping_mul(31).wrapping_add(ticket_index as u64 * 17)) % 4 == 0
+    (seed.wrapping_mul(31).wrapping_add(ticket_index as u64 * 17)).is_multiple_of(4)
 }
 
 fn simulated_turn_end_reason(cell: &Cell) -> &'static str {
@@ -511,7 +511,7 @@ fn parse_issue_id(output: &str) -> Option<u64> {
         let candidate = line
             .trim()
             .strip_prefix('#')
-            .or_else(|| line.trim().split_whitespace().next())?;
+            .or_else(|| line.split_whitespace().next())?;
         candidate.parse::<u64>().ok()
     })
 }

@@ -1054,19 +1054,19 @@ mod tests {
         let temp = TempDir::new()?;
         let source = temp.path().join("events.jsonl");
         let mut file = File::create(&source)?;
-        writeln!(file, "{}", r#"{"event_id":"e1","type":"custom.one"}"#)?;
+        let first_event = r#"{"event_id":"e1","type":"custom.one"}"#;
+        writeln!(file, "{first_event}")?;
         file.sync_all()?;
         import_sources(&options(temp.path(), source.clone()))?;
         let mut file = File::create(&source)?;
-        writeln!(
-            file,
-            "{}",
-            r#"{"event_id":"e2","type":"event.superseded","superseded_event_id":"e1"}"#
-        )?;
+        let superseding_event =
+            r#"{"event_id":"e2","type":"event.superseded","superseded_event_id":"e1"}"#;
+        writeln!(file, "{superseding_event}")?;
         file.sync_all()?;
         import_sources(&options(temp.path(), source.clone()))?;
         let mut file = File::create(&source)?;
-        writeln!(file, "{}", r#"{"event_id":"e3","type":"custom.three"}"#)?;
+        let replacement_event = r#"{"event_id":"e3","type":"custom.three"}"#;
+        writeln!(file, "{replacement_event}")?;
         file.sync_all()?;
         import_sources(&options(temp.path(), source))?;
 
@@ -1154,7 +1154,7 @@ mod tests {
         drop(connection);
         let summary = import_sources(&options(temp.path(), source.clone()))?;
         assert_eq!(summary.rows_read, 1);
-        assert_eq!(fs::metadata(source)?.len() > 0, true);
+        assert!(fs::metadata(source)?.len() > 0);
         Ok(())
     }
 }

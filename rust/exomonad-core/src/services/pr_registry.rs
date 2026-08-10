@@ -149,24 +149,20 @@ pub async fn publish_verified_head(
     Ok(PublicationDisposition::Added)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrState {
+    #[default]
     Open,
     Merged,
     Closed,
     Stuck,
 }
 
-impl Default for PrState {
-    fn default() -> Self {
-        Self::Open
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgejoReviewState {
+    #[default]
     PendingReview,
     Commented,
     ChangesRequested,
@@ -213,12 +209,6 @@ pub struct ReviewerAttempt {
     pub finished_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
-}
-
-impl Default for ForgejoReviewState {
-    fn default() -> Self {
-        Self::PendingReview
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

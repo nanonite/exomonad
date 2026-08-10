@@ -19,18 +19,13 @@ pub const ONE_SHOT_LIFECYCLE_ENV: &str = "EXOMONAD_ONE_SHOT_LIFECYCLE";
 /// observations without changing authoritative workflow transitions, while
 /// `disabled` makes that choice explicit and observable. Neither mode restores
 /// stale pane or root-pane fallback behavior.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OneShotLifecycleMode {
+    #[default]
     Enabled,
     Shadow,
     Disabled,
-}
-
-impl Default for OneShotLifecycleMode {
-    fn default() -> Self {
-        Self::Enabled
-    }
 }
 
 impl OneShotLifecycleMode {
@@ -393,7 +388,7 @@ mod tests {
             Ok(OneShotLifecycleMode::Disabled)
         );
         assert!(OneShotLifecycleMode::parse("root-fallback").is_err());
-        assert!(OneShotLifecycleMode::Disabled.checks_enabled() == false);
+        assert!(!OneShotLifecycleMode::Disabled.checks_enabled());
         assert!(OneShotLifecycleMode::Shadow.checks_enabled());
     }
 

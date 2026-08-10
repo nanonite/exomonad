@@ -603,18 +603,17 @@ fn format_codex_post_tool_use(envelope: HookEnvelope) -> HookEnvelope {
         object.insert("systemMessage".to_string(), Value::String(system_message));
     }
 
-    if let Some(HookSpecificOutput::PostToolUse { additional_context }) =
-        output.hook_specific_output
+    if let Some(HookSpecificOutput::PostToolUse {
+        additional_context: Some(additional_context),
+    }) = output.hook_specific_output
     {
-        if let Some(additional_context) = additional_context {
-            object.insert(
-                "hookSpecificOutput".to_string(),
-                serde_json::json!({
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": additional_context
-                }),
-            );
-        }
+        object.insert(
+            "hookSpecificOutput".to_string(),
+            serde_json::json!({
+                "hookEventName": "PostToolUse",
+                "additionalContext": additional_context
+            }),
+        );
     }
 
     codex_json_envelope(Value::Object(object))

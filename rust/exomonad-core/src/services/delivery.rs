@@ -1628,6 +1628,7 @@ mod tests {
     }
 
     /// Injector that fails its first `fail_times` calls, then succeeds.
+    #[allow(clippy::type_complexity)]
     fn flaky_injector(
         fail_times: u32,
     ) -> (

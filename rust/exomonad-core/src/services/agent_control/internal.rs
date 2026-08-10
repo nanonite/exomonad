@@ -1448,6 +1448,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(clippy::upper_case_acronyms)]
     type ACS = AgentControlService<crate::services::Services>;
 
     #[test]
@@ -2041,7 +2042,7 @@ mod tests {
         let env = service.common_spawn_env(&agent, &session_id, &role);
 
         assert!(
-            env.get("EXOMONAD_TMUX_SESSION").is_none(),
+            !env.contains_key("EXOMONAD_TMUX_SESSION"),
             "No tmux session should be set when not configured"
         );
     }
@@ -2213,7 +2214,7 @@ mod tests {
              (chainlink #259)"
         );
         assert!(
-            env_unset.get("CODEX_HOME").is_none(),
+            !env_unset.contains_key("CODEX_HOME"),
             "CODEX_HOME must NOT be present in the spawn env when unset in the parent \
              process — propagation is opt-in, not synthetic"
         );

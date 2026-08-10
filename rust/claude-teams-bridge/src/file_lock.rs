@@ -129,14 +129,10 @@ fn try_create_lock(lock_path: &Path, ttl: Duration) -> io::Result<()> {
         suffix
     ));
 
-    let file = match OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&temporary_lock_path)
-    {
-        Ok(file) => file,
-        Err(error) => return Err(error),
-    };
+        .open(&temporary_lock_path)?;
 
     let result = (|| {
         serde_json::to_writer(&file, &metadata).map_err(io::Error::other)?;
@@ -384,7 +380,7 @@ mod tests {
         let holder_result = holder.join().unwrap();
         clear_test_publication_gate();
 
-        assert_eq!(observed_breakable.unwrap(), false);
+        assert!(!observed_breakable.unwrap());
         assert!(holder_result.is_ok());
         fs::remove_file(lock_path).unwrap();
     }
