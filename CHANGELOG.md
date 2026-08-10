@@ -245,6 +245,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Document ExoMonad session logging mechanisms and events (#636)
 - feat: prefix continuation context onto spawn_leaf and resume_pr tasks (#626)
 - feat: inject continuation brief at root/TL SessionStart (#625)
 - feat: memory effect handler + memory_* MCP tools in Haskell WASM (#624)

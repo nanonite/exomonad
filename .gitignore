@@ -153,3 +153,6 @@ opencode-*.md
 /experiments/tl-autonomy/*/*
 !/experiments/tl-autonomy/*/REPORT.md
 !/experiments/tl-autonomy/*/ANALYSIS.json
+
+docs/markdown
+docs/pdfs
