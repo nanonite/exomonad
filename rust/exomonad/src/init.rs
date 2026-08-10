@@ -1141,6 +1141,14 @@ pub async fn run(
 
     let session = session_override.unwrap_or(config.tmux_session.clone());
     let session_alive = TmuxIpc::has_session(&session).await?;
+    let session_transition = if recreate {
+        exomonad_core::services::SessionTransition::Recreate
+    } else if session_alive {
+        exomonad_core::services::SessionTransition::Attach
+    } else {
+        exomonad_core::services::SessionTransition::Fresh
+    };
+    exomonad_core::services::transition_session(&cwd, session_transition, "exomonad init")?;
     if should_attach_existing_session(recreate, session_alive) {
         if reviewer_max_rounds.is_some() {
             anyhow::bail!(

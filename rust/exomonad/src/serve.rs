@@ -1337,6 +1337,8 @@ Run `exomonad recompile` first to build it.",
             Some(Arc::new(log))
         }
         Err(e) => {
+            let _ =
+                exomonad_core::services::sink_health::record_failure(&project_dir, &e.to_string());
             warn!(error = %e, "Failed to open event log, JSONL logging disabled");
             None
         }
@@ -1495,6 +1497,16 @@ Run `exomonad recompile` first to build it.",
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&server_pid_path);
     }
+
+    let session_state = exomonad_core::services::session_state::mark_server_started(
+        &project_dir,
+        "exomonad serve",
+    )?;
+    info!(
+        session_id = %session_state.session_id,
+        completeness_status = %session_state.completeness_status,
+        "Recorded authoritative session server start"
+    );
 
     // Write server.pid
     let pid_info = serde_json::json!({

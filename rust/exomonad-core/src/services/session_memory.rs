@@ -1,5 +1,7 @@
+use super::state_mirror::append_state_change;
 use anyhow::{Context, Result};
 use rusqlite::{params_from_iter, types::Value, Connection, OptionalExtension};
+use serde_json::json;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -258,6 +260,22 @@ impl SessionMemoryService {
             "Appended session memory record"
         );
         debug_assert_eq!(inserted, 1);
+        append_state_change(
+            &self.db_path,
+            "memory.state_changed",
+            json!({
+                "operation": "append",
+                "record_id": id,
+                "run_id": record.run_id,
+                "agent_id": record.agent_id,
+                "kind": kind,
+                "importance": record.importance,
+                "summary": record.summary,
+                "detail": record.detail,
+                "metadata_json": record.metadata_json,
+                "supersedes_id": record.supersedes_id
+            }),
+        );
         Ok(id)
     }
 

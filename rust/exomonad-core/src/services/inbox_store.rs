@@ -1,5 +1,7 @@
+use super::state_mirror::append_state_change;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,6 +80,11 @@ impl InboxStore {
              DELETE FROM agent_inbox_meta;",
         )
         .context("failed to clear inbox")?;
+        append_state_change(
+            &self.db_path,
+            "inbox.state_changed",
+            json!({"operation": "clear_all"}),
+        );
         Ok(())
     }
 
@@ -96,7 +103,21 @@ impl InboxStore {
             params![from_agent, normalized_to_agent, content, summary, created_at],
         )
         .context("failed to insert inbox message")?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        append_state_change(
+            &self.db_path,
+            "inbox.state_changed",
+            json!({
+                "operation": "write_message",
+                "message_id": id,
+                "from_agent": from_agent,
+                "to_agent": normalized_to_agent,
+                "content": content,
+                "summary": summary,
+                "created_at": created_at
+            }),
+        );
+        Ok(id)
     }
 
     pub fn peek_unnotified(&self, agent_id: &str) -> Result<Vec<InboxMessageRecord>> {
@@ -123,6 +144,18 @@ impl InboxStore {
         }
         tx.commit()
             .context("failed to commit inbox peek transaction")?;
+        if !messages.is_empty() {
+            append_state_change(
+                &self.db_path,
+                "inbox.state_changed",
+                json!({
+                    "operation": "mark_notified",
+                    "agent_id": normalized_agent_id,
+                    "message_ids": messages.iter().map(|message| message.id).collect::<Vec<_>>(),
+                    "notified_at": now
+                }),
+            );
+        }
         Ok(messages)
     }
 
@@ -155,6 +188,18 @@ impl InboxStore {
         .context("failed to update inbox metadata")?;
         tx.commit()
             .context("failed to commit inbox drain transaction")?;
+        if !messages.is_empty() {
+            append_state_change(
+                &self.db_path,
+                "inbox.state_changed",
+                json!({
+                    "operation": "mark_read",
+                    "agent_id": normalized_agent_id,
+                    "message_ids": messages.iter().map(|message| message.id).collect::<Vec<_>>(),
+                    "read_at": now
+                }),
+            );
+        }
         Ok(messages)
     }
 
@@ -279,6 +324,17 @@ impl InboxStore {
             ],
         )
         .context("failed to record inbox poke metadata")?;
+        append_state_change(
+            &self.db_path,
+            "inbox.state_changed",
+            json!({
+                "operation": "record_poke",
+                "agent_id": normalized_agent_id,
+                "newest_message_id": newest_message_id,
+                "poke_backoff_secs": next_backoff_secs,
+                "last_poke_at": now
+            }),
+        );
         Ok(())
     }
 

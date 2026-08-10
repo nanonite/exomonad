@@ -124,6 +124,7 @@ impl LedgerWriter {
         let lock_file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open ledger lock {}", lock_path.display()))?;
         let _file_lock = Flock::lock(lock_file, FlockArg::LockExclusive)
@@ -143,6 +144,7 @@ impl LedgerWriter {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
+            .truncate(false)
             .open(&target)
             .with_context(|| format!("open ledger segment {}", target.display()))?;
         file.write_all(&line)

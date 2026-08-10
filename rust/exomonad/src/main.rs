@@ -238,7 +238,7 @@ enum LogsCommands {
         /// Source file or directory. May be repeated.
         #[arg(long, value_name = "PATH", required = true)]
         source: Vec<PathBuf>,
-        /// Input format: auto, jsonl, sqlite, or text.
+        /// Input format: auto, jsonl, json, sqlite, or text.
         #[arg(long, default_value = "auto")]
         format: String,
         /// Inspect sources and report counts without writing atlas.db.

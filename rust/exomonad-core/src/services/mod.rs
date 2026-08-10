@@ -34,6 +34,9 @@ pub mod review_policy;
 pub mod secrets;
 mod session_memory;
 mod session_memory_capture;
+pub mod session_state;
+pub mod sink_health;
+pub mod state_mirror;
 pub mod supervisor_registry;
 pub mod synthetic_members;
 pub mod tmux_events;
@@ -64,6 +67,10 @@ pub use self::session_memory::{
     MemoryFilter, MemoryKind, MemoryRecordRow, NewMemoryRecord, SessionMemoryService,
 };
 pub use self::session_memory_capture::{capture_memory, MemoryCapture};
+pub use self::session_state::{
+    state_path, transition as transition_session, SessionState, SessionTransition,
+};
+pub use self::sink_health::{read as read_sink_health, SinkHealth};
 pub use self::supervisor_registry::SupervisorRegistry;
 pub use self::worktree_event_watcher::WatcherRuntimeState;
 use claude_teams_bridge::TeamRegistry;

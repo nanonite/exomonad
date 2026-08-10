@@ -4325,6 +4325,7 @@ mod tests {
             head_sha: Some("abc123".to_string()),
             model: Some("gpt-5.6-luna".to_string()),
             effort: Some("xhigh".to_string()),
+            generation: 2,
         };
         let same_generation = InvocationRecord {
             invocation_id: current.invocation_id.clone(),

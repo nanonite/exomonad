@@ -64,6 +64,8 @@ pub struct InvocationRecord {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl InvocationRecord {
@@ -105,6 +107,14 @@ async fn read_locked(agent_dir: &Path) -> Result<Option<InvocationRecord>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
+}
+
+async fn next_generation(agent_dir: &Path) -> Result<u64> {
+    Ok(read_locked(agent_dir)
+        .await?
+        .map(|record| record.generation)
+        .unwrap_or(0)
+        .saturating_add(1))
 }
 
 async fn write_atomic(agent_dir: &Path, record: &InvocationRecord) -> Result<()> {
@@ -152,6 +162,7 @@ pub async fn start_invocation(
     head_sha: Option<String>,
 ) -> Result<InvocationRecord> {
     let _guard = mutation_lock().lock().await;
+    let generation = next_generation(agent_dir).await?;
     let record = InvocationRecord {
         invocation_id: Uuid::new_v4().to_string(),
         runtime,
@@ -165,6 +176,7 @@ pub async fn start_invocation(
         head_sha,
         model: None,
         effort: None,
+        generation,
     };
     write_atomic(agent_dir, &record).await?;
     crate::services::lifecycle::record_invocation_started(agent_dir, &record);
@@ -190,6 +202,7 @@ pub async fn start_invocation_with_provenance(
     effort: Option<String>,
 ) -> Result<InvocationRecord> {
     let _guard = mutation_lock().lock().await;
+    let generation = next_generation(agent_dir).await?;
     let record = InvocationRecord {
         invocation_id: Uuid::new_v4().to_string(),
         runtime,
@@ -203,6 +216,7 @@ pub async fn start_invocation_with_provenance(
         head_sha,
         model,
         effort,
+        generation,
     };
     write_atomic(agent_dir, &record).await?;
     crate::services::lifecycle::record_invocation_started(agent_dir, &record);

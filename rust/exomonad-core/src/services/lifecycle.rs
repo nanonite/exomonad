@@ -119,7 +119,7 @@ pub struct LifecycleTelemetry {
     pub provider: String,
     pub role: String,
     pub invocation_id: Option<String>,
-    pub generation: Option<String>,
+    pub generation: Option<u64>,
     pub trigger: Option<String>,
     pub pr_number: Option<u64>,
     pub issue_number: Option<u64>,
@@ -138,7 +138,7 @@ impl LifecycleTelemetry {
             provider: record.runtime.suffix().to_string(),
             role: role_for_trigger(record.trigger).to_string(),
             invocation_id: Some(record.invocation_id.clone()),
-            generation: Some(record.invocation_id.clone()),
+            generation: Some(record.generation),
             trigger: Some(trigger_label(record.trigger).to_string()),
             pr_number: record.pr_number,
             issue_number: None,
@@ -167,7 +167,7 @@ impl LifecycleTelemetry {
                 .map(|record| role_for_trigger(record.trigger).to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
             invocation_id: invocation.map(|record| record.invocation_id.clone()),
-            generation: invocation.map(|record| record.invocation_id.clone()),
+            generation: invocation.map(|record| record.generation),
             trigger: invocation.map(|record| trigger_label(record.trigger).to_string()),
             pr_number: invocation.and_then(|record| record.pr_number),
             issue_number: None,
@@ -423,6 +423,7 @@ mod tests {
             .await
             .expect("resumed invocation");
             assert_ne!(first.invocation_id, second.invocation_id);
+            assert_eq!(second.generation, first.generation + 1);
             assert_eq!(
                 finish_invocation(
                     dir.path(),
@@ -495,6 +496,7 @@ mod tests {
             head_sha: Some("sha".to_string()),
             model: Some("gpt-5.6-luna".to_string()),
             effort: Some("xhigh".to_string()),
+            generation: 1,
         };
         let telemetry = LifecycleTelemetry::from_invocation(&record, "finished");
         let value = serde_json::to_value(telemetry).expect("telemetry JSON");
@@ -535,6 +537,7 @@ mod tests {
             head_sha: None,
             model: None,
             effort: None,
+            generation: 1,
         };
         record_invocation_started(&agent_dir, &record);
         let files = fs::read_dir(root.path().join(".exo/events"))

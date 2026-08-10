@@ -25,6 +25,7 @@ pub enum SourceFormat {
     Jsonl,
     Sqlite,
     Text,
+    Json,
 }
 
 impl SourceFormat {
@@ -34,6 +35,7 @@ impl SourceFormat {
             "jsonl" => Ok(Self::Jsonl),
             "sqlite" => Ok(Self::Sqlite),
             "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
             other => bail!("unsupported log format {other:?}; use auto, jsonl, sqlite, or text"),
         }
     }
@@ -342,6 +344,7 @@ fn import_one(
     match format {
         SourceFormat::Jsonl => import_jsonl(&transaction, source, &mut counts)?,
         SourceFormat::Text => import_text(&transaction, source, &mut counts)?,
+        SourceFormat::Json => import_json_document(&transaction, source, &mut counts)?,
         SourceFormat::Sqlite => import_sqlite(&transaction, source, &mut counts)?,
         SourceFormat::Auto => unreachable!("effective format is never auto"),
     }
@@ -417,6 +420,35 @@ fn import_jsonl(
                     &error.to_string(),
                 )?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn import_json_document(
+    transaction: &Transaction<'_>,
+    source: &SourceFingerprint,
+    counts: &mut ImportCounts,
+) -> Result<()> {
+    let contents = fs::read_to_string(&source.label)
+        .with_context(|| format!("read JSON source {}", source.label))?;
+    match serde_json::from_str::<Value>(&contents) {
+        Ok(value) => {
+            counts.read = 1;
+            let event = normalize_event(source, 0, value)?;
+            counts.observe_seq(event.run_seq);
+            insert_event(transaction, &event)?;
+        }
+        Err(error) => {
+            counts.read = 1;
+            counts.rejected = 1;
+            insert_import_error(
+                transaction,
+                &source.source_id,
+                0,
+                "invalid_json",
+                &error.to_string(),
+            )?;
         }
     }
     Ok(())
@@ -505,6 +537,13 @@ fn normalize_event(
     let fallback_id = hash_bytes(format!("{}:{offset}:{canonical}", source.source_id).as_bytes());
     let event_id = string_field(&value, &["event_id", "id"]).unwrap_or(fallback_id);
     let event_type = string_field(&value, &["type", "event_type"])
+        .or_else(|| {
+            if source.label.ends_with("/sink-health.json") {
+                Some("sink.health".to_string())
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| format!("custom.legacy.{}", source.kind));
     let lifecycle_state = string_field(&value, &["lifecycle_state"]).unwrap_or_else(|| {
         if source.kind == "jsonl" {
@@ -734,6 +773,7 @@ fn fingerprint(path: &Path, requested_format: SourceFormat) -> Result<SourceFing
     let kind = match effective_format(&label, requested_format)? {
         SourceFormat::Jsonl => "jsonl",
         SourceFormat::Sqlite => "sqlite",
+        SourceFormat::Json => "json",
         SourceFormat::Text => "text",
         SourceFormat::Auto => unreachable!("effective format is never auto"),
     };
@@ -763,6 +803,7 @@ fn effective_format(label: &str, requested: SourceFormat) -> Result<SourceFormat
     match extension.as_str() {
         "db" | "sqlite" | "sqlite3" => Ok(SourceFormat::Sqlite),
         "log" | "txt" => Ok(SourceFormat::Text),
+        "json" => Ok(SourceFormat::Json),
         _ => Ok(SourceFormat::Jsonl),
     }
 }
@@ -901,6 +942,30 @@ mod tests {
             "e2"
         );
         assert!(!snapshot.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn auto_imports_sink_health_json_into_l2() -> Result<()> {
+        let temp = TempDir::new()?;
+        let health = temp.path().join(".exo/sink-health.json");
+        fs::create_dir_all(health.parent().context("health parent")?)?;
+        fs::write(
+            &health,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "accepted_event_count": 4,
+                "rejected_event_count": 1,
+                "write_failure_count": 1,
+                "measurement_status": "partial"
+            }))?,
+        )?;
+        import_sources(&options(temp.path(), health))?;
+        let connection = Connection::open(temp.path().join(".exo/analysis/atlas.db"))?;
+        assert_eq!(
+            connection.query_row("SELECT event_type FROM events", [], |row| row
+                .get::<_, String>(0))?,
+            "sink.health"
+        );
         Ok(())
     }
 

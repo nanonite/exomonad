@@ -25,3 +25,18 @@ fixture coverage in the same change.
 The registry permits sensitive evidence in local L1, L2, and L3 layers. The L4 compile
 step is the share boundary: it selects allowlisted dimensions and must not emit raw
 payloads, transcripts, reasoning, paths, secrets, or stable source identifiers.
+
+
+## Runtime MVP-B paths
+
+New sessions write required structured telemetry automatically. The authoritative
+boundary is locked in .exo/session.json; swarm continuity remains .exo/run_id.
+The canonical append-only ledger is .exo/ledger/segments/*.jsonl, while the
+per-agent .exo/events and .exo/logs JSONL views remain compatibility inputs.
+
+.exo/sink-health.json is the durable fallback for accepted/rejected event counts,
+write failures, the last successful sequence, and complete/partial/unknown status.
+It is local evidence and is imported into L2 as sink.health. Mutable session,
+memory, and inbox changes emit session.state_changed, memory.state_changed, and
+inbox.state_changed events into L1. Human-readable --verbose tracing does not
+control these structured events.
