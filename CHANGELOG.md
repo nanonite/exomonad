@@ -249,6 +249,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Integrate automatic startup legacy import and Failure Atlas compatibility (#648)
 - Validate detectors incidents adjudication and controlled contrasts (#647)
 - Compile privacy-safe sample and aggregate artifacts (#646)
 - Add ledger corrections retention delivery contracts and gap accounting (#645)

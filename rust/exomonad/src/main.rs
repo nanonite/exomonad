@@ -122,8 +122,8 @@ enum Commands {
         /// Overrides `.exo/review-policy.toml` for this initialized session.
         #[arg(long, value_parser = config::parse_positive_u32)]
         reviewer_max_rounds: Option<u32>,
-        /// Enable verbose observability logging: hooks, Chainlink commands, decisions, reviewer spawns, Forgejo CI events.
-        /// Sets RUST_LOG=info, EXOMONAD_HOOK_TRACE=1, and EXOMONAD_CHAINLINK_TRACE=1 on the server; EXOMONAD_VERBOSE=1 session-wide.
+        /// Enable additional human-readable tracing. Required structured
+        /// telemetry is emitted regardless of this flag.
         #[arg(long)]
         verbose: bool,
         /// Pin which git remote exomonad's PR/CI operations (file_pr, merge_pr,
@@ -139,6 +139,12 @@ enum Commands {
         /// Clear all persisted inbox messages and metadata before starting.
         #[arg(long)]
         reset_inbox: bool,
+        /// Explicitly import legacy sources before starting. Repeat as needed.
+        #[arg(long = "import-legacy", value_name = "PATH")]
+        import_legacy: Vec<PathBuf>,
+        /// Inspect explicit legacy sources without writing atlas.db.
+        #[arg(long)]
+        import_legacy_dry_run: bool,
     },
 
     /// Initialize a new exomonad project in the current directory.
@@ -508,6 +514,8 @@ async fn main() -> Result<()> {
             verbose,
             set_git_remote,
             reset_inbox,
+            import_legacy,
+            import_legacy_dry_run,
         } => {
             if let Err(e) = init::run(
                 session,
@@ -527,6 +535,8 @@ async fn main() -> Result<()> {
                 verbose,
                 set_git_remote,
                 reset_inbox,
+                import_legacy,
+                import_legacy_dry_run,
             )
             .await
             {

@@ -2,6 +2,36 @@
 
 Status: repository-backed inventory, prepared for observability and Failure Atlas analysis.
 
+## Current integrated observability contract
+
+The inventory below includes historical compatibility sinks. The current
+implementation always emits structured telemetry during normal ExoMonad
+sessions; --verbose controls only additional human-readable tracing and never
+controls analysis-grade events.
+
+The authoritative local path is the append-only L1 ledger at
+.exo/ledger/segments/*.jsonl. L2 is the rebuildable .exo/analysis/atlas.db
+view, and .exo/session.json plus the memory/inbox databases are mutable L3
+state whose changes are mirrored into L1. L4 is the only shareable boundary:
+
+    exomonad logs export --mode aggregate
+
+This produces allowlist-only analysis.json, manifest.json, and
+privacy-report.json. Raw events, local payloads, transcripts, reasoning,
+paths, secrets, and stable source identifiers never enter L4. OTel is optional
+and may bridge compatible traces across sessions, but local L1/L2 capture does
+not depend on a collector.
+
+Legacy import is explicit and read-only when requested:
+
+    exomonad logs import --source PATH --dry-run
+    exomonad init --import-legacy PATH --import-legacy-dry-run
+
+An apply import is idempotent and never edits the source. Use
+exomonad logs measure with a preregistration to run the Failure Atlas
+signal/incident/adjudication pipeline; provider, runtime, and harness
+group-bys remain descriptive rather than causal.
+
 This document describes what ExoMonad records while a session is running, where it is
 recorded, which event names are currently emitted, and which fields are available for
 cross-referencing orchestration workflows. It is an inventory of the current code, not

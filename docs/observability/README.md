@@ -97,3 +97,15 @@ treatment, assignment method, fixed primary outcome/denominator, missingness
 rule, stopping rule, and all declared confound controls. Provider/runtime/
 harness group-bys are permanently descriptive. Add --require-ready when a
 caller must fail unless a preregistered controlled contrast is valid.
+
+## Compatibility smoke matrix
+
+The Phase 0 fixture gate covers a mixed session containing Claude, Codex,
+Gemini, and a custom Python loop, plus resume/retry delivery, review/merge,
+partial-sink/gap, state reconstruction/correction, and privacy-boundary cases.
+These fixtures exercise the shared normalized event graph rather than
+transcript-specific adapters. Run the full local handoff checks with:
+
+    just validate-observability-contracts
+    just test-observability-export
+    just test-observability-measurement

@@ -941,6 +941,8 @@ pub async fn run(
     verbose: bool,
     set_git_remote: Option<String>,
     reset_inbox: bool,
+    import_legacy: Vec<PathBuf>,
+    import_legacy_dry_run: bool,
 ) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
     use exomonad_core::services::{resolve_role_context_path, AgentType, InboxStore};
@@ -965,6 +967,20 @@ pub async fn run(
 
     // Resolve config
     let mut config = Config::discover()?;
+
+    if !import_legacy.is_empty() {
+        crate::logs::run(
+            &cwd,
+            import_legacy,
+            "auto".to_string(),
+            import_legacy_dry_run,
+            false,
+        )?;
+        info!(
+            dry_run = import_legacy_dry_run,
+            "explicit legacy observability import completed before init"
+        );
+    }
 
     // CLI flags override config
     if opencode_as_tl {
@@ -1844,6 +1860,7 @@ pub async fn run(
 
     // 4. Poll for server socket
     wait_for_server_socket(&cwd).await?;
+    report_observability_health(&cwd);
 
     ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await;
 
@@ -2450,6 +2467,23 @@ pub async fn wait_for_server_socket(project_dir: &Path) -> Result<()> {
     }
 
     anyhow::bail!("Server socket exists but health check failed.")
+}
+
+fn report_observability_health(project_dir: &Path) {
+    match exomonad_core::services::read_sink_health(project_dir) {
+        Ok(Some(health)) => info!(
+            status = %health.measurement_status,
+            accepted_events = health.accepted_event_count,
+            rejected_events = health.rejected_event_count,
+            write_failures = health.write_failure_count,
+            last_successful_seq = ?health.last_successful_seq,
+            "structured observability startup health"
+        ),
+        Ok(None) => warn!(
+            "structured observability startup health is unknown; sink-health.json is not available yet"
+        ),
+        Err(error) => warn!(%error, "could not read structured observability startup health"),
+    }
 }
 
 /// Parse agent type from CLI string (e.g., "opencode", "claude", "gemini").
