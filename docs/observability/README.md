@@ -79,3 +79,21 @@ for output and has no internal-events export mode.
 The manifest carries database/source hashes plus query, code, method, detector,
 and experiment revisions. Every metric carries the same provenance object.
 Fixed input and revisions produce byte-stable analysis.json output.
+
+## Runtime MVP-E measurement
+
+Run the local measurement pipeline with an explicit preregistration:
+
+    exomonad logs measure --preregistration docs/observability/preregistration.example.json
+
+It writes signals.json, incidents.json, adjudication.json, and
+measurement.json under .exo/analysis/measurement. Mechanical detectors are
+high-recall candidates; incidents are clusters; adjudication records judge
+model, prompt revision, label schema, seed, and Wilson intervals. Single-judge
+precision is marked provisional.
+
+The measurement gate requires session-level units, an explicit baseline and
+treatment, assignment method, fixed primary outcome/denominator, missingness
+rule, stopping rule, and all declared confound controls. Provider/runtime/
+harness group-bys are permanently descriptive. Add --require-ready when a
+caller must fail unless a preregistered controlled contrast is valid.

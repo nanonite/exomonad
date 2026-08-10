@@ -466,6 +466,10 @@ validate-observability-contracts:
 test-observability-export:
     python3 scripts/test_compile_failure_atlas.py
 
+# Smoke-test detector, incident, adjudication, and controlled-contrast gates
+test-observability-measurement:
+    python3 scripts/test_failure_atlas_measure.py
+
 
 # Run E2E review-loop stuck human escalation test
 e2e-review-loop-stuck:

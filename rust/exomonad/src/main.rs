@@ -266,6 +266,21 @@ enum LogsCommands {
         #[arg(long, default_value = ".exo/analysis/export")]
         output: PathBuf,
     },
+    /// Run local detectors, incidents, adjudication, and the measurement gate.
+    Measure {
+        /// Explicit preregistration manifest for a controlled contrast.
+        #[arg(long)]
+        preregistration: Option<PathBuf>,
+        /// Output directory for local measurement artifacts.
+        #[arg(long, default_value = ".exo/analysis/measurement")]
+        output: PathBuf,
+        /// Refuse success unless the measurement-ready gate passes.
+        #[arg(long)]
+        require_ready: bool,
+        /// Local judge model/coder; repeat for independent judges.
+        #[arg(long = "judge-model")]
+        judge_models: Vec<String>,
+    },
 }
 
 // Main
@@ -350,6 +365,29 @@ async fn main() -> Result<()> {
                 std::env::current_dir()?.join(&config.project_dir)
             };
             return logs::export(&project_dir, mode, output);
+        }
+
+        Commands::Logs {
+            command:
+                LogsCommands::Measure {
+                    preregistration,
+                    output,
+                    require_ready,
+                    judge_models,
+                },
+        } => {
+            let project_dir = if config.project_dir.is_absolute() {
+                config.project_dir.clone()
+            } else {
+                std::env::current_dir()?.join(&config.project_dir)
+            };
+            return logs::measure(
+                &project_dir,
+                preregistration,
+                output,
+                require_ready,
+                judge_models,
+            );
         }
 
         Commands::Serve {

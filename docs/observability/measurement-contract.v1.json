@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "contract_id": "exomonad.measurement",
+  "version": 1,
+  "primary_unit": "session",
+  "secondary_units": ["invocation", "generation"],
+  "supported_primary_outcomes": ["completed_session_rate"],
+  "allowed_assignments": ["randomized", "blocked_matched", "shadow"],
+  "required_confound_controls": [
+    "task_type",
+    "initial_complexity",
+    "human_presence",
+    "model_tier",
+    "repository_class",
+    "topology_shape"
+  ],
+  "required_provenance": [
+    "database_hash",
+    "source_manifest_hash",
+    "preregistration_hash",
+    "detector_revision",
+    "incident_revision",
+    "adjudication_revision"
+  ],
+  "causal_comparison_rule": "provider/runtime/harness group-bys are descriptive only"
+}

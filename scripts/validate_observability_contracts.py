@@ -182,9 +182,27 @@ def validate_fixtures(fixtures: dict[str, Any], event_types: set[str], rule_ids:
 def validate(root: Path) -> None:
     registry = load_json(root / "docs/observability/event-registry.json")
     contract = load_json(root / "docs/observability/expected-events.v1.json")
+    measurement = load_json(root / "docs/observability/measurement-contract.v1.json")
     fixtures = load_json(root / "docs/observability/fixtures/phase0-contract-fixtures.json")
     event_types = validate_registry(registry)
     rule_ids = validate_expected_events(contract, event_types)
+    required_measurement_keys = {
+        "contract_id",
+        "version",
+        "primary_unit",
+        "required_confound_controls",
+        "required_provenance",
+        "causal_comparison_rule",
+    }
+    missing_measurement_keys = required_measurement_keys - measurement.keys()
+    if missing_measurement_keys:
+        raise ContractError(
+            "measurement contract missing keys: " + ", ".join(sorted(missing_measurement_keys))
+        )
+    if measurement["primary_unit"] != "session":
+        raise ContractError("measurement primary unit must be session")
+    if len(measurement["required_confound_controls"]) < 6:
+        raise ContractError("measurement contract must declare all confound controls")
     validate_fixtures(fixtures, event_types, rule_ids)
 
 

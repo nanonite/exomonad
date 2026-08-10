@@ -1,0 +1,24 @@
+{
+  "experiment_id": "replace-with-registered-experiment-id",
+  "architecture_revision": "replace-with-architecture-revision",
+  "primary_unit": "session",
+  "estimand": "treatment_minus_baseline_completed_session_rate",
+  "assignment": "blocked_matched",
+  "primary_outcome": {
+    "name": "completed_session_rate",
+    "direction": "increase",
+    "denominator": "complete_sessions"
+  },
+  "baseline_session_ids": ["replace-with-baseline-session-id"],
+  "treatment_session_ids": ["replace-with-treatment-session-id"],
+  "confound_controls": [
+    "task_type",
+    "initial_complexity",
+    "human_presence",
+    "model_tier",
+    "repository_class",
+    "topology_shape"
+  ],
+  "missingness_rule": "exclude partial or unknown sessions and report their count",
+  "stopping_rule": "fixed session list"
+}
