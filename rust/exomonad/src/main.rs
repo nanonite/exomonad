@@ -60,7 +60,7 @@ enum Commands {
         #[arg(value_enum)]
         event: HookEventType,
 
-        /// The runtime environment (Claude or Gemini)
+        /// The runtime environment.
         #[arg(long, default_value = "claude")]
         runtime: HookRuntime,
     },
@@ -82,7 +82,7 @@ enum Commands {
         /// Enable OpenRouter for LLM routing
         #[arg(long)]
         openrouter: bool,
-        /// Set root agent type (valid: claude|gemini|opencode|codex|shoal;
+        /// Set root agent type (valid: claude|opencode|codex|shoal;
         /// overrides --opencode-as-tl and the configured root_agent_type)
         #[arg(long)]
         tl: Option<String>,
@@ -111,7 +111,7 @@ enum Commands {
         /// CLI effort flags override config.toml.
         #[arg(long, value_enum)]
         reviewer_effort_level: Option<config::EffortLevel>,
-        /// Set reviewer agent type (valid: claude|gemini|opencode|codex|shoal).
+        /// Set reviewer agent type (valid: claude|opencode|codex|shoal).
         /// Overrides [reviewer] in config.toml.
         #[arg(long)]
         reviewer: Option<String>,
@@ -215,7 +215,7 @@ enum Commands {
 
     /// List available models per agent harness.
     Models {
-        /// Harness: opencode, gemini, claude, or codex. Omit for all.
+        /// Harness: opencode, claude, or codex. Omit for all.
         #[arg(value_name = "HARNESS")]
         harness: Option<String>,
         /// Provider filter (opencode only). E.g. "anthropic", "openai".

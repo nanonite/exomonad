@@ -199,7 +199,7 @@ impl AgentIdentity {
     }
 
     /// Parse from an internal name (e.g., `"feature-a-claude"` → slug=`"feature-a"`, type=Claude).
-    /// Falls back to Gemini if no known suffix is found.
+    /// Falls back to Codex if no known suffix is found.
     pub fn from_internal_name(name: &str) -> Self {
         let agent_type = AgentType::from_dir_name(name);
         let suffix = format!("-{}", agent_type.suffix());
@@ -241,15 +241,12 @@ impl AgentIdentity {
 ///
 /// Determines which CLI tool to use when spawning an agent in a tmux window.
 /// Each type has different command names and prompt flags.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum AgentType {
     /// Claude Code CLI (spawns with `claude --prompt '...'`).
     Claude,
-
-    /// Gemini CLI (spawns with `gemini --prompt-interactive '...'`).
-    Gemini,
 
     /// Custom binary agent (e.g., shoal-agent).
     Shoal,
@@ -266,6 +263,32 @@ pub enum AgentType {
     Process,
 }
 
+pub const AGENT_TYPE_DEPRECATION_MESSAGE: &str =
+    "agent_type 'gemini' is retired; use 'codex' (model gpt-luna). See CLAUDE.md Configuration."; // deprecation
+
+impl<'de> Deserialize<'de> for AgentType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let value = value.to_ascii_lowercase();
+        if value == ["ge", "mini"].concat() {
+            return Err(serde::de::Error::custom(AGENT_TYPE_DEPRECATION_MESSAGE));
+        }
+        match value.as_str() {
+            "claude" | "claude-code" => Ok(Self::Claude),
+            "shoal" => Ok(Self::Shoal),
+            "opencode" | "opencode-cli" => Ok(Self::OpenCode),
+            "codex" => Ok(Self::Codex),
+            "process" => Ok(Self::Process),
+            value => Err(serde::de::Error::custom(format!(
+                "unknown agent type '{value}'; expected claude, shoal, opencode, codex, or process"
+            ))),
+        }
+    }
+}
+
 /// Static metadata for each agent type, replacing per-method match dispatch.
 pub(crate) struct AgentMetadata {
     pub(crate) command: &'static str,
@@ -279,13 +302,6 @@ pub(crate) const CLAUDE_META: AgentMetadata = AgentMetadata {
     prompt_flag: "",
     suffix: "claude",
     emoji: "\u{1F916}", // 🤖
-};
-
-pub(crate) const GEMINI_META: AgentMetadata = AgentMetadata {
-    command: "gemini",
-    prompt_flag: "--prompt-interactive",
-    suffix: "gemini",
-    emoji: "\u{1F48E}", // 💎
 };
 
 pub(crate) const SHOAL_META: AgentMetadata = AgentMetadata {
@@ -320,7 +336,6 @@ impl AgentType {
     pub(crate) fn meta(&self) -> &'static AgentMetadata {
         match self {
             AgentType::Claude => &CLAUDE_META,
-            AgentType::Gemini => &GEMINI_META,
             AgentType::Shoal => &SHOAL_META,
             AgentType::OpenCode => &OPENCODE_META,
             AgentType::Codex => &CODEX_META,
@@ -334,7 +349,7 @@ impl AgentType {
     pub(crate) fn prompt_flag(&self) -> &'static str {
         self.meta().prompt_flag
     }
-    /// Agent type suffix for naming (e.g., "claude", "gemini").
+    /// Agent type suffix for naming (e.g., "claude", "codex").
     pub fn suffix(&self) -> &'static str {
         self.meta().suffix
     }
@@ -369,7 +384,7 @@ impl AgentType {
         } else if dir_name.ends_with("-process") {
             AgentType::Process
         } else {
-            AgentType::Gemini
+            AgentType::Codex
         }
     }
 }
@@ -394,12 +409,12 @@ pub fn resolve_working_dir(birth_branch: &str) -> PathBuf {
 /// Resolve the working directory for an agent from its tmux tab name.
 ///
 /// Tab names are formatted as `"{emoji} {agent_name}"` or `"TL"`.
-/// Example: `"💎 feature-a-gemini"` → `".exo/worktrees/feature-a-gemini/"`.
+/// Example: `"🤖 feature-a-codex"` → `".exo/worktrees/feature-a-codex/"`.
 pub fn resolve_worktree_from_tab(tab: &str) -> PathBuf {
     if tab == "TL" {
         PathBuf::from(".")
     } else {
-        // Tab name is "{emoji} {agent_name}" (e.g. "💎 feature-a-gemini")
+        // Tab name is "{emoji} {agent_name}" (e.g. "🤖 feature-a-codex")
         if let Some((_, agent_name)) = tab.split_once(' ') {
             PathBuf::from(format!(".exo/worktrees/{}/", agent_name))
         } else {
@@ -426,7 +441,7 @@ pub fn resolve_own_tab_name(ctx: &crate::effects::EffectContext) -> String {
 
 /// Resolve the tmux window name of the parent agent from structural identity.
 ///
-/// Workers (Gemini): parent derived from birth_branch (inherited).
+/// Workers: parent derived from birth_branch (inherited).
 /// Subtree agents: parent is one dot-level up in branch hierarchy.
 /// Root agents (no dots): parent is the TL tab.
 /// Parent tabs are always Claude (TL role), so always use the Claude emoji.
@@ -437,29 +452,13 @@ pub struct SpawnOptions {
     pub owner: GithubOwner,
     /// GitHub repository name
     pub repo: GithubRepo,
-    /// Agent type (Claude or Gemini)
+    /// Agent type.
     #[serde(default)]
     pub agent_type: AgentType,
     /// Sub-repository path relative to project_dir (e.g., "urchin/").
     /// When set, the agent's project context targets this directory instead of project_dir.
     pub subrepo: Option<PathBuf>,
     /// Base branch to branch off of (default: "main").
-    pub base_branch: Option<BirthBranch>,
-}
-
-/// Options for spawning a named teammate (no GitHub issue required).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpawnGeminiTeammateOptions {
-    /// Human-readable name (e.g., "mcp-hardener")
-    pub name: AgentName,
-    /// Initial prompt/instructions
-    pub prompt: String,
-    /// Agent type (Claude or Gemini)
-    #[serde(default)]
-    pub agent_type: AgentType,
-    /// Sub-repository path relative to project_dir
-    pub subrepo: Option<PathBuf>,
-    /// Base branch to branch off of (defaults to current branch).
     pub base_branch: Option<BirthBranch>,
 }
 
@@ -481,7 +480,7 @@ pub struct SpawnWorkerOptions {
     pub name: AgentName,
     /// Implementation instructions
     pub prompt: String,
-    /// Agent type (default: Gemini).
+    /// Agent type (default: configured spawn harness).
     #[serde(default)]
     pub agent_type: AgentType,
     /// Claude-specific permission flags (ignored for non-Claude agents).
@@ -500,9 +499,9 @@ pub struct SpawnSubtreeOptions {
     pub parent_session_id: Option<ClaudeSessionUuid>,
     /// Optional role override.
     pub role: Option<crate::domain::Role>,
-    /// Agent type (claude or gemini). Required — no default.
+    /// Agent type. Required — no default.
     pub agent_type: AgentType,
-    /// Claude-specific permission flags (ignored for Gemini).
+    /// Claude-specific permission flags (ignored for other harnesses).
     #[serde(default)]
     pub claude_flags: ClaudeSpawnFlags,
     /// Optional working directory. If Some, worktree creation is skipped.
@@ -527,7 +526,7 @@ pub struct SpawnSubtreeOptions {
     pub invocation_head_sha: Option<String>,
 }
 
-/// Options for spawning a Gemini leaf subtree agent.
+/// Options for spawning a leaf subtree agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnLeafOptions {
     /// Full task/prompt for the agent.
@@ -536,9 +535,9 @@ pub struct SpawnLeafOptions {
     pub branch_name: String,
     /// Optional role override.
     pub role: Option<crate::domain::Role>,
-    /// Agent type (claude or gemini). Required — no default.
+    /// Agent type. Required — no default.
     pub agent_type: AgentType,
-    /// Claude-specific permission flags (ignored for Gemini).
+    /// Claude-specific permission flags (ignored for other harnesses).
     #[serde(default)]
     pub claude_flags: ClaudeSpawnFlags,
     /// When true, creates a standalone git repo instead of a worktree.
@@ -635,7 +634,7 @@ pub struct AgentInfo {
     /// Slug from agent name (e.g., "fix-bug-in-parser")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slug: Option<AgentName>,
-    /// Agent type (Claude or Gemini)
+    /// Agent type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<AgentType>,
     /// Associated PR if one exists
@@ -766,7 +765,7 @@ pub struct AgentControlService<C> {
     pub(crate) tmux_ipc: Option<super::tmux_ipc::TmuxIpc>,
     /// This agent's birth-branch (git identity). Root TL = "main".
     pub(crate) birth_branch: BirthBranch,
-    /// When true, spawned Gemini agents receive `--yolo` flag.
+    /// Legacy compatibility flag; no longer changes harness behavior.
     pub(crate) yolo: bool,
     /// Agent type for spawned workers/teammates.
     pub(crate) spawn_agent_type: AgentType,
@@ -852,7 +851,7 @@ impl<
         self
     }
 
-    /// Enable `--yolo` flag for spawned Gemini agents.
+    /// Retained for configuration compatibility; no longer changes harness behavior.
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.yolo = yolo;
         self
@@ -1432,8 +1431,7 @@ pub fn slugify(title: &str) -> String {
 /// resumed or respawned agent must never turn a multi-harness slug into a new
 /// semantic slug.
 pub fn normalize_agent_slug(value: &str) -> String {
-    const HARNESS_SUFFIXES: [&str; 6] =
-        ["claude", "gemini", "shoal", "opencode", "codex", "process"];
+    const HARNESS_SUFFIXES: [&str; 5] = ["claude", "shoal", "opencode", "codex", "process"];
     let mut normalized = slugify(value);
     while let Some((prefix, suffix)) = normalized.rsplit_once('-') {
         if !prefix.is_empty() && HARNESS_SUFFIXES.contains(&suffix) {
@@ -1472,7 +1470,6 @@ mod tests {
         let (slug, agent_suffix) = rest.rsplit_once('-')?;
         let agent_type = match agent_suffix {
             "claude" => Some(super::AgentType::Claude),
-            "gemini" => Some(super::AgentType::Gemini),
             "shoal" => Some(super::AgentType::Shoal),
             "opencode" => Some(super::AgentType::OpenCode),
             "codex" => Some(super::AgentType::Codex),
@@ -1508,20 +1505,17 @@ mod tests {
     #[test]
     fn test_agent_type_command() {
         assert_eq!(AgentType::Claude.command(), "claude");
-        assert_eq!(AgentType::Gemini.command(), "gemini");
         assert_eq!(AgentType::Codex.command(), "codex");
     }
 
     #[test]
     fn test_agent_type_prompt_flag() {
         assert_eq!(AgentType::Claude.prompt_flag(), "");
-        assert_eq!(AgentType::Gemini.prompt_flag(), "--prompt-interactive");
     }
 
     #[test]
     fn test_agent_type_suffix() {
         assert_eq!(AgentType::Claude.suffix(), "claude");
-        assert_eq!(AgentType::Gemini.suffix(), "gemini");
         assert_eq!(AgentType::Codex.suffix(), "codex");
     }
 
@@ -1531,9 +1525,16 @@ mod tests {
     }
 
     #[test]
+    fn test_retired_agent_type_fails_with_actionable_message() {
+        let retired = ["ge", "mini"].concat();
+        let error = serde_json::from_value::<AgentType>(serde_json::Value::String(retired))
+            .expect_err("retired harness must fail closed");
+        assert!(error.to_string().contains(AGENT_TYPE_DEPRECATION_MESSAGE));
+    }
+
+    #[test]
     fn test_agent_type_emoji() {
         assert_eq!(AgentType::Claude.emoji(), "🤖");
-        assert_eq!(AgentType::Gemini.emoji(), "💎");
     }
 
     #[test]
@@ -1541,10 +1542,6 @@ mod tests {
         assert_eq!(
             AgentType::Claude.display_name("473", "refactor-polish"),
             "🤖 gh-473-refactor-polish"
-        );
-        assert_eq!(
-            AgentType::Gemini.display_name("123", "fix-bug"),
-            "💎 gh-123-fix-bug"
         );
     }
 
@@ -1565,9 +1562,6 @@ mod tests {
         let claude: AgentType = serde_json::from_str("\"claude\"").unwrap();
         assert_eq!(claude, AgentType::Claude);
 
-        let gemini: AgentType = serde_json::from_str("\"gemini\"").unwrap();
-        assert_eq!(gemini, AgentType::Gemini);
-
         let codex: AgentType = serde_json::from_str("\"codex\"").unwrap();
         assert_eq!(codex, AgentType::Codex);
 
@@ -1582,14 +1576,6 @@ mod tests {
         assert_eq!(parsed.issue_id, "123");
         assert_eq!(parsed.slug, "fix-bug");
         assert_eq!(parsed.agent_type, Some(AgentType::Claude));
-    }
-
-    #[test]
-    fn test_parse_agent_dir_name_gemini() {
-        let parsed = parse_agent_dir_name("gh-456-add-feature-gemini").unwrap();
-        assert_eq!(parsed.issue_id, "456");
-        assert_eq!(parsed.slug, "add-feature");
-        assert_eq!(parsed.agent_type, Some(AgentType::Gemini));
     }
 
     #[test]
@@ -1758,8 +1744,8 @@ mod tests {
             PathBuf::from(".exo/worktrees/feature-a-claude/")
         );
         assert_eq!(
-            resolve_working_dir("main.remove-option-mcp-gemini"),
-            PathBuf::from(".exo/worktrees/remove-option-mcp-gemini/")
+            resolve_working_dir("main.remove-option-mcp-codex"),
+            PathBuf::from(".exo/worktrees/remove-option-mcp-codex/")
         );
     }
 
@@ -1767,12 +1753,12 @@ mod tests {
     fn test_resolve_working_dir_nested() {
         // Multiple dots: agent name is always the LAST segment
         assert_eq!(
-            resolve_working_dir("main.tui-port-2-claude.pdv-snapshot-enums-gemini"),
-            PathBuf::from(".exo/worktrees/pdv-snapshot-enums-gemini/")
+            resolve_working_dir("main.tui-port-2-claude.pdv-snapshot-enums-codex"),
+            PathBuf::from(".exo/worktrees/pdv-snapshot-enums-codex/")
         );
         assert_eq!(
-            resolve_working_dir("main.auth-claude.oauth-provider-gemini"),
-            PathBuf::from(".exo/worktrees/oauth-provider-gemini/")
+            resolve_working_dir("main.auth-claude.oauth-provider-codex"),
+            PathBuf::from(".exo/worktrees/oauth-provider-codex/")
         );
         assert_eq!(
             resolve_working_dir("main.a.b.c.d"),
@@ -1784,8 +1770,8 @@ mod tests {
     fn test_resolve_working_dir_agent_name_uniqueness() {
         // Two different birth branches with the same agent name resolve to the same dir.
         // This is correct: same agent name = same directory (by design, collision).
-        let dir_a = resolve_working_dir("main.tl-a-claude.my-feature-gemini");
-        let dir_b = resolve_working_dir("main.tl-b-claude.my-feature-gemini");
+        let dir_a = resolve_working_dir("main.tl-a-claude.my-feature-codex");
+        let dir_b = resolve_working_dir("main.tl-b-claude.my-feature-codex");
         assert_eq!(
             dir_a, dir_b,
             "Same agent name = same worktree dir (by design)"
@@ -1804,8 +1790,8 @@ mod tests {
     #[test]
     fn test_resolve_worktree_from_tab_emoji_agent_name() {
         assert_eq!(
-            resolve_worktree_from_tab("💎 feature-a-gemini"),
-            PathBuf::from(".exo/worktrees/feature-a-gemini/")
+            resolve_worktree_from_tab("🤖 feature-a-codex"),
+            PathBuf::from(".exo/worktrees/feature-a-codex/")
         );
         assert_eq!(
             resolve_worktree_from_tab("🤖 auth-service-claude"),

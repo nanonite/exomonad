@@ -15,7 +15,7 @@ use crate::services::{
 };
 
 fn structural_parent_session_id(
-    agent_name: &crate::domain::AgentName,
+    _agent_name: &crate::domain::AgentName,
     birth_branch: &crate::domain::BirthBranch,
     identity: Option<&crate::services::agent_resolver::AgentIdentityRecord>,
 ) -> String {
@@ -25,7 +25,6 @@ fn structural_parent_session_id(
         {
             identity.parent_branch.to_string()
         }
-        _ if agent_name.is_gemini_worker() => birth_branch.to_string(),
         _ => birth_branch
             .parent()
             .map(|p| p.to_string())
@@ -683,9 +682,9 @@ mod tests {
                 expected_parent: "root",
             },
             RuntimeParentCase {
-                runtime: AgentType::Gemini,
-                agent_name: "parent-matrix-gemini-gemini",
-                slug: "parent-matrix-gemini",
+                runtime: AgentType::Codex,
+                agent_name: "parent-matrix-codex-codex",
+                slug: "parent-matrix-codex",
                 birth_branch: "main",
                 parent_branch: "main",
                 topology: Topology::SharedDir,
@@ -820,7 +819,7 @@ mod tests {
     async fn notify_parent_captures_successful_child_handoff() {
         let services = Arc::new(crate::services::Services::test());
         let handler = EventHandler::new(services.clone(), None);
-        let ctx = test_ctx("worker-gemini", "main.worker-gemini");
+        let ctx = test_ctx("worker-codex", "main.worker-codex");
 
         let response = crate::effects::EventEffects::notify_parent(
             &handler,
@@ -856,7 +855,7 @@ mod tests {
     async fn notify_parent_captures_explicit_failure_as_blocker() {
         let services = Arc::new(crate::services::Services::test());
         let handler = EventHandler::new(services.clone(), None);
-        let ctx = test_ctx("worker-gemini", "main.worker-gemini");
+        let ctx = test_ctx("worker-codex", "main.worker-codex");
 
         let response = crate::effects::EventEffects::notify_parent(
             &handler,
@@ -901,7 +900,7 @@ mod tests {
         services.session_memory = Arc::clone(&memory);
         let services = Arc::new(services);
         let handler = EventHandler::new(services, None);
-        let ctx = test_ctx("worker-gemini", "main.worker-gemini");
+        let ctx = test_ctx("worker-codex", "main.worker-codex");
         let lock = Connection::open(memory.db_path()).expect("second database connection opens");
         lock.execute_batch("BEGIN EXCLUSIVE")
             .expect("exclusive lock should be acquired");

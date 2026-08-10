@@ -112,7 +112,7 @@ impl<
     /// Clean up an existing worktree (if present) and create a fresh one.
     ///
     /// Consolidates the idempotent cleanup + spawn_blocking + catch_unwind boilerplate
-    /// shared across spawn_agent, spawn_subtree, spawn_leaf_subtree, and spawn_gemini_teammate.
+    /// shared across spawn_agent, spawn_subtree, and spawn_leaf_subtree.
     pub(crate) async fn create_worktree_checked(
         &self,
         worktree_path: &Path,
@@ -286,7 +286,7 @@ impl<
         // subsequent subprocess — MCP servers, hook scripts, direct `chainlink` calls —
         // inherits it transitively. The same path covers windows (TLs, dev-leaves, sub-TLs)
         // and panes (workers), so adding an entry here reaches all five agent runtimes
-        // (Claude, Codex, Gemini, OpenCode, worker) uniformly.
+        // (Claude, Codex, OpenCode, worker) uniformly.
         env_vars.insert(
             "CHAINLINK_DB".to_string(),
             self.ctx
@@ -468,7 +468,7 @@ impl<
         env_vars: &HashMap<String, String>,
         cwd: &Path,
         claude_flags: Option<&ClaudeSpawnFlags>,
-        yolo: bool,
+        _yolo: bool,
         model: Option<&str>,
         effort: Option<&str>,
     ) -> String {
@@ -497,13 +497,6 @@ impl<
                     }
                 }
                 flags
-            }
-            AgentType::Gemini => {
-                if yolo {
-                    " --yolo".to_string()
-                } else {
-                    String::new()
-                }
             }
             AgentType::Codex => String::new(),
             AgentType::OpenCode => String::new(),
@@ -1014,7 +1007,7 @@ impl<
 
     /// Write MCP config for the agent directory.
     ///
-    /// Claude agents get `.mcp.json`. Gemini agents get `.gemini/settings.json`.
+    /// Claude agents get `.mcp.json`.
     /// Codex agents get `.codex/config.toml`; shared hooks live in Codex user config.
     /// Uses stdio transport via `exomonad mcp-stdio`.
     pub(crate) async fn write_agent_mcp_config(
@@ -1041,12 +1034,6 @@ impl<
             AgentType::Claude => {
                 fs::write(agent_dir.join(".mcp.json"), mcp_content).await?;
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote .mcp.json for Claude agent");
-            }
-            AgentType::Gemini => {
-                let gemini_dir = agent_dir.join(".gemini");
-                fs::create_dir_all(&gemini_dir).await?;
-                fs::write(gemini_dir.join("settings.json"), mcp_content).await?;
-                info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote .gemini/settings.json for Gemini agent");
             }
             AgentType::Process => {} // No MCP config for process companions
             AgentType::Shoal => {
@@ -1153,57 +1140,6 @@ impl<
         Ok(())
     }
 
-    /// Pre-trust a directory for Gemini CLI by adding it to `~/.gemini/trustedFolders.json`.
-    ///
-    /// This prevents the interactive "Trust this folder?" dialog that blocks Gemini agents.
-    pub async fn gemini_trust_folder(path: &Path) {
-        let Some(home) = dirs::home_dir() else {
-            warn!("Could not determine home directory for Gemini trust");
-            return;
-        };
-        let gemini_home = home.join(".gemini");
-        if let Err(e) = tokio::fs::create_dir_all(&gemini_home).await {
-            warn!(error = %e, dir = %gemini_home.display(), "Failed to create Gemini config directory");
-            return;
-        }
-        let trust_file = gemini_home.join("trustedFolders.json");
-        let abs_path = match path.canonicalize() {
-            Ok(p) => p.to_string_lossy().to_string(),
-            Err(_) => path.to_string_lossy().to_string(),
-        };
-
-        let mut trust_map: serde_json::Map<String, serde_json::Value> = if trust_file.exists() {
-            match tokio::fs::read_to_string(&trust_file).await {
-                Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-                Err(_) => serde_json::Map::new(),
-            }
-        } else {
-            serde_json::Map::new()
-        };
-
-        if trust_map.contains_key(&abs_path) {
-            return;
-        }
-
-        trust_map.insert(
-            abs_path.clone(),
-            serde_json::Value::String("TRUST_FOLDER".to_string()),
-        );
-
-        if let Ok(content) = serde_json::to_string_pretty(&trust_map) {
-            // Atomic write: temp file + rename to avoid partial writes from concurrent spawns
-            let tmp_file = trust_file.with_extension("tmp");
-            if let Err(e) = tokio::fs::write(&tmp_file, &content).await {
-                warn!(path = %abs_path, error = %e, "Failed to write Gemini trustedFolders.json tmp");
-            } else if let Err(e) = tokio::fs::rename(&tmp_file, &trust_file).await {
-                warn!(path = %abs_path, error = %e, "Failed to rename Gemini trustedFolders.json");
-                let _ = tokio::fs::remove_file(&tmp_file).await;
-            } else {
-                info!(path = %abs_path, "Pre-trusted folder for Gemini CLI");
-            }
-        }
-    }
-
     /// Symlink server socket into worktree so agents find it without walk-up.
     pub(crate) async fn create_socket_symlink(&self, worktree_path: &Path) {
         let source = self.server_socket_source();
@@ -1284,7 +1220,7 @@ impl<
         name: &str,
         agent_type: AgentType,
         role: &str,
-        wasm_name: &str,
+        _wasm_name: &str,
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
     ) -> String {
         match agent_type {
@@ -1296,72 +1232,6 @@ impl<
                             "command": "exomonad",
                             "args": ["mcp-stdio", "--role", role, "--name", name]
                         }
-                    }
-                });
-                if let Some(servers) = config["mcpServers"].as_object_mut() {
-                    for (k, v) in extra_mcp_servers {
-                        servers.insert(k.clone(), v.clone());
-                    }
-                }
-                serde_json::to_string_pretty(&config).unwrap()
-            }
-            AgentType::Gemini => {
-                let mut config = serde_json::json!({
-                    "mcpServers": {
-                        "exomonad": {
-                            "type": "stdio",
-                            "command": "exomonad",
-                            "args": ["mcp-stdio", "--role", role, "--name", name]
-                        }
-                    },
-                    "context": {
-                        "fileName": ["GEMINI.md", format!(".exo/roles/{}/context/{}.md", wasm_name, role)]
-                    },
-                    "hooks": {
-                        "BeforeTool": [
-                            {
-                                "matcher": "*",
-                                "hooks": [
-                                    {
-                                        "type": "command",
-                                        "command": "exomonad hook before-tool --runtime gemini"
-                                    }
-                                ]
-                            }
-                        ],
-                        "BeforeModel": [
-                            {
-                                "matcher": "*",
-                                "hooks": [
-                                    {
-                                        "type": "command",
-                                        "command": "exomonad hook before-model --runtime gemini"
-                                    }
-                                ]
-                            }
-                        ],
-                        "AfterModel": [
-                            {
-                                "matcher": "*",
-                                "hooks": [
-                                    {
-                                        "type": "command",
-                                        "command": "exomonad hook after-model --runtime gemini"
-                                    }
-                                ]
-                            }
-                        ],
-                        "AfterAgent": [
-                            {
-                                "matcher": "*",
-                                "hooks": [
-                                    {
-                                        "type": "command",
-                                        "command": "exomonad hook after-agent --runtime gemini"
-                                    }
-                                ]
-                            }
-                        ]
                     }
                 });
                 if let Some(servers) = config["mcpServers"].as_object_mut() {
@@ -1526,80 +1396,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_mcp_config_format() {
-        let config = ACS::generate_mcp_config(
-            "test-gemini",
-            AgentType::Gemini,
-            "dev",
-            "devswarm",
-            &HashMap::new(),
-        );
-        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
-        assert_eq!(parsed["mcpServers"]["exomonad"]["command"], "exomonad");
-        let args = parsed["mcpServers"]["exomonad"]["args"].as_array().unwrap();
-        assert_eq!(
-            args,
-            &["mcp-stdio", "--role", "dev", "--name", "test-gemini"]
-        );
-        assert_eq!(parsed["mcpServers"]["exomonad"]["type"], "stdio");
-
-        // Check hooks
-        let before_tool = &parsed["hooks"]["BeforeTool"];
-        assert!(before_tool.is_array());
-        let bt_hooks = &before_tool[0]["hooks"];
-        assert_eq!(
-            bt_hooks[0]["command"],
-            "exomonad hook before-tool --runtime gemini"
-        );
-
-        let before_model = &parsed["hooks"]["BeforeModel"];
-        assert!(before_model.is_array());
-        let bm_hooks = &before_model[0]["hooks"];
-        assert_eq!(
-            bm_hooks[0]["command"],
-            "exomonad hook before-model --runtime gemini"
-        );
-
-        let after_model = &parsed["hooks"]["AfterModel"];
-        assert!(after_model.is_array());
-        let am_hooks = &after_model[0]["hooks"];
-        assert_eq!(
-            am_hooks[0]["command"],
-            "exomonad hook after-model --runtime gemini"
-        );
-
-        let after_agent = &parsed["hooks"]["AfterAgent"];
-        assert!(after_agent.is_array());
-        let hooks_list = &after_agent[0]["hooks"];
-        assert_eq!(
-            hooks_list[0]["command"],
-            "exomonad hook after-agent --runtime gemini"
-        );
-    }
-
-    #[test]
-    fn test_gemini_worker_settings_injects_context_path() {
-        let context_path = PathBuf::from("/tmp/exomonad-context/worker.md");
-        let settings = ACS::generate_gemini_worker_settings(
-            "test-worker",
-            Some(&context_path),
-            &HashMap::new(),
-        );
-        let context_files = settings["context"]["fileName"]
-            .as_array()
-            .expect("context.fileName must be an array");
-        let filenames: Vec<&str> = context_files
-            .iter()
-            .map(|value| value.as_str().expect("context filename must be a string"))
-            .collect();
-
-        assert_eq!(
-            filenames,
-            vec!["GEMINI.md", "/tmp/exomonad-context/worker.md"]
-        );
-    }
-
-    #[test]
     fn test_opencode_worker_settings_use_worker_instructions() {
         let settings = ACS::generate_opencode_tl_settings("test-worker", "worker", &HashMap::new());
         let command = settings["mcp"]["exomonad"]["command"]
@@ -1642,20 +1438,6 @@ mod tests {
             .expect("first instruction entry must be a string");
 
         assert_eq!(instructions, "/tmp/sentinel-root.md");
-    }
-
-    #[test]
-    fn test_gemini_root_settings_load_canonical_context() {
-        let context_path = Path::new("/tmp/sentinel-root.md");
-        let settings =
-            ACS::generate_gemini_root_settings("test-root", Some(context_path), &HashMap::new());
-        let context_files = settings["context"]["fileName"]
-            .as_array()
-            .expect("context.fileName must be an array");
-
-        assert_eq!(context_files[0], "GEMINI.md");
-        assert_eq!(context_files[1], "/tmp/sentinel-root.md");
-        assert_eq!(settings["mcpServers"]["exomonad"]["args"][2], "root");
     }
 
     #[test]
@@ -1727,61 +1509,6 @@ mod tests {
             .expect_err("missing role context must fail OpenCode config generation");
 
         assert!(error.to_string().contains("Missing role context"));
-    }
-
-    #[test]
-    fn test_gemini_worker_settings_schema_compliance() {
-        let settings = ACS::generate_gemini_worker_settings("test-worker", None, &HashMap::new());
-
-        // 1. MCP config uses stdio transport
-        assert_eq!(settings["mcpServers"]["exomonad"]["type"], "stdio");
-        assert_eq!(settings["mcpServers"]["exomonad"]["command"], "exomonad");
-        let args = settings["mcpServers"]["exomonad"]["args"]
-            .as_array()
-            .unwrap();
-        assert_eq!(
-            args,
-            &["mcp-stdio", "--role", "worker", "--name", "test-worker"]
-        );
-
-        // 2. Hooks must strictly use PascalCase
-        assert!(
-            settings["hooks"].get("AfterAgent").is_some(),
-            "hooks.AfterAgent is missing"
-        );
-        assert!(
-            settings["hooks"].get("BeforeTool").is_some(),
-            "hooks.BeforeTool is missing"
-        );
-        assert!(
-            settings["hooks"].get("BeforeModel").is_some(),
-            "hooks.BeforeModel is missing"
-        );
-        assert!(
-            settings["hooks"].get("AfterModel").is_some(),
-            "hooks.AfterModel is missing"
-        );
-        assert!(
-            settings["hooks"].get("after-agent").is_none(),
-            "Found invalid kebab-case 'after-agent'"
-        );
-
-        // 3. The hook structure must match the array of matcher/hooks objects
-        let after_agent = &settings["hooks"]["AfterAgent"];
-        assert!(after_agent.is_array(), "hooks.AfterAgent must be an array");
-
-        let first_rule = &after_agent[0];
-        assert_eq!(first_rule["matcher"], "*");
-
-        let hooks_list = &first_rule["hooks"];
-        assert!(hooks_list.is_array());
-
-        let command_hook = &hooks_list[0];
-        assert_eq!(command_hook["type"], "command");
-        assert_eq!(
-            command_hook["command"], "exomonad hook worker-exit --runtime gemini",
-            "Hook command mismatch"
-        );
     }
 
     fn test_services(project_dir: PathBuf) -> Arc<crate::services::Services> {
@@ -1982,18 +1709,18 @@ mod tests {
                 .expect("literal validated string is non-empty"),
         );
 
-        let agent = AgentName::try_from_str("fix-oauth-gemini")
+        let agent = AgentName::try_from_str("fix-oauth-codex")
             .expect("literal validated string is non-empty");
-        let session_id = BranchName::try_from_str("main.tl-auth.fix-oauth-gemini")
+        let session_id = BranchName::try_from_str("main.tl-auth.fix-oauth-codex")
             .expect("literal validated string is non-empty");
         let role = crate::domain::Role::dev();
 
         let env = service.common_spawn_env(&agent, &session_id, &role);
 
-        assert_eq!(env.get("EXOMONAD_AGENT_ID").unwrap(), "fix-oauth-gemini");
+        assert_eq!(env.get("EXOMONAD_AGENT_ID").unwrap(), "fix-oauth-codex");
         assert_eq!(
             env.get("EXOMONAD_SESSION_ID").unwrap(),
-            "main.tl-auth.fix-oauth-gemini"
+            "main.tl-auth.fix-oauth-codex"
         );
         assert_eq!(env.get("EXOMONAD_ROLE").unwrap(), "dev");
         assert_eq!(
@@ -2233,10 +1960,9 @@ mod tests {
         let prompt = Path::new("/tmp/test-prompt.txt");
         for agent_type in [
             AgentType::Claude,
-            AgentType::Gemini,
+            AgentType::Codex,
             AgentType::Shoal,
             AgentType::OpenCode,
-            AgentType::Codex,
         ] {
             let command = ACS::build_agent_command(
                 agent_type,
@@ -2262,18 +1988,6 @@ mod tests {
                 "{agent_type:?} must keep its interactive stdin path for live guidance: {command}"
             );
         }
-
-        let gemini = ACS::build_agent_command(
-            AgentType::Gemini,
-            Some(prompt),
-            None,
-            &empty_env(),
-            Path::new("/tmp/test"),
-            None,
-            false,
-            None,
-        );
-        assert!(gemini.contains("--prompt-interactive"));
 
         let opencode = ACS::build_agent_command(
             AgentType::OpenCode,
@@ -2444,24 +2158,6 @@ mod tests {
         );
 
         assert!(cmd.contains("--model sonnet --effort high"));
-    }
-
-    #[test]
-    fn test_build_agent_command_gemini_ignores_effort() {
-        let cmd = ACS::build_agent_command_with_effort(
-            AgentType::Gemini,
-            None,
-            None,
-            &empty_env(),
-            Path::new("/tmp/worktree"),
-            None,
-            false,
-            None,
-            Some("high"),
-        );
-
-        assert_eq!(cmd, "gemini");
-        assert!(!cmd.contains("effort"));
     }
 
     #[test]

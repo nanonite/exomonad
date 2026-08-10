@@ -36,7 +36,7 @@ pub struct HookInput {
     /// The hook event name (PreToolUse, PostToolUse, etc.).
     pub hook_event_name: String,
 
-    /// Runtime environment (claude, gemini). Injected by Rust before WASM call.
+    /// Runtime environment. Injected by Rust before WASM call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<Runtime>,
 
@@ -92,12 +92,10 @@ pub struct HookInput {
     pub reason: Option<String>,
 
     /// Agent's response text (AfterAgent).
-    /// Ref: <https://geminicli.com/docs/hooks/reference/#afteragent>
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_response: Option<String>,
 
     /// Event timestamp.
-    /// Ref: <https://geminicli.com/docs/hooks/reference/#afteragent>
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
 
@@ -354,36 +352,11 @@ impl InternalStopHookOutput {
         }
     }
 
-    /// Translate to Gemini CLI format.
-    /// Ref: <https://geminicli.com/docs/hooks/reference/#afteragent>
-    pub fn to_gemini(&self) -> GeminiStopHookOutput {
-        match self.decision {
-            StopDecision::Allow => GeminiStopHookOutput {
-                decision: GeminiStopDecision::Allow,
-                reason: None,
-                continue_: true,
-                clear_context: None,
-                system_message: None,
-                suppress_output: None,
-            },
-            StopDecision::Block => GeminiStopHookOutput {
-                decision: GeminiStopDecision::Deny, // Gemini uses "deny" for retry
-                reason: self.reason.clone(),
-                continue_: true,
-                clear_context: None,
-                system_message: None,
-                suppress_output: None,
-            },
-        }
-    }
-
     /// Translate to runtime-specific format and serialize to JSON.
     pub fn to_runtime_json(&self, runtime: &Runtime) -> String {
         match runtime {
             Runtime::Claude => serde_json::to_string(&self.to_claude())
                 .unwrap_or_else(|_| r#"{"continue":true}"#.to_string()),
-            Runtime::Gemini => serde_json::to_string(&self.to_gemini())
-                .unwrap_or_else(|_| r#"{"decision":"allow"}"#.to_string()),
             Runtime::OpenCode => serde_json::to_string(&self.to_claude())
                 .unwrap_or_else(|_| r#"{"continue":true}"#.to_string()),
             Runtime::Codex => serde_json::to_string(&self.to_claude())
@@ -403,40 +376,6 @@ pub struct ClaudeStopHookOutput {
     pub stop_reason: Option<String>,
 }
 
-/// Gemini CLI stop hook decision.
-/// Ref: <https://geminicli.com/docs/hooks/reference/#afteragent>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GeminiStopDecision {
-    /// Allow the agent to stop
-    Allow,
-    /// Deny and trigger retry with reason as correction prompt
-    Deny,
-}
-
-/// Gemini CLI stop hook output format.
-/// Ref: <https://geminicli.com/docs/hooks/reference/#afteragent>
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct GeminiStopHookOutput {
-    /// Decision: allow or deny (deny triggers retry with reason as correction prompt)
-    pub decision: GeminiStopDecision,
-    /// Reason sent to agent as correction prompt (when decision = deny)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    /// Whether to continue the session (false = exit)
-    #[serde(rename = "continue", default = "default_true")]
-    pub continue_: bool,
-    /// Whether to clear conversation context
-    #[serde(skip_serializing_if = "Option::is_none", rename = "clearContext")]
-    pub clear_context: Option<bool>,
-    /// System message to show to user
-    #[serde(skip_serializing_if = "Option::is_none", rename = "systemMessage")]
-    pub system_message: Option<String>,
-    /// Whether to suppress CLI output
-    #[serde(skip_serializing_if = "Option::is_none", rename = "suppressOutput")]
-    pub suppress_output: Option<bool>,
-}
-
 // ============================================================================
 // Hook Envelope (server ↔ CLI wire type)
 // ============================================================================
@@ -445,7 +384,7 @@ pub struct GeminiStopHookOutput {
 /// Server returns this; CLI prints `stdout` and exits with `exit_code`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookEnvelope {
-    /// The JSON string to print to stdout (consumed by Claude Code / Gemini CLI).
+    /// The JSON string to print to stdout (consumed by the active CLI).
     pub stdout: String,
     /// Process exit code (0 = success, 2 = block).
     pub exit_code: i32,
@@ -664,11 +603,11 @@ fn codex_json_envelope(value: Value) -> HookEnvelope {
 }
 
 // ============================================================================
-// Gemini-Specific Hook Domain Types (from WASM, serialized directly)
+// Model hook domain types (from WASM, serialized directly)
 // ============================================================================
 
 /// Internal BeforeModel hook output from WASM.
-/// Same pattern: Haskell ToJSON produces Gemini-compatible format.
+/// Same pattern: Haskell ToJSON produces runtime-compatible format.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InternalBeforeModelOutput {
     /// Whether to continue.
@@ -689,7 +628,7 @@ pub struct InternalBeforeModelOutput {
 }
 
 /// Internal AfterModel hook output from WASM.
-/// Same pattern: Haskell ToJSON produces Gemini-compatible format.
+/// Same pattern: Haskell ToJSON produces runtime-compatible format.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InternalAfterModelOutput {
     /// Whether to continue.
@@ -908,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_hook_input_with_tool_parameters_alias() {
-        // Gemini CLI uses tool_parameters instead of tool_input
+        // Some runtimes use tool_parameters instead of tool_input.
         let json = r#"{"session_id":"s","hook_event_name":"PreToolUse","tool_parameters":{"key":"value"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert!(input.tool_input.is_some());
@@ -975,11 +914,7 @@ mod proptest_tests {
     }
 
     fn arb_runtime() -> impl Strategy<Value = Runtime> {
-        prop_oneof![
-            Just(Runtime::Claude),
-            Just(Runtime::Gemini),
-            Just(Runtime::OpenCode)
-        ]
+        prop_oneof![Just(Runtime::Claude), Just(Runtime::OpenCode)]
     }
 
     fn arb_permission_mode() -> impl Strategy<Value = PermissionMode> {

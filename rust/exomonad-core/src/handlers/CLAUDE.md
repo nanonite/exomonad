@@ -97,18 +97,17 @@ Handles effects in the `agent.*` namespace.
 
 ### Capabilities
 
-- **`spawn_leaf_teammate`**: Spawns a Gemini worker pane in the parent directory.
+- **`spawn_worker`**: Spawns a configured worker pane in the parent directory.
 - **`spawn_subtree`**: Creates a Claude subtree in a new git worktree + tmux window.
-- **`spawn_leaf_subtree`**: Creates a Gemini leaf in a new git worktree + tmux window (used by `spawn_leaf` worktree/standalone modes).
+- **`spawn_leaf_subtree`**: Creates a configured leaf in a new git worktree + tmux window (used by `spawn_leaf` worktree/standalone modes).
 - **`cleanup_merged`**: Removes worktrees for merged branches.
 
 ### Type Safety
 
 - `SpawnResult.agent_dir` is `PathBuf` (not String)
-- `SpawnResult.agent_type` uses the `AgentType` enum (not string "claude"/"gemini")
+- `SpawnResult.agent_type` uses the `AgentType` enum rather than a harness string.
 - `SpawnSubtreeOptions.agent_type` and `SpawnLeafOptions.agent_type` are `AgentType` (required, no default — `AGENT_TYPE_UNSPECIFIED` is rejected)
-- `SpawnOptions.base_branch` and `SpawnGeminiTeammateOptions.base_branch` are `Option<BirthBranch>`
-- `SpawnGeminiTeammateOptions.name` is `AgentName`
+- `SpawnOptions.base_branch` is `Option<BirthBranch>`
 - `AgentInfo.agent_dir` is `Option<PathBuf>`, `AgentInfo.slug` is `Option<AgentName>`
 - Proto conversion uses `AgentType::suffix()` and `AgentType::emoji()` methods
 - Claude session registry lookups use `AgentName`
@@ -171,7 +170,7 @@ The delivery verifier (background task that polls `is_message_read` for 30s) ski
 
 ### Routing Resolution
 
-`deliver_to_agent()` resolves the agent's routing.json by trying multiple path candidates: first the direct `agent_key` directory, then slug (last dot-segment) and full `agent_key` with `-gemini`, `-claude`, and `-shoal` suffixes. This handles both peer messaging (where `agent_key` is already the directory name) and parent notification (where `agent_key` is a dotted branch name). Reads `pane_id` (workers), `window_id` (subtrees/leaves), or `parent_tab` (fallback).
+`deliver_to_agent()` resolves the agent's routing.json by trying multiple path candidates: first the direct `agent_key` directory, then slug (last dot-segment) and full `agent_key` with supported harness suffixes. This handles both peer messaging (where `agent_key` is already the directory name) and parent notification (where `agent_key` is a dotted branch name). Reads `pane_id` (workers), `window_id` (subtrees/leaves), or `parent_tab` (fallback).
 
 ### Session-Qualified Targets
 
@@ -181,7 +180,7 @@ The delivery verifier (background task that polls `is_message_read` for 30s) ski
 
 `TmuxIpc::inject_input` serializes calls to the same target via a per-target `std::sync::Mutex` stored as `Weak` references in a static map. Entries are pruned on each lookup, preventing unbounded growth from ephemeral worker panes. Different targets are independent — locking `@1` does not block injection into `@2`.
 
-A 150ms debounce between `paste-buffer` and `send-keys Enter` gives complex TUIs (Claude Code's Ink renderer, Gemini CLI's readline) time to process pasted text before submission. The Enter keystroke is retried up to 3 times with 200ms between attempts to handle dropped keystrokes. Before injection, copy/scroll mode is detected via `#{pane_in_mode}` and cancelled to prevent silent paste failures.
+A 150ms debounce between `paste-buffer` and `send-keys Enter` gives complex TUIs time to process pasted text before submission. The Enter keystroke is retried up to 3 times with 200ms between attempts to handle dropped keystrokes. Before injection, copy/scroll mode is detected via `#{pane_in_mode}` and cancelled to prevent silent paste failures.
 
 ## Shared Helpers (`handlers/mod.rs`)
 
@@ -204,7 +203,7 @@ Proto3 uses empty strings/zero values as defaults. These helpers eliminate repet
 | `BirthBranch` | Branch-based agent identity | events, github_poller |
 | `BranchName` | Git branch name | file_pr, agent |
 | `PRNumber` | GitHub PR number (wraps u64) | file_pr, merge_pr, copilot, github_poller |
-| `AgentType` | Claude vs Gemini enum, provides `window_display_name()` and `from_dir_name()` | agent, github_poller |
+| `AgentType` | Supported harness enum, provides `window_display_name()` and `from_dir_name()` | agent, github_poller |
 | `GithubOwner` / `GithubRepo` | GitHub repo coordinates | github_poller |
 
 ### Boundary Conversion Pattern

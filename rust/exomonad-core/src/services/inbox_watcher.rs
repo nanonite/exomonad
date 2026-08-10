@@ -1,7 +1,7 @@
 //! Claude Teams inbox watcher for synthetic members.
 //!
-//! Polls inbox files for Gemini workers registered as synthetic team members.
-//! When new messages appear, injects their text into the Gemini agent's
+//! Polls inbox files for workers registered as synthetic team members.
+//! When new messages appear, injects their text into the worker's
 //! tmux pane via `inject_input`.
 
 use std::collections::HashMap;

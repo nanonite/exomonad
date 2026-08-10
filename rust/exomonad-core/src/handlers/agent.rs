@@ -15,8 +15,8 @@ use super::non_empty;
 use crate::services::agent_control::{
     finish_invocation_and_tombstone, read_invocation, slugify, AgentControlService, AgentIdentity,
     AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags, InvocationFinishResult,
-    InvocationRecord, InvocationStatus, InvocationTrigger, SpawnGeminiTeammateOptions,
-    SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
+    InvocationRecord, InvocationStatus, InvocationTrigger, SpawnLeafOptions, SpawnOptions,
+    SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
 };
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
@@ -543,34 +543,56 @@ fn claude_spawn_flags(
     }
 }
 
+// The retired harness keeps its historical protobuf number so old payloads can
+// fail closed with the actionable deprecation message.
+const RETIRED_AGENT_TYPE_VALUE: i32 = 2;
+
 fn convert_agent_type(t: AgentType) -> EffectResult<ServiceAgentType> {
+    if t as i32 == RETIRED_AGENT_TYPE_VALUE {
+        return Err(EffectError::invalid_input(
+            crate::services::agent_control::AGENT_TYPE_DEPRECATION_MESSAGE,
+        ));
+    }
     match t {
         AgentType::Claude => Ok(ServiceAgentType::Claude),
-        AgentType::Gemini => Ok(ServiceAgentType::Gemini),
         AgentType::Shoal => Ok(ServiceAgentType::Shoal),
         AgentType::Opencode => Ok(ServiceAgentType::OpenCode),
         AgentType::Codex => Ok(ServiceAgentType::Codex),
         AgentType::Unspecified => Err(EffectError::invalid_input(
-            "agent_type is required (must be 'claude', 'gemini', 'shoal', 'opencode', or 'codex', got UNSPECIFIED)",
+            "agent_type is required (must be 'claude', 'shoal', 'opencode', or 'codex', got UNSPECIFIED)",
+        )),
+        _ => Err(EffectError::invalid_input(
+            crate::services::agent_control::AGENT_TYPE_DEPRECATION_MESSAGE,
         )),
     }
 }
 
-fn convert_agent_type_or_default(t: AgentType, default_type: ServiceAgentType) -> ServiceAgentType {
+fn convert_agent_type_or_default(
+    t: AgentType,
+    default_type: ServiceAgentType,
+) -> EffectResult<ServiceAgentType> {
+    if t as i32 == RETIRED_AGENT_TYPE_VALUE {
+        return Err(EffectError::invalid_input(
+            crate::services::agent_control::AGENT_TYPE_DEPRECATION_MESSAGE,
+        ));
+    }
     match t {
-        AgentType::Unspecified => default_type,
-        _ => convert_agent_type(t).unwrap_or(default_type),
+        AgentType::Unspecified => Ok(default_type),
+        _ => convert_agent_type(t),
     }
 }
 
 fn proto_agent_type_label(t: AgentType) -> &'static str {
+    if t as i32 == RETIRED_AGENT_TYPE_VALUE {
+        return "retired";
+    }
     match t {
         AgentType::Claude => "claude",
-        AgentType::Gemini => "gemini",
         AgentType::Shoal => "shoal",
         AgentType::Opencode => "opencode",
         AgentType::Codex => "codex",
         AgentType::Unspecified => "unspecified",
+        _ => "retired",
     }
 }
 
@@ -845,46 +867,6 @@ impl<
         Ok(SpawnBatchResponse { agents, errors })
     }
 
-    async fn spawn_gemini_teammate(
-        &self,
-        req: SpawnGeminiTeammateRequest,
-        ctx: &crate::effects::EffectContext,
-    ) -> EffectResult<SpawnGeminiTeammateResponse> {
-        self.ensure_tl_spawn_preflight(ctx).await?;
-        let requested_agent_type = req.agent_type();
-        let effective_agent_type = convert_agent_type(requested_agent_type)?;
-        self.enforce_harness_switch_policy(
-            ctx,
-            "spawn_gemini_teammate",
-            self.service.default_spawn_agent_type(),
-            requested_agent_type,
-            effective_agent_type,
-            self.service
-                .effective_model_for(effective_agent_type, "dev", None),
-            self.service.effective_effort_for("dev", None),
-        )?;
-        let options = SpawnGeminiTeammateOptions {
-            name: AgentName::try_from_str(req.name.as_str())
-                .expect("validated string input is non-empty"),
-            prompt: req.prompt.clone(),
-            agent_type: effective_agent_type,
-            subrepo: non_empty(req.subrepo).map(PathBuf::from),
-            base_branch: non_empty(req.base_branch).map(|s| {
-                BirthBranch::try_from_str(s.as_str()).expect("validated string input is non-empty")
-            }),
-        };
-
-        let result = self
-            .service
-            .spawn_gemini_teammate(&options, &ctx.birth_branch)
-            .await
-            .effect_err_preserve("agent")?;
-
-        Ok(SpawnGeminiTeammateResponse {
-            agent: Some(teammate_result_to_proto(&req.name, &result)),
-        })
-    }
-
     async fn spawn_worker(
         &self,
         req: SpawnWorkerRequest,
@@ -894,7 +876,7 @@ impl<
         let default_type = self.service.default_spawn_agent_type();
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
-            convert_agent_type_or_default(requested_agent_type, default_type);
+            convert_agent_type_or_default(requested_agent_type, default_type)?;
         let model = self
             .service
             .effective_model_for(effective_agent_type, "worker", None);
@@ -1052,7 +1034,7 @@ impl<
         let default_type = self.service.default_spawn_agent_type();
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
-            convert_agent_type_or_default(requested_agent_type, default_type);
+            convert_agent_type_or_default(requested_agent_type, default_type)?;
         let role_name = if req.role.trim().is_empty() {
             "tl"
         } else {
@@ -1413,7 +1395,7 @@ impl<
         let agent_type = convert_agent_type_or_default(
             req.agent_type(),
             self.service.default_spawn_agent_type(),
-        );
+        )?;
         let new_identity = AgentIdentity::new(new_slug.clone(), agent_type);
         let new_internal_name = new_identity.internal_name().to_string();
         let new_branch = match BirthBranch::try_from_str(&original_base_branch) {
@@ -1696,7 +1678,7 @@ impl<
         let default_type = self.service.default_spawn_agent_type();
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
-            convert_agent_type_or_default(requested_agent_type, default_type);
+            convert_agent_type_or_default(requested_agent_type, default_type)?;
         let model = self
             .service
             .effective_model_for(effective_agent_type, "dev", None);
@@ -2008,12 +1990,12 @@ impl<
         let agent_key = ctx.agent_name.to_string();
         let agents_dir = self.ctx.project_dir().join(".exo/agents");
 
-        // FIXME: Routing is written under internal_name (slug-suffix, e.g. "beta-gemini")
+        // FIXME: Routing is written under internal_name (slug-suffix, e.g. "beta-codex")
         // but MCP config passes bare slug as --name (e.g. "beta"). This suffix probing
         // is a band-aid — the real fix is making agent_name consistent between MCP config
         // and routing.json (either always include the suffix, or never).
         let candidates = std::iter::once(agent_key.clone()).chain(
-            ["gemini", "claude", "shoal", "opencode", "codex"]
+            ["claude", "shoal", "opencode", "codex"]
                 .iter()
                 .map(|suffix| format!("{}-{}", agent_key, suffix)),
         );
@@ -2955,7 +2937,7 @@ fn leaf_identity_matches(metadata_name: &str, requested_name: &str) -> bool {
     if metadata_name == requested_name {
         return true;
     }
-    let has_runtime_suffix = ["-claude", "-gemini", "-shoal", "-opencode", "-codex"]
+    let has_runtime_suffix = ["-claude", "-shoal", "-opencode", "-codex"]
         .iter()
         .any(|suffix| metadata_name.ends_with(suffix));
     !has_runtime_suffix
@@ -3652,30 +3634,6 @@ fn spawn_result_to_proto(
     }
 }
 
-fn teammate_result_to_proto(
-    name: &str,
-    result: &crate::services::agent_control::SpawnResult,
-) -> exomonad_proto::effects::agent::AgentInfo {
-    use crate::services::agent_control::Topology;
-
-    exomonad_proto::effects::agent::AgentInfo {
-        id: result.agent_name.to_string(),
-        issue: String::new(),
-        worktree_path: String::new(),
-        branch_name: String::new(),
-        agent_type: service_agent_type_to_proto(result.agent_type),
-        role: 0,
-        alive: true,
-        mux_window: result.agent_type.tab_display_name(name),
-        error: String::new(),
-        pr_number: 0,
-        pr_url: String::new(),
-        topology: Topology::WorktreePerAgent.to_proto(),
-        pane_id: result.pane_id.clone().unwrap_or_default(),
-        ..Default::default()
-    }
-}
-
 fn worker_result_to_proto(
     name: &str,
     result: &crate::services::agent_control::SpawnResult,
@@ -3821,7 +3779,6 @@ fn spawn_result_branch_name(
 fn service_agent_type_to_proto(at: ServiceAgentType) -> i32 {
     match at {
         ServiceAgentType::Claude => AgentType::Claude as i32,
-        ServiceAgentType::Gemini => AgentType::Gemini as i32,
         ServiceAgentType::Shoal => AgentType::Shoal as i32,
         ServiceAgentType::OpenCode => AgentType::Opencode as i32,
         ServiceAgentType::Codex => AgentType::Codex as i32,
@@ -3898,7 +3855,6 @@ pub(crate) fn service_info_to_proto(
 ) -> exomonad_proto::effects::agent::AgentInfo {
     let agent_type = match info.agent_type {
         Some(ServiceAgentType::Claude) => AgentType::Claude as i32,
-        Some(ServiceAgentType::Gemini) => AgentType::Gemini as i32,
         Some(ServiceAgentType::Shoal) => AgentType::Shoal as i32,
         Some(ServiceAgentType::OpenCode) => AgentType::Opencode as i32,
         Some(ServiceAgentType::Codex) => AgentType::Codex as i32,
@@ -4008,8 +3964,8 @@ mod tests {
             ServiceAgentType::Claude
         );
         assert_eq!(
-            convert_agent_type(AgentType::Gemini).unwrap(),
-            ServiceAgentType::Gemini
+            convert_agent_type(AgentType::Codex).unwrap(),
+            ServiceAgentType::Codex
         );
         assert_eq!(
             convert_agent_type(AgentType::Codex).unwrap(),
@@ -4045,8 +4001,8 @@ mod tests {
     #[test]
     fn spawned_child_capture_reports_branch_when_present() {
         let capture = spawned_child_capture(
-            "leaf-1-gemini",
-            "gemini",
+            "leaf-1-codex",
+            "codex",
             "main.leaf-1",
             "leaf_subtree",
             Some("gpt-5.6-luna"),
@@ -4054,11 +4010,11 @@ mod tests {
             "worktree_per_agent",
         );
         assert_eq!(capture.kind, MemoryKind::SpawnedChild);
-        assert!(capture.summary.contains("leaf-1-gemini"));
+        assert!(capture.summary.contains("leaf-1-codex"));
         assert!(capture.summary.contains("main.leaf-1"));
         let metadata = capture.metadata.expect("metadata present");
-        assert_eq!(metadata["agent_id"], "leaf-1-gemini");
-        assert_eq!(metadata["agent_type"], "gemini");
+        assert_eq!(metadata["agent_id"], "leaf-1-codex");
+        assert_eq!(metadata["agent_type"], "codex");
         assert_eq!(metadata["branch"], "main.leaf-1");
         assert_eq!(metadata["spawn_type"], "leaf_subtree");
         assert_eq!(metadata["model"], "gpt-5.6-luna");
@@ -4069,15 +4025,15 @@ mod tests {
     #[test]
     fn spawned_child_capture_omits_branch_for_workers() {
         let capture = spawned_child_capture(
-            "worker-1-gemini",
-            "gemini",
+            "worker-1-codex",
+            "codex",
             "",
             "worker",
             None,
             None,
             "shared_dir",
         );
-        assert!(capture.summary.contains("worker-1-gemini"));
+        assert!(capture.summary.contains("worker-1-codex"));
         assert!(!capture.summary.contains("branch"));
         let metadata = capture.metadata.expect("metadata present");
         assert_eq!(metadata["branch"], "");
@@ -4092,7 +4048,7 @@ mod tests {
         let capture = resume_fix_direction_capture(
             104,
             "abc123",
-            "leaf-1-gemini",
+            "leaf-1-codex",
             "main.leaf-1",
             "address review feedback\nwith extra detail",
             Some("gpt-5.6-luna"),
@@ -4101,13 +4057,13 @@ mod tests {
         );
         assert_eq!(capture.kind, MemoryKind::FixDirection);
         assert!(capture.summary.contains("PR #104"));
-        assert!(capture.summary.contains("leaf-1-gemini"));
+        assert!(capture.summary.contains("leaf-1-codex"));
         assert!(capture.summary.contains("address review feedback"));
         assert!(!capture.summary.contains("with extra detail"));
         let metadata = capture.metadata.expect("metadata present");
         assert_eq!(metadata["pr_number"], 104);
         assert_eq!(metadata["head_sha"], "abc123");
-        assert_eq!(metadata["owner"], "leaf-1-gemini");
+        assert_eq!(metadata["owner"], "leaf-1-codex");
         assert_eq!(metadata["branch"], "main.leaf-1");
         assert_eq!(metadata["model"], "gpt-5.6-luna");
         assert_eq!(metadata["effort"], "xhigh");
@@ -4116,7 +4072,7 @@ mod tests {
 
     fn memory_test_context() -> crate::effects::EffectContext {
         crate::effects::EffectContext {
-            agent_name: AgentName::try_from_str("leaf-1-gemini").expect("literal is valid"),
+            agent_name: AgentName::try_from_str("leaf-1-codex").expect("literal is valid"),
             birth_branch: BirthBranch::try_from_str("main.leaf-1").expect("literal is valid"),
             working_dir: std::path::PathBuf::from("."),
         }
@@ -4131,8 +4087,8 @@ mod tests {
             &ctx,
             handler.ctx.as_ref(),
             spawned_child_capture(
-                "leaf-1-gemini",
-                "gemini",
+                "leaf-1-codex",
+                "codex",
                 "main.leaf-1",
                 "leaf_subtree",
                 Some("gpt-5.6-luna"),
@@ -4148,7 +4104,7 @@ mod tests {
             resume_fix_direction_capture(
                 104,
                 "abc123",
-                "leaf-1-gemini",
+                "leaf-1-codex",
                 "main.leaf-1",
                 "address review feedback",
                 Some("gpt-5.6-luna"),
@@ -4177,8 +4133,8 @@ mod tests {
         // validation; capture_memory must swallow that failure and return
         // None rather than surface it to the caller.
         let mut invalid_spawned = spawned_child_capture(
-            "leaf-1-gemini",
-            "gemini",
+            "leaf-1-codex",
+            "codex",
             "main.leaf-1",
             "leaf_subtree",
             Some("gpt-5.6-luna"),
@@ -4194,7 +4150,7 @@ mod tests {
         let mut invalid_fix = resume_fix_direction_capture(
             104,
             "abc123",
-            "leaf-1-gemini",
+            "leaf-1-codex",
             "main.leaf-1",
             "address review feedback",
             None,
@@ -4266,7 +4222,7 @@ mod tests {
             task: "original task".to_string(),
             branch_name: "owner-slug".to_string(),
             role: Some(crate::domain::Role::dev()),
-            agent_type: ServiceAgentType::Gemini,
+            agent_type: ServiceAgentType::Codex,
             claude_flags: ClaudeSpawnFlags {
                 permission_mode: Some(crate::domain::PermissionMode::Default),
                 allowed_tools: vec!["Read".to_string()],
@@ -4277,8 +4233,7 @@ mod tests {
             start_point: Some("head-sha".to_string()),
             base_branch: Some("main".to_string()),
             expected_agent_name: Some(
-                AgentName::try_from_str("owner-slug-gemini")
-                    .expect("literal is a valid agent name"),
+                AgentName::try_from_str("owner-slug-codex").expect("literal is a valid agent name"),
             ),
             invocation_pr_number: Some(104),
         };
@@ -4344,11 +4299,12 @@ mod tests {
     #[test]
     fn unspecified_agent_type_uses_configured_spawn_default() {
         assert_eq!(
-            convert_agent_type_or_default(AgentType::Unspecified, ServiceAgentType::OpenCode),
+            convert_agent_type_or_default(AgentType::Unspecified, ServiceAgentType::OpenCode)
+                .unwrap(),
             ServiceAgentType::OpenCode
         );
         assert_eq!(
-            convert_agent_type_or_default(AgentType::Unspecified, ServiceAgentType::Codex),
+            convert_agent_type_or_default(AgentType::Unspecified, ServiceAgentType::Codex).unwrap(),
             ServiceAgentType::Codex
         );
     }
@@ -4356,7 +4312,7 @@ mod tests {
     #[test]
     fn explicit_agent_type_overrides_configured_spawn_default() {
         assert_eq!(
-            convert_agent_type_or_default(AgentType::Claude, ServiceAgentType::OpenCode),
+            convert_agent_type_or_default(AgentType::Claude, ServiceAgentType::OpenCode).unwrap(),
             ServiceAgentType::Claude
         );
     }
@@ -4855,11 +4811,11 @@ mod tests {
     #[test]
     fn leaf_subtree_response_reports_actual_branch_for_new_and_resumed_leaves() {
         let result = crate::services::agent_control::SpawnResult {
-            agent_dir: PathBuf::from(".exo/worktrees/fix-pr97-ci-gemini"),
+            agent_dir: PathBuf::from(".exo/worktrees/fix-pr97-ci-codex"),
             branch_name: "main.fix-pr97-ci".to_string(),
-            agent_name: AgentName::try_from_str("fix-pr97-ci-gemini").unwrap(),
+            agent_name: AgentName::try_from_str("fix-pr97-ci-codex").unwrap(),
             issue_title: "fix CI".to_string(),
-            agent_type: ServiceAgentType::Gemini,
+            agent_type: ServiceAgentType::Codex,
             pane_id: None,
         };
         let response = leaf_subtree_result_to_proto("fix-pr97-ci", &result).unwrap();
@@ -4884,9 +4840,9 @@ mod tests {
         let result = crate::services::agent_control::SpawnResult {
             agent_dir: PathBuf::new(),
             branch_name: String::new(),
-            agent_name: AgentName::try_from_str("missing-branch-gemini").unwrap(),
+            agent_name: AgentName::try_from_str("missing-branch-codex").unwrap(),
             issue_title: String::new(),
-            agent_type: ServiceAgentType::Gemini,
+            agent_type: ServiceAgentType::Codex,
             pane_id: None,
         };
         let error = leaf_subtree_result_to_proto("missing-branch", &result).unwrap_err();

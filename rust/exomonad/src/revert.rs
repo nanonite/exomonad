@@ -71,7 +71,6 @@ async fn remove_root_artifacts(project_dir: &Path, report: &mut RevertReport) {
         ".claude/rules/exomonad_role.md",
         "opencode.json",
         ".codex/config.toml",
-        ".gemini/settings.json",
         ".exo/agents/root/opencode.json",
         ".exo/agents/root/.birth_branch",
     ] {
@@ -206,8 +205,8 @@ mod tests {
             companions: vec![CompanionConfig {
                 name: "buddy".to_string(),
                 role: "worker".to_string(),
-                agent_type: Some(AgentType::Gemini),
-                command: "gemini".to_string(),
+                agent_type: Some(AgentType::Codex),
+                command: "codex".to_string(),
                 task: None,
                 model: None,
             }],
@@ -240,7 +239,6 @@ mod tests {
             ".claude/settings.local.json",
             ".claude/rules/exomonad_role.md",
             ".codex/config.toml",
-            ".gemini/settings.json",
             ".exo/agents/root/opencode.json",
             ".exo/agents/root/.birth_branch",
             ".exo/agents/buddy/routing.json",

@@ -146,8 +146,8 @@ mod tests {
 
     fn test_context() -> EffectContext {
         EffectContext {
-            agent_name: AgentName::try_from_str("worker-gemini").unwrap(),
-            birth_branch: BirthBranch::try_from_str("main.tl.worker-gemini").unwrap(),
+            agent_name: AgentName::try_from_str("worker-codex").unwrap(),
+            birth_branch: BirthBranch::try_from_str("main.tl.worker-codex").unwrap(),
             working_dir: std::path::PathBuf::from("."),
         }
     }
@@ -178,8 +178,8 @@ mod tests {
         let records = services.memory.list(MemoryFilter::default()).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].run_id, "main");
-        assert_eq!(records[0].agent_id, "worker-gemini");
-        assert_eq!(records[0].birth_branch, "main.tl.worker-gemini");
+        assert_eq!(records[0].agent_id, "worker-codex");
+        assert_eq!(records[0].birth_branch, "main.tl.worker-codex");
         assert_eq!(records[0].issue_id, Some(629));
     }
 

@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 // Re-export commonly used types
 pub use hook::{
     codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload,
-    ClaudePreToolUseOutput, ClaudeStopHookOutput, GeminiStopDecision, GeminiStopHookOutput,
-    HookEnvelope, HookInput, HookSpecificOutput, InternalAfterModelOutput,
-    InternalBeforeModelOutput, InternalStopHookOutput, PermissionDecision, StopDecision,
+    ClaudePreToolUseOutput, ClaudeStopHookOutput, HookEnvelope, HookInput, HookSpecificOutput,
+    InternalAfterModelOutput, InternalBeforeModelOutput, InternalStopHookOutput,
+    PermissionDecision, StopDecision,
 };
 pub use mcp::{McpError, ToolDefinition};
 pub use service::{
@@ -49,8 +49,6 @@ pub enum Runtime {
     /// Anthropic's Claude Code CLI.
     #[default]
     Claude,
-    /// Google's Gemini CLI.
-    Gemini,
     /// SST OpenCode CLI.
     #[value(name = "opencode")]
     #[serde(rename = "opencode")]
@@ -61,7 +59,7 @@ pub enum Runtime {
 }
 
 /// Hook event type for CLI hooks.
-/// Includes both Claude-specific and Gemini-specific hook types.
+/// Hook types supported by the active runtimes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, strum::Display, Serialize, Deserialize)]
 #[strum(serialize_all = "kebab-case")]
 #[serde(rename_all = "kebab-case")]
@@ -88,13 +86,13 @@ pub enum HookEventType {
     PermissionRequest,
     /// When user submits a prompt
     UserPromptSubmit,
-    /// Gemini: After agent finishes (equivalent to Claude's Stop for main agent)
+    /// After a runtime agent finishes.
     AfterAgent,
-    /// Gemini: Before tool execution (equivalent to Claude's PreToolUse)
+    /// Before tool execution.
     BeforeTool,
-    /// Gemini: Before model invocation (can inject synthetic response)
+    /// Before model invocation.
     BeforeModel,
-    /// Gemini: After model response chunk (can rewrite or discard)
+    /// After a model response chunk.
     AfterModel,
     /// Custom: Worker agent exit (sends completion note to parent)
     WorkerExit,
@@ -117,13 +115,6 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_gemini_serialization() {
-        let val = Runtime::Gemini;
-        let json = serde_json::to_string(&val).unwrap();
-        assert_eq!(json, "\"gemini\"");
-    }
-
-    #[test]
     fn test_runtime_opencode_serialization() {
         let val = Runtime::OpenCode;
         let json = serde_json::to_string(&val).unwrap();
@@ -143,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_runtime_roundtrip() {
-        let val = Runtime::Gemini;
+        let val = Runtime::Claude;
         let json = serde_json::to_string(&val).unwrap();
         let back: Runtime = serde_json::from_str(&json).unwrap();
         assert_eq!(back, val);
@@ -152,7 +143,6 @@ mod tests {
     #[test]
     fn test_runtime_display() {
         assert_eq!(Runtime::Claude.to_string(), "claude");
-        assert_eq!(Runtime::Gemini.to_string(), "gemini");
         assert_eq!(Runtime::OpenCode.to_string(), "opencode");
         assert_eq!(Runtime::Codex.to_string(), "codex");
     }
@@ -186,7 +176,6 @@ mod proptest_tests {
         #[test]
         fn test_runtime_roundtrip_proptest(val in prop_oneof![
             Just(Runtime::Claude),
-            Just(Runtime::Gemini),
             Just(Runtime::OpenCode),
         ]) {
             let json = serde_json::to_string(&val).unwrap();

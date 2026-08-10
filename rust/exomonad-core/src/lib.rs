@@ -107,10 +107,9 @@ pub use logging::{init_logging, init_logging_with_default};
 #[cfg(feature = "runtime")]
 pub use protocol::{
     codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload,
-    ClaudePreToolUseOutput, ClaudeStopHookOutput, GeminiStopHookOutput, HookEnvelope,
-    HookEventType, HookInput, HookSpecificOutput, InternalAfterModelOutput,
-    InternalBeforeModelOutput, InternalStopHookOutput, PermissionDecision,
-    Runtime as ProtocolRuntime, StopDecision,
+    ClaudePreToolUseOutput, ClaudeStopHookOutput, HookEnvelope, HookEventType, HookInput,
+    HookSpecificOutput, InternalAfterModelOutput, InternalBeforeModelOutput,
+    InternalStopHookOutput, PermissionDecision, Runtime as ProtocolRuntime, StopDecision,
 };
 #[cfg(feature = "runtime")]
 pub use util::{build_prompt, find_exomonad_binary, shell_quote};

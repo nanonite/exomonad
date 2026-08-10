@@ -229,7 +229,7 @@ impl<
 
         // Remove git worktree if it exists.
         // spawn_subtree/spawn_leaf_subtree use bare slug as dir name,
-        // spawn_agent/spawn_gemini_teammate use internal_name ({id}-{type}).
+        // spawn_agent uses internal_name ({id}-{type}).
         let worktree_path = {
             let slug_path = self.worktree_base.join(identity.slug());
             if slug_path.exists() {
@@ -386,22 +386,19 @@ impl<
                     // Agent configs are the discovery markers; routing.json and
                     // invocation metadata remain the liveness authority.
                     let is_claude = path.join(".mcp.json").exists();
-                    let is_gemini = path.join(".gemini/settings.json").exists();
                     let is_shoal = path.join(".exo/mcp.json").exists();
                     let is_opencode = path.join("opencode.json").exists();
                     let is_codex = path.join(".codex/config.toml").exists();
 
-                    if is_claude || is_gemini || is_shoal || is_opencode || is_codex {
+                    if is_claude || is_shoal || is_opencode || is_codex {
                         let inferred_type = AgentType::from_dir_name(name);
-                        let agent_type = if is_gemini {
-                            AgentType::Gemini
-                        } else if is_shoal {
+                        let agent_type = if is_shoal {
                             AgentType::Shoal
                         } else if is_opencode {
                             AgentType::OpenCode
                         } else if is_codex {
                             AgentType::Codex
-                        } else if is_claude && inferred_type == AgentType::Gemini {
+                        } else if is_claude {
                             AgentType::Claude
                         } else {
                             inferred_type
@@ -468,7 +465,7 @@ impl<
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
                 let agent_type = AgentType::from_dir_name(name);
-                let Some(base_name) = ["-claude", "-gemini", "-shoal", "-opencode", "-codex"]
+                let Some(base_name) = ["-claude", "-shoal", "-opencode", "-codex"]
                     .iter()
                     .find_map(|suffix| name.strip_suffix(suffix))
                 else {

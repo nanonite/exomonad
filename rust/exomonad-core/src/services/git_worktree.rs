@@ -1002,8 +1002,8 @@ mod tests {
             &["config", "--local", "exomonad.remote", "forgejo"],
         );
 
-        let branch_a = format!("{default_branch}.dev-one-gemini");
-        let path_a = temp.path().join("dev-one-gemini");
+        let branch_a = format!("{default_branch}.dev-one-codex");
+        let path_a = temp.path().join("dev-one-codex");
         service
             .create_workspace(
                 &path_a,
@@ -1014,7 +1014,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             git_config_value(&path_a, "user.name").as_deref(),
-            Some("exomonad-dev-one-gemini")
+            Some("exomonad-dev-one-codex")
         );
         assert_eq!(configured_remote(&path_a).as_deref(), Some("forgejo"));
 
@@ -1031,7 +1031,7 @@ mod tests {
 
         assert_eq!(
             git_config_value(&path_a, "user.name").as_deref(),
-            Some("exomonad-dev-one-gemini")
+            Some("exomonad-dev-one-codex")
         );
         assert_eq!(
             git_config_value(&path_b, "user.name").as_deref(),
@@ -1055,8 +1055,8 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
         let base = BranchName::try_from_str(default_branch.as_str())
             .expect("validated string input is non-empty");
-        let dev_branch = format!("{default_branch}.dev-leaf-gemini");
-        let dev_path = temp.path().join("dev-leaf-gemini");
+        let dev_branch = format!("{default_branch}.dev-leaf-codex");
+        let dev_path = temp.path().join("dev-leaf-codex");
         service
             .create_workspace(
                 &dev_path,
@@ -1080,7 +1080,7 @@ mod tests {
 
         assert_eq!(
             git_config_value(&dev_path, "user.name").as_deref(),
-            Some("exomonad-dev-leaf-gemini")
+            Some("exomonad-dev-leaf-codex")
         );
         assert_eq!(
             git_config_value(&reviewer_path, "user.name").as_deref(),
@@ -1100,8 +1100,8 @@ mod tests {
     fn existing_worktrees_are_migrated_and_shared_legacy_identity_is_removed() {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
-        let existing_branch = format!("{default_branch}.existing-dev-gemini");
-        let existing_path = temp.path().join("existing-dev-gemini");
+        let existing_branch = format!("{default_branch}.existing-dev-codex");
+        let existing_path = temp.path().join("existing-dev-codex");
         run_git(
             temp.path(),
             &["config", "--local", "user.name", "exomonad-legacy-agent"],
@@ -1144,11 +1144,11 @@ mod tests {
 
         assert_eq!(
             git_config_value(&existing_path, "user.name").as_deref(),
-            Some("exomonad-existing-dev-gemini")
+            Some("exomonad-existing-dev-codex")
         );
         assert_eq!(
             git_config_value(&existing_path, "user.email").as_deref(),
-            Some("existing-dev-gemini@exomonad.local")
+            Some("existing-dev-codex@exomonad.local")
         );
         assert_eq!(
             git_local_config_value(temp.path(), "user.name"),
@@ -1171,7 +1171,7 @@ mod tests {
         let bare = TempDir::new().expect("failed to create bare repo directory");
         init_bare_fixture_git_repository(bare.path()).expect("bare git init failed");
         let bare_service = GitWorktreeService::new(bare.path().to_path_buf());
-        let branch = BranchName::try_from_str("main.agent-gemini")
+        let branch = BranchName::try_from_str("main.agent-codex")
             .expect("validated string input is non-empty");
         let base = BranchName::try_from_str("main").expect("validated string input is non-empty");
         let error = bare_service
@@ -1451,7 +1451,7 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
 
         // Simulate exomonad's dot-separated branch naming (suffixed agent names)
-        let birth_branch = format!("{}.remove-option-mcp-gemini", default_branch);
+        let birth_branch = format!("{}.remove-option-mcp-codex", default_branch);
         let branch = BranchName::try_from_str(birth_branch.as_str())
             .expect("validated string input is non-empty");
         let base = BranchName::try_from_str(default_branch.as_str())
@@ -1461,7 +1461,7 @@ mod tests {
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
             relative_dir,
-            std::path::PathBuf::from(".exo/worktrees/remove-option-mcp-gemini/")
+            std::path::PathBuf::from(".exo/worktrees/remove-option-mcp-codex/")
         );
 
         // Step 2: create worktree at the resolved path (relative to project root)
@@ -1487,7 +1487,7 @@ mod tests {
         let default_branch = get_default_branch(temp.path());
 
         let birth_branch = format!(
-            "{}.tui-port-2-claude.pdv-snapshot-enums-gemini",
+            "{}.tui-port-2-claude.pdv-snapshot-enums-codex",
             default_branch
         );
         let branch = BranchName::try_from_str(birth_branch.as_str())
@@ -1498,7 +1498,7 @@ mod tests {
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
             relative_dir,
-            std::path::PathBuf::from(".exo/worktrees/pdv-snapshot-enums-gemini/")
+            std::path::PathBuf::from(".exo/worktrees/pdv-snapshot-enums-codex/")
         );
 
         let worktree_path = temp.path().join(&relative_dir);
@@ -1536,7 +1536,7 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("wt-dotted");
-        let branch_name = format!("{}.feat-a-gemini", default_branch);
+        let branch_name = format!("{}.feat-a-codex", default_branch);
         let branch = BranchName::try_from_str(branch_name.as_str())
             .expect("validated string input is non-empty");
         let base = BranchName::try_from_str(default_branch.as_str())
@@ -1556,7 +1556,7 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("wt-deep");
-        let branch_name = format!("{}.tl.sub.leaf-gemini", default_branch);
+        let branch_name = format!("{}.tl.sub.leaf-codex", default_branch);
         let branch = BranchName::try_from_str(branch_name.as_str())
             .expect("validated string input is non-empty");
         let base = BranchName::try_from_str(default_branch.as_str())
@@ -1576,7 +1576,7 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
 
-        let birth_branch = format!("{}.fix-auth-gemini", default_branch);
+        let birth_branch = format!("{}.fix-auth-codex", default_branch);
         let branch = BranchName::try_from_str(birth_branch.as_str())
             .expect("validated string input is non-empty");
         let base = BranchName::try_from_str(default_branch.as_str())
@@ -1585,7 +1585,7 @@ mod tests {
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
             relative_dir,
-            std::path::PathBuf::from(".exo/worktrees/fix-auth-gemini/")
+            std::path::PathBuf::from(".exo/worktrees/fix-auth-codex/")
         );
 
         let worktree_path = temp.path().join(&relative_dir);
@@ -1627,7 +1627,7 @@ mod tests {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
 
-        let birth_branch = format!("{}.tl.sub.leaf.worker-gemini", default_branch);
+        let birth_branch = format!("{}.tl.sub.leaf.worker-codex", default_branch);
         let branch = BranchName::try_from_str(birth_branch.as_str())
             .expect("validated string input is non-empty");
         let base = BranchName::try_from_str(default_branch.as_str())
@@ -1636,7 +1636,7 @@ mod tests {
         let relative_dir = crate::services::agent_control::resolve_working_dir(&birth_branch);
         assert_eq!(
             relative_dir,
-            std::path::PathBuf::from(".exo/worktrees/worker-gemini/")
+            std::path::PathBuf::from(".exo/worktrees/worker-codex/")
         );
 
         let worktree_path = temp.path().join(&relative_dir);
@@ -1653,9 +1653,9 @@ mod tests {
     #[test]
     fn test_resolve_working_dir_sibling_collision() {
         let dir_a =
-            crate::services::agent_control::resolve_working_dir("main.tl-a.my-feature-gemini");
+            crate::services::agent_control::resolve_working_dir("main.tl-a.my-feature-codex");
         let dir_b =
-            crate::services::agent_control::resolve_working_dir("main.tl-b.my-feature-gemini");
+            crate::services::agent_control::resolve_working_dir("main.tl-b.my-feature-codex");
         assert_eq!(dir_a, dir_b, "Same slug = same dir (known limitation)");
     }
 
@@ -1663,8 +1663,8 @@ mod tests {
     #[test]
     fn test_resolve_working_dir_agent_suffixed() {
         assert_eq!(
-            crate::services::agent_control::resolve_working_dir("main.fix-auth-gemini"),
-            std::path::PathBuf::from(".exo/worktrees/fix-auth-gemini/")
+            crate::services::agent_control::resolve_working_dir("main.fix-auth-codex"),
+            std::path::PathBuf::from(".exo/worktrees/fix-auth-codex/")
         );
     }
 

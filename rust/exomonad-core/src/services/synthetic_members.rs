@@ -58,7 +58,7 @@ fn register_synthetic_member_at_path(
         "agentId": agent_id,
         "name": member_name,
         "agentType": agent_type,
-        "model": "gemini",
+        "model": "codex",
         "color": "green",
         "planModeRequired": false,
         "joinedAt": now,
@@ -240,27 +240,27 @@ mod tests {
         fs::write(&config_path, serde_json::to_string_pretty(&initial_config)?)?;
 
         // Register new member
-        register_synthetic_member_at_path(&config_path, &team_name, "gemini-1", "gemini-worker")?;
+        register_synthetic_member_at_path(&config_path, &team_name, "codex-1", "codex-worker")?;
 
         let content = fs::read_to_string(&config_path)?;
         let config: Value = serde_json::from_str(&content)?;
         let members = config["members"].as_array().unwrap();
         assert_eq!(members.len(), 2);
-        assert!(members.iter().any(|m| m["name"] == "gemini-1"));
+        assert!(members.iter().any(|m| m["name"] == "codex-1"));
 
         // Idempotent registration
-        register_synthetic_member_at_path(&config_path, &team_name, "gemini-1", "gemini-worker")?;
+        register_synthetic_member_at_path(&config_path, &team_name, "codex-1", "codex-worker")?;
         let content = fs::read_to_string(&config_path)?;
         let config: Value = serde_json::from_str(&content)?;
         assert_eq!(config["members"].as_array().unwrap().len(), 2);
 
         // Remove member
-        remove_synthetic_member_at_path(&config_path, &team_name, "gemini-1")?;
+        remove_synthetic_member_at_path(&config_path, &team_name, "codex-1")?;
         let content = fs::read_to_string(&config_path)?;
         let config: Value = serde_json::from_str(&content)?;
         let members = config["members"].as_array().unwrap();
         assert_eq!(members.len(), 1);
-        assert!(!members.iter().any(|m| m["name"] == "gemini-1"));
+        assert!(!members.iter().any(|m| m["name"] == "codex-1"));
 
         Ok(())
     }
@@ -280,15 +280,15 @@ mod tests {
                     "agentType": "human"
                 },
                 {
-                    "agentId": "gemini-1@test-team",
-                    "name": "gemini-1",
-                    "agentType": "gemini-worker",
+                    "agentId": "codex-1@test-team",
+                    "name": "codex-1",
+                    "agentType": "codex-worker",
                     "backendType": "exomonad"
                 },
                 {
-                    "agentId": "gemini-2@test-team",
-                    "name": "gemini-2",
-                    "agentType": "gemini-worker",
+                    "agentId": "codex-2@test-team",
+                    "name": "codex-2",
+                    "agentType": "codex-worker",
                     "backendType": "exomonad"
                 },
                 {

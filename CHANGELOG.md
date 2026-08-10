@@ -251,6 +251,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- M0.3 Retire Gemini runtime paths in the Rust host (#662)
 - M0.2 Retire Gemini spawn paths in the Haskell WASM guest (#661)
 - M0.1 Flip default spawn harness from gemini to codex (#660)
 - M0.5 Remove Gemini from the observability allowlist and contract fixtures (#708)

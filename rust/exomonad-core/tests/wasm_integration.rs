@@ -436,7 +436,7 @@ impl EffectHandler for MockAgentHandler {
                 let req = SpawnLeafSubtreeRequest::decode(payload)
                     .expect("mock agent handler should decode spawn_leaf_subtree request");
                 let agent = AgentInfo {
-                    id: "test-leaf-gemini".into(),
+                    id: "test-leaf-codex".into(),
                     issue: String::new(),
                     worktree_path: "/tmp/test-leaf-worktree".into(),
                     branch_name: "main.test-leaf".into(),
@@ -454,7 +454,7 @@ impl EffectHandler for MockAgentHandler {
                 let invocation = (req.resume_pr_number != 0).then(|| InvocationHandoff {
                     invocation_id: "invocation-test-1".into(),
                     trigger: "resume_pr".into(),
-                    runtime: "gemini".into(),
+                    runtime: "codex".into(),
                     branch_name: "main.test-leaf".into(),
                     target_type: "window".into(),
                     target_id: "@42".into(),
@@ -472,7 +472,7 @@ impl EffectHandler for MockAgentHandler {
                 let req = SpawnWorkerRequest::decode(payload)
                     .map_err(|e| EffectError::invalid_input(format!("decode: {e}")))?;
                 let agent = AgentInfo {
-                    id: "test-worker-gemini".into(),
+                    id: "test-worker-codex".into(),
                     issue: String::new(),
                     worktree_path: String::new(),
                     branch_name: String::new(),
@@ -880,7 +880,7 @@ impl EffectHandler for MockCopilotHandler {
 async fn mcp_tool_visibility_matrix_matches_live_wasm_tools() {
     let runtime = build_test_runtime().await;
     let expected = expected_tool_matrix_from_architecture_doc();
-    let runtimes = ["claude", "codex", "opencode", "gemini"];
+    let runtimes = ["claude", "codex", "opencode", "codex"];
     let mut failures = Vec::new();
 
     for runtime_name in runtimes {
@@ -1351,7 +1351,7 @@ async fn wasm_resume_pr_reports_verified_fresh_invocation_handoff() {
 
     assert_tool_success(&output, "resume_pr");
     assert_eq!(output["result"]["invocation"]["trigger"], "resume_pr");
-    assert_eq!(output["result"]["invocation"]["runtime"], "gemini");
+    assert_eq!(output["result"]["invocation"]["runtime"], "codex");
     assert_eq!(output["result"]["invocation"]["target_type"], "window");
     assert_eq!(output["result"]["invocation"]["target_id"], "@42");
     assert_eq!(output["result"]["invocation"]["fresh"], true);
@@ -1736,7 +1736,7 @@ async fn wasm_hook_worker_exit_notifies_parent_and_closes_self() {
         "role": "worker",
         "session_id": "test-session",
         "hook_event_name": "WorkerExit",
-        "agent_id": "test-worker-gemini",
+        "agent_id": "test-worker-codex",
         "exit_status": "success"
     });
 

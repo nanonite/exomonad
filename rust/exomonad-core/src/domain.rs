@@ -219,13 +219,6 @@ validated_string!(
     "agent_name"
 );
 
-impl AgentName {
-    /// Whether this agent name looks like a Gemini worker (ends with "-gemini").
-    pub fn is_gemini_worker(&self) -> bool {
-        self.0.ends_with("-gemini")
-    }
-}
-
 validated_string!(
     #[doc = "Claude Code session UUID for --fork-session context inheritance."]
     ClaudeSessionUuid,
@@ -1271,8 +1264,8 @@ mod tests {
     fn test_birth_branch_nested_child_roundtrip() {
         let parent =
             BirthBranch::try_from_str("main.feat").expect("literal validated string is non-empty");
-        let child = parent.child("sub-gemini");
-        assert_eq!(child.as_str(), "main.feat.sub-gemini");
+        let child = parent.child("sub-codex");
+        assert_eq!(child.as_str(), "main.feat.sub-codex");
         assert_eq!(child.parent(), Some(parent));
     }
 
@@ -1351,16 +1344,6 @@ mod tests {
     #[test]
     fn test_address_supervisor_display() {
         assert_eq!(Address::Supervisor.to_string(), "supervisor");
-    }
-
-    #[test]
-    fn test_agent_name_is_gemini_worker() {
-        assert!(AgentName::try_from_str("impl-gemini")
-            .expect("literal validated string is non-empty")
-            .is_gemini_worker());
-        assert!(!AgentName::try_from_str("impl-claude")
-            .expect("literal validated string is non-empty")
-            .is_gemini_worker());
     }
 
     #[test]
@@ -1784,7 +1767,7 @@ mod proptest_tests {
     fn any_agent_type() -> impl Strategy<Value = crate::services::agent_control::AgentType> {
         prop_oneof![
             Just(crate::services::agent_control::AgentType::Claude),
-            Just(crate::services::agent_control::AgentType::Gemini),
+            Just(crate::services::agent_control::AgentType::Codex),
             Just(crate::services::agent_control::AgentType::Shoal),
         ]
     }

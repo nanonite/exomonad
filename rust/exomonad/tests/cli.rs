@@ -60,8 +60,7 @@ fn test_init_help_describes_agent_type_flags() -> Result<(), Box<dyn std::error:
     let help = String::from_utf8(output)?;
 
     assert_eq!(
-        help.matches("valid: claude|gemini|opencode|codex|shoal")
-            .count(),
+        help.matches("valid: claude|opencode|codex|shoal").count(),
         2
     );
     assert!(help.contains("With --tl=opencode, stores [opencode].tl_model"));

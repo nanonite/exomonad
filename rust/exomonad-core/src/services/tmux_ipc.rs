@@ -499,7 +499,7 @@ impl TmuxIpc {
     /// Uses load-buffer → paste-buffer → send-keys Enter. The text is written
     /// without a trailing newline so that send-keys Enter is the sole execution
     /// trigger (avoids double-submit). No bracketed paste (-p) — Claude Code's
-    /// Ink TUI and Gemini CLI's readline can't handle the escape sequences.
+    /// Ink TUI and terminal readline implementations can't handle the escape sequences.
     ///
     /// The target is session-qualified (`{session}:{target}`) to ensure all
     /// commands resolve to the same pane. Without qualification, tmux resolves
@@ -583,7 +583,7 @@ impl TmuxIpc {
         }
 
         // No -p flag: bracketed paste (\e[200~...\e[201~) crashes Claude Code's
-        // Ink TUI and breaks Gemini CLI's readline. Plain paste streams bytes
+        // Ink TUI and terminal readline implementations. Plain paste streams bytes
         // as standard keyboard input.
         let paste_started = Instant::now();
         let paste_output = Command::new("tmux")
@@ -646,7 +646,7 @@ impl TmuxIpc {
             return Ok(());
         }
 
-        // For terminal CLIs (Codex, Gemini, OpenCode), submitted input stays in
+        // For terminal CLIs (Codex, OpenCode), submitted input stays in
         // terminal scrollback history, so capture-pane always shows the probe text
         // after Enter. Skip verification for those runtimes and trust paste+Enter.
         if skip_verify {

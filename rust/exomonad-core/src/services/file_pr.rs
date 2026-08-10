@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_resolve_base_branch_agent_suffixed() {
-        let head = BranchName::try_from_str("main.fix-auth-gemini")
+        let head = BranchName::try_from_str("main.fix-auth-codex")
             .expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, None),
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_resolve_base_branch_agent_suffixed_nested() {
-        let head = BranchName::try_from_str("main.tl-auth-claude.fix-oauth-gemini")
+        let head = BranchName::try_from_str("main.tl-auth-claude.fix-oauth-codex")
             .expect("literal validated string is non-empty");
         assert_eq!(
             resolve_base_branch(&head, None),
@@ -420,8 +420,8 @@ mod tests {
             "main.feat",
             "main.auth.middleware",
             "main.a.b.c.d.e",
-            "main.fix-auth-gemini",
-            "main.tl-auth-claude.fix-oauth-gemini",
+            "main.fix-auth-codex",
+            "main.tl-auth-claude.fix-oauth-codex",
         ];
         for case in &cases {
             let head = BranchName::try_from_str(case).expect("validated string input is non-empty");
@@ -596,14 +596,14 @@ mod tests {
         run_fixture_git_command(dir, &["commit", "-m", "init"])?;
 
         // Create a dot-separated branch (ExoMonad convention)
-        run_fixture_git_command(dir, &["checkout", "-b", "main.feat-a-gemini"])?;
+        run_fixture_git_command(dir, &["checkout", "-b", "main.feat-a-codex"])?;
 
         let git_wt = Arc::new(GitWorktreeService::new(dir.to_path_buf()));
         let bookmark = git_wt.get_workspace_bookmark(dir)?;
-        assert_eq!(bookmark, Some("main.feat-a-gemini".to_string()));
+        assert_eq!(bookmark, Some("main.feat-a-codex".to_string()));
 
         // Verify base detection via resolve_base_branch
-        let head = BranchName::try_from_str("main.feat-a-gemini")
+        let head = BranchName::try_from_str("main.feat-a-codex")
             .expect("literal validated string is non-empty");
         let base = resolve_base_branch(&head, None);
         assert_eq!(

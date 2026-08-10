@@ -50,7 +50,7 @@ exomonad shutdown                 # Gracefully shut down the running server
 Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is newer (consuming projects only, not source projects with `.exo/roles/`).
 
 
-Claude MCP is auto-registered during init. For Gemini, register manually (`gemini mcp add ...`).
+Claude MCP is auto-registered during init. Other harnesses use their standard MCP registration.
 
 Use `--recreate` to delete an existing session and create fresh (e.g., after binary updates).
 
@@ -67,7 +67,7 @@ shell_command = "nix develop"  # environment wrapper for TL tab + server
 wasm_dir = ".exo/wasm"        # project-local default
 wasm_name = "devswarm"        # auto-detected from .exo/roles/ if exactly one exists
 model = "sonnet"              # optional — --model flag for root TL agent
-root_agent_type = "claude"    # claude | gemini | opencode | codex
+root_agent_type = "claude"    # claude | opencode | codex | shoal
 spawn_agent_type = "codex"    # default worker/leaf/companion harness
 tl_effort_level = "medium"    # CLI overrides config
 worker_effort_level = "medium"
@@ -82,7 +82,7 @@ effort_level = "medium"
 **Role-specific effort:** `--tl-effort-level`, `--worker-effort-level`, and
 `--reviewer-effort-level` override their matching config values. Resolution is CLI >
 local config > global config > medium default. OpenCode receives effort as a
-model-aware `--variant`; Gemini and Shoal log that effort is ignored.
+model-aware `--variant`; Shoal logs that effort is ignored.
 
 **Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults) and `.gitignore` entries if missing.
 
@@ -133,7 +133,7 @@ Register manually in `.mcp.json`:
 | Tool | Role | Description |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree |
-| `spawn_leaf` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
+| `spawn_leaf` | root, tl | Spawn the configured leaf agent (worktree, inline, or standalone isolation) |
 | `file_pr` | tl, dev | Create/update PR for current branch |
 | `merge_pr` | root, tl | Merge child PR (gh merge + git fetch) |
 | `notify_parent` | tl, dev, worker | Send message to parent agent |

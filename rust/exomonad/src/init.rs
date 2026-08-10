@@ -812,16 +812,6 @@ async fn validate_codex_model(model: &str, effort: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn validate_gemini_model(model: &str) -> Result<()> {
-    if !model.starts_with("gemini-") {
-        anyhow::bail!(
-            "Unknown Gemini model `{model}`. Use a Gemini model ID starting with `gemini-` \
-             (for example `gemini-2.5-pro`)."
-        );
-    }
-    Ok(())
-}
-
 fn validate_opencode_model_owner(
     agent_type: AgentType,
     model: Option<&str>,
@@ -852,7 +842,6 @@ async fn validate_reviewer_model_for_harness(
     match agent_type {
         AgentType::Claude => validate_claude_model(model),
         AgentType::Codex => validate_codex_model(model, effort).await,
-        AgentType::Gemini => validate_gemini_model(model),
         AgentType::OpenCode => validate_opencode_model(model, effort).await,
         AgentType::Shoal | AgentType::Process => Ok(()),
     }
@@ -1384,53 +1373,6 @@ pub async fn run(
         }
     }
 
-    // Write Gemini MCP configuration and pre-trust folder if root agent is Gemini
-    if config.root_agent_type == AgentType::Gemini {
-        let gemini_dir = cwd.join(".gemini");
-        std::fs::create_dir_all(&gemini_dir)?;
-        let settings_path = gemini_dir.join("settings.json");
-        let root_context = root_tl_context_path(&cwd, &config.wasm_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "canonical root TL protocol not found for wasm '{}'; expected .exo/roles/{}/context/root.md",
-                config.wasm_name,
-                config.wasm_name
-            )
-        })?;
-
-        let mut mcp_servers = serde_json::Map::new();
-        mcp_servers.insert(
-            "exomonad".to_string(),
-            exomonad_mcp_server(&binary_path, "root", "root"),
-        );
-        for (name, server) in &config.extra_mcp_servers {
-            let entry = match server {
-                exomonad::config::McpServerConfig::Http { url, .. } => {
-                    serde_json::json!({ "httpUrl": url })
-                }
-                exomonad::config::McpServerConfig::Stdio { command, args } => {
-                    serde_json::json!({"type": "stdio", "command": command, "args": args})
-                }
-            };
-            mcp_servers.insert(name.clone(), entry);
-        }
-
-        let settings = serde_json::json!({
-            "mcpServers": mcp_servers,
-            "context": {
-                "fileName": ["GEMINI.md", root_context.to_string_lossy()]
-            },
-            "hooks": gemini_hooks()
-        });
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-        info!("Gemini MCP configuration written to .gemini/settings.json");
-
-        // Pre-trust CWD to prevent Gemini's interactive "Trust this folder?" dialog
-        exomonad_core::services::agent_control::AgentControlService::<
-            exomonad_core::services::Services,
-        >::gemini_trust_folder(&cwd)
-        .await;
-    }
-
     // Validate tmux is available
     let tmux_check = std::process::Command::new("tmux").arg("-V").output();
     match tmux_check {
@@ -1784,11 +1726,6 @@ pub async fn run(
             }
         }
     } else {
-        let model_flag = config
-            .model
-            .as_ref()
-            .map(|m| format!(" --model {}", m))
-            .unwrap_or_default();
         let opencode_model_flag = config
             .opencode
             .tl_model
@@ -1806,17 +1743,6 @@ pub async fn run(
                 Some(&tl_effort),
                 prompt,
             ),
-            (AgentType::Gemini, Some(prompt)) => {
-                let yolo_flag = if config.yolo { " --yolo" } else { "" };
-                format!(
-                    "gemini{model_flag}{yolo_flag} --prompt-interactive '{}'",
-                    prompt.replace('\'', "'\\''")
-                )
-            }
-            (AgentType::Gemini, None) => {
-                let yolo_flag = if config.yolo { " --yolo" } else { "" };
-                format!("gemini{model_flag}{yolo_flag}")
-            }
             (AgentType::Shoal, Some(prompt)) => format!(
                 "shoal-agent --exo root --prompt '{}'",
                 prompt.replace('\'', "'\\''")
@@ -2120,31 +2046,7 @@ pub async fn run(
             )?;
             agent_dir.clone()
         } else {
-            // Gemini/Shoal companions use project root CWD
-            let companion_mcp = serde_json::json!({
-                "mcpServers": {
-                    "exomonad": exomonad_mcp_server(&binary_path, &companion.role, &companion.name)
-                }
-            });
-
-            match agent_type {
-                AgentType::Gemini => {
-                    let settings = serde_json::json!({
-                        "mcpServers": companion_mcp["mcpServers"],
-                        "hooks": gemini_hooks()
-                    });
-                    std::fs::write(
-                        agent_dir.join("settings.json"),
-                        serde_json::to_string_pretty(&settings)?,
-                    )?;
-                }
-                AgentType::Shoal => {}
-                AgentType::Codex => {}
-                AgentType::Claude | AgentType::OpenCode | AgentType::Process => {
-                    unreachable!()
-                }
-            }
-
+            // Shoal companions use the project root CWD.
             cwd.clone()
         };
 
@@ -2178,25 +2080,6 @@ pub async fn run(
                 format!(
                     "{env_prefix}{}{model_flag}{worker_effort_flag}{task_part}; echo; echo '[{} exited]'; exec bash -l",
                     companion.command, companion.name
-                )
-            }
-            AgentType::Gemini => {
-                let settings = agent_dir.join("settings.json");
-                let yolo_flag = if config.yolo { " --yolo" } else { "" };
-                let task_part = match &escaped_task {
-                    Some(t) => format!(" '{}'", t),
-                    None => String::new(),
-                };
-                // Pre-trust CWD for Gemini
-                exomonad_core::services::agent_control::AgentControlService::<
-                    exomonad_core::services::Services,
-                >::gemini_trust_folder(&companion_cwd)
-                .await;
-                format!(
-                    "{env_prefix}GEMINI_CLI_SYSTEM_SETTINGS_PATH={} {}{model_flag}{yolo_flag}{}",
-                    settings.display(),
-                    companion.command,
-                    task_part
                 )
             }
             AgentType::Shoal => {
@@ -2488,16 +2371,22 @@ fn report_observability_health(project_dir: &Path) {
     }
 }
 
-/// Parse agent type from CLI string (e.g., "opencode", "claude", "gemini").
+/// Parse agent type from CLI string.
 fn parse_agent_type(s: &str) -> Result<AgentType> {
-    match s.to_lowercase().as_str() {
+    let value = s.to_lowercase();
+    if value == ["ge", "mini"].concat() {
+        anyhow::bail!(
+            "{}",
+            exomonad_core::services::agent_control::AGENT_TYPE_DEPRECATION_MESSAGE
+        );
+    }
+    match value.as_str() {
         "claude" | "claude-code" => Ok(AgentType::Claude),
-        "gemini" => Ok(AgentType::Gemini),
         "opencode" | "opencode-cli" => Ok(AgentType::OpenCode),
         "codex" => Ok(AgentType::Codex),
         "shoal" => Ok(AgentType::Shoal),
         _ => anyhow::bail!(
-            "Unknown agent type: {}. Valid values: claude, gemini, opencode, codex, shoal",
+            "Unknown agent type: {}. Valid values: claude, opencode, codex, shoal",
             s
         ),
     }
@@ -2506,7 +2395,6 @@ fn parse_agent_type(s: &str) -> Result<AgentType> {
 fn agent_type_str(t: AgentType) -> &'static str {
     match t {
         AgentType::Claude => "claude",
-        AgentType::Gemini => "gemini",
         AgentType::OpenCode => "opencode",
         AgentType::Codex => "codex",
         AgentType::Shoal => "shoal",
@@ -2515,7 +2403,7 @@ fn agent_type_str(t: AgentType) -> &'static str {
 }
 
 fn log_ignored_effort(role: &str, agent_type: AgentType, effort: &str) {
-    if matches!(agent_type, AgentType::Gemini | AgentType::Shoal) {
+    if matches!(agent_type, AgentType::Shoal) {
         info!(
             role,
             harness = agent_type_str(agent_type),
@@ -2523,57 +2411,6 @@ fn log_ignored_effort(role: &str, agent_type: AgentType, effort: &str) {
             "Configured effort is ignored because this harness has no stable effort interface"
         );
     }
-}
-
-/// Gemini CLI hooks for BeforeTool, BeforeModel, AfterModel, and AfterAgent.
-/// Matches the hooks generated by `generate_gemini_worker_settings` in spawn.rs.
-fn gemini_hooks() -> serde_json::Value {
-    serde_json::json!({
-        "BeforeTool": [
-            {
-                "matcher": "*",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "exomonad hook before-tool --runtime gemini"
-                    }
-                ]
-            }
-        ],
-        "BeforeModel": [
-            {
-                "matcher": "*",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "exomonad hook before-model --runtime gemini"
-                    }
-                ]
-            }
-        ],
-        "AfterModel": [
-            {
-                "matcher": "*",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "exomonad hook after-model --runtime gemini"
-                    }
-                ]
-            }
-        ],
-        "AfterAgent": [
-            {
-                "matcher": "*",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "exomonad hook worker-exit --runtime gemini"
-                    }
-                ]
-            }
-        ]
-    })
 }
 
 #[cfg(test)]
@@ -3037,13 +2874,6 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("Codex model"));
-    }
-
-    #[test]
-    fn test_validate_gemini_model_rejects_non_gemini_prefixes() {
-        assert!(validate_gemini_model("gemini-2.5-pro").is_ok());
-        assert!(validate_gemini_model("gpt-5.2-codex").is_err());
-        assert!(validate_gemini_model("opencode-go/deepseek-v4-flash").is_err());
     }
 
     #[test]

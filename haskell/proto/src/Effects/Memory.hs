@@ -62,6 +62,7 @@ data MemoryKind
   | MemoryKindNEXT_ACTION
   | MemoryKindHUMAN_CLARIFICATION
   | MemoryKindSESSION_SUMMARY
+  | MemoryKindTURN_END
   deriving (Hs.Show, Hs.Eq, Hs.Generic, Hs.NFData)
 
 instance (HsProtobuf.Named MemoryKind) where
@@ -71,7 +72,7 @@ instance (HsProtobuf.HasDefault MemoryKind)
 
 instance (Hs.Bounded MemoryKind) where
   minBound = MemoryKindMEMORY_KIND_UNSPECIFIED
-  maxBound = MemoryKindSESSION_SUMMARY
+  maxBound = MemoryKindTURN_END
 
 instance (Hs.Ord MemoryKind) where
   compare x y =
@@ -94,6 +95,7 @@ instance (HsProtobuf.ProtoEnum MemoryKind) where
   toProtoEnumMay 11 = Hs.Just MemoryKindNEXT_ACTION
   toProtoEnumMay 12 = Hs.Just MemoryKindHUMAN_CLARIFICATION
   toProtoEnumMay 13 = Hs.Just MemoryKindSESSION_SUMMARY
+  toProtoEnumMay 14 = Hs.Just MemoryKindTURN_END
   toProtoEnumMay _ = Hs.Nothing
   fromProtoEnum MemoryKindMEMORY_KIND_UNSPECIFIED = 0
   fromProtoEnum MemoryKindORIGINAL_PLAN = 1
@@ -109,6 +111,7 @@ instance (HsProtobuf.ProtoEnum MemoryKind) where
   fromProtoEnum MemoryKindNEXT_ACTION = 11
   fromProtoEnum MemoryKindHUMAN_CLARIFICATION = 12
   fromProtoEnum MemoryKindSESSION_SUMMARY = 13
+  fromProtoEnum MemoryKindTURN_END = 14
 
 instance (HsJSONPB.ToJSONPB MemoryKind) where
   toJSONPB x _ = HsJSONPB.enumFieldString x
@@ -142,6 +145,8 @@ instance (HsJSONPB.FromJSONPB MemoryKind) where
     Hs.pure MemoryKindHUMAN_CLARIFICATION
   parseJSONPB (HsJSONPB.String "SESSION_SUMMARY") =
     Hs.pure MemoryKindSESSION_SUMMARY
+  parseJSONPB (HsJSONPB.String "TURN_END") =
+    Hs.pure MemoryKindTURN_END
   parseJSONPB v = HsJSONPB.typeMismatch "MemoryKind" v
 
 instance (HsJSONPB.ToJSON MemoryKind) where

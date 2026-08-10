@@ -18,7 +18,7 @@ pub struct InjectionOptions {
     ///
     /// Claude Code's Ink TUI clears the input line immediately on submission,
     /// so `capture-pane` no longer shows the probe text → verification works.
-    /// Terminal CLIs (Codex, Gemini, OpenCode) keep submitted input in
+    /// Terminal CLIs (Codex, OpenCode) keep submitted input in
     /// terminal scrollback history, so the probe is always visible and
     /// verification always fails. Set `skip_verify = true` for those runtimes.
     pub skip_verify: bool,

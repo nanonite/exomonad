@@ -264,13 +264,13 @@ fn reviewer_attempt_is_current(
 fn legacy_event_role_for_agent_type(agent_type: AgentType) -> &'static str {
     match agent_type {
         AgentType::Claude => "tl",
-        AgentType::Gemini | AgentType::Shoal | AgentType::OpenCode | AgentType::Codex => "dev",
+        AgentType::Codex | AgentType::Shoal | AgentType::OpenCode => "dev",
         AgentType::Process => "process",
     }
 }
 
 fn event_target_has_wasm_runtime(agent_type: AgentType) -> bool {
-    matches!(agent_type, AgentType::Claude | AgentType::Gemini)
+    matches!(agent_type, AgentType::Claude | AgentType::Codex)
 }
 
 fn log_missing_event_plugin(
@@ -3959,7 +3959,7 @@ mod tests {
             "kind": "review_commented",
             "pr_number": 43,
             "branch": "main.feature-codex",
-            "author_branch": "main.review-pr-43-gemini",
+            "author_branch": "main.review-pr-43-codex",
             "comments": "Consider the error path.",
         });
 
@@ -4216,10 +4216,10 @@ mod tests {
         PendingPrActions {
             pr_number: 42,
             actions: Vec::new(),
-            branch: BranchName::try_from_str("main.feat-gemini")
+            branch: BranchName::try_from_str("main.feat-codex")
                 .expect("literal validated string is non-empty"),
-            agent_type: AgentType::Gemini,
-            agent_name: "feat-gemini".to_string(),
+            agent_type: AgentType::Codex,
+            agent_name: "feat-codex".to_string(),
             agent_role: "dev".to_string(),
             head_sha: "abc123".to_string(),
             issue_id: Some(632),
@@ -4252,7 +4252,7 @@ mod tests {
         assert_eq!(metadata["head_sha"], "abc123");
         assert_eq!(metadata["verdict"], "changes_requested");
         assert_eq!(metadata["event_kind"], "review_received");
-        assert_eq!(metadata["branch"], "main.feat-gemini");
+        assert_eq!(metadata["branch"], "main.feat-codex");
         assert_eq!(
             metadata["feedback_summary"]
                 .as_str()
@@ -4271,7 +4271,7 @@ mod tests {
             payload: serde_json::json!({
                 "pr_number": 42,
                 "status": "failure",
-                "branch": "main.feat-gemini",
+                "branch": "main.feat-codex",
                 "merge_blocked_on_ci": true,
                 "merge_ready": false,
             }),
@@ -4299,7 +4299,7 @@ mod tests {
                 "kind": "ci_blocked",
                 "pr_number": 42,
                 "ci_status": "failure",
-                "branch": "main.feat-gemini",
+                "branch": "main.feat-codex",
             }),
         };
 
@@ -4385,9 +4385,9 @@ mod tests {
 
     #[test]
     fn test_new_sha_fires_commits_pushed() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
@@ -4409,9 +4409,9 @@ mod tests {
 
     #[test]
     fn test_new_sha_after_approval_reopens_review_round() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.notified_parent_approved = true;
         state.review_approved_at = Some(Instant::now());
@@ -4441,9 +4441,9 @@ mod tests {
 
     #[test]
     fn test_first_approval_increments_review_rounds() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.ci_mergeable_at = Some(Instant::now());
         let reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
 
@@ -4472,9 +4472,9 @@ mod tests {
 
     #[test]
     fn test_approval_after_new_sha_increments_review_rounds_once() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.rounds = 1;
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.notified_parent_approved = true;
@@ -4518,9 +4518,9 @@ mod tests {
 
     #[test]
     fn test_sha_change_after_changes_requested_fires_fixes_pushed() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
         state.addressed_changes = false;
 
@@ -4552,9 +4552,9 @@ mod tests {
 
     #[test]
     fn test_reviewer_approval_triggers_manual_ci_when_status_unknown() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
@@ -4573,7 +4573,7 @@ mod tests {
         assert!(matches!(
             actions.iter().find(|action| matches!(action, PendingAction::TriggerManualCi { .. })),
             Some(PendingAction::TriggerManualCi { pr_number: 1, branch, head_sha })
-                if branch == "main.feat-gemini" && head_sha == "abc123"
+                if branch == "main.feat-codex" && head_sha == "abc123"
         ));
         assert!(actions.iter().any(|action| matches!(
             action,
@@ -4585,9 +4585,9 @@ mod tests {
 
     #[test]
     fn test_ci_failure_after_approval_blocks_pr() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.last_ci_status = CIStatus::Pending;
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.notified_parent_approved = true;
@@ -4634,8 +4634,8 @@ mod tests {
 
         let (branch, agent_type, role) = review_event_target(&pr);
 
-        assert_eq!(branch.as_str(), "main.feat-gemini");
-        assert_eq!(agent_type, AgentType::Gemini);
+        assert_eq!(branch.as_str(), "main.feat-codex");
+        assert_eq!(agent_type, AgentType::Codex);
         assert_eq!(role, "dev");
         assert_ne!(branch.as_str(), "review-pr-1");
     }
@@ -4665,8 +4665,7 @@ mod tests {
     #[test]
     fn test_only_wasm_event_targets_keep_missing_plugin_at_error_level() {
         assert!(event_target_has_wasm_runtime(AgentType::Claude));
-        assert!(event_target_has_wasm_runtime(AgentType::Gemini));
-        assert!(!event_target_has_wasm_runtime(AgentType::Codex));
+        assert!(event_target_has_wasm_runtime(AgentType::Codex));
         assert!(!event_target_has_wasm_runtime(AgentType::OpenCode));
         assert!(!event_target_has_wasm_runtime(AgentType::Shoal));
         assert!(!event_target_has_wasm_runtime(AgentType::Process));
@@ -4674,9 +4673,9 @@ mod tests {
 
     #[test]
     fn test_new_comments_update_comment_count_without_review_received() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let comments = vec![test_comment("Fix this")];
         let actions = compute_pr_actions(
             &mut state,
@@ -4699,9 +4698,9 @@ mod tests {
 
     #[test]
     fn test_changes_requested_fires_single_review_received() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let comments = vec![test_comment("Fix this")];
         let reviews = vec![test_review(
             "Please address comments",
@@ -4747,9 +4746,9 @@ mod tests {
 
     #[test]
     fn test_changes_requested_payload_records_review_author_branch() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let reviews = vec![ForgejoReview {
             review_id: None,
             body: "Please address comments".to_string(),
@@ -4775,16 +4774,16 @@ mod tests {
             action,
             PendingAction::WasmEvent { payload, .. }
                 if payload["kind"] == "review_received"
-                    && payload["branch"] == "main.feat-gemini"
+                    && payload["branch"] == "main.feat-codex"
                     && payload["author_branch"] == "review-pr-1"
         )));
     }
 
     #[test]
     fn test_new_review_same_kind_emits_once_per_fingerprint() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let first = ForgejoReview {
             review_id: Some(10),
             body: "Address the error path".to_string(),
@@ -4861,9 +4860,9 @@ mod tests {
 
     #[test]
     fn test_approval_fires_approved() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
         let actions = compute_pr_actions(
             &mut state,
@@ -4894,9 +4893,9 @@ mod tests {
 
     #[test]
     fn test_approval_with_unknown_ci_does_not_fire_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
@@ -4925,9 +4924,9 @@ mod tests {
 
     #[test]
     fn test_approval_after_green_ci_fires_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.last_ci_status = CIStatus::Success;
         state.ci_mergeable_at = Some(Instant::now() - Duration::from_secs(60));
         let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
@@ -4976,9 +4975,9 @@ mod tests {
 
     #[test]
     fn test_initial_approved_green_ci_observation_fires_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
@@ -5013,9 +5012,9 @@ mod tests {
 
     #[test]
     fn test_initial_approved_neutral_ci_observation_fires_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
@@ -5043,9 +5042,9 @@ mod tests {
 
     #[test]
     fn test_merge_ready_retries_until_delivery_marks_notified() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.notified_parent_approved = true;
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.last_ci_status = CIStatus::Success;
@@ -5084,7 +5083,7 @@ mod tests {
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
         let watcher = WorktreeEventWatcher::new(Arc::new(services));
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
 
         assert_eq!(
@@ -5099,7 +5098,7 @@ mod tests {
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
         let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_ci_source_configured(true);
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
 
         assert_eq!(
@@ -5110,9 +5109,9 @@ mod tests {
 
     #[test]
     fn test_green_ci_after_approval_fires_merge_ready_ci_event() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.notified_parent_approved = true;
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.review_approved_at = Some(Instant::now() - Duration::from_secs(60));
@@ -5143,9 +5142,9 @@ mod tests {
 
     #[test]
     fn test_green_ci_without_approval_does_not_fire_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.last_ci_status = CIStatus::Pending;
 
         let actions = compute_pr_actions(
@@ -5213,9 +5212,9 @@ mod tests {
     }
     #[test]
     fn test_green_ci_after_existing_approval_fires_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.notified_parent_approved = true;
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.review_approved_at =
@@ -5251,9 +5250,9 @@ mod tests {
 
     #[test]
     fn test_changes_requested_fires_review_received() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let reviews = vec![test_review(
             "Needs work",
             ForgejoReviewVerdict::ChangesRequested,
@@ -5285,9 +5284,9 @@ mod tests {
 
     #[test]
     fn test_changes_requested_at_max_rounds_fires_stuck() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.rounds = 1;
         let reviews = vec![test_review(
             "Still needs work",
@@ -5517,9 +5516,9 @@ mod tests {
 
     #[test]
     fn test_ci_change_fires_event() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.last_ci_status = CIStatus::Pending;
         let actions = compute_pr_actions(
             &mut state,
@@ -5545,9 +5544,9 @@ mod tests {
 
     #[test]
     fn test_timeout_after_15_minutes() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.first_seen = Instant::now() - Duration::from_secs(16 * 60);
         let actions = compute_pr_actions(
             &mut state,
@@ -5573,9 +5572,9 @@ mod tests {
 
     #[test]
     fn test_approved_pr_without_merge_ready_delivery_can_timeout() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.notified_parent_approved = true;
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.last_ci_status = CIStatus::Success;
@@ -5610,9 +5609,9 @@ mod tests {
 
     #[test]
     fn test_merge_ready_delivery_suppresses_timeout_after_approval() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.notified_parent_approved = true;
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.merge_ready_notified = true;
@@ -5638,9 +5637,9 @@ mod tests {
 
     #[test]
     fn test_stale_guard_suppresses_after_stuck() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.stuck = true;
         state.rounds = 2;
         let reviews = vec![test_review("Late approval", ForgejoReviewVerdict::Approved)];
@@ -5666,9 +5665,9 @@ mod tests {
 
     #[test]
     fn test_ci_success_after_merge_block_bypasses_stale_guard() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.notified_parent_approved = true;
         state.last_ci_status = CIStatus::Pending;
 
@@ -5697,9 +5696,9 @@ mod tests {
 
     #[test]
     fn test_no_duplicate_approval() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.notified_parent_approved = true;
         let reviews = vec![test_review(
@@ -5723,9 +5722,9 @@ mod tests {
 
     #[test]
     fn test_approval_detected_from_body_text() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let reviews = vec![ForgejoReview {
             review_id: None,
             body: "I have reviewed this and it is APPROVED".to_string(),
@@ -5753,9 +5752,9 @@ mod tests {
 
     #[test]
     fn test_timeout_shorter_after_addressed_changes() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.addressed_changes = true;
         state.first_seen = Instant::now() - Duration::from_secs(6 * 60);
         let actions = compute_pr_actions_with_context(
@@ -5785,9 +5784,9 @@ mod tests {
 
     #[test]
     fn test_review_stall_classification_names_stuck_actor() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
 
         state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
         assert_eq!(
@@ -5811,9 +5810,9 @@ mod tests {
 
     #[test]
     fn test_no_ci_event_when_status_unchanged() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.last_ci_status = CIStatus::Success;
         let actions = compute_pr_actions(
             &mut state,
@@ -5926,9 +5925,9 @@ mod tests {
         assert_eq!(verdict, ForgejoReviewVerdict::Commented);
         assert_eq!(review_state, ForgejoReviewState::Commented);
 
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc");
+        let mut state = test_state(&branch, AgentType::Codex, "abc");
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
@@ -6014,10 +6013,10 @@ mod tests {
 
     #[test]
     fn test_watch_state_new_sets_defaults() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let state = WatchState::new(&branch, AgentType::Gemini, "abc123", CIStatus::Unknown, 0);
-        assert_eq!(state.branch_name.as_str(), "main.feat-gemini");
+        let state = WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0);
+        assert_eq!(state.branch_name.as_str(), "main.feat-codex");
         assert_eq!(state.last_sha, "abc123");
         assert_eq!(state.last_review_state, ForgejoReviewVerdict::None);
         assert!(!state.notified_parent_approved);
@@ -6080,9 +6079,9 @@ mod tests {
 
     #[test]
     fn test_comment_review_is_retained_and_emits_body_once() {
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Gemini, "abc123");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let mut comment = test_review(
             "Looks good with a small suggestion",
             ForgejoReviewVerdict::Commented,
@@ -6301,11 +6300,11 @@ mod tests {
     fn test_pr_entry() -> crate::services::pr_registry::PrEntry {
         crate::services::pr_registry::PrEntry {
             number: 1,
-            head_branch: "main.feat-gemini".to_string(),
+            head_branch: "main.feat-codex".to_string(),
             base_branch: "main".to_string(),
             title: "Test PR".to_string(),
             body: String::new(),
-            author_agent: "feat-gemini".to_string(),
+            author_agent: "feat-codex".to_string(),
             author_role: "dev".to_string(),
             created_at: chrono::Utc::now(),
             state: crate::services::pr_registry::PrState::Open,
@@ -6349,7 +6348,7 @@ mod tests {
         Observation {
             publication: Some(PublishedHead {
                 pr_number: 1,
-                head_branch: "main.feat-gemini".to_string(),
+                head_branch: "main.feat-codex".to_string(),
                 base_branch: "main".to_string(),
                 head_sha: sha.to_string(),
                 author_agent: None,
@@ -6372,7 +6371,7 @@ mod tests {
         Observation {
             publication: Some(PublishedHead {
                 pr_number: 1,
-                head_branch: "main.feat-gemini".to_string(),
+                head_branch: "main.feat-codex".to_string(),
                 base_branch: "main".to_string(),
                 head_sha: sha.to_string(),
                 author_agent: None,
@@ -6493,8 +6492,8 @@ mod tests {
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
         let watcher = WorktreeEventWatcher::new(Arc::new(services));
-        let branch = BranchName::try_from_str("main.feat-gemini").unwrap();
-        let state = WatchState::new(&branch, AgentType::Gemini, "new-sha", CIStatus::Unknown, 0);
+        let branch = BranchName::try_from_str("main.feat-codex").unwrap();
+        let state = WatchState::new(&branch, AgentType::Codex, "new-sha", CIStatus::Unknown, 0);
         watcher.state.prs.lock().await.insert(1, state);
 
         let registry = test_registry(test_pr_entry());
@@ -6633,7 +6632,7 @@ mod tests {
             Observation {
                 publication: Some(PublishedHead {
                     pr_number: 1,
-                    head_branch: "main.feat-gemini".to_string(),
+                    head_branch: "main.feat-codex".to_string(),
                     base_branch: "main".to_string(),
                     head_sha: "abc123".to_string(),
                     author_agent: None,
@@ -6846,7 +6845,7 @@ mod tests {
             Observation {
                 publication: Some(PublishedHead {
                     pr_number: 1,
-                    head_branch: "main.feat-gemini".to_string(),
+                    head_branch: "main.feat-codex".to_string(),
                     base_branch: "main".to_string(),
                     head_sha: "abc123".to_string(),
                     author_agent: None,
@@ -7018,7 +7017,7 @@ mod tests {
             Observation {
                 publication: Some(PublishedHead {
                     pr_number: 1,
-                    head_branch: "main.feat-gemini".to_string(),
+                    head_branch: "main.feat-codex".to_string(),
                     base_branch: "main".to_string(),
                     head_sha: "abc123".to_string(),
                     author_agent: None,
@@ -7055,7 +7054,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
-        let branch = BranchName::try_from_str("main.feat-gemini")
+        let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let ci_status_map = services.ci_status_map.clone();
         ci_status_map
@@ -7327,7 +7326,7 @@ mod tests {
             Observation {
                 publication: Some(PublishedHead {
                     pr_number: 1,
-                    head_branch: "main.feat-gemini".to_string(),
+                    head_branch: "main.feat-codex".to_string(),
                     base_branch: "main".to_string(),
                     head_sha: "def456".to_string(),
                     author_agent: None,
@@ -7407,7 +7406,7 @@ mod tests {
             Observation {
                 publication: Some(PublishedHead {
                     pr_number: 1,
-                    head_branch: "main.feat-gemini".to_string(),
+                    head_branch: "main.feat-codex".to_string(),
                     base_branch: "main".to_string(),
                     head_sha: "def456".to_string(),
                     author_agent: None,

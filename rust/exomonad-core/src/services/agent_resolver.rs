@@ -23,7 +23,7 @@ pub struct AgentIdentityRecord {
     pub agent_name: AgentName,
     /// Bare slug without type suffix (e.g., "feature-a").
     pub slug: Slug,
-    /// Agent type (Claude, Gemini, Shoal, Process).
+    /// Agent type (Claude, Shoal, OpenCode, Codex, or Process).
     pub agent_type: AgentType,
     /// Git branch identity (e.g., "main.feature-a").
     pub birth_branch: BirthBranch,
@@ -263,7 +263,6 @@ impl AgentResolver {
         } else {
             let slug = agent_name
                 .trim_end_matches("-claude")
-                .trim_end_matches("-gemini")
                 .trim_end_matches("-shoal")
                 .trim_end_matches("-process");
             worktree_base.join(slug)
@@ -354,7 +353,7 @@ mod tests {
         AgentIdentityRecord {
             agent_name: AgentName::try_from_str(name).expect("validated string input is non-empty"),
             slug: Slug::try_from_str(slug).expect("validated string input is non-empty"),
-            agent_type: AgentType::Gemini,
+            agent_type: AgentType::Codex,
             birth_branch: BirthBranch::try_from_str(parent_branch)
                 .expect("validated string input is non-empty"),
             parent_branch: BirthBranch::try_from_str(parent_branch)
@@ -516,7 +515,7 @@ mod tests {
         resolver.register(record1).await.unwrap();
 
         // Same slug, different parent → collision for worktree agents
-        let record2 = test_record("feature-a-gemini", "feature-a", "dev.feature-a-gemini");
+        let record2 = test_record("feature-a-codex", "feature-a", "dev.feature-a-codex");
         // register still succeeds but logs a warning
         resolver.register(record2).await.unwrap();
 
@@ -538,7 +537,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let resolver = AgentResolver::load(tmp.path().to_path_buf()).await;
 
-        let record = worker_record("worker-a-gemini", "worker-a", "main");
+        let record = worker_record("worker-a-codex", "worker-a", "main");
         resolver.register(record).await.unwrap();
 
         // SharedDir agents don't count as slug collisions
@@ -589,7 +588,7 @@ mod tests {
             .await
             .unwrap();
         resolver
-            .register(worker_record("worker-b-gemini", "worker-b", "main"))
+            .register(worker_record("worker-b-codex", "worker-b", "main"))
             .await
             .unwrap();
 
@@ -606,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_identity_json_roundtrip() {
-        let record = worker_record("research-gemini", "research", "main.tl-branch");
+        let record = worker_record("research-codex", "research", "main.tl-branch");
         let json = serde_json::to_string_pretty(&record).unwrap();
         let deserialized: AgentIdentityRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(record, deserialized);

@@ -44,8 +44,8 @@ Human in tmux session
             ├── WASM: loaded from .exo/wasm/ at runtime
             └── fork_wave / spawn_leaf creates:
                 ├── Window subtree-1 (Claude, worktree off current branch, role=tl)
-                ├── Window leaf-1 (Gemini, worktree off current branch, role=dev)
-                ├── Pane worker-a (Gemini, in parent dir, ephemeral, role=worker)
+                ├── Window leaf-1 (Codex, worktree off current branch, role=dev)
+                ├── Pane worker-a (Codex, in parent dir, ephemeral, role=worker)
                 └── ... (recursive tree of worktrees + workers)
 ```
 
@@ -60,13 +60,13 @@ Each subtree agent (`spawn_subtree`):
 
 Each leaf agent (`spawn_leaf` with worktree/standalone isolation):
 - Same worktree isolation as `spawn_subtree` (own branch, own directory)
-- Gemini — dev role (no spawn tools)
+- Codex — dev role (no spawn tools)
 - Runs in tmux window, files PR against parent branch
 
 Each worker agent (`spawn_leaf` with inline isolation):
 - Runs in a tmux pane in the parent's directory (no branch, no worktree, ephemeral)
-- Always Gemini — lightweight, focused execution
-- MCP config in `.exo/agents/{name}/settings.json`, pointed via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`
+- Always Codex — lightweight, focused execution
+- Routing config in `.exo/agents/{name}/routing.json`
 
 ## Documentation Tree
 
@@ -126,11 +126,11 @@ nix develop .#wasm -c wasm32-wasi-cabal build --project-file=cabal.project.wasm 
 
 `exomonad init` selects root, worker, and reviewer harnesses independently with
 `--tl`, `--worker`, and `--reviewer`, or the matching config fields. Supported
-harnesses are Claude, Gemini, OpenCode, Codex, and Shoal where the
+harnesses are Claude, OpenCode, Codex, and Shoal where the
 selected role supports them. Effort precedence is CLI > local config > global
 config > medium default. OpenCode uses effort as a
 model-aware `--variant`, and `--worker-model` applies to OpenCode.
-Gemini and Shoal accept the shared setting but log that it is ignored.
+Shoal accepts the shared setting but logs that it is ignored.
 Codex passes the resolved effort as model_reasoning_effort, including xhigh,
 after model capability validation. Worker model selection applies to OpenCode
 and Codex command generation.
@@ -162,7 +162,6 @@ echo '{"hook_event_name":"PreToolUse",...}' | exomonad hook pre-tool-use
 | `EXOMONAD_SESSION_ID` | agent spawn | Parent's birth-branch, used for routing `notify_parent` |
 | `EXOMONAD_ROLE` | agent spawn | Agent's role name (tl, dev, worker) |
 | `EXOMONAD_TMUX_SESSION` | tmux_events, agent_control | tmux session name for IPC. Set globally via `tmux set-environment` during `exomonad init`; inherited by all windows/panes |
-| `GEMINI_CLI_SYSTEM_SETTINGS_PATH` | agent spawn | Points Gemini at per-agent settings.json |
 | `EXOMONAD_SWARM_RUN_ID` | agent spawn, logging | Swarm run ID (OTel resource attribute, propagated to children) |
 | `EXOMONAD_PARENT_AGENT` | agent spawn, logging | Parent agent's birth branch (OTel resource attribute) |
 
@@ -181,7 +180,7 @@ All tools are defined in Haskell WASM and executed via host functions.
 | Tool | Role | Description |
 |------|------|-------------|
 | `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree |
-| `spawn_leaf` | root, tl | Spawn Gemini agent (worktree, inline, or standalone isolation) |
+| `spawn_leaf` | root, tl | Spawn the configured leaf agent (worktree, inline, or standalone isolation) |
 | `file_pr` | tl, dev | Create/update PR for current branch (auto-detects base branch from naming) |
 | `merge_pr` | tl | Merge child PR (gh pr merge + git fetch) |
 | `notify_parent` | all | Send message to parent agent (auto-routed via Teams inbox, UDS, or tmux) |
@@ -239,7 +238,7 @@ Proto field helpers in `handlers/mod.rs`: `non_empty(String) → Option<String>`
 
 ## Configuration
 
-`exomonad init` auto-registers the Claude MCP server. For Gemini or custom setups, register manually in `.mcp.json`:
+`exomonad init` auto-registers the Claude MCP server. For custom setups, register manually in `.mcp.json`:
 ```json
 {
   "mcpServers": {

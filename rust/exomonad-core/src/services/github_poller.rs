@@ -374,7 +374,7 @@ impl<
         let agent_name = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
         let role = match agent_type {
             AgentType::Claude => "tl",
-            AgentType::Gemini => "dev",
+            AgentType::Codex => "dev",
             AgentType::Shoal => "dev",
             AgentType::OpenCode | AgentType::Codex => "dev",
             AgentType::Process => return Ok(None), // Process companions don't have WASM handlers
@@ -1179,7 +1179,7 @@ mod tests {
     fn make_pr_state(branch: &str, sha: &str) -> PRState {
         PRState::new(
             &BranchName::try_from_str(branch).expect("validated string input is non-empty"),
-            AgentType::Gemini,
+            AgentType::Codex,
             &CommitSha::try_from_str(sha).expect("validated string input is non-empty"),
             CIStatus::Pending,
             0,

@@ -474,7 +474,7 @@ async fn resolve_agent_birth_branch(
     // Strip known suffixes to get the slug for worktree dir lookup.
     let slug = agent_name
         .trim_end_matches("-claude")
-        .trim_end_matches("-gemini")
+        .trim_end_matches("-codex")
         .trim_end_matches("-shoal")
         .trim_end_matches("-process");
     let worktree_path = worktree_base.join(slug);
@@ -631,7 +631,7 @@ pub async fn handle_hook_inner(
         /// Worker exit: WASM handles notifyParent as side effect, returns simple allow
         WorkerExit,
         /// BeforeModel/AfterModel: passed through to WASM, response serialized as-is.
-        /// Currently only Gemini fires these; the dispatch arm is runtime-agnostic.
+        /// Runtime-specific model hooks use these; the dispatch arm is runtime-agnostic.
         BeforeModel,
         AfterModel,
     }

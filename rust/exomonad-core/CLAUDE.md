@@ -33,7 +33,7 @@ Without `runtime`: only `ui_protocol` module available (agent event types, telem
 | `PluginManager` | Manages WASM guest calls and host function dispatch via Extism |
 | `RuntimeBuilder` | Fluent API for assembling handlers and loading WASM |
 | `SpawnSubtreeOptions` | Options for spawning a Claude agent (permissions, etc.) |
-| `SpawnLeafOptions` | Options for spawning a Gemini agent |
+| `SpawnLeafOptions` | Options for spawning the configured leaf agent |
 
 `SpawnResult.branch_name` is the actual dot-prefixed git branch created or
 resumed by worktree spawns. Agent response conversion must use this value

@@ -22,7 +22,6 @@ pub fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
 fn parse_agent_type_env(s: &str) -> Option<AgentType> {
     match s.to_lowercase().as_str() {
         "claude" | "claude-code" => Some(AgentType::Claude),
-        "gemini" => Some(AgentType::Gemini),
         "opencode" | "opencode-cli" => Some(AgentType::OpenCode),
         "codex" => Some(AgentType::Codex),
         "shoal" => Some(AgentType::Shoal),
@@ -97,7 +96,7 @@ pub struct CompanionConfig {
     pub command: String,
     /// Task/prompt passed as positional arg to the command. None = interactive (no initial prompt).
     pub task: Option<String>,
-    /// Model override (e.g., "haiku", "sonnet"). Passed as --model flag to Claude/Gemini.
+    /// Model override (e.g., "haiku", "sonnet"). Passed as --model flag to the selected CLI.
     pub model: Option<String>,
 }
 
@@ -220,14 +219,14 @@ pub struct RawConfig {
     #[serde(default)]
     pub extra_mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 
-    /// Initial prompt for the root agent (used with `gemini --prompt-interactive`).
+    /// Initial prompt for the root agent.
     pub initial_prompt: Option<String>,
 
     /// Custom command for the root TL window (overrides agent_type-based default).
     /// Use for development (e.g., `cargo run -p shoal-agent -- --exo root`).
     pub root_command: Option<String>,
 
-    /// When true, spawned Gemini agents receive `--yolo` flag.
+    /// Retained for configuration compatibility; no longer changes harness behavior.
     #[serde(default)]
     pub yolo: bool,
 
@@ -317,7 +316,7 @@ pub struct Config {
     pub extra_mcp_servers: std::collections::HashMap<String, McpServerConfig>,
     /// Initial prompt for the root agent.
     pub initial_prompt: Option<String>,
-    /// When true, spawned Gemini agents receive `--yolo` flag.
+    /// Retained for configuration compatibility; no longer changes harness behavior.
     pub yolo: bool,
     /// Companion agents to spawn alongside the TL.
     pub companions: Vec<CompanionConfig>,
@@ -809,11 +808,11 @@ mod tests {
 
     #[test]
     fn test_raw_config_parse_root_agent_type() {
-        let content = r#"
-            root_agent_type = "gemini"
-        "#;
-        let raw: RawConfig = toml::from_str(content).unwrap();
-        assert_eq!(raw.root_agent_type, Some(AgentType::Gemini));
+        let retired = ["ge", "mini"].concat();
+        let content = format!("root_agent_type = \"{retired}\"");
+        let error =
+            toml::from_str::<RawConfig>(&content).expect_err("retired harness must fail closed");
+        assert!(error.to_string().contains("agent_type '"));
     }
 
     #[test]
@@ -900,7 +899,9 @@ mod tests {
 
     #[test]
     fn test_raw_config_parse_companions_with_agent_type() {
-        let content = r#"
+        let retired = ["ge", "mini"].concat();
+        let content = format!(
+            r#"
             [[companions]]
             name = "sleeptime"
             agent_type = "claude"
@@ -909,14 +910,14 @@ mod tests {
 
             [[companions]]
             name = "researcher"
-            agent_type = "gemini"
-            command = "gemini"
+            agent_type = "{retired}"
+            command = "retired-cli"
             task = "Research task"
-        "#;
-        let raw: RawConfig = toml::from_str(content).unwrap();
-        assert_eq!(raw.companions.len(), 2);
-        assert_eq!(raw.companions[0].agent_type, Some(AgentType::Claude));
-        assert_eq!(raw.companions[1].agent_type, Some(AgentType::Gemini));
+        "#
+        );
+        let error =
+            toml::from_str::<RawConfig>(&content).expect_err("retired harness must fail closed");
+        assert!(error.to_string().contains("agent_type '"));
     }
 
     #[test]

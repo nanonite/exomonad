@@ -1,7 +1,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeKind {
     Codex,
-    Gemini,
     OpenCode,
     Unknown,
 }
@@ -11,8 +10,6 @@ pub fn runtime_from_agent_name(agent_name: &str) -> RuntimeKind {
         RuntimeKind::Codex
     } else if agent_name.ends_with("-opencode") {
         RuntimeKind::OpenCode
-    } else if agent_name.ends_with("-gemini") || !agent_name.contains('-') {
-        RuntimeKind::Gemini
     } else {
         RuntimeKind::Unknown
     }
@@ -27,7 +24,6 @@ pub fn positive_consumption_signal(runtime: RuntimeKind, before: &str, after: &s
 
     match runtime {
         RuntimeKind::Codex => codex_signal(&before, &after),
-        RuntimeKind::Gemini => gemini_signal(&before, &after),
         RuntimeKind::OpenCode => opencode_signal(&before, &after),
         RuntimeKind::Unknown => false,
     }
@@ -39,10 +35,6 @@ fn normalize(text: &str) -> String {
 
 fn codex_signal(before: &str, after: &str) -> bool {
     gained_marker(before, after, &["assistant", "tokens", "codex", "thinking"])
-}
-
-fn gemini_signal(before: &str, after: &str) -> bool {
-    gained_marker(before, after, &["gemini", "model", "responding", "turn"])
 }
 
 fn opencode_signal(before: &str, after: &str) -> bool {
@@ -71,17 +63,6 @@ mod tests {
             "user input pending
 assistant
 I can help with that",
-        ));
-    }
-
-    #[test]
-    fn gemini_positive_signal_detects_model_response() {
-        assert!(positive_consumption_signal(
-            RuntimeKind::Gemini,
-            "> prompt",
-            "> prompt
-Gemini
-response text",
         ));
     }
 

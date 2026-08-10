@@ -13,6 +13,7 @@ import "exomonad/common.proto";
 enum AgentType {
   AGENT_TYPE_UNSPECIFIED = 0;
   AGENT_TYPE_CLAUDE = 1;
+  // Retired harness; wire value 2 is retained for compatibility with historical messages.
   AGENT_TYPE_GEMINI = 2;
   AGENT_TYPE_SHOAL = 3;
   AGENT_TYPE_OPENCODE = 4;
@@ -36,7 +37,7 @@ message AgentInfo {
   string worktree_path = 3;
   // Git branch name.
   string branch_name = 4;
-  // Agent type (Claude/Gemini).
+  // Agent type.
   AgentType agent_type = 5;
   // Agent role (dev/tl/pm).
   exomonad.common.Role role = 6;
@@ -128,31 +129,6 @@ message SpawnBatchResponse {
   repeated AgentInfo agents = 1;
   // Errors for failed spawns (parallel to issues list).
   repeated string errors = 2;
-}
-
-// ============================================================================
-// SpawnGeminiTeammate - Spawn a named Gemini teammate with a direct prompt (no GitHub issue)
-// ============================================================================
-
-message SpawnGeminiTeammateRequest {
-  // Human-readable name (e.g., "mcp-hardener").
-  string name = 1;
-  // Initial prompt/instructions for the agent.
-  string prompt = 2;
-  // Agent type (default: Gemini).
-  AgentType agent_type = 3;
-  // Sub-repository path relative to project_dir (e.g., "urchin/").
-  string subrepo = 4;
-  reserved 5;
-  reserved "team_name";
-  // Workspace topology.
-  WorkspaceTopology topology = 6;
-  // Branch to create worktree from (default: current branch).
-  string base_branch = 7;
-}
-
-message SpawnGeminiTeammateResponse {
-  AgentInfo agent = 1;
 }
 
 // ============================================================================
@@ -286,7 +262,7 @@ message SpawnWorkerRequest {
   repeated string allowed_tools = 4;
   // Tool patterns to disallow. Empty = no restriction.
   repeated string disallowed_tools = 5;
-  // Optional agent type override (default: Gemini).
+  // Optional agent type override (default: Codex).
   AgentType agent_type = 6;
 }
 
@@ -415,7 +391,7 @@ message WatcherPrStateResponse {
 }
 
 // ============================================================================
-// SpawnLeafSubtree - Spawn a Gemini leaf agent in a new git worktree
+// SpawnLeafSubtree - Spawn a leaf agent in a new git worktree
 // ============================================================================
 
 message SpawnLeafSubtreeRequest {
@@ -585,7 +561,6 @@ message ReplaceClosedPrResponse {
 service AgentEffects {
   rpc Spawn(SpawnRequest) returns (SpawnResponse);
   rpc SpawnBatch(SpawnBatchRequest) returns (SpawnBatchResponse);
-  rpc SpawnGeminiTeammate(SpawnGeminiTeammateRequest) returns (SpawnGeminiTeammateResponse);
   rpc SpawnWorker(SpawnWorkerRequest) returns (SpawnWorkerResponse);
   rpc SpawnSubtree(SpawnSubtreeRequest) returns (SpawnSubtreeResponse);
   rpc SpawnReviewer(SpawnReviewerRequest) returns (SpawnReviewerResponse);

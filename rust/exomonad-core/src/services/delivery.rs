@@ -724,14 +724,14 @@ pub fn resolve_tab_name_for_agent(
     }
 
     // A bare birth-branch like "main" has no recognized agent type suffix.
-    // from_internal_name defaults to Gemini when no suffix matches, so
-    // cross-checking distinguishes a bare branch from an actual Gemini agent.
+    // from_internal_name defaults to Codex when no suffix matches, so
+    // cross-checking distinguishes a bare branch from an actual Codex agent.
     // Bare branches are always the root TL's birth-branch → window is "TL".
     let derived_type = crate::services::agent_control::AgentType::from_dir_name(agent_key.as_str());
     if matches!(
         derived_type,
-        crate::services::agent_control::AgentType::Gemini
-    ) && !agent_key.as_str().ends_with("-gemini")
+        crate::services::agent_control::AgentType::Codex
+    ) && !agent_key.as_str().ends_with("-codex")
     {
         return "TL".to_string();
     }
@@ -1111,7 +1111,7 @@ async fn deliver_via_tmux(
     let routing_candidates = std::iter::once(agent_key.to_string())
         .chain(std::iter::once(slug.to_string()))
         .chain(
-            ["gemini", "claude", "shoal", "opencode", "codex"]
+            ["claude", "shoal", "opencode", "codex"]
                 .iter()
                 .flat_map(|suffix| {
                     [
@@ -1707,7 +1707,6 @@ mod tests {
     fn claude_teams_path_bypasses_agent_inbox_while_codex_falls_back_gracefully() {
         assert!(supports_teams_inbox(crate::services::AgentType::Claude));
         assert!(!supports_teams_inbox(crate::services::AgentType::Codex));
-        assert!(!supports_teams_inbox(crate::services::AgentType::Gemini));
         assert!(!supports_teams_inbox(crate::services::AgentType::OpenCode));
     }
 

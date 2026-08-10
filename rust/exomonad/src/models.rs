@@ -5,11 +5,10 @@ pub async fn run(harness: Option<String>, provider: Option<String>) -> Result<()
     match harness.as_deref() {
         None => run_all(provider).await,
         Some("opencode") => run_opencode(provider).await,
-        Some("gemini") => run_gemini(),
         Some("claude") => run_claude(),
         Some("codex") => run_codex(),
         Some(other) => {
-            bail!("Unknown harness: {other}. Valid: opencode, gemini, claude, codex")
+            bail!("Unknown harness: {other}. Valid: opencode, claude, codex")
         }
     }
 }
@@ -29,14 +28,6 @@ async fn run_opencode(provider: Option<String>) -> Result<()> {
     if !status.success() {
         bail!("`opencode models` exited {status}");
     }
-    Ok(())
-}
-
-fn run_gemini() -> Result<()> {
-    println!("gemini-2.5-pro");
-    println!("gemini-2.0-flash");
-    println!("gemini-2.0-flash-lite");
-    println!("Note: Gemini does not expose model discovery. List may be stale.");
     Ok(())
 }
 
@@ -125,9 +116,6 @@ async fn run_all(provider: Option<String>) -> Result<()> {
     if let Err(error) = run_opencode(provider).await {
         println!("opencode: unavailable ({error:#})");
     }
-    println!();
-    println!("# gemini");
-    run_gemini()?;
     println!();
     println!("# claude");
     run_claude()?;

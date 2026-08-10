@@ -228,13 +228,13 @@ mod tests {
             success: true,
             message: "PR #42 merged via squash".to_string(),
             git_fetched: true,
-            branch_name: "main.fix-auth-gemini".to_string(),
+            branch_name: "main.fix-auth-codex".to_string(),
         };
 
         assert!(response.success);
         assert!(response.message.contains("42"));
         assert!(response.git_fetched);
-        assert_eq!(response.branch_name, "main.fix-auth-gemini");
+        assert_eq!(response.branch_name, "main.fix-auth-codex");
     }
 
     #[test]

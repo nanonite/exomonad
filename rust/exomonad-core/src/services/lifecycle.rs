@@ -72,12 +72,11 @@ impl OneShotLifecycleMode {
 /// Stable provider list used by deterministic contract tests and operator
 /// documentation. `Process` is included because it is a supported AgentType,
 /// although it has no workflow identity or provider-specific MCP setup.
-pub const LIFECYCLE_PROVIDERS: [AgentType; 6] = [
+pub const LIFECYCLE_PROVIDERS: [AgentType; 5] = [
     AgentType::Claude,
-    AgentType::Gemini,
+    AgentType::Codex,
     AgentType::Shoal,
     AgentType::OpenCode,
-    AgentType::Codex,
     AgentType::Process,
 ];
 
@@ -85,7 +84,7 @@ pub const fn provider_delivery_contract(agent_type: AgentType) -> &'static str {
     match agent_type {
         AgentType::Claude => "teams_inbox -> exact_tmux -> durable_inbox",
         AgentType::Shoal => "uds -> exact_tmux -> durable_inbox",
-        AgentType::Gemini | AgentType::OpenCode | AgentType::Codex => "exact_tmux -> durable_inbox",
+        AgentType::Codex | AgentType::OpenCode => "exact_tmux -> durable_inbox",
         AgentType::Process => "external_process -> durable_inbox",
     }
 }
@@ -327,7 +326,7 @@ fn agent_dir_candidates(agent_key: &str) -> Vec<String> {
         .map(|(_, value)| value)
         .unwrap_or(agent_key);
     let mut candidates = vec![agent_key.to_string(), slug.to_string()];
-    for suffix in ["gemini", "claude", "shoal", "opencode", "codex", "process"] {
+    for suffix in ["claude", "shoal", "opencode", "codex", "process"] {
         candidates.push(format!("{slug}-{suffix}"));
         candidates.push(format!("{agent_key}-{suffix}"));
     }
@@ -394,7 +393,7 @@ mod tests {
 
     #[test]
     fn provider_matrix_has_stable_contracts() {
-        assert_eq!(LIFECYCLE_PROVIDERS.len(), 6);
+        assert_eq!(LIFECYCLE_PROVIDERS.len(), 5);
         for provider in LIFECYCLE_PROVIDERS {
             assert!(!provider.suffix().is_empty());
             assert!(!provider_delivery_contract(provider).is_empty());

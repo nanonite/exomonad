@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn test_response_field_conversion() {
         let pr_number = crate::domain::PRNumber::new(42);
-        let head = BranchName::try_from_str("main.fix-auth-gemini")
+        let head = BranchName::try_from_str("main.fix-auth-codex")
             .expect("literal validated string is non-empty");
         let base = BranchName::try_from_str("main").expect("literal validated string is non-empty");
 
@@ -468,7 +468,7 @@ mod tests {
         };
 
         assert_eq!(response.pr_number, 42);
-        assert_eq!(response.head_branch, "main.fix-auth-gemini");
+        assert_eq!(response.head_branch, "main.fix-auth-codex");
         assert_eq!(response.base_branch, "main");
         assert!(response.created);
     }

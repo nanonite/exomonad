@@ -1116,7 +1116,7 @@ mod tests {
         let source = temp.path().join("events.jsonl");
         fs::write(
             &source,
-            r#"{"event_id":"e1","type":"agent.invocation.started","session_id":"s1","run_seq":1,"data":{"provider":"gemini","runtime":"gemini","harness":"exo","role":"dev"}}"#,
+            r#"{"event_id":"e1","type":"agent.invocation.started","session_id":"s1","run_seq":1,"data":{"provider":"codex","runtime":"codex","harness":"exo","role":"dev"}}"#,
         )?;
         import_sources(&options(temp.path(), source))?;
         let connection = Connection::open(temp.path().join(".exo/analysis/atlas.db"))?;
@@ -1135,8 +1135,8 @@ mod tests {
         assert_eq!(
             provenance,
             (
-                Some("gemini".to_string()),
-                Some("gemini".to_string()),
+                Some("codex".to_string()),
+                Some("codex".to_string()),
                 Some("exo".to_string()),
                 Some("dev".to_string()),
             )

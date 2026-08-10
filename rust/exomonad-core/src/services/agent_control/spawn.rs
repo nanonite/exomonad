@@ -620,10 +620,8 @@ impl<
             // Write .mcp.json for the agent
             let role = match options.agent_type {
                 AgentType::Claude => crate::domain::Role::tl(),
-                AgentType::Gemini => crate::domain::Role::dev(),
                 AgentType::Shoal => crate::domain::Role::shoal(),
-                AgentType::OpenCode => crate::domain::Role::dev(),
-                AgentType::Codex => crate::domain::Role::dev(),
+                AgentType::OpenCode | AgentType::Codex => crate::domain::Role::dev(),
                 AgentType::Process => unreachable!("Process agents are not spawned via effects"),
             };
             let model = self.effective_model_for(options.agent_type, role.as_str(), None);
@@ -763,265 +761,6 @@ impl<
         }
 
         result
-    }
-
-    /// Spawn a named teammate with a direct prompt.
-    ///
-    /// Idempotent on teammate name: if already running, returns existing info.
-    /// If config entry exists but tmux window is dead, cleans stale entry and respawns.
-    /// No per-agent directories or MCP configs — agents share the repo's config.
-    /// State lives in Teams config.json + tmux window only.
-    #[tracing::instrument(skip(self, options), fields(name = %options.name.as_str()))]
-    pub async fn spawn_gemini_teammate(
-        &self,
-        options: &SpawnGeminiTeammateOptions,
-        caller_bb: &BirthBranch,
-    ) -> Result<SpawnResult> {
-        info!(name = %options.name, timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_gemini_teammate");
-
-        let result = timeout(SPAWN_TIMEOUT, async {
-            self.resolve_tmux_session()?;
-
-            let effective_project_dir = self.effective_project_dir(options.subrepo.as_deref())?;
-
-            // Sanitize name and construct typed identity
-            let identity = AgentIdentity::new(
-                normalize_agent_slug(options.name.as_str()),
-                options.agent_type,
-            );
-            let agent_name = identity.internal_name();
-            let display_name = identity.display_name();
-
-            // Idempotency check: if tmux window is alive, return existing info
-            let tab_alive = self.is_tmux_window_alive(&display_name).await;
-
-            info!(
-                name = %options.name,
-                agent_name = %agent_name,
-                tab_alive,
-                "Idempotency check"
-            );
-
-            if tab_alive {
-                info!(name = %options.name, "Teammate already running, returning existing");
-                return Ok(SpawnResult {
-                    agent_dir: PathBuf::new(),
-                    branch_name: String::new(),
-                    agent_name,
-                    issue_title: options.name.to_string(),
-                    agent_type: options.agent_type,
-                    pane_id: None,
-                });
-            }
-
-            // Determine base branch
-            let base_branch = if let Some(ref b) = options.base_branch {
-                BranchName::try_from_str(b.as_str()).expect("validated string input is non-empty")
-            } else {
-                // Default to current branch
-                let current_branch_output = Command::new("git")
-                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                    .current_dir(&effective_project_dir)
-                    .output()
-                    .await
-                    .context("Failed to get current branch")?;
-                let branch_str = String::from_utf8_lossy(&current_branch_output.stdout)
-                    .trim()
-                    .to_string();
-                BranchName::try_from_str(branch_str.as_str())
-                    .expect("validated string input is non-empty")
-            };
-
-            // Use '.' separator to avoid directory/file conflicts in git refs
-            // and avoid ambiguity with '-' word separators in slugs.
-            // Branch includes type suffix so rsplit_once('.') yields the AgentName directly.
-            let branch_name =
-                BranchName::try_from_str(format!("{}.{}", base_branch, agent_name).as_str())
-                    .expect("validated string input is non-empty");
-            let worktree_path = self.worktree_base.join(agent_name.as_str());
-
-            self.create_worktree_checked(&worktree_path, &branch_name, &base_branch)
-                .await?;
-
-            let role = crate::domain::Role::dev();
-            let model = self.effective_model_for(options.agent_type, role.as_str(), None);
-            let effort = self.effective_effort_for(role.as_str(), None);
-            let mut env_vars = self.common_spawn_env(&agent_name, &branch_name, &role);
-
-            // Write per-agent MCP config into the worktree
-            self.write_agent_mcp_config(
-                &effective_project_dir,
-                &worktree_path,
-                options.agent_type,
-                &role,
-            )
-            .await?;
-
-            // For Gemini agents, point at worktree settings via env var and pre-trust folder
-            if options.agent_type == AgentType::Gemini {
-                let settings_path = worktree_path.join(".gemini").join("settings.json");
-                env_vars.insert(
-                    "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
-                    settings_path.to_string_lossy().to_string(),
-                );
-                Self::gemini_trust_folder(&worktree_path).await;
-            }
-
-            let window_id = self
-                .new_tmux_window(
-                    &display_name,
-                    &worktree_path,
-                    options.agent_type,
-                    Some(&options.prompt),
-                    env_vars,
-                )
-                .await?;
-
-            // Store window_id for message delivery and cleanup
-            let routing = RoutingInfo::window(window_id);
-            let effective_birth = self.effective_birth_branch(Some(caller_bb));
-            let child_birth = effective_birth.child(agent_name.as_str());
-            let identity_record = AgentIdentityRecord {
-                agent_name: agent_name.clone(),
-                slug: Slug::try_from_str(identity.slug())
-                    .context("generated agent slug was empty")?,
-                agent_type: options.agent_type,
-                birth_branch: child_birth,
-                parent_branch: effective_birth,
-                working_dir: worktree_path.clone(),
-                display_name: display_name.clone(),
-                topology: Topology::WorktreePerAgent,
-                model: model.clone(),
-                effort: effort.clone(),
-            };
-            self.finalize_spawn(&agent_name, routing, Some(identity_record))
-                .await?;
-
-            self.emit_agent_started(&agent_name)?;
-
-            Ok::<SpawnResult, anyhow::Error>(SpawnResult {
-                agent_dir: PathBuf::new(),
-                branch_name: branch_name.to_string(),
-                agent_name,
-                issue_title: options.name.to_string(),
-                agent_type: options.agent_type,
-                pane_id: None,
-            })
-        })
-        .await
-        .map_err(|_| {
-            let msg = format!(
-                "spawn_gemini_teammate timed out after {}s",
-                SPAWN_TIMEOUT.as_secs()
-            );
-            warn!(name = %options.name, error = %msg, "spawn_gemini_teammate timed out");
-            anyhow::Error::new(TimeoutError { message: msg })
-        })??;
-
-        info!(name = %options.name, "spawn_gemini_teammate completed successfully");
-        Ok(result)
-    }
-
-    /// Generate settings.json content for a Gemini worker.
-    ///
-    /// Constructs the JSON configuration including MCP server connection and lifecycle hooks.
-    /// Note: Gemini hooks must be PascalCase (e.g. AfterAgent).
-    ///
-    /// `context_path` is an optional absolute path to the role context file.
-    /// Using an absolute path ensures workers spawned from worktrees can find the context.
-    pub(crate) fn generate_gemini_worker_settings(
-        agent_name: &str,
-        context_path: Option<&Path>,
-        extra_mcp_servers: &HashMap<String, serde_json::Value>,
-    ) -> serde_json::Value {
-        Self::generate_gemini_settings(agent_name, "worker", context_path, extra_mcp_servers)
-    }
-
-    /// Generate root Gemini settings that load the canonical root protocol.
-    pub fn generate_gemini_root_settings(
-        agent_name: &str,
-        context_path: Option<&Path>,
-        extra_mcp_servers: &HashMap<String, serde_json::Value>,
-    ) -> serde_json::Value {
-        Self::generate_gemini_settings(agent_name, "root", context_path, extra_mcp_servers)
-    }
-
-    fn generate_gemini_settings(
-        agent_name: &str,
-        role: &str,
-        context_path: Option<&Path>,
-        extra_mcp_servers: &HashMap<String, serde_json::Value>,
-    ) -> serde_json::Value {
-        let mut context_files = vec![serde_json::Value::String("GEMINI.md".to_string())];
-        if let Some(path) = context_path {
-            context_files.push(serde_json::Value::String(
-                path.to_string_lossy().to_string(),
-            ));
-        }
-        let mut settings = serde_json::json!({
-            "mcpServers": {
-                "exomonad": {
-                    "type": "stdio",
-                    "command": "exomonad",
-                    "args": ["mcp-stdio", "--role", role, "--name", agent_name]
-                }
-            },
-            "context": {
-                "fileName": context_files
-            },
-            "hooks": {
-                "BeforeTool": [
-                    {
-                        "matcher": "*",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": "exomonad hook before-tool --runtime gemini"
-                            }
-                        ]
-                    }
-                ],
-                "BeforeModel": [
-                    {
-                        "matcher": "*",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": "exomonad hook before-model --runtime gemini"
-                            }
-                        ]
-                    }
-                ],
-                "AfterModel": [
-                    {
-                        "matcher": "*",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": "exomonad hook after-model --runtime gemini"
-                            }
-                        ]
-                    }
-                ],
-                "AfterAgent": [
-                    {
-                        "matcher": "*",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": "exomonad hook worker-exit --runtime gemini"
-                            }
-                        ]
-                    }
-                ]
-            }
-        });
-        if let Some(servers) = settings["mcpServers"].as_object_mut() {
-            for (k, v) in extra_mcp_servers {
-                servers.insert(k.clone(), v.clone());
-            }
-        }
-        settings
     }
 
     /// Generate opencode.json content for an OpenCode agent.
@@ -1244,9 +983,9 @@ impl<
 
             // Idempotency: check if agent config dir already exists (workers are panes, not tabs)
             let agent_config_dir = agents_dir.join(agent_name.as_str());
-            let settings_path = agent_config_dir.join("settings.json");
-            if settings_path.exists() {
-                // Check tmux pane liveness — settings.json can outlive the pane
+            let routing_path = agent_config_dir.join("routing.json");
+            if routing_path.exists() {
+                // Check tmux pane liveness — routing.json can outlive the pane
                 let existing_pane_id = match RoutingInfo::read_from_dir(&agent_config_dir).await {
                     Ok(routing) => match routing.pane_id {
                         Some(ref pane_id) if self.tmux()?.pane_exists(pane_id).await.unwrap_or(false) => {
@@ -1298,18 +1037,6 @@ impl<
             fs::write(agent_config_dir.join(".birth_branch"), parent_bb.as_str()).await?;
 
             match agent_type {
-                AgentType::Gemini => {
-                    let context_path = self.resolve_role_context(&role);
-                    let settings = Self::generate_gemini_worker_settings(agent_name.as_str(), context_path.as_deref(), &self.extra_mcp_servers);
-                    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?).await?;
-                    info!(path = %settings_path.display(), agent_name = %agent_name, "Wrote worker Gemini settings to agent config dir");
-                    env_vars.insert(
-                        "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
-                        settings_path.to_string_lossy().to_string(),
-                    );
-                    let caller_worktree_for_trust = self.project_dir().join(&ctx.working_dir);
-                    Self::gemini_trust_folder(&caller_worktree_for_trust).await;
-                }
                 AgentType::OpenCode => {
                     // Write worker-specific opencode.json so the worker gets
                     // its own role/name (not the caller's root config, which
@@ -1488,9 +1215,9 @@ impl<
             let model = self.effective_model_for(agent_type, role.as_str(), options.model.as_deref());
             let effort = self.effective_effort_for(role.as_str(), options.effort.as_deref());
 
-            // Validate role context before spawning. Claude and Gemini consume a
-            // copied file; OpenCode and Codex receive the same content inline in
-            // their runtime instruction settings below.
+            // Validate role context before spawning. Claude consumes a copied
+            // file; OpenCode and Codex receive the same content inline in their
+            // runtime instruction settings below.
             let context_src = self.resolve_role_context(role).ok_or_else(|| {
                 anyhow!(
                     "Missing role context for {} at .exo/roles/{}/context/{}.md",
@@ -1512,18 +1239,6 @@ impl<
                             format!("Failed to copy Claude role context to {}", dest.display())
                         })?;
                     info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into worktree");
-                }
-                AgentType::Gemini => {
-                    let dest_dir = worktree_path.join(format!(".exo/roles/{}/context", self.wasm_name));
-                    fs::create_dir_all(&dest_dir).await?;
-                    let dest = dest_dir.join(format!("{}.md", role));
-                    let _ = fs::remove_file(&dest).await;
-                    Self::copy_role_context_with_interpolation(&context_src, &dest, spawn_type)
-                        .await
-                        .with_context(|| {
-                            format!("Failed to copy Gemini role context to {}", dest.display())
-                        })?;
-                    info!(role = %role, src = %context_src.display(), dest = %dest.display(), "Copied role context into Gemini worktree");
                 }
                 AgentType::OpenCode | AgentType::Codex | AgentType::Shoal | AgentType::Process => {}
             }
@@ -1765,8 +1480,8 @@ impl<
         Ok(result)
     }
 
-    /// Spawn a Gemini leaf agent in a new git worktree.
-    #[instrument(skip_all, fields(slug = %options.branch_name, agent_type = "gemini"))]
+    /// Spawn a leaf agent in a new git worktree.
+    #[instrument(skip_all, fields(slug = %options.branch_name))]
     pub async fn spawn_leaf_subtree(
         &self,
         options: &SpawnLeafOptions,
@@ -2015,14 +1730,6 @@ impl<
             let mut env_vars = self.common_spawn_env(&agent_name, &branch_name, role);
             self.write_agent_mcp_config(effective_project_dir, &worktree_path, agent_type, role)
                 .await?;
-
-            // Set GEMINI_CLI_SYSTEM_SETTINGS_PATH and pre-trust folder
-            let settings_path = worktree_path.join(".gemini").join("settings.json");
-            env_vars.insert(
-                "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
-                settings_path.to_string_lossy().to_string(),
-            );
-            Self::gemini_trust_folder(&worktree_path).await;
 
             let mut task = options.task.clone();
 
