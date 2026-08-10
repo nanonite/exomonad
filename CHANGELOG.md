@@ -118,6 +118,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M2.2 Atomic run-state write path with CAS and re-observation (#672)
 - M2.1 Closed-key run-state schema and validator (#671)
 - M1.6 Port TLStopCheck terminal conditions into loop predicates (#670)
 - M1.4 Port TLPhase and TLEvent to Python as a pure transition function (#668)

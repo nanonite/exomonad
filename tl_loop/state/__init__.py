@@ -1,5 +1,6 @@
 """Durable TL run-state schema and persistence boundaries."""
 
+from .lock import LockOwner, LockTimeout, RunLock, owner_is_stale
 from .schema import (
     BUDGET_KEYS,
     EVENT_KEYS,
@@ -21,10 +22,12 @@ from .schema import (
     Verdict,
     validate,
 )
+from .write import ConcurrentWrite, MutationError, StateReadError, WriteHooks, apply
 
 __all__ = [
     "BUDGET_KEYS",
     "BudgetLedger",
+    "ConcurrentWrite",
     "EVENT_KEYS",
     "EventCursor",
     "FSM_KEYS",
@@ -33,13 +36,21 @@ __all__ = [
     "GateState",
     "GateStatus",
     "LEDGER_KEYS",
+    "LockOwner",
+    "LockTimeout",
     "RUN_KEYS",
     "RunState",
+    "RunLock",
     "SCHEMA_VERSION",
     "SLICE_KEYS",
     "SchemaError",
     "SliceState",
     "SliceStatus",
+    "StateReadError",
+    "MutationError",
     "Verdict",
+    "WriteHooks",
+    "apply",
+    "owner_is_stale",
     "validate",
 ]
