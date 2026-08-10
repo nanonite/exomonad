@@ -1,0 +1,10 @@
+{
+  "branch_name": "feature/private-harness",
+  "custom_payload": {
+    "reasoning": "fixture-only private reasoning",
+    "transcript": "fixture-only private transcript"
+  },
+  "fake_token": "ghp_FAKE_TOKEN_FOR_FIXTURES_ONLY_123456",
+  "path": "/home/goya/private/project",
+  "url": "https://example.invalid/private"
+}

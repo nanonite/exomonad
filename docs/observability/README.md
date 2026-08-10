@@ -63,3 +63,19 @@ agent_inbox.duplicates_dropped, and agent_inbox.messages_abandoned.
 expected-events.v1.json is embedded in the core and reconciled by session;
 missing required outcomes remain denominator gaps and produce partial or
 unknown completeness rather than zero-valued success.
+
+## Runtime MVP-D export
+
+After importing a session into L2, compile the only shareable artifact with:
+
+    exomonad logs export --mode aggregate
+
+The command writes analysis.json, manifest.json, and privacy-report.json under
+.exo/analysis/export by default. The Python compiler reads an explicit
+allowlisted view of L2, computes aggregate metrics and pointer-only exemplars,
+then runs a denylist scanner as a backstop. It never reads local_payload_json
+for output and has no internal-events export mode.
+
+The manifest carries database/source hashes plus query, code, method, detector,
+and experiment revisions. Every metric carries the same provenance object.
+Fixed input and revisions produce byte-stable analysis.json output.

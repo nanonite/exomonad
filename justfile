@@ -462,6 +462,10 @@ validate-settings:
 validate-observability-contracts:
     python3 scripts/validate_observability_contracts.py
 
+# Smoke-test the allowlist-first, deterministic Failure Atlas compiler
+test-observability-export:
+    python3 scripts/test_compile_failure_atlas.py
+
 
 # Run E2E review-loop stuck human escalation test
 e2e-review-loop-stuck:

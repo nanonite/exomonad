@@ -257,6 +257,15 @@ enum LogsCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Compile a shareable aggregate/sample artifact from the local L2 store.
+    Export {
+        /// Shareable export mode. Only aggregate is permitted.
+        #[arg(long, default_value = "aggregate")]
+        mode: String,
+        /// Output directory for analysis.json, manifest.json, and privacy-report.json.
+        #[arg(long, default_value = ".exo/analysis/export")]
+        output: PathBuf,
+    },
 }
 
 // Main
@@ -330,6 +339,17 @@ async fn main() -> Result<()> {
                 std::env::current_dir()?.join(&config.project_dir)
             };
             return logs::drop_segments(&project_dir, older_than_seconds, dry_run);
+        }
+
+        Commands::Logs {
+            command: LogsCommands::Export { mode, output },
+        } => {
+            let project_dir = if config.project_dir.is_absolute() {
+                config.project_dir.clone()
+            } else {
+                std::env::current_dir()?.join(&config.project_dir)
+            };
+            return logs::export(&project_dir, mode, output);
         }
 
         Commands::Serve {
