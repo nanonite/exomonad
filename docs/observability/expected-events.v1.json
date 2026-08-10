@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "contract_id": "exomonad.expected-events",
+  "version": 1,
+  "schema_version": 1,
+  "unit": "session",
+  "description": "Deterministic denominator rules for required workflow events.",
+  "rules": [
+    {
+      "rule_id": "spawn_requires_invocation_start",
+      "prerequisite_event": "agent.spawned",
+      "required_event": "agent.invocation.started",
+      "allowed_delay_ms": 300000,
+      "applicable_sources": ["rust", "haskell", "lifecycle"],
+      "legacy_confidence_rule": "Legacy rows count as exact only when source and agent identity are explicit; otherwise mark unknown.",
+      "denominator_effect": "Add one expected invocation-start event for each observed spawn transition."
+    },
+    {
+      "rule_id": "invocation_requires_finish",
+      "prerequisite_event": "agent.invocation.started",
+      "required_event": "agent.invocation.finished",
+      "allowed_delay_ms": null,
+      "allowed_window": "until session termination or explicit abandonment",
+      "applicable_sources": ["lifecycle"],
+      "legacy_confidence_rule": "Legacy invocation rows without a terminal marker are unknown, not successful.",
+      "denominator_effect": "Add one expected invocation-finished event for each observed invocation start."
+    },
+    {
+      "rule_id": "parent_notification_requires_delivery",
+      "prerequisite_event": "agent.notify_parent",
+      "required_event": "message.delivery",
+      "allowed_delay_ms": 300000,
+      "applicable_sources": ["rust", "haskell"],
+      "legacy_confidence_rule": "Legacy parent notifications without a transport outcome are unknown.",
+      "denominator_effect": "Add one expected delivery attempt for each observed parent notification."
+    },
+    {
+      "rule_id": "delivery_requires_consumption_observation",
+      "prerequisite_event": "message.delivery",
+      "required_event": "message.consumed",
+      "allowed_delay_ms": null,
+      "allowed_window": "until inbox expiration, abandonment, or session termination",
+      "applicable_sources": ["rust", "sqlite"],
+      "legacy_confidence_rule": "Legacy delivery rows without an inbox consumer are unknown.",
+      "denominator_effect": "Add one expected consumption observation for each durable delivery attempt."
+    },
+    {
+      "rule_id": "published_pr_requires_observation",
+      "prerequisite_event": "pr.published",
+      "required_event": "watcher.pr_observation",
+      "allowed_delay_ms": 600000,
+      "applicable_sources": ["rust", "watcher"],
+      "legacy_confidence_rule": "Legacy PR rows without watcher identity remain unknown.",
+      "denominator_effect": "Add one expected PR observation for each eligible published PR."
+    },
+    {
+      "rule_id": "merge_request_requires_merge_outcome",
+      "prerequisite_event": "pr.merge_requested",
+      "required_event": "pr.merged",
+      "allowed_delay_ms": null,
+      "allowed_window": "until merge failure, cancellation, or session termination",
+      "applicable_sources": ["rust", "haskell", "watcher"],
+      "legacy_confidence_rule": "A legacy merge request without an explicit outcome is unknown.",
+      "denominator_effect": "Add one expected merge outcome for each observed merge request."
+    }
+  ]
+}

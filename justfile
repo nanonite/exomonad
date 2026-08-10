@@ -85,19 +85,21 @@ wasm-guest-test:
 test:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> [1/7] Formatting checks..."
+    echo ">>> [1/8] Observability contract checks..."
+    just validate-observability-contracts
+    echo ">>> [2/8] Formatting checks..."
     just check-fmt
-    echo ">>> [2/7] Rust check (all targets)..."
+    echo ">>> [3/8] Rust check (all targets)..."
     nix develop --command cargo check --workspace --all-targets
-    echo ">>> [3/7] WASM build..."
+    echo ">>> [4/8] WASM build..."
     just wasm-all
-    echo ">>> [4/7] Rust tests (all targets)..."
+    echo ">>> [5/8] Rust tests (all targets)..."
     just rust-test-all
-    echo ">>> [5/7] Role hook tests..."
+    echo ">>> [6/8] Role hook tests..."
     just role-hook-tests
-    echo ">>> [6/7] WASM guest tests..."
+    echo ">>> [7/8] WASM guest tests..."
     just wasm-guest-test
-    echo ">>> [7/7] Proto freshness check..."
+    echo ">>> [8/8] Proto freshness check..."
     just proto-check
     echo ">>> All checks passed."
 
@@ -455,6 +457,10 @@ live-teams-e2e:
 # Validate Gemini settings against schema
 validate-settings:
     nix-shell -p python3Packages.jsonschema --run "python3 scripts/validate_json.py .gemini/settings.json schema/gemini-cli/settings.schema.json"
+
+# Validate the Phase 0 observability registries and synthetic fixtures
+validate-observability-contracts:
+    python3 scripts/validate_observability_contracts.py
 
 
 # Run E2E review-loop stuck human escalation test

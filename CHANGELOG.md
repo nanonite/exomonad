@@ -117,6 +117,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Gemini (#36)
 
 ### Added
+- Adopt append-only ExoMonad evidence ledger (#640)
+- Improve ExoMonad orchestration measurement plan (#639)
+- Strengthen ExoMonad orchestration measurement discipline (#638)
+- Add privacy-preserving ExoMonad log export and import plan (#637)
 - Capture notifications and shutdown summaries (#633)
 - Capture notifications and shutdown summaries (#633)
 - Capture pull request review and CI facts (#632)
@@ -245,6 +249,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Freeze ExoMonad observability contracts and implementation gates (#642)
 - Document ExoMonad session logging mechanisms and events (#636)
 - feat: prefix continuation context onto spawn_leaf and resume_pr tasks (#626)
 - feat: inject continuation brief at root/TL SessionStart (#625)

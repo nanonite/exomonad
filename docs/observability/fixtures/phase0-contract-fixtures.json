@@ -1,0 +1,65 @@
+{
+  "fixture_id": "exomonad.phase0.contracts",
+  "version": 1,
+  "purpose": "Synthetic, non-sensitive coverage for schema, identity, multi-harness, completeness, and measurement gates.",
+  "scenarios": [
+    {
+      "scenario_id": "multi_harness_session",
+      "session_id": "fixture-session-001",
+      "harnesses": ["claude", "codex", "gemini", "python-loop"],
+      "events": ["agent.spawned", "agent.invocation.started", "tool.called", "agent.invocation.finished"]
+    },
+    {
+      "scenario_id": "resume_retry_and_delivery",
+      "session_id": "fixture-session-002",
+      "harnesses": ["claude", "python-loop"],
+      "events": ["agent.resumed", "agent.invocation.started", "agent.notify_parent", "message.delivery", "message.consumed", "agent_inbox.duplicates_dropped", "agent_inbox.messages_abandoned"]
+    },
+    {
+      "scenario_id": "review_and_merge_loop",
+      "session_id": "fixture-session-003",
+      "harnesses": ["codex", "custom"],
+      "events": ["pr.published", "watcher.pr_observation", "copilot.review", "ci.status_changed", "pr.merge_requested", "pr.merged"]
+    },
+    {
+      "scenario_id": "partial_sink_and_gap",
+      "session_id": "fixture-session-004",
+      "harnesses": ["python-loop"],
+      "events": ["sink.health", "agent.spawned", "agent.invocation.started"],
+      "expected_status": "partial",
+      "missing_sequence": 3
+    },
+    {
+      "scenario_id": "state_reconstruction_and_correction",
+      "session_id": "fixture-session-005",
+      "harnesses": ["custom"],
+      "events": ["session.state_changed", "memory.state_changed", "inbox.state_changed", "event.superseded", "ledger.segment.dropped"]
+    },
+    {
+      "scenario_id": "privacy_boundary_inputs",
+      "session_id": "fixture-session-006",
+      "harnesses": ["claude"],
+      "events": ["custom"],
+      "sensitive_input_classes": ["conversation", "reasoning", "payload", "absolute_path", "url", "branch", "fake_token", "secret_like_custom_payload"],
+      "expected_l4_policy": "allowlist_only"
+    }
+  ],
+  "invariant_coverage": {
+    "I1": ["state_reconstruction_and_correction"],
+    "I2": ["state_reconstruction_and_correction"],
+    "I3": ["partial_sink_and_gap"],
+    "I4": ["state_reconstruction_and_correction"],
+    "I5": ["state_reconstruction_and_correction"],
+    "I6": ["privacy_boundary_inputs"],
+    "I7": ["privacy_boundary_inputs"],
+    "I8": ["review_and_merge_loop"]
+  },
+  "required_event_contracts": [
+    "spawn_requires_invocation_start",
+    "invocation_requires_finish",
+    "parent_notification_requires_delivery",
+    "delivery_requires_consumption_observation",
+    "published_pr_requires_observation",
+    "merge_request_requires_merge_outcome"
+  ]
+}
