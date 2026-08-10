@@ -33,6 +33,14 @@ closed event kinds map only onto event types already present in the
 observability allowlist, and absent review head SHAs remain absent for the
 server-emission findings tracked by M2.7.
 
+`tl_loop/events/reader.py` replays those projections by global `run_seq` across
+lexically ordered segments and applies the ledger's supersession and sequence
+status semantics. `LedgerQueue` is an in-process bounded tailer; handling is
+at-least-once and a consumer acknowledges only after successful handling.
+Acknowledgement persists the global `run_seq` in the run-state cursor through
+the single state writer, so restart begins at `cursor + 1`. No queue or event
+log file is created.
+
 ## FSM parity fixture
 
 `tl_loop/fsm/` is a pure port of `.exo/roles/devswarm/TLPhase.hs`. The golden
