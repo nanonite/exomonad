@@ -264,6 +264,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Add a bounded TL loop for workers and dev leaves (#713)
 - Route issue-close and inbox wakeups through the canonical ledger (#712)
 - Preserve sibling merge recipient context in ledger events (#711)
 - Preserve terminal event head SHAs in the canonical ledger (#710)
