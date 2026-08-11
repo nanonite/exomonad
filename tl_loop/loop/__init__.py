@@ -28,6 +28,15 @@ from .escalate import (
     park,
     switch_harness,
 )
+from .heartbeat import (
+    HeartbeatConfig,
+    HeartbeatDeadlineExceeded,
+    HeartbeatError,
+    HeartbeatResult,
+    SyntheticHeartbeatEvent,
+    heartbeat_due,
+    heartbeat_once,
+)
 from .review import (
     DEFAULT_REVIEW_POLICY,
     MissingReviewedHead,
@@ -64,6 +73,10 @@ __all__ = [
     "EffectIntent",
     "EscalationError",
     "HarnessSwitchDecision",
+    "HeartbeatConfig",
+    "HeartbeatDeadlineExceeded",
+    "HeartbeatError",
+    "HeartbeatResult",
     "IntendedAction",
     "IssueCreationError",
     "Judgment",
@@ -84,6 +97,7 @@ __all__ = [
     "ShadowRunResult",
     "StaleVerdict",
     "SubTLTask",
+    "SyntheticHeartbeatEvent",
     "TLEventDecoder",
     "TLLoopConfig",
     "TLLoopError",
@@ -95,6 +109,8 @@ __all__ = [
     "authorize_harness_switch",
     "derive_child_branch",
     "derive_child_worktree",
+    "heartbeat_due",
+    "heartbeat_once",
     "load_freshness_window",
     "park",
     "ready",

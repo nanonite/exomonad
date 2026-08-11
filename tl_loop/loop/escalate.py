@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.fsm.phase import TLPhase
 from tl_loop.select.ledger import LedgerInput
 from tl_loop.state.schema import BudgetLedger, ParkCause, SliceState, SliceStatus
 from tl_loop.state.store import RunStore
@@ -28,9 +29,7 @@ _TERMINAL_STATUSES = frozenset(
         SliceStatus.BLOCKED.value,
     }
 )
-_AUDIT_FIELDS = frozenset(
-    {"from_harness", "to_harness", "reason", "model", "effort"}
-)
+_AUDIT_FIELDS = frozenset({"from_harness", "to_harness", "reason", "model", "effort"})
 
 
 class EscalationError(RuntimeError):
@@ -144,6 +143,16 @@ def park(
                 blocked_ids.add(dependent_id)
                 blocked.append(dependent_id)
                 changed = True
+        raw_fsm = document.get("fsm")
+        if isinstance(raw_fsm, dict):
+            waiting = raw_fsm.get("waiting")
+            if isinstance(waiting, list):
+                waiting[:] = [item for item in waiting if item not in blocked_ids]
+                if not waiting and raw_fsm.get("phase") in {
+                    TLPhase.TLWaiting.value,
+                    TLPhase.TLMerging.value,
+                }:
+                    raw_fsm["phase"] = TLPhase.TLFailed.value
         return document
 
     apply(store.run_dir, mutate)
@@ -169,9 +178,7 @@ def authorize_harness_switch(
         "effort": effort,
     }
     source_env = os.environ if env is None else env
-    allowed = to_harness in allow or source_env.get(
-        "EXOMONAD_ALLOW_HARNESS_SWITCH"
-    ) == "1"
+    allowed = to_harness in allow or source_env.get("EXOMONAD_ALLOW_HARNESS_SWITCH") == "1"
     return HarnessSwitchDecision(
         allowed=allowed,
         from_harness=from_harness,

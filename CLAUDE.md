@@ -36,6 +36,14 @@ This is why the tree prevents context window drift: each node's cognitive load i
 
 Within a single TL's scope, work proceeds in waves. Wave N produces merged code. Wave N+1 builds on it. The wave boundary is where understanding accumulates — the TL reads the merged diffs, learns what the children actually built, and uses that knowledge to write sharper specs for the next wave.
 
+Long-running waves may persist an explicit objective, deadline, and completion
+predicate in run state. When the event queue is idle, the configured heartbeat
+interval re-observes worker liveness through poll_workers and PR state through
+watcher_pr_state. Reconciliation is idempotent and stays inside the shared
+state writer: it never invents event-log sequence numbers or budget charges.
+A dead or stalled slice is escalated through the M5.3 parking path with an
+auditable cause; tmux scraping is not a liveness source.
+
 ### Branch Naming as Coordinate System
 
 `{parent}.{name}` (dot separator) encodes tree address, where `name = {slug}-{type}` (e.g., `auth-claude`, `oauth-provider-codex`). `dev.auth-claude.oauth-provider-codex` tells you: root is `dev`, first-level TL is `auth` (Claude), leaf is `oauth-provider` (Codex). The last dot-segment IS the `AgentName` — one namespace, zero translation. PRs target the parent branch, not main — merged via recursive fold up the tree. The git DAG IS the computation trace.

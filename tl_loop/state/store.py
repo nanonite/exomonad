@@ -6,7 +6,7 @@ import copy
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeAlias, cast
@@ -32,6 +32,7 @@ from .schema import (
     FSMState,
     GateState,
     GateStatus,
+    GoalState,
     ParkCause,
     RunState,
     SchemaError,
@@ -66,6 +67,7 @@ class ResumeState:
     slices: SliceMap
     budgets: BudgetLedger
     offset: int
+    goals: GoalState = field(default_factory=GoalState)
 
     @property
     def phase(self) -> TLPhase:
@@ -110,6 +112,17 @@ class RunStore:
         """Return local replay state without contacting the runtime."""
         return resume(self.run_id, root_dir=self.root_dir)
 
+    def set_goals(self, goals: GoalState) -> RunState:
+        """Persist goal and heartbeat metadata through the atomic writer."""
+        encoded = _encode_goals(goals)
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            document["goals"] = copy.deepcopy(encoded)
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
 
 def create(run_id: str, root_spec: RootSpec, *, root_dir: str | Path = DEFAULT_ROOT) -> RunState:
     """Create a run at ``.exo/tl-loop/<run_id>/run.json``.
@@ -126,7 +139,9 @@ def create(run_id: str, root_spec: RootSpec, *, root_dir: str | Path = DEFAULT_R
         validate(initial)
         _assert_consistent(directory / "run.json", _decode(initial))
     except SchemaError as error:
-        raise CorruptCheckpoint(f"{directory / 'run.json'}: schema inconsistency: {error}") from error
+        raise CorruptCheckpoint(
+            f"{directory / 'run.json'}: schema inconsistency: {error}"
+        ) from error
     apply(directory, _identity, initial=initial)
     return load(directory / "run.json")
 
@@ -188,6 +203,7 @@ def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:
         slices=state.slices,
         budgets=state.budgets,
         offset=state.events.last_consumed_offset,
+        goals=state.goals,
     )
 
 
@@ -204,6 +220,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "parent_run_id",
         "parent_agent_id",
         "depth",
+        "goals",
     }
     unknown = sorted(set(root_spec) - allowed)
     if unknown:
@@ -223,9 +240,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
     return document
 
 
-def _assert_worktree_available(
-    initial: Mapping[str, object], target: Path, root_dir: Path
-) -> None:
+def _assert_worktree_available(initial: Mapping[str, object], target: Path, root_dir: Path) -> None:
     owner = initial.get("owner_worktree")
     if not isinstance(owner, str) or not owner:
         return
@@ -247,9 +262,7 @@ def _assert_worktree_available(
             and _normalize_worktree(existing_owner) == normalized_owner
             and phase not in {TLPhase.TLDone.value, TLPhase.TLFailed.value}
         ):
-            raise WorktreeClaimError(
-                f"worktree {owner!r} is already claimed by {candidate.parent}"
-            )
+            raise WorktreeClaimError(f"worktree {owner!r} is already claimed by {candidate.parent}")
 
 
 def _resolve_run_directory(
@@ -410,6 +423,7 @@ def _decode(document: dict[str, object]) -> RunState:
         ),
         gates=tuple(_decode_gate(cast(dict[str, object], gate)) for gate in raw_gates),
         events=EventCursor(last_consumed_offset=cast(int, events["last_consumed_offset"])),
+        goals=_decode_goals(cast(dict[str, object], document.get("goals", {}))),
         owner_branch=cast(str | None, document.get("owner_branch")),
         owner_worktree=cast(str | None, document.get("owner_worktree")),
         parent_branch=cast(str | None, document.get("parent_branch")),
@@ -423,6 +437,26 @@ def _decode_counter_map(value: object) -> Mapping[str, int]:
     if not isinstance(value, dict):
         return MappingProxyType({})
     return MappingProxyType({key: cast(int, amount) for key, amount in value.items()})
+
+
+def _encode_goals(goals: GoalState) -> dict[str, object]:
+    return {
+        "objective": goals.objective,
+        "deadline": goals.deadline,
+        "completion_predicate": goals.completion_predicate,
+        "last_heartbeat_at": goals.last_heartbeat_at,
+        "last_progress_at": goals.last_progress_at,
+    }
+
+
+def _decode_goals(value: dict[str, object]) -> GoalState:
+    return GoalState(
+        objective=cast(str, value.get("objective", "")),
+        deadline=cast(float, value.get("deadline", 0.0)),
+        completion_predicate=cast(str, value.get("completion_predicate", "")),
+        last_heartbeat_at=cast(float | None, value.get("last_heartbeat_at")),
+        last_progress_at=cast(float | None, value.get("last_progress_at")),
+    )
 
 
 def _encode_charge(charge: BudgetCharge) -> dict[str, object]:
@@ -515,7 +549,10 @@ def _assert_fsm_slices_consistent(
     slices: Mapping[str, SliceState | object],
 ) -> None:
     waiting = set(waiting_ids)
-    active_statuses = {status.value for status in (SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING)}
+    active_statuses = {
+        status.value
+        for status in (SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING)
+    }
     for slice_id in waiting_ids:
         value = slices.get(slice_id)
         status = value.status if isinstance(value, SliceState) else value

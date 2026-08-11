@@ -33,6 +33,7 @@ from tl_loop.fsm.phase import (
 )
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import park
+from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
 from tl_loop.loop.review import ReviewGateError, verify_review, watcher_head
 from tl_loop.loop.schedule import ScheduleDeadlock, ready
 from tl_loop.select.agent_type import select_agent_type, selection_failure
@@ -43,6 +44,7 @@ from tl_loop.select.model import ModelCatalog, select_model
 from tl_loop.select.policy import HarnessPolicy, load_policy
 from tl_loop.state.schema import (
     BudgetLedger,
+    GoalState,
     ParkCause,
     RunState,
     SliceState,
@@ -68,9 +70,9 @@ class LoopTimeout(TLLoopError):
     """The loop received no event for its configured idle window."""
 
 
-
 class DepthLimitExceeded(TLLoopError):
     """A recursive child reached the configured depth ceiling."""
+
 
 class EffectFailed(TLLoopError):
     """An active effect returned an explicit failure."""
@@ -136,7 +138,11 @@ class WorkPlan:
     sub_tls: tuple[SubTLTask, ...] = ()
 
     def __post_init__(self) -> None:
-        names = [task.name for task in self.workers] + [task.name for task in self.leaves] + [task.name for task in self.sub_tls]
+        names = (
+            [task.name for task in self.workers]
+            + [task.name for task in self.leaves]
+            + [task.name for task in self.sub_tls]
+        )
         if len(names) != len(set(names)):
             raise ValueError("worker and leaf names must be unique")
 
@@ -151,8 +157,6 @@ class WorkPlan:
             leaves=_leaves(value.get("leaves", ())),
             sub_tls=_sub_tls(value.get("sub_tls", ())),
         )
-
-
 
 
 @dataclass(frozen=True)
@@ -188,6 +192,8 @@ class TLLoopConfig:
     max_events: int = 256
     poll_interval: float = 0.1
     idle_timeout: float = 30.0
+    heartbeat: HeartbeatConfig | None = None
+    goals: GoalState | None = None
     chainlink_issue_id: int | None = None
     merge_force: bool | None = None
     merge_strategy: str | None = None
@@ -278,6 +284,7 @@ class TLRunResult:
     effects: tuple[EffectIntent, ...]
     transitions: tuple[LoopTransition, ...]
     consumed_events: tuple[int, ...]
+    heartbeat_events: tuple[SyntheticHeartbeatEvent, ...] = ()
 
 
 def tl_run(
@@ -329,7 +336,12 @@ def run_tl_loop(
     store = RunStore(run_id, Path(root_dir))
     if not store.path.exists():
         root_state: dict[str, object] = {}
-        if work_plan.sub_tls or selected.parent_branch is not None or selected.worktree is not None or selected.depth > 0:
+        if (
+            work_plan.sub_tls
+            or selected.parent_branch is not None
+            or selected.worktree is not None
+            or selected.depth > 0
+        ):
             root_state = {
                 "owner_branch": selected.branch,
                 "owner_worktree": _effective_worktree(selected, Path(root_dir), run_id),
@@ -338,6 +350,8 @@ def run_tl_loop(
                 "parent_agent_id": selected.parent_agent_id,
                 "depth": selected.depth,
             }
+        if selected.goals is not None:
+            root_state["goals"] = _encode_goals(selected.goals)
         if initial_slices is not None:
             root_state["slices"] = copy.deepcopy(dict(initial_slices))
         if budgets is not None:
@@ -378,8 +392,11 @@ def _run_loop(
     merged: set[str] = set()
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
+    heartbeat_events: list[SyntheticHeartbeatEvent] = []
     if not expected and not plan.sub_tls:
-        state = store.checkpoint(TLDone(), state.slices, state.budgets, state.events.last_consumed_offset)
+        state = store.checkpoint(
+            TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
+        )
         return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
 
     deadline = time.monotonic() + config.idle_timeout
@@ -389,6 +406,25 @@ def _run_loop(
             break
         event = _next_event(source, config, deadline)
         if event is None:
+            if config.heartbeat is not None:
+                heartbeat = heartbeat_once(
+                    state,
+                    store,
+                    effects,
+                    config.heartbeat,
+                )
+                if heartbeat.fired:
+                    state = heartbeat.state
+                    heartbeat_events.extend(heartbeat.events)
+                    phase = _phase_from_state(state)
+                    if heartbeat.parked_slice_ids and _all_expected_terminal(state, expected):
+                        state = store.checkpoint(
+                            TLFailed("heartbeat parked the remaining active slices"),
+                            state.slices,
+                            state.budgets,
+                            state.events.last_consumed_offset,
+                        )
+                        phase = _phase_from_state(state)
             deadline = time.monotonic() + config.idle_timeout
             continue
         event_seq = event.run_seq
@@ -404,6 +440,8 @@ def _run_loop(
             _checkpoint_and_ack(store, source, event, state, phase)
             state = store.load()
             continue
+        if config.heartbeat is not None:
+            state = _note_heartbeat_progress(store, state)
         if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW}:
             state = _record_review_event(store, state, phase, event, event_seq)
             source.acknowledge(event)
@@ -451,9 +489,7 @@ def _run_loop(
         )
         phase = next_phase
         if config.policy is not None and config.max_parallel_slices is not None:
-            state = _dispatch_children(
-                plan, state, config, effects, effects_log, store
-            )
+            state = _dispatch_children(plan, state, config, effects, effects_log, store)
         if isinstance(phase, (TLDone, TLFailed)):
             break
     else:
@@ -462,7 +498,9 @@ def _run_loop(
         )
     if not isinstance(phase, (TLDone, TLFailed)):
         raise LoopTimeout(f"TL did not reach a terminal phase within {config.idle_timeout:g}s")
-    return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
+    return TLRunResult(
+        state, tuple(effects_log), tuple(transitions), tuple(consumed), tuple(heartbeat_events)
+    )
 
 
 def _dispatch_children(
@@ -488,9 +526,7 @@ def _dispatch_children(
         if selected_harness is not None:
             state = store.load()
         worker_args: dict[str, object] = {"name": worker.name, "task": worker.task}
-        _optional_argument(
-            worker_args, "agent_type", selected_harness or worker.agent_type
-        )
+        _optional_argument(worker_args, "agent_type", selected_harness or worker.agent_type)
         _invoke(
             "spawn_worker",
             worker.name,
@@ -514,9 +550,7 @@ def _dispatch_children(
         if selected_harness is not None:
             state = store.load()
         leaf_args: dict[str, object] = {"name": leaf.name, "task": leaf.task}
-        _optional_argument(
-            leaf_args, "agent_type", selected_harness or leaf.agent_type
-        )
+        _optional_argument(leaf_args, "agent_type", selected_harness or leaf.agent_type)
         for name, value in (
             ("boundary", leaf.boundary),
             ("read_first", leaf.read_first),
@@ -554,24 +588,61 @@ def _run_sub_tls(
         if current.status is not SliceStatus.PENDING:
             continue
         branch = derive_child_branch(config.branch, task.name)
-        worktree = str(task.worktree or derive_child_worktree(
-            _effective_worktree(config, store.root_dir, store.run_id), task.name
-        ))
+        worktree = str(
+            task.worktree
+            or derive_child_worktree(
+                _effective_worktree(config, store.root_dir, store.run_id), task.name
+            )
+        )
         if config.depth >= config.max_depth:
-            parked = replace(current, status=SliceStatus.PARKED, park_cause=ParkCause.SCHEDULE_DEADLOCK)
-            state = store.checkpoint(TLFailed(f"depth ceiling reached for {task.name}"), {**state.slices, task.name: parked}, state.budgets, state.events.last_consumed_offset)
+            parked = replace(
+                current, status=SliceStatus.PARKED, park_cause=ParkCause.SCHEDULE_DEADLOCK
+            )
+            state = store.checkpoint(
+                TLFailed(f"depth ceiling reached for {task.name}"),
+                {**state.slices, task.name: parked},
+                state.budgets,
+                state.events.last_consumed_offset,
+            )
             raise DepthLimitExceeded(f"depth ceiling {config.max_depth} reached for {task.name!r}")
-        spawned = replace(current, status=SliceStatus.SPAWNED, base_ref=config.branch, branch=branch, worktree=worktree)
-        state = store.checkpoint(_phase_from_state(state), {**state.slices, task.name: spawned}, state.budgets, state.events.last_consumed_offset)
+        spawned = replace(
+            current,
+            status=SliceStatus.SPAWNED,
+            base_ref=config.branch,
+            branch=branch,
+            worktree=worktree,
+        )
+        state = store.checkpoint(
+            _phase_from_state(state),
+            {**state.slices, task.name: spawned},
+            state.budgets,
+            state.events.last_consumed_offset,
+        )
         child_config = _child_config(config, task, source, effects, store, branch, worktree)
         child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, state.budgets)
-        status = SliceStatus.MERGED if child_result.final_state.fsm.phase is TLPhase.TLDone else SliceStatus.FAILED
+        status = (
+            SliceStatus.MERGED
+            if child_result.final_state.fsm.phase is TLPhase.TLDone
+            else SliceStatus.FAILED
+        )
         completed = replace(spawned, status=status)
-        state = store.checkpoint(_phase_from_state(state), {**state.slices, task.name: completed}, state.budgets, state.events.last_consumed_offset)
+        state = store.checkpoint(
+            _phase_from_state(state),
+            {**state.slices, task.name: completed},
+            state.budgets,
+            state.events.last_consumed_offset,
+        )
         if status is SliceStatus.FAILED:
-            return store.checkpoint(TLFailed(f"recursive child {task.name} failed"), state.slices, state.budgets, state.events.last_consumed_offset)
+            return store.checkpoint(
+                TLFailed(f"recursive child {task.name} failed"),
+                state.slices,
+                state.budgets,
+                state.events.last_consumed_offset,
+            )
     if plan.sub_tls and not plan.workers and not plan.leaves:
-        state = store.checkpoint(TLDone(), state.slices, state.budgets, state.events.last_consumed_offset)
+        state = store.checkpoint(
+            TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
+        )
     return state
 
 
@@ -627,9 +698,9 @@ def _park_schedule_deadlock(
 def _can_dispatch(name: str, state: RunState, config: TLLoopConfig) -> bool:
     if config.policy is None or config.max_parallel_slices is None:
         return True
-    return name in {slice_state.id for slice_state in ready(
-        state.slices, config.max_parallel_slices
-    )}
+    return name in {
+        slice_state.id for slice_state in ready(state.slices, config.max_parallel_slices)
+    }
 
 
 def _already_dispatched(name: str, state: RunState) -> bool:
@@ -678,14 +749,10 @@ def _prepare_spawn(
                 issue_creator=live,
                 ledger=state.budgets,
             )
-        raise TLLoopError(
-            f"cannot select harness for {name!r}: {failure.value}; slice parked"
-        )
+        raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}; slice parked")
     model_id: str | None = None
     if config.catalog is not None:
-        model_id = select_model(
-            choice.harness, config.catalog, config.requested_model
-        ).model_id
+        model_id = select_model(choice.harness, config.catalog, config.requested_model).model_id
 
     def record_spawn(document: dict[str, object]) -> dict[str, object]:
         slices = document.get("slices")
@@ -757,8 +824,11 @@ def _merge_completed_leaf(
         return True
     current = state.slices.get(completion.slug)
     live = cast(EffectClient, effects) if config.active else None
-    if config.active and live is not None and current is not None and (
-        current.verdict is not None or current.reviewed_head is not None
+    if (
+        config.active
+        and live is not None
+        and current is not None
+        and (current.verdict is not None or current.reviewed_head is not None)
     ):
         watcher_arguments = {"pr_number": pr_number}
         effects_log.append(
@@ -770,9 +840,7 @@ def _merge_completed_leaf(
         )
         watcher_result = live.watcher_pr_state(pr_number=pr_number)
         if watcher_result.success is False:
-            raise EffectFailed(
-                watcher_result.error or "watcher_pr_state returned failure"
-            )
+            raise EffectFailed(watcher_result.error or "watcher_pr_state returned failure")
         try:
             verify_review(
                 current,
@@ -810,9 +878,7 @@ def _merge_completed_leaf(
     return True
 
 
-def _discard_review(
-    slices: Mapping[str, SliceState], slice_id: str
-) -> dict[str, SliceState]:
+def _discard_review(slices: Mapping[str, SliceState], slice_id: str) -> dict[str, SliceState]:
     current = slices.get(slice_id)
     if current is None:
         return dict(slices)
@@ -991,10 +1057,10 @@ def derive_child_worktree(parent_worktree: str | Path, name: str) -> Path:
     return Path(parent_worktree) / name
 
 
-
 def _effective_worktree(config: TLLoopConfig, root_dir: Path, run_id: str) -> str:
     value = config.worktree or (root_dir / run_id)
     return str(Path(value).expanduser().resolve())
+
 
 def _initial_slices(
     plan: WorkPlan,
@@ -1010,7 +1076,10 @@ def _initial_slices(
     result: dict[str, dict[str, object]] = {}
     for worker in plan.workers:
         result[worker.name] = _initial_slice_record(
-            worker.name, (f"tl-loop/{worker.name}",), ("controller",), worker.agent_type,
+            worker.name,
+            (f"tl-loop/{worker.name}",),
+            ("controller",),
+            worker.agent_type,
             derive_child_branch(selected.branch, worker.name) if nested else None,
             str(derive_child_worktree(owner_worktree, worker.name)) if nested else None,
             selected.parent_branch if nested else None,
@@ -1019,19 +1088,52 @@ def _initial_slices(
         paths = leaf.boundary or (f"tl-loop/{leaf.name}",)
         test_plan = leaf.verify or leaf.steps or ("controller",)
         result[leaf.name] = _initial_slice_record(
-            leaf.name, paths, test_plan, leaf.agent_type,
+            leaf.name,
+            paths,
+            test_plan,
+            leaf.agent_type,
             derive_child_branch(selected.branch, leaf.name) if nested else None,
             str(derive_child_worktree(owner_worktree, leaf.name)) if nested else None,
             selected.parent_branch if nested else None,
         )
     for task in plan.sub_tls:
         result[task.name] = _initial_slice_record(
-            task.name, (f"tl-loop/{task.name}",), ("controller",), task.agent_type,
-
-            derive_child_branch(selected.branch, task.name), str(task.worktree or derive_child_worktree(owner_worktree, task.name)), selected.branch,
+            task.name,
+            (f"tl-loop/{task.name}",),
+            ("controller",),
+            task.agent_type,
+            derive_child_branch(selected.branch, task.name),
+            str(task.worktree or derive_child_worktree(owner_worktree, task.name)),
+            selected.branch,
         )
     return result
 
+
+def _all_expected_terminal(state: RunState, expected: set[str]) -> bool:
+    terminal = {
+        SliceStatus.MERGED,
+        SliceStatus.FAILED,
+        SliceStatus.PARKED,
+        SliceStatus.BLOCKED,
+    }
+    return bool(expected) and all(
+        state.slices.get(slice_id) is not None and state.slices[slice_id].status in terminal
+        for slice_id in expected
+    )
+
+
+def _note_heartbeat_progress(store: RunStore, state: RunState) -> RunState:
+    return store.set_goals(replace(state.goals, last_progress_at=time.time()))
+
+
+def _encode_goals(goals: GoalState) -> dict[str, object]:
+    return {
+        "objective": goals.objective,
+        "deadline": goals.deadline,
+        "completion_predicate": goals.completion_predicate,
+        "last_heartbeat_at": goals.last_heartbeat_at,
+        "last_progress_at": goals.last_progress_at,
+    }
 
 
 def _initial_slice_record(
@@ -1105,7 +1207,6 @@ def _leaves(value: object) -> tuple[LeafTask, ...]:
     return tuple(_leaf(item) for item in value)
 
 
-
 def _sub_tls(value: object) -> tuple[SubTLTask, ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise TypeError("work plan sub_tls must be an array")
@@ -1134,13 +1235,12 @@ def _sub_tl(value: object) -> SubTLTask:
         raise ValueError(f"sub-TL contains unknown keys: {', '.join(unknown)}")
     plan_value = value.get("plan")
     if plan_value is None:
-        plan_value = {
-            key: value[key]
-            for key in ("workers", "leaves", "sub_tls")
-            if key in value
-
-        }
-    plan = plan_value if isinstance(plan_value, WorkPlan) else WorkPlan.from_mapping(cast(Mapping[str, object], plan_value))
+        plan_value = {key: value[key] for key in ("workers", "leaves", "sub_tls") if key in value}
+    plan = (
+        plan_value
+        if isinstance(plan_value, WorkPlan)
+        else WorkPlan.from_mapping(cast(Mapping[str, object], plan_value))
+    )
     return SubTLTask(
         _required_text(value, "name", "sub-TL"),
         plan,
@@ -1150,6 +1250,8 @@ def _sub_tl(value: object) -> SubTLTask:
         cast(str | Path | None, value.get("worktree")),
         _optional_string(value, "agent_id", "sub-TL"),
     )
+
+
 def _worker(value: object) -> WorkerTask:
     if isinstance(value, WorkerTask):
         return value

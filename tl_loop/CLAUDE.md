@@ -73,6 +73,22 @@ the FSM, slice map, budget ledger, and event-log replay offset from that file.
 Resume treats the checkpoint and event log as authoritative and performs no
 server or network query.
 
+## Long-running wave goals and heartbeats
+
+RunState.goals is optional durable metadata for a long-running wave:
+objective, deadline, completion predicate, and the last heartbeat/progress
+timestamps. HeartbeatConfig supplies an explicit idle interval and stall
+threshold. An idle heartbeat calls only the read-side poll_workers and
+watcher_pr_state effects, then persists reconciled slice state through the
+shared writer. Synthetic heartbeat events are deterministic observations; they
+do not consume ledger sequence numbers or charge budgets.
+
+Dead panes and no-progress stalls use the existing M5.3 park path with
+stall_detected, including needs-human issue creation and dependent blocking.
+Read-only shadow effects fail closed when parking would be required. Repeated
+heartbeats must be safe to run because terminal slices are no longer polled and
+unchanged PR observations produce no new synthetic event.
+
 ## Ledger-backed event projection
 
 The immutable ledger at `.exo/ledger/segments/` is the TL loop's event storage

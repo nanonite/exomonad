@@ -35,6 +35,7 @@ class ParkCause(str, Enum):
     SCHEDULE_DEADLOCK = "schedule_deadlock"
     REVIEW_STUCK = "review_stuck"
     HARNESS_SWITCH_REQUESTED = "harness_switch_requested"
+    STALL_DETECTED = "stall_detected"
 
 
 class Verdict(str, Enum):
@@ -77,6 +78,7 @@ RUN_KEYS = frozenset(
         "parent_run_id",
         "parent_agent_id",
         "depth",
+        "goals",
     }
 )
 FSM_KEYS = frozenset({"phase", "waiting"})
@@ -143,6 +145,15 @@ CHARGE_KEYS = frozenset(
 )
 GATE_KEYS = frozenset({"name", "status"})
 EVENT_KEYS = frozenset({"last_consumed_offset"})
+GOAL_KEYS = frozenset(
+    {
+        "objective",
+        "deadline",
+        "completion_predicate",
+        "last_heartbeat_at",
+        "last_progress_at",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -224,6 +235,17 @@ class EventCursor:
     last_consumed_offset: int
 
 
+@dataclass(frozen=True)
+class GoalState:
+    """Durable objective and liveness timestamps for one long-running wave."""
+
+    objective: str = ""
+    deadline: float = 0.0
+    completion_predicate: str = ""
+    last_heartbeat_at: float | None = None
+    last_progress_at: float | None = None
+
+
 SliceMap: TypeAlias = Mapping[str, SliceState]
 
 
@@ -245,6 +267,7 @@ class RunState:
     parent_run_id: str | None = None
     parent_agent_id: str | None = None
     depth: int = 0
+    goals: GoalState = field(default_factory=GoalState)
 
 
 class SchemaError(ValueError):
@@ -284,6 +307,7 @@ def validate(doc: object) -> None:
         _unique_strings(fsm.get("waiting"), "run.fsm.waiting", errors)
 
     slices = _slice_map(root.get("slices"), errors)
+    _goals(root.get("goals"), errors)
     _budgets(root.get("budgets"), errors)
     _gates(root.get("gates"), errors)
     _events(root.get("events"), errors)
@@ -344,12 +368,9 @@ def _validate_slice(
     _nullable_enum_value(value, "verdict", path, Verdict, errors)
     _nullable_string(value, "verdict_at", path, errors)
     if value.get("verdict") is not None and (
-        not isinstance(value.get("reviewed_head"), str)
-        or not value.get("reviewed_head")
+        not isinstance(value.get("reviewed_head"), str) or not value.get("reviewed_head")
     ):
-        errors.append(
-            (f"{path}.reviewed_head", "is required when verdict is present")
-        )
+        errors.append((f"{path}.reviewed_head", "is required when verdict is present"))
     _nullable_enum_value(value, "park_cause", path, ParkCause, errors)
     _nullable_positive_int(value, "park_issue_id", path, errors)
     _nullable_string(value, "blocked_by", path, errors)
@@ -446,9 +467,7 @@ def _charges(value: object, path: str, errors: list[tuple[str, str]]) -> None:
             seen.add(identity)
 
 
-def _boolean(
-    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
-) -> None:
+def _boolean(holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]) -> None:
     if type(holder.get(key)) is not bool:
         errors.append((f"{path}.{key}", "must be a boolean"))
 
@@ -478,6 +497,35 @@ def _events(value: object, errors: list[tuple[str, str]]) -> None:
         _non_negative_int(events, "last_consumed_offset", "run.events", errors)
 
 
+def _goals(value: object, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    goals = _object(value, "run.goals", GOAL_KEYS, errors)
+    if goals is None:
+        return
+    _goal_text(goals, "objective", "run.goals", errors)
+    _non_negative_number(goals, "deadline", "run.goals", errors)
+    _goal_text(goals, "completion_predicate", "run.goals", errors)
+    for key in ("last_heartbeat_at", "last_progress_at"):
+        if goals.get(key) is not None:
+            _non_negative_number(goals, key, "run.goals", errors)
+
+
+def _goal_text(
+    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+) -> None:
+    if not isinstance(holder.get(key), str):
+        errors.append((f"{path}.{key}", "must be a string"))
+
+
+def _non_negative_number(
+    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+) -> None:
+    value = holder.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        errors.append((f"{path}.{key}", "must be a non-negative number"))
+
+
 def _validate_waiting(
     waiting: object,
     slices: Mapping[str, dict[str, object]],
@@ -502,7 +550,9 @@ def _validate_dependencies(
         graph[slice_id] = [dependency for dependency in dependencies if isinstance(dependency, str)]
         for dependency in graph[slice_id]:
             if dependency not in slices:
-                errors.append((f"run.slices[{slice_id!r}].depends_on", f"unknown slice {dependency!r}"))
+                errors.append(
+                    (f"run.slices[{slice_id!r}].depends_on", f"unknown slice {dependency!r}")
+                )
 
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -584,7 +634,12 @@ def _enum_value(
     value = holder.get(key)
     allowed = {member.value for member in enum_type}
     if value not in allowed:
-        errors.append((f"{path}.{key}", f"must be one of {', '.join(sorted(cast(str, item) for item in allowed))}"))
+        errors.append(
+            (
+                f"{path}.{key}",
+                f"must be one of {', '.join(sorted(cast(str, item) for item in allowed))}",
+            )
+        )
 
 
 def _nullable_enum_value(
