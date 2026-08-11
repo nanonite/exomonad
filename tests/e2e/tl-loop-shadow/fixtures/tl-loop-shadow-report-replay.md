@@ -24,7 +24,7 @@ unmatched shadow action; an actual-only action would be `MISSING`.
 
 Classification: accepted-intentional-difference. The shadow loop receives one
 `ChildSpawned` event per child and records one deterministic `dispatch` intent
-for each child. The live interactive TL records the equivalent fan-out as one
+for each child. The fixture actual stream records the equivalent fan-out as one
 `fork_wave` tool call whose child list contains both slices. The first child is
 therefore paired as a DIVERGENT row, and the second shadow dispatch remains an
 EXTRA row because the actual fan-out already includes it. No child is lost and
@@ -35,8 +35,8 @@ maintainer. Status: accepted for the read-only M3 gate.
 ### Merge `shadow-slice-a` — DIVERGENT
 
 Classification: accepted-intentional-difference. The shadow loop records its
-non-executing judgment as `merge`, while the live TL invokes the transport tool
-`merge_pr`. Both rows target `shadow-slice-a` and carry the same normalized PR
+non-executing judgment as `merge`, while the fixture actual stream records the
+transport tool `merge_pr`. Both rows target `shadow-slice-a` and carry the same normalized PR
 number, so the state transition and selected PR agree even though the
 programmatic action vocabulary is intentionally abstracted. Owner: M3 shadow
 maintainer. Status: accepted for the read-only M3 gate.
@@ -44,8 +44,8 @@ maintainer. Status: accepted for the read-only M3 gate.
 ### Merge `shadow-slice-b` — DIVERGENT
 
 Classification: accepted-intentional-difference. The shadow loop records its
-non-executing judgment as `merge`, while the live TL invokes the transport tool
-`merge_pr`. Both rows target `shadow-slice-b` and carry the same normalized PR
+non-executing judgment as `merge`, while the fixture actual stream records the
+transport tool `merge_pr`. Both rows target `shadow-slice-b` and carry the same normalized PR
 number, so the state transition and selected PR agree even though the
 programmatic action vocabulary is intentionally abstracted. Owner: M3 shadow
 maintainer. Status: accepted for the read-only M3 gate.

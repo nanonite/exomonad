@@ -21,13 +21,13 @@ rationale for every non-MATCH row. The M2.7 coverage audit marks the
 
 All four non-MATCH rows are accepted-intentional-differences:
 
-1. The child fan-out DIVERGENT row pairs one shadow `dispatch` with the live
-   `fork_wave`. The live call carries both children in one transport action;
+1. The child fan-out DIVERGENT row pairs one shadow `dispatch` with the fixture
+   actual `fork_wave`. The actual row carries both children in one transport action;
    the shadow loop records one deterministic intent per child. The second
    shadow dispatch is consequently the EXTRA row. Both children remain
    represented, so this is action-granularity variance rather than lost state.
-2. The `shadow-slice-a` merge DIVERGENT row compares shadow `merge` with live
-   `merge_pr`. The target and normalized PR number agree; the difference is
+2. The `shadow-slice-a` merge DIVERGENT row compares shadow `merge` with the
+   fixture actual `merge_pr`. The target and normalized PR number agree; the difference is
    the intentional distinction between a non-executing judgment and its
    transport tool.
 3. The `shadow-slice-b` merge DIVERGENT row has the same accepted rationale
