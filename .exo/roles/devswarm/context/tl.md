@@ -3,81 +3,43 @@ paths:
   - "**"
 ---
 
-# Spawned TL Protocol
+# TL Decompose-Prompt Reference
 
-Call `check_inbox` at the start of each task and after completing each major step. Use `list_agents` to check which agents are alive and whether they have responded.
+This file is retained as prompt vocabulary for authoring and reviewing a
+structured TL `WorkPlan`. It is not the TL protocol and is not an instruction
+to start an interactive coordinator. The programmatic controller in
+`tl_loop/` owns planning, dispatch, event consumption, review, merge, and
+terminal decisions.
 
-The continuation brief is injected automatically into the TL session's
-SessionStart context after the TeamCreate instruction. Do not call
-`continuation_brief` manually at startup; use it only for a mid-session refresh.
+## Hylomorphic vocabulary
 
-Hylomorphic TL: scaffold-fork-converge over worktrees, waves in a context monad.
+The hylomorphism remains useful language for the controller: a validated plan
+and checkpoint describe the unfold, while ledger-driven review, merge, and
+upward PR transitions describe the fold. The controller performs both through
+durable state; this reference does not direct an agent to scaffold, fork,
+idle, poll, or fold manually.
 
-You ARE your worktree. One agent, one branch, one directory.
+## WorkPlan authoring
 
-You are a node in a forking tree of cognition. You can:
-- Split: Fork yourself into parallel selves (fork_wave), each with your full context. They are you, diverged.
-- Extend: Spawn leaf and worker agents (spawn_leaf, spawn_worker) as your hands — focused execution on a single spec.
-- Fold: Merge your children's work back into your branch. What they built becomes what you know.
+Use this order when writing a root or child plan:
 
-Build context until you can see the tree. Then become the tree.
+1. **ANTI-PATTERNS** — explicit DO NOT rules first.
+2. **READ FIRST** — exact files, interfaces, and existing tests.
+3. **STEPS** — bounded actions with named ownership paths.
+4. **VERIFY** — exact commands and expected evidence.
+5. **DONE CRITERIA** — observable completion conditions.
 
-1. SCAFFOLD: Write the shared foundation (types, stubs, CLAUDE.md). Commit + push.
-2. SPLIT + EXTEND: Fork sub-TLs for complex subtrees. Spawn Codex leaves for focused tasks. Everything parallel that can be parallel.
-3. IDLE: After spawning, call `poll_workers` once with `include_dead=true` to snapshot pane liveness, Chainlink session state, issue status, and age; then STOP. End your turn with no further output. Conserve your context window.
-   Messages from children arrive via Teams inbox BETWEEN your turns — if you keep generating text, they queue but cannot be delivered.
-   When a message arrives, you wake up naturally. Do not busy-wait or run ad hoc polling loops.
-4. FOLD: Merge PRs. Integration commit. What you learned sharpens the next wave.
-5. REPEAT: If more waves, goto 2. If done, PR upward. Your parent folds you in turn.
+Each slice should declare its paths, dependencies, base ref, test plan, and
+bounded retry/parallelism expectations. Harness, model, budget, and hidden
+fallback choices belong to the controller's policy and selector, not to the
+natural-language prompt.
 
-Every token you spend on work a child could do is wasted. Delegate aggressively.
-Write specs complete enough that children don't need to ask — but be ready when they do.
-If a task involves more than scaffolding, split or extend. Never implement alone.
-Never touch another agent's worktree. Never checkout another branch.
+## Ownership boundary
 
-## PR acceptance criteria handoff
+Leaves implement in issue-owned worktrees and file PRs. Reviewers judge the
+exact PR head. The controller consumes authoritative ledger events and sends
+repair work through `resume_pr`. Human decisions are named durable gates.
 
-When filing or updating a PR, require its body to contain the literal `## Acceptance Criteria` heading with the issue's Definition-of-Done bullets copied verbatim beneath it. When composing a `resume_pr` repair handoff, put those same bullets in `done_criteria` and tell the resumed owner to preserve or update that heading on the next `file_pr` call.
-
-## Review-fix handoff
-
-When a `[REVIEW ACTION REQUIRED]` message arrives, reviewer text is input, not a patch plan. Before steering the leaf:
-
-1. Read the PR diff, reviewer comments, and affected source/tests.
-2. State the root cause and propose the concrete solution with exact files/lines.
-3. Build a complete handoff with ROOT CAUSE, PROPOSED SOLUTION, READ FIRST, STEPS, VERIFY, BOUNDARY, and DONE CRITERIA.
-4. For an existing open PR, call `resume_pr` with the PR number and structured fields. Do not call `spawn_leaf`, create a sibling branch, create a new issue, or close the owning issue.
-5. Require the leaf to commit/push, end its Chainlink session, and report verification results.
-
-Each dev invocation handles one assignment and exits after its authoritative
-handoff; it does not wait for merge-ready. The watcher owns PR/review/CI state.
-Use `resume_pr` for a fresh invocation in the same owner worktree, branch, and
-PR when later guidance requires more work.
-
-## Worker Spawning
-
-When calling `spawn_worker`, omit `agent_type` to use `{{spawn_agent_type}}`; set it only when the task explicitly requires a different type.
-When calling `fork_wave`, set `agent_type` on each child to `{{spawn_agent_type}}` unless the task explicitly requires a different type.
-
-A coding assignment remains within {{spawn_agent_type}} for retries and
-ordinary respawns. If that harness cannot proceed, report the structured
-[STUCK: harness-switch] guidance to the root/human; do not silently switch
-to Claude, Codex, or another harness. A cross-harness coding spawn
-requires explicit human approval through EXOMONAD_ALLOW_HARNESS_SWITCH=1,
-which is audited with the from/to harness, reason, model, and effort.
-Use resume_pr for existing PR work so the persisted owner harness is reused.
-
-
-## Notification Vocabulary
-
-- `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Call `merge_pr` with `chainlink_issue_id` so it closes the child issue and commits `CHANGELOG.md` before merging, then verify.
-- After `merge_pr` completes successfully and verification passes, call `dispose_leaf` for the dev leaf and call `dispose_leaf` for the reviewer leaf for that issue. Use a reason like `merged PR #<number>` and keep `force=false` unless the leaf is a genuine orphan. `merge_pr` does not perform cleanup side effects.
-
-The review-loop watcher routes all non-merge-ready outcomes (`dev_not_pushing`,
-`reviewer_not_responding`, `reviewer_never_started`, and `dev_failed`) to the
-human escalation surface as Chainlink `review-stuck` issues. Do not branch on
-review-loop timeout, stuck, or failed signals in this TL prompt.
-
-## Completion Protocol
-
-When all waves are done: `file_pr` to parent branch, then `notify_parent` with success.
+Do not use `check_inbox`, `list_agents`, `poll_workers`, tmux scraping, or
+peer-message text as the controller's state machine. Do not create a second
+coordinator, a duplicate branch, or a silent fallback to an interactive TL.

@@ -30,9 +30,11 @@ PRs are tracked in Forgejo. Do NOT use `gh` commands — they will fail. The wor
 
 ## Agent Hierarchy
 
-- **TL (Tech Lead)**: Claude. Decomposes, specs, scaffolds, spawns, merges. Never implements directly.
+- **TL controller**: The Python `tl_loop` process. Loads structured plans, selects bounded harnesses, dispatches work, consumes the ledger, applies review gates, merges, and parks or escalates runs. It never edits source code.
 - **Dev (Leaf)**: Configured agent type (OpenCode, Codex, or Shoal — set via `--worker` flag at init). Implements a focused spec, files PR via `file_pr` MCP. No spawning.
 - **Worker**: Ephemeral pane agent. Research or non-conflicting in-place edits. No branch, no PR.
+- **Reviewer**: The configured review harness. Reviews the issue-owned PR head and never authors its branch.
+- **Human operator**: Observes the controller window and answers explicitly named durable gates.
 
 ## Harness and effort selection
 
@@ -42,43 +44,49 @@ as CLI > local config > global config > medium default. Worker effort is inherit
 by forked TLs, leaves, ephemeral workers, and companions. OpenCode receives effort
 as a model-aware `--variant`; Codex and Shoal log that effort is ignored.
 
-## The TL Protocol: Scaffold-Fork-Converge
+## The TL Protocol: Programmatic Loop
 
-Every TL at every level of the tree follows this protocol:
+`tl_loop` is the only coordinator for a run. The hylomorphism remains the
+conceptual model, but its transitions are durable Python state and ledger
+events rather than an interactive prompt protocol.
 
-### 1. Scaffold
+### 1. Load and validate
 
-Before spawning any children, commit the shared foundation they'll build against:
+Load the closed-key `WorkPlan`, checkpoint, harness policy, capability map, and
+review policy. Reject unknown fields, invalid ownership paths, cycles, missing
+test plans, invalid budgets, and natural-language coordinator prompts. Never
+invent a fallback plan or widen a policy on startup.
 
-- **Types and interfaces** that children implement
-- **Test harness and fixtures** children will use
-- **Stub files** showing where children put their code
-- **CLAUDE.md additions** scoping this TL's domain
+### 2. Select and dispatch
 
-Commit and push. Children fork from this commit.
+Classify each ready slice and select the cheapest allowed harness/model that
+meets its capability and budget constraints. Persist the reservation and slice
+ownership in the same state write, then dispatch through the existing
+ExoMonad effect client. A child sub-TL is a nested `tl_run`, not another
+interactive coordinator session.
 
-### 2. Fork (spawn wave)
+### 3. Consume and converge
 
-Spawn children for wave N. Zero dependencies between siblings in the same wave.
+Consume the immutable ledger by global sequence through the typed projection
+and bounded in-process queue. Acknowledge only after handling succeeds.
 
-- **Sub-TLs**: `fork_wave` (Claude). They inherit full conversation context.
-- **Devs**: `spawn_leaf`. They get a self-contained spec. The CLAUDE.md from the scaffolding commit gives them project context.
+The loop advances only on authoritative events: PR/review/CI state, fixes
+pushed, approved or timed-out review, merge result, worker failure, and liveness
+observation. Reviewed-head SHA binding prevents merging a verdict for another
+head. Review repair uses `resume_pr` and never creates a stacked or duplicate
+owner.
 
-### 3. Converge (merge wave)
+### 4. Merge, park, or gate
 
-Wait for children to complete (notifications arrive via Teams inbox). Merge their PRs sequentially. Then write an **integration commit**:
+An approved current head with passing CI is mergeable. A bounded timeout may
+merge only when policy permits and CI passes. Retry, parallelism, recursion,
+budget, and review-round ceilings are explicit. Exhaustion parks the run with
+an auditable cause; the operator can approve or reject a named gate with the
+`tl_loop gate` command and resume from the checkpoint.
 
-- Wire children's outputs together
-- Run integration tests
-- Fix integration bugs
-
-### 4. Next wave (if any)
-
-Wave N+1 depends on merged wave N. Repeat from step 2.
-
-### 5. PR to parent
-
-After all waves are merged and integrated, file a PR to the parent TL's branch.
+The controller is complete only at `TLDone` or `TLFailed`. It does not wait on
+an interactive prompt, scrape tmux output, manually fix a leaf, or silently
+continue past a bound.
 
 ## Spec Quality
 
@@ -94,17 +102,23 @@ Include complete code snippets. Name every file by full path. Include exact comm
 
 ## Convergence Protocol
 
-The TL does NOT iterate on children's work. Convergence is **leaf + reviewer**, not TL:
+Convergence is a controller transition over leaf, reviewer, watcher, and
+ledger state:
 
-1. Leaf implements spec, commits, files PR via `file_pr` MCP
-2. Reviewer agent reviews automatically on PR creation
-3. If reviewer requests changes → the TL receives the comments, diagnoses the root cause, and builds a repair handoff
-4. TL calls `resume_pr` → the existing PR owner receives the handoff plus fetched review context → fixes → pushes
-5. System notifies parent: `[FIXES PUSHED]`, `[PR READY]`, `[MERGE READY]`, `[REVIEW TIMEOUT]`, or `[STUCK]`
-6. TL merges on `[MERGE READY]`. On `[STUCK]`, ask the human for clarification; the leaf remains alive in its PR worktree.
+1. The controller persists a slice and dispatches its issue-owned leaf.
+2. The leaf implements, tests, commits, and files the PR.
+3. The reviewer checks the exact PR head; review comments are delivered to the
+   owner, and the watcher emits the resulting review/CI events.
+4. A NO-GO repair is composed and sent through `resume_pr`; a new owner,
+   branch, or coordinator is not created.
+5. `[PR READY]`, `[FIXES PUSHED]`, or policy-allowed `[REVIEW TIMEOUT]` plus
+   passing CI permits merge of the reviewed head. `[STUCK]` and `[FAILED]`
+   park the run and expose a human gate.
 
-The TL never manually reviews code, never fixes a leaf's implementation.
-See `.exo/review-policy.toml` for review round limits, timeouts, and complexity thresholds.
+The inbox remains a human/worker delivery mechanism. Controller coordination
+uses the durable ledger projection and run checkpoint, not inbox text or a
+second message broker. See `.exo/review-policy.toml` for review limits,
+timeouts, and complexity thresholds.
 
 ### Closed-PR replacement recovery
 
@@ -131,4 +145,5 @@ fresh leaves.
 - `notify_parent` for completion/failure/status updates to parent
 - `send_tmux_message` / `send_mailbox_message` for peer-to-peer messaging between any agents
 - Messages arrive as native `<teammate-message>` via Teams inbox
-- TL idles between spawning and receiving notifications — no polling
+- The controller remains live in its TL window and consumes the ledger; human
+  operators answer named gates rather than steering an interactive TL

@@ -1,4 +1,15 @@
-# Stable Teams with Dedicated Merge Queue Reviewer
+# Subsumed proposal: Stable Teams with Dedicated Merge Queue Reviewer
+
+Status: **Subsumed by** [ADR: Programmatic TL controller](../docs/decisions/tl-as-loop.md)
+
+The current architecture has one merge queue: the programmatic `tl_loop`
+controller. It consumes the durable ledger, applies review and CI gates, and
+calls `merge_pr`; it does not create a native Claude merge-reviewer teammate.
+This file is retained as a historical design record only. Its implementation
+sketch is not an active protocol and must not be used to add a second
+coordinator, inbox watcher, or merge path.
+
+## Historical proposal
 
 ## Context
 

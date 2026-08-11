@@ -4,8 +4,10 @@
 interactive TL orchestration loop. It owns the controller finite state machine
 and calls the Rust ExoMonad runtime over its Unix-domain socket (UDS) boundary.
 
-This package is intentionally a scaffold at M1.1. Runtime dependencies remain
-empty; development tools are declared in `pyproject.toml`.
+This package is the shipped controller for the M8 TL-as-loop architecture.
+Runtime dependencies remain standard-library-only; development tools are
+declared in `pyproject.toml`. The controller is launched by the default TL
+window and can also be run directly for bounded tests and replay.
 
 All I/O stays in Rust. Python owns controller decisions and pure state/event
 transitions, while Rust remains responsible for sockets, processes, files,

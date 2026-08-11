@@ -24,7 +24,7 @@ These are 1:1:1. You cannot have a worktree without a context window to operate 
 
 **Fold (algebra = merge + integrate).** As children complete, the TL merges their PRs, wires outputs together, and writes an integration commit. Each merge is paramorphic — the TL accumulates understanding from what children produced. This accumulated context informs the next wave's specs. After all waves are folded, the TL files a PR upward, and its parent folds it in turn.
 
-The operational realization is **Scaffold-Fork-Converge** (see [Tech Lead Praxis](#scaffold-fork-converge)).
+The operational realization is the programmatic controller described in [Tech Lead Praxis](#tech-lead-praxis).
 
 ### Depth over Breadth
 
@@ -473,20 +473,24 @@ Without Tempo running, spans still appear in stderr via the tracing fmt layer.
 ### Components
 
 ```
-Human in tmux session
-    ├── Server window: exomonad serve (Rust + Haskell WASM RPC surface)
-    └── TL window: Python tl_loop controller (durable FSM + run state)
-            ├── EffectClient over the ExoMonad UDS
-            │       └── MCP effects via WASM (fork_wave, spawn_leaf, merge_pr, etc.)
+Human operator in tmux
+    ├── Server window: exomonad serve
+    │       └── Rust runtime ↔ Haskell WASM RPC surface
+    └── TL window: Python tl_loop controller
+            ├── WorkPlan + durable FSM/run state
             ├── LedgerReader/Queue consumes child and watcher events
-            ├── Pending gates are logged and answered with the gate command
-            └── Agent tree owned by the loop:
-                    ├── worktree: dev.feature-a (leaf)
-                    │   ├── worker: rust-impl (Codex, in-place pane)
-                    │   └── reviewer (configured harness)
-                    └── worktree: dev.feature-b (leaf)
-                        └── ...
+            ├── Pending gates are logged and answered explicitly
+            └── EffectClient over the ExoMonad UDS
+                    └── Rust runtime ↔ Haskell WASM effects
+                            └── Claude Code/Codex/OpenCode workers and reviewers
+                                    ├── worktree: dev.feature-a
+                                    └── worktree: dev.feature-b
 ```
+
+The Python controller sits between the agent harnesses and the Rust runtime:
+it owns orchestration policy and durable transitions, while Haskell defines
+the RPC surface and Rust executes the resulting effects. The human-facing TL
+window is an observation and gate surface, not another agent coordinator.
 
 **Haskell WASM = Embedded DSL**
 - Defines tool schemas, handlers, decision logic
@@ -648,12 +652,13 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
 - `export GITHUB_TOKEN="test-token-e2e"` (dummy token to avoid auth errors)
 - Cleanup via `trap cleanup EXIT` (kills tmux session, removes temp dir)
 - Testrunner uses only `notify_parent` MCP tool + read-only bash observation
-- Root TL creates a team and idles
+- Scenario harnesses configure their required agents; the programmatic TL
+  controller consumes the plan and ledger without an interactive coordinator.
 
 **Adding a new E2E test:**
 1. Create `tests/e2e/{name}/run.sh` following the pattern above
 2. Create `testrunner.md` with the test plan (phases, assertions, report format)
-3. Create `e2e-test.md` with root TL rules (usually: create team, idle)
+3. Create `e2e-test.md` with scenario-specific controller or harness rules
 4. Add `just e2e-{name}` recipe to `justfile`
 
 ### Task Tracking
@@ -670,126 +675,95 @@ GitHub Issues. Branch naming: `gh-{number}/{description}`. Reference issue in co
 
 ## Tech Lead Praxis
 
-The operational manual for executing the hylomorphism (see [Model](#model)). The TL is the recursion's driver at each node: it performs the unfold (scaffold + spawn), idles while children work, then performs the fold (merge + integrate + PR upward). Everything below is how to do that well.
+The hylomorphism in [Model](#model) remains the system's conceptual frame.
+The executable TL is `tl_loop`, a bounded controller that turns a structured
+plan into durable dispatch, review, merge, and escalation transitions. There
+is one controller per run; the tmux TL window only exposes its logs and human
+gates.
 
-The TL coordinator is the `tl_loop` Python controller. It is the only coordinator
-for a run: it owns the FSM, durable state, ledger consumption, harness selection,
-dispatch, review gates, merges, and upward PR effects. The tmux TL window is an
-operator surface for its logs and human decisions; it does not launch Claude,
-Codex, OpenCode, or another interactive coordinator.
+### Controller contract
 
-### Depth over Breadth
+The controller's workflow is:
 
-Use sub-TLs to keep each context window sharp. If a task decomposes into more than ~4 independent leaves, interpose a sub-TL. The root should never reason about implementation details — only about the decomposition structure and integration points. Sub-TLs absorb complexity; root sees summaries.
+**load plan → validate state → select harnesses → dispatch → consume ledger
+events → apply review gates → merge or park**.
 
-### Intelligence Gradient
+It owns the FSM, checkpoints, budget ledger, harness selection, reviewed-head
+binding, repair handoffs, merge decisions, and upward PR effects. Rust still
+executes effects, Haskell still defines the RPC surface, and workers/reviewers
+still own implementation and review. The controller never edits source code
+or manually reviews a diff.
 
-The controller consumes a structured WorkPlan and dispatches. Codex implements. Reviewer agents review. The controller never implements directly and never manually reviews intermediate output.
+### Structured plans and bounded judgment
 
-**Cost model:** Controller tokens are spent on bounded planning and state transitions; implementation and review remain in the leaf and reviewer harnesses. The controller's job is to execute a precise plan and let the convergence loop handle quality.
+The root plan is JSON with closed keys for workers, leaves, and recursive
+sub-TLs. A plan declares paths, dependencies, base refs, tests, and bounded
+parallelism/retries; it cannot choose a harness, model, budget, or hidden
+fallback. The selector applies `.exo/harness_policy.toml` and capability
+ratings without widening an allowlist or ceiling.
 
-### Fire-and-Forget Execution
+Model calls are narrow structured judgments: `decompose`,
+`adjudicate_review`, and `compose_repair`. Their schemas, context budgets,
+attempts, token charges, and replay records are explicit. Control flow stays
+in Python and the state writer, not in a free-form prompt.
 
-The loop's workflow is: **load plan → select harnesses → dispatch → consume events → merge**. It does not wait on an interactive prompt or manually review intermediate output. The operator can inspect the live log and answer an explicitly named durable gate.
+### Dispatch and convergence
 
-**Convergence is leaf + reviewer + event handlers, with the controller applying the durable transitions:**
-1. The controller validates the plan, writes durable slice state, and dispatches a leaf
-2. Leaf works → commits → files PR
-3. Worktree event watcher detects reviewer agent review comments → fires `handle_event(PRReview::ReviewReceived)` → handler injects comments into leaf's pane
-4. Leaf reads reviewer feedback, fixes, pushes
-5. Watcher detects SHA change after `ChangesRequested` → fires `handle_event(PRReview::FixesPushed)` → handler sends `[FIXES PUSHED]` to the controller
-6. The controller consumes `[from: leaf-id] [FIXES PUSHED] PR #N — CI passing. Ready to merge.` → merges the PR
+1. The controller validates the plan, reserves budget, and persists each
+   slice before dispatching through the ExoMonad effect client.
+2. A leaf works in its issue-owned branch/worktree, commits, and files its PR.
+3. The watcher and reviewer produce ledger events; the controller consumes
+   them by sequence number and acknowledges only after handling succeeds.
+4. Review comments go to the live PR owner. A changed head is repaired through
+   `resume_pr`; a fresh branch or duplicate coordinator is never created.
+5. A fresh approved head with passing CI, or an allowed review timeout with
+   passing CI, permits `merge_pr`. The controller verifies the post-merge
+   state before advancing dependents.
 
-**Note:** The reviewer agent re-reviews after fixes are pushed. The `FixesPushed` event signals that the leaf has responded to all review comments and the reviewer should re-evaluate.
+### Depth, waves, and recursion
 
-**Alternative paths:**
-- **Reviewer approves** → watcher fires `handle_event(PRReview::ReviewerApproved)` → handler sends `[PR READY]` to the controller → controller merges
-- **Reviewer comments or requests changes** → watcher dispatches the review event to the live PR owner and the owning parent controller; the owner receives the review text, while `tlPrReviewHandler` sends the controller-facing `[REVIEW ACTION REQUIRED]` guidance → owner fixes → pushes → reviewer re-checks
-- **No reviewer response after timeout** → watcher fires `handle_event(PRReview::ReviewTimeout)` → handler sends `[REVIEW TIMEOUT]` to the controller → controller merges if CI passes
-- **Leaf sends status updates** → `notify_parent` delivers `[from: leaf-id] message` to the controller → informational, controller reads but does not auto-merge
-- **Leaf fails** → `notify_parent` with `failure` status → delivers `[FAILED: leaf-id] message` to the controller → controller records the failure for the next plan
-- **Review is stuck** → after max rounds without convergence, watcher fires `handle_event(PRReview::Stuck)` → handler sends `[STUCK: leaf-id]` to the controller → human intervention required
-- **Reviewer requests changes after one fix round** → dev state enters `DevNeedsHumanDirection` → handler sends `[STUCK: leaf-id]` to the controller → human intervention required
+`max_parallel_slices`, dependency readiness, retry ceilings, and recursion
+depth are durable gates. A child sub-TL is another `tl_run` with nested state,
+not another Claude session. Parallel slices share no ownership paths; the
+controller advances the next wave only after its dependencies are merged or
+parked.
 
-**Escalation, not iteration.** If a leaf fails after reaching `reviewer_max_rounds` (see `.exo/review-policy.toml`), the watcher fires the `Stuck` event. The controller records the bounded failure; the operator answers any named human gate before a new plan is run. The controller never manually fixes a leaf's code.
+### Human gates and bounded failure
 
-### Spec Quality (You Only Get One Shot)
+Review disagreement, missing CI, stale heads, budget exhaustion, liveness
+failure, and harness-switch requests become named durable gates or terminal
+parking causes. The operator answers a gate explicitly:
 
-Since the TL doesn't iterate on specs, the v1 spec must be production-quality. Every spec follows this structure:
-
+```bash
+python3 -m tl_loop gate --project-root . --run-id root --name <gate> --approve
+python3 -m tl_loop gate --project-root . --run-id root --name <gate> --reject
 ```
-1. ANTI-PATTERNS      — Known Codex failure modes as explicit "DO NOT" rules (FIRST)
-2. READ FIRST         — Exact files to read (CLAUDE.md, source files, proto files)
-3. STEPS              — Numbered, each step = one concrete action with code snippets
-4. VERIFY             — Exact build/test commands with env vars (PROTOC path, etc.)
-5. DONE CRITERIA      — What "done" looks like (tests pass, PR filed)
-```
 
-**Anti-patterns section is mandatory and comes first.** These are known Codex failure modes — front-load them so the agent reads them before touching code:
+The controller resumes from the checkpoint. It does not coax a model to keep
+working, silently retry beyond a ceiling, or ask a second interactive TL to
+make the decision.
 
-| Known Failure Mode | Anti-Pattern Rule |
-|---|---|
-| Adds unnecessary dependencies | "ZERO external dependencies. Do NOT add serde/tokio/etc." |
-| Invents escape hatches | "No `todo!()`, `Raw(String)`, `Other(Box<dyn Any>)` variants" |
-| Writes thinking-out-loud comments | "No stream-of-consciousness comments. Doc comments only." |
-| Renames types/variants to "simpler" names | "Use EXACT type signatures below. Do not rename." |
-| Makes architectural decisions | "Do not change the module structure. Files listed below are exhaustive." |
-| Overengineers | "This is N lines in M files, not a new module/framework." |
+### Plan quality
 
-**Key rules:**
-- **One agent = one focused change.** If it touches >3 files or requires architectural decisions, split it.
-- **Include complete code.** Don't describe what to write — show the exact code. Codex executes better from examples than descriptions.
-- **Include exact commands.** Not "run the tests" but `PROTOC=/nix/store/... cargo test --workspace`.
-- **Name every file.** Not "update the proto" but "edit `proto/effects/agent.proto` AND `rust/exomonad-proto/proto/effects/agent.proto`".
-- **Specs are self-contained.** The leaf has no context from previous attempts. Every spec must stand alone with complete code snippets and full file paths.
+Every plan follows the same compact contract:
 
-### Scaffold-Fork-Converge
+1. **ANTI-PATTERNS** — explicit DO NOT rules first.
+2. **READ FIRST** — exact files and existing interfaces.
+3. **STEPS** — concrete bounded actions.
+4. **VERIFY** — exact commands and expected gates.
+5. **DONE CRITERIA** — observable completion conditions.
 
-The recursive execution pattern. Every TL at every level follows this protocol:
+The controller enforces the machine-checkable portions; the reviewer and
+human gate cover the remainder. See [the TL ADR](docs/decisions/tl-as-loop.md)
+for the boundary, borrowed patterns, and rejected alternatives.
 
-1. **Scaffold** — Before spawning children, commit the shared foundation:
-   - Types/interfaces that children implement against
-   - Test harness/fixtures children will use
-   - Stub files showing where children put their code
-   - CLAUDE.md additions scoping this TL's domain
-   - Commit and push. Children fork from this commit.
+### Event vocabulary
 
-2. **Fork** — Spawn wave N children. Zero deps between siblings in the same wave.
-   - Sub-TLs: `fork_wave` (Claude, Codex, or OpenCode — agent type from config or explicit `agent_type`). Claude agents inherit context via `--fork-session`; Codex and OpenCode require context injected in the task spec.
-   - Devs: `spawn_leaf` (worktree+PR, agent type from config) — they get CLAUDE.md from scaffolding
-   - Workers: `spawn_worker` (ephemeral pane) — research or non-conflicting edits
-
-3. **Converge** — Wait for child notifications. Merge their PRs. Write an integration commit:
-   - Wire children's outputs together
-   - Run integration tests, fix integration bugs
-
-4. **Next wave** — If wave N+1 exists, repeat from step 2. Wave N+1 depends on merged wave N.
-
-5. **PR to parent** — After all waves merged and integrated, file PR to parent's branch.
-
-This is recursive — sub-TLs follow the same pattern. A 4-level-deep tree means 4 levels of scaffold-fork-converge, each TL independently managing its subtree.
-
-### Parallelization
-
-Spawn multiple leaves when tasks are independent (no file conflicts, no ordering dependency). The TL spawns a wave, returns, and gets poked as each leaf completes. Examples:
-- Proto plumbing + nix shell wrapping — independent, parallel.
-- Haskell tool changes + Rust handler changes — often dependent (proto-gen first), sequential.
-
-### When the Controller Receives Events
-
-The controller remains live in the TL window and consumes the ledger queue; it
-does not rely on a harness inbox or an interactive prompt. It records:
-- **`[FIXES PUSHED]`** (event handler) — leaf addressed reviewer comments and pushed fixes. The controller merges if CI passes.
-- **`[PR READY]`** (event handler) — reviewer approved a leaf's PR. The controller merges and verifies the result builds cleanly. Multiple leaves landing in parallel may interact.
-- **`[REVIEW TIMEOUT]`** (event handler) — no reviewer response after timeout (configured in `.exo/review-policy.toml`). The controller merges if CI passes.
-- **`[STUCK: agent-id]`** — review did not converge within `reviewer_max_rounds`, or the reviewer still requests changes after the single allowed fix round. The run parks and the human gate is visible in the TL log.
-- **`[from: agent-id]`** (agent message) — informational update from a leaf. The controller does not auto-merge without the review gate.
-- **`[FAILED: agent-id]`** — leaf exhausted retries. The controller records the failure and stops the bounded run.
-- Worktree event watcher notifications (CI status, PR merge conflicts).
-
-The operator answers a named durable gate with `python3 -m tl_loop gate --run-id root
---name <gate> --approve|--reject`. The controller then resumes from the persisted
-state; it never asks a second interactive TL to make the decision.
+The controller consumes ledger projections for `[FIXES PUSHED]`, `[PR READY]`,
+`[REVIEW TIMEOUT]`, `[STUCK: agent-id]`, `[FAILED: agent-id]`, CI state, PR
+state, and merge conflicts. Informational worker messages remain messages;
+they cannot approve a merge. Every handled event advances the durable cursor
+or parks the run with an auditable cause.
 
 ---
 
@@ -806,12 +780,14 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 │   ├── exomonad-core/CLAUDE.md ← Unified library: framework, handlers, services, protocol, UI types
 │   └── exomonad-proto/     ← Proto-generated types (prost) for FFI + effects
 ├── tl_loop/CLAUDE.md          ← Programmatic TL controller (FSM + Rust UDS client boundary)
+├── .exo/roles/devswarm/context/tl.md ← Decompose-prompt reference (not the TL protocol)
 ├── tests/e2e/                 ← E2E tests (see § E2E Test Pattern)
 │   ├── messaging/             ← Teams inbox delivery test
 │   └── hook-rewrite/          ← PII rewriting hooks test
 ├── docs/architecture/         ← Cross-cutting architecture references
 │   └── agent-system.md        ← Role × tool matrix, hook deny rules, per-role state machines, PR review flow (+ .html view)
 └── docs/decisions/            ← Architecture decision records (living docs)
+    └── tl-as-loop.md          ← Programmatic TL boundary and borrowed patterns
 ```
 
 | I want to... | Read this |
@@ -825,6 +801,8 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 | Work with external service clients | `rust/exomonad-core/` (services/external/) |
 | Work on WASM guest (MCP tools) | `haskell/wasm-guest/CLAUDE.md` |
 | Work on the programmatic TL controller | `tl_loop/CLAUDE.md` |
+| Understand the TL architecture decision | `docs/decisions/tl-as-loop.md` |
+| Write or review a decompose prompt | `.exo/roles/devswarm/context/tl.md` |
 | Add or modify E2E tests | `CLAUDE.md` § E2E Test Pattern + `tests/e2e/messaging/` as reference |
 | Understand architectural decisions | `docs/decisions/` |
 | See role tool matrix, hook rules, state machines, PR review flow | `docs/architecture/agent-system.md` |
