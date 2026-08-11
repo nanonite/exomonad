@@ -270,6 +270,15 @@ CLI flag > local config > global config > medium default. Worker effort is inher
 by forked TLs, leaves, ephemeral workers, and companions. OpenCode receives the
 resolved level as its model `--variant`; Codex and Shoal log that effort is ignored.
 
+**TL-loop harness policy:** `.exo/harness_policy.toml` is the required human-authored
+allowlist and budget boundary for the programmatic controller. It must contain exactly
+`roles.tl`, `roles.worker`, and `roles.reviewer`. Each role declares `allow` (ordered
+`harness/model` entries), `cost_rank` (one positive rank for every allowed entry),
+`token_budget` (a positive role ceiling), `per_harness_budget` (optional positive
+ceilings whose keys must be allowed), and `escalate_after_attempts` (a positive
+NO-GO threshold). A missing or invalid file is a startup error; the selector never
+creates a permissive default or widens these boundaries.
+
 **Multiple git remotes:** By default, PR/CI operations (`file_pr`, `merge_pr`, the
 Forgejo watcher, and pushes) auto-detect the git remote to use, preferring one
 named `origin`. If a project has more than one remote — e.g. a GitHub `origin`
