@@ -1,5 +1,18 @@
 """Recursive-language-model integration boundary."""
 
+from .adjudicate import (
+    ADJUDICATE_PROMPT,
+    ADJUDICATION_SCHEMA,
+    DEFAULT_REVIEW_POLICY,
+    AdjudicationError,
+    AdjudicationInputError,
+    AdjudicationResult,
+    AdjudicationValidationError,
+    NitRecordingError,
+    ReviewedHeadMismatch,
+    ReviewPolicy,
+    adjudicate_review,
+)
 from .budget import (
     SECTION_PRIORITY_ORDER,
     ApproximateTokenCounter,
@@ -32,6 +45,7 @@ from .decompose import (
     decompose,
     validate_decomposition,
 )
+from .review_input import load_review_policy
 from .schema import OutputSchemaError, validate_output
 from .store import (
     BudgetExceeded,
@@ -44,10 +58,17 @@ from .store import (
 )
 
 __all__ = [
+    "ADJUDICATE_PROMPT",
+    "ADJUDICATION_SCHEMA",
     "DECOMPOSE_PROMPT",
+    "DEFAULT_REVIEW_POLICY",
     "MAX_ATTEMPTS",
     "SECTION_PRIORITY_ORDER",
     "SLICE_SPEC_SCHEMA",
+    "AdjudicationError",
+    "AdjudicationInputError",
+    "AdjudicationResult",
+    "AdjudicationValidationError",
     "ApproximateTokenCounter",
     "BudgetExceeded",
     "CompactionResult",
@@ -58,7 +79,10 @@ __all__ = [
     "DecompositionValidationError",
     "InputSection",
     "JudgmentFailed",
+    "NitRecordingError",
     "OutputSchemaError",
+    "ReviewPolicy",
+    "ReviewedHeadMismatch",
     "RlmBackend",
     "RlmCallError",
     "RlmCallStore",
@@ -69,11 +93,13 @@ __all__ = [
     "RlmResponse",
     "RlmRoleLedger",
     "SliceSpec",
+    "adjudicate_review",
     "compact_inputs",
     "compact_sections",
     "context_budget",
     "decompose",
     "judgment_hash",
+    "load_review_policy",
     "resolve_token_counter",
     "rlm",
     "sections_from_inputs",

@@ -53,6 +53,18 @@ does not suppress a fresh corrective attempt. Exhaustion raises
 DecompositionParked with ParkCause.RETRIES_EXHAUSTED; no malformed
 decomposition reaches run state.
 
+## RLM review adjudication boundary
+
+tl_loop.rlm.adjudicate.adjudicate_review receives the diff, comments,
+criteria, and exact reviewed head through an injected model choice. The diff
+and criteria remain required RLM sections, so ContextOverflow stops the call
+before a compacted-away diff can be judged. The model output is closed to GO,
+GO-WITH-NITS, and NO-GO with structured reasons and an echoed head. Python
+loads the canonical review policy and applies minimum-round, external-path,
+line-count, and complexity gates; a GO behind a gate is marked
+second_review_required and is not mergeable. GO-WITH-NITS remains mergeable
+only after every nit is written to the supplied Chainlink issue writer.
+
 ## Checkpoint and resume layout
 
 Each run is persisted at `.exo/tl-loop/<run_id>/run.json`; the shared writer
