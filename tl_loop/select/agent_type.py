@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from math import ceil
 from typing import cast
 
 from tl_loop.select.capability import CapabilityMap, load_capability
@@ -40,6 +41,14 @@ class HarnessChoice:
     matched_rule: str
     estimated_cost: int
     candidate_set: tuple[str, ...]
+    role: str = "worker"
+    role_budget: int | None = None
+    harness_budget: int | None = None
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Return the reservation amount under the selector's naming."""
+        return self.estimated_cost
 
 
 def select_agent_type(
@@ -68,6 +77,9 @@ def select_agent_type(
         matched_rule=classification.matched_rule_name,
         estimated_cost=estimated_cost,
         candidate_set=tuple(item[0] for item in candidates),
+        role=role,
+        role_budget=role_policy.token_budget,
+        harness_budget=role_policy.per_harness_budget.get(harness),
     )
 
 
@@ -88,14 +100,19 @@ def selection_failure(
     return SelectionFailure.OVER_BUDGET
 
 
-def estimate_cost(slice: SliceState, difficulty: Difficulty) -> int:
-    """Estimate tokens from difficulty, test steps, paths, and dependencies."""
+def estimate_cost(
+    slice: SliceState, difficulty: Difficulty, harness_rate: float = 1.0
+) -> int:
+    """Estimate tokens using the documented task shape and harness rate."""
+    if harness_rate <= 0:
+        raise ValueError("harness_rate must be positive")
     base = {
         Difficulty.TRIVIAL: 100,
         Difficulty.STANDARD: 500,
         Difficulty.HARD: 1000,
     }[difficulty]
-    return base + 50 * len(slice.test_plan) + 100 * len(slice.paths) + 50 * len(slice.depends_on)
+    unscaled = base + 50 * len(slice.test_plan) + 100 * len(slice.paths) + 50 * len(slice.depends_on)
+    return ceil(unscaled * harness_rate)
 
 
 def _role_policy(policy: HarnessPolicy, role: str) -> RolePolicy:
@@ -116,7 +133,9 @@ def _candidates(
     capable = _capable_harnesses(slice, role_policy, capabilities, classification)
     result: list[tuple[str, int]] = []
     for harness in capable:
-        cost = estimate_cost(slice, classification.difficulty)
+        cost = estimate_cost(
+            slice, classification.difficulty, role_policy.cost_rank[harness]
+        )
         if _within_budget(ledger, role, role_policy, harness, cost):
             result.append((harness, cost))
     return result
@@ -171,9 +190,25 @@ def _spent(ledger: object, kind: str, role: str, harness: str) -> int:
         if kind == "role":
             return ledger.role_spent.get(role, 0) + ledger.role_reserved.get(role, 0)
         return ledger.harness_spent.get(harness, 0) + ledger.harness_reserved.get(harness, 0)
-    if isinstance(ledger, BudgetLedger) and kind == "role":
-        return _non_negative(ledger.tokens, "ledger.tokens")
+    if isinstance(ledger, BudgetLedger):
+        if kind == "role":
+            if ledger.role_spent or ledger.role_reserved:
+                return (
+                    _non_negative(ledger.role_spent.get(role, 0), "ledger.role_spent")
+                    + _non_negative(ledger.role_reserved.get(role, 0), "ledger.role_reserved")
+                )
+            return _non_negative(ledger.tokens, "ledger.tokens")
+        return (
+            _non_negative(ledger.harness_spent.get(harness, 0), "ledger.harness_spent")
+            + _non_negative(ledger.harness_reserved.get(harness, 0), "ledger.harness_reserved")
+        )
     if isinstance(ledger, Mapping):
+        direct_spent = ledger.get(f"{kind}_spent")
+        direct_reserved = ledger.get(f"{kind}_reserved")
+        if direct_spent is not None or direct_reserved is not None:
+            return _counter_value(direct_spent, role, harness, kind, "spent") + _counter_value(
+                direct_reserved, role, harness, kind, "reserved"
+            )
         spent = _mapping_value(ledger, "spent", kind, role, harness)
         reserved = _mapping_value(ledger, "reserved", kind, role, harness)
         return spent + reserved
@@ -185,9 +220,23 @@ def _mapping_value(
 ) -> int:
     value = ledger.get(key, {})
     if isinstance(value, Mapping):
+        nested = value.get(kind)
+        if isinstance(nested, Mapping):
+            value = nested
         lookup = role if kind == "role" else harness
         return _non_negative(value.get(lookup, 0), f"ledger.{key}.{lookup}")
     return _non_negative(value, f"ledger.{key}") if kind == "role" else 0
+
+
+def _counter_value(
+    value: object, role: str, harness: str, kind: str, label: str
+) -> int:
+    if value is None:
+        return 0
+    if not isinstance(value, Mapping):
+        raise TypeError(f"ledger.{kind}_{label} must be an object")
+    lookup = role if kind == "role" else harness
+    return _non_negative(value.get(lookup, 0), f"ledger.{kind}_{label}.{lookup}")
 
 
 def _non_negative(value: object, path: str) -> int:

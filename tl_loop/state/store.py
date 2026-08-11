@@ -5,25 +5,28 @@ from __future__ import annotations
 import copy
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, TypeAlias, cast
+from typing import TypeAlias, cast
 
 from tl_loop.fsm.phase import (
     PhaseValue,
     TLAllMerged,
     TLDispatching,
+    TLDone,
     TLFailed,
+    TLMerging,
     TLPhase,
     TLPlanning,
     TLPRFiled,
-    TLDone,
-    TLMerging,
     TLWaiting,
 )
 
 from .schema import (
+    ActualTokens,
+    BudgetCharge,
     BudgetLedger,
     EventCursor,
     FSMState,
@@ -284,12 +287,28 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
 
 def _encode_budgets(budgets: BudgetInput) -> dict[str, object]:
     if isinstance(budgets, BudgetLedger):
-        return {"ledger": {"tokens": budgets.tokens, "wall_seconds": budgets.wall_seconds}}
+        ledger: dict[str, object] = {
+            "tokens": budgets.tokens,
+            "wall_seconds": budgets.wall_seconds,
+        }
+        for key, counter in (
+            ("role_spent", budgets.role_spent),
+            ("harness_spent", budgets.harness_spent),
+            ("role_reserved", budgets.role_reserved),
+            ("harness_reserved", budgets.harness_reserved),
+        ):
+            if counter:
+                ledger[key] = dict(counter)
+        if budgets.charges:
+            ledger["charges"] = [_encode_charge(charge) for charge in budgets.charges]
+        return {"ledger": ledger}
     if not isinstance(budgets, Mapping):
         raise TypeError("budgets must be a BudgetLedger or object")
-    value = dict(budgets)
+    value: dict[str, object] = {
+        key: item for key, item in cast(Mapping[str, object], budgets).items()
+    }
     if "ledger" in value:
-        return copy.deepcopy(value)
+        return copy.deepcopy(cast(dict[str, object], value))
     return {"ledger": copy.deepcopy(value)}
 
 
@@ -322,9 +341,51 @@ def _decode(document: dict[str, object]) -> RunState:
         budgets=BudgetLedger(
             tokens=cast(int, budgets["tokens"]),
             wall_seconds=cast(int, budgets["wall_seconds"]),
+            role_spent=_decode_counter_map(budgets.get("role_spent")),
+            harness_spent=_decode_counter_map(budgets.get("harness_spent")),
+            role_reserved=_decode_counter_map(budgets.get("role_reserved")),
+            harness_reserved=_decode_counter_map(budgets.get("harness_reserved")),
+            charges=tuple(
+                _decode_charge(cast(dict[str, object], charge))
+                for charge in cast(list[object], budgets.get("charges", []))
+            ),
         ),
         gates=tuple(_decode_gate(cast(dict[str, object], gate)) for gate in raw_gates),
         events=EventCursor(last_consumed_offset=cast(int, events["last_consumed_offset"])),
+    )
+
+
+def _decode_counter_map(value: object) -> Mapping[str, int]:
+    if not isinstance(value, dict):
+        return MappingProxyType({})
+    return MappingProxyType({key: cast(int, amount) for key, amount in value.items()})
+
+
+def _encode_charge(charge: BudgetCharge) -> dict[str, object]:
+    return {
+        "slice_id": charge.slice_id,
+        "attempt": charge.attempt,
+        "role": charge.role,
+        "harness": charge.harness,
+        "estimated_tokens": charge.estimated_tokens,
+        "actual": charge.actual,
+        "delta_tokens": charge.delta_tokens,
+        "warning": charge.warning,
+        "reconciled": charge.reconciled,
+    }
+
+
+def _decode_charge(value: dict[str, object]) -> BudgetCharge:
+    return BudgetCharge(
+        slice_id=cast(str, value["slice_id"]),
+        attempt=cast(int, value["attempt"]),
+        role=cast(str, value["role"]),
+        harness=cast(str, value["harness"]),
+        estimated_tokens=cast(int, value["estimated_tokens"]),
+        actual=cast(ActualTokens, value["actual"]),
+        delta_tokens=cast(int | None, value["delta_tokens"]),
+        warning=cast(bool, value["warning"]),
+        reconciled=cast(bool, value["reconciled"]),
     )
 
 
@@ -406,8 +467,8 @@ def _assert_fsm_slices_consistent(
 
 
 __all__ = [
-    "CorruptCheckpoint",
     "DEFAULT_ROOT",
+    "CorruptCheckpoint",
     "ResumeState",
     "RunStore",
     "checkpoint",

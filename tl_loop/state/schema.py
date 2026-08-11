@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Mapping, TypeAlias, cast
+from typing import Literal, TypeAlias, cast
 
 from tl_loop.fsm.phase import TLPhase
 
@@ -66,7 +67,30 @@ SLICE_KEYS = frozenset(
     }
 )
 BUDGET_KEYS = frozenset({"ledger"})
-LEDGER_KEYS = frozenset({"tokens", "wall_seconds"})
+LEDGER_KEYS = frozenset(
+    {
+        "tokens",
+        "wall_seconds",
+        "role_spent",
+        "harness_spent",
+        "role_reserved",
+        "harness_reserved",
+        "charges",
+    }
+)
+CHARGE_KEYS = frozenset(
+    {
+        "slice_id",
+        "attempt",
+        "role",
+        "harness",
+        "estimated_tokens",
+        "actual",
+        "delta_tokens",
+        "warning",
+        "reconciled",
+    }
+)
 GATE_KEYS = frozenset({"name", "status"})
 EVENT_KEYS = frozenset({"last_consumed_offset"})
 
@@ -99,12 +123,35 @@ class FSMState:
     waiting: tuple[str, ...]
 
 
+ActualTokens: TypeAlias = int | Literal["unknown"]
+
+
+@dataclass(frozen=True)
+class BudgetCharge:
+    """One immutable slice-attempt budget record and its reconciliation."""
+
+    slice_id: str
+    attempt: int
+    role: str
+    harness: str
+    estimated_tokens: int
+    actual: ActualTokens
+    delta_tokens: int | None
+    warning: bool
+    reconciled: bool
+
+
 @dataclass(frozen=True)
 class BudgetLedger:
     """Monotonic resource counters charged by the controller."""
 
     tokens: int
     wall_seconds: int
+    role_spent: Mapping[str, int] = field(default_factory=dict)
+    harness_spent: Mapping[str, int] = field(default_factory=dict)
+    role_reserved: Mapping[str, int] = field(default_factory=dict)
+    harness_reserved: Mapping[str, int] = field(default_factory=dict)
+    charges: tuple[BudgetCharge, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +282,68 @@ def _budgets(value: object, errors: list[tuple[str, str]]) -> None:
         return
     _non_negative_int(ledger, "tokens", "run.budgets.ledger", errors)
     _non_negative_int(ledger, "wall_seconds", "run.budgets.ledger", errors)
+    for key in ("role_spent", "harness_spent", "role_reserved", "harness_reserved"):
+        _counter_map(ledger, key, "run.budgets.ledger", errors)
+    _charges(ledger.get("charges"), "run.budgets.ledger", errors)
+
+
+def _counter_map(
+    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+) -> None:
+    if key not in holder:
+        return
+    value = holder[key]
+    if not isinstance(value, dict):
+        errors.append((f"{path}.{key}", "must be an object"))
+        return
+    for name, amount in value.items():
+        if not isinstance(name, str) or not name:
+            errors.append((f"{path}.{key}", "keys must be non-empty strings"))
+        if type(amount) is not int or amount < 0:
+            errors.append((f"{path}.{key}.{name}", "must be a non-negative integer"))
+
+
+def _charges(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    if not isinstance(value, list):
+        errors.append((f"{path}.charges", "must be an array"))
+        return
+    seen: set[tuple[str, int]] = set()
+    for index, raw_charge in enumerate(value):
+        charge_path = f"{path}.charges[{index}]"
+        charge = _object(raw_charge, charge_path, CHARGE_KEYS, errors)
+        if charge is None:
+            continue
+        _non_empty_string(charge, "slice_id", charge_path, errors)
+        _non_negative_int(charge, "attempt", charge_path, errors)
+        if type(charge.get("attempt")) is int and cast(int, charge["attempt"]) < 1:
+            errors.append((f"{charge_path}.attempt", "must be a positive integer"))
+        _non_empty_string(charge, "role", charge_path, errors)
+        _non_empty_string(charge, "harness", charge_path, errors)
+        _non_negative_int(charge, "estimated_tokens", charge_path, errors)
+        actual = charge.get("actual")
+        if actual != "unknown" and (type(actual) is not int or actual < 0):
+            errors.append((f"{charge_path}.actual", "must be a non-negative integer or 'unknown'"))
+        delta = charge.get("delta_tokens")
+        if delta is not None and type(delta) is not int:
+            errors.append((f"{charge_path}.delta_tokens", "must be null or an integer"))
+        _boolean(charge, "warning", charge_path, errors)
+        _boolean(charge, "reconciled", charge_path, errors)
+        slice_id = charge.get("slice_id")
+        attempt = charge.get("attempt")
+        if isinstance(slice_id, str) and type(attempt) is int:
+            identity = (slice_id, cast(int, attempt))
+            if identity in seen:
+                errors.append((f"{charge_path}", "duplicate slice_id and attempt"))
+            seen.add(identity)
+
+
+def _boolean(
+    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+) -> None:
+    if type(holder.get(key)) is not bool:
+        errors.append((f"{path}.{key}", "must be a boolean"))
 
 
 def _gates(value: object, errors: list[tuple[str, str]]) -> None:

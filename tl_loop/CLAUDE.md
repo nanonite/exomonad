@@ -41,6 +41,29 @@ Acknowledgement persists the global `run_seq` in the run-state cursor through
 the single state writer, so restart begins at `cursor + 1`. No queue or event
 log file is created.
 
+## Selector budget ledger
+
+The selector estimates a spawn before it is written to run state. The estimator
+inputs are the classified difficulty, test-step count, path count, and harness
+rate. The checked-in harness policy supplies the rate through cost_rank; a
+rank of 1 is the baseline. The formula is:
+
+    ceil((base(difficulty) + 50 * test_steps + 100 * paths + 50 * dependencies) * harness_rate)
+
+The difficulty bases are 100 tokens for trivial, 500 for standard, and 1,000
+for hard. Dependencies are included because they add context to a slice.
+HarnessChoice.estimated_cost is the reservation charged to both the selected
+role and harness. charge_spawn must run in the same atomic
+tl_loop.state.write.apply mutation that records the spawn, so concurrent
+selectors cannot consume the same remaining ceiling.
+
+A child completion reconciles the reservation with authoritative usage. The
+caller passes Chainlink usage first, or the harness-reported usage when
+Chainlink has none. If neither source reports tokens, the charge persists
+actual="unknown" and conservatively applies its estimate to spent counters; it
+never claims the estimate was actual usage. A measured estimate delta is
+flagged when its absolute value exceeds 20% of the estimate.
+
 ## FSM parity fixture
 
 `tl_loop/fsm/` is a pure port of `.exo/roles/devswarm/TLPhase.hs`. The golden
