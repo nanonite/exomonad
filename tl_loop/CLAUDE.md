@@ -145,11 +145,11 @@ just tl-loop-golden
 The Python test suite rejects a stale fixture, including when the Haskell source
 changes without regeneration.
 
-The phase-level predicates in `tl_loop/fsm/terminal.py` intentionally run in
-parallel with the WASM `TLStopCheck.hs` hook while M3 uses shadow mode. The
-Python loop does not copy the hook's nudge prose or its external checks for
-uncommitted work and missing PRs. Retire the parallel WASM implementation in
-M8.1 once the controller is authoritative.
+The phase-level predicates in `tl_loop/fsm/terminal.py` are the authoritative
+terminal mechanism for the programmatic TL. The WASM TL role no longer carries
+a coordination stop hook; its worker and reviewer lifecycle hooks remain
+independent. The Python loop owns terminal decisions without copying nudge prose
+or external checks for uncommitted work and missing PRs.
 
 ## RLM repair boundary
 

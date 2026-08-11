@@ -135,9 +135,13 @@ The TL/root deny carries this exact redispatch message so the agent retries thro
 |------|------|----|-----|----------|--------|
 | `SessionStart` | default (team register) | default | default | default | default |
 | `PostToolUse` | team registration | team registration | http rewriting | none | none |
-| `Stop` / `SubagentStop` | allow | `tlStopCheck` (blocks if children pending) | `DevPhase.canExit` | `reviewerStopCheck` (blocks if `ReviewerReviewing`) | `workerStopCheck` |
+| `Stop` / `SubagentStop` | allow | allow | `DevPhase.canExit` | `reviewerStopCheck` (blocks if `ReviewerReviewing`) | `workerStopCheck` |
 | `BeforeModel` / `AfterModel` | allow | allow | http rewriting | allow | allow |
 | Event handlers | `prReviewEventHandlers` | `prReviewEventHandlers` | `prReviewEventHandlers` | `reviewerEventHandlers` | default |
+
+The TL role has no coordination stop hook. The programmatic loop's terminal
+predicate is the sole TL completion mechanism; the worker and reviewer stop
+checks remain lifecycle-specific and unchanged.
 
 ```mermaid
 flowchart LR

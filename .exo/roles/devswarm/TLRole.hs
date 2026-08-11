@@ -4,7 +4,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 
--- | TL role config: spawn, PR, merge tools with state transitions and stop hook checks.
+-- | TL role config: spawn, PR, and merge tools with state transitions.
 module TLRole (config, Tools) where
 
 import Control.Monad (forM_, void, when)
@@ -13,9 +13,9 @@ import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import ExoMonad
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
-import ExoMonad.Guest.Effects.StopHook (checkUncommittedWork, getCurrentBranch)
+import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.ReviewHandoff (reviewHandoffInstructions)
-import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
+import ExoMonad.Guest.StateMachine (applyEvent)
 import ExoMonad.Guest.Tools.Agents (ListAgents (..))
 import ExoMonad.Guest.Tools.Chainlink
   ( ChainlinkBlock (..),
@@ -85,12 +85,11 @@ import ExoMonad.Guest.Tools.Spawn
 import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
 import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
 import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
-import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), StopDecision (..), StopHookOutput (..), allowResponse, allowStopResponse, blockStopResponse)
-import ExoMonad.Types (Effects, HookConfig (..), teamRegistrationPostToolUse, tlSessionStartHook)
+import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
+import ExoMonad.Types (HookConfig (..), teamRegistrationPostToolUse, tlSessionStartHook)
 import HookPolicy (preToolUseWithImplementationBlock)
 import PRReviewHandler (tlPRReviewEventHandlers)
 import TLPhase (ChildHandle (..), TLEvent (..), TLPhase (..))
-import TLStopCheck (tlStopCheck)
 
 tlRedispatchMessage :: Text -> Text
 tlRedispatchMessage toolName =
@@ -354,8 +353,8 @@ config =
         HookConfig
           { preToolUse = preToolUseWithImplementationBlock tlRedispatchMessage (\_ -> pure (allowResponse Nothing)),
             postToolUse = teamRegistrationPostToolUse,
-            onStop = \_ -> tlStopCheck,
-            onSubagentStop = \_ -> tlStopCheck,
+            onStop = \_ -> pure allowStopResponse,
+            onSubagentStop = \_ -> pure allowStopResponse,
             onSessionStart = tlSessionStartHook,
             beforeModel = \_ -> pure (BeforeModelAllow Nothing),
             afterModel = \_ -> pure (AfterModelAllow Nothing)

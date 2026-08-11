@@ -146,7 +146,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - M2.3 Checkpoint and resume API (#673)
 - M2.2 Atomic run-state write path with CAS and re-observation (#672)
 - M2.1 Closed-key run-state schema and validator (#671)
-- M1.6 Port TLStopCheck terminal conditions into loop predicates (#670)
+- M1.6 Port TL terminal conditions into loop predicates (#670)
 - M1.4 Port TLPhase and TLEvent to Python as a pure transition function (#668)
 - M1.3 Typed effect-client methods for the TL tool surface (#667)
 - M1.2 UDS transport client for the exomonad server socket (#666)
@@ -284,6 +284,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- M8.1 Remove TL stop-hook coordination from the WASM role (#704)
 - M5.6 Live single-wave run on a scratch repo (#694)
 - Watcher: skip legacy inbox/tmux delivery for ledger-owned (tl_loop) worktrees (#714)
 - M5.5 Replayable loop test over a recorded event stream (#693)

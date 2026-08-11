@@ -26,8 +26,6 @@ from tl_loop.fsm import (
     TLDispatching,
     TLMerging,
     TLWaiting,
-    is_terminal,
-    is_waiting,
     transition,
 )
 from tl_loop.client.transport import JsonObject, JsonValue
@@ -64,16 +62,13 @@ def test_python_fsm_matches_every_haskell_golden_row() -> None:
         phase_data = row.get("phase")
         event_data = row.get("event")
         expected = row.get("result")
-        stop = row.get("stop")
         assert isinstance(phase_data, dict)
         assert isinstance(event_data, dict)
         assert expected is not None
-        assert isinstance(stop, dict)
         phase = _parse_phase(cast(JsonObject, phase_data))
         event = _parse_event(cast(JsonObject, event_data))
         actual = _apply_transition(phase, event)
         assert actual == expected, f"{phase_data!r} + {event_data!r}"
-        assert _stop_json(phase) == stop, f"stop decision mismatch for {phase_data!r}"
 
 
 def _load_fixture() -> JsonObject:
@@ -181,15 +176,6 @@ def _apply_transition(phase: PhaseValue, event: TLEvent) -> JsonValue:
     except IllegalTransition:
         return "illegal"
     return _phase_json(result)
-
-
-def _stop_json(phase: PhaseValue) -> JsonObject:
-    return {
-        "decision": "allow" if not isinstance(phase, TLPRFiled) else "block",
-        "waiting": is_waiting(phase),
-        "terminal": is_terminal(phase),
-    }
-
 
 def _phase_json(phase: PhaseValue) -> JsonObject:
     if isinstance(phase, TLPlanning):
