@@ -83,6 +83,8 @@ class LedgerReader:
         run_dir: str | Path | None = None,
         run_id: str | None = None,
         state_root: str | Path = DEFAULT_ROOT,
+        scope_run_id: str | None = None,
+        scope_agent_id: str | None = None,
     ) -> None:
         if run_dir is not None and run_id is not None:
             raise ValueError("reader accepts either run_dir or run_id, not both")
@@ -94,6 +96,10 @@ class LedgerReader:
             self.run_dir = Path(state_root) / run_id
         else:
             self.run_dir = None
+        _optional_scope_text(scope_run_id, "scope_run_id")
+        _optional_scope_text(scope_agent_id, "scope_agent_id")
+        self.scope_run_id = scope_run_id
+        self.scope_agent_id = scope_agent_id
 
     def cursor(self) -> int:
         """Return the persisted global cursor, or zero for a new local reader."""
@@ -117,6 +123,8 @@ class LedgerReader:
             if event_type not in MAPPED_EVENT_TYPES:
                 continue
             envelope = _project_row(row)
+            if not self._in_scope(envelope):
+                continue
             if envelope.run_seq is None:
                 findings.append(
                     LedgerFinding(
@@ -135,6 +143,12 @@ class LedgerReader:
                 projected.append(envelope)
         projected.sort(key=lambda event: cast(int, event.run_seq))
         return ReadResult(tuple(projected), status, tuple(findings))
+
+    def _in_scope(self, event: EventEnvelope) -> bool:
+        """Keep one run and its directly owned child events in scope."""
+        if self.scope_run_id is not None and event.run_id != self.scope_run_id:
+            return False
+        return not (self.scope_agent_id is not None and event.agent_id not in {self.scope_agent_id} and event.parent_agent_id != self.scope_agent_id)
 
     def acknowledge(self, event_or_run_seq: EventEnvelope | int) -> int:
         """Persist a consumed global sequence through the M2.2 writer."""
@@ -251,6 +265,11 @@ def _resolve_superseded(rows: list[LedgerRow]) -> list[LedgerRow]:
 def _event_id(document: LedgerDocument) -> str | None:
     value = document.get("event_id")
     return value if isinstance(value, str) else None
+
+
+def _optional_scope_text(value: str | None, name: str) -> None:
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError(f"{name} must be null or a non-empty string")
 
 
 __all__ = [

@@ -139,6 +139,19 @@ def test_kill_and_restart_redelivers_only_unacknowledged_events(tmp_path: Path) 
     assert redelivered.run_seq == 102
 
 
+
+def test_reader_scope_excludes_grandchild_events_from_root(tmp_path: Path) -> None:
+    events = deepcopy(_fixture_events()[:3])
+    for sequence, (event, agent, parent) in enumerate(
+        zip(events, ("root", "child", "grandchild"), (None, "root", "child")), start=1
+    ):
+        event["run_id"] = "scope-run"
+        event["run_seq"] = sequence
+        event["agent_id"] = agent
+        event["parent_agent_id"] = parent
+    segments = tmp_path / "segments"
+    _write_segment(segments, 1, events)
+
 def _fixture_events() -> list[dict[str, object]]:
     return cast(list[dict[str, object]], json.loads(FIXTURE.read_text(encoding="utf-8")))
 

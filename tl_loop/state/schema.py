@@ -62,7 +62,22 @@ TERMINAL_SLICE_STATUSES = frozenset(
     }
 )
 RUN_KEYS = frozenset(
-    {"version", "revision", "run_id", "fsm", "slices", "budgets", "gates", "events"}
+    {
+        "version",
+        "revision",
+        "run_id",
+        "fsm",
+        "slices",
+        "budgets",
+        "gates",
+        "events",
+        "owner_branch",
+        "owner_worktree",
+        "parent_branch",
+        "parent_run_id",
+        "parent_agent_id",
+        "depth",
+    }
 )
 FSM_KEYS = frozenset({"phase", "waiting"})
 SLICE_KEYS = frozenset(
@@ -224,6 +239,12 @@ class RunState:
     budgets: BudgetLedger
     gates: tuple[GateState, ...]
     events: EventCursor
+    owner_branch: str | None = None
+    owner_worktree: str | None = None
+    parent_branch: str | None = None
+    parent_run_id: str | None = None
+    parent_agent_id: str | None = None
+    depth: int = 0
 
 
 class SchemaError(ValueError):
@@ -245,6 +266,16 @@ def validate(doc: object) -> None:
     _version(root, errors)
     _non_negative_int(root, "revision", "run", errors)
     _non_empty_string(root, "run_id", "run", errors)
+    for key in (
+        "owner_branch",
+        "owner_worktree",
+        "parent_branch",
+        "parent_run_id",
+        "parent_agent_id",
+    ):
+        _nullable_string(root, key, "run", errors)
+    if "depth" in root:
+        _non_negative_int(root, "depth", "run", errors)
 
     fsm = _object(root.get("fsm"), "run.fsm", FSM_KEYS, errors)
     if fsm is not None:

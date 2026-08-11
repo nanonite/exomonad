@@ -54,6 +54,10 @@ class CorruptCheckpoint(ValueError):
     """A persisted run state is valid JSON but cannot be resumed safely."""
 
 
+class WorktreeClaimError(RuntimeError):
+    """A live run already owns the requested worktree."""
+
+
 @dataclass(frozen=True)
 class ResumeState:
     """The local state required to resume a controller without network I/O."""
@@ -117,6 +121,7 @@ def create(run_id: str, root_spec: RootSpec, *, root_dir: str | Path = DEFAULT_R
     _validate_run_id(run_id)
     directory = Path(root_dir) / run_id
     initial = _initial_document(run_id, root_spec)
+    _assert_worktree_available(initial, directory, Path(root_dir))
     try:
         validate(initial)
         _assert_consistent(directory / "run.json", _decode(initial))
@@ -187,7 +192,19 @@ def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:
 
 
 def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
-    allowed = {"fsm", "slices", "budgets", "gates", "events"}
+    allowed = {
+        "fsm",
+        "slices",
+        "budgets",
+        "gates",
+        "events",
+        "owner_branch",
+        "owner_worktree",
+        "parent_branch",
+        "parent_run_id",
+        "parent_agent_id",
+        "depth",
+    }
     unknown = sorted(set(root_spec) - allowed)
     if unknown:
         raise ValueError(f"root_spec contains unknown sections: {', '.join(unknown)}")
@@ -204,6 +221,35 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
     for key, value in root_spec.items():
         document[key] = copy.deepcopy(value)
     return document
+
+
+def _assert_worktree_available(
+    initial: Mapping[str, object], target: Path, root_dir: Path
+) -> None:
+    owner = initial.get("owner_worktree")
+    if not isinstance(owner, str) or not owner:
+        return
+    normalized_owner = _normalize_worktree(owner)
+    search_root = root_dir.parent
+    if not search_root.exists():
+        return
+    for candidate in search_root.rglob("run.json"):
+        if candidate == target / "run.json":
+            continue
+        existing = _read_existing_state(candidate)
+        if existing is None:
+            continue
+        existing_owner = existing.get("owner_worktree")
+        raw_fsm = existing.get("fsm")
+        phase = raw_fsm.get("phase") if isinstance(raw_fsm, dict) else None
+        if (
+            isinstance(existing_owner, str)
+            and _normalize_worktree(existing_owner) == normalized_owner
+            and phase not in {TLPhase.TLDone.value, TLPhase.TLFailed.value}
+        ):
+            raise WorktreeClaimError(
+                f"worktree {owner!r} is already claimed by {candidate.parent}"
+            )
 
 
 def _resolve_run_directory(
@@ -364,6 +410,12 @@ def _decode(document: dict[str, object]) -> RunState:
         ),
         gates=tuple(_decode_gate(cast(dict[str, object], gate)) for gate in raw_gates),
         events=EventCursor(last_consumed_offset=cast(int, events["last_consumed_offset"])),
+        owner_branch=cast(str | None, document.get("owner_branch")),
+        owner_worktree=cast(str | None, document.get("owner_worktree")),
+        parent_branch=cast(str | None, document.get("parent_branch")),
+        parent_run_id=cast(str | None, document.get("parent_run_id")),
+        parent_agent_id=cast(str | None, document.get("parent_agent_id")),
+        depth=cast(int, document.get("depth", 0)),
     )
 
 
@@ -491,11 +543,24 @@ def _assert_fsm_slices_consistent(
         )
 
 
+def _read_existing_state(path: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(_read_bytes(path).decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return cast(dict[str, object], value) if isinstance(value, dict) else None
+
+
+def _normalize_worktree(value: str) -> str:
+    return str(Path(value).expanduser().resolve())
+
+
 __all__ = [
     "DEFAULT_ROOT",
     "CorruptCheckpoint",
     "ResumeState",
     "RunStore",
+    "WorktreeClaimError",
     "checkpoint",
     "create",
     "load",

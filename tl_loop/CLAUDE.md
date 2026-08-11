@@ -145,3 +145,22 @@ RepairHandoff sections. Python retries semantic path-boundary violations,
 dispatches only through resume_pr, and increments the owning slice's attempts
 once after a successful dispatch. No repair handoff creates a branch, leaf
 name, or agent type.
+
+## Recursive sub-TL ownership
+
+`WorkPlan.sub_tls` runs a child `tl_run` directly, without `fork_wave` or a
+Claude session. A child checkpoint lives at
+`.exo/tl-loop/<parent_run_id>/<sub_tl_id>/run.json`; a grandchild nests below
+that child directory. Parent state contains only its direct sub-TL slice and
+the child terminal result.
+
+Branches use the coordinate form `{parent}.{name}`. A child PR targets its
+parent branch, recorded as the child slice `base_ref`. Run state records the
+owner branch, owner worktree, parent lineage, and recursion depth. Creating a
+live run that claims an already-owned worktree fails closed. `max_depth` parks
+the attempted recursive slice with `schedule_deadlock` and raises
+`DepthLimitExceeded`.
+
+Ledger readers may set `scope_run_id` and `scope_agent_id`. An agent scope
+includes the agent's own events and its directly spawned children, so a root
+reader does not consume a grandchild review event.

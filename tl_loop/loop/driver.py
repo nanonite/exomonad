@@ -67,6 +67,10 @@ class LoopTimeout(TLLoopError):
     """The loop received no event for its configured idle window."""
 
 
+
+class DepthLimitExceeded(TLLoopError):
+    """A recursive child reached the configured depth ceiling."""
+
 class EffectFailed(TLLoopError):
     """An active effect returned an explicit failure."""
 
@@ -128,22 +132,48 @@ class WorkPlan:
 
     workers: tuple[WorkerTask, ...] = ()
     leaves: tuple[LeafTask, ...] = ()
+    sub_tls: tuple[SubTLTask, ...] = ()
 
     def __post_init__(self) -> None:
-        names = [task.name for task in self.workers] + [task.name for task in self.leaves]
+        names = [task.name for task in self.workers] + [task.name for task in self.leaves] + [task.name for task in self.sub_tls]
         if len(names) != len(set(names)):
             raise ValueError("worker and leaf names must be unique")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> WorkPlan:
         """Parse the small, closed plan shape used by the TL entry point."""
-        unknown = sorted(set(value) - {"workers", "leaves"})
+        unknown = sorted(set(value) - {"workers", "leaves", "sub_tls"})
         if unknown:
             raise ValueError(f"work plan contains unknown keys: {', '.join(unknown)}")
         return cls(
             workers=_workers(value.get("workers", ())),
             leaves=_leaves(value.get("leaves", ())),
+            sub_tls=_sub_tls(value.get("sub_tls", ())),
         )
+
+
+
+
+@dataclass(frozen=True)
+class SubTLTask:
+    """One recursive child TL executed with an isolated nested run-state."""
+
+    name: str
+    plan: WorkPlan | Mapping[str, object]
+    source: EventQueue | None = None
+    effects: EffectClient | ReadOnlyEffectClient | None = None
+    agent_type: str | None = None
+    worktree: str | Path | None = None
+    agent_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.name, "sub-TL name")
+        if not isinstance(self.plan, (WorkPlan, Mapping)):
+            raise TypeError("sub-TL plan must be a WorkPlan or object")
+        _optional_text(self.agent_type, "sub-TL agent_type")
+        _optional_text(self.agent_id, "sub-TL agent_id")
+        if self.worktree is not None:
+            _require_text(str(self.worktree), "sub-TL worktree")
 
 
 @dataclass(frozen=True)
@@ -171,6 +201,14 @@ class TLLoopConfig:
     requested_model: str | None = None
     role: str = "worker"
     review_policy_path: str | Path | None = None
+    branch: str = "main"
+    worktree: str | Path | None = None
+    agent_id: str | None = None
+    parent_branch: str | None = None
+    parent_run_id: str | None = None
+    parent_agent_id: str | None = None
+    depth: int = 0
+    max_depth: int = 3
 
     def __post_init__(self) -> None:
         for name in ("max_workers", "max_leaves", "max_events"):
@@ -193,6 +231,17 @@ class TLLoopConfig:
         _optional_text(self.working_dir, "working_dir")
         _require_text(self.run_id, "run_id")
         _require_text(self.role, "role")
+        for name in ("depth", "max_depth"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        _require_text(self.branch, "branch")
+        _optional_text(self.agent_id, "agent_id")
+        _optional_text(self.parent_branch, "parent_branch")
+        _optional_text(self.parent_run_id, "parent_run_id")
+        _optional_text(self.parent_agent_id, "parent_agent_id")
+        if self.worktree is not None:
+            _require_text(str(self.worktree), "worktree")
         _optional_text(self.requested_model, "requested_model")
 
 
@@ -249,7 +298,7 @@ def tl_run(
         config=selected,
         root_dir=selected.root_dir,
         budgets=budgets,
-        initial_slices=_initial_slices(plan),
+        initial_slices=_initial_slices(plan, selected),
     )
 
 
@@ -273,10 +322,20 @@ def run_tl_loop(
         raise LoopLimitExceeded("work plan exceeds max_workers")
     if len(work_plan.leaves) > selected.max_leaves:
         raise LoopLimitExceeded("work plan exceeds max_leaves")
+    initial_slices = initial_slices or _initial_slices(work_plan, selected, root_dir, run_id)
 
     store = RunStore(run_id, Path(root_dir))
     if not store.path.exists():
         root_state: dict[str, object] = {}
+        if work_plan.sub_tls or selected.parent_branch is not None or selected.worktree is not None or selected.depth > 0:
+            root_state = {
+                "owner_branch": selected.branch,
+                "owner_worktree": _effective_worktree(selected, Path(root_dir), run_id),
+                "parent_branch": selected.parent_branch,
+                "parent_run_id": selected.parent_run_id,
+                "parent_agent_id": selected.parent_agent_id,
+                "depth": selected.depth,
+            }
         if initial_slices is not None:
             root_state["slices"] = copy.deepcopy(dict(initial_slices))
         if budgets is not None:
@@ -285,6 +344,7 @@ def run_tl_loop(
     state = store.load()
     effects_log: list[EffectIntent] = []
     state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
+    state = _run_sub_tls(work_plan, state, selected, source, effects, store)
     return _run_loop(
         run_id,
         work_plan,
@@ -316,6 +376,10 @@ def _run_loop(
     merged: set[str] = set()
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
+    if not expected and not plan.sub_tls:
+        state = store.checkpoint(TLDone(), state.slices, state.budgets, state.events.last_consumed_offset)
+        return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
+
     deadline = time.monotonic() + config.idle_timeout
 
     while len(consumed) < config.max_events:
@@ -470,6 +534,68 @@ def _dispatch_children(
             effects_log,
         )
     return store.load() if config.policy is not None else state
+
+
+def _run_sub_tls(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    source: EventQueue,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+) -> RunState:
+    """Run direct recursive children and retain only terminal child state."""
+    for task in plan.sub_tls:
+        current = state.slices.get(task.name)
+        if current is None:
+            raise TLLoopError(f"recursive slice {task.name!r} is missing")
+        if current.status is not SliceStatus.PENDING:
+            continue
+        branch = derive_child_branch(config.branch, task.name)
+        worktree = str(task.worktree or derive_child_worktree(
+            _effective_worktree(config, store.root_dir, store.run_id), task.name
+        ))
+        if config.depth >= config.max_depth:
+            parked = replace(current, status=SliceStatus.PARKED, park_cause=ParkCause.SCHEDULE_DEADLOCK)
+            state = store.checkpoint(TLFailed(f"depth ceiling reached for {task.name}"), {**state.slices, task.name: parked}, state.budgets, state.events.last_consumed_offset)
+            raise DepthLimitExceeded(f"depth ceiling {config.max_depth} reached for {task.name!r}")
+        spawned = replace(current, status=SliceStatus.SPAWNED, base_ref=config.branch, branch=branch, worktree=worktree)
+        state = store.checkpoint(_phase_from_state(state), {**state.slices, task.name: spawned}, state.budgets, state.events.last_consumed_offset)
+        child_config = _child_config(config, task, source, effects, store, branch, worktree)
+        child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, state.budgets)
+        status = SliceStatus.MERGED if child_result.final_state.fsm.phase is TLPhase.TLDone else SliceStatus.FAILED
+        completed = replace(spawned, status=status)
+        state = store.checkpoint(_phase_from_state(state), {**state.slices, task.name: completed}, state.budgets, state.events.last_consumed_offset)
+        if status is SliceStatus.FAILED:
+            return store.checkpoint(TLFailed(f"recursive child {task.name} failed"), state.slices, state.budgets, state.events.last_consumed_offset)
+    if plan.sub_tls and not plan.workers and not plan.leaves:
+        state = store.checkpoint(TLDone(), state.slices, state.budgets, state.events.last_consumed_offset)
+    return state
+
+
+def _child_config(
+    config: TLLoopConfig,
+    task: SubTLTask,
+    source: EventQueue,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    branch: str,
+    worktree: str,
+) -> TLLoopConfig:
+    return replace(
+        config,
+        source=task.source or source,
+        effects=task.effects or effects,
+        root_dir=store.run_dir,
+        run_id=task.name,
+        branch=branch,
+        worktree=worktree,
+        parent_branch=config.branch,
+        parent_run_id=store.run_id,
+        parent_agent_id=config.agent_id or store.run_id,
+        agent_id=task.agent_id or task.name,
+        depth=config.depth + 1,
+    )
 
 
 def _park_schedule_deadlock(
@@ -824,8 +950,8 @@ def _root_inputs(
     elif isinstance(root_spec, Mapping):
         raw = root_spec
         plan_value = raw.get("plan")
-        if plan_value is None and ("workers" in raw or "leaves" in raw):
-            plan_value = {key: raw[key] for key in ("workers", "leaves") if key in raw}
+        if plan_value is None and any(key in raw for key in ("workers", "leaves", "sub_tls")):
+            plan_value = {key: raw[key] for key in ("workers", "leaves", "sub_tls") if key in raw}
         if isinstance(plan_value, WorkPlan):
             plan = plan_value
         elif isinstance(plan_value, Mapping):
@@ -846,35 +972,81 @@ def _root_inputs(
     return plan, run_id, cast(EventQueue, source), effects
 
 
-def _initial_slices(plan: WorkPlan) -> dict[str, dict[str, object]]:
+def derive_child_branch(parent_branch: str, name: str) -> str:
+    _require_text(parent_branch, "parent branch")
+    _require_text(name, "child name")
+    return f"{parent_branch}.{name}"
+
+
+def derive_child_worktree(parent_worktree: str | Path, name: str) -> Path:
+    _require_text(str(parent_worktree), "parent worktree")
+    _require_text(name, "child name")
+    return Path(parent_worktree) / name
+
+
+
+def _effective_worktree(config: TLLoopConfig, root_dir: Path, run_id: str) -> str:
+    value = config.worktree or (root_dir / run_id)
+    return str(Path(value).expanduser().resolve())
+
+def _initial_slices(
+    plan: WorkPlan,
+    config: TLLoopConfig | None = None,
+    root_dir: str | Path | None = None,
+    run_id: str | None = None,
+) -> dict[str, dict[str, object]]:
+    selected = config or TLLoopConfig()
+    state_root = Path(root_dir or selected.root_dir)
+    nested = selected.parent_branch is not None
+    current_run = run_id or selected.run_id
+    owner_worktree = _effective_worktree(selected, state_root, current_run)
     result: dict[str, dict[str, object]] = {}
     for worker in plan.workers:
         result[worker.name] = _initial_slice_record(
-            worker.name, (f"tl-loop/{worker.name}",), ("controller",), worker.agent_type
+            worker.name, (f"tl-loop/{worker.name}",), ("controller",), worker.agent_type,
+            derive_child_branch(selected.branch, worker.name) if nested else None,
+            str(derive_child_worktree(owner_worktree, worker.name)) if nested else None,
+            selected.parent_branch if nested else None,
         )
     for leaf in plan.leaves:
         paths = leaf.boundary or (f"tl-loop/{leaf.name}",)
         test_plan = leaf.verify or leaf.steps or ("controller",)
         result[leaf.name] = _initial_slice_record(
-            leaf.name, paths, test_plan, leaf.agent_type
+            leaf.name, paths, test_plan, leaf.agent_type,
+            derive_child_branch(selected.branch, leaf.name) if nested else None,
+            str(derive_child_worktree(owner_worktree, leaf.name)) if nested else None,
+            selected.parent_branch if nested else None,
+        )
+    for task in plan.sub_tls:
+        result[task.name] = _initial_slice_record(
+            task.name, (f"tl-loop/{task.name}",), ("controller",), task.agent_type,
+
+            derive_child_branch(selected.branch, task.name), str(task.worktree or derive_child_worktree(owner_worktree, task.name)), selected.branch,
         )
     return result
 
 
+
 def _initial_slice_record(
-    name: str, paths: Sequence[str], test_plan: Sequence[str], agent_type: str | None
+    name: str,
+    paths: Sequence[str],
+    test_plan: Sequence[str],
+    agent_type: str | None,
+    branch: str | None = None,
+    worktree: str | None = None,
+    base_ref: str | None = None,
 ) -> dict[str, object]:
     return {
         "id": name,
         "status": SliceStatus.PENDING.value,
         "paths": list(paths),
         "depends_on": [],
-        "base_ref": None,
+        "base_ref": base_ref,
         "test_plan": list(test_plan),
         "agent_type": agent_type,
         "model": None,
-        "branch": None,
-        "worktree": None,
+        "branch": branch,
+        "worktree": worktree,
         "pr_number": None,
         "reviewed_head": None,
         "attempts": 0,
@@ -926,6 +1098,51 @@ def _leaves(value: object) -> tuple[LeafTask, ...]:
     return tuple(_leaf(item) for item in value)
 
 
+
+def _sub_tls(value: object) -> tuple[SubTLTask, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError("work plan sub_tls must be an array")
+    return tuple(_sub_tl(item) for item in value)
+
+
+def _sub_tl(value: object) -> SubTLTask:
+    if isinstance(value, SubTLTask):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("sub-TL task must be an object")
+    allowed = {
+        "name",
+        "plan",
+        "workers",
+        "leaves",
+        "sub_tls",
+        "source",
+        "effects",
+        "agent_type",
+        "worktree",
+        "agent_id",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"sub-TL contains unknown keys: {', '.join(unknown)}")
+    plan_value = value.get("plan")
+    if plan_value is None:
+        plan_value = {
+            key: value[key]
+            for key in ("workers", "leaves", "sub_tls")
+            if key in value
+
+        }
+    plan = plan_value if isinstance(plan_value, WorkPlan) else WorkPlan.from_mapping(cast(Mapping[str, object], plan_value))
+    return SubTLTask(
+        _required_text(value, "name", "sub-TL"),
+        plan,
+        cast(EventQueue | None, value.get("source")),
+        cast(EffectClient | ReadOnlyEffectClient | None, value.get("effects")),
+        _optional_string(value, "agent_type", "sub-TL"),
+        cast(str | Path | None, value.get("worktree")),
+        _optional_string(value, "agent_id", "sub-TL"),
+    )
 def _worker(value: object) -> WorkerTask:
     if isinstance(value, WorkerTask):
         return value
@@ -999,17 +1216,21 @@ def _optional_argument(arguments: dict[str, object], key: str, value: object) ->
 
 
 __all__ = [
+    "DepthLimitExceeded",
     "EffectFailed",
     "EffectIntent",
     "EventQueue",
     "LeafTask",
     "LoopLimitExceeded",
     "LoopTimeout",
+    "SubTLTask",
     "TLLoopConfig",
     "TLLoopError",
     "TLRunResult",
     "WorkPlan",
     "WorkerTask",
+    "derive_child_branch",
+    "derive_child_worktree",
     "run_tl_loop",
     "tl_run",
 ]

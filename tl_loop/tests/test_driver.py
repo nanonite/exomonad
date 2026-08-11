@@ -15,6 +15,8 @@ from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.driver import (
+    DepthLimitExceeded,
+    SubTLTask,
     LoopLimitExceeded,
     TLLoopConfig,
     WorkerTask,
@@ -28,6 +30,7 @@ from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import BudgetLedger
 
+from tl_loop.state.store import load as load_state
 
 @dataclass
 class SyntheticQueue:
@@ -396,7 +399,64 @@ def _event(
     return project(cast(dict[str, object], raw))
 
 
+
+def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) -> None:
+    transport = RecordingTransport()
+    grand_source = SyntheticQueue([])
+    child_source = SyntheticQueue([])
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "child",
+                WorkPlan(
+                    sub_tls=(
+                        SubTLTask("grandchild", WorkPlan(), source=grand_source),
+                    )
+                ),
+                source=child_source,
+            ),
+        )
+    )
+
+    result = run_tl_loop(
+        "recursive-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=_config(),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    assert set(result.final_state.slices) == {"child"}
+    assert result.final_state.slices["child"].branch == "main.child"
+    assert result.final_state.slices["child"].base_ref == "main"
+    child = load_state(tmp_path / "recursive-run" / "child" / "run.json")
+    assert set(child.slices) == {"grandchild"}
+    assert child.owner_branch == "main.child"
+    assert child.parent_branch == "main"
+    assert child.slices["grandchild"].branch == "main.child.grandchild"
+    assert child.slices["grandchild"].base_ref == "main.child"
+    assert transport.calls == []
+
+
+
+def test_recursive_depth_ceiling_parks_schedule_deadlock(tmp_path: Path) -> None:
+    with pytest.raises(DepthLimitExceeded):
+        run_tl_loop(
+            "depth-run",
+            WorkPlan(sub_tls=(SubTLTask("child", WorkPlan(), source=SyntheticQueue([])),)),
+            SyntheticQueue([]),
+            EffectClient(RecordingTransport()),
+            config=TLLoopConfig(max_depth=0, poll_interval=0.001, idle_timeout=0.1),
+            root_dir=tmp_path,
+        )
+
+    state = load_state(tmp_path / "depth-run" / "run.json")
+    assert state.fsm.phase is TLPhase.TLFailed
+    assert state.slices["child"].status.value == "parked"
 __all__ = [
+
     "RecordingTransport",
     "SyntheticQueue",
     "test_active_loop_dispatches_direct_children_and_merges_leaf",

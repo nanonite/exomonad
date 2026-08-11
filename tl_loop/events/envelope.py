@@ -93,6 +93,7 @@ class EventEnvelope:
     review_state: str | None
     ci_status: str | None
     data: Mapping[str, object]
+    parent_agent_id: str | None = None
 
     @property
     def reviewed_head(self) -> str | None:
@@ -131,6 +132,8 @@ def project(event: LedgerEventInput) -> EventEnvelope:
         notification=_optional_string(data, "notification", event_type),
         review_state=_optional_string(data, "review_state", event_type),
         ci_status=_ci_status(data, event_type),
+        parent_agent_id=_optional_string(event, "parent_agent_id", event_type)
+        or _optional_string(data, "parent_agent_id", event_type),
         data=MappingProxyType(cast(dict[str, object], copy.deepcopy(dict(data)))),
     )
 
