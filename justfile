@@ -336,6 +336,14 @@ test-mcp *args:
 e2e-messaging:
     ./tests/e2e/messaging/run.sh
 
+# Capture a live multi-slice TL trajectory beside the read-only shadow loop.
+e2e-tl-loop-shadow:
+    ./tests/e2e/tl-loop-shadow/run.sh
+
+check-e2e-tl-loop-shadow:
+    bash -n tests/e2e/tl-loop-shadow/run.sh
+    python3 -m py_compile tests/e2e/tl-loop-shadow/shadow_companion.py
+
 # Run bounded Claude-only smoke test (root SessionStart + TeamCreate, no children)
 e2e-claude-only:
     ./tests/e2e/claude-only/run.sh

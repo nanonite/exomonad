@@ -38,6 +38,7 @@ class EventKind(str, Enum):
     PR_REVIEW = "pr.review"
     COPILOT_REVIEW = "copilot.review"
     CI_STATUS_CHANGED = "ci.status_changed"
+    AGENT_SPAWNED = "agent.spawned"
     AGENT_COMPLETED = "agent.completed"
     AGENT_STUCK = "agent.stuck"
     AGENT_NOTIFY_PARENT = "agent.notify_parent"

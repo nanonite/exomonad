@@ -582,6 +582,7 @@ cabal test all             # Haskell tests
 # E2E tests (interactive — launches tmux session, you observe)
 just e2e-messaging         # Teams inbox delivery pipeline
 just e2e-oc-rewrite        # BeforeModel/AfterModel PII rewriting
+just e2e-tl-loop-shadow    # Live TL trajectory beside the read-only shadow loop
 ```
 
 `just rust-test` is the fast library-only Rust loop. `just test` runs the full

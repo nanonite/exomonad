@@ -9,7 +9,8 @@ The interactive TL can receive a direct message, a WASM `handle_event` input,
 an inbox message, or a parent notification. This audit calls a wakeup
 “covered” only when the same condition has a durable L1 ledger row whose event
 type is projected by M2.6. The bridge’s closed event set is
-`tl_loop/events/envelope.py:30-67`; transient `pr_review`, `ci_status`,
+`tl_loop/events/envelope.py:30-68`; the lifecycle `agent.spawned` row is
+projected so shadow mode can observe real fan-out; transient `pr_review`, `ci_status`,
 `sibling_merged`, and `issue_closed` inputs are covered only when their
 canonical ledger rows are present. Generic `event.dispatched` rows do not
 count by themselves.
@@ -101,6 +102,7 @@ is still part of the supported wakeup contract and is audited here.
 
 | wakeup | source | bridged kind | status (covered / gap) | notes |
 |---|---|---|---|---|
+| child fan-out | `rust/exomonad-core/src/handlers/agent.rs:936-955,1112-1131,1744-1758`; `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Spawn.hs:616-630` | `agent.spawned` | covered for shadow mode | The projection preserves the child identity, branch, and agent type needed to start a real shadow trajectory; duplicate Rust/guest rows remain observable. |
 | PR filed or updated | `rust/exomonad-core/src/handlers/file_pr.rs:149-179,206-215` | `pr.filed` / `pr.updated` | covered | The row includes PR metadata and `head_sha`. |
 | verified PR published | `rust/exomonad-core/src/handlers/file_pr.rs:149-164` | `pr.published` | covered | Publication is durable and includes `head_sha`. |
 | PR merged | `rust/exomonad-core/src/handlers/merge_pr.rs:104-129`; `rust/exomonad-core/src/services/merge_pr.rs:44-49`; `haskell/wasm-guest/src/ExoMonad/Guest/Tools/MergePR.hs:443-470` | `pr.merged` | covered | Rust and the Haskell tool receive the same verified Forgejo head SHA through the merge effect response; a missing source is explicitly annotated. |

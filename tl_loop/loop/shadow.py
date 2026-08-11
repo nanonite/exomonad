@@ -135,6 +135,8 @@ class TLEventDecoder:
             return self._decode_explicit(explicit)
         if event.kind is EventKind.AGENT_NOTIFY_PARENT:
             return self._decode_parent_notification(event)
+        if event.kind is EventKind.AGENT_SPAWNED:
+            return self._decode_spawn(event)
         if event.kind is EventKind.AGENT_COMPLETED:
             return self._decode_completion(event)
         if event.kind is EventKind.AGENT_STUCK:
@@ -188,6 +190,13 @@ class TLEventDecoder:
         if status in {"success", "completed"}:
             return ChildCompleted(_agent(event))
         return ChildFailed(_agent(event), _string(event.data, "message", event.event_type))
+
+    def _decode_spawn(self, event: EventEnvelope) -> TLEvent:
+        """Decode the two canonical spawn payload shapes without synthesis."""
+        slug = _string_from_keys(event.data, ("slug", "child_agent"), event.event_type)
+        branch = _string(event.data, "branch", event.event_type)
+        agent_type = _string(event.data, "agent_type", event.event_type)
+        return ChildSpawned(ChildHandle(slug, branch, agent_type))
 
     def _decode_completion(self, event: EventEnvelope) -> TLEvent:
         status = _string(event.data, "status", event.event_type)
@@ -313,7 +322,7 @@ def _update_slices(slices: Mapping[str, SliceState], event: TLEvent) -> dict[str
             updated[handle.slug] = SliceState(
                 id=handle.slug,
                 status=SliceStatus.SPAWNED,
-                paths=("unknown",),
+                paths=_shadow_slice_paths(handle.slug),
                 depends_on=(),
                 base_ref=None,
                 test_plan=(),
@@ -342,6 +351,11 @@ def _update_slices(slices: Mapping[str, SliceState], event: TLEvent) -> dict[str
         if current is not None:
             updated[event.slug] = replace(current, status=SliceStatus.FAILED)
     return updated
+
+
+def _shadow_slice_paths(slug: str) -> tuple[str, ...]:
+    """Give synthetic shadow slices distinct ownership tokens."""
+    return (f"shadow:{slug}",)
 
 
 def _phase_from_state(state: RunState) -> PhaseValue:
@@ -420,6 +434,17 @@ def _string(value: Mapping[str, object], key: str, event_type: str) -> str:
     if not isinstance(candidate, str) or not candidate:
         raise ShadowLoopError(f"{event_type!r}: {key} must be a non-empty string")
     return candidate
+
+
+def _string_from_keys(
+    value: Mapping[str, object], keys: tuple[str, ...], event_type: str
+) -> str:
+    for key in keys:
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    joined = " or ".join(keys)
+    raise ShadowLoopError(f"{event_type!r}: requires {joined}")
 
 
 def _positive_int(value: Mapping[str, object], key: str, event_type: str) -> int:

@@ -313,5 +313,26 @@
     "source": "rust",
     "lifecycle_state": "delivered",
     "data": {"recipient": "task-a", "unread_count": 2, "newest_message_id": 17, "message": "You have 2 unread message(s). Call check_inbox.", "outcome": "tmux", "delivered": true, "transport": "tmux", "source": "worktree_event_watcher"}
+  },
+  {
+    "schema_version": 1,
+    "event_id": "00000000-0000-4000-8000-000000000016",
+    "id": "00000000-0000-4000-8000-000000000016",
+    "event_time": "2026-08-10T04:48:02.263Z",
+    "observed_at": "2026-08-10T04:48:02.263Z",
+    "run_seq": 116,
+    "type": "agent.spawned",
+    "agent_id": "root",
+    "run_id": "run-1",
+    "session_id": "session-1",
+    "invocation_id": "invocation-5",
+    "generation": 2,
+    "provider": "openai",
+    "runtime": "codex",
+    "harness": "codex",
+    "role": "tl",
+    "source": "rust",
+    "lifecycle_state": "emitted",
+    "data": {"child_agent": "task-b", "agent_type": "codex", "spawn_type": "leaf", "branch": "task-b"}
   }
 ]

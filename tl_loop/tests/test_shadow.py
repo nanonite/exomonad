@@ -12,7 +12,9 @@ from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
-from tl_loop.loop.shadow import ShadowLoop
+from tl_loop.fsm.event import ChildSpawned
+from tl_loop.fsm.phase import ChildHandle
+from tl_loop.loop.shadow import ShadowLoop, TLEventDecoder
 from tl_loop.state.store import create
 
 
@@ -31,6 +33,31 @@ class SyntheticQueue:
         assert event.run_seq is not None
         self.acknowledged.append(event.run_seq)
         return event.run_seq
+
+
+def test_shadow_decoder_accepts_canonical_spawn_payload() -> None:
+    raw = {
+        "schema_version": 1,
+        "event_id": "spawn-event",
+        "id": "spawn-event",
+        "event_time": "2026-08-11T00:00:00Z",
+        "observed_at": "2026-08-11T00:00:00Z",
+        "run_seq": 1,
+        "type": "agent.spawned",
+        "agent_id": "root",
+        "run_id": "run-1",
+        "session_id": "session-1",
+        "lifecycle_state": "emitted",
+        "data": {
+            "child_agent": "child-a",
+            "agent_type": "codex",
+            "branch": "main.child-a",
+        },
+    }
+
+    decoded = TLEventDecoder().decode(project(raw))
+
+    assert decoded == ChildSpawned(ChildHandle("child-a", "main.child-a", "codex"))
 
 
 def test_shadow_loop_reaches_terminal_phase_and_records_intended_sequence(tmp_path: Path) -> None:
@@ -90,6 +117,26 @@ def test_shadow_loop_reaches_terminal_phase_and_records_intended_sequence(tmp_pa
     assert checkpoint["events"]["last_consumed_offset"] == 3
 
 
+def test_shadow_loop_accepts_two_distinct_live_spawns(tmp_path: Path) -> None:
+    create("two-spawns", {}, root_dir=tmp_path / "shadow")
+    source = SyntheticQueue(
+        [
+            _event(1, "child_spawned", "child-a"),
+            _event(2, "child_spawned", "child-b"),
+        ]
+    )
+
+    result = ShadowLoop.for_run(
+        source,
+        "two-spawns",
+        readonly_client=ReadOnlyEffectClient(EffectClient(_RecordingTransport())),
+        root_dir=tmp_path / "shadow",
+    ).run()
+
+    assert result.final_state.slices["child-a"].paths == ("shadow:child-a",)
+    assert result.final_state.slices["child-b"].paths == ("shadow:child-b",)
+
+
 @dataclass
 class _RecordingTransport:
     def call_tool(
@@ -103,7 +150,7 @@ class _RecordingTransport:
         return {"success": True, "result": None}
 
 
-def _event(run_seq: int, shadow_kind: str) -> EventEnvelope:
+def _event(run_seq: int, shadow_kind: str, slug: str = "child-a") -> EventEnvelope:
     raw = {
         "schema_version": 1,
         "event_id": f"event-{run_seq}",
@@ -126,7 +173,7 @@ def _event(run_seq: int, shadow_kind: str) -> EventEnvelope:
         "data": {
             "shadow_event": {
                 "kind": shadow_kind,
-                "slug": "child-a",
+                "slug": slug,
                 "branch": "main.child-a",
                 "agent_type": "codex",
                 "reason": "synthetic reason",
