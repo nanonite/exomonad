@@ -409,7 +409,8 @@ The importer should recognize these formats independently:
    low-confidence source type;
 5. `.exo/memory.db` session-memory rows;
 6. `.exo/inbox.db` durable inbox rows;
-7. custom `issue_closed.jsonl` rows.
+7. canonical `issue.closed`, `inbox.message`, and `inbox.poke` ledger rows;
+8. historical `issue_closed.jsonl` sidecars, if present, as legacy evidence only.
 
 Do not pretend that `sidecar.log` is a stable machine schema. It can be imported as a
 diagnostic source with parser version and confidence, but structured EventLog records

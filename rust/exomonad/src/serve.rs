@@ -1570,6 +1570,7 @@ Run `exomonad recompile` first to build it.",
     let orphan_project_dir = Arc::new(project_dir.clone());
     let orphan_git_wt = services.git_worktree_service().clone();
     let orphan_tmux_session = Some(config.tmux_session.clone());
+    let orphan_event_log = event_log.clone();
     tokio::spawn(async move {
         exomonad_core::services::orphan_reconciler::run_orphan_reconciler(
             orphan_project_dir,
@@ -1578,6 +1579,7 @@ Run `exomonad recompile` first to build it.",
             orphan_max_leaf,
             orphan_max_reviewer,
             orphan_tmux_session,
+            orphan_event_log,
         )
         .await;
     });

@@ -9,13 +9,15 @@ The interactive TL can receive a direct message, a WASM `handle_event` input,
 an inbox message, or a parent notification. This audit calls a wakeup
 “covered” only when the same condition has a durable L1 ledger row whose event
 type is projected by M2.6. The bridge’s closed event set is
-`tl_loop/events/envelope.py:30-64`; transient `pr_review`, `ci_status`,
-`sibling_merged`, and `issue_closed` inputs, generic `event.dispatched` rows,
-and direct inbox/tmux delivery do not count by themselves.
+`tl_loop/events/envelope.py:30-67`; transient `pr_review`, `ci_status`,
+`sibling_merged`, and `issue_closed` inputs are covered only when their
+canonical ledger rows are present. Generic `event.dispatched` rows do not
+count by themselves.
 
-Every remaining gap below has a filed Chainlink issue and blocks the next
-loop-driver task, #678. The audit identified the original gaps; #709 now
-records the transient review wakeups in the canonical ledger.
+The audit identified the original gaps; #709 records transient review
+wakeups, #710 preserves terminal head SHAs, #711 preserves sibling recipient
+context, and #712 routes issue-close and inbox wakeups through the canonical
+ledger.
 
 ## Notification vocabulary and direct wakeups
 
@@ -41,9 +43,9 @@ records the transient review wakeups in the canonical ledger.
 | `[STUCK: agent]` | `rust/exomonad-core/src/services/delivery.rs:182-205,215-235,744-805` | `agent.notify_parent` | covered | Rust accepts `stuck` as a parent-notification status and logs it. |
 | `[Sibling Merged]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:599-603,2419-2495` | `agent.sibling_merged` | covered | One canonical row is recorded per recipient with the recipient branch/PR and the complete dispatched payload. |
 | `[Sibling Merged]` from dormant poller | `rust/exomonad-core/src/services/github_poller.rs:643-705` | `agent.sibling_merged` | covered | The dormant path records the same per-recipient payload and verified merged head before dispatch. |
-| `[ISSUE CLOSED: #id ...]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:662-667`; `rust/exomonad-core/src/services/orphan_reconciler.rs:199-223` | none | gap — #712 | The source is legacy `.exo/events/issue_closed.jsonl`, outside the M2.6 ledger segments. |
-| unread-inbox poke | `rust/exomonad-core/src/services/worktree_event_watcher.rs:1444-1484` | none | gap — #712 | The watcher directly routes a tmux notification; it does not append a canonical event. |
-| raw inbox message | `rust/exomonad-core/src/services/inbox_watcher.rs:44-138` | none | gap — #712 | New `TeamsMessage` entries are directly injected into tmux. |
+| `[ISSUE CLOSED: #id ...]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:662-667`; `rust/exomonad-core/src/services/orphan_reconciler.rs:15-246` | `issue.closed` | covered | The reconciler appends the immutable ledger row before disposing the worktree; the old sidecar writer is gone. |
+| unread-inbox poke | `rust/exomonad-core/src/services/worktree_event_watcher.rs:1547-1610` | `inbox.poke` | covered | The watcher records recipient, unread count, newest message, exact notification, transport, and delivery outcome before inbox bookkeeping. |
+| raw inbox message | `rust/exomonad-core/src/services/inbox_watcher.rs:44-164` | `inbox.message` | covered | Each TeamsMessage is copied into the canonical ledger before exact tmux injection; the bridge tails only ledger segments. |
 
 ## `PRReviewEvent` variants
 
@@ -108,13 +110,12 @@ is still part of the supported wakeup contract and is audited here.
 | guest completion | `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs:130-153` | `agent.completed` | explicit finding | This generic tool event has no verified PR context; it records `head_sha: null` and `head_sha_finding` for interpretation. |
 | harness-switch/no-op stuck | `rust/exomonad-core/src/handlers/events.rs:139-159,281-294` | `agent.stuck` | explicit finding | These policy events have no verified PR context; they record the null SHA and finding. |
 | parent notification | `rust/exomonad-core/src/services/delivery.rs:772-799` | `agent.notify_parent` | explicit finding | Generic notifications retain a null SHA and finding unless a verified watcher handoff supplies one. |
-| sibling merge observation | `rust/exomonad-core/src/services/event_log.rs:42-72`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2419-2495` | `agent.sibling_merged` | covered | The row carries the removed sibling’s verified head, recipient branch/PR, and full wakeup payload; #712 remains the only M2.7 blocker. |
+| sibling merge observation | `rust/exomonad-core/src/services/event_log.rs:42-72`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2419-2495` | `agent.sibling_merged` | covered | The row carries the removed sibling’s verified head, recipient branch/PR, and full wakeup payload. |
 
 ## Mode decision
 
-Coverage is not sufficient for M3 shadow mode (#678): #712 remains an explicit
-blocker for direct inbox/issue-close wakeups.
+Coverage is sufficient for M3 shadow mode (#678): all direct inbox and
+issue-close wakeups in this audit now have projected canonical ledger rows.
 
-Coverage is also not sufficient for M5 active mode. Active mode additionally
-requires a canonical representation for issue-close and inbox-triggered
-wakeups. Resolve the filed blocker before enabling either mode.
+Coverage is not sufficient for M5 active mode. Active mode still requires the
+separate policy and control-plane gates defined by the milestone.

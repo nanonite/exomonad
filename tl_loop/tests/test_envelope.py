@@ -68,6 +68,10 @@ def test_review_and_ci_fields_are_projected_from_data_without_synthesis() -> Non
         "parent_branch": "root",
         "sibling_pr_number": 102,
     }
+    assert projected["issue.closed"].data["issue_id"] == 313
+    assert projected["issue.closed"].data["closed_by"] == "orphan_reconciler"
+    assert projected["inbox.message"].data["text"] == "Continue the assigned task."
+    assert projected["inbox.poke"].data["unread_count"] == 2
     assert all(projected[event_type].head_sha is None for event_type in SERVER_EMIT_HEAD_SHA_GAPS)
     assert all(
         projected[event_type].data["head_sha_finding"]

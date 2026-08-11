@@ -293,6 +293,9 @@ observed high-value fields, not a guaranteed schema contract.
 | `agent.stuck` | A disallowed harness switch or silent no-op handoff requires guidance | operation/kind, configured/requested harness, parent, status, reason, guidance requirement, retry policy, model/effort/policy |
 | `agent.notify_parent` | A child sends completion/status to its parent | parent, status, message, source |
 | `agent.sibling_merged` | A sibling merge is observed/notified | sibling/PR context, status, and related message fields |
+| `issue.closed` | The orphan reconciler observes a closed issue before worktree disposal | issue ID, worktree slug, closer, source |
+| `inbox.message` | A new Teams inbox message is observed before tmux injection | team, sender, recipient, exact text, summary, timestamp, read state, transport |
+| `inbox.poke` | The watcher attempts an unread-inbox wakeup | recipient, unread count, newest message ID, exact notification, outcome, transport |
 | `agent.completed` | Guest event before parent notification | status, message, PR number, tasks completed |
 | `agent.stop_check` | Guest stop-check decision is recorded | branch and result |
 | `custom` | Guest runtime emits an arbitrary custom event | arbitrary JSON payload |
@@ -322,9 +325,9 @@ The watcher maps changed-review status to `copilot.review`. CI states `pending`,
 preserved as their raw status values. A legacy GitHub poller contains similar logic,
 but the active server uses `WorktreeEventWatcher`.
 
-An orphan reconciler also writes a custom, non-EventLog file
-`.exo/events/issue_closed.jsonl` with `{event_type, payload: {issue_id, slug, closed_by}}`.
-It is used for idempotent cleanup and has a different schema.
+The orphan reconciler records `issue.closed` in the canonical immutable ledger
+before idempotent cleanup. The former `.exo/events/issue_closed.jsonl` sidecar is
+not a live source; historical sidecar files remain untouched for interpretation.
 
 ### Hook events
 
@@ -388,6 +391,9 @@ The following names were found in `otel.name` fields or instrumentation spans:
 | `agent_inbox.duplicates_dropped` | Event/log | Deduplication |
 | `agent_inbox.messages_abandoned` | Event/log | Retry exhaustion |
 | `agent.sibling_merged` | Event/log | Sibling merge notification |
+| `issue.closed` | Event/log | Closed issue observed before worktree disposal |
+| `inbox.message` | Event/log | Teams inbox message observed before tmux injection |
+| `inbox.poke` | Event/log | Unread inbox wakeup attempt and delivery outcome |
 | `event.dispatched`, `event.dispatch_failed` | Event/log | Role routing |
 | `agent.guidance.delivery` | Event/log | Lifecycle and OTel |
 | `copilot.review` | Event/log | Dynamic watcher mapping |
@@ -475,7 +481,7 @@ For the current files, a first-pass extractor should ingest:
 3. OTel export data;
 4. `.exo/logs/init.jsonl` and `watcher.log` as diagnostic sources;
 5. `.exo/memory.db` and `.exo/inbox.db` as state snapshots or related tables;
-6. the custom `issue_closed.jsonl` schema separately.
+6. historical sidecar files, if present, as immutable legacy evidence rather than a live event source.
 
 Raw files should be retained alongside parsed rows so detector changes can be replayed.
 Do not interpret absent rows as negative evidence without recording whether the relevant
@@ -486,7 +492,8 @@ sink was enabled, whether an EventLog write failed, and whether the process was 
 1. **Identity is incomplete in standard JSONL.** Rows lack a consistent `run_id`, role,
    provider/runtime, harness, birth branch, invocation ID, and trace/span IDs.
 2. **There are multiple sinks and schemas.** `.exo/logs`, `.exo/events`, watcher text,
-   init JSONL, SQLite, OTel, and `issue_closed.jsonl` need an explicit ingestion map.
+   init JSONL, SQLite, and OTel need an explicit ingestion map; the canonical ledger is
+   the source for issue-close and inbox wakeups.
 3. **Semantic duplicates are not normalized.** Haskell and Rust can both emit
    `agent.spawned` and `pr.merged` with different payloads.
 4. **Important delivery signals are OTel-only.** Message sends, delivery attempts,

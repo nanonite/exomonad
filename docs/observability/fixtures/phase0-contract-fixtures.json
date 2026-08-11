@@ -19,7 +19,7 @@
       "scenario_id": "review_and_merge_loop",
       "session_id": "fixture-session-003",
       "harnesses": ["codex", "custom"],
-      "events": ["pr.published", "watcher.pr_observation", "pr.review", "copilot.review", "ci.status_changed", "pr.merge_requested", "pr.merged"]
+      "events": ["pr.published", "watcher.pr_observation", "pr.review", "copilot.review", "ci.status_changed", "pr.merge_requested", "pr.merged", "issue.closed", "inbox.message", "inbox.poke"]
     },
     {
       "scenario_id": "partial_sink_and_gap",

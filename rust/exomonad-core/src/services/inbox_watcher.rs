@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::tmux_events::inject_input;
+use super::EventLog;
 use claude_teams_bridge::{inbox_path, TeamsMessage};
 
 /// Per-member watch state.
@@ -26,6 +27,7 @@ struct WatchState {
 /// Watches synthetic member inbox files and routes messages to tmux panes.
 pub struct InboxWatcher {
     watches: Arc<Mutex<HashMap<String, WatchState>>>,
+    event_log: Option<Arc<EventLog>>,
 }
 
 impl Default for InboxWatcher {
@@ -38,7 +40,14 @@ impl InboxWatcher {
     pub fn new() -> Self {
         Self {
             watches: Arc::new(Mutex::new(HashMap::new())),
+            event_log: None,
         }
+    }
+
+    /// Attach the process-wide canonical ledger before starting inbox watches.
+    pub fn with_event_log(mut self, event_log: Arc<EventLog>) -> Self {
+        self.event_log = Some(event_log);
+        self
     }
 
     /// Start watching a member's inbox. Spawns a tokio task polling every 500ms.
@@ -77,6 +86,7 @@ impl InboxWatcher {
         let watches_ref = self.watches.clone();
         let member = member_name.clone();
         let team = team_name.clone();
+        let event_log = self.event_log.clone();
 
         tokio::spawn(async move {
             info!(
@@ -120,6 +130,26 @@ impl InboxWatcher {
                         let new_count = msgs.len() - state.last_count;
                         info!(member = %member, new_messages = new_count, "InboxWatcher: routing to tmux");
                         for msg in &msgs[state.last_count..] {
+                            let Some(log) = &event_log else {
+                                warn!(member = %member, "Skipping inbox injection because the canonical event log is unavailable");
+                                continue;
+                            };
+                            let data = serde_json::json!({
+                                "team": team,
+                                "recipient": member,
+                                "sender": msg.from,
+                                "text": msg.text,
+                                "summary": msg.summary,
+                                "timestamp": msg.timestamp,
+                                "read": msg.read,
+                                "transport": "tmux",
+                                "source": "inbox_watcher",
+                                "lifecycle_state": "observed",
+                            });
+                            if let Err(error) = log.append("inbox.message", &member, &data) {
+                                warn!(member = %member, %error, "Failed to append canonical inbox message");
+                                continue;
+                            }
                             if let Err(e) =
                                 inject_input(&state.tmux_target, &msg.text, &state.project_dir)
                                     .await

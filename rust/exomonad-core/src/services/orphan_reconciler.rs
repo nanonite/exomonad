@@ -5,6 +5,7 @@ use crate::services::agent_control::{
 };
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::git_worktree::GitWorktreeService;
+use crate::services::EventLog;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::sync::Arc;
@@ -19,16 +20,18 @@ pub async fn run_orphan_reconciler(
     max_leaf_session_seconds: u64,
     max_reviewer_session_seconds: u64,
     tmux_session: Option<String>,
+    event_log: Option<Arc<EventLog>>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
-        if let Err(err) = reconcile_once(
+        if let Err(err) = reconcile_once_with_event_log(
             &project_dir,
             git_wt.clone(),
             max_leaf_session_seconds,
             max_reviewer_session_seconds,
             tmux_session.as_deref(),
+            event_log.as_deref(),
         )
         .await
         {
@@ -44,7 +47,26 @@ pub async fn reconcile_once(
     max_reviewer_session_seconds: u64,
     tmux_session: Option<&str>,
 ) -> Result<()> {
-    reconcile_issue_worktrees(project_dir, git_wt.clone()).await?;
+    reconcile_once_with_event_log(
+        project_dir,
+        git_wt,
+        max_leaf_session_seconds,
+        max_reviewer_session_seconds,
+        tmux_session,
+        None,
+    )
+    .await
+}
+
+async fn reconcile_once_with_event_log(
+    project_dir: &Path,
+    git_wt: Arc<GitWorktreeService>,
+    max_leaf_session_seconds: u64,
+    max_reviewer_session_seconds: u64,
+    tmux_session: Option<&str>,
+    event_log: Option<&EventLog>,
+) -> Result<()> {
+    reconcile_issue_worktrees(project_dir, git_wt.clone(), event_log).await?;
     let _ = git_wt;
     reconcile_session_timeouts(
         project_dir,
@@ -59,7 +81,12 @@ pub async fn reconcile_once(
 async fn reconcile_issue_worktrees(
     project_dir: &Path,
     git_wt: Arc<GitWorktreeService>,
+    event_log: Option<&EventLog>,
 ) -> Result<()> {
+    let Some(event_log) = event_log else {
+        warn!("Skipping closed-worktree reconciliation because the canonical event log is unavailable");
+        return Ok(());
+    };
     let worktrees_dir = project_dir.join(".exo/worktrees");
     let Ok(mut entries) = tokio::fs::read_dir(&worktrees_dir).await else {
         return Ok(());
@@ -75,11 +102,11 @@ async fn reconcile_issue_worktrees(
         let Some(issue_id) = issue_id_for_worktree(project_dir, &slug).await else {
             continue;
         };
-        if issue_closed_event_already_recorded(project_dir, issue_id, &slug).await? {
+        if issue_closed_event_already_recorded(event_log, issue_id, &slug)? {
             continue;
         }
         if let Some(previous_slug) =
-            issue_closed_event_recorded_for_other_worktree(project_dir, issue_id, &slug).await?
+            issue_closed_event_recorded_for_other_worktree(event_log, issue_id, &slug)?
         {
             info!(
                 issue_id,
@@ -89,7 +116,7 @@ async fn reconcile_issue_worktrees(
             );
         }
         if chainlink_issue_is_closed(project_dir, issue_id).await? {
-            append_issue_closed_event(project_dir, issue_id, &slug, "orphan_reconciler").await?;
+            append_issue_closed_event(event_log, issue_id, &slug, "orphan_reconciler")?;
             dispose_agent_resources(project_dir, git_wt.clone(), &slug).await;
             info!(issue_id, agent = %slug, "Reconciled closed Chainlink issue for live worktree");
         }
@@ -149,76 +176,71 @@ async fn issue_id_for_worktree(project_dir: &Path, slug: &str) -> Option<u64> {
     }
 }
 
-async fn issue_closed_event_already_recorded(
-    project_dir: &Path,
+fn issue_closed_event_already_recorded(
+    event_log: &EventLog,
     issue_id: u64,
     slug: &str,
 ) -> Result<bool> {
-    let path = project_dir.join(".exo/events/issue_closed.jsonl");
-    let Ok(content) = tokio::fs::read_to_string(path).await else {
-        return Ok(false);
-    };
-    Ok(content
-        .lines()
-        .any(|line| issue_closed_line_matches(line, issue_id, slug)))
+    Ok(event_log
+        .ledger()
+        .read_events()
+        .map_err(|error| anyhow!("read canonical issue-close ledger: {error}"))?
+        .iter()
+        .any(|record| issue_closed_record_matches(&record.event, issue_id, slug)))
 }
 
-async fn issue_closed_event_recorded_for_other_worktree(
-    project_dir: &Path,
+fn issue_closed_event_recorded_for_other_worktree(
+    event_log: &EventLog,
     issue_id: u64,
     slug: &str,
 ) -> Result<Option<String>> {
-    let path = project_dir.join(".exo/events/issue_closed.jsonl");
-    let Ok(content) = tokio::fs::read_to_string(path).await else {
-        return Ok(None);
-    };
-    Ok(content.lines().find_map(|line| {
-        let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
-        let payload = value.get("payload")?;
-        let recorded_issue_id = payload.get("issue_id")?.as_u64()?;
-        let recorded_slug = payload.get("slug")?.as_str()?;
-        (recorded_issue_id == issue_id && recorded_slug != slug).then(|| recorded_slug.to_string())
-    }))
+    Ok(event_log
+        .ledger()
+        .read_events()
+        .map_err(|error| anyhow!("read canonical issue-close ledger: {error}"))?
+        .iter()
+        .find_map(|record| {
+            let data = record.event.data.as_object()?;
+            let recorded_issue_id = data.get("issue_id")?.as_u64()?;
+            let recorded_slug = data.get("slug")?.as_str()?;
+            (record.event.event_type == "issue.closed"
+                && recorded_issue_id == issue_id
+                && recorded_slug != slug)
+                .then(|| recorded_slug.to_string())
+        }))
 }
 
-fn issue_closed_line_matches(line: &str, issue_id: u64, slug: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
-    let payload = value.get("payload");
-    payload
-        .and_then(|payload| payload.get("issue_id"))
-        .and_then(serde_json::Value::as_u64)
-        == Some(issue_id)
-        && payload
-            .and_then(|payload| payload.get("slug"))
-            .and_then(serde_json::Value::as_str)
-            == Some(slug)
+fn issue_closed_record_matches(
+    event: &crate::services::LedgerEvent,
+    issue_id: u64,
+    slug: &str,
+) -> bool {
+    event.event_type == "issue.closed"
+        && event
+            .data
+            .get("issue_id")
+            .and_then(serde_json::Value::as_u64)
+            == Some(issue_id)
+        && event.data.get("slug").and_then(serde_json::Value::as_str) == Some(slug)
 }
 
-async fn append_issue_closed_event(
-    project_dir: &Path,
+fn append_issue_closed_event(
+    event_log: &EventLog,
     issue_id: u64,
     slug: &str,
     closed_by: &str,
 ) -> Result<()> {
-    let events_dir = project_dir.join(".exo/events");
-    tokio::fs::create_dir_all(&events_dir).await?;
-    let event = serde_json::json!({
-        "event_type": "issue_closed",
-        "payload": {
+    event_log.append(
+        "issue.closed",
+        slug,
+        &serde_json::json!({
             "issue_id": issue_id,
             "slug": slug,
             "closed_by": closed_by,
-        }
-    });
-    let line = serde_json::to_string(&event)? + "\n";
-    let path = events_dir.join("issue_closed.jsonl");
-    let mut options = tokio::fs::OpenOptions::new();
-    options.create(true).append(true);
-    let mut file = options.open(path).await?;
-    use tokio::io::AsyncWriteExt;
-    file.write_all(line.as_bytes()).await?;
+            "source": "orphan_reconciler",
+            "lifecycle_state": "observed",
+        }),
+    )?;
     Ok(())
 }
 
@@ -711,40 +733,42 @@ mod tests {
     }
 
     #[test]
-    fn detects_recorded_issue_closed_lines() {
-        let line = r#"{"event_type":"issue_closed","payload":{"issue_id":313,"slug":"issue-313-first","closed_by":"test"}}"#;
-        assert!(issue_closed_line_matches(line, 313, "issue-313-first"));
-        assert!(!issue_closed_line_matches(line, 313, "issue-313-second"));
-        assert!(!issue_closed_line_matches(line, 312, "issue-313-first"));
+    fn detects_canonical_issue_closed_records() {
+        let event = crate::services::LedgerEvent::new(
+            "issue.closed",
+            Some("issue-313-first".to_string()),
+            serde_json::json!({
+                "issue_id": 313,
+                "slug": "issue-313-first",
+                "closed_by": "test",
+            }),
+        );
+        assert!(issue_closed_record_matches(&event, 313, "issue-313-first"));
+        assert!(!issue_closed_record_matches(
+            &event,
+            313,
+            "issue-313-second"
+        ));
+        assert!(!issue_closed_record_matches(&event, 312, "issue-313-first"));
     }
 
     #[tokio::test]
     async fn same_issue_worktrees_have_independent_disposal_ledger_entries() {
         let temp_dir = tempfile::tempdir().unwrap();
-        append_issue_closed_event(temp_dir.path(), 313, "issue-313-first", "test")
-            .await
-            .unwrap();
+        let event_log = EventLog::open(temp_dir.path().join(".exo/logs")).unwrap();
+        append_issue_closed_event(&event_log, 313, "issue-313-first", "test").unwrap();
 
-        assert!(
-            issue_closed_event_already_recorded(temp_dir.path(), 313, "issue-313-first")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !issue_closed_event_already_recorded(temp_dir.path(), 313, "issue-313-second")
-                .await
-                .unwrap()
-        );
+        assert!(issue_closed_event_already_recorded(&event_log, 313, "issue-313-first").unwrap());
+        assert!(!issue_closed_event_already_recorded(&event_log, 313, "issue-313-second").unwrap());
         assert_eq!(
-            issue_closed_event_recorded_for_other_worktree(
-                temp_dir.path(),
-                313,
-                "issue-313-second"
-            )
-            .await
-            .unwrap(),
+            issue_closed_event_recorded_for_other_worktree(&event_log, 313, "issue-313-second")
+                .unwrap(),
             Some("issue-313-first".to_string())
         );
+        assert!(!temp_dir
+            .path()
+            .join(".exo/events/issue_closed.jsonl")
+            .exists());
     }
 
     #[tokio::test]

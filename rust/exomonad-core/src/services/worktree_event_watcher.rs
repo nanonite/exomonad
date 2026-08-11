@@ -1570,6 +1570,22 @@ where
                 "Unread inbox poke",
             )
             .await;
+            if let Some(log) = self.ctx.event_log() {
+                let data = serde_json::json!({
+                    "recipient": candidate.agent_id.as_str(),
+                    "unread_count": candidate.unread_count,
+                    "newest_message_id": candidate.newest_message_id,
+                    "message": message.as_str(),
+                    "outcome": outcome.method_string(),
+                    "delivered": outcome.is_success(),
+                    "transport": "tmux",
+                    "source": "worktree_event_watcher",
+                    "lifecycle_state": if outcome.is_success() { "delivered" } else { "observed" },
+                });
+                if let Err(error) = log.append("inbox.poke", candidate.agent_id.as_str(), &data) {
+                    warn!(agent = %candidate.agent_id, %error, "Failed to append canonical inbox poke");
+                }
+            }
             if outcome.is_success() {
                 self.ctx
                     .inbox_store()

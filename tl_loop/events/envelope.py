@@ -42,6 +42,9 @@ class EventKind(str, Enum):
     AGENT_STUCK = "agent.stuck"
     AGENT_NOTIFY_PARENT = "agent.notify_parent"
     AGENT_SIBLING_MERGED = "agent.sibling_merged"
+    ISSUE_CLOSED = "issue.closed"
+    INBOX_MESSAGE = "inbox.message"
+    INBOX_POKE = "inbox.poke"
 
 
 EVENT_TYPE_BY_KIND: Mapping[EventKind, str] = MappingProxyType(
