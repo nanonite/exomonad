@@ -1,5 +1,15 @@
 """Controller loops for the programmatic TL."""
 
+from .escalate import (
+    EscalationError,
+    HarnessSwitchDecision,
+    IssueCreationError,
+    ParkCause,
+    ParkResult,
+    authorize_harness_switch,
+    park,
+    switch_harness,
+)
 from .driver import (
     EffectFailed,
     EffectIntent,
@@ -32,12 +42,17 @@ __all__ = [
     "ActionRecorder",
     "DeterministicJudgments",
     "EffectFailed",
+    "EscalationError",
     "EffectIntent",
+    "HarnessSwitchDecision",
     "IntendedAction",
+    "IssueCreationError",
     "Judgment",
     "LeafTask",
     "LoopLimitExceeded",
     "LoopTimeout",
+    "ParkCause",
+    "ParkResult",
     "ScheduleDeadlock",
     "ScheduleError",
     "ShadowLoop",
@@ -51,6 +66,9 @@ __all__ = [
     "WorkerTask",
     "active_count",
     "ready",
+    "authorize_harness_switch",
+    "park",
     "run_tl_loop",
+    "switch_harness",
     "tl_run",
 ]

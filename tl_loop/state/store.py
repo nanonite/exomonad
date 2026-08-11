@@ -37,6 +37,7 @@ from .schema import (
     SliceMap,
     SliceState,
     SliceStatus,
+    ParkCause,
     Verdict,
     validate,
 )
@@ -264,7 +265,7 @@ def _encode_slices(slices: Mapping[str, SliceInput]) -> dict[str, object]:
 
 def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
     if isinstance(value, SliceState):
-        return {
+        record: dict[str, object] = {
             "id": value.id,
             "status": value.status.value,
             "paths": list(value.paths),
@@ -280,6 +281,15 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             "attempts": value.attempts,
             "verdict": value.verdict.value if value.verdict else None,
         }
+        if value.park_cause is not None:
+            record["park_cause"] = value.park_cause.value
+        if value.park_issue_id is not None:
+            record["park_issue_id"] = value.park_issue_id
+        if value.park_audit is not None:
+            record["park_audit"] = copy.deepcopy(dict(value.park_audit))
+        if value.blocked_by is not None:
+            record["blocked_by"] = value.blocked_by
+        return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
     raise TypeError(f"slice {slice_id!r} is not a SliceState or object")
@@ -405,6 +415,18 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         reviewed_head=cast(str | None, value["reviewed_head"]),
         attempts=cast(int, value["attempts"]),
         verdict=Verdict(cast(str, value["verdict"])) if value["verdict"] is not None else None,
+        park_cause=(
+            ParkCause(cast(str, value["park_cause"]))
+            if value.get("park_cause") is not None
+            else None
+        ),
+        park_issue_id=cast(int | None, value.get("park_issue_id")),
+        park_audit=(
+            MappingProxyType(copy.deepcopy(cast(dict[str, object], value["park_audit"])))
+            if isinstance(value.get("park_audit"), dict)
+            else None
+        ),
+        blocked_by=cast(str | None, value.get("blocked_by")),
     )
 
 

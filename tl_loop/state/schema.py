@@ -23,6 +23,18 @@ class SliceStatus(str, Enum):
     MERGED = "merged"
     FAILED = "failed"
     PARKED = "parked"
+    BLOCKED = "blocked"
+
+
+class ParkCause(str, Enum):
+    """Closed reasons that can park a slice for human action."""
+
+    RETRIES_EXHAUSTED = "retries_exhausted"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    NO_CAPABLE_HARNESS = "no_capable_harness"
+    SCHEDULE_DEADLOCK = "schedule_deadlock"
+    REVIEW_STUCK = "review_stuck"
+    HARNESS_SWITCH_REQUESTED = "harness_switch_requested"
 
 
 class Verdict(str, Enum):
@@ -42,7 +54,12 @@ class GateStatus(str, Enum):
 
 
 TERMINAL_SLICE_STATUSES = frozenset(
-    {SliceStatus.MERGED.value, SliceStatus.FAILED.value, SliceStatus.PARKED.value}
+    {
+        SliceStatus.MERGED.value,
+        SliceStatus.FAILED.value,
+        SliceStatus.PARKED.value,
+        SliceStatus.BLOCKED.value,
+    }
 )
 RUN_KEYS = frozenset(
     {"version", "revision", "run_id", "fsm", "slices", "budgets", "gates", "events"}
@@ -64,6 +81,23 @@ SLICE_KEYS = frozenset(
         "reviewed_head",
         "attempts",
         "verdict",
+        "park_cause",
+        "park_issue_id",
+        "park_audit",
+        "blocked_by",
+    }
+)
+PARK_AUDIT_KEYS = frozenset(
+    {
+        "attempts",
+        "verdict",
+        "harness",
+        "model",
+        "ledger",
+        "from_harness",
+        "to_harness",
+        "reason",
+        "effort",
     }
 )
 BUDGET_KEYS = frozenset({"ledger"})
@@ -113,6 +147,10 @@ class SliceState:
     reviewed_head: str | None
     attempts: int
     verdict: Verdict | None
+    park_cause: ParkCause | None = None
+    park_issue_id: int | None = None
+    park_audit: Mapping[str, object] | None = None
+    blocked_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +309,34 @@ def _validate_slice(
     _nullable_positive_int(value, "pr_number", path, errors)
     _non_negative_int(value, "attempts", path, errors)
     _nullable_enum_value(value, "verdict", path, Verdict, errors)
+    _nullable_enum_value(value, "park_cause", path, ParkCause, errors)
+    _nullable_positive_int(value, "park_issue_id", path, errors)
+    _nullable_string(value, "blocked_by", path, errors)
+    _park_audit(value.get("park_audit"), path, errors)
+
+
+def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    audit = _object(value, f"{path}.park_audit", PARK_AUDIT_KEYS, errors)
+    if audit is None:
+        return
+    if "attempts" in audit:
+        _non_negative_int(audit, "attempts", f"{path}.park_audit", errors)
+    if "verdict" in audit:
+        _nullable_enum_value(audit, "verdict", f"{path}.park_audit", Verdict, errors)
+    for key in ("harness", "model", "from_harness", "to_harness", "reason", "effort"):
+        if key in audit:
+            _nullable_string(audit, key, f"{path}.park_audit", errors)
+    ledger = audit.get("ledger")
+    if ledger is not None:
+        parsed = _object(ledger, f"{path}.park_audit.ledger", LEDGER_KEYS, errors)
+        if parsed is not None:
+            _non_negative_int(parsed, "tokens", f"{path}.park_audit.ledger", errors)
+            _non_negative_int(parsed, "wall_seconds", f"{path}.park_audit.ledger", errors)
+            for key in ("role_spent", "harness_spent", "role_reserved", "harness_reserved"):
+                _counter_map(parsed, key, f"{path}.park_audit.ledger", errors)
+            _charges(parsed.get("charges"), f"{path}.park_audit.ledger", errors)
 
 
 def _budgets(value: object, errors: list[tuple[str, str]]) -> None:

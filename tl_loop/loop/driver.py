@@ -32,13 +32,14 @@ from tl_loop.fsm.phase import (
     TLWaiting,
 )
 from tl_loop.fsm.transition import IllegalTransition, transition
-from tl_loop.loop.schedule import ready
+from tl_loop.loop.escalate import park
+from tl_loop.loop.schedule import ScheduleDeadlock, ready
 from tl_loop.select.agent_type import select_agent_type, selection_failure
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model
 from tl_loop.select.policy import HarnessPolicy, load_policy
-from tl_loop.state.schema import BudgetLedger, RunState, SliceStatus
+from tl_loop.state.schema import BudgetLedger, ParkCause, RunState, SliceStatus
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
@@ -389,11 +390,16 @@ def _dispatch_children(
 ) -> RunState:
     live = cast(EffectClient, effects) if config.active else None
     for worker in plan.workers:
-        if not _can_dispatch(worker.name, state, config):
+        try:
+            dispatchable = _can_dispatch(worker.name, state, config)
+        except ScheduleDeadlock as error:
+            _park_schedule_deadlock(error, state, config, live, store)
+            raise TLLoopError(str(error)) from error
+        if not dispatchable:
             continue
         if _already_dispatched(worker.name, state):
             continue
-        selected_harness = _prepare_spawn(worker.name, state, config, store)
+        selected_harness = _prepare_spawn(worker.name, state, config, live, store)
         if selected_harness is not None:
             state = store.load()
         worker_args: dict[str, object] = {"name": worker.name, "task": worker.task}
@@ -410,11 +416,16 @@ def _dispatch_children(
             effects_log,
         )
     for leaf in plan.leaves:
-        if not _can_dispatch(leaf.name, state, config):
+        try:
+            dispatchable = _can_dispatch(leaf.name, state, config)
+        except ScheduleDeadlock as error:
+            _park_schedule_deadlock(error, state, config, live, store)
+            raise TLLoopError(str(error)) from error
+        if not dispatchable:
             continue
         if _already_dispatched(leaf.name, state):
             continue
-        selected_harness = _prepare_spawn(leaf.name, state, config, store)
+        selected_harness = _prepare_spawn(leaf.name, state, config, live, store)
         if selected_harness is not None:
             state = store.load()
         leaf_args: dict[str, object] = {"name": leaf.name, "task": leaf.task}
@@ -442,6 +453,30 @@ def _dispatch_children(
     return store.load() if config.policy is not None else state
 
 
+def _park_schedule_deadlock(
+    error: ScheduleDeadlock,
+    state: RunState,
+    config: TLLoopConfig,
+    live: EffectClient | None,
+    store: RunStore,
+) -> None:
+    if not config.active:
+        return
+    if live is None:
+        raise TLLoopError("active loop has no effect client for escalation")
+    blocked_id = error.blocked_slices[0]
+    slice_state = state.slices.get(blocked_id)
+    if slice_state is None:
+        raise TLLoopError(f"deadlock references missing slice {blocked_id!r}")
+    park(
+        slice_state,
+        ParkCause.SCHEDULE_DEADLOCK,
+        store=store,
+        issue_creator=live,
+        ledger=state.budgets,
+    )
+
+
 def _can_dispatch(name: str, state: RunState, config: TLLoopConfig) -> bool:
     if config.policy is None or config.max_parallel_slices is None:
         return True
@@ -459,6 +494,7 @@ def _prepare_spawn(
     name: str,
     state: RunState,
     config: TLLoopConfig,
+    live: EffectClient | None,
     store: RunStore,
 ) -> str | None:
     if config.policy is None:
@@ -474,7 +510,25 @@ def _prepare_spawn(
         failure = selection_failure(
             slice_state, config.role, state.budgets, config.policy, capabilities
         )
-        raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}")
+        cause = {
+            "over_budget": ParkCause.BUDGET_EXHAUSTED,
+            "no_capable_harness": ParkCause.NO_CAPABLE_HARNESS,
+        }.get(failure.value)
+        if cause is None:
+            raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}")
+        if config.active:
+            if live is None:
+                raise TLLoopError("active loop has no effect client for escalation")
+            park(
+                slice_state,
+                cause,
+                store=store,
+                issue_creator=live,
+                ledger=state.budgets,
+            )
+        raise TLLoopError(
+            f"cannot select harness for {name!r}: {failure.value}; slice parked"
+        )
     model_id: str | None = None
     if config.catalog is not None:
         model_id = select_model(
