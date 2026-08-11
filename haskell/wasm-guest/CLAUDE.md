@@ -115,7 +115,7 @@ Every new or updated `file_pr` body carries the issue's Definition of Done under
 | Role | Tools | State Machine | Spawned by |
 |------|-------|---------------|------------|
 | **root** | `RootForkWave`, `RootSpawnLeaf`, `RootSpawnCodex`, `RootSpawnWorker`, `RootMergePR`, `SendTmuxMessage / SendMailboxMessage` | `TLPhase` (tracks children via `ChildSpawned`/`ChildCompleted`) | `exomonad init` (human-facing TL) |
-| **tl** | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnCodex`, `TLSpawnWorker`, `TLMergePR`, `TLFilePR`, `TLNotifyParent`, `SendTmuxMessage / SendMailboxMessage` | `TLPhase` | `fork_wave` |
+| **tl** | `TLForkWave`, `TLSpawnLeaf`, `TLSpawnCodex`, `TLSpawnWorker`, `TLMergePR`, `TLFilePR`, `TLNotifyParent`, `SendTmuxMessage / SendMailboxMessage` | None — Python `tl_loop` owns state; no TL phase is persisted in WASM | `fork_wave` |
 | **dev** | `DevFilePR`, `DevNotifyParent`, `SendTmuxMessage / SendMailboxMessage`, `DevTaskList`, `DevTaskGet`, `DevTaskUpdate` | `DevPhase` (one assignment per process; watcher owns later PR/review/CI state) | `spawn_leaf` (worktree) |
 | **worker** | `WorkerNotifyParent`, `SendTmuxMessage / SendMailboxMessage`, `WorkerTaskList`, `WorkerTaskGet`, `WorkerTaskUpdate` | None (ephemeral, parent controls exit) | `spawn_worker` |
 | **testrunner** | `Instruct`, `TestrunnerNotifyParent` | None (allow-all hooks) | Companion config |
@@ -127,11 +127,11 @@ The guest handles hooks invoked by Claude Code:
 - **`onPreToolUse`**: Validates tool calls (stops restricted tools).
 - **`onPostToolUse`**: Logs tool usage.
 - **`onSubagentStop`**: Validates child agent exit status.
-- **`onStop`**: Stop hook — gates agent exit. Uses `StopCheckResult` (MustBlock/ShouldNudge/Clean).
+- **`onStop`**: Role-specific lifecycle hook. Worker and reviewer checks may gate exit; root and programmatic TL allow exit, while the Python loop owns TL terminal decisions.
 
 ### State Machine (`ExoMonad.Guest.StateMachine`)
 
-Generic `StateMachine` typeclass for agent lifecycle phases. Users define sum types + transitions, framework handles KV persistence, logging, and stop hook integration.
+Generic `StateMachine` typeclass for agent lifecycle phases. Users define sum types + transitions, and the framework handles KV persistence, logging, and stop-hook integration for roles that opt into it.
 
 ```haskell
 class (ToJSON phase, FromJSON phase, Typeable phase, Show phase) => StateMachine phase event where
@@ -147,10 +147,10 @@ class (ToJSON phase, FromJSON phase, Typeable phase, Show phase) => StateMachine
 
 **Phase types** live in `.exo/roles/devswarm/`:
 - `DevPhase.hs` — dev agent phases + events + `StateMachine` instance
-- `TLPhase.hs` — TL agent phases (with `ChildHandle` in `TLWaiting`) + events + instance
+- `TLPhase.hs` — Haskell golden-parity source for the Python TL FSM; also retained by the legacy root role
 - `WorkerPhase.hs` — worker agent phases + events + instance
 
-**KV key scoping:** Each machine writes to `"phase-{machineName}"` (e.g., `"phase-dev"`, `"phase-tl"`), preventing cross-role collisions.
+**KV key scoping:** Each persisted machine writes to `"phase-{machineName}"` (e.g., `"phase-dev"` or `"phase-worker"`). The programmatic `tl` role does not write a `phase-tl` key; `TLPhase.hs` remains available for root compatibility and golden parity.
 
 **Usage from tool/event handlers:**
 ```haskell

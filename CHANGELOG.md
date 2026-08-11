@@ -284,6 +284,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- M8.2 Reduce TLRole.hs to an RPC surface (#705)
 - M8.1 Remove TL stop-hook coordination from the WASM role (#704)
 - M5.6 Live single-wave run on a scratch repo (#694)
 - Watcher: skip legacy inbox/tmux delivery for ledger-owned (tl_loop) worktrees (#714)

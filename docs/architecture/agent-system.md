@@ -162,9 +162,14 @@ flowchart LR
 
 ## 4. Per-role State Machines
 
-State persisted in KV per `birth-branch`. Transitions fire from tool handlers and from event handlers.
+State is persisted in KV per `birth-branch` only for roles that invoke the state-machine persistence helpers. Root, dev, reviewer, and worker lifecycle state remains in WASM; the programmatic `tl` role is an RPC surface with no persisted TL phase.
 
-### TLPhase
+### TLPhase (golden parity and root compatibility)
+
+`TLPhase.hs` remains the Haskell source of truth for the Python FSM golden
+fixture and is retained for the legacy `root` role. The programmatic `tl`
+role does not import it or call `applyEvent`; its transition and terminal state
+lives in `tl_loop`.
 
 ```mermaid
 stateDiagram-v2

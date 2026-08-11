@@ -4,18 +4,14 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 
--- | TL role config: spawn, PR, and merge tools with state transitions.
+-- | TL role config: an RPC surface for the programmatic Python controller.
 module TLRole (config, Tools) where
 
-import Control.Monad (forM_, void, when)
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import ExoMonad
-import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
-import ExoMonad.Guest.Effects.StopHook (getCurrentBranch)
 import ExoMonad.Guest.ReviewHandoff (reviewHandoffInstructions)
-import ExoMonad.Guest.StateMachine (applyEvent)
 import ExoMonad.Guest.Tools.Agents (ListAgents (..))
 import ExoMonad.Guest.Tools.Chainlink
   ( ChainlinkBlock (..),
@@ -51,10 +47,10 @@ import ExoMonad.Guest.Tools.Events
     notifyParentDescription,
     notifyParentSchema,
   )
-import ExoMonad.Guest.Tools.FilePR (FilePRArgs, FilePROutput (..), filePRCore, filePRDescription, filePRSchema)
+import ExoMonad.Guest.Tools.FilePR (FilePRArgs, filePRCore, filePRDescription, filePRSchema)
 import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
 import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), MemoryList (..))
-import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
+import ExoMonad.Guest.Tools.MergePR (MergePRArgs, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
@@ -62,8 +58,7 @@ import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
-    ForkWaveArgs (..),
-    ForkWaveResult (..),
+    ForkWaveArgs,
     SpawnLeafArgs,
     SpawnLeafSubtreeArgs,
     SpawnWorkerToolArgs,
@@ -82,14 +77,13 @@ import ExoMonad.Guest.Tools.Spawn
     spawnWorkerToolDescription,
     spawnWorkerToolSchema,
   )
-import ExoMonad.Guest.Tools.SpawnCodex (SpawnCodex, handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
+import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
 import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
 import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
 import ExoMonad.Types (HookConfig (..), teamRegistrationPostToolUse, tlSessionStartHook)
 import HookPolicy (preToolUseWithImplementationBlock)
 import PRReviewHandler (tlPRReviewEventHandlers)
-import TLPhase (ChildHandle (..), TLEvent (..), TLPhase (..))
 
 tlRedispatchMessage :: Text -> Text
 tlRedispatchMessage toolName =
@@ -102,7 +96,7 @@ tlRedispatchMessage toolName =
     <> "If neither path fits, re-decompose with spawn_leaf or spawn_worker.\n"
     <> "See CLAUDE.md § Tech Lead Praxis for the full protocol."
 
--- | TL-specific file_pr: files PR, transitions TLPhase.
+-- | TL-specific file_pr RPC wrapper.
 data TLFilePR
 
 instance MCPTool TLFilePR where
@@ -114,16 +108,9 @@ instance MCPTool TLFilePR where
     result <- filePRCore args
     case result of
       Left err -> pure $ errorResult err
-      Right output -> do
-        branch <- getCurrentBranch
-        void $
-          applyEvent @TLPhase @TLEvent
-            branch
-            TLPlanning
-            (OwnPRFiled (fpoNumber output) (fpoUrl output) (fpoHeadBranch output))
-        pure $ successResult (Aeson.toJSON output)
+      Right output -> pure $ successResult (Aeson.toJSON output)
 
--- | TL-specific merge_pr: merges child PR, transitions TLPhase via ChildCompleted.
+-- | TL-specific merge_pr RPC wrapper.
 data TLMergePR
 
 instance MCPTool TLMergePR where
@@ -135,16 +122,9 @@ instance MCPTool TLMergePR where
     result <- mergePRCore args
     case result of
       Left err -> pure $ errorResult err
-      Right output -> do
-        when (mpoSuccess output) $ do
-          case extractAgentName (mpoBranchName output) of
-            Just slug -> do
-              branch <- getCurrentBranch
-              void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildCompleted slug)
-            Nothing -> pure ()
-        pure $ mergePRRender output
+      Right output -> pure $ mergePRRender output
 
--- | TL-specific fork_wave: spawns Claude subtrees, fires ChildSpawned per child.
+-- | TL-specific fork_wave RPC wrapper.
 data TLForkWave
 
 instance MCPTool TLForkWave where
@@ -156,19 +136,9 @@ instance MCPTool TLForkWave where
     result <- forkWaveCore args
     case result of
       Left err -> pure $ errorResult err
-      Right fwResult -> do
-        forM_ (fwrSpawned fwResult) $ \(slug, sr) -> do
-          let handle =
-                ChildHandle
-                  { chSlug = slug,
-                    chBranch = branchName sr,
-                    chAgentType = agentTypeResult sr
-                  }
-          branch <- getCurrentBranch
-          void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
-        pure $ forkWaveRender fwResult
+      Right fwResult -> pure $ forkWaveRender fwResult
 
--- | TL-specific spawn_leaf: worktree spawn fires ChildSpawned.
+-- | TL-specific spawn_leaf RPC wrapper.
 data TLSpawnLeaf
 
 instance MCPTool TLSpawnLeaf where
@@ -180,16 +150,7 @@ instance MCPTool TLSpawnLeaf where
     result <- spawnLeafCore args
     case result of
       Left err -> pure $ errorResult err
-      Right (slug, sr) -> do
-        let handle =
-              ChildHandle
-                { chSlug = slug,
-                  chBranch = branchName sr,
-                  chAgentType = agentTypeResult sr
-                }
-        branch <- getCurrentBranch
-        void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
-        pure $ spawnLeafRender (Right (slug, sr))
+      Right result -> pure $ spawnLeafRender (Right result)
 
 -- | TL-specific spawn_worker: ephemeral pane, no state transition.
 data TLSpawnWorker
@@ -221,16 +182,7 @@ instance MCPTool TLSpawnCodex where
     result <- handleSpawnCodex args
     case result of
       Left err -> pure $ errorResult err
-      Right (slug, sr) -> do
-        let handle =
-              ChildHandle
-                { chSlug = slug,
-                  chBranch = branchName sr,
-                  chAgentType = agentTypeResult sr
-                }
-        branch <- getCurrentBranch
-        void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
-        pure $ spawnLeafRender (Right (slug, sr))
+      Right result -> pure $ spawnLeafRender (Right result)
 
 -- | TL notify_parent: thin wrapper, no phase transitions.
 data TLNotifyParent
