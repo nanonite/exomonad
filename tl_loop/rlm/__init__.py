@@ -22,6 +22,16 @@ from .call import (
     judgment_hash,
     rlm,
 )
+from .decompose import (
+    DECOMPOSE_PROMPT,
+    SLICE_SPEC_SCHEMA,
+    DecompositionConfigurationError,
+    DecompositionParked,
+    DecompositionValidationError,
+    SliceSpec,
+    decompose,
+    validate_decomposition,
+)
 from .schema import OutputSchemaError, validate_output
 from .store import (
     BudgetExceeded,
@@ -34,13 +44,18 @@ from .store import (
 )
 
 __all__ = [
+    "DECOMPOSE_PROMPT",
     "MAX_ATTEMPTS",
     "SECTION_PRIORITY_ORDER",
+    "SLICE_SPEC_SCHEMA",
     "ApproximateTokenCounter",
     "BudgetExceeded",
     "CompactionResult",
     "ContextBudgetError",
     "ContextOverflow",
+    "DecompositionConfigurationError",
+    "DecompositionParked",
+    "DecompositionValidationError",
     "InputSection",
     "JudgmentFailed",
     "OutputSchemaError",
@@ -53,12 +68,15 @@ __all__ = [
     "RlmRequest",
     "RlmResponse",
     "RlmRoleLedger",
+    "SliceSpec",
     "compact_inputs",
     "compact_sections",
     "context_budget",
+    "decompose",
     "judgment_hash",
     "resolve_token_counter",
     "rlm",
     "sections_from_inputs",
+    "validate_decomposition",
     "validate_output",
 ]

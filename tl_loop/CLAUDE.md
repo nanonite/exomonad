@@ -40,6 +40,19 @@ may be injected; otherwise canonical JSON is counted at four UTF-8 characters
 per token, and the method, final count, budget, and dropped section names are
 recorded in every RLM event.
 
+## RLM decomposition boundary
+
+tl_loop.rlm.decompose.decompose is the only M6.3 entry point for turning a
+root specification into SliceSpec records. It receives the resolved model
+choice by dependency injection; the root specification cannot select a
+harness, model, budget, or parallelism. The model returns only the closed
+slices schema. Python rejects duplicate or overlapping ownership paths,
+unknown dependencies, cycles, missing test plans, and repository-escaping
+paths. Each cross-field violation is fed back with a retry ordinal so replay
+does not suppress a fresh corrective attempt. Exhaustion raises
+DecompositionParked with ParkCause.RETRIES_EXHAUSTED; no malformed
+decomposition reaches run state.
+
 ## Checkpoint and resume layout
 
 Each run is persisted at `.exo/tl-loop/<run_id>/run.json`; the shared writer
