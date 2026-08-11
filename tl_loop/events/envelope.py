@@ -35,6 +35,7 @@ class EventKind(str, Enum):
     PR_PUBLISHED = "pr.published"
     PR_MERGED = "pr.merged"
     PR_MERGE_FAILED = "pr.merge_failed"
+    PR_REVIEW = "pr.review"
     COPILOT_REVIEW = "copilot.review"
     CI_STATUS_CHANGED = "ci.status_changed"
     AGENT_COMPLETED = "agent.completed"
@@ -85,6 +86,8 @@ class EventEnvelope:
     observed_at: str
     pr_number: int | None
     head_sha: str | None
+    review_kind: str | None
+    notification: str | None
     review_state: str | None
     ci_status: str | None
     data: Mapping[str, object]
@@ -122,6 +125,8 @@ def project(event: LedgerEventInput) -> EventEnvelope:
         observed_at=_required_string(event, "observed_at", event_type),
         pr_number=_optional_int(data, "pr_number", event_type),
         head_sha=_head_sha(data, event_type),
+        review_kind=_optional_string(data, "kind", event_type),
+        notification=_optional_string(data, "notification", event_type),
         review_state=_optional_string(data, "review_state", event_type),
         ci_status=_ci_status(data, event_type),
         data=MappingProxyType(cast(dict[str, object], copy.deepcopy(dict(data)))),

@@ -2,6 +2,7 @@ use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::agent_resources::dispose_reviewers_for_pr;
+use crate::services::event_log::{canonical_review_wakeup_data, PR_REVIEW_EVENT_TYPE};
 use crate::services::pr_registry::{
     read_published_heads, ForgejoReviewState, PrEntry, PrRegistry, PrState, PublishedHead,
     ReviewerAttempt, ReviewerAttemptPhase,
@@ -686,7 +687,13 @@ fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventAction
             message: pr_ready_message(pr_number),
         }),
         "timeout" => Some(EventActionResponse::InjectMessage {
-            message: review_timeout_message(pr_number, value_u64(payload, "minutes")?),
+            message: review_timeout_message(
+                pr_number,
+                payload
+                    .get("minutes_elapsed")
+                    .and_then(serde_json::Value::as_u64)
+                    .or_else(|| payload.get("minutes").and_then(serde_json::Value::as_u64))?,
+            ),
         }),
         "fixes_pushed" => Some(EventActionResponse::InjectMessage {
             message: fixes_pushed_message(pr_number, value_str(payload, "ci_status")?),
@@ -1441,6 +1448,100 @@ where
         }
     }
 
+    fn log_review_wakeup(&self, pending: &PendingPrActions, payload: &serde_json::Value) {
+        let Some(log) = self.ctx.event_log() else {
+            return;
+        };
+        let mut data = canonical_review_wakeup_data(
+            pending.branch.as_str(),
+            pending.pr_number,
+            pending.head_sha.as_str(),
+            payload,
+        );
+        if let Some(EventActionResponse::InjectMessage { message }) =
+            native_tl_pr_review_action(payload)
+        {
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "notification".to_string(),
+                    serde_json::Value::String(message),
+                );
+            }
+        }
+        if let Err(error) = log.append(PR_REVIEW_EVENT_TYPE, &pending.agent_name, &data) {
+            warn!(
+                pr_number = pending.pr_number,
+                branch = %pending.branch,
+                %error,
+                "Failed to write canonical PR review wakeup"
+            );
+        }
+    }
+
+    fn log_review_stall(
+        &self,
+        pending: &PendingPrActions,
+        pr_number: u64,
+        classification: ReviewStallKind,
+        diagnostic: &ReviewStallDiagnostic,
+    ) {
+        let Some(log) = self.ctx.event_log() else {
+            return;
+        };
+        let kind = match classification {
+            ReviewStallKind::CiFailed => "ci_blocked",
+            ReviewStallKind::DevNotPushing => "dev_not_pushing",
+            ReviewStallKind::ReviewerNotResponding => "reviewer_not_responding",
+            ReviewStallKind::ReviewerNeverStarted => "reviewer_never_started",
+        };
+        let payload = serde_json::json!({
+            "kind": kind,
+            "pr_number": pr_number,
+            "branch": diagnostic.branch,
+            "head_sha": diagnostic.head_sha,
+            "rounds": diagnostic.rounds,
+            "stall_classification": classification.as_str(),
+            "reviewer_registered": diagnostic.reviewer_registered,
+            "forgejo_review_present": diagnostic.forgejo_review_present,
+            "wait_seconds": diagnostic.wait_seconds,
+            "ci_status": diagnostic.ci_status.as_str(),
+        });
+        let mut data = canonical_review_wakeup_data(
+            pending.branch.as_str(),
+            pr_number,
+            pending.head_sha.as_str(),
+            &payload,
+        );
+        let notification = match classification {
+            ReviewStallKind::CiFailed => {
+                tl_ci_blocked_message(pr_number, diagnostic.ci_status.as_str(), &diagnostic.branch)
+            }
+            ReviewStallKind::DevNotPushing => {
+                format!("[DEV NOT PUSHING] PR #{pr_number} needs TL attention.")
+            }
+            ReviewStallKind::ReviewerNotResponding => {
+                format!("[REVIEWER NOT RESPONDING] PR #{pr_number} needs TL attention.")
+            }
+            ReviewStallKind::ReviewerNeverStarted => {
+                format!("[REVIEWER NEVER STARTED] PR #{pr_number} needs TL attention.")
+            }
+        };
+        if let Some(object) = data.as_object_mut() {
+            object.insert(
+                "notification".to_string(),
+                serde_json::Value::String(notification),
+            );
+        }
+        if let Err(error) = log.append(PR_REVIEW_EVENT_TYPE, &pending.agent_name, &data) {
+            warn!(
+                pr_number,
+                branch = %pending.branch,
+                %error,
+                "Failed to write canonical PR review stall"
+            );
+        }
+    }
+
     async fn poke_unread_inbox_agents(&self) -> Result<()> {
         let candidates = self
             .ctx
@@ -1930,6 +2031,9 @@ where
                         event_type,
                         payload,
                     } => {
+                        if event_type == "pr_review" {
+                            self.log_review_wakeup(&pending, &payload);
+                        }
                         let release_message = merge_ready_release_message(&payload);
 
                         let payload_kind = payload
@@ -2061,6 +2165,7 @@ where
                         classification,
                         diagnostic,
                     } => {
+                        self.log_review_stall(&pending, pr_number, classification, &diagnostic);
                         info!(
                             pr_number,
                             classification = classification.as_str(),
@@ -3170,6 +3275,15 @@ fn compute_pr_actions_with_context(
                     ci_status,
                 ),
             });
+            pending_actions.push(PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload: serde_json::json!({
+                    "kind": "stuck",
+                    "pr_number": pr_number.as_u64(),
+                    "branch": branch,
+                    "rounds": old_state.rounds,
+                }),
+            });
             pending_actions.push(PendingAction::NotifyParentRepair {
                 head_sha: pr_sha.to_string(),
                 round: old_state.rounds,
@@ -3264,6 +3378,15 @@ fn compute_pr_actions_with_context(
                     max_wait_seconds,
                     ci_status,
                 ),
+            });
+            pending_actions.push(PendingAction::WasmEvent {
+                event_type: "pr_review",
+                payload: serde_json::json!({
+                    "kind": "stuck",
+                    "pr_number": pr_number.as_u64(),
+                    "branch": branch,
+                    "rounds": old_state.rounds,
+                }),
             });
             pending_actions.push(PendingAction::NotifyParentRepair {
                 head_sha: pr_sha.to_string(),
@@ -3366,6 +3489,15 @@ fn compute_pr_actions_with_context(
                 max_wait_seconds,
                 ci_status,
             ),
+        });
+        pending_actions.push(PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": "timeout",
+                "pr_number": pr_number.as_u64(),
+                "branch": branch,
+                "minutes_elapsed": max_wait_seconds / 60,
+            }),
         });
         pending_actions.push(PendingAction::NotifyParentRepair {
             head_sha: pr_sha.to_string(),
@@ -4035,7 +4167,7 @@ mod tests {
                 "[PR READY] PR #46",
             ),
             (
-                serde_json::json!({ "kind": "timeout", "pr_number": 47, "minutes": 15 }),
+                serde_json::json!({ "kind": "timeout", "pr_number": 47, "minutes_elapsed": 15 }),
                 "[REVIEW TIMEOUT] PR #47",
             ),
             (

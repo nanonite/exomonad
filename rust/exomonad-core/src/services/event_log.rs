@@ -13,6 +13,29 @@ use std::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
 
+pub const PR_REVIEW_EVENT_TYPE: &str = "pr.review";
+
+/// Build the canonical payload for a transient `pr_review` wakeup.
+pub fn canonical_review_wakeup_data(
+    branch: &str,
+    pr_number: u64,
+    head_sha: &str,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let mut data = payload.as_object().cloned().unwrap_or_else(|| {
+        let mut object = serde_json::Map::new();
+        object.insert("payload".to_string(), payload.clone());
+        object
+    });
+    data.entry("branch".to_string())
+        .or_insert_with(|| serde_json::Value::String(branch.to_string()));
+    data.entry("pr_number".to_string())
+        .or_insert_with(|| serde_json::Value::from(pr_number));
+    data.entry("head_sha".to_string())
+        .or_insert_with(|| serde_json::Value::String(head_sha.to_string()));
+    serde_json::Value::Object(data)
+}
+
 /// Compatibility event view plus the canonical append-only ledger.
 ///
 /// The process mutex and OS advisory locks serialize sequence allocation and
@@ -279,6 +302,23 @@ mod tests {
         assert_eq!(records[0].event.harness.as_deref(), Some("exo"));
         assert_eq!(records[0].event.role.as_deref(), Some("worker"));
         assert_eq!(records[0].event.source, "lifecycle");
+    }
+
+    #[test]
+    fn canonical_review_wakeup_data_preserves_payload_and_context() {
+        let payload = serde_json::json!({
+            "kind": "merge_ready",
+            "ci_status": "success",
+            "notification": "[MERGE READY] PR #7",
+        });
+
+        let data = canonical_review_wakeup_data("main.worker", 7, "abc123", &payload);
+
+        assert_eq!(data["kind"], "merge_ready");
+        assert_eq!(data["notification"], "[MERGE READY] PR #7");
+        assert_eq!(data["branch"], "main.worker");
+        assert_eq!(data["pr_number"], 7);
+        assert_eq!(data["head_sha"], "abc123");
     }
 
     #[test]

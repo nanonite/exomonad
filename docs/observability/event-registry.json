@@ -96,6 +96,7 @@
     {"type": "pr.merge_requested", "payload_class": "aggregate_dimensions", "producers": ["rust", "haskell"]},
     {"type": "pr.merged", "payload_class": "aggregate_dimensions", "producers": ["rust", "haskell", "watcher"]},
     {"type": "pr.merge_failed", "payload_class": "pointer_only", "producers": ["rust", "haskell"]},
+    {"type": "pr.review", "payload_class": "local_sensitive", "producers": ["watcher", "rust"]},
     {"type": "copilot.review", "payload_class": "local_sensitive", "producers": ["watcher"]},
     {"type": "ci.status_changed", "payload_class": "aggregate_dimensions", "producers": ["watcher"]},
     {"type": "event.dispatched", "payload_class": "aggregate_dimensions", "producers": ["watcher", "haskell"]},

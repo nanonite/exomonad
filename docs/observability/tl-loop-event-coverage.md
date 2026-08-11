@@ -13,27 +13,28 @@ type is projected by M2.6. The bridge’s closed event set is
 `sibling_merged`, and `issue_closed` inputs, generic `event.dispatched` rows,
 and direct inbox/tmux delivery do not count by themselves.
 
-Every gap below has a filed Chainlink issue and blocks the next loop-driver
-task, #678. The audit does not repair gaps.
+Every remaining gap below has a filed Chainlink issue and blocks the next
+loop-driver task, #678. The audit identified the original gaps; #709 now
+records the transient review wakeups in the canonical ledger.
 
 ## Notification vocabulary and direct wakeups
 
 | wakeup | source | bridged kind | status (covered / gap) | notes |
 |---|---|---|---|---|
-| `[MERGE READY]` | `.exo/roles/devswarm/context/root.md:63-67`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:572-575,3324-3338` | `agent.notify_parent` for the repair handoff; no exact release envelope | gap — #709 | The exact release message is injected after the transient `pr_review` action at `rust/exomonad-core/src/services/worktree_event_watcher.rs:1998-2005`. |
-| `[PR READY]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:605-607,681-687` | none | gap — #709 | Native TL delivery is derived from `approved`; no canonical row records that wakeup. |
-| `[REVIEW TIMEOUT]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:609-612,3341-3375` | `agent.notify_parent` for the generic handoff | gap — #709 | The exact timeout variant is a transient `pr_review` input. |
-| `[FIXES PUSHED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:615-626,2951-2962` | none | gap — #709 | The watcher emits only a transient `pr_review` input for this token. |
-| `[COMMITS PUSHED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:628-640,2963-2971` | none | gap — #709 | The watcher emits only a transient `pr_review` input for this token. |
+| `[MERGE READY]` | `.exo/roles/devswarm/context/root.md:63-67`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:572-575,3324-3338` | `pr.review` plus `agent.notify_parent` repair handoff | covered | The canonical row preserves the exact release notification before injection. |
+| `[PR READY]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:605-607,681-687` | `pr.review` | covered | The `approved` wakeup retains the native TL notification text. |
+| `[REVIEW TIMEOUT]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:609-612,3341-3375` | `pr.review` plus `agent.notify_parent` handoff | covered | The active watcher now records a canonical timeout wakeup with elapsed minutes and notification text. |
+| `[FIXES PUSHED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:615-626,2951-2962` | `pr.review` | covered | The canonical row retains the transient payload and verified head. |
+| `[COMMITS PUSHED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:628-640,2963-2971` | `pr.review` | covered | The canonical row retains the transient payload and verified head. |
 | `[CI Status]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:578-585,3282-3309` | `ci.status_changed` | covered | The canonical row preserves branch, status, message, reviews/comments, and verified `head_sha`. |
-| `[CI BLOCKED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:587-596,2975-3024` | `agent.notify_parent` for a repair handoff; no exact token envelope | gap — #709 | The direct TL message is produced by transient `pr_review` handling. |
-| `[CI TRIGGERED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:704-708,3113-3128` | none | gap — #709 | The trigger is a transient `pr_review` input. |
-| `[STUCK: pr, rounds]` | `.exo/roles/devswarm/context/root.md:69-72`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:642-645,3148-3178` | `agent.notify_parent` for a generic handoff | gap — #709 | The exact stuck wakeup is not a canonical event; the generic handoff is insufficient for deterministic replay. |
-| `[DEV NOT PUSHING]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:727-729` | none | gap — #709 | Native TL action only. |
-| `[REVIEWER NOT RESPONDING]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:730-732` | none | gap — #709 | Native TL action only. |
-| `[REVIEWER NEVER STARTED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:733-735` | none | gap — #709 | Native TL action only. |
-| `[DEV FAILED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:736-738` | none | gap — #709 | Native TL action only. |
-| `[RATE LIMITED]` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:63-70,112,132`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:697-702` | none | gap — #709 | The guest accepts the variant, but no current watcher/poller producer records it. |
+| `[CI BLOCKED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:587-596,2975-3024` | `pr.review` plus `agent.notify_parent` repair handoff | covered | The canonical row retains the exact native TL notification and CI diagnosis. |
+| `[CI TRIGGERED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:704-708,3113-3128` | `pr.review` | covered | The trigger is now retained with branch and verified head context. |
+| `[STUCK: pr, rounds]` | `.exo/roles/devswarm/context/root.md:69-72`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:642-645,3148-3178` | `pr.review` plus `agent.notify_parent` handoff | covered | Max-round and review-loop stuck wakeups retain rounds and notification text. |
+| `[DEV NOT PUSHING]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:727-729` | `pr.review` | covered | Human-escalation diagnostics are projected as canonical review wakeups. |
+| `[REVIEWER NOT RESPONDING]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:730-732` | `pr.review` | covered | Human-escalation diagnostics are projected as canonical review wakeups. |
+| `[REVIEWER NEVER STARTED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:733-735` | `pr.review` | covered | Human-escalation diagnostics are projected as canonical review wakeups. |
+| `[DEV FAILED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:736-738` | `pr.review` | covered | The canonical review path is ready for this guest variant; current watcher classification is recorded as a review stall. |
+| `[RATE LIMITED]` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:63-70,112,132`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:697-702` | `pr.review` when produced | covered | The guest accepts the variant, but no current watcher/poller producer exists; there is therefore no live row to replay. |
 | `[REPAIR HANDOFF]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:560-568,2085-2101` | `agent.notify_parent` | covered | The parent notification ledger row preserves the handoff message and outcome context. |
 | `[from: agent]` | `rust/exomonad-core/src/services/delivery.rs:215-235,744-805` | `agent.notify_parent` | covered | Success notifications are logged before EventQueue publication and delivery. |
 | `[FAILED: agent]` | `rust/exomonad-core/src/services/delivery.rs:215-235,744-805` | `agent.notify_parent` | covered | Failure status and message are preserved in the canonical row. |
@@ -53,23 +54,23 @@ Rust watcher.
 
 | wakeup | source | bridged kind | status (covered / gap) | notes |
 |---|---|---|---|---|
-| `review_received` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:26-31,104`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3132-3204` | `copilot.review` | covered | Changes-requested review emits both the transient variant and the canonical review row. |
-| `review_commented` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:32-37,105`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3208-3235` | none | gap — #709 | Commented review is dispatched only as `pr_review`. |
-| `approved` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:38-40,106`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3041-3085` | none | gap — #709 | Approval is a transient `pr_review` event plus a parent handoff, not a distinct ledger row. |
-| `timeout` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:41-44,107`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3341-3375` | none | gap — #709 | Timeout has no dedicated canonical envelope. |
-| `fixes_pushed` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:45-49,108`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2951-2962` | none | gap — #709 | The transient event includes `head_sha`, but no ledger row is emitted for the transition. |
-| `commits_pushed` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:50-53,109`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2963-2971` | none | gap — #709 | The transient event has no canonical counterpart. |
-| `reviewer_approved` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:54-56,110`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3070-3078` | none | gap — #709 | The watcher emits `approved`, not a durable `reviewer_approved` envelope. |
-| `reviewer_requested_changes` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:57-62,111`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3180-3193` | `copilot.review` | covered | The review row preserves the comments/reviews and verified head. |
-| `rate_limited` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:63-66,112`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:697-702` | none | gap — #709 | Declared input with no current producer or ledger row. |
-| `stuck` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:67-70,113`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3148-3178` | none | gap — #709 | The review-loop stuck signal is transient; `agent.stuck` is emitted only for a separate harness-switch/no-op condition. |
-| `ci_triggered` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:71-75,114`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3113-3128` | none | gap — #709 | No canonical row records the manual-CI trigger decision. |
-| `ci_blocked` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:76-80,115`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2975-3024` | none | gap — #709 | The status-change row is not emitted for this review-blocking transition. |
-| `merge_ready` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:81-85,116`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3086-3112,3313-3338` | none | gap — #709 | The direct merge-ready wakeup is transient; `pr.merged` happens only after a later merge. |
-| `dev_not_pushing` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:86-88,117`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:334-348` | none | gap — #709 | Review-stall classification is not projected to a canonical event. |
-| `reviewer_not_responding` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:89-91,118`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:334-348` | none | gap — #709 | Review-stall classification is not projected to a canonical event. |
-| `reviewer_never_started` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:92-94,119`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:334-348` | none | gap — #709 | Review-stall classification is not projected to a canonical event. |
-| `dev_failed` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:95-97,120`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:334-348` | none | gap — #709 | Review-stall classification is not projected to a canonical event. |
+| `review_received` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:26-31,104`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3132-3204` | `pr.review` and `copilot.review` | covered | Changes-requested review emits both the transient variant and canonical review evidence. |
+| `review_commented` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:32-37,105`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3208-3235` | `pr.review` | covered | Commented review retains its comments and review kind. |
+| `approved` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:38-40,106`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3041-3085` | `pr.review` | covered | Approval retains the transient payload and native notification. |
+| `timeout` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:41-44,107`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3341-3375` | `pr.review` | covered | Timeout now has a canonical envelope with elapsed minutes. |
+| `fixes_pushed` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:45-49,108`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2951-2962` | `pr.review` | covered | The transient event and verified head are retained. |
+| `commits_pushed` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:50-53,109`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2963-2971` | `pr.review` | covered | The transient event and verified head are retained. |
+| `reviewer_approved` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:54-56,110`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3070-3078` | `pr.review` | covered | The active producer’s `approved` kind is the canonical alias for this guest variant. |
+| `reviewer_requested_changes` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:57-62,111`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3180-3193` | `pr.review` and `copilot.review` | covered | The review rows preserve the comments/reviews and verified head. |
+| `rate_limited` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:63-66,112`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:697-702` | `pr.review` when produced | covered | Declared input has no current producer; future producers use the canonical review path. |
+| `stuck` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:67-70,113`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3148-3178` | `pr.review` | covered | Review-loop stuck signals now retain rounds and notification text. |
+| `ci_triggered` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:71-75,114`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3113-3128` | `pr.review` | covered | The manual-CI trigger decision is retained. |
+| `ci_blocked` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:76-80,115`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2975-3024` | `pr.review` | covered | The review-blocking transition is retained with CI status. |
+| `merge_ready` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:81-85,116`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3086-3112,3313-3338` | `pr.review` | covered | The direct merge-ready wakeup is retained before any later `pr.merged` event. |
+| `dev_not_pushing` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:86-88,117`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:334-348` | `pr.review` | covered | Review-stall classification is projected to a canonical event. |
+| `reviewer_not_responding` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:89-91,118`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:334-348` | `pr.review` | covered | Review-stall classification is projected to a canonical event. |
+| `reviewer_never_started` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:92-94,119`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:334-348` | `pr.review` | covered | Review-stall classification is projected to a canonical event. |
+| `dev_failed` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:95-97,120`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:334-348` | `pr.review` | covered | The canonical review path accepts the guest failure kind; no active watcher producer currently classifies this exact variant. |
 
 ## GitHub poller transitions
 
@@ -79,12 +80,12 @@ is still part of the supported wakeup contract and is audited here.
 
 | wakeup | source | bridged kind | status (covered / gap) | notes |
 |---|---|---|---|---|
-| new SHA after changes requested → `fixes_pushed` | `rust/exomonad-core/src/services/github_poller.rs:137-174` | none | gap — #709 | Poller emits only transient `pr_review`. |
-| new SHA outside review-response cycle → `commits_pushed` | `rust/exomonad-core/src/services/github_poller.rs:163-174` | none | gap — #709 | Poller emits only transient `pr_review`. |
-| Copilot approval → `approved` | `rust/exomonad-core/src/services/github_poller.rs:181-193` | none | gap — #709 | No canonical approval envelope. |
-| Copilot changes requested → `review_received` | `rust/exomonad-core/src/services/github_poller.rs:197-220` | `copilot.review` | covered | The poller emits the review row with the verified `head_sha`. |
+| new SHA after changes requested → `fixes_pushed` | `rust/exomonad-core/src/services/github_poller.rs:137-174` | `pr.review` | covered | Poller retains the transient payload and verified head. |
+| new SHA outside review-response cycle → `commits_pushed` | `rust/exomonad-core/src/services/github_poller.rs:163-174` | `pr.review` | covered | Poller retains the transient payload and verified head. |
+| Copilot approval → `approved` | `rust/exomonad-core/src/services/github_poller.rs:181-193` | `pr.review` | covered | Poller records the approval transition. |
+| Copilot changes requested → `review_received` | `rust/exomonad-core/src/services/github_poller.rs:197-220` | `pr.review` and `copilot.review` | covered | The poller emits the transition row with the verified `head_sha`. |
 | CI status transition | `rust/exomonad-core/src/services/github_poller.rs:221-237` | `ci.status_changed` | covered | The poller emits the CI row with the verified `head_sha`. |
-| review timeout | `rust/exomonad-core/src/services/github_poller.rs:240-258` | none | gap — #709 | Timeout is only a transient `pr_review` input. |
+| review timeout | `rust/exomonad-core/src/services/github_poller.rs:240-258` | `pr.review` | covered | Poller records the timeout transition and elapsed minutes. |
 
 ## Parent-notification statuses
 
@@ -111,10 +112,9 @@ is still part of the supported wakeup contract and is audited here.
 
 ## Mode decision
 
-Coverage is not sufficient for M3 shadow mode (#678): #709-#712 are explicit
-blockers, and the shadow loop would otherwise observe a partial projection and
-could not deterministically replay several review decisions or direct inbox
-wakeups.
+Coverage is not sufficient for M3 shadow mode (#678): #710-#712 remain explicit
+blockers, and the shadow loop would otherwise observe missing terminal head
+context, incomplete sibling targeting, and direct inbox/issue-close wakeups.
 
 Coverage is also not sufficient for M5 active mode. Active mode additionally
 requires the reviewed head for terminal events, complete sibling targeting,

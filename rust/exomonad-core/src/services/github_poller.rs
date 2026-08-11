@@ -8,6 +8,7 @@
 use crate::domain::{BranchName, CIStatus, CommitSha, GithubOwner, GithubRepo, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
+use crate::services::event_log::{canonical_review_wakeup_data, PR_REVIEW_EVENT_TYPE};
 use crate::services::github::map_octo_err;
 use crate::services::repo;
 use anyhow::Result;
@@ -829,6 +830,26 @@ impl<
                     event_type,
                     payload,
                 } => {
+                    if event_type == "pr_review" {
+                        let data = canonical_review_wakeup_data(
+                            branch.as_str(),
+                            pr_number.as_u64(),
+                            pr_sha.as_str(),
+                            &payload,
+                        );
+                        if let Some(log) = self.ctx.event_log() {
+                            if let Err(error) =
+                                log.append(PR_REVIEW_EVENT_TYPE, branch.as_str(), &data)
+                            {
+                                warn!(
+                                    pr_number = pr_number.as_u64(),
+                                    branch = %branch,
+                                    %error,
+                                    "Failed to write canonical PR review wakeup"
+                                );
+                            }
+                        }
+                    }
                     if let Ok(Some(action)) = self
                         .call_handle_event(branch.as_str(), agent_type, event_type, payload)
                         .await

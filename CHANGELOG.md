@@ -262,6 +262,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Record canonical envelopes for PR review wakeups (#709)
 - M2.7 Event-completeness audit against the inbox wakeup set (#677)
 - M1.5 Golden parity test: Python FSM vs Haskell TLPhase (#669)
 - M0.6 Fail-closed retired-provider deprecation + CI grep gate (#664)
