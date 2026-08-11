@@ -292,6 +292,8 @@ impl<
                             "model": model,
                             "effort": effort,
                             "policy": "configured_worker_harness",
+                            "head_sha": null,
+                            "head_sha_finding": "not_available_without_verified_pr_context",
                         }),
                     );
                 }

@@ -139,7 +139,9 @@ notifyParentCore args = do
               [ "status" .= npStatus args,
                 "message" .= npMessage args,
                 "pr_number" .= npPrNumber args,
-                "tasks_completed" .= npTasksCompleted args
+                "tasks_completed" .= npTasksCompleted args,
+                "head_sha" .= (Nothing :: Maybe Text),
+                "head_sha_finding" .= ("not_available_without_verified_pr_context" :: Text)
               ]
   void $
     suspendEffect_ @LogEmitEvent

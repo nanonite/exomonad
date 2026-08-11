@@ -52,17 +52,14 @@ KIND_BY_EVENT_TYPE: Mapping[str, EventKind] = MappingProxyType(
 )
 MAPPED_EVENT_TYPES = frozenset(KIND_BY_EVENT_TYPE)
 
-# These event types still have server-side emitters that do not put a head SHA
-# in their payloads. This is a finding for M2.7 (#677), not permission for this
-# projection to synthesize it.
+# These event types still have server-side emitters without verified PR context.
+# This is a finding for M2.7 (#677), not permission for this projection to
+# synthesize a SHA.
 SERVER_EMIT_HEAD_SHA_GAPS = frozenset(
     {
-        "pr.merged",
-        "pr.merge_failed",
         "agent.completed",
         "agent.stuck",
         "agent.notify_parent",
-        "agent.sibling_merged",
     }
 )
 

@@ -91,9 +91,9 @@ is still part of the supported wakeup contract and is audited here.
 
 | wakeup | source | bridged kind | status (covered / gap) | notes |
 |---|---|---|---|---|
-| `notify_parent(status=success)` | `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs:52-67,130-168`; `rust/exomonad-core/src/services/delivery.rs:182-205,772-805` | `agent.completed` then `agent.notify_parent` | covered | The Haskell tool emits completion first; the shared Rust delivery path records the parent notification. The terminal completion row still lacks `head_sha` (#710). |
-| `notify_parent(status=failure)` | `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs:52-67,130-168`; `rust/exomonad-core/src/services/delivery.rs:182-205,772-805` | `agent.completed` then `agent.notify_parent` | covered | Status/message are preserved. The terminal completion row still lacks `head_sha` (#710). |
-| `notify_parent(status=stuck)` | `rust/exomonad-core/src/services/delivery.rs:182-205,772-805` | `agent.notify_parent` | covered | Rust accepts and logs `stuck`; the Haskell tool currently exposes only success/failure. The row still lacks `head_sha` (#710). |
+| `notify_parent(status=success)` | `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs:52-67,130-168`; `rust/exomonad-core/src/services/delivery.rs:182-805` | `agent.completed` then `agent.notify_parent` | covered | The Haskell tool emits completion first; the shared Rust delivery path records the parent notification. Both rows retain an explicit no-verified-PR-context finding. |
+| `notify_parent(status=failure)` | `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs:52-67,130-168`; `rust/exomonad-core/src/services/delivery.rs:182-805` | `agent.completed` then `agent.notify_parent` | covered | Status/message are preserved, and the missing SHA is explicit rather than synthesized. |
+| `notify_parent(status=stuck)` | `rust/exomonad-core/src/services/delivery.rs:182-805` | `agent.notify_parent` | covered | Rust accepts and logs `stuck`; the Haskell tool currently exposes only success/failure. The row records the same explicit finding when no PR context is available. |
 
 ## Existing canonical event cross-check
 
@@ -101,20 +101,20 @@ is still part of the supported wakeup contract and is audited here.
 |---|---|---|---|---|
 | PR filed or updated | `rust/exomonad-core/src/handlers/file_pr.rs:149-179,206-215` | `pr.filed` / `pr.updated` | covered | The row includes PR metadata and `head_sha`. |
 | verified PR published | `rust/exomonad-core/src/handlers/file_pr.rs:149-164` | `pr.published` | covered | Publication is durable and includes `head_sha`. |
-| PR merged | `rust/exomonad-core/src/handlers/merge_pr.rs:104-121` | `pr.merged` | gap — #710 | The row has PR number/strategy but no verified `head_sha`. |
-| PR merge failed | `rust/exomonad-core/src/handlers/merge_pr.rs:134-149` | `pr.merge_failed` | gap — #710 | The row has PR number/error but no verified `head_sha`. |
+| PR merged | `rust/exomonad-core/src/handlers/merge_pr.rs:104-129`; `rust/exomonad-core/src/services/merge_pr.rs:44-49`; `haskell/wasm-guest/src/ExoMonad/Guest/Tools/MergePR.hs:443-470` | `pr.merged` | covered | Rust and the Haskell tool receive the same verified Forgejo head SHA through the merge effect response; a missing source is explicitly annotated. |
+| PR merge failed | `rust/exomonad-core/src/handlers/merge_pr.rs:134-149`; `rust/exomonad-core/src/services/merge_pr.rs:44-49` | `pr.merge_failed` | covered | The failure row retains the head SHA from the same verified PR lookup. |
 | Copilot review changed | `rust/exomonad-core/src/services/worktree_event_watcher.rs:2686-2741` | `copilot.review` | covered | #676 added `head_sha` to the active watcher emission. |
 | CI status changed | `rust/exomonad-core/src/services/worktree_event_watcher.rs:3282-3309` | `ci.status_changed` | covered | #676 added `head_sha` to the active watcher emission. |
-| guest completion | `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs:130-151` | `agent.completed` | gap — #710 | The completion row is canonical but has no verified `head_sha`. |
-| harness-switch/no-op stuck | `rust/exomonad-core/src/handlers/events.rs:139-157,281-292` | `agent.stuck` | gap — #710 | The row is canonical but has no verified `head_sha`. |
-| parent notification | `rust/exomonad-core/src/services/delivery.rs:772-791` | `agent.notify_parent` | gap — #710 | The row is canonical but has no verified `head_sha`. |
-| sibling merge observation | `rust/exomonad-core/src/services/worktree_event_watcher.rs:2372-2389` | `agent.sibling_merged` | gap — #710, #711 | The row lacks both a verified `head_sha` and the dispatched sibling recipient context. |
+| guest completion | `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs:130-153` | `agent.completed` | explicit finding | This generic tool event has no verified PR context; it records `head_sha: null` and `head_sha_finding` for interpretation. |
+| harness-switch/no-op stuck | `rust/exomonad-core/src/handlers/events.rs:139-159,281-294` | `agent.stuck` | explicit finding | These policy events have no verified PR context; they record the null SHA and finding. |
+| parent notification | `rust/exomonad-core/src/services/delivery.rs:772-799` | `agent.notify_parent` | explicit finding | Generic notifications retain a null SHA and finding unless a verified watcher handoff supplies one. |
+| sibling merge observation | `rust/exomonad-core/src/services/worktree_event_watcher.rs:2419-2495` | `agent.sibling_merged` | gap — #711 | The row now carries the removed sibling’s last verified head, but still lacks the dispatched sibling recipient context. |
 
 ## Mode decision
 
-Coverage is not sufficient for M3 shadow mode (#678): #710-#712 remain explicit
-blockers, and the shadow loop would otherwise observe missing terminal head
-context, incomplete sibling targeting, and direct inbox/issue-close wakeups.
+Coverage is not sufficient for M3 shadow mode (#678): #711-#712 remain explicit
+blockers, and the shadow loop would otherwise observe incomplete sibling
+targeting and direct inbox/issue-close wakeups.
 
 Coverage is also not sufficient for M5 active mode. Active mode additionally
 requires the reviewed head for terminal events, complete sibling targeting,

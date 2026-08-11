@@ -2319,6 +2319,7 @@ where
             &message,
             Some("SHA-scoped parent repair handoff"),
             "watcher_parent_repair_handoff",
+            Some(head_sha),
         )
         .await;
         if matches!(result, crate::services::delivery::DeliveryResult::Failed) {
@@ -2428,8 +2429,8 @@ where
         let state_guard = self.state.prs.lock().await;
 
         for pr_num in removed {
-            let branch = match state_guard.get(pr_num) {
-                Some(s) => s.branch_name.clone(),
+            let (branch, head_sha) = match state_guard.get(pr_num) {
+                Some(s) => (s.branch_name.clone(), s.last_sha.clone()),
                 None => continue,
             };
 
@@ -2490,6 +2491,7 @@ where
                         "pr_number": *pr_num,
                         "branch": branch.as_str(),
                         "parent": parent_branch,
+                        "head_sha": head_sha,
                     }),
                 );
             }
@@ -2753,6 +2755,7 @@ where
                         &message,
                         None,
                         "event_handler",
+                        None,
                     )
                     .await,
                     crate::services::delivery::DeliveryResult::Failed

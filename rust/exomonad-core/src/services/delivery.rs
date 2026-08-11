@@ -768,6 +768,7 @@ pub async fn notify_parent_delivery(
     message: &str,
     summary: Option<&str>,
     source: &str,
+    head_sha: Option<&str>,
 ) -> DeliveryResult {
     // 1. Log OTel event + JSONL
     tracing::info!(
@@ -786,6 +787,12 @@ pub async fn notify_parent_delivery(
                 "status": status.as_str(),
                 "message": message,
                 "source": source,
+                "head_sha": head_sha,
+                "head_sha_finding": head_sha.map(|_| serde_json::Value::Null).unwrap_or_else(|| {
+                    serde_json::Value::String(
+                        "not_available_without_verified_pr_context".to_string(),
+                    )
+                }),
             }),
         );
     }

@@ -262,6 +262,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Preserve terminal event head SHAs in the canonical ledger (#710)
 - Record canonical envelopes for PR review wakeups (#709)
 - M2.7 Event-completeness audit against the inbox wakeup set (#677)
 - M1.5 Golden parity test: Python FSM vs Haskell TLPhase (#669)

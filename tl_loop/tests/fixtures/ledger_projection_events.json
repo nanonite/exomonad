@@ -81,7 +81,7 @@
     "role": "worker",
     "source": "rust",
     "lifecycle_state": "emitted",
-    "data": {"pr_number": 101, "strategy": "squash", "git_fetched": true}
+    "data": {"pr_number": 101, "strategy": "squash", "git_fetched": true, "head_sha": "bbb222", "head_sha_finding": null}
   },
   {
     "schema_version": 1,
@@ -102,7 +102,7 @@
     "role": "worker",
     "source": "rust",
     "lifecycle_state": "emitted",
-    "data": {"pr_number": 102, "error": "merge conflict"}
+    "data": {"pr_number": 102, "error": "merge conflict", "head_sha": "ccc333", "head_sha_finding": null}
   },
   {
     "schema_version": 1,
@@ -186,7 +186,7 @@
     "role": "worker",
     "source": "haskell",
     "lifecycle_state": "completed",
-    "data": {"status": "success", "message": "done", "pr_number": 101}
+    "data": {"status": "success", "message": "done", "pr_number": 101, "head_sha": null, "head_sha_finding": "not_available_without_verified_pr_context"}
   },
   {
     "schema_version": 1,
@@ -207,7 +207,7 @@
     "role": "worker",
     "source": "rust",
     "lifecycle_state": "emitted",
-    "data": {"kind": "harness_switch_disallowed", "guidance_required": true}
+    "data": {"kind": "harness_switch_disallowed", "guidance_required": true, "head_sha": null, "head_sha_finding": "not_available_without_verified_pr_context"}
   },
   {
     "schema_version": 1,
@@ -228,7 +228,7 @@
     "role": "worker",
     "source": "rust",
     "lifecycle_state": "emitted",
-    "data": {"parent": "root", "status": "completed", "source": "worker"}
+    "data": {"parent": "root", "status": "completed", "source": "worker", "head_sha": null, "head_sha_finding": "not_available_without_verified_pr_context"}
   },
   {
     "schema_version": 1,
@@ -249,6 +249,6 @@
     "role": "watcher",
     "source": "watcher",
     "lifecycle_state": "observed",
-    "data": {"pr_number": 101, "branch": "task-a", "parent": "root"}
+    "data": {"pr_number": 101, "branch": "task-a", "parent": "root", "head_sha": "bbb222"}
   }
 ]

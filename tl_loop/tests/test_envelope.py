@@ -58,7 +58,15 @@ def test_review_and_ci_fields_are_projected_from_data_without_synthesis() -> Non
     assert projected["copilot.review"].review_state == "changes_requested"
     assert projected["ci.status_changed"].head_sha == "bbb222"
     assert projected["ci.status_changed"].ci_status == "failure"
+    assert projected["pr.merged"].head_sha == "bbb222"
+    assert projected["pr.merge_failed"].head_sha == "ccc333"
+    assert projected["agent.sibling_merged"].head_sha == "bbb222"
     assert all(projected[event_type].head_sha is None for event_type in SERVER_EMIT_HEAD_SHA_GAPS)
+    assert all(
+        projected[event_type].data["head_sha_finding"]
+        == "not_available_without_verified_pr_context"
+        for event_type in SERVER_EMIT_HEAD_SHA_GAPS
+    )
 
 
 def test_unmapped_allowlisted_event_type_is_rejected_at_read_time() -> None:

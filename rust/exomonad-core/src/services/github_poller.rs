@@ -530,6 +530,7 @@ impl<
                     &message,
                     Some(&summary),
                     "event_handler",
+                    None,
                 )
                 .await;
             }
@@ -635,6 +636,7 @@ impl<
 
             for (pr_num, branch) in &tracked {
                 if !pr_map.contains_key(branch.as_str()) {
+                    let head_sha = state_guard.get(pr_num).map(|state| state.last_sha.clone());
                     let parent_branch = branch
                         .as_str()
                         .rsplit_once('.')
@@ -683,6 +685,7 @@ impl<
                                 "pr_number": pr_num.as_u64(),
                                 "branch": branch.as_str(),
                                 "parent": parent_branch,
+                                "head_sha": head_sha,
                             }),
                         );
                     }

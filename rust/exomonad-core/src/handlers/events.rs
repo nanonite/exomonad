@@ -153,6 +153,8 @@ fn capture_parent_notification<C: HasSessionMemory + HasEventLog>(
                     "reason": bounded_handoff_reason(message),
                     "guidance_required": true,
                     "retry_policy": "same_harness_or_resume_pr",
+                    "head_sha": null,
+                    "head_sha_finding": "not_available_without_verified_pr_context",
                 }),
             );
         }
@@ -381,6 +383,7 @@ impl<
                 &req.message,
                 None,
                 "agent",
+                None,
             )
             .await;
             capture_parent_notification(
@@ -420,6 +423,7 @@ impl<
                 &req.message,
                 None,
                 "agent",
+                None,
             )
             .await;
             capture_parent_notification(
@@ -464,6 +468,7 @@ impl<
             &req.message,
             None,
             "agent",
+            None,
         )
         .await;
         capture_parent_notification(

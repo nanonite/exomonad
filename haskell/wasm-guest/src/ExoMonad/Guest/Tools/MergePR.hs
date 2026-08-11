@@ -444,6 +444,12 @@ runMerge args = do
           mergeSuccess = MP.mergePrResponseSuccess resp
           mergeMsg = TL.toStrict (MP.mergePrResponseMessage resp)
           gitFetched = MP.mergePrResponseGitFetched resp
+          headSha = TL.toStrict (MP.mergePrResponseHeadSha resp)
+          headShaValue = if T.null headSha then Nothing else Just headSha
+          headShaFinding =
+            if T.null headSha
+              then Just ("not_available_without_verified_pr_context" :: Text)
+              else Nothing
 
       void $ suspendEffect_ @LogInfo (Log.InfoRequest {Log.infoRequestMessage = TL.fromStrict $ "MergePR: " <> mergeMsg, Log.infoRequestFields = ""})
 
@@ -455,7 +461,9 @@ runMerge args = do
                     Aeson.encode $
                       object
                         [ "pr_number" .= mprPrNumber args,
-                          "success" .= True
+                          "success" .= True,
+                          "head_sha" .= headShaValue,
+                          "head_sha_finding" .= headShaFinding
                         ]
             void $
               suspendEffect_ @LogEmitEvent

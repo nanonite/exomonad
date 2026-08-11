@@ -16,6 +16,8 @@ message MergePrResponse {
   bool git_fetched = 3;
   // Head branch of the merged PR (e.g., "main.feature-a"). Empty if unknown.
   string branch_name = 4;
+  // Verified Forgejo head SHA. Empty if the source did not provide one.
+  string head_sha = 5;
 }
 
 service MergePrEffects {

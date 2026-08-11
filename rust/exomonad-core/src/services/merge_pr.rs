@@ -14,6 +14,7 @@ pub struct MergePROutput {
     pub message: String,
     pub git_fetched: bool,
     pub branch_name: BranchName,
+    pub head_sha: Option<String>,
 }
 
 /// Merge a PR using the Forgejo API.
@@ -45,6 +46,7 @@ pub async fn merge_pr_async(
         .get_pull_request(&repo_info.owner, &repo_info.repo, pr_number)
         .await?;
     let branch_name = pr.head_ref.clone();
+    let head_sha = pr.head_sha.clone();
 
     let method = match strategy {
         MergeStrategy::Squash => "squash",
@@ -70,6 +72,7 @@ pub async fn merge_pr_async(
             message: error.to_string(),
             git_fetched: false,
             branch_name,
+            head_sha,
         });
     }
 
@@ -99,6 +102,7 @@ pub async fn merge_pr_async(
         message: format!("PR #{} merged via {}", pr_number, strategy),
         git_fetched,
         branch_name,
+        head_sha,
     })
 }
 

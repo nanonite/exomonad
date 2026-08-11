@@ -107,6 +107,7 @@ impl<
                 pr_number = pr_number.as_u64(),
                 strategy = strategy.as_str(),
                 git_fetched = result.git_fetched,
+                head_sha = ?result.head_sha,
                 "[event] pr.merged"
             );
             if let Some(log) = self.ctx.event_log() {
@@ -117,6 +118,14 @@ impl<
                         "pr_number": pr_number.as_u64(),
                         "strategy": strategy.as_str(),
                         "git_fetched": result.git_fetched,
+                        "head_sha": result.head_sha,
+                        "head_sha_finding": if result.head_sha.is_some() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::String(
+                                "not_available_without_verified_pr_context".to_string(),
+                            )
+                        },
                     }),
                 );
             }
@@ -136,6 +145,7 @@ impl<
                 otel.name = "pr.merge_failed",
                 pr_number = pr_number.as_u64(),
                 error = %result.message,
+                head_sha = ?result.head_sha,
                 "[event] pr.merge_failed"
             );
             if let Some(log) = self.ctx.event_log() {
@@ -145,6 +155,14 @@ impl<
                     &serde_json::json!({
                         "pr_number": pr_number.as_u64(),
                         "error": &result.message,
+                        "head_sha": result.head_sha,
+                        "head_sha_finding": if result.head_sha.is_some() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::String(
+                                "not_available_without_verified_pr_context".to_string(),
+                            )
+                        },
                     }),
                 );
             }
@@ -155,6 +173,7 @@ impl<
             message: result.message,
             git_fetched: result.git_fetched,
             branch_name: result.branch_name.to_string(),
+            head_sha: result.head_sha.unwrap_or_default(),
         })
     }
 }
@@ -229,12 +248,14 @@ mod tests {
             message: "PR #42 merged via squash".to_string(),
             git_fetched: true,
             branch_name: "main.fix-auth-codex".to_string(),
+            head_sha: "verified-sha".to_string(),
         };
 
         assert!(response.success);
         assert!(response.message.contains("42"));
         assert!(response.git_fetched);
         assert_eq!(response.branch_name, "main.fix-auth-codex");
+        assert_eq!(response.head_sha, "verified-sha");
     }
 
     #[test]
