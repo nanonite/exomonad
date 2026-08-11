@@ -361,7 +361,7 @@ suspension, and worker exit diagnostics.
 
 | Event type or signal | Where | Observed fields |
 | --- | --- | --- |
-| `tool.called` | Standard EventLog and OTel | tool name, role, duration in ms, success, error |
+| `tool.called` | Standard EventLog and OTel | tool name, role, original arguments, duration in ms, success, error |
 | `log.emit_event` event type | Standard EventLog and OTel | caller-selected type, event ID, JSON payload |
 | `message.delivery` | OTel/tracing | sender, recipient, channel/method, outcome, detail, attempt |
 | `agent.message_sent` | OTel/tracing | address, method, success |

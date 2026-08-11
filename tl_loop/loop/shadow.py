@@ -54,6 +54,13 @@ class EventSource(Protocol):
         """Persist consumption of one event sequence."""
 
 
+class ActionRecorder(Protocol):
+    """Persistence capability for intended actions."""
+
+    def record(self, action: IntendedAction) -> None:
+        """Persist one action before the source is acknowledged."""
+
+
 class ShadowJudgments(Protocol):
     """The three judgment seams kept deterministic until the LLM milestone."""
 
@@ -200,12 +207,14 @@ class ShadowLoop:
         readonly_client: ReadOnlyEffectClient,
         judgments: ShadowJudgments | None = None,
         decoder: TLEventDecoder | None = None,
+        recorder: ActionRecorder | None = None,
     ) -> None:
         self.source = source
         self.store = store
         self.judgments = judgments or DeterministicJudgments()
         self.decoder = decoder or TLEventDecoder()
         self.readonly_client = readonly_client
+        self.recorder = recorder
 
     @classmethod
     def for_run(
@@ -217,17 +226,23 @@ class ShadowLoop:
         root_dir: str | Path = DEFAULT_SHADOW_ROOT,
         judgments: ShadowJudgments | None = None,
         decoder: TLEventDecoder | None = None,
+        recorder: ActionRecorder | None = None,
     ) -> ShadowLoop:
         """Open a shadow checkpoint below ``.exo/tl-loop/shadow``."""
         store = RunStore(run_id, Path(root_dir))
         if not store.path.exists():
             create(run_id, {}, root_dir=store.root_dir)
+        if recorder is None:
+            from tl_loop.shadow.recorder import IntendedActionRecorder
+
+            recorder = IntendedActionRecorder(run_id, root_dir=store.root_dir)
         return cls(
             source,
             store,
             readonly_client=readonly_client,
             judgments=judgments,
             decoder=decoder,
+            recorder=recorder,
         )
 
     def run(self, *, timeout: float | None = None, max_events: int | None = None) -> ShadowRunResult:
@@ -266,6 +281,8 @@ class ShadowLoop:
                 _phase_tag(next_phase),
             )
             state = self.store.checkpoint(next_phase, slices, state.budgets, event_seq)
+            if self.recorder is not None:
+                self.recorder.record(action)
             self.source.acknowledge(event)
             phase = next_phase
             actions.append(action)
@@ -413,6 +430,7 @@ def _positive_int(value: Mapping[str, object], key: str, event_type: str) -> int
 
 
 __all__ = [
+    "ActionRecorder",
     "DeterministicJudgments",
     "DEFAULT_SHADOW_ROOT",
     "IntendedAction",

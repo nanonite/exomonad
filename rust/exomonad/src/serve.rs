@@ -1046,6 +1046,7 @@ pub async fn call_tool(
     Json(body): Json<ToolCallRequest>,
 ) -> impl IntoResponse {
     tracing::info!(tool = %body.name, "Executing tool");
+    let tool_arguments = body.arguments.clone();
 
     let input = exomonad_core::mcp::tools::MCPCallInput::new(
         role.clone(),
@@ -1077,6 +1078,7 @@ pub async fn call_tool(
                     &serde_json::json!({
                         "tool_name": body.name,
                         "role": role,
+                        "arguments": tool_arguments.clone(),
                         "duration_ms": duration_ms,
                         "success": false,
                         "error": e.to_string(),
@@ -1107,6 +1109,7 @@ pub async fn call_tool(
             &serde_json::json!({
                 "tool_name": body.name,
                 "role": role,
+                "arguments": tool_arguments,
                 "duration_ms": duration_ms,
                 "success": output.success,
                 "error": output.error,

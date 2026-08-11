@@ -118,6 +118,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M3.2 Intended-action recorder and divergence diff report (#679)
 - M3.1 Shadow-mode loop skeleton (read-only) (#678)
 - M2.6 Bridge server events into the event log (#676)
 - M2.5 Python reader and in-process queue over the existing ledger segments (#675)
