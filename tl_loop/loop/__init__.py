@@ -12,6 +12,7 @@ from .driver import (
     WorkerTask,
     WorkPlan,
     run_tl_loop,
+    tl_run,
 )
 from .shadow import (
     DEFAULT_SHADOW_ROOT,
@@ -46,4 +47,5 @@ __all__ = [
     "WorkPlan",
     "WorkerTask",
     "run_tl_loop",
+    "tl_run",
 ]

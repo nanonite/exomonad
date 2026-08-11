@@ -19,7 +19,13 @@ from tl_loop.loop.driver import (
     TLLoopConfig,
     WorkPlan,
     run_tl_loop,
+    tl_run,
 )
+from tl_loop.select.capability import CapabilityMap
+from tl_loop.select.classify import Difficulty
+from tl_loop.select.model import ModelCatalog
+from tl_loop.select.policy import validate_policy
+from tl_loop.state.schema import BudgetLedger
 
 
 @dataclass
@@ -86,6 +92,44 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert result.final_state.slices["worker-a"].status.value == "merged"
     assert result.final_state.slices["leaf-a"].status.value == "merged"
     assert source.acknowledged == [1, 2, 3, 4, 5]
+
+
+def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> None:
+    transport = RecordingTransport()
+    run_id = "selector-run"
+    source = SyntheticQueue(_lifecycle_events(run_id))
+    policy = validate_policy(_selector_policy())
+    config = TLLoopConfig(
+        source=source,
+        effects=EffectClient(transport),
+        root_dir=tmp_path,
+        policy=policy,
+        capabilities=CapabilityMap(
+            {"codex/gpt-luna": Difficulty.STANDARD, "claude/sonnet": Difficulty.HARD}
+        ),
+        catalog=ModelCatalog.from_fixture(
+            Path(__file__).parent / "fixtures" / "model_catalog.json"
+        ),
+        requested_model="gpt-5.5",
+        max_workers=1,
+        max_leaves=1,
+        max_events=5,
+        poll_interval=0.001,
+        idle_timeout=0.1,
+    )
+
+    result = tl_run({"run_id": run_id, "plan": _plan()}, config, BudgetLedger(0, 0))
+
+    assert [name for name, _ in transport.calls] == [
+        "spawn_worker",
+        "spawn_leaf",
+        "merge_pr",
+    ]
+    assert transport.calls[0][1]["agent_type"] == "codex/gpt-luna"
+    assert result.final_state.budgets.role_reserved == {"worker": 500}
+    assert result.final_state.budgets.harness_reserved == {"codex/gpt-luna": 500}
+    assert result.final_state.slices["worker-a"].model == "gpt-5.5"
+    assert result.final_state.fsm.phase is TLPhase.TLDone
 
 
 def test_shadow_loop_uses_the_same_driver_without_mutating_transport(
@@ -172,6 +216,17 @@ def test_loop_rejects_an_event_stream_over_its_event_ceiling(tmp_path: Path) -> 
             ),
             root_dir=tmp_path,
         )
+
+
+def _selector_policy() -> dict[str, object]:
+    role = {
+        "allow": ["codex/gpt-luna", "claude/sonnet"],
+        "cost_rank": {"codex/gpt-luna": 1, "claude/sonnet": 2},
+        "token_budget": 120000,
+        "per_harness_budget": {"codex/gpt-luna": 80000, "claude/sonnet": 40000},
+        "escalate_after_attempts": 1,
+    }
+    return {"roles": {"tl": dict(role), "worker": dict(role), "reviewer": dict(role)}}
 
 
 def _plan() -> WorkPlan:
