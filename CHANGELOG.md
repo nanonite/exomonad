@@ -118,6 +118,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M5.2 depends_on DAG scheduling and max_parallel_slices gate (#690)
 - M5.1 Loop driver: single-wave spawn-wait-adjudicate-merge (#689)
 - M4.6 Budget ledger with same-write charging and reconciliation (#687)
 - M4.5 select_model: port the prime-agent resolution ladder (#686)
