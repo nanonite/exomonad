@@ -18,6 +18,7 @@ pub async fn run(_name: Option<String>, reviewer_max_rounds: Option<u32>) -> Res
     info!("Initializing new ExoMonad project");
     std::fs::create_dir_all(cwd.join(".exo"))?;
     std::fs::write(&config_path, config_content())?;
+    write_tl_loop_defaults(&cwd)?;
 
     let policy_path = cwd.join(".exo/review-policy.toml");
     if !policy_path.exists() {
@@ -163,6 +164,54 @@ fn config_content() -> String {
     .to_string()
 }
 
+fn write_tl_loop_defaults(project_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(project_dir.join(".exo"))?;
+    let policy_path = project_dir.join(".exo/harness_policy.toml");
+    if !policy_path.exists() {
+        std::fs::write(
+            &policy_path,
+            r#"# Human-authored harness and budget boundaries for the TL loop.
+
+[roles.tl]
+allow = ["codex/gpt-luna"]
+cost_rank = { "codex/gpt-luna" = 1 }
+token_budget = 120000
+escalate_after_attempts = 1
+
+[roles.worker]
+allow = ["codex/gpt-luna", "claude/sonnet"]
+cost_rank = { "codex/gpt-luna" = 1, "claude/sonnet" = 2 }
+token_budget = 120000
+per_harness_budget = { "codex/gpt-luna" = 80000, "claude/sonnet" = 40000 }
+escalate_after_attempts = 1
+
+[roles.reviewer]
+allow = ["codex/gpt-luna"]
+cost_rank = { "codex/gpt-luna" = 1 }
+token_budget = 60000
+escalate_after_attempts = 1
+"#,
+        )?;
+        info!("Created .exo/harness_policy.toml");
+    }
+
+    let capability_path = project_dir.join(".exo/harness_capability.toml");
+    if !capability_path.exists() {
+        std::fs::write(
+            &capability_path,
+            r#"# Static capability ratings. Each entry records the operator's basis.
+
+[capabilities]
+# Basis: operator judgment for the default low-cost worker model; standard tasks only.
+"codex/gpt-luna" = "standard"
+# Basis: vendor tier and the configured escalation target; hard tasks are supported.
+"claude/sonnet" = "hard"
+"#,
+        )?;
+        info!("Created .exo/harness_capability.toml");
+    }
+    Ok(())
+}
 fn forgejo_ssh_remote_url(
     forgejo_url: &str,
     configured_port: Option<u16>,
@@ -373,6 +422,23 @@ async fn register_forgejo_repo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tl_loop_defaults_are_created_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tl_loop_defaults(dir.path()).unwrap();
+
+        let policy = dir.path().join(".exo/harness_policy.toml");
+        let capability = dir.path().join(".exo/harness_capability.toml");
+        assert!(policy.exists());
+        assert!(capability.exists());
+        let original = std::fs::read_to_string(&policy).unwrap();
+
+        std::fs::write(&policy, "custom = true\n").unwrap();
+        write_tl_loop_defaults(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(policy).unwrap(), "custom = true\n");
+        assert!(!original.is_empty());
+    }
 
     #[test]
     fn scaffolds_forgejo_ci_placeholder_workflow() {

@@ -47,7 +47,7 @@ fn test_hook_fails_open_when_server_unreachable() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-fn test_init_help_describes_agent_type_flags() -> Result<(), Box<dyn std::error::Error>> {
+fn test_init_help_describes_worker_and_reviewer_flags() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = cargo_bin_cmd!("exomonad");
 
     let output = cmd
@@ -61,12 +61,13 @@ fn test_init_help_describes_agent_type_flags() -> Result<(), Box<dyn std::error:
 
     assert_eq!(
         help.matches("valid: claude|opencode|codex|shoal").count(),
-        2
+        1
     );
-    assert!(help.contains("With --tl=opencode, stores [opencode].tl_model"));
-    assert!(help.contains("With other TL agents, stores the root agent model"));
+    assert!(!help.contains("--tl"));
+    assert!(!help.contains("--opencode-as-tl"));
     assert!(help.contains("CLI effort flags override config.toml"));
     assert!(help.contains("forked TLs, leaves, ephemeral workers, and companions"));
+    assert!(help.contains("Maximum reviewer rounds before a PR is escalated to Stuck"));
 
     Ok(())
 }

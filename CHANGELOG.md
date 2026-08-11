@@ -119,6 +119,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M8.3 Make the programmatic loop the default TL (#706)
 - M7.4 Goals and heartbeats for long-running waves (#703)
 - M7.3 Refine trigger on observed repetition (#702)
 - M7.2 Durable dispatch-policy store with snapshot and rollback (#701)

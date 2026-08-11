@@ -53,7 +53,24 @@ PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/active_run.py" \
     --remote "$REMOTE_DIR" \
     --artifacts "$ARTIFACTS"
 
-printf '>>> [Phase 2] Confirming captured assertions before cleanup...\n'
+printf '>>> [Phase 2] Exercising the default TL-window controller command without starting a session...\n'
+mkdir -p "$REPO_DIR/.exo/tl-loop"
+printf '%s\n' '{"run_id":"root","plan":{"leaves":[]}}' > "$REPO_DIR/.exo/tl-loop/plan.json"
+PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop run \
+    --project-root "$REPO_DIR" \
+    --plan "$REPO_DIR/.exo/tl-loop/plan.json" \
+    --run-id root
+python3 - "$REPO_DIR/.exo/tl-loop/root/run.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert state["fsm"]["phase"] == "tl_done"
+print("PASS: default TL controller command reached tl_done without tmux")
+PY
+
+printf '>>> [Phase 3] Confirming captured assertions before cleanup...\n'
 [[ -s "$ARTIFACTS" ]] || { echo "ERROR: active run artifact is missing." >&2; exit 1; }
 python3 - "$ARTIFACTS" <<'PY'
 import json

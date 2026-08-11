@@ -247,6 +247,11 @@ _install profile:
     cp .exo/wasm/wasm-guest-devswarm.wasm ~/.exo/wasm/
     [ -f .exo/wasm/wasm-guest-e2e-test.wasm ] && cp .exo/wasm/wasm-guest-e2e-test.wasm ~/.exo/wasm/ || true
 
+    # Install the standard-library-only programmatic TL controller for consuming repos.
+    mkdir -p ~/.exo/tl_loop
+    cp tl_loop/__init__.py tl_loop/__main__.py ~/.exo/tl_loop/
+    cp -R tl_loop/client tl_loop/events tl_loop/fsm tl_loop/harness tl_loop/loop tl_loop/rlm tl_loop/select tl_loop/shadow tl_loop/state ~/.exo/tl_loop/
+
     # Install role context files for consuming repos
     mkdir -p ~/.exo/roles/devswarm/context
     cp .exo/roles/devswarm/context/*.md ~/.exo/roles/devswarm/context/
@@ -348,7 +353,7 @@ check-e2e-tl-loop-shadow:
     bash -n tests/e2e/tl-loop-shadow/run.sh
     python3 -m py_compile tests/e2e/tl-loop-shadow/shadow_companion.py
 
-# Run the bounded active TL loop against a scratch repository; no interactive session.
+# Run the bounded active TL loop and the default TL-window command against a scratch repository; no session is created by this test.
 e2e-tl-loop-active:
     ./tests/e2e/tl-loop-active/run.sh
 

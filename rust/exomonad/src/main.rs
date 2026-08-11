@@ -76,33 +76,16 @@ enum Commands {
         /// Delete existing session and create fresh
         #[arg(long)]
         recreate: bool,
-        /// Use OpenCode as the root TL agent (default: Claude)
-        #[arg(long)]
-        opencode_as_tl: bool,
         /// Enable OpenRouter for LLM routing
         #[arg(long)]
         openrouter: bool,
-        /// Set root agent type (valid: claude|opencode|codex|shoal;
-        /// overrides --opencode-as-tl and the configured root_agent_type)
-        #[arg(long)]
-        tl: Option<String>,
         /// Set spawn agent type for workers/teammates. The worker effort level is
         /// inherited by forked TLs, leaves, ephemeral workers, and companions.
         #[arg(long)]
         worker: Option<String>,
-        /// Model for the root TL agent.
-        /// With --tl=opencode, stores [opencode].tl_model and validates via
-        /// opencode models.
-        /// With other TL agents, stores the root agent model.
-        #[arg(long)]
-        tl_model: Option<String>,
         /// Model for spawned workers with --worker=opencode.
         #[arg(long)]
         worker_model: Option<String>,
-        /// Effort for the root TL: low, medium, high, xhigh, or max. CLI effort
-        /// flags override config.toml; omitted effort defaults to medium.
-        #[arg(long, value_enum)]
-        tl_effort_level: Option<config::EffortLevel>,
         /// Effort inherited by forked TLs, leaves, ephemeral workers, and companions.
         /// For OpenCode this becomes the model's `--variant` when supported.
         #[arg(long, value_enum)]
@@ -504,13 +487,9 @@ async fn main() -> Result<()> {
         Commands::Init {
             session,
             recreate,
-            opencode_as_tl,
             openrouter,
-            tl,
             worker,
-            tl_model,
             worker_model,
-            tl_effort_level,
             worker_effort_level,
             reviewer_effort_level,
             reviewer,
@@ -525,13 +504,9 @@ async fn main() -> Result<()> {
             if let Err(e) = init::run(
                 session,
                 recreate,
-                opencode_as_tl,
                 openrouter,
-                tl,
                 worker,
-                tl_model,
                 worker_model,
-                tl_effort_level,
                 worker_effort_level,
                 reviewer_effort_level,
                 reviewer,

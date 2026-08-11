@@ -129,17 +129,23 @@ if !status.success() {
 
 **`exomonad init` is the idempotent entry point for development sessions.** It creates a tmux session with:
 - **Server window**: Runs `exomonad serve` (the MCP server, binds to `.exo/server.sock`)
-- **TL window**: Runs `nix develop` (where you launch `claude` or work directly)
+- **TL window**: Runs the programmatic Python controller (`python3 -m tl_loop`), which owns planning, dispatch, event consumption, merge decisions, and durable run state.
 
-The server must be running before Claude Code or Codex can use MCP tools. Without it, every tool call fails. Init also writes `.mcp.json` (MCP server config) and `.claude/settings.local.json` (hooks and session settings).
+The server must be running before the controller or any worker can use MCP effects. Without it, effect calls fail explicitly. Init also writes `.mcp.json` with the `tl/root` identity, `.exo/agents/root/identity.json`, `.exo/tl-loop/plan.json` when supplied, and `.claude/settings.local.json` for worker hooks.
 
 ```bash
 cd exomonad/                  # Run from the project root
 exomonad new                  # One-time setup: creates config, WASM, rules
 exomonad init                 # Creates tmux session, starts server
-# Then in the TL window:
-claude                        # MCP tools available immediately
+# The TL window now runs the controller. Give it a JSON WorkPlan:
+python3 -m tl_loop status --project-root .
+python3 -m tl_loop gate --project-root . --run-id root --name <gate> --approve
 ```
+
+The controller waits for `.exo/tl-loop/plan.json` when no structured
+`initial_prompt` is configured. A plan document contains a `plan` object with
+`workers`, `leaves`, and/or `sub_tls`; legacy natural-language TL prompts are
+rejected because there is no interactive TL fallback.
 
 Use `--recreate` to tear down and rebuild the session (e.g., after binary updates).
 
@@ -162,7 +168,7 @@ exomonad shutdown                # Gracefully shut down the running server
 
 ### MCP Registration
 
-`exomonad init` automatically registers the Claude MCP server. For Codex, register manually via stdio:
+`exomonad init` automatically registers the `tl/root` MCP identity in `.mcp.json`; the Python controller uses the same UDS runtime boundary. Worker and companion harnesses receive their own role/name registrations. For manual Codex access, register via stdio:
 ```bash
 codex mcp add exomonad --command "exomonad mcp-stdio"
 ```
@@ -174,7 +180,7 @@ After running `just install-all` (which installs WASM to `~/.exo/wasm/`), any pr
 ```bash
 cd ~/new-project && git init
 exomonad new                  # Creates .exo/config.toml, copies WASM from ~/.exo/wasm/
-exomonad init                 # Starts server, registers Claude MCP, creates tmux session
+exomonad init                 # Starts server, registers tl/root, creates the controller TL window
 ```
 
 For custom roles, copy `.exo/roles/` and `.exo/lib/` from exomonad and `exomonad new` will build WASM from source instead.
@@ -230,11 +236,11 @@ project_dir = "."
 shell_command = "nix develop" # environment wrapper for TL tab + server
 wasm_dir = ".exo/wasm"       # project-local (default), override for shared installs
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
-model = "sonnet"             # optional — passed as --model flag to root TL agent
-root_agent_type = "claude"   # claude | opencode | codex | shoal
+model = "sonnet"             # legacy root-model compatibility; ignored by the programmatic TL
+root_agent_type = "claude"   # legacy compatibility; init always starts the Python TL controller
 spawn_agent_type = "codex"   # default harness for workers, leaves, and companions
-# CLI flags override these values. Omitted effort is medium.
-tl_effort_level = "medium"
+# Worker/reviewer CLI flags override their values. Root TL effort is ignored.
+tl_effort_level = "medium"   # legacy compatibility; not used by the controller
 worker_effort_level = "medium"
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
 forgejo_url = "http://localhost:3000"           # optional — Forgejo base URL
@@ -305,7 +311,7 @@ automatically. Omit the flag to keep today's auto-detect behavior.
 - WASM: `wasm_dir` in config > `.exo/wasm/` (project-local)
 
 **Hook configuration** is auto-generated in two places:
-- **`exomonad init`**: Writes `.claude/settings.local.json` with all hooks (SessionStart, PreToolUse, etc.) for the root TL session
+- **`exomonad init`**: Writes `.claude/settings.local.json` with hooks for workers and companions; the root TL controller is not an interactive harness session
 - **`fork_wave`**: Writes `.claude/settings.local.json` into each spawned Claude worktree
 
 The `SessionStart` hook is critical — it registers the Claude session UUID in `ClaudeSessionRegistry`, which `fork_wave` reads to pass `--resume <uuid> --fork-session` for context inheritance. Without it, spawned subtrees start with no context.
@@ -468,14 +474,18 @@ Without Tempo running, spans still appear in stderr via the tracing fmt layer.
 
 ```
 Human in tmux session
-    └── Claude Code + exomonad (Rust + Haskell WASM)
-            ├── MCP tools via WASM (fork_wave, spawn_leaf, spawn_worker, etc.)
-            └── Agent tree:
-                ├── worktree: dev.feature-a (TL role, can spawn children)
-                │   ├── worker: rust-impl (Codex, in-place pane)
-                │   └── worker: haskell-impl (Codex, in-place pane)
-                └── worktree: dev.feature-b (TL role)
-                    └── ...
+    ├── Server window: exomonad serve (Rust + Haskell WASM RPC surface)
+    └── TL window: Python tl_loop controller (durable FSM + run state)
+            ├── EffectClient over the ExoMonad UDS
+            │       └── MCP effects via WASM (fork_wave, spawn_leaf, merge_pr, etc.)
+            ├── LedgerReader/Queue consumes child and watcher events
+            ├── Pending gates are logged and answered with the gate command
+            └── Agent tree owned by the loop:
+                    ├── worktree: dev.feature-a (leaf)
+                    │   ├── worker: rust-impl (Codex, in-place pane)
+                    │   └── reviewer (configured harness)
+                    └── worktree: dev.feature-b (leaf)
+                        └── ...
 ```
 
 **Haskell WASM = Embedded DSL**
@@ -604,8 +614,8 @@ just e2e-tl-loop-active    # Programmatic TL loop over a scratch repository
 ```
 
 `just e2e-tl-loop-active` is intentionally non-interactive: it uses a bounded
-Python controller, a bare scratch remote, and deterministic effect/review
-stubs without `exomonad init` or tmux.
+Python controller, a bare scratch remote, deterministic effect/review stubs,
+and the exact default TL-window command without creating an ExoMonad session.
 
 `just rust-test` is the fast library-only Rust loop. `just test` runs the full
 Rust workspace test set, including native integration targets, after building
@@ -662,40 +672,46 @@ GitHub Issues. Branch naming: `gh-{number}/{description}`. Reference issue in co
 
 The operational manual for executing the hylomorphism (see [Model](#model)). The TL is the recursion's driver at each node: it performs the unfold (scaffold + spawn), idles while children work, then performs the fold (merge + integrate + PR upward). Everything below is how to do that well.
 
+The TL coordinator is the `tl_loop` Python controller. It is the only coordinator
+for a run: it owns the FSM, durable state, ledger consumption, harness selection,
+dispatch, review gates, merges, and upward PR effects. The tmux TL window is an
+operator surface for its logs and human decisions; it does not launch Claude,
+Codex, OpenCode, or another interactive coordinator.
+
 ### Depth over Breadth
 
 Use sub-TLs to keep each context window sharp. If a task decomposes into more than ~4 independent leaves, interpose a sub-TL. The root should never reason about implementation details — only about the decomposition structure and integration points. Sub-TLs absorb complexity; root sees summaries.
 
 ### Intelligence Gradient
 
-Claude (Opus) decomposes and dispatches. Codex implements. Reviewer agent reviews. The TL never implements directly and never manually reviews intermediate output.
+The controller consumes a structured WorkPlan and dispatches. Codex implements. Reviewer agents review. The controller never implements directly and never manually reviews intermediate output.
 
-**Cost model:** Opus tokens are 10-30x Codex tokens. Every line of code the TL writes is expensive code. Every review cycle the TL performs is an expensive review cycle. The TL's job is producing specs sharp enough that the leaf + reviewer convergence loop handles quality without TL involvement.
+**Cost model:** Controller tokens are spent on bounded planning and state transitions; implementation and review remain in the leaf and reviewer harnesses. The controller's job is to execute a precise plan and let the convergence loop handle quality.
 
 ### Fire-and-Forget Execution
 
-The TL's workflow is: **decompose → spec → spawn → move on**. The TL does not wait, poll, review intermediate output, or re-spec. It spawns all leaves it can, then idles until messages arrive.
+The loop's workflow is: **load plan → select harnesses → dispatch → consume events → merge**. It does not wait on an interactive prompt or manually review intermediate output. The operator can inspect the live log and answer an explicitly named durable gate.
 
-**Convergence is leaf + reviewer + event handlers, not TL:**
-1. TL writes spec, spawns leaf (Codex), returns immediately
+**Convergence is leaf + reviewer + event handlers, with the controller applying the durable transitions:**
+1. The controller validates the plan, writes durable slice state, and dispatches a leaf
 2. Leaf works → commits → files PR
 3. Worktree event watcher detects reviewer agent review comments → fires `handle_event(PRReview::ReviewReceived)` → handler injects comments into leaf's pane
 4. Leaf reads reviewer feedback, fixes, pushes
-5. Watcher detects SHA change after `ChangesRequested` → fires `handle_event(PRReview::FixesPushed)` → handler sends `[FIXES PUSHED]` to TL
-6. TL sees `[from: leaf-id] [FIXES PUSHED] PR #N — CI passing. Ready to merge.` → merges the PR
+5. Watcher detects SHA change after `ChangesRequested` → fires `handle_event(PRReview::FixesPushed)` → handler sends `[FIXES PUSHED]` to the controller
+6. The controller consumes `[from: leaf-id] [FIXES PUSHED] PR #N — CI passing. Ready to merge.` → merges the PR
 
 **Note:** The reviewer agent re-reviews after fixes are pushed. The `FixesPushed` event signals that the leaf has responded to all review comments and the reviewer should re-evaluate.
 
 **Alternative paths:**
-- **Reviewer approves** → watcher fires `handle_event(PRReview::ReviewerApproved)` → handler sends `[PR READY]` to TL → TL merges
-- **Reviewer comments or requests changes** → watcher dispatches the review event to the live PR owner and the owning parent TL; the owner receives the review text, while `tlPrReviewHandler` sends the TL-facing `[REVIEW ACTION REQUIRED]` guidance → owner fixes → pushes → reviewer re-checks
-- **No reviewer response after timeout** → watcher fires `handle_event(PRReview::ReviewTimeout)` → handler sends `[REVIEW TIMEOUT]` to TL → TL merges if CI passes
-- **Leaf sends status updates** → `notify_parent` delivers `[from: leaf-id] message` to TL → informational, TL reads but does not auto-merge
-- **Leaf fails** → `notify_parent` with `failure` status → delivers `[FAILED: leaf-id] message` to TL → TL re-decomposes
-- **Review is stuck** → after max rounds without convergence, watcher fires `handle_event(PRReview::Stuck)` → handler sends `[STUCK: leaf-id]` to TL → human intervention required
-- **Reviewer requests changes after one fix round** → dev state enters `DevNeedsHumanDirection` → handler sends `[STUCK: leaf-id]` to TL → human intervention required
+- **Reviewer approves** → watcher fires `handle_event(PRReview::ReviewerApproved)` → handler sends `[PR READY]` to the controller → controller merges
+- **Reviewer comments or requests changes** → watcher dispatches the review event to the live PR owner and the owning parent controller; the owner receives the review text, while `tlPrReviewHandler` sends the controller-facing `[REVIEW ACTION REQUIRED]` guidance → owner fixes → pushes → reviewer re-checks
+- **No reviewer response after timeout** → watcher fires `handle_event(PRReview::ReviewTimeout)` → handler sends `[REVIEW TIMEOUT]` to the controller → controller merges if CI passes
+- **Leaf sends status updates** → `notify_parent` delivers `[from: leaf-id] message` to the controller → informational, controller reads but does not auto-merge
+- **Leaf fails** → `notify_parent` with `failure` status → delivers `[FAILED: leaf-id] message` to the controller → controller records the failure for the next plan
+- **Review is stuck** → after max rounds without convergence, watcher fires `handle_event(PRReview::Stuck)` → handler sends `[STUCK: leaf-id]` to the controller → human intervention required
+- **Reviewer requests changes after one fix round** → dev state enters `DevNeedsHumanDirection` → handler sends `[STUCK: leaf-id]` to the controller → human intervention required
 
-**Escalation, not iteration.** If a leaf fails after reaching `reviewer_max_rounds` (see `.exo/review-policy.toml`), the watcher fires the `Stuck` event. The TL then decides: re-decompose, try a different approach, or flag for human intervention. The TL never manually fixes a leaf's code.
+**Escalation, not iteration.** If a leaf fails after reaching `reviewer_max_rounds` (see `.exo/review-policy.toml`), the watcher fires the `Stuck` event. The controller records the bounded failure; the operator answers any named human gate before a new plan is run. The controller never manually fixes a leaf's code.
 
 ### Spec Quality (You Only Get One Shot)
 
@@ -759,18 +775,21 @@ Spawn multiple leaves when tasks are independent (no file conflicts, no ordering
 - Proto plumbing + nix shell wrapping — independent, parallel.
 - Haskell tool changes + Rust handler changes — often dependent (proto-gen first), sequential.
 
-### When TL Gets Notified
+### When the Controller Receives Events
 
-The TL is idle between spawning and receiving notifications. It wakes up for:
-- **`[FIXES PUSHED]`** (event handler) — leaf addressed reviewer comments and pushed fixes. TL merges if CI passes.
-- **`[PR READY]`** (event handler) — reviewer approved a leaf's PR. TL merges and verifies the result builds cleanly. Multiple leaves landing in parallel may interact.
-- **`[REVIEW TIMEOUT]`** (event handler) — no reviewer response after timeout (configured in `.exo/review-policy.toml`). TL merges if CI passes.
-- **`[STUCK: agent-id]`** — review did not converge within `reviewer_max_rounds`, or the reviewer still requests changes after the single allowed fix round. Human intervention required — the PR cannot be auto-merged.
-- **`[from: agent-id]`** (agent message) — informational update from a leaf. Do not auto-merge; read the message.
-- **`[FAILED: agent-id]`** — leaf exhausted retries. TL re-decomposes or escalates.
+The controller remains live in the TL window and consumes the ledger queue; it
+does not rely on a harness inbox or an interactive prompt. It records:
+- **`[FIXES PUSHED]`** (event handler) — leaf addressed reviewer comments and pushed fixes. The controller merges if CI passes.
+- **`[PR READY]`** (event handler) — reviewer approved a leaf's PR. The controller merges and verifies the result builds cleanly. Multiple leaves landing in parallel may interact.
+- **`[REVIEW TIMEOUT]`** (event handler) — no reviewer response after timeout (configured in `.exo/review-policy.toml`). The controller merges if CI passes.
+- **`[STUCK: agent-id]`** — review did not converge within `reviewer_max_rounds`, or the reviewer still requests changes after the single allowed fix round. The run parks and the human gate is visible in the TL log.
+- **`[from: agent-id]`** (agent message) — informational update from a leaf. The controller does not auto-merge without the review gate.
+- **`[FAILED: agent-id]`** — leaf exhausted retries. The controller records the failure and stops the bounded run.
 - Worktree event watcher notifications (CI status, PR merge conflicts).
 
-The TL does NOT wake up for intermediate progress, reviewer comments, or partial results. The convergence loop (leaf + reviewer) runs without TL involvement.
+The operator answers a named durable gate with `python3 -m tl_loop gate --run-id root
+--name <gate> --approve|--reject`. The controller then resumes from the persisted
+state; it never asks a second interactive TL to make the decision.
 
 ---
 

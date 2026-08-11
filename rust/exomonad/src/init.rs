@@ -10,12 +10,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-const ROOT_PROTOCOL_ENV: &str = "EXOMONAD_ROOT_TL_PROTOCOL_PATH";
-
-fn root_tl_context_path(cwd: &Path, wasm_name: &str) -> Option<PathBuf> {
-    exomonad_core::services::agent_control::resolve_role_context_path(cwd, wasm_name, "root")
-}
-
 fn read_root_tl_protocol(cwd: &Path, wasm_name: &str) -> Option<String> {
     exomonad_core::services::agent_control::load_role_context(cwd, wasm_name, "root")
 }
@@ -31,18 +25,6 @@ fn codex_root_instructions(cwd: &Path, wasm_name: &str) -> String {
         .unwrap_or_else(|| {
             exomonad_core::services::agent_control::CODEX_TL_RUNTIME_NOTES.to_string()
         })
-}
-
-fn custom_root_command_with_protocol(command: &str, protocol_path: Option<&Path>) -> String {
-    match protocol_path {
-        Some(path) => format!(
-            "{}={} {}",
-            ROOT_PROTOCOL_ENV,
-            shell_escape::escape(path.display().to_string().into()),
-            command
-        ),
-        None => command.to_string(),
-    }
 }
 
 fn watcher_dashboard_command(cwd: &Path) -> Result<String> {
@@ -524,128 +506,6 @@ fn write_codex_companion_config(
     Ok(())
 }
 
-fn write_codex_root_config(config: &Config, cwd: &Path) -> Result<()> {
-    let codex_dir = cwd.join(".codex");
-    std::fs::create_dir_all(&codex_dir)?;
-    let extra_mcp_servers = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
-    let configured_effort = config.tl_effort_level.level.to_string();
-    let codex_config = exomonad_core::codex_config::render_codex_config_with_effort(
-        "root",
-        "root",
-        &codex_root_instructions(cwd, &config.wasm_name),
-        config.model.as_deref(),
-        Some(&configured_effort),
-        &extra_mcp_servers,
-        &exomonad_core::find_exomonad_binary(),
-    );
-    let codex_config_path = codex_dir.join("config.toml");
-    std::fs::write(&codex_config_path, codex_config)?;
-    if let Some(config_path) = exomonad_core::codex_config::codex_user_config_path() {
-        exomonad_core::codex_config::trust_codex_project(&config_path, cwd).with_context(|| {
-            format!("Failed to trust Codex project in {}", config_path.display())
-        })?;
-        exomonad_core::codex_config::install_codex_hook_trust(&config_path, &codex_config_path)
-            .with_context(|| format!("Failed to trust Codex hooks in {}", config_path.display()))?;
-        info!(path = %config_path.display(), "Marked project as trusted in Codex user config");
-    } else {
-        warn!("Could not determine Codex home; project may not be trusted automatically");
-    }
-    let legacy_hooks_path = codex_dir.join("hooks.json");
-    if legacy_hooks_path.exists() {
-        std::fs::remove_file(legacy_hooks_path)?;
-    }
-    info!("Codex configuration written to .codex/");
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn build_claude_root_command(model: Option<&str>, initial_prompt: Option<&str>) -> String {
-    build_claude_root_command_with_effort(model, None, initial_prompt)
-}
-
-fn build_claude_root_command_with_effort(
-    model: Option<&str>,
-    effort: Option<&str>,
-    initial_prompt: Option<&str>,
-) -> String {
-    let model_flag = model
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" --model {}", shell_escape::escape(value.into())))
-        .unwrap_or_default();
-    let effort_flag = effort
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" --effort {}", shell_escape::escape(value.into())))
-        .unwrap_or_default();
-
-    let launch = initial_prompt
-        .filter(|value| !value.is_empty())
-        .map(|prompt| {
-            format!(
-                "claude --dangerously-skip-permissions{model_flag}{effort_flag} {}",
-                shell_escape::escape(prompt.into())
-            )
-        })
-        .unwrap_or_else(|| {
-            format!("claude --dangerously-skip-permissions{model_flag}{effort_flag}")
-        });
-
-    format!("{launch}; echo; echo [Claude Code exited]; exec bash -l")
-}
-
-#[allow(dead_code)]
-fn build_codex_root_command(
-    cwd: &Path,
-    model: Option<&str>,
-    initial_prompt: Option<&str>,
-) -> String {
-    build_codex_root_command_with_effort(cwd, model, None, initial_prompt)
-}
-
-fn build_codex_root_command_with_effort(
-    cwd: &Path,
-    model: Option<&str>,
-    effort: Option<&str>,
-    initial_prompt: Option<&str>,
-) -> String {
-    build_codex_root_command_for_agent("codex", cwd, model, effort, initial_prompt)
-}
-
-fn build_codex_root_command_for_agent(
-    command: &str,
-    cwd: &Path,
-    model: Option<&str>,
-    effort: Option<&str>,
-    initial_prompt: Option<&str>,
-) -> String {
-    let escaped_dir = shell_escape::escape(cwd.display().to_string().into());
-    let model_flag = model
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" --model {}", shell_escape::escape(value.into())))
-        .unwrap_or_default();
-    let effort_flag = effort
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" -c model_reasoning_effort=\"{}\"", value))
-        .unwrap_or_default();
-    let prompt = initial_prompt
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" {}", shell_escape::escape(value.into())))
-        .unwrap_or_default();
-
-    let command_line = format!(
-        "{} --dangerously-bypass-approvals-and-sandbox --cd {}{}{}{}",
-        command, escaped_dir, model_flag, effort_flag, prompt
-    );
-    let restart_hint = shell_escape::escape(
-        format!(
-            "[Codex exited - restart with: {} --dangerously-bypass-approvals-and-sandbox --cd {}{}{}]",
-            command, escaped_dir, model_flag, effort_flag
-        )
-        .into(),
-    );
-
-    format!("{command_line}; echo; printf '%s\n' {restart_hint}; exec bash -l")
-}
-
 /// Reject `--tl-model` / `--worker-model` values that opencode doesn't recognise.
 /// Caller must only invoke this when the model is `Some` and the agent type is OpenCode.
 /// Validate a Claude model string against known aliases and the `claude-*` prefix convention.
@@ -911,19 +771,92 @@ fn agent_configuration_environment(config: &Config) -> String {
     format!(" {}", parts.join(" "))
 }
 
+fn tl_loop_package_root(cwd: &Path) -> Result<PathBuf> {
+    let local = cwd.join("tl_loop");
+    if local.join("__main__.py").is_file() {
+        return Ok(cwd.to_path_buf());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let installed = PathBuf::from(home).join(".exo");
+        if installed.join("tl_loop/__main__.py").is_file() {
+            return Ok(installed);
+        }
+    }
+    anyhow::bail!(
+        "programmatic TL package not found; run `just install-all` in the exomonad repository"
+    )
+}
+
+fn write_tl_loop_plan(cwd: &Path, initial_prompt: Option<&str>) -> Result<()> {
+    let Some(prompt) = initial_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let value = serde_json::from_str::<Value>(prompt)
+        .context("initial_prompt must be a JSON WorkPlan document for the programmatic TL")?;
+    if !value.is_object() {
+        anyhow::bail!("initial_prompt must be a JSON object containing the TL WorkPlan");
+    }
+    let plan_path = cwd.join(".exo/tl-loop/plan.json");
+    if plan_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = plan_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(plan_path, serde_json::to_string_pretty(&value)?)?;
+    info!("Wrote structured TL plan from initial_prompt");
+    Ok(())
+}
+
+fn write_tl_loop_identity(cwd: &Path, branch: &str) -> Result<()> {
+    let agent_dir = cwd.join(".exo/agents/root");
+    std::fs::create_dir_all(&agent_dir)?;
+    let identity = serde_json::json!({
+        "agent_name": "root",
+        "slug": "root",
+        "agent_type": "codex",
+        "birth_branch": branch,
+        "parent_branch": branch,
+        "working_dir": ".",
+        "display_name": "TL loop",
+        "topology": "shared_dir",
+        "model": null,
+        "effort": null,
+        "ledger_owned": true,
+    });
+    std::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_string_pretty(&identity)?,
+    )?;
+    Ok(())
+}
+
+fn tl_loop_command(cwd: &Path, package_root: &Path) -> String {
+    let package = shell_escape::escape(package_root.display().to_string().into());
+    let project = shell_escape::escape(cwd.display().to_string().into());
+    let plan = shell_escape::escape(
+        cwd.join(".exo/tl-loop/plan.json")
+            .display()
+            .to_string()
+            .into(),
+    );
+    format!(
+        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl PYTHONPATH={package} python3 -m tl_loop run --project-root {project} --plan {plan} --run-id root --wait-for-plan"
+    )
+}
+
 /// Run the init command: create or attach to tmux session.
 // The CLI exposes these independent initialization options as separate flags.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     session_override: Option<String>,
     recreate: bool,
-    opencode_as_tl: bool,
     openrouter: bool,
-    tl: Option<String>,
     worker: Option<String>,
-    tl_model: Option<String>,
     worker_model: Option<String>,
-    tl_effort_level: Option<EffortLevel>,
     worker_effort_level: Option<EffortLevel>,
     reviewer_effort_level: Option<EffortLevel>,
     reviewer: Option<String>,
@@ -958,6 +891,8 @@ pub async fn run(
 
     // Resolve config
     let mut config = Config::discover()?;
+    let tl_loop_root = tl_loop_package_root(&cwd)?;
+    write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
 
     if !import_legacy.is_empty() {
         crate::logs::run(
@@ -974,30 +909,13 @@ pub async fn run(
     }
 
     // CLI flags override config
-    if opencode_as_tl {
-        config.opencode_as_tl = true;
-        config.root_agent_type = AgentType::OpenCode;
-    }
-    if let Some(ref tl_type) = tl {
-        config.root_agent_type = parse_agent_type(tl_type)?;
-    }
     if let Some(ref worker_type) = worker {
         config.spawn_agent_type = parse_agent_type(worker_type)?;
-    }
-    if let Some(m) = tl_model {
-        if config.root_agent_type == AgentType::OpenCode {
-            config.opencode.tl_model = Some(m);
-        } else {
-            config.model = Some(m);
-        }
     }
     if let Some(m) = worker_model {
         if config.spawn_agent_type == AgentType::OpenCode {
             config.opencode.worker_model = Some(m);
         }
-    }
-    if let Some(level) = tl_effort_level {
-        config.tl_effort_level = ResolvedEffort::from_cli(level);
     }
     if let Some(level) = worker_effort_level {
         config.worker_effort_level = ResolvedEffort::from_cli(level);
@@ -1016,12 +934,6 @@ pub async fn run(
     }
 
     validate_opencode_model_owner(
-        config.root_agent_type,
-        config.opencode.tl_model.as_deref(),
-        "[opencode].tl_model",
-        "root_agent_type",
-    )?;
-    validate_opencode_model_owner(
         config.spawn_agent_type,
         config.opencode.worker_model.as_deref(),
         "[opencode].worker_model",
@@ -1034,15 +946,6 @@ pub async fn run(
     log_ignored_effort("tl", config.root_agent_type, &tl_effort);
     log_ignored_effort("worker", config.spawn_agent_type, &worker_effort);
     log_ignored_effort("reviewer", config.reviewer.agent_type, &reviewer_effort);
-    if config.root_agent_type == AgentType::OpenCode {
-        if let Some(m) = config.opencode.tl_model.as_deref() {
-            validate_opencode_model(m, Some(&tl_effort)).await?;
-        }
-    } else if config.root_agent_type == AgentType::Codex {
-        if let Some(m) = config.model.as_deref() {
-            validate_codex_model(m, Some(&tl_effort)).await?;
-        }
-    }
     if config.spawn_agent_type == AgentType::OpenCode {
         if let Some(m) = config.opencode.worker_model.as_deref() {
             validate_opencode_model(m, Some(&worker_effort)).await?;
@@ -1059,11 +962,7 @@ pub async fn run(
     )
     .await?;
 
-    let root_model = if config.root_agent_type == AgentType::OpenCode {
-        config.opencode.tl_model.as_deref()
-    } else {
-        config.model.as_deref()
-    };
+    let root_model = None::<&str>;
     let worker_model = if config.spawn_agent_type == AgentType::OpenCode {
         config.opencode.worker_model.as_deref()
     } else {
@@ -1265,6 +1164,7 @@ pub async fn run(
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|| "main".to_string());
+        write_tl_loop_identity(&cwd, &current_branch)?;
         std::fs::write(root_agent_dir.join(".birth_branch"), &current_branch)?;
         info!(branch = %current_branch, "Wrote root agent birth branch");
     }
@@ -1281,48 +1181,12 @@ pub async fn run(
         check_fj_cli_configuration(&cwd);
     }
 
-    // Write root runtime configuration.
+    // Hooks remain available to Claude workers and companions; the root TL is
+    // the Python controller below and never launches an interactive harness.
     let binary_path = exomonad_core::find_exomonad_binary();
-    match config.root_agent_type {
-        AgentType::OpenCode => {
-            use exomonad_core::services::agent_control::AgentControlService;
-            use exomonad_core::services::Services;
-            let extra_mcp_servers = std::collections::HashMap::new();
-            let effort = config.tl_effort_level.level.to_string();
-            let root_context = root_tl_context_path(&cwd, &config.wasm_name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "canonical root TL protocol not found for wasm '{}'; expected .exo/roles/{}/context/root.md",
-                    config.wasm_name,
-                    config.wasm_name
-                )
-            })?;
-            let opencode_config =
-                AgentControlService::<Services>::generate_opencode_root_settings_with_context(
-                    "root",
-                    &root_context,
-                    &extra_mcp_servers,
-                    Some(&effort),
-                );
-            let opencode_dir = cwd.join(".exo/agents/root");
-            std::fs::create_dir_all(&opencode_dir)?;
-            std::fs::write(
-                opencode_dir.join("opencode.json"),
-                serde_json::to_string_pretty(&opencode_config)?,
-            )?;
-            AgentControlService::<Services>::write_opencode_plugin_files(&opencode_dir)
-                .await
-                .context("Failed to write OpenCode plugin files to .exo/agents/root")?;
-            info!("OpenCode configuration written to .exo/agents/root/");
-        }
-        AgentType::Codex => {
-            write_codex_root_config(&config, &cwd).context("Failed to write Codex root config")?;
-        }
-        _ => {
-            exomonad_core::hooks::HookConfig::write_persistent(&cwd, &binary_path, None, None)
-                .context("Failed to write hook configuration")?;
-            info!("Hook configuration written to .claude/settings.local.json");
-        }
-    }
+    exomonad_core::hooks::HookConfig::write_persistent(&cwd, &binary_path, None, None)
+        .context("Failed to write hook configuration")?;
+    info!("Hook configuration written to .claude/settings.local.json");
 
     // Copy Claude rules template if available and not already present
     {
@@ -1347,28 +1211,6 @@ pub async fn run(
                     src = %src.display(),
                     "Copied Claude rules to .claude/rules/exomonad.md"
                 );
-            }
-        }
-    }
-
-    // Symlink role context for root agent
-    {
-        let context_source = resolve_role_context_path(&cwd, &config.wasm_name, "root");
-        if let Some(src) = context_source {
-            let rules_dir = match config.root_agent_type {
-                AgentType::Codex => cwd.join(".codex"),
-                _ => cwd.join(".claude/rules"),
-            };
-            std::fs::create_dir_all(&rules_dir)?;
-            let link = rules_dir.join("exomonad_role.md");
-            let _ = std::fs::remove_file(&link); // idempotent
-                                                 // Compute relative path from the role dir to the source
-            let relative = pathdiff::diff_paths(&src, &rules_dir).unwrap_or(src.clone());
-            match std::os::unix::fs::symlink(&relative, &link) {
-                Ok(()) => {
-                    info!(src = %src.display(), link = %link.display(), "Symlinked role context for root")
-                }
-                Err(e) => warn!(error = %e, "Failed to symlink role context (non-fatal)"),
             }
         }
     }
@@ -1432,37 +1274,35 @@ pub async fn run(
     info!(session = %session, "Creating session");
 
     // 1. Write .mcp.json (for Claude Code discovery)
-    if config.root_agent_type == AgentType::Claude {
-        let mut mcp_servers = serde_json::Map::new();
-        mcp_servers.insert(
-            "exomonad".to_string(),
-            exomonad_mcp_server(&binary_path, "root", "root"),
-        );
+    let mut mcp_servers = serde_json::Map::new();
+    mcp_servers.insert(
+        "exomonad".to_string(),
+        exomonad_mcp_server(&binary_path, "tl", "root"),
+    );
 
-        // Add extra MCP servers from config
-        for (name, server) in &config.extra_mcp_servers {
-            let entry = match server {
-                exomonad::config::McpServerConfig::Http { url, headers } => {
-                    let mut e = serde_json::json!({"type": "http", "url": url});
-                    if !headers.is_empty() {
-                        e["headers"] = serde_json::to_value(headers)?;
-                    }
-                    e
+    // Add extra MCP servers from config
+    for (name, server) in &config.extra_mcp_servers {
+        let entry = match server {
+            exomonad::config::McpServerConfig::Http { url, headers } => {
+                let mut e = serde_json::json!({"type": "http", "url": url});
+                if !headers.is_empty() {
+                    e["headers"] = serde_json::to_value(headers)?;
                 }
-                exomonad::config::McpServerConfig::Stdio { command, args } => {
-                    serde_json::json!({"type": "stdio", "command": command, "args": args})
-                }
-            };
-            mcp_servers.insert(name.clone(), entry);
-        }
-
-        let mcp_json = serde_json::json!({ "mcpServers": mcp_servers });
-        std::fs::write(
-            cwd.join(".mcp.json"),
-            serde_json::to_string_pretty(&mcp_json)?,
-        )?;
-        info!("Wrote .mcp.json with {} MCP server(s)", mcp_servers.len());
+                e
+            }
+            exomonad::config::McpServerConfig::Stdio { command, args } => {
+                serde_json::json!({"type": "stdio", "command": command, "args": args})
+            }
+        };
+        mcp_servers.insert(name.clone(), entry);
     }
+
+    let mcp_json = serde_json::json!({ "mcpServers": mcp_servers });
+    std::fs::write(
+        cwd.join(".mcp.json"),
+        serde_json::to_string_pretty(&mcp_json)?,
+    )?;
+    info!("Wrote .mcp.json with {} MCP server(s)", mcp_servers.len());
 
     // 2. Create session in background
     let server_window_id = TmuxIpc::new_session(&session, &cwd).await?;
@@ -1670,114 +1510,10 @@ pub async fn run(
         );
     }
 
-    // Create "TL" window
-    // OpenCode TL stays on the current branch (same as Claude TL) — workers fork off
-    // it via fork_wave and file PRs back. A separate worktree branch for the TL would
-    // break the parent-branch PR topology.
-    if config.root_agent_type == AgentType::OpenCode {
-        use exomonad_core::services::agent_control::AgentControlService;
-        use exomonad_core::services::Services;
-        let extra_mcp = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
-        // Write opencode.json to repo root so the TL window discovers it via CWD.
-        let effort = config.tl_effort_level.level.to_string();
-        let root_context = root_tl_context_path(&cwd, &config.wasm_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "canonical root TL protocol not found for wasm '{}'; expected .exo/roles/{}/context/root.md",
-                config.wasm_name,
-                config.wasm_name
-            )
-        })?;
-        let opencode_config =
-            AgentControlService::<Services>::generate_opencode_root_settings_with_context(
-                "root",
-                &root_context,
-                &extra_mcp,
-                Some(&effort),
-            );
-        std::fs::write(
-            cwd.join("opencode.json"),
-            serde_json::to_string_pretty(&opencode_config)?,
-        )?;
-        AgentControlService::<Services>::write_opencode_plugin_files(&cwd)
-            .await
-            .context("Failed to write OpenCode plugin files to repo root")?;
-        info!("Wrote opencode.json and plugin to repo root for OpenCode TL");
-    }
+    // The human-facing TL window runs one coordinator: the Python controller.
+    // Root harness settings and root_command are intentionally ignored.
     let tl_cwd = cwd.clone();
-
-    let base_command = if let Some(ref cmd) = config.root_command {
-        match root_tl_context_path(&cwd, &config.wasm_name) {
-            Some(path) => {
-                warn!(
-                    command = %cmd,
-                    protocol_path = %path.display(),
-                    env_var = ROOT_PROTOCOL_ENV,
-                    "Custom root_command must consume the canonical root TL protocol"
-                );
-                custom_root_command_with_protocol(cmd, Some(&path))
-            }
-            None => {
-                warn!(
-                    command = %cmd,
-                    env_var = ROOT_PROTOCOL_ENV,
-                    "Custom root_command has no canonical root TL protocol path"
-                );
-                cmd.clone()
-            }
-        }
-    } else {
-        let opencode_model_flag = config
-            .opencode
-            .tl_model
-            .as_deref()
-            .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
-            .unwrap_or_default();
-        let tl_effort = config.tl_effort_level.level.to_string();
-        let opencode_variant_flag = format!(
-            " --variant {}",
-            shell_escape::escape(tl_effort.as_str().into())
-        );
-        match (config.root_agent_type, config.initial_prompt.as_deref()) {
-            (AgentType::Claude, prompt) => build_claude_root_command_with_effort(
-                config.model.as_deref(),
-                Some(&tl_effort),
-                prompt,
-            ),
-            (AgentType::Shoal, Some(prompt)) => format!(
-                "shoal-agent --exo root --prompt '{}'",
-                prompt.replace('\'', "'\\''")
-            ),
-            (AgentType::Shoal, None) => "shoal-agent --exo root".to_string(),
-            (AgentType::OpenCode, Some(prompt)) => {
-                let yolo = if config.yolo {
-                    " --dangerously-skip-permissions"
-                } else {
-                    ""
-                };
-                format!(
-                    "opencode run{yolo}{opencode_model_flag}{opencode_variant_flag} '{}'",
-                    prompt.replace('\'', "'\\''")
-                )
-            }
-            (AgentType::OpenCode, None) => {
-                let yolo = if config.yolo {
-                    " --dangerously-skip-permissions"
-                } else {
-                    ""
-                };
-                format!("opencode{opencode_model_flag}{yolo} --agent exomonad-root")
-            }
-            (AgentType::Codex, prompt) => build_codex_root_command_with_effort(
-                &cwd,
-                config.model.as_deref(),
-                Some(&tl_effort),
-                prompt,
-            ),
-            (AgentType::Process, _) => {
-                unreachable!("Process is for companions only, not root agent")
-            }
-        }
-    };
+    let base_command = tl_loop_command(&cwd, &tl_loop_root);
 
     let tl_command = match config.shell_command {
         Some(ref sc) => format!("{} -c \"{}\"", sc, base_command.replace('"', "\\\"")),
@@ -2421,25 +2157,6 @@ mod tests {
     };
 
     #[test]
-    fn root_protocol_loader_prefers_local_sentinel_and_strips_frontmatter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".exo/roles/sentinel/context");
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(
-            path.join("root.md"),
-            "---\npaths: [\"**\"]\n---\n\nSENTINEL ROOT PROTOCOL\n",
-        )
-        .unwrap();
-
-        let resolved = root_tl_context_path(tmp.path(), "sentinel").unwrap();
-        assert_eq!(resolved, path.join("root.md"));
-        assert_eq!(
-            read_root_tl_protocol(tmp.path(), "sentinel").as_deref(),
-            Some("SENTINEL ROOT PROTOCOL")
-        );
-    }
-
-    #[test]
     fn codex_protocol_delivery_is_prompt_independent() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(".exo/roles/sentinel/context");
@@ -2454,19 +2171,6 @@ mod tests {
                 assert!(!instructions.contains(prompt));
             }
         }
-    }
-
-    #[test]
-    fn custom_root_command_exposes_canonical_protocol_path() {
-        let path = Path::new("/tmp/sentinel-root.md");
-        let command = custom_root_command_with_protocol("custom-root", Some(path));
-        assert!(command.starts_with("EXOMONAD_ROOT_TL_PROTOCOL_PATH="));
-        assert!(command.contains("/tmp/sentinel-root.md"));
-        assert!(command.ends_with(" custom-root"));
-        assert_eq!(
-            custom_root_command_with_protocol("custom-root", None),
-            "custom-root"
-        );
     }
 
     #[test]
@@ -2938,6 +2642,28 @@ mod tests {
     }
 
     #[test]
+    fn tl_loop_command_uses_programmatic_controller() {
+        let command = tl_loop_command(Path::new("/tmp/repo"), Path::new("/tmp/exo"));
+        assert!(command.contains("EXOMONAD_ROLE=tl"));
+        assert!(command.contains("PYTHONPATH=/tmp/exo"));
+        assert!(command.contains("python3 -m tl_loop run"));
+        assert!(command.contains("--wait-for-plan"));
+    }
+
+    #[test]
+    fn structured_initial_prompt_writes_plan_and_rejects_legacy_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_tl_loop_plan(tmp.path(), Some(r#"{"plan":{"leaves":[]}}"#)).unwrap();
+        let plan = std::fs::read_to_string(tmp.path().join(".exo/tl-loop/plan.json")).unwrap();
+        assert!(plan.contains("\"plan\""));
+
+        let invalid = tempfile::tempdir().unwrap();
+        let error = write_tl_loop_plan(invalid.path(), Some("interactive TL prompt")).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("initial_prompt must be a JSON WorkPlan"));
+    }
+    #[test]
     fn parses_opencode_verbose_catalog_variants() {
         let catalog = parse_opencode_model_catalog(
             "opencode-go/deepseek-v4-pro\n{\n  \"id\": \"deepseek-v4-pro\",\n  \"providerID\": \"opencode-go\",\n  \"variants\": {\n    \"high\": {},\n    \"max\": {}\n  }\n}\n",
@@ -2946,78 +2672,5 @@ mod tests {
         assert!(catalog["opencode-go/deepseek-v4-pro"].contains("high"));
         assert!(catalog["opencode-go/deepseek-v4-pro"].contains("max"));
         assert!(!catalog["opencode-go/deepseek-v4-pro"].contains("medium"));
-    }
-
-    #[test]
-    fn claude_root_command_includes_effort() {
-        let command = build_claude_root_command_with_effort(Some("sonnet"), Some("xhigh"), None);
-
-        assert!(command
-            .starts_with("claude --dangerously-skip-permissions --model sonnet --effort xhigh"));
-    }
-
-    #[test]
-    fn codex_root_command_includes_effort() {
-        let command = build_codex_root_command_with_effort(
-            Path::new("/tmp/exomonad"),
-            Some("gpt-5.2"),
-            Some("high"),
-            None,
-        );
-
-        assert!(command.starts_with(
-            "codex --dangerously-bypass-approvals-and-sandbox --cd /tmp/exomonad --model gpt-5.2 -c model_reasoning_effort=\"high\""
-        ));
-    }
-
-    #[test]
-    fn codex_luna_root_command_preserves_xhigh() {
-        let command = build_codex_root_command_with_effort(
-            Path::new("/tmp/exomonad"),
-            Some("gpt-5.6-luna"),
-            Some("xhigh"),
-            None,
-        );
-
-        assert!(command.contains("--model gpt-5.6-luna -c model_reasoning_effort=\"xhigh\""));
-    }
-
-    #[test]
-    fn claude_root_command_uses_initial_prompt() {
-        let command = build_claude_root_command(Some("sonnet"), Some("Spawn the worker"));
-
-        assert_eq!(
-            command,
-            "claude --dangerously-skip-permissions --model sonnet 'Spawn the worker'; echo; echo [Claude Code exited]; exec bash -l"
-        );
-        assert!(!command.contains(" -c"));
-        assert!(command.ends_with("exec bash -l"));
-    }
-
-    #[test]
-    fn claude_root_command_without_prompt_starts_fresh_session() {
-        let command = build_claude_root_command(Some("sonnet"), None);
-
-        assert_eq!(
-            command,
-            "claude --dangerously-skip-permissions --model sonnet; echo; echo [Claude Code exited]; exec bash -l"
-        );
-        assert!(!command.contains(" -c"));
-    }
-
-    #[test]
-    fn codex_root_command_launches_codex_tl() {
-        let command = build_codex_root_command(
-            Path::new("/tmp/exomonad repo"),
-            Some("gpt-5.2"),
-            Some("Plan the next wave"),
-        );
-
-        assert_eq!(
-            command,
-            "codex --dangerously-bypass-approvals-and-sandbox --cd '/tmp/exomonad repo' --model gpt-5.2 'Plan the next wave'; echo; printf '%s\n' '[Codex exited - restart with: codex --dangerously-bypass-approvals-and-sandbox --cd '\\''/tmp/exomonad repo'\\'' --model gpt-5.2]'; exec bash -l"
-        );
-        assert!(!command.contains("not implemented"));
-        assert!(command.ends_with("exec bash -l"));
     }
 }
