@@ -118,6 +118,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M4.5 select_model: port the prime-agent resolution ladder (#686)
 - M4.4 select_agent_type: cheapest-fit selection within bounds (#685)
 - M4.3 Harness capability map (#684)
 - M4.2 Deterministic task-difficulty classifier (#683)
