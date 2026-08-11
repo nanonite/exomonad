@@ -32,6 +32,7 @@ from tl_loop.fsm.phase import (
     TLWaiting,
 )
 from tl_loop.fsm.transition import IllegalTransition, transition
+from tl_loop.loop.schedule import ready
 from tl_loop.select.agent_type import select_agent_type, selection_failure
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.ledger import apply_spawn_and_charge
@@ -143,6 +144,7 @@ class TLLoopConfig:
     active: bool = True
     max_workers: int = 8
     max_leaves: int = 8
+    max_parallel_slices: int | None = None
     max_events: int = 256
     poll_interval: float = 0.1
     idle_timeout: float = 30.0
@@ -165,6 +167,10 @@ class TLLoopConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        if self.max_parallel_slices is not None and (
+            type(self.max_parallel_slices) is not int or self.max_parallel_slices < 0
+        ):
+            raise ValueError("max_parallel_slices must be null or non-negative")
         if self.max_events == 0:
             raise ValueError("max_events must be positive")
         if self.poll_interval < 0:
@@ -358,6 +364,10 @@ def _run_loop(
             after_tag.value,
         )
         phase = next_phase
+        if config.policy is not None and config.max_parallel_slices is not None:
+            state = _dispatch_children(
+                plan, state, config, effects, effects_log, store
+            )
         if isinstance(phase, (TLDone, TLFailed)):
             break
     else:
@@ -379,6 +389,8 @@ def _dispatch_children(
 ) -> RunState:
     live = cast(EffectClient, effects) if config.active else None
     for worker in plan.workers:
+        if not _can_dispatch(worker.name, state, config):
+            continue
         if _already_dispatched(worker.name, state):
             continue
         selected_harness = _prepare_spawn(worker.name, state, config, store)
@@ -398,6 +410,8 @@ def _dispatch_children(
             effects_log,
         )
     for leaf in plan.leaves:
+        if not _can_dispatch(leaf.name, state, config):
+            continue
         if _already_dispatched(leaf.name, state):
             continue
         selected_harness = _prepare_spawn(leaf.name, state, config, store)
@@ -426,6 +440,14 @@ def _dispatch_children(
             effects_log,
         )
     return store.load() if config.policy is not None else state
+
+
+def _can_dispatch(name: str, state: RunState, config: TLLoopConfig) -> bool:
+    if config.policy is None or config.max_parallel_slices is None:
+        return True
+    return name in {slice_state.id for slice_state in ready(
+        state.slices, config.max_parallel_slices
+    )}
 
 
 def _already_dispatched(name: str, state: RunState) -> bool:

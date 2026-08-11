@@ -14,6 +14,7 @@ from .driver import (
     run_tl_loop,
     tl_run,
 )
+from .schedule import ScheduleDeadlock, ScheduleError, active_count, ready
 from .shadow import (
     DEFAULT_SHADOW_ROOT,
     ActionRecorder,
@@ -37,6 +38,8 @@ __all__ = [
     "LeafTask",
     "LoopLimitExceeded",
     "LoopTimeout",
+    "ScheduleDeadlock",
+    "ScheduleError",
     "ShadowLoop",
     "ShadowLoopError",
     "ShadowRunResult",
@@ -46,6 +49,8 @@ __all__ = [
     "TLRunResult",
     "WorkPlan",
     "WorkerTask",
+    "active_count",
+    "ready",
     "run_tl_loop",
     "tl_run",
 ]

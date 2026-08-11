@@ -17,6 +17,7 @@ from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.driver import (
     LoopLimitExceeded,
     TLLoopConfig,
+    WorkerTask,
     WorkPlan,
     run_tl_loop,
     tl_run,
@@ -130,6 +131,42 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
     assert result.final_state.budgets.harness_reserved == {"codex/gpt-luna": 500}
     assert result.final_state.slices["worker-a"].model == "gpt-5.5"
     assert result.final_state.fsm.phase is TLPhase.TLDone
+
+
+def test_tl_run_width_gate_dispatches_next_ready_slice_after_completion(
+    tmp_path: Path,
+) -> None:
+    transport = RecordingTransport()
+    run_id = "width-run"
+    source = SyntheticQueue(_serial_worker_events(run_id))
+    policy = validate_policy(_selector_policy())
+    config = TLLoopConfig(
+        source=source,
+        effects=EffectClient(transport),
+        root_dir=tmp_path,
+        policy=policy,
+        capabilities=CapabilityMap(
+            {"codex/gpt-luna": Difficulty.STANDARD, "claude/sonnet": Difficulty.HARD}
+        ),
+        max_workers=2,
+        max_leaves=0,
+        max_parallel_slices=1,
+        max_events=5,
+        poll_interval=0.001,
+        idle_timeout=0.1,
+    )
+    plan = WorkPlan(
+        workers=(
+            WorkerTask("worker-a", "first"),
+            WorkerTask("worker-b", "second"),
+        )
+    )
+
+    result = tl_run({"run_id": run_id, "plan": plan}, config, BudgetLedger(0, 0))
+
+    assert [name for name, _ in transport.calls] == ["spawn_worker", "spawn_worker"]
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    assert result.final_state.budgets.role_reserved == {"worker": 500}
 
 
 def test_shadow_loop_uses_the_same_driver_without_mutating_transport(
@@ -274,6 +311,16 @@ def _canonical_lifecycle(run_id: str) -> list[EventEnvelope]:
         _canonical_event(4, "agent.notify_parent", "worker-a", run_id),
         _canonical_event(5, "agent.completed", "leaf-a", run_id, pr_number=42),
         _event(6, "all_children_done", run_id=run_id),
+    ]
+
+
+def _serial_worker_events(run_id: str) -> list[EventEnvelope]:
+    return [
+        _event(1, "child_spawned", "worker-a", run_id=run_id),
+        _event(2, "child_completed", "worker-a", run_id=run_id),
+        _event(3, "child_spawned", "worker-b", run_id=run_id),
+        _event(4, "child_completed", "worker-b", run_id=run_id),
+        _event(5, "all_children_done", run_id=run_id),
     ]
 
 
