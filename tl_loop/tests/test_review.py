@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -34,8 +34,7 @@ from tl_loop.state.schema import (
 )
 from tl_loop.state.store import RunStore, create
 
-
-NOW = datetime(2026, 8, 11, 17, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 11, 17, 0, tzinfo=UTC)
 
 
 def test_verdict_without_reviewed_head_fails_schema_validation() -> None:
@@ -144,7 +143,7 @@ def test_expired_matching_head_is_refused_before_merge(tmp_path: Path) -> None:
 
 
 def _fresh_verdict_at() -> str:
-    return (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    return (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
 
 
 def _slice(*, verdict_at: str | None) -> SliceState:

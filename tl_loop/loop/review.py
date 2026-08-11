@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.state.schema import SliceState, Verdict
@@ -72,7 +72,7 @@ def verify_review(
     if slice.verdict_at is None:
         raise StaleVerdict(f"slice {slice.id!r} verdict has no observed timestamp")
     observed = _parse_timestamp(slice.verdict_at)
-    current = now or datetime.now(timezone.utc)
+    current = now or datetime.now(UTC)
     age_seconds = max(0.0, (current - observed).total_seconds())
     window = (
         freshness_window_secs
@@ -116,12 +116,12 @@ def load_freshness_window(path: str | Path = DEFAULT_REVIEW_POLICY) -> int:
 
 def _parse_timestamp(value: str) -> datetime:
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError as error:
         raise StaleVerdict(f"invalid verdict timestamp: {value!r}") from error
     if parsed.tzinfo is None:
         raise StaleVerdict("verdict timestamp must include a timezone")
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
 __all__ = [

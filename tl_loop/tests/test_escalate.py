@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Mapping, cast
+from typing import cast
 
 import pytest
 
@@ -20,7 +20,6 @@ from tl_loop.loop.escalate import (
 )
 from tl_loop.state.schema import BudgetLedger, ParkCause, SliceState, SliceStatus, Verdict
 from tl_loop.state.store import RunStore, create
-
 
 CAUSES = tuple(ParkCause)
 

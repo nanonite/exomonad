@@ -32,12 +32,12 @@ from .schema import (
     FSMState,
     GateState,
     GateStatus,
+    ParkCause,
     RunState,
     SchemaError,
     SliceMap,
     SliceState,
     SliceStatus,
-    ParkCause,
     Verdict,
     validate,
 )

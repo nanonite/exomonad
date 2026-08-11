@@ -1,0 +1,92 @@
+{
+  "budgets": {
+    "ledger": {
+      "charges": [
+        {
+          "actual": "unknown",
+          "attempt": 1,
+          "delta_tokens": null,
+          "estimated_tokens": 250,
+          "harness": "codex/gpt-luna",
+          "reconciled": false,
+          "role": "worker",
+          "slice_id": "worker-a",
+          "warning": false
+        },
+        {
+          "actual": "unknown",
+          "attempt": 1,
+          "delta_tokens": null,
+          "estimated_tokens": 250,
+          "harness": "codex/gpt-luna",
+          "reconciled": false,
+          "role": "worker",
+          "slice_id": "leaf-a",
+          "warning": false
+        }
+      ],
+      "harness_reserved": {
+        "codex/gpt-luna": 500
+      },
+      "role_reserved": {
+        "worker": 500
+      },
+      "tokens": 0,
+      "wall_seconds": 0
+    }
+  },
+  "events": {
+    "last_consumed_offset": 7
+  },
+  "fsm": {
+    "phase": "tl_done",
+    "waiting": []
+  },
+  "gates": [],
+  "revision": 9,
+  "run_id": "<run-id>",
+  "slices": {
+    "leaf-a": {
+      "agent_type": "codex/gpt-luna",
+      "attempts": 1,
+      "base_ref": null,
+      "branch": "main.leaf-a",
+      "depends_on": [],
+      "id": "leaf-a",
+      "model": null,
+      "paths": [
+        "src/leaf.py"
+      ],
+      "pr_number": 42,
+      "reviewed_head": "head-a",
+      "status": "merged",
+      "test_plan": [
+        "just tl-loop-test"
+      ],
+      "verdict": "GO",
+      "verdict_at": "<timestamp>",
+      "worktree": null
+    },
+    "worker-a": {
+      "agent_type": "codex/gpt-luna",
+      "attempts": 1,
+      "base_ref": null,
+      "branch": "main.worker-a",
+      "depends_on": [],
+      "id": "worker-a",
+      "model": null,
+      "paths": [
+        "tl-loop/worker-a"
+      ],
+      "pr_number": null,
+      "reviewed_head": null,
+      "status": "merged",
+      "test_plan": [
+        "controller"
+      ],
+      "verdict": null,
+      "worktree": null
+    }
+  },
+  "version": 1
+}

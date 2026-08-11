@@ -1,0 +1,78 @@
+{
+  "budgets": {
+    "ledger": {
+      "tokens": 0,
+      "wall_seconds": 0
+    }
+  },
+  "events": {
+    "last_consumed_offset": 0
+  },
+  "fsm": {
+    "phase": "tl_planning",
+    "waiting": []
+  },
+  "gates": [],
+  "revision": 1,
+  "run_id": "<run-id>",
+  "slices": {
+    "leaf-a": {
+      "agent_type": null,
+      "attempts": 0,
+      "base_ref": null,
+      "branch": null,
+      "depends_on": [],
+      "id": "leaf-a",
+      "model": null,
+      "paths": [
+        "src/leaf.py"
+      ],
+      "pr_number": null,
+      "reviewed_head": null,
+      "status": "pending",
+      "test_plan": [
+        "just tl-loop-test"
+      ],
+      "verdict": null,
+      "worktree": null
+    },
+    "worker-a": {
+      "agent_type": null,
+      "attempts": 0,
+      "base_ref": null,
+      "branch": null,
+      "depends_on": [],
+      "id": "worker-a",
+      "model": null,
+      "park_audit": {
+        "attempts": 0,
+        "harness": null,
+        "ledger": {
+          "charges": [],
+          "harness_reserved": {},
+          "harness_spent": {},
+          "role_reserved": {},
+          "role_spent": {},
+          "tokens": 0,
+          "wall_seconds": 0
+        },
+        "model": null,
+        "verdict": null
+      },
+      "park_cause": "retries_exhausted",
+      "park_issue_id": 900,
+      "paths": [
+        "tl-loop/worker-a"
+      ],
+      "pr_number": null,
+      "reviewed_head": null,
+      "status": "parked",
+      "test_plan": [
+        "controller"
+      ],
+      "verdict": null,
+      "worktree": null
+    }
+  },
+  "version": 1
+}

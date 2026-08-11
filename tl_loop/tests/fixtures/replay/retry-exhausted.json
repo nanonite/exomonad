@@ -1,0 +1,46 @@
+{
+  "name": "retry-exhausted",
+  "run_id": "replay-park",
+  "policy": "selector_policy_over_constrained.toml",
+  "plan": {
+    "workers": [
+      {
+        "name": "worker-a",
+        "task": "inspect the repository"
+      }
+    ],
+    "leaves": [
+      {
+        "name": "leaf-a",
+        "task": "implement the requested change",
+        "boundary": [
+          "src/leaf.py"
+        ],
+        "verify": [
+          "just tl-loop-test"
+        ]
+      }
+    ]
+  },
+  "events": [],
+  "expected_actions": [
+    {
+      "operation": "chainlink_issue_create",
+      "arguments": {
+        "description": "Slice worker-a is parked for human action. Cause: retries_exhausted. Audit: {\"attempts\": 0, \"harness\": null, \"ledger\": {\"charges\": [], \"harness_reserved\": {}, \"harness_spent\": {}, \"role_reserved\": {}, \"role_spent\": {}, \"tokens\": 0, \"wall_seconds\": 0}, \"model\": null, \"verdict\": null}",
+        "labels": [
+          "needs-human"
+        ],
+        "priority": "high",
+        "title": "Escalate slice worker-a: retries_exhausted",
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    }
+  ],
+  "active": false,
+  "expect_terminal_park": true,
+  "park_slice": "worker-a",
+  "golden": "retry-exhausted.golden.json"
+}

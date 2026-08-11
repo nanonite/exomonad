@@ -60,6 +60,10 @@ haskell-test:
 tl-loop-test:
     python3 -m pytest -q tl_loop/tests
 
+# Replay committed TL event streams against the real loop
+tl-loop-replay:
+    python3 -m pytest -q tl_loop/tests/test_replay.py
+
 # Lint the programmatic TL controller
 tl-loop-lint:
     ruff check tl_loop
@@ -113,7 +117,7 @@ wasm-guest-test:
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
 # Run tests: Python checks, formatting, Rust check, WASM build/tests, Rust tests, proto freshness
-test: tl-loop-test tl-loop-lint
+test: tl-loop-replay tl-loop-test tl-loop-lint
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/8] Observability contract checks..."
