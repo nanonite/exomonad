@@ -64,6 +64,8 @@ actual="unknown" and conservatively applies its estimate to spent counters; it
 never claims the estimate was actual usage. A measured estimate delta is
 flagged when its absolute value exceeds 20% of the estimate.
 
+A selector result of None with SelectionFailure.OVER_BUDGET is a bounded needs-human parking signal; the controller must not widen the allowlist or silently raise a ceiling to continue.
+
 ## FSM parity fixture
 
 `tl_loop/fsm/` is a pure port of `.exo/roles/devswarm/TLPhase.hs`. The golden

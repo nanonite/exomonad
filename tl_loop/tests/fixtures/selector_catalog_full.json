@@ -1,0 +1,34 @@
+{
+  "models": [
+    {
+      "harness": "codex",
+      "provider": "openai-codex",
+      "model_id": "gpt-5.5",
+      "name": "GPT-5.5"
+    },
+    {
+      "harness": "codex",
+      "provider": "openai-codex",
+      "model_id": "gpt-5-codex-20260101",
+      "name": "GPT-5 Codex January 2026"
+    },
+    {
+      "harness": "codex",
+      "provider": "openai-codex",
+      "model_id": "gpt-5-codex-20250101",
+      "name": "GPT-5 Codex January 2025"
+    },
+    {
+      "harness": "claude",
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-4-6",
+      "name": "Claude Sonnet"
+    },
+    {
+      "harness": "claude",
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-4-6-20250101",
+      "name": "Claude Sonnet Dated"
+    }
+  ]
+}

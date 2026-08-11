@@ -1,0 +1,10 @@
+{
+  "models": [
+    {
+      "harness": "codex",
+      "provider": "openai-codex",
+      "model_id": "gpt-5.5",
+      "name": "GPT-5.5"
+    }
+  ]
+}

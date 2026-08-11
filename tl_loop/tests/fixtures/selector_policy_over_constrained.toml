@@ -1,0 +1,20 @@
+[roles.tl]
+allow = ["codex/gpt-luna"]
+cost_rank = { "codex/gpt-luna" = 1 }
+token_budget = 1
+per_harness_budget = { "codex/gpt-luna" = 1 }
+escalate_after_attempts = 1
+
+[roles.worker]
+allow = ["codex/gpt-luna"]
+cost_rank = { "codex/gpt-luna" = 1 }
+token_budget = 1
+per_harness_budget = { "codex/gpt-luna" = 1 }
+escalate_after_attempts = 1
+
+[roles.reviewer]
+allow = ["codex/gpt-luna"]
+cost_rank = { "codex/gpt-luna" = 1 }
+token_budget = 1
+per_harness_budget = { "codex/gpt-luna" = 1 }
+escalate_after_attempts = 1
