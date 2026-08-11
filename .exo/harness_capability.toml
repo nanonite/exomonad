@@ -1,0 +1,7 @@
+# Static capability ratings. Each entry records the operator's basis.
+
+[capabilities]
+# Basis: operator judgment for the default low-cost worker model; standard tasks only.
+"codex/gpt-luna" = "standard"
+# Basis: vendor tier and the configured escalation target; hard tasks are supported.
+"claude/sonnet" = "hard"
