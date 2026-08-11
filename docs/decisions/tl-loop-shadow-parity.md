@@ -1,6 +1,6 @@
 # ADR: TL shadow parity gate
 
-Status: Proposed, awaiting human operator sign-off
+Status: Accepted
 Date: 2026-08-11
 Scope: M3.4 Shadow parity acceptance gate (#681)
 
@@ -44,15 +44,13 @@ M3.3 run passed before this gate was opened.
 The M3 read-only trajectory is parity-acceptable for the captured replay after
 the explicit classifications above. There are zero untriaged rows.
 
-M5 is **NO-GO pending human sign-off**. No M5 task may begin until the human
-operator accepts these three intentional differences and the ADR is updated
-with the sign-off below.
+M5 is **GO**. The human operator accepted the three intentional differences
+and the ADR now records the sign-off below.
 
 ## Human sign-off
 
-- Operator: pending
-- Decision: pending approval or rejection
-- Date: pending
-- Notes: The operator must explicitly confirm whether the accepted
-  action-granularity and abstraction-vocabulary differences are sufficient for
-  the M5 go/no-go decision.
+- Operator: human operator
+- Decision: APPROVED
+- Date: 2026-08-11
+- Notes: Approved in the operator conversation with the accepted
+  action-granularity and abstraction-vocabulary differences.
