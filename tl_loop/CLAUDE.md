@@ -134,3 +134,14 @@ parallel with the WASM `TLStopCheck.hs` hook while M3 uses shadow mode. The
 Python loop does not copy the hook's nudge prose or its external checks for
 uncommitted work and missing PRs. Retire the parallel WASM implementation in
 M8.1 once the controller is authoritative.
+
+## RLM repair boundary
+
+tl_loop.rlm.repair.compose_repair is the only repair handoff path for a
+NO-GO review. It calls watcher_pr_state first and requires the existing PR to
+be open, unmerged, and identified by both head branch and SHA. The RLM receives
+the NO-GO reasons as its primary required section and returns exactly the seven
+RepairHandoff sections. Python retries semantic path-boundary violations,
+dispatches only through resume_pr, and increments the owning slice's attempts
+once after a successful dispatch. No repair handoff creates a branch, leaf
+name, or agent type.

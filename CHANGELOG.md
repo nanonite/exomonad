@@ -119,6 +119,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M6.5 compose_repair -> RepairHandoff feeding resume_pr (#699)
 - M6.4 adjudicate_review -> GO | GO-WITH-NITS | NO-GO (#698)
 - M6.3 decompose(spec) -> [SliceSpec] with ownership contract (#697)
 - M6.2 Deterministic context budgeting per rlm call (#696)

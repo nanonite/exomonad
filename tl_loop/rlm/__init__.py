@@ -45,6 +45,19 @@ from .decompose import (
     decompose,
     validate_decomposition,
 )
+from .repair import (
+    REPAIR_HANDOFF_FIELDS,
+    REPAIR_HANDOFF_SCHEMA,
+    REPAIR_PROMPT,
+    RepairBoundaryError,
+    RepairDispatchError,
+    RepairError,
+    RepairHandoff,
+    RepairHandoffRejected,
+    RepairInputError,
+    RepairPRStateError,
+    compose_repair,
+)
 from .review_input import load_review_policy
 from .schema import OutputSchemaError, validate_output
 from .store import (
@@ -63,6 +76,9 @@ __all__ = [
     "DECOMPOSE_PROMPT",
     "DEFAULT_REVIEW_POLICY",
     "MAX_ATTEMPTS",
+    "REPAIR_HANDOFF_FIELDS",
+    "REPAIR_HANDOFF_SCHEMA",
+    "REPAIR_PROMPT",
     "SECTION_PRIORITY_ORDER",
     "SLICE_SPEC_SCHEMA",
     "AdjudicationError",
@@ -81,6 +97,13 @@ __all__ = [
     "JudgmentFailed",
     "NitRecordingError",
     "OutputSchemaError",
+    "RepairBoundaryError",
+    "RepairDispatchError",
+    "RepairError",
+    "RepairHandoff",
+    "RepairHandoffRejected",
+    "RepairInputError",
+    "RepairPRStateError",
     "ReviewPolicy",
     "ReviewedHeadMismatch",
     "RlmBackend",
@@ -96,6 +119,7 @@ __all__ = [
     "adjudicate_review",
     "compact_inputs",
     "compact_sections",
+    "compose_repair",
     "context_budget",
     "decompose",
     "judgment_hash",
