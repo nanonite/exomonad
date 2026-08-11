@@ -119,6 +119,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M6.2 Deterministic context budgeting per rlm call (#696)
 - M6.1 rlm(): bounded structured LM call primitive (#695)
 - M5.4 reviewed_head SHA binding for verdicts (#692)
 - M5.3 Escalation and needs-human parking terminal state (#691)

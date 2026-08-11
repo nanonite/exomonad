@@ -45,6 +45,10 @@ class RlmRequest:
     output_schema: Mapping[str, object]
     attempt: int
     retry_error: str | None = None
+    context_budget: int = 0
+    token_count: int = 0
+    token_count_method: str = ""
+    dropped_sections: tuple[str, ...] = ()
     tools: tuple[object, ...] = ()
 
 
@@ -114,6 +118,8 @@ class RlmModelChoice:
     store: RlmCallStore = field(default_factory=RlmCallStore)
     replay: MutableMapping[str, object] = field(default_factory=dict)
     max_attempts: int = 3
+    context_length: int | None = None
+    token_counter: object | None = None
 
     def __post_init__(self) -> None:
         if not self.model_id:
@@ -122,6 +128,10 @@ class RlmModelChoice:
             raise ValueError("role must be non-empty")
         if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 3:
             raise ValueError("max_attempts must be between 1 and 3")
+        if self.context_length is not None and (
+            type(self.context_length) is not int or self.context_length <= 0
+        ):
+            raise ValueError("context_length must be a positive integer")
 
 
 def normalize_response(raw: object) -> RlmResponse:

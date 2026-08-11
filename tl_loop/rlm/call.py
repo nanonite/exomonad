@@ -11,6 +11,7 @@ from typing import cast
 
 from tl_loop.client.transport import JsonObject, JsonValue
 
+from .budget import CompactionResult, compact_inputs
 from .schema import OutputSchemaError, validate_output
 from .store import (
     RlmCallStore,
@@ -57,9 +58,11 @@ def rlm(
     """Perform one bounded, stateless, structured, tool-free LM judgment."""
     _validate_call_arguments(name, inputs, output_schema)
     choice = _coerce_model_choice(model_choice)
-    request_inputs = copy.deepcopy(cast(JsonObject, dict(inputs)))
+    original_inputs = copy.deepcopy(cast(JsonObject, dict(inputs)))
     request_schema = copy.deepcopy(dict(output_schema))
-    input_hash = judgment_hash(name, request_inputs, request_schema, choice.model_id)
+    compaction = compact_inputs(original_inputs, choice)
+    request_inputs = compaction.prompt
+    input_hash = judgment_hash(name, original_inputs, request_schema, choice.model_id)
 
     replayed = choice.replay.get(input_hash)
     if replayed is not None:
@@ -73,11 +76,21 @@ def rlm(
                 input_hash,
                 attempt=1,
                 response=response,
+                compaction=compaction,
                 replayed=True,
                 validation_error=str(error),
             )
             raise JudgmentFailed(name, (str(error),)) from error
-        _record_success(choice, name, input_hash, 1, response, result, replayed=True)
+        _record_success(
+            choice,
+            name,
+            input_hash,
+            1,
+            response,
+            compaction,
+            result,
+            replayed=True,
+        )
         return result
 
     errors: list[str] = []
@@ -89,6 +102,10 @@ def rlm(
             output_schema=copy.deepcopy(request_schema),
             attempt=attempt,
             retry_error=errors[-1] if errors else None,
+            context_budget=compaction.context_budget,
+            token_count=compaction.final_token_count,
+            token_count_method=compaction.token_count_method,
+            dropped_sections=compaction.dropped_sections,
         )
         try:
             response = _invoke(choice.backend, request)
@@ -99,13 +116,16 @@ def rlm(
                 input_hash,
                 attempt,
                 response=None,
+                compaction=compaction,
                 replayed=False,
                 validation_error=None,
                 call_error=type(error).__name__,
             )
             if isinstance(error, RlmError):
                 raise
-            raise RlmCallError(f"RLM backend failed for {name!r}: {type(error).__name__}") from error
+            raise RlmCallError(
+                f"RLM backend failed for {name!r}: {type(error).__name__}"
+            ) from error
 
         try:
             result = validate_output(response.output, request_schema)
@@ -118,6 +138,7 @@ def rlm(
                 input_hash,
                 attempt,
                 response,
+                compaction=compaction,
                 replayed=False,
                 validation_error=message,
             )
@@ -125,7 +146,16 @@ def rlm(
                 raise JudgmentFailed(name, tuple(errors)) from error
             continue
 
-        _record_success(choice, name, input_hash, attempt, response, result, replayed=False)
+        _record_success(
+            choice,
+            name,
+            input_hash,
+            attempt,
+            response,
+            compaction,
+            result,
+            replayed=False,
+        )
         choice.replay[input_hash] = response
         return result
 
@@ -153,7 +183,9 @@ def judgment_hash(
             separators=(",", ":"),
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
-        raise RlmConfigurationError(f"RLM inputs are not canonical JSON: {error}") from error
+        raise RlmConfigurationError(
+            f"RLM inputs are not canonical JSON: {error}"
+        ) from error
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -199,8 +231,12 @@ def _coerce_model_choice(model_choice: object) -> RlmModelChoice:
         replay = {}
     role = _member(model_choice, "role") or "worker"
     max_attempts = _member(model_choice, "max_attempts") or MAX_ATTEMPTS
+    context_length = _member(model_choice, "context_length")
+    token_counter = _member(model_choice, "token_counter")
     if not isinstance(role, str) or not isinstance(max_attempts, int):
         raise RlmConfigurationError("model_choice runtime metadata is invalid")
+    if context_length is not None and type(context_length) is not int:
+        raise RlmConfigurationError("model_choice context_length must be an integer")
     return RlmModelChoice(
         model_id=model_id,
         backend=backend,
@@ -208,6 +244,8 @@ def _coerce_model_choice(model_choice: object) -> RlmModelChoice:
         store=store,
         replay=replay,
         max_attempts=max_attempts,
+        context_length=cast(int | None, context_length),
+        token_counter=token_counter,
     )
 
 
@@ -236,6 +274,7 @@ def _record_success(
     input_hash: str,
     attempt: int,
     response: RlmResponse,
+    compaction: CompactionResult,
     result: JsonObject,
     *,
     replayed: bool,
@@ -246,6 +285,7 @@ def _record_success(
         input_hash,
         attempt,
         response,
+        compaction=compaction,
         replayed=replayed,
         result=result,
     )
@@ -259,6 +299,7 @@ def _record_failure(
     attempt: int,
     response: RlmResponse | None,
     *,
+    compaction: CompactionResult,
     replayed: bool,
     validation_error: str | None,
     call_error: str | None = None,
@@ -269,6 +310,7 @@ def _record_failure(
         input_hash,
         attempt,
         response,
+        compaction=compaction,
         replayed=replayed,
         result=None,
         validation_error=validation_error,
@@ -285,6 +327,7 @@ def _event(
     attempt: int,
     response: RlmResponse | None,
     *,
+    compaction: CompactionResult,
     replayed: bool,
     result: JsonObject | None,
     validation_error: str | None = None,
@@ -300,6 +343,10 @@ def _event(
         "output_tokens": response.output_tokens if response else 0,
         "total_tokens": response.total_tokens if response else 0,
         "latency_ms": response.latency_ms if response else 0,
+        "context_budget": compaction.context_budget,
+        "final_token_count": compaction.final_token_count,
+        "token_count_method": compaction.token_count_method,
+        "dropped_sections": list(compaction.dropped_sections),
         "replayed": replayed,
         "result": _redact(result) if result is not None else None,
     }

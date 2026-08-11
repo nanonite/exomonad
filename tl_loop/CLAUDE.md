@@ -29,6 +29,17 @@ commits the role token charge and event record together. Replay entries are
 keyed by the canonical hash of the judgment name, inputs, model, and output
 schema, so hermetic tests can avoid network access.
 
+Every model choice supplies its resolved context_length. RLM reserves
+floor(context_length * 0.8) using integer arithmetic. Plain input mappings
+are one required section; callers that need compaction pass the explicit
+sections envelope with name, content, priority, and required fields. Sections
+are rendered in descending priority and optional sections are removed in
+ascending priority until the deterministic prompt fits. Required overflow
+raises ContextOverflow instead of truncating content. Provider token counters
+may be injected; otherwise canonical JSON is counted at four UTF-8 characters
+per token, and the method, final count, budget, and dropped section names are
+recorded in every RLM event.
+
 ## Checkpoint and resume layout
 
 Each run is persisted at `.exo/tl-loop/<run_id>/run.json`; the shared writer

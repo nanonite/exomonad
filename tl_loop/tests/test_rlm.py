@@ -38,6 +38,7 @@ def _choice(backend: FakeBackend, *, replay: dict[str, object] | None = None) ->
         backend=backend,
         store=RlmCallStore(),
         replay=replay if replay is not None else {},
+        context_length=1000,
     )
 
 
