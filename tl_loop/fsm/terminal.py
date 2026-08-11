@@ -6,10 +6,10 @@ from .phase import (
     PhaseValue,
     TLAllMerged,
     TLDispatching,
-    TLFailed,
-    TLPlanning,
     TLDone,
+    TLFailed,
     TLMerging,
+    TLPlanning,
     TLWaiting,
 )
 

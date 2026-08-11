@@ -15,16 +15,16 @@ from .phase import (
     PhaseValue,
     TLAllMerged,
     TLDispatching,
+    TLDone,
     TLFailed,
+    TLMerging,
     TLPhase,
     TLPlanning,
     TLPRFiled,
-    TLDone,
-    TLMerging,
     TLWaiting,
 )
-from .transition import IllegalTransition, transition
 from .terminal import is_terminal, is_waiting
+from .transition import IllegalTransition, transition
 
 __all__ = [
     "AllChildrenDone",
@@ -39,15 +39,15 @@ __all__ = [
     "PhaseValue",
     "TLAllMerged",
     "TLDispatching",
+    "TLDone",
     "TLEvent",
     "TLFailed",
+    "TLMerging",
+    "TLPRFiled",
     "TLPhase",
     "TLPlanning",
-    "TLPRFiled",
-    "TLDone",
-    "TLMerging",
     "TLWaiting",
-    "transition",
     "is_terminal",
     "is_waiting",
+    "transition",
 ]

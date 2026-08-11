@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Callable, NoReturn, cast
+from collections.abc import Callable
+from typing import NoReturn, cast
 
-from .effects import EffectClient, TOOL_METHODS, ToolResult
+from .effects import TOOL_METHODS, EffectClient, ToolResult
 
 
 class MutationBlocked(RuntimeError):

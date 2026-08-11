@@ -14,9 +14,11 @@ import json
 import math
 import sqlite3
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import datetime
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 DETECTOR_REVISION = "mvp-e-mechanical-v1"
 INCIDENT_REVISION = "mvp-e-incident-cluster-v1"
@@ -225,7 +227,7 @@ def _sequence_gaps(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for session_id, session_rows in grouped.items():
         ordered = sorted(session_rows, key=lambda row: (row["run_seq"], row["event_key"]))
         missing = []
-        for left, right in zip(ordered, ordered[1:]):
+        for left, right in pairwise(ordered):
             if right["run_seq"] > left["run_seq"] + 1:
                 missing.extend(range(left["run_seq"] + 1, right["run_seq"]))
         if missing:
@@ -287,10 +289,10 @@ def cluster_incidents(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 clusters.append([signal])
         for cluster in clusters:
             detectors = sorted({signal["detector"] for signal in cluster})
-            primary = sorted(
+            primary = min(
                 cluster,
                 key=lambda signal: (-signal["score"], signal["detector"], signal["signal_id"]),
-            )[0]
+            )
             incident_id = _hash_json(
                 [INCIDENT_REVISION, session_id, [signal["signal_id"] for signal in cluster]]
             )
@@ -343,7 +345,7 @@ def _load_judge_labels(
         if judge not in labels:
             raise ValueError(f"labels contain unknown judge {judge!r}")
         if not isinstance(signal_id, str) or not isinstance(label, str):
-            raise ValueError("each adjudication label needs string signal_id and label")
+            raise TypeError("each adjudication label needs string signal_id and label")
         if label not in LABEL_SCHEMA:
             raise ValueError(f"unsupported adjudication label {label!r}")
         if signal_id in labels[judge]:
@@ -362,10 +364,10 @@ def _load_judge_labels(
                 elif isinstance(entries, list):
                     for entry in entries:
                         if not isinstance(entry, dict):
-                            raise ValueError("judge label lists must contain objects")
+                            raise TypeError("judge label lists must contain objects")
                         add(judge, entry.get("signal_id"), entry.get("label"))
                 else:
-                    raise ValueError("each judge must map to labels or label records")
+                    raise TypeError("each judge must map to labels or label records")
         elif len(judge_models) == 1:
             for signal_id, label in raw.items():
                 add(judge_models[0], signal_id, label)
@@ -374,15 +376,15 @@ def _load_judge_labels(
     elif isinstance(raw, list):
         for entry in raw:
             if not isinstance(entry, dict):
-                raise ValueError("adjudication labels must contain objects")
+                raise TypeError("adjudication labels must contain objects")
             judge = entry.get("judge")
             if judge is None and len(judge_models) == 1:
                 judge = judge_models[0]
             if not isinstance(judge, str):
-                raise ValueError("multiple judges require a judge field per label")
+                raise TypeError("multiple judges require a judge field per label")
             add(judge, entry.get("signal_id"), entry.get("label"))
     else:
-        raise ValueError("adjudication labels must be an object or list")
+        raise TypeError("adjudication labels must be an object or list")
     return labels
 
 

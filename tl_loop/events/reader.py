@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from itertools import pairwise
 from pathlib import Path
-from typing import Iterable, Mapping, TypeAlias, cast
+from typing import TypeAlias, cast
 
-from .envelope import EventEnvelope, MAPPED_EVENT_TYPES, UnmappedEventType, project
 from tl_loop.state.store import DEFAULT_ROOT
 from tl_loop.state.write import apply
+
+from .envelope import MAPPED_EVENT_TYPES, EventEnvelope, UnmappedEventType, project
 
 DEFAULT_LEDGER_ROOT = Path(".exo/ledger/segments")
 LedgerDocument: TypeAlias = dict[str, object]
@@ -63,7 +66,7 @@ class ReadResult:
     sequence_status: SequenceStatus
     findings: tuple[LedgerFinding, ...]
 
-    def __iter__(self) -> Iterable[EventEnvelope]:
+    def __iter__(self) -> Iterator[EventEnvelope]:
         return iter(self.events)
 
     def __len__(self) -> int:
@@ -196,7 +199,7 @@ def sequence_status(run_sequences: Iterable[int | None]) -> SequenceStatus:
     sequences = sorted(sequence for sequence in run_sequences if sequence is not None)
     if not sequences:
         return SequenceStatus.UNKNOWN
-    if all(right == left + 1 for left, right in zip(sequences, sequences[1:], strict=False)):
+    if all(right == left + 1 for left, right in pairwise(sequences)):
         return SequenceStatus.COMPLETE
     return SequenceStatus.PARTIAL
 

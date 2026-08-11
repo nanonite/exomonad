@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Mapping, TypeAlias, cast
+from typing import TypeAlias, cast
 
 LedgerEventInput: TypeAlias = Mapping[str, object]
 
@@ -193,14 +194,14 @@ def _head_sha(data: Mapping[str, object], event_type: str) -> str | None:
 
 __all__ = [
     "EVENT_TYPE_BY_KIND",
-    "EventEnvelope",
-    "EventKind",
-    "EnvelopeError",
-    "InvalidLedgerEvent",
     "KIND_BY_EVENT_TYPE",
-    "LedgerEventInput",
     "MAPPED_EVENT_TYPES",
     "SERVER_EMIT_HEAD_SHA_GAPS",
+    "EnvelopeError",
+    "EventEnvelope",
+    "EventKind",
+    "InvalidLedgerEvent",
+    "LedgerEventInput",
     "UnmappedEventType",
     "project",
     "project_ledger_event",

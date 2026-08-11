@@ -97,7 +97,8 @@ class LedgerQueue:
                     self._put_until_stopped(event)
                     cursor = event.run_seq if event.run_seq is not None else cursor
                 self._stop.wait(self.poll_interval)
-        except BaseException as error:
+        except Exception as error:  # noqa: BLE001
+            # Surface any ordinary tailer failure to the consumer thread.
             if not self._stop.is_set():
                 self._error = error
 

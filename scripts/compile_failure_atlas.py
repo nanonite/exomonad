@@ -154,7 +154,7 @@ def _provenance(source_manifest_hash: str, method_hash: str) -> dict[str, str]:
     }
 
 
-def _number(value: int | float, provenance: dict[str, str]) -> dict[str, Any]:
+def _number(value: float, provenance: dict[str, str]) -> dict[str, Any]:
     return {"value": value, "provenance": provenance}
 
 

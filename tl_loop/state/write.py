@@ -9,9 +9,10 @@ import json
 import os
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, TypeAlias
+from typing import TypeAlias
 
 from .lock import RunLock
 from .schema import SchemaError, validate

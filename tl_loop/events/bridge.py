@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Mapping, TypeAlias
+from collections.abc import Mapping
+from typing import TypeAlias
 
 from .envelope import EventEnvelope, project
 from .queue import LedgerQueue
@@ -25,7 +26,7 @@ def bridge_event(event: BridgeInput, *, logger: logging.Logger | None = None) ->
     try:
         envelope = project(event)
     except Exception as error:
-        active_logger.exception("bridge error event_type=%s error=%s", event_type, error)
+        active_logger.exception("bridge error event_type=%s", event_type)
         raise BridgeError(f"could not bridge server event {event_type!r}: {error}") from error
     _log_after(active_logger, envelope)
     return envelope
@@ -66,8 +67,8 @@ class EventBridge:
         self.logger.info("bridge before queue_get timeout=%s", timeout)
         try:
             envelope = self.queue.get(timeout=timeout)
-        except Exception as error:
-            self.logger.exception("bridge error queue_get error=%s", error)
+        except Exception:
+            self.logger.exception("bridge error queue_get")
             raise
         _log_after(self.logger, envelope)
         return envelope
@@ -77,8 +78,8 @@ class EventBridge:
         self.logger.info("bridge before acknowledge run_seq=%s", _run_seq(event))
         try:
             cursor = self.queue.acknowledge(event)
-        except Exception as error:
-            self.logger.exception("bridge error acknowledge error=%s", error)
+        except Exception:
+            self.logger.exception("bridge error acknowledge")
             raise
         self.logger.info("bridge after acknowledge run_seq=%s", cursor)
         return cursor

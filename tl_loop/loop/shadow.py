@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import copy
 import queue as queue_module
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, Protocol
+from typing import Protocol
 
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.envelope import EventEnvelope, EventKind
@@ -25,12 +26,12 @@ from tl_loop.fsm.phase import (
     PhaseValue,
     TLAllMerged,
     TLDispatching,
+    TLDone,
     TLFailed,
+    TLMerging,
     TLPhase,
     TLPlanning,
     TLPRFiled,
-    TLDone,
-    TLMerging,
     TLWaiting,
 )
 from tl_loop.fsm.transition import IllegalTransition, transition
@@ -455,9 +456,9 @@ def _positive_int(value: Mapping[str, object], key: str, event_type: str) -> int
 
 
 __all__ = [
+    "DEFAULT_SHADOW_ROOT",
     "ActionRecorder",
     "DeterministicJudgments",
-    "DEFAULT_SHADOW_ROOT",
     "IntendedAction",
     "Judgment",
     "ShadowLoop",

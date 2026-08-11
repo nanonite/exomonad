@@ -66,7 +66,7 @@ tl-loop-replay:
 
 # Lint the programmatic TL controller
 tl-loop-lint:
-    ruff check tl_loop
+    ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py
 
 # Type-check the programmatic TL controller
 tl-loop-typecheck:

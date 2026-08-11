@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Mapping
+from collections.abc import Mapping
 
 from .event import (
     AllChildrenDone,
@@ -18,10 +18,10 @@ from .phase import (
     Phase,
     PhaseValue,
     TLAllMerged,
-    TLFailed,
-    TLPRFiled,
     TLDone,
+    TLFailed,
     TLMerging,
+    TLPRFiled,
     TLWaiting,
 )
 

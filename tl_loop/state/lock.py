@@ -9,7 +9,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 
 class LockTimeout(TimeoutError):
@@ -43,7 +43,7 @@ class RunLock:
         self.owner: LockOwner | None = None
         self.stale_owner_detected = False
 
-    def __enter__(self) -> RunLock:
+    def __enter__(self) -> Self:
         self.acquire()
         return self
 
