@@ -13,6 +13,7 @@ from .envelope import (
     project,
     project_ledger_event,
 )
+from .bridge import BridgeError, EventBridge, bridge_event
 from .queue import EventQueue, LedgerQueue, QueueError
 from .reader import (
     DEFAULT_LEDGER_ROOT,
@@ -28,7 +29,9 @@ from .reader import (
 
 __all__ = [
     "EVENT_TYPE_BY_KIND",
+    "BridgeError",
     "EventEnvelope",
+    "EventBridge",
     "EventKind",
     "EventQueue",
     "EnvelopeError",
@@ -49,5 +52,6 @@ __all__ = [
     "UnmappedEventType",
     "project",
     "project_ledger_event",
+    "bridge_event",
     "sequence_status",
 ]

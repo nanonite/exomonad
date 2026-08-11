@@ -51,14 +51,13 @@ KIND_BY_EVENT_TYPE: Mapping[str, EventKind] = MappingProxyType(
 )
 MAPPED_EVENT_TYPES = frozenset(KIND_BY_EVENT_TYPE)
 
-# Current emitters do not put a head SHA in these event payloads. This is a
-# finding for M2.7 (#677), not permission for this projection to synthesize it.
+# These event types still have server-side emitters that do not put a head SHA
+# in their payloads. This is a finding for M2.7 (#677), not permission for this
+# projection to synthesize it.
 SERVER_EMIT_HEAD_SHA_GAPS = frozenset(
     {
         "pr.merged",
         "pr.merge_failed",
-        "copilot.review",
-        "ci.status_changed",
         "agent.completed",
         "agent.stuck",
         "agent.notify_parent",
@@ -76,6 +75,7 @@ class EventEnvelope:
     run_seq: int | None
     run_id: str | None
     agent_id: str | None
+    slice_id: str | None
     session_id: str | None
     invocation_id: str | None
     generation: int | None
@@ -88,6 +88,11 @@ class EventEnvelope:
     review_state: str | None
     ci_status: str | None
     data: Mapping[str, object]
+
+    @property
+    def reviewed_head(self) -> str | None:
+        """Compatibility name used by the run-state slice schema."""
+        return self.head_sha
 
 
 def project(event: LedgerEventInput) -> EventEnvelope:
@@ -107,6 +112,7 @@ def project(event: LedgerEventInput) -> EventEnvelope:
         run_seq=_optional_int(event, "run_seq", event_type),
         run_id=_optional_string(event, "run_id", event_type),
         agent_id=_optional_string(event, "agent_id", event_type),
+        slice_id=_optional_string(data, "slice_id", event_type),
         session_id=_optional_string(event, "session_id", event_type),
         invocation_id=_optional_string(event, "invocation_id", event_type),
         generation=_optional_int(event, "generation", event_type),
@@ -115,7 +121,7 @@ def project(event: LedgerEventInput) -> EventEnvelope:
         lifecycle_state=_required_string(event, "lifecycle_state", event_type),
         observed_at=_required_string(event, "observed_at", event_type),
         pr_number=_optional_int(data, "pr_number", event_type),
-        head_sha=_optional_string(data, "head_sha", event_type),
+        head_sha=_head_sha(data, event_type),
         review_state=_optional_string(data, "review_state", event_type),
         ci_status=_ci_status(data, event_type),
         data=MappingProxyType(cast(dict[str, object], copy.deepcopy(dict(data)))),
@@ -166,6 +172,17 @@ def _optional_int(event: LedgerEventInput, key: str, event_type: str) -> int | N
 def _ci_status(data: Mapping[str, object], event_type: str) -> str | None:
     key = "status" if event_type == EventKind.CI_STATUS_CHANGED.value else "ci_status"
     return _optional_string(data, key, event_type)
+
+
+def _head_sha(data: Mapping[str, object], event_type: str) -> str | None:
+    value = data.get("head_sha")
+    if value is None:
+        value = data.get("reviewed_head")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise InvalidLedgerEvent(f"{event_type!r}: head_sha must be null or a non-empty string")
+    return value
 
 
 __all__ = [

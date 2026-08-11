@@ -81,6 +81,7 @@ enum PendingAction {
     EmitEvent {
         status: String,
         message: String,
+        head_sha: String,
         comments: Option<Vec<ForgejoReviewComment>>,
         reviews: Option<Vec<ForgejoReview>>,
     },
@@ -2030,6 +2031,7 @@ where
                     PendingAction::EmitEvent {
                         status,
                         message,
+                        head_sha,
                         comments,
                         reviews,
                     } => {
@@ -2037,6 +2039,7 @@ where
                             pending.branch.as_str(),
                             &status,
                             &message,
+                            &head_sha,
                             pending.agent_type,
                             comments,
                             reviews,
@@ -2685,6 +2688,7 @@ where
         branch: &str,
         status: &str,
         message: &str,
+        head_sha: &str,
         _agent_type: AgentType,
         comments: Option<Vec<ForgejoReviewComment>>,
         reviews: Option<Vec<ForgejoReview>>,
@@ -2712,6 +2716,7 @@ where
         tracing::info!(
             otel.name = event_name,
             agent_id = %branch,
+            head_sha = %head_sha,
             branch = %branch,
             status = %status,
             message = %message,
@@ -2726,6 +2731,7 @@ where
                 branch,
                 &serde_json::json!({
                     "branch": branch,
+                    "head_sha": head_sha,
                     "status": status,
                     "message": message,
                     "comments": comments,
@@ -3192,6 +3198,7 @@ fn compute_pr_actions_with_context(
             pending_actions.push(PendingAction::EmitEvent {
                 status: "copilot_review".to_string(),
                 message: message.clone(),
+                head_sha: pr_sha.to_string(),
                 comments: Some(comments.to_vec()),
                 reviews: Some(reviews.to_vec()),
             });
@@ -3296,6 +3303,7 @@ fn compute_pr_actions_with_context(
         pending_actions.push(PendingAction::EmitEvent {
             status: ci_status.to_string(),
             message: format!("[CI STATUS: {}] {}", branch, ci_status),
+            head_sha: pr_sha.to_string(),
             comments: None,
             reviews: None,
         });
@@ -4734,6 +4742,10 @@ mod tests {
 
         assert_eq!(review_received_count, 1);
         assert_eq!(emit_event_count, 1);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::EmitEvent { head_sha, .. } if head_sha == "abc123"
+        )));
         assert!(!actions
             .iter()
             .any(|action| matches!(action, PendingAction::NotifyParentRepair { .. })));
@@ -5538,6 +5550,10 @@ mod tests {
                 event_type: "ci_status",
                 ..
             }
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::EmitEvent { head_sha, .. } if head_sha == "abc123"
         )));
         assert_eq!(state.last_ci_status, CIStatus::Success);
     }

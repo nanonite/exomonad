@@ -49,7 +49,9 @@ def test_review_and_ci_fields_are_projected_from_data_without_synthesis() -> Non
     assert projected["pr.filed"].head_sha == "aaa111"
     assert projected["pr.updated"].head_sha == "bbb222"
     assert projected["pr.published"].head_sha == "bbb222"
+    assert projected["copilot.review"].head_sha == "bbb222"
     assert projected["copilot.review"].review_state == "changes_requested"
+    assert projected["ci.status_changed"].head_sha == "bbb222"
     assert projected["ci.status_changed"].ci_status == "failure"
     assert all(projected[event_type].head_sha is None for event_type in SERVER_EMIT_HEAD_SHA_GAPS)
 

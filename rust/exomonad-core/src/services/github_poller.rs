@@ -74,6 +74,7 @@ enum PendingAction {
     EmitEvent {
         status: String,
         message: String,
+        head_sha: String,
         comments: Option<Vec<CopilotComment>>,
         reviews: Option<Vec<CopilotReview>>,
     },
@@ -202,6 +203,7 @@ fn compute_pr_actions(
         pending_actions.push(PendingAction::EmitEvent {
             status: "copilot_review".to_string(),
             message: message.clone(),
+            head_sha: pr_sha.to_string(),
             comments: Some(copilot_comments.to_vec()),
             reviews: Some(copilot_reviews.to_vec()),
         });
@@ -228,6 +230,7 @@ fn compute_pr_actions(
         pending_actions.push(PendingAction::EmitEvent {
             status: ci_status.to_string(),
             message: format!("[CI STATUS: {}] {}", branch, ci_status),
+            head_sha: pr_sha.to_string(),
             comments: None,
             reviews: None,
         });
@@ -837,6 +840,7 @@ impl<
                 PendingAction::EmitEvent {
                     status,
                     message,
+                    head_sha,
                     comments,
                     reviews,
                 } => {
@@ -844,6 +848,7 @@ impl<
                         branch.as_str(),
                         &status,
                         &message,
+                        &head_sha,
                         agent_type,
                         Some(pr_number),
                         comments,
@@ -1046,8 +1051,17 @@ impl<
         agent_type: AgentType,
         pr_number: Option<PRNumber>,
     ) {
-        self.emit_event_with_reviews(branch, status, message, agent_type, pr_number, None, None)
-            .await;
+        self.emit_event_with_reviews(
+            branch,
+            status,
+            message,
+            "",
+            agent_type,
+            pr_number,
+            None,
+            None,
+        )
+        .await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1056,6 +1070,7 @@ impl<
         branch: &str,
         status: &str,
         message: &str,
+        head_sha: &str,
         _agent_type: AgentType,
         _pr_number: Option<PRNumber>,
         comments: Option<Vec<CopilotComment>>,
@@ -1086,6 +1101,7 @@ impl<
         tracing::info!(
             otel.name = event_name,
             agent_id = %branch,
+            head_sha = %head_sha,
             branch = %branch,
             status = %status,
             message = %message,
@@ -1100,6 +1116,7 @@ impl<
                 branch,
                 &serde_json::json!({
                     "branch": branch,
+                    "head_sha": head_sha,
                     "status": status,
                     "message": message,
                     "comments": comments,

@@ -123,7 +123,7 @@
     "role": "watcher",
     "source": "watcher",
     "lifecycle_state": "observed",
-    "data": {"pr_number": 101, "review_state": "changes_requested", "status": "copilot_review", "reviews": []}
+    "data": {"pr_number": 101, "head_sha": "bbb222", "review_state": "changes_requested", "status": "copilot_review", "reviews": []}
   },
   {
     "schema_version": 1,
@@ -144,7 +144,7 @@
     "role": "watcher",
     "source": "watcher",
     "lifecycle_state": "observed",
-    "data": {"pr_number": 101, "status": "failure", "message": "tests failed"}
+    "data": {"pr_number": 101, "head_sha": "bbb222", "status": "failure", "message": "tests failed"}
   },
   {
     "schema_version": 1,
