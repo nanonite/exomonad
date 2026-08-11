@@ -275,6 +275,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- M5.5 Replayable loop test over a recorded event stream (#693)
 - M4.7 Selector test suite against catalog and policy fixtures (#688)
 - Add a bounded TL loop for workers and dev leaves (#713)
 - Route issue-close and inbox wakeups through the canonical ledger (#712)
