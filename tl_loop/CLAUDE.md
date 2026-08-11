@@ -180,3 +180,19 @@ Learned harness preferences are validated against the human-authored
 policy by dependency injection and may use it only after authoritative cost
 rank, capability, and budget filtering; it cannot widen an allowlist or
 change any ceiling.
+
+## Evidence-gated wave refinement
+
+`tl_loop.harness.refine.maybe_refine` is callable only when the durable FSM
+phase is `TLAllMerged`, `TLDone`, or `TLFailed`. It reads the immutable
+`LedgerReader` projection (or an equivalent sequence-bearing event iterable),
+refuses hard findings and partial sequence ranges, and never refines during a
+live wave.
+
+The closed triggers are repeated task-class failure, a repeated successful
+tactic, repeated delegation of an allowed role, and repeated behavior policy.
+The default threshold is two observations and is configurable. Every learned
+entry stores the contributing `run_seq` values in the policy `evidence` map;
+entries without evidence fail validation. Capability pass/fail aggregates are
+stored separately with their own sequence evidence and remain bounded by the
+human-authored harness allowlist.

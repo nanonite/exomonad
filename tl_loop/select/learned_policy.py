@@ -31,9 +31,12 @@ _ROOT_KEYS = frozenset(
         "decomposition_heuristics",
         "task_class_preferences",
         "repair_patterns",
+        "evidence",
+        "capability_observations",
         "history",
     }
 )
+_CAPABILITY_OBSERVATION_KEYS = frozenset({"passed", "failed", "evidence_seqs"})
 _HISTORY_KEYS = frozenset({"revision", "trigger", "created_at"})
 _TASK_CLASSES = frozenset(rule.name for rule in CLASSIFICATION_RULES)
 
@@ -52,11 +55,22 @@ class PolicyHistoryEntry:
 
 
 @dataclass(frozen=True)
+class CapabilityObservation:
+    """Observed harness outcomes, each backed by immutable ledger sequences."""
+
+    passed: int
+    failed: int
+    evidence_seqs: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class LearnedPolicy:
     """Validated learned choices that cannot widen the human harness policy."""
 
     version: int
     revision: int
+    evidence: Mapping[str, tuple[int, ...]]
+    capability_observations: Mapping[str, CapabilityObservation]
     decomposition_heuristics: Mapping[str, tuple[str, ...]]
     task_class_preferences: Mapping[str, Mapping[str, tuple[str, ...]]]
     repair_patterns: Mapping[str, Mapping[str, tuple[str, ...]]]
@@ -72,6 +86,8 @@ def default_document() -> Document:
     return {
         "version": LEARNED_POLICY_VERSION,
         "revision": 0,
+        "evidence": {},
+        "capability_observations": {},
         "decomposition_heuristics": {},
         "task_class_preferences": {},
         "repair_patterns": {},
@@ -101,6 +117,18 @@ def validate_learned_policy(document: object, policy: HarnessPolicy) -> LearnedP
         policy,
         task_classes=False,
     )
+    evidence = _parse_evidence(
+        root.get("evidence", {}),
+        "dispatch-policy.evidence",
+        heuristics,
+        preferences,
+        repairs,
+    )
+    capability_observations = _parse_capability_observations(
+        root.get("capability_observations", {}),
+        "dispatch-policy.capability_observations",
+        policy,
+    )
     history = _parse_history(
         _required(root, "history", "dispatch-policy"),
         "dispatch-policy.history",
@@ -115,6 +143,8 @@ def validate_learned_policy(document: object, policy: HarnessPolicy) -> LearnedP
         decomposition_heuristics=MappingProxyType(heuristics),
         task_class_preferences=MappingProxyType(preferences),
         repair_patterns=MappingProxyType(repairs),
+        evidence=MappingProxyType(evidence),
+        capability_observations=MappingProxyType(capability_observations),
         history=history,
     )
 
@@ -166,6 +196,7 @@ class DispatchPolicyStore:
         self,
         mutator: Callable[[Document], Mapping[str, object]],
         *,
+        evidence: Mapping[str, Sequence[int]] | None = None,
         trigger: str,
     ) -> LearnedPolicy:
         """Validate, snapshot, and atomically apply one policy mutation."""
@@ -192,6 +223,8 @@ class DispatchPolicyStore:
             if not isinstance(candidate_value, Mapping):
                 raise TypeError("learned-policy mutator must return an object")
             candidate = dict(candidate_value)
+            if evidence is not None:
+                candidate["evidence"] = _merge_evidence(document.get("evidence", {}), evidence)
             history = _history_documents(document.get("history"))
             history.append(
                 {
@@ -220,7 +253,9 @@ class DispatchPolicyStore:
         trigger: str,
     ) -> LearnedPolicy:
         """Replace learned data through the same validated mutation path."""
-        replacement = to_document(document) if isinstance(document, LearnedPolicy) else dict(document)
+        replacement = (
+            to_document(document) if isinstance(document, LearnedPolicy) else dict(document)
+        )
         return self.mutate(lambda _current: replacement, trigger=trigger)
 
     def rollback(self, revision: int) -> LearnedPolicy:
@@ -257,6 +292,15 @@ def to_document(policy: LearnedPolicy) -> Document:
         },
         "task_class_preferences": _serialize_preferences(policy.task_class_preferences),
         "repair_patterns": _serialize_preferences(policy.repair_patterns),
+        "evidence": {key: list(seqs) for key, seqs in policy.evidence.items()},
+        "capability_observations": {
+            harness: {
+                "passed": observation.passed,
+                "failed": observation.failed,
+                "evidence_seqs": list(observation.evidence_seqs),
+            }
+            for harness, observation in policy.capability_observations.items()
+        },
         "history": [
             {
                 "revision": event.revision,
@@ -282,9 +326,7 @@ def _required(table: Mapping[str, object], key: str, path: str) -> object:
     return table[key]
 
 
-def _reject_unknown(
-    table: Mapping[str, object], allowed: frozenset[str], path: str
-) -> None:
+def _reject_unknown(table: Mapping[str, object], allowed: frozenset[str], path: str) -> None:
     unknown = sorted(set(table) - allowed)
     if unknown:
         raise LearnedPolicyInvalid(f"{path}: unknown key(s): {', '.join(unknown)}")
@@ -292,9 +334,7 @@ def _reject_unknown(
 
 def _version(value: object, path: str) -> int:
     if type(value) is not int or value != LEARNED_POLICY_VERSION:
-        raise LearnedPolicyInvalid(
-            f"{path}: must equal supported version {LEARNED_POLICY_VERSION}"
-        )
+        raise LearnedPolicyInvalid(f"{path}: must equal supported version {LEARNED_POLICY_VERSION}")
     return cast(int, value)
 
 
@@ -366,9 +406,7 @@ def _parse_history(value: object, path: str) -> tuple[PolicyHistoryEntry, ...]:
             f"{path}[{index}].revision",
         )
         if revision <= previous:
-            raise LearnedPolicyInvalid(
-                f"{path}[{index}].revision: entries must be increasing"
-            )
+            raise LearnedPolicyInvalid(f"{path}[{index}].revision: entries must be increasing")
         trigger = _require_text(
             _required(entry, "trigger", f"{path}[{index}]"),
             f"{path}[{index}].trigger",
@@ -380,6 +418,77 @@ def _parse_history(value: object, path: str) -> tuple[PolicyHistoryEntry, ...]:
         entries.append(PolicyHistoryEntry(revision, trigger, created_at))
         previous = revision
     return tuple(entries)
+
+
+def _parse_evidence(
+    value: object,
+    path: str,
+    heuristics: Mapping[str, tuple[str, ...]],
+    preferences: Mapping[str, Mapping[str, tuple[str, ...]]],
+    repairs: Mapping[str, Mapping[str, tuple[str, ...]]],
+) -> dict[str, tuple[int, ...]]:
+    table = _mapping(value, path)
+    expected: set[str] = set()
+    expected.update(
+        f"decomposition_heuristics:{task_class}"
+        for task_class, values in heuristics.items()
+        if values
+    )
+    expected.update(
+        f"task_class_preferences:{task_class}:{role}"
+        for task_class, roles in preferences.items()
+        for role, values in roles.items()
+        if values
+    )
+    expected.update(
+        f"repair_patterns:{pattern}:{role}"
+        for pattern, roles in repairs.items()
+        for role, values in roles.items()
+        if values
+    )
+    unknown = sorted(set(table) - expected)
+    if unknown:
+        raise LearnedPolicyInvalid(
+            f"{path}: evidence has no corresponding learned entry: {', '.join(unknown)}"
+        )
+    result = {key: _sequences(raw, f"{path}.{key}") for key, raw in table.items()}
+    missing = sorted(expected - set(result))
+    if missing:
+        raise LearnedPolicyInvalid(
+            f"{path}: learned entry is missing evidence: {', '.join(missing)}"
+        )
+    return result
+
+
+def _parse_capability_observations(
+    value: object,
+    path: str,
+    policy: HarnessPolicy,
+) -> dict[str, CapabilityObservation]:
+    table = _mapping(value, path)
+    allowed = {harness for role in policy.roles.values() for harness in role.allow}
+    result: dict[str, CapabilityObservation] = {}
+    for harness, raw_observation in table.items():
+        if harness not in allowed:
+            raise LearnedPolicyInvalid(f"{path}.{harness}: harness is not present in allow")
+        observation = _mapping(raw_observation, f"{path}.{harness}")
+        _reject_unknown(observation, _CAPABILITY_OBSERVATION_KEYS, f"{path}.{harness}")
+        passed = _non_negative_int(
+            _required(observation, "passed", f"{path}.{harness}"),
+            f"{path}.{harness}.passed",
+        )
+        failed = _non_negative_int(
+            _required(observation, "failed", f"{path}.{harness}"),
+            f"{path}.{harness}.failed",
+        )
+        if passed + failed == 0:
+            raise LearnedPolicyInvalid(f"{path}.{harness}: at least one outcome is required")
+        evidence = _sequences(
+            _required(observation, "evidence_seqs", f"{path}.{harness}"),
+            f"{path}.{harness}.evidence_seqs",
+        )
+        result[harness] = CapabilityObservation(passed, failed, evidence)
+    return result
 
 
 def _task_class(value: str, path: str) -> None:
@@ -397,6 +506,32 @@ def _strings(value: object, path: str) -> tuple[str, ...]:
     if len(values) != len(set(values)):
         raise LearnedPolicyInvalid(f"{path}: entries must be unique")
     return cast(tuple[str, ...], values)
+
+
+def _sequences(value: object, path: str) -> tuple[int, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise LearnedPolicyInvalid(f"{path}: must be an array of sequence numbers")
+    values = tuple(value)
+    if any(type(item) is not int or item < 0 for item in values):
+        raise LearnedPolicyInvalid(f"{path}: must contain unique non-negative sequence numbers")
+    if not values:
+        raise LearnedPolicyInvalid(f"{path}: must contain at least one sequence number")
+    if len(values) != len(set(values)):
+        raise LearnedPolicyInvalid(f"{path}: entries must be unique")
+    return cast(tuple[int, ...], values)
+
+
+def _merge_evidence(current: object, updates: Mapping[str, Sequence[int]]) -> dict[str, list[int]]:
+    merged = {
+        key: list(_sequences(value, f"dispatch-policy.evidence.{key}"))
+        for key, value in _mapping(current, "dispatch-policy.evidence").items()
+    }
+    for key, values in updates.items():
+        if not isinstance(key, str) or not key:
+            raise LearnedPolicyInvalid("dispatch-policy.evidence keys must be non-empty strings")
+        additions = _sequences(values, f"dispatch-policy.evidence.{key}")
+        merged[key] = list(dict.fromkeys(merged.get(key, []) + list(additions)))
+    return merged
 
 
 def _serialize_preferences(
@@ -445,6 +580,7 @@ __all__ = [
     "DEFAULT_LEARNED_POLICY_PATH",
     "DEFAULT_SNAPSHOT_DIR",
     "LEARNED_POLICY_VERSION",
+    "CapabilityObservation",
     "DispatchPolicyStore",
     "LearnedPolicy",
     "LearnedPolicyInvalid",

@@ -31,9 +31,7 @@ CAPABILITIES = CapabilityMap(
 
 def test_learned_harness_outside_allowlist_is_rejected() -> None:
     document = default_document()
-    document["task_class_preferences"] = {
-        "focused_slice": {"worker": ["outside/human-policy"]}
-    }
+    document["task_class_preferences"] = {"focused_slice": {"worker": ["outside/human-policy"]}}
 
     with pytest.raises(LearnedPolicyInvalid, match="not present in allow"):
         validate_learned_policy(document, load_policy(POLICY_PATH))
@@ -62,6 +60,11 @@ def test_store_snapshots_mutations_and_rolls_back_exact_payload(tmp_path: Path) 
             },
         },
         trigger="repeated focused-slice repair",
+        evidence={
+            "decomposition_heuristics:focused_slice": [1, 2],
+            "task_class_preferences:focused_slice:worker": [1, 2],
+            "repair_patterns:no_go:worker": [1, 2],
+        },
     )
 
     assert updated.revision == 1
@@ -74,6 +77,8 @@ def test_store_snapshots_mutations_and_rolls_back_exact_payload(tmp_path: Path) 
     assert restored.decomposition_heuristics == {}
     assert restored.task_class_preferences == {}
     assert restored.repair_patterns == {}
+    assert restored.evidence == {}
+    assert restored.capability_observations == {}
     assert store.history()[-1].trigger == "rollback:0"
     assert load_learned_policy(policy_path, policy_path=POLICY_PATH) == restored
 
@@ -121,14 +126,14 @@ def test_selector_uses_learned_order_for_equal_cost_rank() -> None:
     document["task_class_preferences"] = {
         "focused_slice": {"worker": ["claude/sonnet", "codex/gpt-luna"]}
     }
+    document["evidence"] = {"task_class_preferences:focused_slice:worker": [1, 2]}
     learned = validate_learned_policy(document, policy)
 
-    choice = select_agent_type(
-        _slice(), "worker", SelectionLedger(), policy, CAPABILITIES, learned
-    )
+    choice = select_agent_type(_slice(), "worker", SelectionLedger(), policy, CAPABILITIES, learned)
 
     assert choice is not None
     assert choice.harness == "claude/sonnet"
+
 
 def _slice() -> SliceState:
     return SliceState(
