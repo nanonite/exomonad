@@ -249,6 +249,6 @@
     "role": "watcher",
     "source": "watcher",
     "lifecycle_state": "observed",
-    "data": {"pr_number": 101, "branch": "task-a", "parent": "root", "head_sha": "bbb222"}
+    "data": {"pr_number": 101, "branch": "task-a", "parent": "root", "head_sha": "bbb222", "head_sha_finding": null, "recipient": "task-b", "recipient_pr_number": 102, "payload": {"merged_branch": "task-a", "parent_branch": "root", "sibling_pr_number": 102}}
   }
 ]

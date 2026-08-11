@@ -36,6 +36,32 @@ pub fn canonical_review_wakeup_data(
     serde_json::Value::Object(data)
 }
 
+/// Build the canonical payload for one sibling-merge recipient wakeup.
+pub fn canonical_sibling_merged_data(
+    merged_pr_number: u64,
+    merged_branch: &str,
+    parent_branch: &str,
+    head_sha: Option<&str>,
+    recipient: &str,
+    recipient_pr_number: u64,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pr_number": merged_pr_number,
+        "branch": merged_branch,
+        "parent": parent_branch,
+        "head_sha": head_sha,
+        "head_sha_finding": head_sha.map(|_| serde_json::Value::Null).unwrap_or_else(|| {
+            serde_json::Value::String(
+                "not_available_without_verified_pr_context".to_string(),
+            )
+        }),
+        "recipient": recipient,
+        "recipient_pr_number": recipient_pr_number,
+        "payload": payload,
+    })
+}
+
 /// Compatibility event view plus the canonical append-only ledger.
 ///
 /// The process mutex and OS advisory locks serialize sequence allocation and
@@ -319,6 +345,32 @@ mod tests {
         assert_eq!(data["branch"], "main.worker");
         assert_eq!(data["pr_number"], 7);
         assert_eq!(data["head_sha"], "abc123");
+    }
+
+    #[test]
+    fn canonical_sibling_merged_data_preserves_recipient_and_payload() {
+        let payload = serde_json::json!({
+            "merged_branch": "main.parent.merged",
+            "parent_branch": "main.parent",
+            "sibling_pr_number": 9,
+        });
+
+        let data = canonical_sibling_merged_data(
+            8,
+            "main.parent.merged",
+            "main.parent",
+            Some("abc123"),
+            "main.parent.sibling",
+            9,
+            &payload,
+        );
+
+        assert_eq!(data["pr_number"], 8);
+        assert_eq!(data["recipient"], "main.parent.sibling");
+        assert_eq!(data["recipient_pr_number"], 9);
+        assert_eq!(data["payload"], payload);
+        assert_eq!(data["head_sha"], "abc123");
+        assert_eq!(data["head_sha_finding"], serde_json::Value::Null);
     }
 
     #[test]

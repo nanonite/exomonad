@@ -39,8 +39,8 @@ records the transient review wakeups in the canonical ledger.
 | `[from: agent]` | `rust/exomonad-core/src/services/delivery.rs:215-235,744-805` | `agent.notify_parent` | covered | Success notifications are logged before EventQueue publication and delivery. |
 | `[FAILED: agent]` | `rust/exomonad-core/src/services/delivery.rs:215-235,744-805` | `agent.notify_parent` | covered | Failure status and message are preserved in the canonical row. |
 | `[STUCK: agent]` | `rust/exomonad-core/src/services/delivery.rs:182-205,215-235,744-805` | `agent.notify_parent` | covered | Rust accepts `stuck` as a parent-notification status and logs it. |
-| `[Sibling Merged]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:599-603,2325-2389` | `agent.sibling_merged` | gap — #711 | A row exists, but it omits the target sibling and `sibling_pr_number` from the dispatched payload. |
-| `[Sibling Merged]` from dormant poller | `rust/exomonad-core/src/services/github_poller.rs:643-705` | `agent.sibling_merged` | gap — #711 | The poller builds the full sibling payload for dispatch but logs only merged PR/branch/parent, with no target sibling or verified head. |
+| `[Sibling Merged]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:599-603,2419-2495` | `agent.sibling_merged` | covered | One canonical row is recorded per recipient with the recipient branch/PR and the complete dispatched payload. |
+| `[Sibling Merged]` from dormant poller | `rust/exomonad-core/src/services/github_poller.rs:643-705` | `agent.sibling_merged` | covered | The dormant path records the same per-recipient payload and verified merged head before dispatch. |
 | `[ISSUE CLOSED: #id ...]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:662-667`; `rust/exomonad-core/src/services/orphan_reconciler.rs:199-223` | none | gap — #712 | The source is legacy `.exo/events/issue_closed.jsonl`, outside the M2.6 ledger segments. |
 | unread-inbox poke | `rust/exomonad-core/src/services/worktree_event_watcher.rs:1444-1484` | none | gap — #712 | The watcher directly routes a tmux notification; it does not append a canonical event. |
 | raw inbox message | `rust/exomonad-core/src/services/inbox_watcher.rs:44-138` | none | gap — #712 | New `TeamsMessage` entries are directly injected into tmux. |
@@ -108,15 +108,13 @@ is still part of the supported wakeup contract and is audited here.
 | guest completion | `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs:130-153` | `agent.completed` | explicit finding | This generic tool event has no verified PR context; it records `head_sha: null` and `head_sha_finding` for interpretation. |
 | harness-switch/no-op stuck | `rust/exomonad-core/src/handlers/events.rs:139-159,281-294` | `agent.stuck` | explicit finding | These policy events have no verified PR context; they record the null SHA and finding. |
 | parent notification | `rust/exomonad-core/src/services/delivery.rs:772-799` | `agent.notify_parent` | explicit finding | Generic notifications retain a null SHA and finding unless a verified watcher handoff supplies one. |
-| sibling merge observation | `rust/exomonad-core/src/services/worktree_event_watcher.rs:2419-2495` | `agent.sibling_merged` | gap — #711 | The row now carries the removed sibling’s last verified head, but still lacks the dispatched sibling recipient context. |
+| sibling merge observation | `rust/exomonad-core/src/services/event_log.rs:42-72`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2419-2495` | `agent.sibling_merged` | covered | The row carries the removed sibling’s verified head, recipient branch/PR, and full wakeup payload; #712 remains the only M2.7 blocker. |
 
 ## Mode decision
 
-Coverage is not sufficient for M3 shadow mode (#678): #711-#712 remain explicit
-blockers, and the shadow loop would otherwise observe incomplete sibling
-targeting and direct inbox/issue-close wakeups.
+Coverage is not sufficient for M3 shadow mode (#678): #712 remains an explicit
+blocker for direct inbox/issue-close wakeups.
 
 Coverage is also not sufficient for M5 active mode. Active mode additionally
-requires the reviewed head for terminal events, complete sibling targeting,
-and a canonical representation for issue-close and inbox-triggered wakeups.
-Resolve the filed blockers before enabling either mode.
+requires a canonical representation for issue-close and inbox-triggered
+wakeups. Resolve the filed blocker before enabling either mode.

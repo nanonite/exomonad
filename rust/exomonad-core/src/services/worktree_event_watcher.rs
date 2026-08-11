@@ -2,7 +2,9 @@ use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::agent_resources::dispose_reviewers_for_pr;
-use crate::services::event_log::{canonical_review_wakeup_data, PR_REVIEW_EVENT_TYPE};
+use crate::services::event_log::{
+    canonical_review_wakeup_data, canonical_sibling_merged_data, PR_REVIEW_EVENT_TYPE,
+};
 use crate::services::pr_registry::{
     read_published_heads, ForgejoReviewState, PrEntry, PrRegistry, PrState, PublishedHead,
     ReviewerAttempt, ReviewerAttemptPhase,
@@ -2456,6 +2458,31 @@ where
                         "parent_branch": parent_branch,
                         "sibling_pr_number": sib_num,
                     });
+                    tracing::info!(
+                        otel.name = "agent.sibling_merged",
+                        agent_id = %sib_state.branch_name,
+                        pr_number = *pr_num,
+                        branch = %branch,
+                        parent = %parent_branch,
+                        sibling_pr_number = *sib_num,
+                        "[event] agent.sibling_merged"
+                    );
+                    if let Some(log) = self.ctx.event_log() {
+                        let data = canonical_sibling_merged_data(
+                            *pr_num,
+                            branch.as_str(),
+                            parent_branch,
+                            Some(head_sha.as_str()),
+                            sib_state.branch_name.as_str(),
+                            *sib_num,
+                            &payload,
+                        );
+                        let _ = log.append(
+                            "agent.sibling_merged",
+                            sib_state.branch_name.as_str(),
+                            &data,
+                        );
+                    }
                     if let Ok(Some(action)) = self
                         .call_handle_event(
                             sib_state.branch_name.as_str(),
@@ -2473,27 +2500,6 @@ where
                         .await;
                     }
                 }
-            }
-
-            tracing::info!(
-                otel.name = "agent.sibling_merged",
-                agent_id = %branch,
-                pr_number = *pr_num,
-                branch = %branch,
-                parent = %parent_branch,
-                "[event] agent.sibling_merged"
-            );
-            if let Some(log) = self.ctx.event_log() {
-                let _ = log.append(
-                    "agent.sibling_merged",
-                    branch.as_str(),
-                    &serde_json::json!({
-                        "pr_number": *pr_num,
-                        "branch": branch.as_str(),
-                        "parent": parent_branch,
-                        "head_sha": head_sha,
-                    }),
-                );
             }
         }
 

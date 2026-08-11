@@ -61,6 +61,13 @@ def test_review_and_ci_fields_are_projected_from_data_without_synthesis() -> Non
     assert projected["pr.merged"].head_sha == "bbb222"
     assert projected["pr.merge_failed"].head_sha == "ccc333"
     assert projected["agent.sibling_merged"].head_sha == "bbb222"
+    assert projected["agent.sibling_merged"].data["recipient"] == "task-b"
+    assert projected["agent.sibling_merged"].data["recipient_pr_number"] == 102
+    assert projected["agent.sibling_merged"].data["payload"] == {
+        "merged_branch": "task-a",
+        "parent_branch": "root",
+        "sibling_pr_number": 102,
+    }
     assert all(projected[event_type].head_sha is None for event_type in SERVER_EMIT_HEAD_SHA_GAPS)
     assert all(
         projected[event_type].data["head_sha_finding"]
