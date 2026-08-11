@@ -348,6 +348,14 @@ check-e2e-tl-loop-shadow:
     bash -n tests/e2e/tl-loop-shadow/run.sh
     python3 -m py_compile tests/e2e/tl-loop-shadow/shadow_companion.py
 
+# Run the bounded active TL loop against a scratch repository; no interactive session.
+e2e-tl-loop-active:
+    ./tests/e2e/tl-loop-active/run.sh
+
+check-e2e-tl-loop-active:
+    bash -n tests/e2e/tl-loop-active/run.sh
+    python3 -m py_compile tests/e2e/tl-loop-active/active_run.py
+
 # Run bounded Claude-only smoke test (root SessionStart + TeamCreate, no children)
 e2e-claude-only:
     ./tests/e2e/claude-only/run.sh
