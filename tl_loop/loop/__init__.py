@@ -24,6 +24,19 @@ from .driver import (
     run_tl_loop,
     tl_run,
 )
+from .review import (
+    DEFAULT_REVIEW_POLICY,
+    MissingReviewedHead,
+    MissingVerdict,
+    ReviewEvidence,
+    ReviewGateError,
+    ReviewHeadMismatch,
+    StaleVerdict,
+    VerdictNotApproved,
+    load_freshness_window,
+    verify_review,
+    watcher_head,
+)
 from .schedule import ScheduleDeadlock, ScheduleError, active_count, ready
 from .shadow import (
     DEFAULT_SHADOW_ROOT,
@@ -38,6 +51,7 @@ from .shadow import (
 )
 
 __all__ = [
+    "DEFAULT_REVIEW_POLICY",
     "DEFAULT_SHADOW_ROOT",
     "ActionRecorder",
     "DeterministicJudgments",
@@ -51,9 +65,15 @@ __all__ = [
     "LeafTask",
     "LoopLimitExceeded",
     "LoopTimeout",
+    "MissingReviewedHead",
+    "MissingVerdict",
     "ParkCause",
     "ParkResult",
+    "ReviewEvidence",
+    "ReviewGateError",
+    "ReviewHeadMismatch",
     "ScheduleDeadlock",
+    "StaleVerdict",
     "ScheduleError",
     "ShadowLoop",
     "ShadowLoopError",
@@ -70,5 +90,9 @@ __all__ = [
     "park",
     "run_tl_loop",
     "switch_harness",
+    "VerdictNotApproved",
+    "load_freshness_window",
+    "verify_review",
+    "watcher_head",
     "tl_run",
 ]

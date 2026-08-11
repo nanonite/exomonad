@@ -69,7 +69,9 @@ def _slice(slice_id: str, status: SliceStatus, path: str) -> SliceState:
         branch=f"task/{slice_id}",
         worktree=f".worktrees/{slice_id}",
         pr_number=42 if status is SliceStatus.IN_REVIEW else None,
-        reviewed_head="abc123" if status is SliceStatus.IN_REVIEW else None,
+        reviewed_head="abc123"
+        if status in {SliceStatus.IN_REVIEW, SliceStatus.MERGED}
+        else None,
         attempts=1,
         verdict=Verdict.GO if status is SliceStatus.MERGED else None,
     )

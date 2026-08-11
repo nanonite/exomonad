@@ -79,6 +79,7 @@ SLICE_KEYS = frozenset(
         "worktree",
         "pr_number",
         "reviewed_head",
+        "verdict_at",
         "attempts",
         "verdict",
         "park_cause",
@@ -147,6 +148,7 @@ class SliceState:
     reviewed_head: str | None
     attempts: int
     verdict: Verdict | None
+    verdict_at: str | None = None
     park_cause: ParkCause | None = None
     park_issue_id: int | None = None
     park_audit: Mapping[str, object] | None = None
@@ -309,6 +311,14 @@ def _validate_slice(
     _nullable_positive_int(value, "pr_number", path, errors)
     _non_negative_int(value, "attempts", path, errors)
     _nullable_enum_value(value, "verdict", path, Verdict, errors)
+    _nullable_string(value, "verdict_at", path, errors)
+    if value.get("verdict") is not None and (
+        not isinstance(value.get("reviewed_head"), str)
+        or not value.get("reviewed_head")
+    ):
+        errors.append(
+            (f"{path}.reviewed_head", "is required when verdict is present")
+        )
     _nullable_enum_value(value, "park_cause", path, ParkCause, errors)
     _nullable_positive_int(value, "park_issue_id", path, errors)
     _nullable_string(value, "blocked_by", path, errors)

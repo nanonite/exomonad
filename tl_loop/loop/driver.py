@@ -33,13 +33,21 @@ from tl_loop.fsm.phase import (
 )
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import park
+from tl_loop.loop.review import ReviewGateError, verify_review, watcher_head
 from tl_loop.loop.schedule import ScheduleDeadlock, ready
 from tl_loop.select.agent_type import select_agent_type, selection_failure
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model
 from tl_loop.select.policy import HarnessPolicy, load_policy
-from tl_loop.state.schema import BudgetLedger, ParkCause, RunState, SliceStatus
+from tl_loop.state.schema import (
+    BudgetLedger,
+    ParkCause,
+    RunState,
+    SliceState,
+    SliceStatus,
+    Verdict,
+)
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
@@ -162,6 +170,7 @@ class TLLoopConfig:
     catalog: ModelCatalog | None = None
     requested_model: str | None = None
     role: str = "worker"
+    review_policy_path: str | Path | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_workers", "max_leaves", "max_events"):
@@ -329,6 +338,10 @@ def _run_loop(
             _checkpoint_and_ack(store, source, event, state, phase)
             state = store.load()
             continue
+        if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW}:
+            state = _record_review_event(store, state, phase, event, event_seq)
+            source.acknowledge(event)
+            continue
         try:
             fsm_event = decoder.decode(event)
         except Exception as error:
@@ -337,12 +350,8 @@ def _run_loop(
             _checkpoint_and_ack(store, source, event, state, phase)
             state = store.load()
             continue
-        try:
-            next_phase = transition(phase, fsm_event)
-        except IllegalTransition as error:
-            raise TLLoopError(str(error)) from error
         if isinstance(fsm_event, ChildCompleted):
-            _merge_completed_leaf(
+            merge_allowed = _merge_completed_leaf(
                 event,
                 fsm_event,
                 leaf_names,
@@ -350,7 +359,17 @@ def _run_loop(
                 effects,
                 config,
                 effects_log,
+                state,
             )
+            if not merge_allowed:
+                next_slices = _discard_review(state.slices, fsm_event.slug)
+                state = store.checkpoint(phase, next_slices, state.budgets, event_seq)
+                source.acknowledge(event)
+                continue
+        try:
+            next_phase = transition(phase, fsm_event)
+        except IllegalTransition as error:
+            raise TLLoopError(str(error)) from error
         next_slices = _update_slices(state.slices, fsm_event)
         state = store.checkpoint(next_phase, next_slices, state.budgets, event_seq)
         source.acknowledge(event)
@@ -598,16 +617,47 @@ def _merge_completed_leaf(
     effects: EffectClient | ReadOnlyEffectClient,
     config: TLLoopConfig,
     effects_log: list[EffectIntent],
-) -> None:
+    state: RunState,
+) -> bool:
     pr_number = event.pr_number
     if completion.slug not in leaf_names or pr_number is None or completion.slug in merged:
-        return
+        return True
+    current = state.slices.get(completion.slug)
+    live = cast(EffectClient, effects) if config.active else None
+    if config.active and live is not None and current is not None and (
+        current.verdict is not None or current.reviewed_head is not None
+    ):
+        watcher_arguments = {"pr_number": pr_number}
+        effects_log.append(
+            EffectIntent("watcher_pr_state", completion.slug, watcher_arguments, True)
+        )
+        LOGGER.info(
+            "[TL loop] effect=watcher_pr_state target=%s active=true",
+            completion.slug,
+        )
+        watcher_result = live.watcher_pr_state(pr_number=pr_number)
+        if watcher_result.success is False:
+            raise EffectFailed(
+                watcher_result.error or "watcher_pr_state returned failure"
+            )
+        try:
+            verify_review(
+                current,
+                watcher_head(watcher_result),
+                policy_path=config.review_policy_path or Path(".exo/review-policy.toml"),
+            )
+        except ReviewGateError as error:
+            LOGGER.warning(
+                "[TL loop] refusing merge target=%s reason=%s",
+                completion.slug,
+                error,
+            )
+            return False
     arguments: dict[str, object] = {"pr_number": pr_number}
     _optional_argument(arguments, "chainlink_issue_id", config.chainlink_issue_id)
     _optional_argument(arguments, "force", config.merge_force)
     _optional_argument(arguments, "strategy", config.merge_strategy)
     _optional_argument(arguments, "working_dir", config.working_dir)
-    live = cast(EffectClient, effects) if config.active else None
     _invoke(
         "merge_pr",
         completion.slug,
@@ -624,6 +674,64 @@ def _merge_completed_leaf(
         effects_log,
     )
     merged.add(completion.slug)
+    return True
+
+
+def _discard_review(
+    slices: Mapping[str, SliceState], slice_id: str
+) -> dict[str, SliceState]:
+    current = slices.get(slice_id)
+    if current is None:
+        return dict(slices)
+    return {
+        **slices,
+        slice_id: replace(
+            current,
+            status=SliceStatus.IN_REVIEW,
+            verdict=None,
+            reviewed_head=None,
+            verdict_at=None,
+        ),
+    }
+
+
+def _record_review_event(
+    store: RunStore,
+    state: RunState,
+    phase: PhaseValue,
+    event: EventEnvelope,
+    event_seq: int,
+) -> RunState:
+    slice_id = event.slice_id or event.agent_id
+    if slice_id is None:
+        raise TLLoopError(f"{event.event_type!r} has no slice identity")
+    current = state.slices.get(slice_id)
+    if current is None:
+        raise TLLoopError(f"review event references unknown slice {slice_id!r}")
+    verdict = _review_verdict(event)
+    if verdict is None:
+        return store.checkpoint(phase, state.slices, state.budgets, event_seq)
+    if event.head_sha is None:
+        raise TLLoopError(f"{event.event_type!r} verdict has no reviewed head SHA")
+    updated = dict(state.slices)
+    updated[slice_id] = replace(
+        current,
+        pr_number=event.pr_number or current.pr_number,
+        reviewed_head=event.head_sha,
+        verdict=verdict,
+        verdict_at=event.observed_at,
+    )
+    return store.checkpoint(phase, updated, state.budgets, event_seq)
+
+
+def _review_verdict(event: EventEnvelope) -> Verdict | None:
+    if event.review_kind in {"merge_ready", "approved"}:
+        return Verdict.GO
+    if event.review_state in {"approved", "approve"}:
+        return Verdict.GO
+    if event.review_state in {"changes_requested", "request_changes"}:
+        return Verdict.NO_GO
+    return None
 
 
 def _invoke(
