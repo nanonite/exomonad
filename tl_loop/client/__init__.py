@@ -8,6 +8,7 @@ from .effects import (
     EffectTransport,
     ToolResult,
 )
+from .readonly import MUTATING_METHODS, READ_METHODS, MutationBlocked, ReadOnlyEffectClient
 from .transport import (
     DEFAULT_TIMEOUT_SECONDS,
     DecodeError,
@@ -33,5 +34,9 @@ __all__ = [
     "TransportClient",
     "TransportError",
     "ToolResult",
+    "MUTATING_METHODS",
+    "READ_METHODS",
+    "MutationBlocked",
+    "ReadOnlyEffectClient",
     "resolve_socket_path",
 ]

@@ -1,0 +1,136 @@
+"""End-to-end synthetic coverage for the read-only shadow loop."""
+
+from __future__ import annotations
+
+import json
+import queue
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import cast
+
+from tl_loop.events.envelope import EventEnvelope, project
+from tl_loop.client.effects import EffectClient
+from tl_loop.client.readonly import ReadOnlyEffectClient
+from tl_loop.client.transport import JsonObject
+from tl_loop.loop.shadow import ShadowLoop
+from tl_loop.state.store import create
+
+
+@dataclass
+class SyntheticQueue:
+    events: list[EventEnvelope]
+    acknowledged: list[int] = field(default_factory=list)
+
+    def get(self, timeout: float | None = None) -> EventEnvelope:
+        del timeout
+        if not self.events:
+            raise queue.Empty
+        return self.events.pop(0)
+
+    def acknowledge(self, event: EventEnvelope) -> int:
+        assert event.run_seq is not None
+        self.acknowledged.append(event.run_seq)
+        return event.run_seq
+
+
+def test_shadow_loop_reaches_terminal_phase_and_records_intended_sequence(tmp_path: Path) -> None:
+    create(
+        "synthetic-shadow",
+        {
+            "slices": {
+                "child-a": {
+                    "id": "child-a",
+                    "status": "spawned",
+                    "paths": ["src"],
+                    "depends_on": [],
+                    "base_ref": "main",
+                    "test_plan": ["just test"],
+                    "agent_type": "codex",
+                    "model": None,
+                    "branch": "main.child-a",
+                    "worktree": "/tmp/child-a",
+                    "pr_number": None,
+                    "reviewed_head": None,
+                    "attempts": 1,
+                    "verdict": None,
+                }
+            }
+        },
+        root_dir=tmp_path / "shadow",
+    )
+    source = SyntheticQueue(
+        [
+            _event(1, "child_spawned"),
+            _event(2, "child_completed"),
+            _event(3, "all_children_done"),
+        ]
+    )
+
+    readonly = ReadOnlyEffectClient(EffectClient(_RecordingTransport()))
+    result = ShadowLoop.for_run(
+        source,
+        "synthetic-shadow",
+        readonly_client=readonly,
+        root_dir=tmp_path / "shadow",
+    ).run()
+
+    assert [action.kind for action in result.actions] == ["dispatch", "dispatch", "dispatch"]
+    assert [action.event_seq for action in result.actions] == [1, 2, 3]
+    assert [action.phase_before.value for action in result.actions] == [
+        "tl_planning",
+        "tl_waiting",
+        "tl_all_merged",
+    ]
+    assert result.actions[-1].phase_after.value == "tl_done"
+    assert result.final_state.fsm.phase.value == "tl_done"
+    assert result.final_state.events.last_consumed_offset == 3
+    assert source.acknowledged == [1, 2, 3]
+
+    checkpoint = json.loads((tmp_path / "shadow" / "synthetic-shadow" / "run.json").read_text())
+    assert checkpoint["events"]["last_consumed_offset"] == 3
+
+
+@dataclass
+class _RecordingTransport:
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        del role, name, tool_name, arguments
+        return {"success": True, "result": None}
+
+
+def _event(run_seq: int, shadow_kind: str) -> EventEnvelope:
+    raw = {
+        "schema_version": 1,
+        "event_id": f"event-{run_seq}",
+        "id": f"event-{run_seq}",
+        "event_time": "2026-08-11T00:00:00Z",
+        "observed_at": "2026-08-11T00:00:00Z",
+        "run_seq": run_seq,
+        "type": "agent.notify_parent",
+        "agent_id": "child-a",
+        "run_id": "synthetic-shadow",
+        "session_id": "session-1",
+        "invocation_id": None,
+        "generation": 1,
+        "provider": "openai",
+        "runtime": "codex",
+        "harness": "codex",
+        "role": "worker",
+        "source": "synthetic",
+        "lifecycle_state": "observed",
+        "data": {
+            "shadow_event": {
+                "kind": shadow_kind,
+                "slug": "child-a",
+                "branch": "main.child-a",
+                "agent_type": "codex",
+                "reason": "synthetic reason",
+            }
+        },
+    }
+    return project(cast(dict[str, object], raw))
