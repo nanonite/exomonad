@@ -15,6 +15,20 @@ The runtime creates per-run state under `.exo/tl-loop/<run_id>/`. That directory
 is runtime state, not Python source, and must never be used as the package code
 location.
 
+## RLM judgment boundary
+
+The tl_loop.rlm boundary is for bounded structured judgments only. Its
+backend receives a stateless RlmRequest with tools=() and cannot be given
+an effect client, agent spawner, or filesystem capability. Responses are
+validated with closed-key output schemas; invalid responses retry at most three
+attempts and then raise JudgmentFailed.
+
+Each attempt is recorded with the model, input hash, token counts, latency,
+attempt number, replay flag, and redacted validated result. RlmCallStore
+commits the role token charge and event record together. Replay entries are
+keyed by the canonical hash of the judgment name, inputs, model, and output
+schema, so hermetic tests can avoid network access.
+
 ## Checkpoint and resume layout
 
 Each run is persisted at `.exo/tl-loop/<run_id>/run.json`; the shared writer
