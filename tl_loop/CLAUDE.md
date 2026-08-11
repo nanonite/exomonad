@@ -164,3 +164,19 @@ the attempted recursive slice with `schedule_deadlock` and raises
 Ledger readers may set `scope_run_id` and `scope_agent_id`. An agent scope
 includes the agent's own events and its directly spawned children, so a root
 reader does not consume a grandchild review event.
+
+## Learned dispatch policy
+
+`tl_loop.select.learned_policy.DispatchPolicyStore` persists optional learned
+dispatch data at `.exo/tl-loop/dispatch-policy.json`. A missing document is
+the empty version-one policy. Mutations use the M2.2 atomic writer, snapshot
+the prior revision under `.exo/tl-loop/dispatch-policy.snapshots/`, and append
+a trigger to durable history. `rollback(revision)` restores the snapshot's
+decomposition, preferences, and repair patterns while recording a new
+rollback revision.
+
+Learned harness preferences are validated against the human-authored
+`.exo/harness_policy.toml` allowlist. The M4 selector receives a validated
+policy by dependency injection and may use it only after authoritative cost
+rank, capability, and budget filtering; it cannot widen an allowlist or
+change any ceiling.

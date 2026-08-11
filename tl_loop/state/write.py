@@ -19,6 +19,7 @@ from .schema import SchemaError, validate
 
 Document: TypeAlias = dict[str, object]
 Mutator: TypeAlias = Callable[[Document], Document]
+Validator: TypeAlias = Callable[[object], None]
 
 
 class ConcurrentWrite(RuntimeError):
@@ -56,6 +57,9 @@ def apply(
     lock_timeout: float = 5.0,
     hooks: WriteHooks | None = None,
     initial: Document | None = None,
+    target_name: str = "run.json",
+    lock_name: str = "run.lock",
+    validator: Validator = validate,
 ) -> Document:
     """Apply one validated mutation through the only run-state write path.
 
@@ -65,21 +69,21 @@ def apply(
     if not callable(mutator):
         raise TypeError("run-state mutator must be callable")
     directory = Path(run_dir)
-    target = directory / "run.json"
-    lock_path = directory.parent / "run.lock"
+    target = _target_path(directory, target_name)
+    lock_path = directory.parent / lock_name
 
     with RunLock(lock_path, timeout=lock_timeout):
         if _is_missing(target):
             if initial is None:
-                observed = _read_valid_snapshot(target)
+                observed = _read_valid_snapshot(target, validator)
             else:
-                validate(initial)
+                validator(initial)
                 candidate_value = mutator(copy.deepcopy(initial))
                 if not isinstance(candidate_value, dict):
                     raise MutationError("run-state mutator must return an object")
                 candidate = copy.deepcopy(candidate_value)
                 candidate["revision"] = initial["revision"]
-                validate(candidate)
+                validator(candidate)
                 temporary = _write_temp(directory, candidate)
                 try:
                     if hooks and hooks.before_rename:
@@ -92,23 +96,23 @@ def apply(
         if initial is not None:
             raise FileExistsError(f"run state already exists: {target}")
 
-        observed = _read_valid_snapshot(target)
+        observed = _read_valid_snapshot(target, validator)
         candidate_value = mutator(copy.deepcopy(observed.document))
         if not isinstance(candidate_value, dict):
             raise MutationError("run-state mutator must return an object")
         candidate = copy.deepcopy(candidate_value)
         candidate["revision"] = observed.revision + 1
-        validate(candidate)
+        validator(candidate)
 
-        _assert_unchanged(target, observed)
-        reobserved = _read_valid_snapshot(target)
+        _assert_unchanged(target, observed, validator)
+        reobserved = _read_valid_snapshot(target, validator)
         _assert_same_snapshot(observed, reobserved)
 
         temporary = _write_temp(directory, candidate)
         try:
             if hooks and hooks.before_rename:
                 hooks.before_rename()
-            _assert_unchanged(target, observed)
+            _assert_unchanged(target, observed, validator)
             _replace_atomically(temporary, target, directory)
         except BaseException:
             _remove_temp(temporary)
@@ -124,7 +128,14 @@ def _is_missing(target: Path) -> bool:
     return False
 
 
-def _read_valid_snapshot(target: Path) -> _Snapshot:
+def _target_path(directory: Path, target_name: str) -> Path:
+    target = Path(target_name)
+    if not target_name or target.name != target_name or target.is_absolute():
+        raise ValueError("target_name must be a non-empty filename")
+    return directory / target
+
+
+def _read_valid_snapshot(target: Path, validator: Validator = validate) -> _Snapshot:
     try:
         data = _read_bytes(target)
         value = json.loads(data.decode("utf-8"))
@@ -133,7 +144,7 @@ def _read_valid_snapshot(target: Path) -> _Snapshot:
     if not isinstance(value, dict):
         raise StateReadError(f"run state {target} must contain a JSON object")
     document = value
-    validate(document)
+    validator(document)
     stat = target.stat()
     revision = document.get("revision")
     if type(revision) is not int:
@@ -154,8 +165,10 @@ def _read_bytes(target: Path) -> bytes:
         return stream.read()
 
 
-def _assert_unchanged(target: Path, observed: _Snapshot) -> None:
-    current = _read_valid_snapshot(target)
+def _assert_unchanged(
+    target: Path, observed: _Snapshot, validator: Validator = validate
+) -> None:
+    current = _read_valid_snapshot(target, validator)
     _assert_same_snapshot(observed, current)
 
 
@@ -230,11 +243,34 @@ def _remove_temp(temporary: Path) -> None:
         pass
 
 
+def publish(
+    path: str | Path,
+    document: Document,
+    *,
+    validator: Validator | None = None,
+) -> None:
+    """Publish one JSON document with the same fsync-and-rename primitives."""
+    if validator is not None:
+        validator(document)
+    target = Path(path)
+    temporary = _write_temp(target.parent, document)
+    try:
+        if _is_missing(target):
+            _create_atomically(temporary, target, target.parent)
+        else:
+            _replace_atomically(temporary, target, target.parent)
+    except BaseException:
+        _remove_temp(temporary)
+        raise
+
+
 __all__ = [
     "ConcurrentWrite",
     "Document",
     "MutationError",
     "StateReadError",
+    "Validator",
     "WriteHooks",
     "apply",
+    "publish",
 ]

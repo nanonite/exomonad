@@ -35,7 +35,15 @@ from .store import (
     load,
     resume,
 )
-from .write import ConcurrentWrite, MutationError, StateReadError, WriteHooks, apply
+from .write import (
+    ConcurrentWrite,
+    MutationError,
+    StateReadError,
+    Validator,
+    WriteHooks,
+    apply,
+    publish,
+)
 
 __all__ = [
     "BUDGET_KEYS",
@@ -67,6 +75,7 @@ __all__ = [
     "SliceState",
     "SliceStatus",
     "StateReadError",
+    "Validator",
     "Verdict",
     "WorktreeClaimError",
     "WriteHooks",
@@ -75,6 +84,7 @@ __all__ = [
     "create",
     "load",
     "owner_is_stale",
+    "publish",
     "resume",
     "validate",
 ]

@@ -119,6 +119,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- M7.2 Durable dispatch-policy store with snapshot and rollback (#701)
 - M7.1 Recursive sub-TL loops with the one-agent-one-branch invariant (#700)
 - M6.5 compose_repair -> RepairHandoff feeding resume_pr (#699)
 - M6.4 adjudicate_review -> GO | GO-WITH-NITS | NO-GO (#698)

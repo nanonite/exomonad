@@ -37,6 +37,7 @@ from tl_loop.loop.review import ReviewGateError, verify_review, watcher_head
 from tl_loop.loop.schedule import ScheduleDeadlock, ready
 from tl_loop.select.agent_type import select_agent_type, selection_failure
 from tl_loop.select.capability import CapabilityMap, load_capability
+from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model
 from tl_loop.select.policy import HarnessPolicy, load_policy
@@ -196,6 +197,7 @@ class TLLoopConfig:
     root_dir: str | Path = DEFAULT_ROOT
     run_id: str = "tl-run"
     policy: HarnessPolicy | None = None
+    learned_policy: LearnedPolicy | None = None
     capabilities: CapabilityMap | None = None
     catalog: ModelCatalog | None = None
     requested_model: str | None = None
@@ -649,7 +651,12 @@ def _prepare_spawn(
         raise TLLoopError(f"selector slice {name!r} is missing from run state")
     capabilities = config.capabilities or load_capability()
     choice = select_agent_type(
-        slice_state, config.role, state.budgets, config.policy, capabilities
+        slice_state,
+        config.role,
+        state.budgets,
+        config.policy,
+        capabilities,
+        config.learned_policy,
     )
     if choice is None:
         failure = selection_failure(

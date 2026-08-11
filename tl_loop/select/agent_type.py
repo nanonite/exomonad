@@ -10,6 +10,7 @@ from typing import cast
 
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.classify import Classification, Difficulty, classify_task
+from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.policy import HarnessPolicy, RolePolicy
 from tl_loop.state.schema import BudgetLedger, SliceState, Verdict
 
@@ -57,6 +58,7 @@ def select_agent_type(
     ledger: object,
     policy: HarnessPolicy,
     capabilities: CapabilityMap | None = None,
+    learned_policy: LearnedPolicy | None = None,
 ) -> HarnessChoice | None:
     """Select the cheapest allowed capable harness that still has budget."""
     role_policy = _role_policy(policy, role)
@@ -67,7 +69,10 @@ def select_agent_type(
     )
     if not candidates:
         return None
-    selected = min(candidates, key=lambda item: role_policy.cost_rank[item[0]])
+    selected = min(
+        candidates,
+        key=lambda item: _selection_key(item, role_policy, classification, role, learned_policy),
+    )
     harness, estimated_cost = selected
     reason = _selection_reason(slice, classification, role_policy)
     return HarnessChoice(
@@ -120,6 +125,31 @@ def _role_policy(policy: HarnessPolicy, role: str) -> RolePolicy:
         return policy.roles[role]
     except KeyError as error:
         raise ValueError(f"unknown policy role {role!r}") from error
+
+
+def _selection_key(
+    candidate: tuple[str, int],
+    role_policy: RolePolicy,
+    classification: Classification,
+    role: str,
+    learned_policy: LearnedPolicy | None,
+) -> tuple[int, int, int]:
+    harness, _cost = candidate
+    learned_order = (
+        learned_policy.preference_order(classification.matched_rule_name, role)
+        if learned_policy is not None
+        else ()
+    )
+    learned_rank = (
+        learned_order.index(harness)
+        if harness in learned_order
+        else len(learned_order)
+    )
+    return (
+        role_policy.cost_rank[harness],
+        learned_rank,
+        role_policy.allow.index(harness),
+    )
 
 
 def _candidates(
