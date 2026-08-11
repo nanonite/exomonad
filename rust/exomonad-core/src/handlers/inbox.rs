@@ -146,6 +146,7 @@ mod tests {
                 topology: Topology::SharedDir,
                 model: None,
                 effort: None,
+                ledger_owned: false,
             })
             .await
             .expect("identity registration should succeed");
@@ -185,6 +186,7 @@ mod tests {
                 topology: Topology::SharedDir,
                 model: None,
                 effort: None,
+                ledger_owned: false,
             })
             .await
             .expect("bare root registration should succeed");
@@ -204,6 +206,7 @@ mod tests {
                 topology: Topology::SharedDir,
                 model: None,
                 effort: None,
+                ledger_owned: false,
             })
             .await
             .expect("canonical root registration should succeed");

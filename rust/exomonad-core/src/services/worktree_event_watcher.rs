@@ -2311,6 +2311,13 @@ where
         outcome: &str,
         context: &str,
     ) -> bool {
+        if self
+            .skip_legacy_delivery(pending.branch.as_str(), "parent_repair_handoff")
+            .await
+        {
+            return true;
+        }
+
         let (parent_session_id, _) = self.parent_event_target(pending.branch.as_str()).await;
         let parent_name = AgentName::try_from_str(&parent_session_id)
             .expect("canonical parent identity is non-empty");
@@ -2700,6 +2707,24 @@ where
         }
     }
 
+    async fn skip_legacy_delivery(&self, branch: &str, event_kind: &str) -> bool {
+        if self
+            .ctx
+            .agent_resolver()
+            .is_ledger_owned_branch(branch)
+            .await
+        {
+            info!(
+                branch,
+                event_kind,
+                "Skipping legacy inbox/tmux delivery for ledger-owned branch; canonical ledger is authoritative"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     async fn handle_event_action(
         &self,
         action: EventActionResponse,
@@ -2708,6 +2733,10 @@ where
     ) -> bool {
         match action {
             EventActionResponse::InjectMessage { message } => {
+                if self.skip_legacy_delivery(branch, "inject_message").await {
+                    return true;
+                }
+
                 let preview: String = message.chars().take(200).collect();
                 info!(
                     branch,
@@ -2744,6 +2773,10 @@ where
                 message,
                 pr_number: _pr_number,
             } => {
+                if self.skip_legacy_delivery(branch, "notify_parent").await {
+                    return true;
+                }
+
                 let agent_slug = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
                 let parent_session_id = match branch.rsplit_once('.') {
                     Some((parent, _)) => {
@@ -2788,6 +2821,13 @@ where
     }
 
     async fn deliver_release_message(&self, branch: &str, agent_type: AgentType, message: &str) {
+        if self
+            .skip_legacy_delivery(branch, "merge_ready_release")
+            .await
+        {
+            return;
+        }
+
         let agent_name =
             AgentName::try_from_str(branch).expect("validated string input is non-empty");
         let tab_name = if let Ok(records) = self.ctx.agent_resolver().records_ref().try_read() {
@@ -4253,6 +4293,65 @@ mod tests {
             }
             other => panic!("expected TL CI InjectMessage fallback, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn ledger_owned_event_actions_skip_legacy_delivery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let resolver = crate::services::AgentResolver::load(temp_dir.path().to_path_buf()).await;
+        resolver
+            .register(crate::services::AgentIdentityRecord {
+                agent_name: AgentName::try_from_str("ledger-owned-codex")
+                    .expect("literal validated string is non-empty"),
+                slug: crate::domain::Slug::try_from_str("ledger-owned")
+                    .expect("literal validated string is non-empty"),
+                agent_type: AgentType::Codex,
+                birth_branch: BirthBranch::try_from_str("main.ledger-owned-codex")
+                    .expect("literal validated string is non-empty"),
+                parent_branch: BirthBranch::try_from_str("main")
+                    .expect("literal validated string is non-empty"),
+                working_dir: std::path::PathBuf::from(".exo/worktrees/ledger-owned-codex"),
+                display_name: "ledger-owned-codex".to_string(),
+                topology: crate::services::agent_control::Topology::WorktreePerAgent,
+                model: None,
+                effort: None,
+                ledger_owned: true,
+            })
+            .await
+            .unwrap();
+
+        let mut services = crate::services::Services::test();
+        services.agent_resolver = Arc::new(resolver);
+        let inbox = services.inbox_store.clone();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let branch = "main.ledger-owned-codex";
+
+        assert!(
+            watcher
+                .handle_event_action(
+                    EventActionResponse::InjectMessage {
+                        message: "ledger event".to_string(),
+                    },
+                    branch,
+                    AgentType::Codex,
+                )
+                .await
+        );
+        assert!(
+            watcher
+                .handle_event_action(
+                    EventActionResponse::NotifyParent {
+                        message: "ledger parent event".to_string(),
+                        pr_number: 714,
+                    },
+                    branch,
+                    AgentType::Codex,
+                )
+                .await
+        );
+
+        assert!(!inbox.has_unread("ledger-owned-codex").unwrap());
+        assert!(!inbox.has_unread("root").unwrap());
     }
 
     #[tokio::test]
@@ -6586,6 +6685,7 @@ mod tests {
                 topology: crate::services::agent_control::Topology::WorktreePerAgent,
                 model: None,
                 effort: None,
+                ledger_owned: false,
             })
             .await
             .unwrap();

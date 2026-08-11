@@ -407,6 +407,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            ledger_owned: false,
         }
     }
 

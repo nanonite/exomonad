@@ -1638,6 +1638,7 @@ mod tests {
             topology: Topology::SharedDir,
             model: None,
             effort: None,
+            ledger_owned: false,
         };
         let pane_id = tmux_ipc::PaneId::parse("%42").unwrap();
         let agent_dir = service

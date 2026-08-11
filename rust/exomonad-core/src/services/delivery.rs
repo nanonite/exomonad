@@ -1679,6 +1679,7 @@ mod tests {
                 topology: Topology::WorktreePerAgent,
                 model: None,
                 effort: None,
+                ledger_owned: false,
             })
             .await
             .expect("identity registration should succeed");

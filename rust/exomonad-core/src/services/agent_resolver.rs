@@ -41,6 +41,9 @@ pub struct AgentIdentityRecord {
     /// Effort selected for the owner invocation, when configured.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Whether this branch is owned by the ledger-backed TL loop rather than an interactive agent.
+    #[serde(default)]
+    pub ledger_owned: bool,
 }
 
 const IDENTITY_FILENAME: &str = "identity.json";
@@ -147,6 +150,15 @@ impl AgentResolver {
     /// Returns a reference to the inner RwLock for `try_read()` usage.
     pub fn records_ref(&self) -> &RwLock<HashMap<AgentName, AgentIdentityRecord>> {
         &self.records
+    }
+
+    /// Return whether the canonical identity record marks a branch as ledger-owned.
+    pub async fn is_ledger_owned_branch(&self, branch: &str) -> bool {
+        self.records
+            .read()
+            .await
+            .values()
+            .any(|record| record.ledger_owned && record.birth_branch.as_str() == branch)
     }
 
     /// Register a new agent identity (writes to disk and memory).
@@ -346,6 +358,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            ledger_owned: false,
         }
     }
 
@@ -363,7 +376,22 @@ mod tests {
             topology: Topology::SharedDir,
             model: None,
             effort: None,
+            ledger_owned: false,
         }
+    }
+
+    #[test]
+    fn legacy_identity_defaults_to_interactive_delivery() {
+        let record = test_record("feature-a-claude", "feature-a", "main.feature-a-claude");
+        let mut value = serde_json::to_value(record).expect("record should serialize");
+        value
+            .as_object_mut()
+            .expect("identity should serialize as an object")
+            .remove("ledger_owned");
+
+        let restored: AgentIdentityRecord =
+            serde_json::from_value(value).expect("legacy identity should deserialize");
+        assert!(!restored.ledger_owned);
     }
 
     #[tokio::test]

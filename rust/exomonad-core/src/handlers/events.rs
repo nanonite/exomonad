@@ -656,6 +656,7 @@ mod tests {
                 topology: case.topology,
                 model: None,
                 effort: None,
+                ledger_owned: false,
             })
             .await
             .expect("identity registration should succeed");
@@ -947,6 +948,7 @@ mod tests {
             topology: Topology::SharedDir,
             model: None,
             effort: None,
+            ledger_owned: false,
         };
 
         assert_eq!(

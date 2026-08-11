@@ -702,6 +702,7 @@ impl<
                 topology: Topology::WorktreePerAgent,
                 model: model.clone(),
                 effort: effort.clone(),
+                ledger_owned: false,
             };
             self.finalize_spawn(&agent_name, routing, Some(identity_record))
                 .await?;
@@ -1106,6 +1107,7 @@ impl<
                 topology: Topology::SharedDir,
                 model: model.clone(),
                 effort: effort.clone(),
+                ledger_owned: false,
             };
             self.finalize_spawn(&agent_name, routing, Some(identity_record))
                 .await?;
@@ -1435,6 +1437,7 @@ impl<
                 topology: Topology::WorktreePerAgent,
                 model: model.clone(),
                 effort: effort.clone(),
+                ledger_owned: false,
             };
             let trigger = if options
                 .role
@@ -1890,6 +1893,7 @@ impl<
                 topology: Topology::WorktreePerAgent,
                 model: identity_model.clone(),
                 effort: identity_effort.clone(),
+                ledger_owned: false,
             };
             let trigger = if options.expected_agent_name.is_some() {
                 InvocationTrigger::ResumePr
