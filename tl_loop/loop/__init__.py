@@ -1,8 +1,21 @@
 """Controller loops for the programmatic TL."""
 
+from .driver import (
+    EffectFailed,
+    EffectIntent,
+    LeafTask,
+    LoopLimitExceeded,
+    LoopTimeout,
+    TLLoopConfig,
+    TLLoopError,
+    TLRunResult,
+    WorkerTask,
+    WorkPlan,
+    run_tl_loop,
+)
 from .shadow import (
-    ActionRecorder,
     DEFAULT_SHADOW_ROOT,
+    ActionRecorder,
     DeterministicJudgments,
     IntendedAction,
     Judgment,
@@ -13,13 +26,24 @@ from .shadow import (
 )
 
 __all__ = [
-    "DeterministicJudgments",
     "DEFAULT_SHADOW_ROOT",
     "ActionRecorder",
+    "DeterministicJudgments",
+    "EffectFailed",
+    "EffectIntent",
     "IntendedAction",
     "Judgment",
+    "LeafTask",
+    "LoopLimitExceeded",
+    "LoopTimeout",
     "ShadowLoop",
     "ShadowLoopError",
     "ShadowRunResult",
     "TLEventDecoder",
+    "TLLoopConfig",
+    "TLLoopError",
+    "TLRunResult",
+    "WorkPlan",
+    "WorkerTask",
+    "run_tl_loop",
 ]
