@@ -39,17 +39,17 @@ prReady n =
     <> T.pack (show n)
     <> " approved by Forgejo reviewer. Merge with `merge_pr` tool."
 
--- | No Forgejo reviewer response within timeout — signals TL to merge if CI passes.
+-- | No Forgejo reviewer response within timeout — parks the slice at a named gate.
 --
 -- >>> reviewTimeout 42 15
--- "[REVIEW TIMEOUT] PR #42 \x2014 no Forgejo reviewer response after 15 minutes. Merge with `merge_pr` using `force: true`."
+-- "[REVIEW TIMEOUT] PR #42 \x2014 no Forgejo reviewer response after 15 minutes. The slice is parked at the `tl-timeout` gate; no merge is permitted."
 reviewTimeout :: Int -> Int -> Text
 reviewTimeout n mins =
   "[REVIEW TIMEOUT] PR #"
     <> T.pack (show n)
     <> " \x2014 no Forgejo reviewer response after "
     <> T.pack (show mins)
-    <> " minutes. Merge with `merge_pr` using `force: true`."
+    <> " minutes. The slice is parked at the `tl-timeout` gate; no merge is permitted."
 
 -- | Fixes pushed after Forgejo reviewer feedback; the reviewer may not re-review automatically,
 -- so this is the actionable signal for the TL.

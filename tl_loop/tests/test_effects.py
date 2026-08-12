@@ -154,7 +154,6 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     client.merge_pr(
         pr_number=1,
         chainlink_issue_id=2,
-        force=False,
         strategy="squash",
         working_dir=".",
     )

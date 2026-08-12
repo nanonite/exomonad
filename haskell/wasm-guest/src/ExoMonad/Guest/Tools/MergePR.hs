@@ -59,7 +59,6 @@ data MergePRArgs = MergePRArgs
   { mprPrNumber :: Int,
     mprStrategy :: Maybe Text,
     mprWorkingDir :: Maybe Text,
-    mprForce :: Maybe Bool,
     mprChainlinkIssueId :: Maybe Int
   }
   deriving (Show, Eq, Generic)
@@ -70,7 +69,6 @@ instance FromJSON MergePRArgs where
       <$> v .: "pr_number"
       <*> v .:? "strategy"
       <*> v .:? "working_dir"
-      <*> v .:? "force"
       <*> v .:? "chainlink_issue_id"
 
 data MergePROutput = MergePROutput
@@ -96,7 +94,7 @@ instance Aeson.ToJSON MergePROutput where
 
 -- | Shared tool description for merge_pr.
 mergePRDescription :: Text
-mergePRDescription = "Merge a GitHub pull request and fetch changes. Checks Forgejo reviewer status before merging: requires either a clean review (no change requests) or commits pushed after the latest review. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. Use force=true to bypass reviewer readiness (e.g., after [REVIEW TIMEOUT]). After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact."
+mergePRDescription = "Merge a GitHub pull request and fetch changes. Checks Forgejo reviewer status before merging: requires either a clean review (no change requests) or commits pushed after the latest review. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact."
 
 -- | Shared tool schema for merge_pr.
 mergePRSchema :: Aeson.Object
@@ -105,7 +103,6 @@ mergePRSchema =
     [ ("pr_number", "PR number to merge"),
       ("strategy", "Merge strategy: squash (default), merge, or rebase"),
       ("working_dir", "Working directory for git operations"),
-      ("force", "Skip Forgejo reviewer check and merge immediately (use after [REVIEW TIMEOUT])"),
       ("chainlink_issue_id", "Optional Chainlink issue ID to close and commit CHANGELOG.md before merging")
     ]
 
@@ -113,9 +110,8 @@ mergePRSchema =
 -- Returns Left on error, Right MergePROutput on success.
 mergePRCore :: MergePRArgs -> Eff Effects (Either Text MergePROutput)
 mergePRCore args = do
-  let force = fromMaybe False (mprForce args)
   let prNum = mprPrNumber args
-  void $ suspendEffect_ @LogInfo (Log.InfoRequest {Log.infoRequestMessage = TL.fromStrict $ "MergePR: Merging PR #" <> T.pack (show prNum) <> if force then " (force)" else "", Log.infoRequestFields = ""})
+  void $ suspendEffect_ @LogInfo (Log.InfoRequest {Log.infoRequestMessage = TL.fromStrict $ "MergePR: Merging PR #" <> T.pack (show prNum), Log.infoRequestFields = ""})
 
   -- Get repo info and branch (shared across self-merge guard and readiness check)
   repoInfoResult <- suspendEffect @GitGetRepoInfo (Git.GetRepoInfoRequest {Git.getRepoInfoRequestWorkingDir = "."})
@@ -140,8 +136,8 @@ mergePRCore args = do
                 }
           case localPrResult of
             Right localPr
-              | FPR.localPrResponseFound localPr -> mergeFromLocalPr args prNum force owner repo currentBranch localPr
-            _ -> mergeFromGitHub args prNum force owner repo currentBranch localPrResult
+              | FPR.localPrResponseFound localPr -> mergeFromLocalPr args prNum owner repo currentBranch localPr
+            _ -> mergeFromGitHub args prNum owner repo currentBranch localPrResult
     _ -> do
       void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = "MergePR: failed to get repo info or branch for self-merge check", Log.errorRequestFields = ""})
       pure $ Left ("Failed to determine repo/branch info. Cannot verify self-merge guard for PR #" <> T.pack (show prNum) <> ".")
@@ -201,29 +197,23 @@ truncateText limit value =
     then value
     else T.take limit value <> "..."
 
-mergeFromLocalPr :: MergePRArgs -> Int -> Bool -> Text -> Text -> Text -> FPR.LocalPrResponse -> Eff Effects (Either Text MergePROutput)
-mergeFromLocalPr args prNum force owner repo currentBranch localPr = do
+mergeFromLocalPr :: MergePRArgs -> Int -> Text -> Text -> Text -> FPR.LocalPrResponse -> Eff Effects (Either Text MergePROutput)
+mergeFromLocalPr args prNum owner repo currentBranch localPr = do
   let headBranch = TL.toStrict (FPR.localPrResponseHeadBranch localPr)
   if headBranch == currentBranch
     then pure $ Left $ "Cannot merge your own PR #" <> T.pack (show prNum) <> ". Your parent agent will merge this PR after reviewing. Call notify_parent instead."
-    else
-      if force
-        then doMerge args
-        else mergeFromHostedPr args prNum owner repo currentBranch (Right localPr)
+    else mergeFromHostedPr args prNum owner repo currentBranch (Right localPr)
 
 mergeFromGitHub ::
   MergePRArgs ->
   Int ->
-  Bool ->
   Text ->
   Text ->
   Text ->
   Either EffectError FPR.LocalPrResponse ->
   Eff Effects (Either Text MergePROutput)
-mergeFromGitHub args prNum force owner repo currentBranch localPrResult = do
-  if force
-    then doMerge args
-    else mergeFromHostedPr args prNum owner repo currentBranch localPrResult
+mergeFromGitHub args prNum owner repo currentBranch localPrResult = do
+  mergeFromHostedPr args prNum owner repo currentBranch localPrResult
 
 mergeFromHostedPr ::
   MergePRArgs ->
@@ -302,7 +292,7 @@ checkReviewerReadinessFromPR prNum resp =
                       NotReady $
                         "Forgejo reviewer requested changes on PR #"
                           <> T.pack (show prNum)
-                          <> ". Wait for the agent to push fixes ([FIXES PUSHED]) or use force=true."
+                          <> ". Wait for the agent to push fixes ([FIXES PUSHED]) before merging."
                 Protobuf.Enumerated (Right GH.ReviewStateREVIEW_STATE_COMMENTED) ->
                   if headSha /= reviewSha && not (T.null headSha) && not (T.null reviewSha)
                     then Ready
@@ -310,7 +300,7 @@ checkReviewerReadinessFromPR prNum resp =
                       NotReady $
                         "Forgejo reviewer commented on PR #"
                           <> T.pack (show prNum)
-                          <> ". Wait for the agent to address comments ([FIXES PUSHED]) or use force=true."
+                          <> ". Wait for the agent to address comments ([FIXES PUSHED]) before merging."
                 _ -> Ready
 
 -- | Extract the agent name (last dot-segment) from a branch name.

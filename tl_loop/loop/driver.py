@@ -211,7 +211,6 @@ class TLLoopConfig:
     heartbeat: HeartbeatConfig | None = None
     goals: GoalState | None = None
     chainlink_issue_id: int | None = None
-    merge_force: bool | None = None
     merge_strategy: str | None = None
     working_dir: str | None = None
     source: EventQueue | None = None
@@ -930,7 +929,6 @@ def _merge_completed_leaf(
             return False
     arguments: dict[str, object] = {"pr_number": pr_number}
     _optional_argument(arguments, "chainlink_issue_id", config.chainlink_issue_id)
-    _optional_argument(arguments, "force", config.merge_force)
     _optional_argument(arguments, "strategy", config.merge_strategy)
     _optional_argument(arguments, "working_dir", config.working_dir)
     _invoke(
@@ -942,7 +940,6 @@ def _merge_completed_leaf(
         lambda client: client.merge_pr(
             pr_number=pr_number,
             chainlink_issue_id=config.chainlink_issue_id,
-            force=config.merge_force,
             strategy=config.merge_strategy,
             working_dir=config.working_dir,
         ),

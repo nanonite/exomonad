@@ -30,7 +30,7 @@ Do not do any of these. They belong to the controller or no longer exist:
   independent gates: watcher `merge_ready` (reviewer approval **and** CI
   `success`/`neutral`), a closed adjudication verdict, the
   `.exo/review-policy.toml` policy veto, and reviewed-head SHA binding. Do not
-  diagnose a stalled PR by hand and call `merge_pr` to force it through.
+  diagnose a stalled PR by hand and call `merge_pr` without those gates.
 - **No run termination.** A bounded failure parks with an auditable cause and
   waits for a named human gate answered with
   `python3 -m tl_loop gate --run-id <id> --name <gate> --approve|--reject`.

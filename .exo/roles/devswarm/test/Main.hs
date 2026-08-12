@@ -653,8 +653,11 @@ assertReviewerFacingTextDoesNotMentionCopilot = do
   assertNoCopilot "reviewTimeout" (Tpl.reviewTimeout 42 15)
   assertContains "merge_pr description" "Forgejo reviewer" mergePRDescription
   assertContains "merge_pr description issue id" "chainlink_issue_id" mergePRDescription
+  assertNotContains "merge_pr description force bypass" "force=true" mergePRDescription
+  assertNotContains "merge_pr schema force bypass" "force" mergePrSchemaText
   assertContains "prReady" "Forgejo reviewer" (Tpl.prReady 42)
   assertContains "reviewTimeout" "Forgejo reviewer" (Tpl.reviewTimeout 42 15)
+  assertNotContains "reviewTimeout merge bypass" "force" (Tpl.reviewTimeout 42 15)
   case Aeson.fromJSON (Aeson.object ["pr_number" Aeson..= (7 :: Int), "chainlink_issue_id" Aeson..= (42 :: Int)]) of
     Aeson.Success args -> assertEqual "merge_pr parses chainlink_issue_id" (Just 42) (mprChainlinkIssueId args)
     Aeson.Error err -> fail $ "merge_pr args parse failed: " <> err
@@ -825,6 +828,10 @@ assertNoCopilot label_ value =
 assertContains :: String -> Text -> Text -> IO ()
 assertContains label_ expected value =
   assertBool (label_ <> " should mention " <> T.unpack expected) (expected `T.isInfixOf` value)
+
+assertNotContains :: String -> Text -> Text -> IO ()
+assertNotContains label_ unexpected value =
+  assertBool (label_ <> " should not mention " <> T.unpack unexpected) (not (unexpected `T.isInfixOf` value))
 
 showDevTransition :: TransitionResult DevPhase -> String
 showDevTransition (Transitioned phase) = "Transitioned " <> show phase

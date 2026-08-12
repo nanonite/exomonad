@@ -775,8 +775,19 @@ impl EffectHandler for MockGitHubHandler {
             }
             .encode_to_vec()),
             "github.get_pull_request" => Ok(GetPullRequestResponse {
-                pull_request: None,
-                reviews: vec![],
+                pull_request: Some(PullRequest {
+                    number: 42,
+                    state: IssueState::Open as i32,
+                    head_ref: "main.test-leaf".into(),
+                    base_ref: "main".into(),
+                    head_sha: "abc123".into(),
+                    ..Default::default()
+                }),
+                reviews: vec![Review {
+                    state: ReviewState::Approved as i32,
+                    commit_id: "abc123".into(),
+                    ..Default::default()
+                }],
             }
             .encode_to_vec()),
             "github.create_pull_request" => Ok(CreatePullRequestResponse {
@@ -1502,8 +1513,7 @@ async fn wasm_merge_pr_roundtrip() {
         "tl",
         "merge_pr",
         json!({
-            "pr_number": 42,
-            "force": true
+            "pr_number": 42
         }),
     )
     .await;

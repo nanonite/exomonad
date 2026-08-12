@@ -289,6 +289,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Remove timeout force guidance and enforce merge gate policy (#758)
 - E6: Evaluate owning the agent loop for durable TL->agent steering (#723)
 - E6 :: E6.5 Write the ADR (#756)
 - E6 :: E6.4 Design a durable per-agent steering queue (#755)

@@ -318,13 +318,11 @@ class EffectClient:
         *,
         pr_number: int,
         chainlink_issue_id: int | None = None,
-        force: bool | None = None,
         strategy: str | None = None,
         working_dir: str | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {"pr_number": pr_number}
         _put(arguments, "chainlink_issue_id", chainlink_issue_id)
-        _put(arguments, "force", force)
         _put(arguments, "strategy", strategy)
         _put(arguments, "working_dir", working_dir)
         return self._call("merge_pr", arguments)
