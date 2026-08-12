@@ -121,6 +121,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- E11: Observability contract for the guidance queue (#768)
 - E10: Runtime adapters with boundary and acceptance evidence (#767)
 - E7: Durable guidance queue schema and transactional API (#764)
 - E3: Move review workflow into tl_loop (#720)
