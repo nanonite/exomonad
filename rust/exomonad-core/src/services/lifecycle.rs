@@ -6,6 +6,7 @@
 
 use super::agent_control::{AgentType, InvocationRecord, InvocationStatus, InvocationTrigger};
 use super::event_log::EventLog;
+use super::guidance_queue::GuidanceBatch;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::warn;
@@ -111,6 +112,12 @@ impl LifecycleEventKind {
 pub struct LifecycleTelemetry {
     pub source_agent: Option<String>,
     pub source: String,
+    pub batch_id: Option<String>,
+    pub item_id: Option<String>,
+    pub queue_class: Option<String>,
+    pub queue_seq: Option<i64>,
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
     pub provider: String,
     pub runtime: String,
     pub harness: String,
@@ -133,6 +140,12 @@ impl LifecycleTelemetry {
         Self {
             source_agent: None,
             source: "lifecycle".to_string(),
+            batch_id: None,
+            item_id: None,
+            queue_class: None,
+            queue_seq: None,
+            run_id: None,
+            session_id: None,
             provider: record.runtime.suffix().to_string(),
             runtime: record.runtime.suffix().to_string(),
             harness: "exomonad".to_string(),
@@ -161,6 +174,12 @@ impl LifecycleTelemetry {
         Self {
             source_agent: Some(source_agent.to_string()),
             source: "lifecycle".to_string(),
+            batch_id: None,
+            item_id: None,
+            queue_class: None,
+            queue_seq: None,
+            run_id: None,
+            session_id: None,
             provider: invocation
                 .map(|record| record.runtime.suffix().to_string())
                 .unwrap_or_else(|| provider.suffix().to_string()),
@@ -183,6 +202,32 @@ impl LifecycleTelemetry {
             rollout_mode: OneShotLifecycleMode::from_env(),
             channel: Some(channel.to_string()),
         }
+    }
+
+    fn with_guidance_batch(mut self, batch: &GuidanceBatch) -> Self {
+        self.batch_id = Some(batch.batch_id.clone());
+        self.item_id = (batch.items.len() == 1).then(|| batch.items[0].item_id.clone());
+        self.queue_class = Some(batch.queue_class.as_str().to_string());
+        self.queue_seq = Some(batch.queue_seq);
+        self.run_id = batch.identity.run_id.clone();
+        self.session_id = batch.identity.session_id.clone();
+        if let Some(runtime) = &batch.identity.runtime {
+            self.runtime = runtime.clone();
+            self.provider = runtime.clone();
+        }
+        if let Some(harness) = &batch.identity.harness {
+            self.harness = harness.clone();
+        }
+        if let Some(role) = &batch.identity.role {
+            self.role = role.clone();
+        }
+        if let Some(invocation_id) = &batch.identity.invocation_id {
+            self.invocation_id = Some(invocation_id.clone());
+        }
+        if let Some(generation) = batch.identity.generation {
+            self.generation = Some(generation);
+        }
+        self
     }
 }
 
@@ -211,6 +256,17 @@ pub async fn record_guidance_delivery(
     channel: &str,
     outcome: &str,
 ) {
+    record_guidance_delivery_with_batch(project_dir, recipient, from, channel, outcome, None).await;
+}
+
+pub async fn record_guidance_delivery_with_batch(
+    project_dir: &Path,
+    recipient: &str,
+    from: &str,
+    channel: &str,
+    outcome: &str,
+    batch: Option<&GuidanceBatch>,
+) {
     let invocation = current_invocation(project_dir, recipient).await;
     let provider = invocation
         .as_ref()
@@ -218,6 +274,11 @@ pub async fn record_guidance_delivery(
         .unwrap_or_else(|| AgentType::from_dir_name(recipient));
     let telemetry =
         LifecycleTelemetry::guidance(provider, invocation.as_ref(), from, outcome, channel);
+    let telemetry = if let Some(batch) = batch {
+        telemetry.with_guidance_batch(batch)
+    } else {
+        telemetry
+    };
     tracing::info!(
         otel.name = "agent.guidance.delivery",
         provider = %telemetry.provider,

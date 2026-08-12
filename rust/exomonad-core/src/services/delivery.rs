@@ -4,7 +4,9 @@ use crate::services::agent_control::{
 };
 use crate::services::agent_inbox::{idempotency_key_for_message, InboxMessage, GLOBAL_AGENT_INBOX};
 use crate::services::tmux_events;
-use crate::services::{GuidanceBatchRequest, GuidanceIdentity, GuidanceItemInput, QueueClass};
+use crate::services::{
+    GuidanceBatch, GuidanceBatchRequest, GuidanceIdentity, GuidanceItemInput, QueueClass,
+};
 use claude_teams_bridge as teams_mailbox;
 use claude_teams_bridge::TeamRegistry;
 use exomonad_proto::effects::events::{event, AgentMessage, Event};
@@ -559,7 +561,10 @@ async fn deliver_to_agent_for(
             .await
         }
         MessageDeliveryPath::TmuxOnly => {
-            if !record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class).await {
+            if record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class)
+                .await
+                .is_none()
+            {
                 return DeliveryResult::Failed;
             }
             match deliver_via_tmux(ctx.project_dir(), agent_key, tmux_target, from, message).await {
@@ -568,7 +573,10 @@ async fn deliver_to_agent_for(
             }
         }
         MessageDeliveryPath::MailboxOnly => {
-            if !record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class).await {
+            if record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class)
+                .await
+                .is_none()
+            {
                 return DeliveryResult::Failed;
             }
             match deliver_to_agent_mailbox(ctx, agent_key, from, message, summary).await {
@@ -727,7 +735,7 @@ async fn record_inbox_delivery(
     message: &str,
     summary: &str,
     queue_class: QueueClass,
-) -> bool {
+) -> Option<GuidanceBatch> {
     let to_agent = canonical_recipient_key(ctx.agent_resolver(), agent_key).await;
     let idempotency_key = idempotency_key_for_message(from.as_str(), &to_agent, message);
     let request = GuidanceBatchRequest {
@@ -758,7 +766,7 @@ async fn record_inbox_delivery(
                 to = %to_agent,
                 "Committed durable guidance batch and compatibility message before transport"
             );
-            true
+            Some(result.batch)
         }
         Err(error) => {
             warn!(
@@ -767,7 +775,7 @@ async fn record_inbox_delivery(
                 error = %error,
                 "Failed to commit durable guidance batch before transport"
             );
-            false
+            None
         }
     }
 }
@@ -1459,7 +1467,9 @@ async fn deliver_to_agent_with_class(
     let _agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
     let agent_type = agent_type_from_key(agent_key);
-    if !record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class).await {
+    let Some(batch) =
+        record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class).await
+    else {
         crate::services::lifecycle::record_guidance_delivery(
             project_dir,
             agent_key,
@@ -1469,7 +1479,7 @@ async fn deliver_to_agent_with_class(
         )
         .await;
         return DeliveryResult::Failed;
-    }
+    };
     // Batch lookup: sender's team (for Tier 2 scoping) + recipient in-memory check.
     // Single lock acquisition instead of two separate get() calls.
     let (sender_info, recipient_info) = team_registry.get_pair(from.as_str(), agent_key).await;
@@ -1544,12 +1554,13 @@ async fn deliver_to_agent_with_class(
                     detail = format!("{}/{}", team_info.team_name, team_info.inbox_name),
                     "[event] message.delivery"
                 );
-                crate::services::lifecycle::record_guidance_delivery(
+                crate::services::lifecycle::record_guidance_delivery_with_batch(
                     project_dir,
                     agent_key,
                     from.as_str(),
                     "teams_inbox",
                     "success",
+                    Some(&batch),
                 )
                 .await;
 
@@ -1648,12 +1659,13 @@ async fn deliver_to_agent_with_class(
                     detail = %socket_path.to_string_lossy(),
                     "[event] message.delivery"
                 );
-                crate::services::lifecycle::record_guidance_delivery(
+                crate::services::lifecycle::record_guidance_delivery_with_batch(
                     project_dir,
                     agent_key,
                     from.as_str(),
                     "uds",
                     "success",
+                    Some(&batch),
                 )
                 .await;
                 return DeliveryResult::Uds;
@@ -1669,12 +1681,13 @@ async fn deliver_to_agent_with_class(
                     detail = %e,
                     "[event] message.delivery"
                 );
-                crate::services::lifecycle::record_guidance_delivery(
+                crate::services::lifecycle::record_guidance_delivery_with_batch(
                     project_dir,
                     agent_key,
                     from.as_str(),
                     "uds",
                     "failed",
+                    Some(&batch),
                 )
                 .await;
             }
@@ -1683,7 +1696,7 @@ async fn deliver_to_agent_with_class(
 
     // Fall back to tmux STDIN injection
     let result = deliver_via_tmux(project_dir, agent_key, tmux_target, from, message).await;
-    crate::services::lifecycle::record_guidance_delivery(
+    crate::services::lifecycle::record_guidance_delivery_with_batch(
         project_dir,
         agent_key,
         from.as_str(),
@@ -1693,6 +1706,7 @@ async fn deliver_to_agent_with_class(
         } else {
             "queued"
         },
+        Some(&batch),
     )
     .await;
     match result {
@@ -1879,17 +1893,16 @@ mod tests {
         let services = services_with_agent("patch-step-over", "patch-step-over-opencode").await;
         let from = agent_name("root");
 
-        assert!(
-            record_inbox_delivery(
-                &services,
-                "patch-step-over",
-                &from,
-                "hello",
-                "summary",
-                QueueClass::FollowUp,
-            )
-            .await
-        );
+        assert!(record_inbox_delivery(
+            &services,
+            "patch-step-over",
+            &from,
+            "hello",
+            "summary",
+            QueueClass::FollowUp,
+        )
+        .await
+        .is_some());
 
         let (queue_class, state, content, source_message_id): (String, String, String, i64) =
             services

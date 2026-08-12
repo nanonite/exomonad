@@ -304,27 +304,33 @@ impl InboxStore {
         append_state_change(
             self.db_path(),
             "inbox.state_changed",
-            serde_json::json!({
-                "operation": "write_message",
-                "message_id": source_message_id,
-                "from_agent": from_agent,
-                "to_agent": normalized_to_agent,
-                "content": content,
-                "summary": summary,
-                "created_at": now
-            }),
+            with_batch_identity(
+                serde_json::json!({
+                    "operation": "write_message",
+                    "message_id": source_message_id,
+                    "from_agent": from_agent,
+                    "to_agent": normalized_to_agent,
+                    "content": content,
+                    "summary": summary,
+                    "created_at": now
+                }),
+                &result.batch,
+            ),
         );
         append_state_change(
             self.db_path(),
             "message.delivery",
-            serde_json::json!({
-                "message_id": source_message_id,
-                "from_agent": from_agent,
-                "to_agent": normalized_to_agent,
-                "attempt": 1,
-                "outcome": "accepted",
-                "transport": "durable_inbox"
-            }),
+            with_batch_identity(
+                serde_json::json!({
+                    "message_id": source_message_id,
+                    "from_agent": from_agent,
+                    "to_agent": normalized_to_agent,
+                    "attempt": 1,
+                    "outcome": "accepted",
+                    "transport": "durable_inbox"
+                }),
+                &result.batch,
+            ),
         );
         append_enqueue_event(self, &result);
         let comparison = super::guidance_shadow::compare_batch(self, &result.batch.batch_id)
@@ -448,20 +454,20 @@ impl InboxStore {
         }
         let batch = load_batch(&tx, &batch_id)?;
         tx.commit().context("failed to commit guidance claim")?;
+        drop(conn);
         emit_recovery_events(self, recovered);
         append_queue_event(
             self,
             "inbox.state_changed",
-            serde_json::json!({
-                "operation": "claim",
-                "batch_id": batch.batch_id,
-                "agent_id": batch.agent_id,
-                "queue_class": batch.queue_class.as_str(),
-                "queue_seq": batch.queue_seq,
-                "consumer": consumer.consumer_id,
-                "boundary": boundary.phase,
-                "lease_expires_at": batch.lease_expires_at,
-            }),
+            with_batch_identity(
+                serde_json::json!({
+                    "operation": "claim",
+                    "consumer": consumer.consumer_id,
+                    "boundary": boundary.phase,
+                    "lease_expires_at": batch.lease_expires_at,
+                }),
+                &batch,
+            ),
         );
         Ok(Some(batch))
     }
@@ -515,33 +521,38 @@ impl InboxStore {
             params![next_attempt, lease_expires_at, batch_id, consumer_id],
         )
         .context("failed to record guidance transport attempt")?;
+        let batch = load_batch(&tx, batch_id)?;
         tx.commit().context("failed to commit guidance transport")?;
         append_queue_event(
             self,
             "message.delivery",
-            serde_json::json!({
-                "batch_id": batch_id,
-                "consumer": consumer_id,
-                "attempt": next_attempt,
-                "method": attempt.method,
-                "outcome": attempt.outcome,
-                "acceptance": "unknown",
-                "confidence": "unknown",
-                "detail": attempt.detail,
-            }),
+            with_batch_identity(
+                serde_json::json!({
+                    "consumer": consumer_id,
+                    "attempt": next_attempt,
+                    "method": attempt.method,
+                    "outcome": attempt.outcome,
+                    "acceptance": "unknown",
+                    "confidence": "unknown",
+                    "detail": attempt.detail,
+                }),
+                &batch,
+            ),
         );
         append_queue_event(
             self,
             "inbox.state_changed",
-            serde_json::json!({
-                "operation": "transport_submitted",
-                "batch_id": batch_id,
-                "consumer": consumer_id,
-                "attempt": next_attempt,
-                "state": GuidanceState::Submitted,
-                "acceptance": "unknown",
-                "confidence": "unknown",
-            }),
+            with_batch_identity(
+                serde_json::json!({
+                    "operation": "transport_submitted",
+                    "consumer": consumer_id,
+                    "attempt": next_attempt,
+                    "state": GuidanceState::Submitted,
+                    "acceptance": "unknown",
+                    "confidence": "unknown",
+                }),
+                &batch,
+            ),
         );
         Ok(next_attempt)
     }
@@ -604,16 +615,17 @@ impl InboxStore {
             append_queue_event(
                 self,
                 "inbox.state_changed",
-                serde_json::json!({
-                    "operation": "acknowledgement_unproven",
-                    "batch_id": batch.batch_id,
-                    "agent_id": batch.agent_id,
-                    "consumer": evidence.consumer_id,
-                    "state": batch.state,
-                    "acceptance": "unknown",
-                    "confidence": evidence.confidence,
-                    "evidence_kind": evidence.evidence_kind,
-                }),
+                with_batch_identity(
+                    serde_json::json!({
+                        "operation": "acknowledgement_unproven",
+                        "consumer": evidence.consumer_id,
+                        "state": batch.state,
+                        "acceptance": "unknown",
+                        "confidence": evidence.confidence,
+                        "evidence_kind": evidence.evidence_kind,
+                    }),
+                    &batch,
+                ),
             );
             return Ok(GuidanceAckResult::Rejected {
                 reason: "non-exact runtime evidence cannot accept a guidance batch".to_string(),
@@ -641,27 +653,29 @@ impl InboxStore {
         append_queue_event(
             self,
             "inbox.state_changed",
-            serde_json::json!({
-                "operation": "acknowledge",
-                "batch_id": evidence.batch_id,
-                "agent_id": agent_id,
-                "consumer": evidence.consumer_id,
-                "evidence_kind": evidence.evidence_kind,
-                "acceptance": "exact",
-                "confidence": evidence.confidence,
-            }),
+            with_batch_identity(
+                serde_json::json!({
+                    "operation": "acknowledge",
+                    "consumer": evidence.consumer_id,
+                    "evidence_kind": evidence.evidence_kind,
+                    "acceptance": "exact",
+                    "confidence": evidence.confidence,
+                }),
+                &batch,
+            ),
         );
         append_queue_event(
             self,
             "message.consumed",
-            serde_json::json!({
-                "batch_id": evidence.batch_id,
-                "agent_id": agent_id,
-                "consumer": evidence.consumer_id,
-                "ack_kind": "runtime_accepted",
-                "confidence": evidence.confidence,
-                "item_count": evidence.item_ids.len(),
-            }),
+            with_batch_identity(
+                serde_json::json!({
+                    "consumer": evidence.consumer_id,
+                    "ack_kind": "runtime_accepted",
+                    "confidence": evidence.confidence,
+                    "item_count": evidence.item_ids.len(),
+                }),
+                &batch,
+            ),
         );
         Ok(GuidanceAckResult::Accepted)
     }
@@ -701,6 +715,7 @@ impl InboxStore {
         } else {
             GuidanceState::Pending
         };
+        let batch = load_batch(&tx, batch_id)?;
         tx.execute(
             "UPDATE guidance_batches
              SET state = ?1, available_at = ?2, lease_owner = NULL,
@@ -720,25 +735,30 @@ impl InboxStore {
         append_queue_event(
             self,
             "inbox.state_changed",
-            serde_json::json!({
-                "operation": if terminal { "abandon" } else { "release_for_retry" },
-                "batch_id": batch_id,
-                "consumer": consumer_id,
-                "state": new_state,
-                "reason": reason,
-                "available_at": next_attempt_at,
-            }),
+            with_batch_identity(
+                serde_json::json!({
+                    "operation": if terminal { "abandon" } else { "release_for_retry" },
+                    "consumer": consumer_id,
+                    "state": new_state,
+                    "reason": reason,
+                    "available_at": next_attempt_at,
+                    "attempt": attempt_count,
+                }),
+                &batch,
+            ),
         );
         if terminal {
             append_queue_event(
                 self,
                 "agent_inbox.messages_abandoned",
-                serde_json::json!({
-                    "batch_id": batch_id,
-                    "consumer": consumer_id,
-                    "reason": reason,
-                    "attempt": attempt_count,
-                }),
+                with_batch_identity(
+                    serde_json::json!({
+                        "consumer": consumer_id,
+                        "reason": reason,
+                        "attempt": attempt_count,
+                    }),
+                    &batch,
+                ),
             );
         }
         Ok(new_state)
@@ -769,6 +789,7 @@ impl InboxStore {
                 .context("failed to commit idempotent cancellation")?;
             return Ok(current);
         }
+        let batch = load_batch(&tx, batch_id)?;
         tx.execute(
             "UPDATE guidance_batches
              SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
@@ -782,12 +803,16 @@ impl InboxStore {
         append_queue_event(
             self,
             "inbox.state_changed",
-            serde_json::json!({
-                "operation": "cancel",
-                "batch_id": batch_id,
-                "state": GuidanceState::Cancelled,
-                "reason": reason,
-            }),
+            with_batch_identity(
+                serde_json::json!({
+                    "operation": "cancel",
+                    "state": GuidanceState::Cancelled,
+                    "reason": reason,
+                    "consumer": batch.lease_owner,
+                    "attempt": batch.attempt_count,
+                }),
+                &batch,
+            ),
         );
         Ok(GuidanceState::Cancelled)
     }
@@ -800,6 +825,7 @@ impl InboxStore {
             .context("failed to start guidance recovery transaction")?;
         let recovered = recover_expired_in_tx(&tx, now)?;
         tx.commit().context("failed to commit guidance recovery")?;
+        drop(conn);
         emit_recovery_events(self, recovered.clone());
         Ok(recovered
             .into_iter()
@@ -892,15 +918,13 @@ fn append_enqueue_event(store: &InboxStore, result: &GuidanceEnqueueResult) {
     append_queue_event(
         store,
         "inbox.state_changed",
-        serde_json::json!({
-            "operation": "enqueue",
-            "batch_id": batch.batch_id,
-            "agent_id": batch.agent_id,
-            "queue_class": batch.queue_class.as_str(),
-            "queue_seq": batch.queue_seq,
-            "item_count": batch.items.len(),
-            "idempotency_key": batch.idempotency_key,
-        }),
+        with_batch_identity(
+            serde_json::json!({
+                "operation": "enqueue",
+                "idempotency_key": batch.idempotency_key,
+            }),
+            batch,
+        ),
     );
 }
 
@@ -1188,22 +1212,29 @@ fn retry_backoff_seconds(attempt_count: i64) -> i64 {
 
 fn emit_recovery_events(store: &InboxStore, recovered: Vec<(String, GuidanceState)>) {
     for (batch_id, state) in recovered {
+        let batch = store.inspect_batch(&batch_id).ok().flatten();
+        let state_data = serde_json::json!({
+            "operation": "lease_expired",
+            "batch_id": batch_id,
+            "state": state,
+        });
         append_queue_event(
             store,
             "inbox.state_changed",
-            serde_json::json!({
-                "operation": "lease_expired",
-                "batch_id": batch_id,
-                "state": state,
+            batch.as_ref().map_or(state_data.clone(), |batch| {
+                with_batch_identity(state_data.clone(), batch)
             }),
         );
         if state == GuidanceState::Abandoned {
+            let abandoned_data = serde_json::json!({
+                "batch_id": batch_id,
+                "reason": "lease_expired_retry_budget",
+            });
             append_queue_event(
                 store,
                 "agent_inbox.messages_abandoned",
-                serde_json::json!({
-                    "batch_id": batch_id,
-                    "reason": "lease_expired_retry_budget",
+                batch.as_ref().map_or(abandoned_data.clone(), |batch| {
+                    with_batch_identity(abandoned_data.clone(), batch)
                 }),
             );
         }
@@ -1214,11 +1245,71 @@ fn append_queue_event(store: &InboxStore, event_type: &str, data: Value) {
     append_state_change(store.db_path(), event_type, data);
 }
 
+pub(crate) fn with_batch_identity(mut data: Value, batch: &GuidanceBatch) -> Value {
+    let Some(object) = data.as_object_mut() else {
+        return data;
+    };
+    object.insert("batch_id".to_string(), serde_json::json!(batch.batch_id));
+    object.insert(
+        "item_ids".to_string(),
+        serde_json::json!(batch
+            .items
+            .iter()
+            .map(|item| &item.item_id)
+            .collect::<Vec<_>>()),
+    );
+    if batch.items.len() == 1 {
+        object.insert(
+            "item_id".to_string(),
+            serde_json::json!(batch.items[0].item_id),
+        );
+    }
+    object.insert("agent_id".to_string(), serde_json::json!(batch.agent_id));
+    object.insert(
+        "queue_class".to_string(),
+        serde_json::json!(batch.queue_class.as_str()),
+    );
+    object.insert("queue_seq".to_string(), serde_json::json!(batch.queue_seq));
+    for (name, value) in [
+        ("run_id", batch.identity.run_id.as_ref()),
+        ("session_id", batch.identity.session_id.as_ref()),
+        ("invocation_id", batch.identity.invocation_id.as_ref()),
+        ("runtime", batch.identity.runtime.as_ref()),
+        ("harness", batch.identity.harness.as_ref()),
+        ("role", batch.identity.role.as_ref()),
+    ] {
+        if let Some(value) = value {
+            object.insert(name.to_string(), serde_json::json!(value));
+        }
+    }
+    if let Some(generation) = batch.identity.generation {
+        object.insert("generation".to_string(), serde_json::json!(generation));
+    }
+    data
+}
+
+pub(crate) fn load_batch_by_source_message_id(
+    conn: &Connection,
+    source_message_id: i64,
+) -> Result<Option<GuidanceBatch>> {
+    let batch_id: Option<String> = conn
+        .query_row(
+            "SELECT batch_id FROM guidance_batches WHERE source_message_id = ?1",
+            params![source_message_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to find guidance batch for source message")?;
+    batch_id
+        .map(|batch_id| load_batch(conn, &batch_id))
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::guidance_adapters::{
-        AcceptanceKind, BoundaryEvidence, RuntimeAcceptanceEvidence,
+        AcceptanceKind, BoundaryEvidence, RuntimeAcceptanceEvidence, TransportOutcome,
     };
     use serde_json::json;
 
@@ -1274,6 +1365,72 @@ mod tests {
             store.enqueue_batch(request("agent", QueueClass::Steering, Some("event-1")))?;
         assert!(!replay.created);
         assert_eq!(replay.batch.batch_id, first.batch.batch_id);
+        Ok(())
+    }
+
+    #[test]
+    fn guidance_events_include_queue_identity_dimensions() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = InboxStore::open(directory.path())?;
+        let mut queued = request("agent", QueueClass::Steering, Some("identity-event"));
+        queued.identity = GuidanceIdentity {
+            run_id: Some("run-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            invocation_id: Some("invocation-1".to_string()),
+            generation: Some(3),
+            runtime: Some("codex".to_string()),
+            harness: Some("exomonad".to_string()),
+            role: Some("dev".to_string()),
+        };
+        let batch = store.enqueue_batch(queued)?.batch;
+        let consumer = GuidanceConsumer {
+            consumer_id: "consumer-1".to_string(),
+            invocation_id: Some("invocation-1".to_string()),
+            generation: Some(3),
+        };
+        let claimed = store
+            .claim_next(&BoundaryEvidence::turn_finished("agent"), &consumer, 60)?
+            .expect("claimed batch");
+        store.record_transport_attempt(
+            &claimed.batch_id,
+            &consumer.consumer_id,
+            &TransportAttempt {
+                method: "test_transport".to_string(),
+                outcome: TransportOutcome::Success,
+                detail: None,
+            },
+        )?;
+
+        let events =
+            crate::services::LedgerWriter::open_project(directory.path())?.read_events()?;
+        let delivery = events
+            .iter()
+            .find(|record| record.event.event_type == "message.delivery")
+            .expect("delivery event");
+        for (field, expected) in [
+            ("batch_id", serde_json::json!(batch.batch_id)),
+            ("item_id", serde_json::json!(batch.items[0].item_id)),
+            ("agent_id", serde_json::json!("agent")),
+            ("queue_class", serde_json::json!("steering")),
+            ("queue_seq", serde_json::json!(0)),
+            ("run_id", serde_json::json!("run-1")),
+            ("session_id", serde_json::json!("session-1")),
+            ("invocation_id", serde_json::json!("invocation-1")),
+            ("generation", serde_json::json!(3)),
+            ("runtime", serde_json::json!("codex")),
+            ("harness", serde_json::json!("exomonad")),
+            ("role", serde_json::json!("dev")),
+            ("consumer", serde_json::json!("consumer-1")),
+            ("attempt", serde_json::json!(1)),
+        ] {
+            assert_eq!(delivery.event.data[field], expected, "field {field}");
+        }
+        assert!(!delivery
+            .event
+            .data
+            .as_object()
+            .unwrap()
+            .contains_key("content"));
         Ok(())
     }
 

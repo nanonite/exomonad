@@ -213,6 +213,10 @@ impl InboxStore {
              ORDER BY created_at ASC, id ASC",
             normalized_agent_id.as_ref(),
         )?;
+        let source_batches = messages
+            .iter()
+            .map(|message| super::guidance_queue::load_batch_by_source_message_id(&tx, message.id))
+            .collect::<Result<Vec<_>>>()?;
         tx.execute(
             "UPDATE messages SET read_at = ?1 WHERE to_agent = ?2 AND read_at IS NULL",
             params![now, normalized_agent_id.as_ref()],
@@ -238,19 +242,22 @@ impl InboxStore {
                     "read_at": now
                 }),
             );
-            for message in &messages {
+            for (message, batch) in messages.iter().zip(source_batches) {
+                let event = json!({
+                    "message_id": message.id,
+                    "from_agent": message.from_agent,
+                    "to_agent": message.to_agent,
+                    "consumer": normalized_agent_id,
+                    "outcome": "consumed",
+                    "ack_kind": "inbox_read",
+                    "confidence": "unknown",
+                    "read_at": now
+                });
                 append_state_change(
                     &self.db_path,
                     "message.consumed",
-                    json!({
-                        "message_id": message.id,
-                        "from_agent": message.from_agent,
-                        "to_agent": message.to_agent,
-                        "consumer": normalized_agent_id,
-                        "outcome": "consumed",
-                        "ack_kind": "inbox_read",
-                        "confidence": "unknown",
-                        "read_at": now
+                    batch.as_ref().map_or(event.clone(), |batch| {
+                        super::guidance_queue::with_batch_identity(event, batch)
                     }),
                 );
             }

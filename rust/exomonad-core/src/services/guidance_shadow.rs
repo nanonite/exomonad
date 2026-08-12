@@ -25,11 +25,19 @@ pub struct ShadowLegacyProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowQueueProjection {
     pub batch_id: String,
+    pub item_ids: Vec<String>,
     pub source_message_id: Option<i64>,
     pub agent_id: String,
     pub queue_class: QueueClass,
     pub queue_seq: i64,
     pub state: GuidanceState,
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
+    pub invocation_id: Option<String>,
+    pub generation: Option<u64>,
+    pub runtime: Option<String>,
+    pub harness: Option<String>,
+    pub role: Option<String>,
     pub item_count: usize,
     pub item_from_agent: Option<String>,
     pub item_content_digest: Option<String>,
@@ -80,16 +88,29 @@ pub fn compare_batch(store: &InboxStore, batch_id: &str) -> Result<ShadowCompari
 }
 
 pub(crate) fn emit_comparison(store: &InboxStore, comparison: &ShadowComparison) {
+    let queue = comparison.queue.as_ref();
     super::state_mirror::append_state_change(
         store.db_path(),
         "inbox.state_changed",
         serde_json::json!({
             "operation": "shadow_compare",
-            "batch_id": comparison.queue.as_ref().map(|queue| &queue.batch_id),
+            "batch_id": queue.map(|queue| &queue.batch_id),
+            "item_ids": queue.map(|queue| &queue.item_ids),
+            "item_id": queue.and_then(|queue| (queue.item_ids.len() == 1).then(|| &queue.item_ids[0])),
             "source_message_id": comparison
                 .queue
                 .as_ref()
                 .and_then(|queue| queue.source_message_id),
+            "agent_id": queue.map(|queue| &queue.agent_id),
+            "queue_class": queue.map(|queue| queue.queue_class.as_str()),
+            "queue_seq": queue.map(|queue| queue.queue_seq),
+            "run_id": queue.and_then(|queue| queue.run_id.as_ref()),
+            "session_id": queue.and_then(|queue| queue.session_id.as_ref()),
+            "invocation_id": queue.and_then(|queue| queue.invocation_id.as_ref()),
+            "generation": queue.and_then(|queue| queue.generation),
+            "runtime": queue.and_then(|queue| queue.runtime.as_ref()),
+            "harness": queue.and_then(|queue| queue.harness.as_ref()),
+            "role": queue.and_then(|queue| queue.role.as_ref()),
             "in_sync": comparison.in_sync(),
             "diff_count": comparison.diff_count(),
             "diffs": &comparison.diffs,
@@ -100,11 +121,23 @@ pub(crate) fn emit_comparison(store: &InboxStore, comparison: &ShadowComparison)
 fn compare_loaded_batch(store: &InboxStore, batch: &GuidanceBatch) -> Result<ShadowComparison> {
     let queue = ShadowQueueProjection {
         batch_id: batch.batch_id.clone(),
+        item_ids: batch
+            .items
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect(),
         source_message_id: batch.source_message_id,
         agent_id: batch.agent_id.clone(),
         queue_class: batch.queue_class,
         queue_seq: batch.queue_seq,
         state: batch.state,
+        run_id: batch.identity.run_id.clone(),
+        session_id: batch.identity.session_id.clone(),
+        invocation_id: batch.identity.invocation_id.clone(),
+        generation: batch.identity.generation,
+        runtime: batch.identity.runtime.clone(),
+        harness: batch.identity.harness.clone(),
+        role: batch.identity.role.clone(),
         item_count: batch.items.len(),
         item_from_agent: batch.items.first().map(|item| item.from_agent.clone()),
         item_content_digest: batch.items.first().map(|item| digest(&item.content)),
