@@ -4918,8 +4918,6 @@ data WatcherPrStateResponse
     watcherPrStateResponseError :: Hs.Text,
     watcherPrStateResponsePrNumber :: Hs.Word64,
     watcherPrStateResponseFound :: Hs.Bool,
-    watcherPrStateResponseMergeReady :: Hs.Bool,
-    watcherPrStateResponseBlocker :: Hs.Text,
     watcherPrStateResponseReviewState :: Hs.Text,
     watcherPrStateResponseCiStatus :: Hs.Text,
     watcherPrStateResponseHeadSha :: Hs.Text,
@@ -4946,8 +4944,6 @@ instance (HsProtobuf.Message WatcherPrStateResponse) where
         watcherPrStateResponseError,
         watcherPrStateResponsePrNumber,
         watcherPrStateResponseFound,
-        watcherPrStateResponseMergeReady,
-        watcherPrStateResponseBlocker,
         watcherPrStateResponseReviewState,
         watcherPrStateResponseCiStatus,
         watcherPrStateResponseHeadSha,
@@ -4968,39 +4964,25 @@ instance (HsProtobuf.Message WatcherPrStateResponse) where
                                     ( Hs.mappend
                                         ( Hs.mappend
                                             ( Hs.mappend
-                                                ( Hs.mappend
-                                                    ( Hs.mappend
-                                                        ( HsProtobuf.encodeMessageField
-                                                            (HsProtobuf.FieldNumber 1)
-                                                            watcherPrStateResponseSuccess
-                                                        )
-                                                        ( HsProtobuf.encodeMessageField
-                                                            (HsProtobuf.FieldNumber 2)
-                                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                                watcherPrStateResponseError
-                                                            )
-                                                        )
-                                                    )
-                                                    ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 3)
-                                                        watcherPrStateResponsePrNumber
-                                                    )
+                                                ( HsProtobuf.encodeMessageField
+                                                    (HsProtobuf.FieldNumber 1)
+                                                    watcherPrStateResponseSuccess
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 4)
-                                                    watcherPrStateResponseFound
+                                                    (HsProtobuf.FieldNumber 2)
+                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                        watcherPrStateResponseError
+                                                    )
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 5)
-                                                watcherPrStateResponseMergeReady
+                                                (HsProtobuf.FieldNumber 3)
+                                                watcherPrStateResponsePrNumber
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 6)
-                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                watcherPrStateResponseBlocker
-                                            )
+                                            (HsProtobuf.FieldNumber 4)
+                                            watcherPrStateResponseFound
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
@@ -5071,15 +5053,6 @@ instance (HsProtobuf.Message WatcherPrStateResponse) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 4)
-      <*> HsProtobuf.at
-        HsProtobuf.decodeMessageField
-        (HsProtobuf.FieldNumber 5)
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 6)
-              )
-          )
       <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
               ( HsProtobuf.at
                   HsProtobuf.decodeMessageField
@@ -5148,18 +5121,6 @@ instance (HsProtobuf.Message WatcherPrStateResponse) where
         []
         "",
       HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 5)
-        (HsProtobufAST.Prim HsProtobufAST.Bool)
-        (HsProtobufAST.Single "merge_ready")
-        []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 6)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "blocker")
-        []
-        "",
-      HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 7)
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "review_state")
@@ -5211,30 +5172,12 @@ instance (HsProtobuf.Message WatcherPrStateResponse) where
 
 instance (HsJSONPB.ToJSONPB WatcherPrStateResponse) where
   toJSONPB
-    ( WatcherPrStateResponse
-        f1
-        f2
-        f3
-        f4
-        f5
-        f6
-        f7
-        f8
-        f9
-        f10
-        f11
-        f12
-        f13
-        f14
-      ) =
+    (WatcherPrStateResponse f1 f2 f3 f4 f7 f8 f9 f10 f11 f12 f13 f14) =
       HsJSONPB.object
         [ "success" .= f1,
           "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
           "pr_number" .= f3,
           "found" .= f4,
-          "merge_ready" .= f5,
-          "blocker"
-            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
           "review_state"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
           "ci_status"
@@ -5251,30 +5194,12 @@ instance (HsJSONPB.ToJSONPB WatcherPrStateResponse) where
           "review_count" .= f14
         ]
   toEncodingPB
-    ( WatcherPrStateResponse
-        f1
-        f2
-        f3
-        f4
-        f5
-        f6
-        f7
-        f8
-        f9
-        f10
-        f11
-        f12
-        f13
-        f14
-      ) =
+    (WatcherPrStateResponse f1 f2 f3 f4 f7 f8 f9 f10 f11 f12 f13 f14) =
       HsJSONPB.pairs
         [ "success" .= f1,
           "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
           "pr_number" .= f3,
           "found" .= f4,
-          "merge_ready" .= f5,
-          "blocker"
-            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
           "review_state"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
           "ci_status"
@@ -5303,10 +5228,6 @@ instance (HsJSONPB.FromJSONPB WatcherPrStateResponse) where
                 )
             <*> obj .: "pr_number"
             <*> obj .: "found"
-            <*> obj .: "merge_ready"
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "blocker")
-                )
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "review_state")
                 )

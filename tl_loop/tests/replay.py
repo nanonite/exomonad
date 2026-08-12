@@ -69,7 +69,6 @@ class RecordingTransport:
                 "result": {
                     "found": True,
                     "head_sha": self.current_head,
-                    "merge_ready": True,
                 },
             }
         if tool_name == "chainlink_issue_create":

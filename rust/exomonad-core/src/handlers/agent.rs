@@ -682,8 +682,6 @@ fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPr
         error: error.into(),
         pr_number,
         found: false,
-        merge_ready: false,
-        blocker: String::new(),
         review_state: "unknown".to_string(),
         ci_status: CIStatus::Unknown.as_str().to_string(),
         head_sha: String::new(),
@@ -731,35 +729,6 @@ fn review_state_from_forgejo_reviews(
         ("approved".to_string(), review_count)
     } else {
         ("pending_review".to_string(), review_count)
-    }
-}
-
-fn watcher_pr_merge_diagnosis(
-    pr: &ForgejoPullRequest,
-    review_state: &str,
-    ci_status: CIStatus,
-) -> (bool, String) {
-    if pr.merged {
-        return (false, "PR is already merged".to_string());
-    }
-    if !pr.state.eq_ignore_ascii_case("open") {
-        return (false, format!("PR is {}", pr.state));
-    }
-    if pr.head_sha.as_deref().unwrap_or_default().is_empty() {
-        return (false, "PR head SHA is unavailable".to_string());
-    }
-    if review_state == "changes_requested" {
-        return (false, "review changes requested".to_string());
-    }
-    if review_state != "approved" {
-        return (false, "review approval pending".to_string());
-    }
-
-    match ci_status {
-        CIStatus::Success | CIStatus::Neutral => (true, String::new()),
-        CIStatus::Pending => (false, "CI status pending".to_string()),
-        CIStatus::Failure => (false, "CI status failure".to_string()),
-        CIStatus::Unknown => (false, "CI status unknown".to_string()),
     }
 }
 
@@ -1671,15 +1640,11 @@ impl<
                 .await
                 .unwrap_or(CIStatus::Unknown)
         };
-        let (merge_ready, blocker) = watcher_pr_merge_diagnosis(&pr, &review_state, ci_status);
-
         Ok(WatcherPrStateResponse {
             success: true,
             error: String::new(),
             pr_number: req.pr_number,
             found: true,
-            merge_ready,
-            blocker,
             review_state,
             ci_status: ci_status.as_str().to_string(),
             head_sha,
@@ -4646,24 +4611,6 @@ mod tests {
 
         assert_eq!(state, "changes_requested");
         assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn watcher_pr_merge_diagnosis_requires_review_and_green_ci() {
-        let pr = test_forgejo_pr();
-
-        assert_eq!(
-            watcher_pr_merge_diagnosis(&pr, "approved", CIStatus::Success),
-            (true, String::new())
-        );
-        assert_eq!(
-            watcher_pr_merge_diagnosis(&pr, "approved", CIStatus::Pending),
-            (false, "CI status pending".to_string())
-        );
-        assert_eq!(
-            watcher_pr_merge_diagnosis(&pr, "pending_review", CIStatus::Success),
-            (false, "review approval pending".to_string())
-        );
     }
 
     #[tokio::test]

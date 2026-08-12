@@ -557,8 +557,6 @@ impl EffectHandler for MockAgentHandler {
                     error: String::new(),
                     pr_number: req.pr_number,
                     found: true,
-                    merge_ready: true,
-                    blocker: String::new(),
                     review_state: review_state.into(),
                     ci_status: ci_status.into(),
                     head_sha: head_sha.into(),

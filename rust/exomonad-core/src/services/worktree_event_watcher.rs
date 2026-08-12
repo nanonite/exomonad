@@ -32,7 +32,6 @@ const DEFAULT_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(600);
 const WATCHER_CAPTURE_TEXT_CHARS: usize = 160;
 const WATCHER_CAPTURE_SHA_CHARS: usize = 80;
-const EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT: bool = true;
 
 fn inbox_poke_message(unread_count: usize) -> String {
     format!(
@@ -448,12 +447,6 @@ fn value_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(|value| value.as_str())
 }
 
-fn merge_ready_message(pr_number: u64, status: &str, branch: &str) -> String {
-    format!(
-        "[MERGE READY] PR #{pr_number} on branch {branch} has CI status {status} and reviewer approval. Merge with `merge_pr` tool."
-    )
-}
-
 fn ci_status_message(pr_number: u64, status: &str, branch: &str) -> String {
     let suffix = match status {
         "success" => "\n\nCI passed.",
@@ -602,13 +595,6 @@ fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventAction
         "stuck" => Some(EventActionResponse::InjectMessage {
             message: stuck_message(pr_number, value_u64(payload, "rounds")?),
         }),
-        "merge_ready" => Some(EventActionResponse::InjectMessage {
-            message: merge_ready_message(
-                pr_number,
-                value_str(payload, "ci_status")?,
-                value_str(payload, "branch")?,
-            ),
-        }),
         "dev_not_pushing" => Some(EventActionResponse::InjectMessage {
             message: format!("[DEV NOT PUSHING] PR #{pr_number} needs TL attention."),
         }),
@@ -653,17 +639,6 @@ fn native_leaf_pr_review_action(payload: &serde_json::Value) -> Option<EventActi
                 value_u64(payload, "rounds")?
             ),
         }),
-        "merge_ready" => {
-            let pr_number = value_u64(payload, "pr_number")?;
-            Some(EventActionResponse::NotifyParent {
-                message: merge_ready_message(
-                    pr_number,
-                    value_str(payload, "ci_status")?,
-                    value_str(payload, "branch")?,
-                ),
-                pr_number: pr_number as i64,
-            })
-        }
         "approved"
         | "reviewer_approved"
         | "timeout"
@@ -686,25 +661,9 @@ fn native_ci_status_action(payload: &serde_json::Value, role: &str) -> Option<Ev
         .get("merge_blocked_on_ci")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let merge_ready = payload
-        .get("merge_ready")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-
     if role == "tl" {
-        let message =
-            if (merge_blocked_on_ci || merge_ready) && matches!(status, "success" | "neutral") {
-                merge_ready_message(pr_number, status, branch)
-            } else {
-                ci_status_message(pr_number, status, branch)
-            };
-        return Some(EventActionResponse::InjectMessage { message });
-    }
-
-    if (merge_blocked_on_ci || merge_ready) && matches!(status, "success" | "neutral") {
-        return Some(EventActionResponse::NotifyParent {
-            message: merge_ready_message(pr_number, status, branch),
-            pr_number: pr_number as i64,
+        return Some(EventActionResponse::InjectMessage {
+            message: ci_status_message(pr_number, status, branch),
         });
     }
 
@@ -1690,8 +1649,6 @@ where
                         if event_type == "pr_review" {
                             self.log_review_wakeup(&pending, &payload);
                         }
-                        let release_message = merge_ready_release_message(&payload);
-
                         let payload_kind = payload
                             .get("kind")
                             .and_then(|v| v.as_str())
@@ -1726,9 +1683,7 @@ where
                         // Review events target the live PR owner and, for comments or requested
                         // changes, the owner's parent TL. Never inject an event into the
                         // already-exited reviewer branch.
-                        for (target_index, (target_branch, target_agent_type, target_role)) in
-                            event_targets.into_iter().enumerate()
-                        {
+                        for (target_branch, target_agent_type, target_role) in event_targets {
                             let response = self
                                 .call_handle_event_for_role(
                                     &target_branch,
@@ -1740,23 +1695,12 @@ where
                                 .await;
                             match response {
                                 Ok(Some(response)) => {
-                                    let confirmed = self
-                                        .handle_event_action(
-                                            response,
-                                            &target_branch,
-                                            target_agent_type,
-                                        )
-                                        .await;
-                                    if confirmed && target_index == 0 {
-                                        if let Some(message) = release_message.as_ref() {
-                                            self.deliver_release_message(
-                                                &target_branch,
-                                                target_agent_type,
-                                                message,
-                                            )
-                                            .await;
-                                        }
-                                    }
+                                    self.handle_event_action(
+                                        response,
+                                        &target_branch,
+                                        target_agent_type,
+                                    )
+                                    .await;
                                 }
                                 Ok(None) => {
                                     warn!(
@@ -2261,38 +2205,6 @@ where
         }
     }
 
-    async fn deliver_release_message(&self, branch: &str, agent_type: AgentType, message: &str) {
-        if self
-            .skip_legacy_delivery(branch, "merge_ready_release")
-            .await
-        {
-            return;
-        }
-
-        let agent_name =
-            AgentName::try_from_str(branch).expect("validated string input is non-empty");
-        let tab_name = if let Ok(records) = self.ctx.agent_resolver().records_ref().try_read() {
-            records.get(&agent_name).map(|r| r.display_name.clone())
-        } else {
-            None
-        }
-        .unwrap_or_else(|| {
-            let slug = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
-            agent_type.tab_display_name(slug)
-        });
-
-        crate::services::delivery::deliver_to_agent(
-            &*self.ctx,
-            branch,
-            &tab_name,
-            &AgentName::try_from_str("event-handler")
-                .expect("literal validated string is non-empty"),
-            message,
-            "Merge-ready release",
-        )
-        .await;
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn emit_event(
         &self,
@@ -2636,7 +2548,6 @@ fn compute_pr_actions_with_context(
         old_state.last_review_state = ForgejoReviewVerdict::Approved;
         old_state.notified_parent_approved = true;
         old_state.review_approved_at = Some(now);
-        let merge_ready_now = EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT && ci_now_mergeable;
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
             payload: serde_json::json!({
@@ -2647,17 +2558,7 @@ fn compute_pr_actions_with_context(
                 "branch": branch,
             }),
         });
-        if merge_ready_now {
-            pending_actions.push(PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload: serde_json::json!({
-                    "kind": "merge_ready",
-                    "pr_number": pr_number.as_u64(),
-                    "ci_status": ci_status.as_str(),
-                    "branch": branch,
-                }),
-            });
-        } else if old_state.ci_triggered_sha.as_deref() != Some(pr_sha) {
+        if old_state.ci_triggered_sha.as_deref() != Some(pr_sha) {
             old_state.ci_triggered_sha = Some(pr_sha.to_string());
             pending_actions.push(PendingAction::TriggerManualCi {
                 pr_number: pr_number.as_u64(),
@@ -2819,9 +2720,6 @@ fn compute_pr_actions_with_context(
 
     if ci_changed {
         let reviewer_approved = old_state.notified_parent_approved;
-        let ci_completed_merge_ready = EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT
-            && old_state.review_approved_at.is_some()
-            && ci_now_mergeable;
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "ci_status",
             payload: serde_json::json!({
@@ -2830,7 +2728,6 @@ fn compute_pr_actions_with_context(
                 "branch": branch,
                 "merge_blocked_on_ci": merge_blocked_on_ci,
                 "reviewer_approved": reviewer_approved,
-                "merge_ready": ci_completed_merge_ready,
             }),
         });
         pending_actions.push(PendingAction::EmitEvent {
@@ -3077,41 +2974,6 @@ fn review_event_dispatches_to_parent(event_type: &str, payload: &serde_json::Val
         )
 }
 
-fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
-    let kind_is_merge_ready = payload
-        .get("kind")
-        .and_then(|value| value.as_str())
-        .is_some_and(|kind| kind == "merge_ready");
-    let ci_event_is_merge_ready = payload
-        .get("merge_ready")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-
-    if !kind_is_merge_ready && !ci_event_is_merge_ready {
-        return None;
-    }
-
-    let pr_number = payload
-        .get("pr_number")
-        .and_then(|value| value.as_u64())
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let status = payload
-        .get("ci_status")
-        .or_else(|| payload.get("status"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("success");
-    let branch = payload
-        .get("branch")
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-
-    Some(format!(
-        "[MERGE READY] PR #{} on {} has reviewer approval and CI {}. You may stop; the parent TL owns merge.",
-        pr_number, branch, status
-    ))
-}
-
 fn watcher_action_capture(
     pending: &PendingPrActions,
     action: &PendingAction,
@@ -3197,10 +3059,6 @@ fn watcher_ci_capture(
                 .get("merge_blocked_on_ci")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false),
-            "merge_ready": payload
-                .get("merge_ready")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false),
         })),
     })
 }
@@ -3246,19 +3104,12 @@ fn ci_diagnosis(status: &str, payload: &serde_json::Value) -> String {
         .get("merge_blocked_on_ci")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let merge_ready = payload
-        .get("merge_ready")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    match (status, merge_blocked, merge_ready) {
-        ("failure", true, _) => "CI failed and is blocking merge".to_string(),
-        ("failure", false, _) => "CI failed for the verified PR head".to_string(),
-        ("success" | "neutral", _, true) => {
-            "CI is mergeable and reviewer approval is present".to_string()
-        }
-        ("success" | "neutral", _, false) => "CI is mergeable for the verified PR head".to_string(),
-        ("pending", _, _) => "CI is still running for the verified PR head".to_string(),
-        ("unknown", _, _) => "CI status is unknown for the verified PR head".to_string(),
+    match (status, merge_blocked) {
+        ("failure", true) => "CI failed and is blocking merge".to_string(),
+        ("failure", false) => "CI failed for the verified PR head".to_string(),
+        ("success" | "neutral", _) => "CI is passing for the verified PR head".to_string(),
+        ("pending", _) => "CI is still running for the verified PR head".to_string(),
+        ("unknown", _) => "CI status is unknown for the verified PR head".to_string(),
         _ => "CI status changed for the verified PR head".to_string(),
     }
 }
@@ -3408,25 +3259,6 @@ mod tests {
     }
 
     #[test]
-    fn test_native_leaf_fallback_notifies_parent_for_merge_ready() {
-        let payload = serde_json::json!({
-            "kind": "merge_ready",
-            "pr_number": 43,
-            "ci_status": "success",
-            "branch": "main.feature-codex",
-        });
-
-        match native_event_action("pr_review", &payload, "dev") {
-            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
-                assert_eq!(pr_number, 43);
-                assert!(message.contains("MERGE READY"));
-                assert!(message.contains("PR #43"));
-            }
-            other => panic!("expected merge-ready NotifyParent fallback, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn test_native_leaf_fallback_notifies_parent_for_ci_blocked() {
         let payload = serde_json::json!({
             "pr_number": 44,
@@ -3483,10 +3315,6 @@ mod tests {
                 serde_json::json!({ "kind": "stuck", "pr_number": 50, "rounds": 3 }),
                 "[STUCK: 50, rounds=3]",
             ),
-            (
-                serde_json::json!({ "kind": "merge_ready", "pr_number": 51, "ci_status": "neutral", "branch": "main.subtl" }),
-                "[MERGE READY] PR #51",
-            ),
         ];
 
         for (payload, expected) in cases {
@@ -3536,20 +3364,16 @@ mod tests {
     }
 
     #[test]
-    fn test_native_tl_fallback_injects_merge_ready_ci_status() {
+    fn test_native_fallback_ignores_retired_readiness_signal() {
         let payload = serde_json::json!({
+            "kind": "merge_ready",
             "pr_number": 52,
-            "status": "success",
+            "ci_status": "success",
             "branch": "main.subtl",
-            "merge_ready": true,
         });
 
-        match native_event_action("ci_status", &payload, "tl") {
-            Some(EventActionResponse::InjectMessage { message }) => {
-                assert!(message.contains("[MERGE READY] PR #52"));
-            }
-            other => panic!("expected TL CI InjectMessage fallback, got {other:?}"),
-        }
+        assert!(native_event_action("pr_review", &payload, "tl").is_none());
+        assert!(native_event_action("pr_review", &payload, "dev").is_none());
     }
 
     #[tokio::test]
@@ -3609,72 +3433,6 @@ mod tests {
 
         assert!(!inbox.has_unread("ledger-owned-codex").unwrap());
         assert!(!inbox.has_unread("root").unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_no_plugin_dispatch_uses_native_fallback_for_non_wasm_dev_leaf() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-        let plugins: PluginMap = Arc::new(RwLock::new(HashMap::new()));
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_plugins(plugins);
-        let payload = serde_json::json!({
-            "kind": "merge_ready",
-            "pr_number": 53,
-            "ci_status": "success",
-            "branch": "main.feature-shoal",
-        });
-
-        match watcher
-            .call_handle_event_for_role(
-                "main.feature-shoal",
-                AgentType::Shoal,
-                "dev",
-                "pr_review",
-                payload,
-            )
-            .await
-            .unwrap()
-        {
-            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
-                assert_eq!(pr_number, 53);
-                assert!(message.contains("[MERGE READY] PR #53"));
-            }
-            other => panic!("expected native NotifyParent fallback, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_no_plugin_dispatch_uses_native_fallback_for_process_agent() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-        let plugins: PluginMap = Arc::new(RwLock::new(HashMap::new()));
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_plugins(plugins);
-        let payload = serde_json::json!({
-            "kind": "merge_ready",
-            "pr_number": 54,
-            "ci_status": "success",
-            "branch": "main.feature-process",
-        });
-
-        match watcher
-            .call_handle_event_for_role(
-                "main.feature-process",
-                AgentType::Process,
-                "process",
-                "pr_review",
-                payload,
-            )
-            .await
-            .unwrap()
-        {
-            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
-                assert_eq!(pr_number, 54);
-                assert!(message.contains("[MERGE READY] PR #54"));
-            }
-            other => panic!("expected native Process NotifyParent fallback, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -3794,7 +3552,6 @@ mod tests {
                 "status": "failure",
                 "branch": "main.feat-codex",
                 "merge_blocked_on_ci": true,
-                "merge_ready": false,
             }),
         };
 
@@ -4368,176 +4125,7 @@ mod tests {
             .iter()
             .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
             if payload["kind"] == "approved")));
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "merge_ready")));
         assert!(state.notified_parent_approved);
-    }
-
-    #[test]
-    fn test_approval_with_unknown_ci_does_not_fire_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-codex")
-            .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
-
-        let actions = compute_pr_actions(
-            &mut state,
-            PRNumber::new(1),
-            "abc123",
-            &[],
-            &reviews,
-            CIStatus::Unknown,
-            true,
-            branch.as_str(),
-            &|_, _| String::new(),
-            5,
-        );
-
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "approved"
-        )));
-        assert!(!actions.iter().any(|a| matches!(
-            a,
-            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "merge_ready"
-        )));
-    }
-
-    #[test]
-    fn test_approval_after_green_ci_fires_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-codex")
-            .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        state.last_ci_status = CIStatus::Success;
-        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
-
-        let actions = compute_pr_actions(
-            &mut state,
-            PRNumber::new(1),
-            "abc123",
-            &[],
-            &reviews,
-            CIStatus::Success,
-            false,
-            branch.as_str(),
-            &|_, _| String::new(),
-            5,
-        );
-
-        let pr_review_kinds: Vec<&str> = actions
-            .iter()
-            .filter_map(|a| match a {
-                PendingAction::WasmEvent {
-                    event_type: "pr_review",
-                    payload,
-                } => payload.get("kind").and_then(|kind| kind.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(pr_review_kinds, vec!["approved", "merge_ready"]);
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload,
-            } if payload["kind"] == "merge_ready" && payload["ci_status"] == "success"
-        )));
-    }
-
-    #[test]
-    fn test_initial_approved_green_ci_observation_fires_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-codex")
-            .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
-
-        let actions = compute_pr_actions(
-            &mut state,
-            PRNumber::new(1),
-            "abc123",
-            &[],
-            &reviews,
-            CIStatus::Success,
-            false,
-            branch.as_str(),
-            &|_, _| String::new(),
-            5,
-        );
-
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload,
-            } if payload["kind"] == "merge_ready"
-        )));
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PendingAction::WasmEvent {
-                event_type: "ci_status",
-                payload,
-            } if payload["status"] == "success"
-        )));
-    }
-
-    #[test]
-    fn test_initial_approved_neutral_ci_observation_fires_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-codex")
-            .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
-
-        let actions = compute_pr_actions(
-            &mut state,
-            PRNumber::new(1),
-            "abc123",
-            &[],
-            &reviews,
-            CIStatus::Neutral,
-            false,
-            branch.as_str(),
-            &|_, _| String::new(),
-            5,
-        );
-
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload,
-            } if payload["kind"] == "merge_ready" && payload["ci_status"] == "neutral"
-        )));
-    }
-
-    #[test]
-    fn test_merge_ready_compatibility_event_is_not_persisted() {
-        let branch = BranchName::try_from_str("main.feat-codex")
-            .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
-
-        let actions = compute_pr_actions(
-            &mut state,
-            PRNumber::new(1),
-            "abc123",
-            &[],
-            &reviews,
-            CIStatus::Success,
-            false,
-            branch.as_str(),
-            &|_, _| String::new(),
-            5,
-        );
-
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload,
-            } if payload["kind"] == "merge_ready"
-        )));
     }
 
     #[tokio::test]
@@ -4571,108 +4159,7 @@ mod tests {
     }
 
     #[test]
-    fn test_green_ci_after_approval_fires_merge_ready_ci_event() {
-        let branch = BranchName::try_from_str("main.feat-codex")
-            .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        state.notified_parent_approved = true;
-        state.last_review_state = ForgejoReviewVerdict::Approved;
-        state.review_approved_at = Some(Instant::now() - Duration::from_secs(60));
-        state.last_ci_status = CIStatus::Pending;
-
-        let actions = compute_pr_actions(
-            &mut state,
-            PRNumber::new(1),
-            "abc123",
-            &[],
-            &[],
-            CIStatus::Success,
-            false,
-            branch.as_str(),
-            &|_, _| String::new(),
-            5,
-        );
-
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PendingAction::WasmEvent {
-                event_type: "ci_status",
-                payload,
-            } if payload["merge_ready"] == true && payload["reviewer_approved"] == true
-        )));
-    }
-
-    #[test]
-    fn test_green_ci_without_approval_does_not_fire_merge_ready() {
-        let branch = BranchName::try_from_str("main.feat-codex")
-            .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        state.last_ci_status = CIStatus::Pending;
-
-        let actions = compute_pr_actions(
-            &mut state,
-            PRNumber::new(1),
-            "abc123",
-            &[],
-            &[],
-            CIStatus::Success,
-            true,
-            branch.as_str(),
-            &|_, _| String::new(),
-            5,
-        );
-
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PendingAction::WasmEvent {
-                event_type: "ci_status",
-                payload,
-            } if payload["status"] == "success" && payload["merge_ready"] == false
-        )));
-    }
-
-    #[test]
-    fn test_merge_ready_review_payload_builds_dev_release_message() {
-        let payload = serde_json::json!({
-            "kind": "merge_ready",
-            "pr_number": 7,
-            "ci_status": "success",
-            "branch": "main.feature.dev",
-        });
-
-        let message = merge_ready_release_message(&payload).unwrap();
-
-        assert!(message.contains("[MERGE READY] PR #7"));
-        assert!(message.contains("main.feature.dev"));
-        assert!(message.contains("You may stop"));
-    }
-
-    #[test]
-    fn test_merge_ready_ci_payload_builds_dev_release_message() {
-        let payload = serde_json::json!({
-            "pr_number": 8,
-            "status": "neutral",
-            "branch": "main.feature.dev",
-            "merge_ready": true,
-        });
-
-        let message = merge_ready_release_message(&payload).unwrap();
-
-        assert!(message.contains("[MERGE READY] PR #8"));
-        assert!(message.contains("CI neutral"));
-    }
-
-    #[test]
-    fn test_non_merge_ready_payload_has_no_release_message() {
-        let payload = serde_json::json!({
-            "kind": "approved",
-            "pr_number": 9,
-        });
-
-        assert!(merge_ready_release_message(&payload).is_none());
-    }
-    #[test]
-    fn test_green_ci_after_existing_approval_fires_merge_ready() {
+    fn test_green_ci_after_existing_approval_emits_observation_only() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
@@ -4699,7 +4186,9 @@ mod tests {
             PendingAction::WasmEvent {
                 event_type: "ci_status",
                 payload,
-            } if payload["status"] == "success" && payload["merge_ready"] == true
+            } if payload["status"] == "success"
+                && payload["merge_blocked_on_ci"] == false
+                && payload["reviewer_approved"] == true
         )));
         assert!(!actions.iter().any(|action| matches!(
             action,
@@ -4915,7 +4404,7 @@ mod tests {
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WasmEvent { payload, .. }
-                if payload["kind"] == "approved" || payload["kind"] == "merge_ready"
+                if payload["kind"] == "approved"
         )));
         assert!(!actions.iter().any(|action| matches!(
             action,
@@ -4965,7 +4454,7 @@ mod tests {
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WasmEvent { payload, .. }
-                if payload["kind"] == "approved" || payload["kind"] == "merge_ready"
+                if payload["kind"] == "approved"
         )));
     }
 
@@ -5030,7 +4519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_approved_pr_without_merge_ready_delivery_can_timeout() {
+    fn test_approved_pr_can_timeout_after_delivery() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
@@ -5064,7 +4553,7 @@ mod tests {
     }
 
     #[test]
-    fn test_approved_pr_without_merge_ready_state_can_timeout() {
+    fn test_approved_pr_can_timeout_without_state_delivery() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");

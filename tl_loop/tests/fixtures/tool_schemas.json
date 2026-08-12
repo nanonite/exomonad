@@ -292,7 +292,7 @@
       "name": "resume_pr"
     },
     {
-      "description": "Query live Forgejo PR review and CI state. Returns merge_ready and a blocker string so TL/root agents can diagnose stuck watcher notification paths before deciding whether to call merge_pr.",
+      "description": "Query live Forgejo PR review and CI observations for an existing PR, including its current head SHA, review state, and CI status. Use the returned evidence for diagnostics; this tool does not authorize merging.",
       "inputSchema": {
         "properties": {
           "pr_number": {

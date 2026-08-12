@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from typing import TypeAlias
 
 from tl_loop.client.effects import EffectClient, ToolResult
@@ -17,7 +16,6 @@ from tl_loop.state.schema import (
     RunState,
     SliceState,
     SliceStatus,
-    Verdict,
 )
 from tl_loop.state.store import RunStore
 
@@ -262,23 +260,6 @@ def _reconcile_pr(slice_state: SliceState, payload: JsonMapping) -> tuple[SliceS
     head_sha = payload.get("head_sha")
     if head_sha is not None and not isinstance(head_sha, str):
         raise HeartbeatError("watcher_pr_state head_sha must be a string or null")
-    merge_ready = payload.get("merge_ready")
-    if not isinstance(merge_ready, bool):
-        raise HeartbeatError("watcher_pr_state merge_ready must be boolean")
-    if merge_ready:
-        if not head_sha:
-            raise HeartbeatError("merge_ready watcher state has no head_sha")
-        if slice_state.verdict is Verdict.GO and slice_state.reviewed_head == head_sha:
-            return slice_state, "pr.review"
-        return (
-            replace(
-                slice_state,
-                reviewed_head=head_sha,
-                verdict=Verdict.GO,
-                verdict_at=datetime.now(UTC).isoformat(),
-            ),
-            "pr.review",
-        )
     if head_sha and head_sha != slice_state.reviewed_head:
         return replace(
             slice_state, reviewed_head=head_sha, verdict=None, verdict_at=None
@@ -289,7 +270,7 @@ def _reconcile_pr(slice_state: SliceState, payload: JsonMapping) -> tuple[SliceS
 def _pr_payload(payload: JsonMapping) -> dict[str, object]:
     return {
         key: payload[key]
-        for key in ("head_sha", "merge_ready", "review_state", "ci_status")
+        for key in ("head_sha", "review_state", "ci_status")
         if key in payload
     }
 

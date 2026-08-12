@@ -68,13 +68,11 @@ No other approval layer is required.
 
 ### What each current layer becomes
 
-**1. Watcher `merge_ready` — demoted to derived state.** The controller can
-compute it from `pr.review` and `ci.status_changed` keyed by head SHA. A
-separate watcher decision adds a second opinion with no extra information.
-E4.2 (#742) removed the watcher's durable merge-readiness state. The event
-remains only as a temporary compatibility signal behind
-`EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT` until the remaining consumers are
-migrated.
+**1. Watcher merge readiness — removed from the watcher.** The controller or
+merge boundary can derive it from current-head `pr.review` and
+`ci.status_changed` observations. A separate watcher decision adds a second
+opinion with no extra information. E4.2 (#742) removed the watcher's durable
+merge-readiness state, and #760 removed its remaining compatibility producer.
 
 **2. TL `adjudicate_review` — the workflow approval decision.** The reviewer
 submits structured findings for the exact head it inspected. Those findings are
@@ -255,10 +253,11 @@ Only after Phase 2 is proven in a live run.
 1. Completed in E4.1 (#741): stop spawning reviewers from the watcher by
    removing its decision, claim, and automatic-spawn paths. The TL retains the
    `spawn_reviewer` effect and calls it from the head-change transition.
-2. Completed in E4.2 (#742): stop computing authoritative `merge_ready` by
-   removing `ci_mergeable_at` and `merge_ready_notified`. The compatibility
-   event remains behind `EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT` until its
-   remaining consumers are migrated.
+2. Completed in E4.2 (#742) and #760: stop computing authoritative
+   `merge_ready` by removing `ci_mergeable_at`, `merge_ready_notified`, and the
+   remaining compatibility event producer. The event type may remain in
+   compatibility readers, but the watcher no longer computes, emits, or
+   dispatches it.
 3. Completed in E4.3 (#743): stop composing repair handoffs by removing the
    watcher message/delivery path and durable handoff fingerprints. The TL now
    consumes canonical review, CI, timeout, and stuck facts directly.

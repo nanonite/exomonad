@@ -382,8 +382,6 @@ message WatcherPrStateResponse {
   string error = 2;
   uint64 pr_number = 3;
   bool found = 4;
-  bool merge_ready = 5;
-  string blocker = 6;
   string review_state = 7;
   string ci_status = 8;
   string head_sha = 9;

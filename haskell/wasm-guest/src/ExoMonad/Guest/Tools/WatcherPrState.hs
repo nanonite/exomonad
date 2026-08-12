@@ -39,7 +39,7 @@ instance FromJSON WatcherPrStateArgs where
       <$> v .: "pr_number"
 
 watcherPrStateDescription :: Text
-watcherPrStateDescription = "Query live Forgejo PR review and CI state. Returns merge_ready and a blocker string so TL/root agents can diagnose stuck watcher notification paths before deciding whether to call merge_pr."
+watcherPrStateDescription = "Query live Forgejo PR review and CI observations for an existing PR, including its current head SHA, review state, and CI status. Use the returned evidence for diagnostics; this tool does not authorize merging."
 
 watcherPrStateSchema :: Aeson.Object
 watcherPrStateSchema =
@@ -66,8 +66,6 @@ watcherPrStateCore args
                   [ "success" .= True,
                     "pr_number" .= PA.watcherPrStateResponsePrNumber resp,
                     "found" .= PA.watcherPrStateResponseFound resp,
-                    "merge_ready" .= PA.watcherPrStateResponseMergeReady resp,
-                    "blocker" .= lazyText (PA.watcherPrStateResponseBlocker resp),
                     "review_state" .= lazyText (PA.watcherPrStateResponseReviewState resp),
                     "ci_status" .= lazyText (PA.watcherPrStateResponseCiStatus resp),
                     "head_sha" .= lazyText (PA.watcherPrStateResponseHeadSha resp),

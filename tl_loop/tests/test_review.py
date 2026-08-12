@@ -303,7 +303,6 @@ class RecordingTransport:
                 "result": {
                     "found": True,
                     "head_sha": self.current_head,
-                    "merge_ready": True,
                 },
             }
         return {"success": True, "result": None}

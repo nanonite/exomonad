@@ -27,10 +27,11 @@ Do not do any of these. They belong to the controller or no longer exist:
   recursion are the controller's `WorkPlan` and FSM. A child sub-TL is a nested
   `tl_run`, not another agent session.
 - **No merge queue.** The controller decides what merges, after four
-  independent gates: watcher `merge_ready` (reviewer approval **and** CI
-  `success`/`neutral`), a closed adjudication verdict, the
-  `.exo/review-policy.toml` policy veto, and reviewed-head SHA binding. Do not
-  diagnose a stalled PR by hand and call `merge_pr` without those gates.
+  independent gates: current-head reviewer approval and CI
+  `success`/`neutral` observations, a closed adjudication verdict, the
+  `.exo/review-policy.toml` policy veto, and reviewed-head SHA binding. The
+  watcher reports observations; it does not authorize merging. Do not diagnose
+  a stalled PR by hand and call `merge_pr` without those gates.
 - **No run termination.** A bounded failure parks with an auditable cause and
   waits for a named human gate answered with
   `python3 -m tl_loop gate --run-id <id> --name <gate> --approve|--reject`.

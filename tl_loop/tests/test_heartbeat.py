@@ -13,7 +13,6 @@ from tl_loop.state.schema import (
     ParkCause,
     RunState,
     SliceStatus,
-    Verdict,
 )
 from tl_loop.state.store import RunStore, create
 
@@ -23,7 +22,6 @@ class HeartbeatTransport:
     """Effect transport with deterministic liveness and watcher responses."""
 
     pane_alive: bool = True
-    merge_ready: bool = False
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
@@ -59,9 +57,8 @@ class HeartbeatTransport:
                     "success": True,
                     "result": {
                         "head_sha": "head-new",
-                        "merge_ready": self.merge_ready,
-                        "review_state": "approved" if self.merge_ready else "pending",
-                        "ci_status": "pass" if self.merge_ready else "pending",
+                        "review_state": "approved",
+                        "ci_status": "success",
                     },
                 },
             )
@@ -121,7 +118,7 @@ def test_repeated_heartbeat_reconciliation_is_idempotent(tmp_path: Path) -> None
         pr_number=42,
         reviewed_head="head-old",
     )
-    transport = HeartbeatTransport(merge_ready=True)
+    transport = HeartbeatTransport()
     effects = EffectClient(transport)
     config = HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0)
 
@@ -129,9 +126,9 @@ def test_repeated_heartbeat_reconciliation_is_idempotent(tmp_path: Path) -> None
     second = heartbeat_once(first.state, store, effects, config, now=20.0)
 
     reconciled = first.state.slices["slice-a"]
-    assert reconciled.verdict is Verdict.GO
+    assert reconciled.verdict is None
     assert reconciled.reviewed_head == "head-new"
-    assert [event.kind for event in first.events] == ["pr.review"]
+    assert [event.kind for event in first.events] == ["pr.updated"]
     assert second.events == ()
     assert second.parked_slice_ids == ()
     assert second.state.budgets == first.state.budgets
