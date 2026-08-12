@@ -289,6 +289,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E4: Reduce the watcher to a pure sensor (#721)
 - E1: Reconcile review-gate documentation with TL-as-loop architecture (#718)
 - E5 :: E5.2 Repoint or delete fork_wave e2e tests (#747)
 - E5 :: E5.1 Remove fork_wave from code (#746)
