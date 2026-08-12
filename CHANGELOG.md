@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E1 :: E1.1 Revise the watcher-as-sensor ADR (#724)
 - feat: automatic memory capture hooks (Phase 3, deferred) (#627)
 - Add continuation brief end-to-end coverage (#634)
 - EPIC: Replace the interactive TL with a programmatic orchestration loop (#659)

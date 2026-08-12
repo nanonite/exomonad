@@ -1,7 +1,7 @@
 # ADR: The watcher is a sensor, not a review coordinator
 
 Date: 2026-08-12
-Status: Proposed
+Status: Accepted
 Supersedes parts of: [tl-as-loop.md](tl-as-loop.md), [tl-loop-event-bridge.md](tl-loop-event-bridge.md)
 
 ## Context
@@ -34,8 +34,8 @@ This ADR narrows the gate set and moves review workflow to the controller.
 ```
 watcher   = facts
 ledger    = memory
-TL        = workflow
-reviewer  = approval authority
+TL        = workflow and adjudication
+reviewer  = binding evidence and findings
 CI        = machine authority
 dev-leaf / worker = implementation authority
 ```
@@ -52,7 +52,7 @@ Moving HTTP into Python would trade one split brain for a worse one.
 
 ```
 merge_allowed =
-      reviewer_approved(current_head_sha)
+      tl_adjudicated_go(current_head_sha)
    && ci_success_or_neutral(current_head_sha)
    && current_head_sha == live_pr_head_sha
 ```
@@ -73,11 +73,13 @@ separate watcher decision adds a second opinion with no extra information.
 Keep the event only as a temporary compatibility signal behind a flag, then
 remove it.
 
-**2. RLM `adjudicate_review` — no longer an approval layer.** The reviewer is
-the approval authority. A second model judgment weakens the authority boundary
-and makes "who approved this?" unanswerable. `adjudicate_review` is retained
-only where structured repair planning needs it; approval comes from the
-reviewer verdict, repair instructions come from `compose_repair`.
+**2. TL `adjudicate_review` — the workflow approval decision.** The reviewer
+submits structured findings for the exact head it inspected. Those findings are
+binding evidence: the TL may not invent a verdict where no reviewer evidence
+exists, may not ignore an unresolved blocking finding, and may not adjudicate
+one head using findings from another. `adjudicate_review` turns that evidence
+into the workflow's GO/NO-GO decision. The reviewer supplies evidence and
+findings; the TL owns the adjudication and the resulting merge decision.
 
 This is the largest blast radius in this ADR — see Risks.
 
@@ -100,6 +102,25 @@ SHA A reviewed and approved
 ```
 
 This one is provably necessary.
+
+### Decision 2: TL-owned acceptance criteria
+
+The TL owns the acceptance criteria supplied to the reviewer. It composes them
+from the run plan, `SliceState.test_plan`, verification commands, boundaries,
+and DONE CRITERIA, then injects the criteria when spawning the reviewer. The
+dev-leaf may document criteria in the PR body, but it cannot define its own
+pass condition as the authoritative source. The reviewer's literal
+`## Acceptance Criteria` contract remains the format for presenting the
+criteria and findings.
+
+### Same-leaf repair rule
+
+When the TL adjudicates NO-GO or CI failure, repair guidance returns through
+`resume_pr` to the same dev-leaf. `resume_pr` preserves the issue, PR, branch,
+worktree, ownership chain, and expected head SHA. A new `spawn_leaf` would
+create an orphan sibling branch and violate the one-agent-one-branch
+invariant. If a distinct repair harness is ever needed, it must be expressed
+as `resume_pr(..., repair_harness="dev")`, never as a new leaf.
 
 ### A timeout is not an approval
 
@@ -130,8 +151,9 @@ Transitions the controller owns:
 | Trigger | Controller action |
 |---------|-------------------|
 | PR filed / head changed | Clear prior review + CI state; `spawn_reviewer(pr_number, force=false)`; wait |
-| Reviewer requests changes | Record NO-GO for `head_sha`; `compose_repair`; `resume_pr` on same PR/worktree/branch; new head; spawn reviewer again |
-| Reviewer approves | Record `review_ok(head_sha)`; wait for CI on the same head |
+| Binding reviewer findings arrive | `adjudicate_review(findings, head_sha)`; record the TL's GO/NO-GO decision |
+| TL adjudicates NO-GO | `compose_repair`; `resume_pr` on same PR/worktree/branch; new head; spawn reviewer again |
+| TL adjudicates GO | Record `review_ok(head_sha)`; wait for CI on the same head |
 | CI success/neutral | Record `ci_ok(head_sha)`; if `review_ok(head_sha)` then `merge_pr`, then verify post-merge state |
 | CI failure | Record `ci_failed(head_sha)`; compose repair; `resume_pr` on same PR/worktree/branch |
 | Review timeout / missing CI / stale reviewer | Park with a named gate. No merge |
@@ -150,12 +172,15 @@ name.
 |------|:---------:|:------:|:--------------:|:-----:|
 | dev-leaf | yes | no | no | no |
 | worker | yes | no | no | no |
-| reviewer | no | yes | **yes** | no |
-| TL controller | no source edits | no semantic review | no | **yes**, after gates |
+| reviewer | no | yes; findings are binding evidence | no | no |
+| TL controller | no source edits | adjudicates findings | **yes**, after binding evidence | **yes**, after gates |
 | CI | no | no | no | machine gate only |
 
 The controller adjudicates *workflow*. It must not become the reviewer, must
-not invent a reviewer verdict, and may require one.
+not invent reviewer findings or a verdict, and must require binding reviewer
+evidence before a GO decision. Messaging and steering between harness turns
+are out of scope for this ADR; that work is tracked separately under Milestone
+M10, Agent loop ownership (#723).
 
 ---
 
@@ -168,8 +193,8 @@ language that is currently wrong in three places.
 
 1. **`CLAUDE.md`** — replace "A fresh approved head with passing CI, or an
    allowed review timeout with passing CI, permits `merge_pr`" with "A fresh
-   reviewer-approved head with passing CI permits `merge_pr`. Review timeout
-   parks the slice."
+   TL-adjudicated GO based on binding reviewer findings, with passing CI,
+   permits `merge_pr`. Review timeout parks the slice."
 2. **`docs/guides/programming-the-tl.md`** — replace "Four independent checks
    must all hold" with two authorities plus one integrity invariant. Move the
    second-reviewer rules under an explicit "Optional policy" heading. Remove
@@ -214,10 +239,10 @@ anything is deleted.
    `compose_repair` already exists and already refuses anything but `resume_pr`.
 6. Narrow `verify_review` to the canonical rule. Make the extra-review policy
    an explicit optional predicate rather than an inline veto.
-7. Demote `adjudicate_review`: keep the call for repair planning, remove it
-   from the approval path. Decide explicitly whether `GO-WITH-NITS` survives —
-   it currently gates on nits being written to the Chainlink issue, which is
-   real behavior that needs a new home or a deliberate removal.
+7. Keep `adjudicate_review` as the TL's workflow decision over binding reviewer
+   findings. Decide explicitly whether `GO-WITH-NITS` survives — it currently
+   gates on nits being written to the Chainlink issue, which is real behavior
+   that needs a new home or a deliberate removal.
 8. Timeout parks with a named gate. No merge path from a timeout.
 
 **Verify:** `just rust-test` unaffected; new Python tests for each transition
@@ -273,11 +298,11 @@ cognition tree") and needs the same treatment `root.md` received in `957a921e`.
 
 ## Risks
 
-**Demoting `adjudicate_review` is the big one.** It has closed output schemas,
-context-budget handling, replay fixtures, policy gate integration, and a
-`GO-WITH-NITS` path that writes nits to Chainlink. Phase 2 step 7 must decide
-what survives rather than leaving it half-wired — a subsystem that is called but
-whose verdict is ignored is worse than either extreme.
+**Making reviewer evidence binding is the big one.** `adjudicate_review` has
+closed output schemas, context-budget handling, replay fixtures, policy gate
+integration, and a `GO-WITH-NITS` path that writes nits to Chainlink. Phase 2
+step 7 must decide what survives rather than leaving it half-wired — the TL
+must not adjudicate without reviewer evidence or ignore a blocking finding.
 
 **Phase 2 and Phase 3 must not overlap in a live run.** Both components driving
 reviewer spawn simultaneously means double-spawn. Gate Phase 2's reviewer spawn
