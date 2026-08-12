@@ -68,4 +68,7 @@ events.
 - E9.2 (#781) adds `ack_kind` and `confidence` to every acknowledgement.
 - E9.3 (#782) ensures transport success cannot emit `runtime_accepted`.
 - E9.4 (#783) keeps batches without acceptance evidence visible as
-  `pending`/`unknown` rather than silently consumed.
+  `pending`/`unknown` rather than silently consumed. The durable batch
+  projection reports `acceptance_confidence=unknown` until exact acceptance;
+  transport and rejected-ack observations carry the same explicit unknown
+  classification.

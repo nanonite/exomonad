@@ -147,6 +147,9 @@ pub struct GuidanceBatch {
     pub queue_class: QueueClass,
     pub queue_seq: i64,
     pub state: GuidanceState,
+    /// Exact only after the durable batch reaches `accepted`; all other
+    /// states remain explicitly unproven.
+    pub acceptance_confidence: AcceptanceConfidence,
     pub created_at: i64,
     pub available_at: i64,
     pub lease_owner: Option<String>,
@@ -453,6 +456,16 @@ impl InboxStore {
         Ok(Some(batch))
     }
 
+    /// Inspect a batch without claiming it or changing its durable state.
+    ///
+    /// The returned `acceptance_confidence` makes transport success and
+    /// runtime acceptance distinguishable to queue observers.
+    pub fn inspect_batch(&self, batch_id: &str) -> Result<Option<GuidanceBatch>> {
+        validate_id(batch_id, "batch id")?;
+        let conn = self.connection()?;
+        load_batch_optional(&conn, batch_id)
+    }
+
     /// Record one transport attempt without acknowledging runtime consumption.
     pub fn record_transport_attempt(
         &self,
@@ -502,6 +515,8 @@ impl InboxStore {
                 "attempt": next_attempt,
                 "method": attempt.method,
                 "outcome": attempt.outcome,
+                "acceptance": "unknown",
+                "confidence": "unknown",
                 "detail": attempt.detail,
             }),
         );
@@ -513,6 +528,9 @@ impl InboxStore {
                 "batch_id": batch_id,
                 "consumer": consumer_id,
                 "attempt": next_attempt,
+                "state": GuidanceState::Submitted,
+                "acceptance": "unknown",
+                "confidence": "unknown",
             }),
         );
         Ok(next_attempt)
@@ -573,6 +591,20 @@ impl InboxStore {
         if evidence.confidence != AcceptanceConfidence::Exact {
             tx.commit()
                 .context("failed to commit unproven acknowledgement")?;
+            append_queue_event(
+                self,
+                "inbox.state_changed",
+                serde_json::json!({
+                    "operation": "acknowledgement_unproven",
+                    "batch_id": batch.batch_id,
+                    "agent_id": batch.agent_id,
+                    "consumer": evidence.consumer_id,
+                    "state": batch.state,
+                    "acceptance": "unknown",
+                    "confidence": evidence.confidence,
+                    "evidence_kind": evidence.evidence_kind,
+                }),
+            );
             return Ok(GuidanceAckResult::Rejected {
                 reason: "non-exact runtime evidence cannot accept a guidance batch".to_string(),
             });
@@ -605,6 +637,7 @@ impl InboxStore {
                 "agent_id": agent_id,
                 "consumer": evidence.consumer_id,
                 "evidence_kind": evidence.evidence_kind,
+                "acceptance": "exact",
                 "confidence": evidence.confidence,
             }),
         );
@@ -1026,6 +1059,11 @@ fn load_batch(conn: &Connection, batch_id: &str) -> Result<GuidanceBatch> {
         queue_class: QueueClass::parse(&row.2)?,
         queue_seq: row.3,
         state: GuidanceState::parse(&row.4)?,
+        acceptance_confidence: if row.4 == GuidanceState::Accepted.as_str() {
+            AcceptanceConfidence::Exact
+        } else {
+            AcceptanceConfidence::Unknown
+        },
         created_at: row.5,
         available_at: row.6,
         lease_owner: row.7,
@@ -1528,6 +1566,11 @@ mod tests {
         let batch = store
             .enqueue_batch(request("agent", QueueClass::Steering, None))?
             .batch;
+        let pending = store
+            .inspect_batch(&batch.batch_id)?
+            .expect("pending batch");
+        assert_eq!(pending.state, GuidanceState::Pending);
+        assert_eq!(pending.acceptance_confidence, AcceptanceConfidence::Unknown);
         let consumer = GuidanceConsumer {
             consumer_id: "consumer-a".to_string(),
             invocation_id: Some("invocation-a".to_string()),
@@ -1548,16 +1591,52 @@ mod tests {
         assert!(events_after_transport
             .iter()
             .any(|record| record.event.event_type == "message.delivery"));
+        let delivery = events_after_transport
+            .iter()
+            .find(|record| record.event.event_type == "message.delivery")
+            .expect("transport should emit delivery evidence");
+        assert_eq!(delivery.event.data["acceptance"], "unknown");
+        assert_eq!(delivery.event.data["confidence"], "unknown");
         assert!(events_after_transport
             .iter()
             .all(|record| record.event.event_type != "message.consumed"));
+        let submitted = store
+            .inspect_batch(&batch.batch_id)?
+            .expect("submitted batch");
+        assert_eq!(submitted.state, GuidanceState::Submitted);
+        assert_eq!(
+            submitted.acceptance_confidence,
+            AcceptanceConfidence::Unknown
+        );
         let rejected = store.acknowledge_runtime(&RuntimeAcceptanceEvidence {
             confidence: AcceptanceConfidence::Unknown,
             ..ack(&claimed, "consumer-a")
         })?;
         assert!(matches!(rejected, GuidanceAckResult::Rejected { .. }));
+        let events_after_unknown_ack =
+            crate::services::LedgerWriter::open_project(directory.path())
+                .unwrap()
+                .read_events()
+                .unwrap();
+        let unproven = events_after_unknown_ack
+            .iter()
+            .find(|record| {
+                record.event.event_type == "inbox.state_changed"
+                    && record.event.data["operation"] == "acknowledgement_unproven"
+            })
+            .expect("unproven acknowledgement should remain observable");
+        assert_eq!(unproven.event.data["acceptance"], "unknown");
+        assert_eq!(unproven.event.data["state"], "submitted");
         let accepted = store.acknowledge_runtime(&ack(&claimed, "consumer-a"))?;
         assert_eq!(accepted, GuidanceAckResult::Accepted);
+        let accepted_batch = store
+            .inspect_batch(&batch.batch_id)?
+            .expect("accepted batch");
+        assert_eq!(accepted_batch.state, GuidanceState::Accepted);
+        assert_eq!(
+            accepted_batch.acceptance_confidence,
+            AcceptanceConfidence::Exact
+        );
         let duplicate = store.acknowledge_runtime(&ack(&claimed, "consumer-a"))?;
         assert_eq!(duplicate, GuidanceAckResult::AlreadyAccepted);
         let consumed = crate::services::LedgerWriter::open_project(directory.path())
