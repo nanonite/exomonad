@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E1 :: E1.5 Declare target event contract in tl-loop-event-bridge.md (#728)
 - E1 :: E1.4 Fix docs/architecture/agent-system.md and .html (#727)
 - E1 :: E1.3 Fix docs/guides/programming-the-tl.md (#726)
 - E1 :: E1.2 Fix CLAUDE.md timeout language (#725)
