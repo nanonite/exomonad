@@ -1,17 +1,13 @@
 use super::tmux_events::InjectionOptions;
 use anyhow::{anyhow, Result};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const DEFAULT_WARNING_THRESHOLD: usize = 8;
 const DEFAULT_HARD_CAP: usize = 32;
-const DEFAULT_DEDUP_WINDOW: Duration = Duration::from_secs(30);
 
 pub static GLOBAL_AGENT_INBOX: LazyLock<AgentInbox> = LazyLock::new(AgentInbox::default);
 
@@ -20,7 +16,7 @@ pub struct DedupKey {
     recipient: String,
     event_type: String,
     scope_key: Option<u64>,
-    payload_hash: Option<u64>,
+    idempotency_key: String,
 }
 
 impl DedupKey {
@@ -29,20 +25,21 @@ impl DedupKey {
             recipient: recipient.to_string(),
             event_type: event_type.to_string(),
             scope_key,
-            payload_hash: None,
+            idempotency_key: format!(
+                "structured:{recipient}:{event_type}:{}",
+                scope_key
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
         }
     }
 
-    fn freeform(from: &str, recipient: &str, body: &str) -> Self {
-        let mut hasher = DefaultHasher::new();
-        from.hash(&mut hasher);
-        recipient.hash(&mut hasher);
-        body.hash(&mut hasher);
+    fn freeform(recipient: &str) -> Self {
         Self {
             recipient: recipient.to_string(),
             event_type: "notify_parent_freeform".to_string(),
             scope_key: None,
-            payload_hash: Some(hasher.finish()),
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -87,9 +84,20 @@ impl InboxMessage {
         self.injection_options = injection_options;
         self
     }
+
+    pub fn with_idempotency_key(mut self, idempotency_key: impl Into<String>) -> Self {
+        self.dedup_key.idempotency_key = idempotency_key.into();
+        self
+    }
 }
 
-fn dedup_key_for_message(from: &str, recipient: &str, body: &str) -> DedupKey {
+/// Return the stable key for a structured message or a fresh UUID for a
+/// free-form message. Callers persist this key with the durable batch.
+pub fn idempotency_key_for_message(from: &str, recipient: &str, body: &str) -> String {
+    dedup_key_for_message(from, recipient, body).idempotency_key
+}
+
+fn dedup_key_for_message(_from: &str, recipient: &str, body: &str) -> DedupKey {
     for (tag, event_type) in [
         ("[MERGE READY]", "MergeReady"),
         ("[PR READY]", "ReviewApproved"),
@@ -111,7 +119,7 @@ fn dedup_key_for_message(from: &str, recipient: &str, body: &str) -> DedupKey {
         return DedupKey::structured(recipient, "Stuck", Some(scope_key));
     }
 
-    DedupKey::freeform(from, recipient, body)
+    DedupKey::freeform(recipient)
 }
 
 fn append_inbox_event(
@@ -159,14 +167,6 @@ struct AgentQueue {
     messages: VecDeque<InboxMessage>,
     consumer_active: bool,
     pending: HashSet<DedupKey>,
-    recent: HashMap<DedupKey, Instant>,
-}
-
-impl AgentQueue {
-    fn prune_recent(&mut self, now: Instant, dedup_window: Duration) {
-        self.recent
-            .retain(|_, delivered_at| now.duration_since(*delivered_at) < dedup_window);
-    }
 }
 
 #[derive(Debug)]
@@ -175,7 +175,6 @@ pub struct AgentInbox {
     next_id: AtomicU64,
     warning_threshold: usize,
     hard_cap: usize,
-    dedup_window: Duration,
 }
 
 impl Default for AgentInbox {
@@ -186,32 +185,19 @@ impl Default for AgentInbox {
 
 impl AgentInbox {
     pub fn new(warning_threshold: usize, hard_cap: usize) -> Self {
-        Self::new_with_dedup_window(warning_threshold, hard_cap, DEFAULT_DEDUP_WINDOW)
-    }
-
-    pub fn new_with_dedup_window(
-        warning_threshold: usize,
-        hard_cap: usize,
-        dedup_window: Duration,
-    ) -> Self {
         Self {
             queues: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             warning_threshold,
             hard_cap,
-            dedup_window,
         }
     }
 
     pub async fn enqueue(&self, agent: &str, mut message: InboxMessage) -> Result<EnqueueOutcome> {
         let mut queues = self.queues.lock().await;
         let queue = queues.entry(agent.to_string()).or_default();
-        let now = Instant::now();
-        queue.prune_recent(now, self.dedup_window);
 
-        if queue.pending.contains(&message.dedup_key)
-            || queue.recent.contains_key(&message.dedup_key)
-        {
+        if queue.pending.contains(&message.dedup_key) {
             append_inbox_event(
                 &message.project_dir,
                 &message.recipient,
@@ -220,6 +206,7 @@ impl AgentInbox {
                     "recipient": message.recipient,
                     "event_type": message.dedup_key.event_type,
                     "scope_key": message.dedup_key.scope_key,
+                    "idempotency_key": message.dedup_key.idempotency_key,
                     "outcome": "dropped"
                 }),
             );
@@ -227,13 +214,15 @@ impl AgentInbox {
                 recipient = %message.recipient,
                 event_type = %message.dedup_key.event_type,
                 scope_key = ?message.dedup_key.scope_key,
-                "dropping duplicate agent inbox message within dedup window"
+                idempotency_key = %message.dedup_key.idempotency_key,
+                "dropping duplicate pending agent inbox message"
             );
             tracing::info!(
                 otel.name = "agent_inbox.duplicates_dropped",
                 recipient = %message.recipient,
                 event_type = %message.dedup_key.event_type,
                 scope_key = ?message.dedup_key.scope_key,
+                idempotency_key = %message.dedup_key.idempotency_key,
                 "[metric] agent_inbox.duplicates_dropped"
             );
             return Ok(EnqueueOutcome {
@@ -283,7 +272,6 @@ impl AgentInbox {
             return;
         };
 
-        let mut delivered_key = None;
         if success
             && queue
                 .messages
@@ -292,16 +280,10 @@ impl AgentInbox {
         {
             if let Some(message) = queue.messages.pop_front() {
                 queue.pending.remove(&message.dedup_key);
-                delivered_key = Some(message.dedup_key);
             }
         }
 
-        if let Some(key) = delivered_key {
-            queue.recent.insert(key, Instant::now());
-        }
-
         queue.consumer_active = false;
-        queue.prune_recent(Instant::now(), self.dedup_window);
     }
 
     /// Drop the head message after delivery attempts are exhausted. Clears the
@@ -324,7 +306,6 @@ impl AgentInbox {
         }
 
         queue.consumer_active = false;
-        queue.prune_recent(Instant::now(), self.dedup_window);
     }
 
     pub async fn queue_depth(&self, agent: &str) -> usize {
@@ -535,7 +516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_structural_message_is_dropped_within_window() {
+    async fn duplicate_structured_identity_is_dropped_while_pending() {
         let inbox = AgentInbox::new(8, 32);
         let body =
             "[MERGE READY] PR #42 on branch main.a has CI status success and reviewer approval.";
@@ -550,19 +531,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_structural_message_is_allowed_outside_window() {
-        let inbox = AgentInbox::new_with_dedup_window(8, 32, Duration::from_millis(1));
+    async fn duplicate_structured_identity_is_allowed_after_delivery() {
+        let inbox = AgentInbox::new(8, 32);
         let body =
             "[MERGE READY] PR #42 on branch main.a has CI status success and reviewer approval.";
         inbox.enqueue("agent", message(body)).await.unwrap();
         let first = inbox.begin_delivery("agent").await.unwrap();
         inbox.complete_delivery("agent", first.id, true).await;
-        tokio::time::sleep(Duration::from_millis(2)).await;
 
         let outcome = inbox.enqueue("agent", message(body)).await.unwrap();
 
         assert!(!outcome.dropped_as_duplicate);
         assert_eq!(inbox.queue_depth("agent").await, 1);
+    }
+
+    #[tokio::test]
+    async fn identical_freeform_bodies_receive_distinct_identities() {
+        let inbox = AgentInbox::new(8, 32);
+        let first = inbox.enqueue("agent", message("same body")).await.unwrap();
+        let second = inbox.enqueue("agent", message("same body")).await.unwrap();
+
+        assert!(!first.dropped_as_duplicate);
+        assert!(!second.dropped_as_duplicate);
+        assert_eq!(inbox.queue_depth("agent").await, 2);
     }
 
     #[tokio::test]
@@ -582,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_delivery_does_not_mark_recent_dedup_window() {
+    async fn failed_delivery_keeps_identity_pending_for_retry() {
         let inbox = AgentInbox::new(8, 32);
         let body = "[MERGE READY] PR #42 on branch main.a";
         inbox.enqueue("agent", message(body)).await.unwrap();

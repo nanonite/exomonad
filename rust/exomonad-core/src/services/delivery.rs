@@ -2,7 +2,7 @@ use crate::domain::{Address, AgentName, BirthBranch, RoutingInfo, Slug};
 use crate::services::agent_control::{
     finish_invocation_and_tombstone, InvocationFinishResult, InvocationStatus,
 };
-use crate::services::agent_inbox::{InboxMessage, GLOBAL_AGENT_INBOX};
+use crate::services::agent_inbox::{idempotency_key_for_message, InboxMessage, GLOBAL_AGENT_INBOX};
 use crate::services::tmux_events;
 use crate::services::{GuidanceBatchRequest, GuidanceIdentity, GuidanceItemInput, QueueClass};
 use claude_teams_bridge as teams_mailbox;
@@ -729,6 +729,7 @@ async fn record_inbox_delivery(
     queue_class: QueueClass,
 ) -> bool {
     let to_agent = canonical_recipient_key(ctx.agent_resolver(), agent_key).await;
+    let idempotency_key = idempotency_key_for_message(from.as_str(), &to_agent, message);
     let request = GuidanceBatchRequest {
         agent_id: to_agent.clone(),
         queue_class,
@@ -739,7 +740,7 @@ async fn record_inbox_delivery(
             injection_options: serde_json::Value::Null,
         }],
         identity: GuidanceIdentity::default(),
-        idempotency_key: None,
+        idempotency_key: Some(idempotency_key),
         source_message_id: None,
     };
     match ctx.inbox_store().enqueue_batch_with_compatibility(
