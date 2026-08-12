@@ -293,6 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E14 :: E14.3 Route intents through the same validation as CLI arguments (#808)
 - E14 :: E14.2 Implement interpret_operator_intent under the RLM boundary (#807)
 - E14 :: E14.1 Define the closed intent schema (#806)
 - E13 :: E13.6 Staleness and authority test suite (#805)

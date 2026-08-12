@@ -59,6 +59,7 @@ from .intent import (
     IntentInputError,
     interpret_operator_intent,
 )
+from .intent_routing import IntentRoutingError, route_operator_intent
 from .repair import (
     REPAIR_HANDOFF_FIELDS,
     REPAIR_HANDOFF_SCHEMA,
@@ -110,6 +111,7 @@ __all__ = [
     "InputSection",
     "INTERPRET_OPERATOR_INTENT_PROMPT",
     "IntentInputError",
+    "IntentRoutingError",
     "IntentValidationError",
     "JudgmentFailed",
     "OutputSchemaError",
@@ -148,6 +150,7 @@ __all__ = [
     "load_review_policy",
     "parse_operator_intent",
     "interpret_operator_intent",
+    "route_operator_intent",
     "resolve_token_counter",
     "rlm",
     "sections_from_inputs",
