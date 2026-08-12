@@ -61,7 +61,7 @@ repairs use `resume_pr` and do not create a new owner, branch, or PR.
 
 - `[FIXES PUSHED]` — leaf addressed reviewer comments and pushed. Merge if CI passes.
 - `[PR READY]` — Reviewer approved on first review. Merge.
-- `[REVIEW TIMEOUT]` — no reviewer response after timeout. Merge if CI passes.
+- `[REVIEW TIMEOUT]` — no reviewer response after timeout. Park the slice; never merge from a timeout.
 - `[STUCK: id]` — review did not converge. Re-decompose or escalate.
 - `[FAILED: id]` — leaf exhausted retries. Re-decompose or escalate.
 

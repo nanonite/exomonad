@@ -57,7 +57,7 @@ This keeps the worktree branch namespace clean. A nested TL's reviewer would be 
 
 The reviewer merges autonomously when conditions are met:
 - `[PR READY]` (Copilot approved + CI green) → merge immediately
-- `[REVIEW TIMEOUT]` (no review after timeout, CI green) → merge with `force=true`
+- `[REVIEW TIMEOUT]` (no review after timeout) → park at a named gate; never merge from timeout
 - `[FIXES PUSHED]` (agent addressed Copilot comments, CI green) → merge
 
 Reviewer notifies TL after each merge: "Merged PR #42 for agent-a. Build clean." On failure or conflict, escalates to TL.

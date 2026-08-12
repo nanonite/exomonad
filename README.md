@@ -110,7 +110,7 @@ A run ends at `TLDone` or `TLFailed`. Bounded failures — retries exhausted, bu
 
 ## How It Works
 
-**Four layers, each doing one thing:**
+**System layers, each doing one thing:**
 
 | Layer | What | Why |
 |-------|------|-----|
@@ -132,12 +132,25 @@ load plan → validate state → select harness → dispatch
 
 Every transition is a durable write under `.exo/tl-loop/<run_id>/run.json`. Events come from the immutable ledger at `.exo/ledger/segments/` by global sequence number, and are acknowledged only after handling succeeds — so a restart resumes at `cursor + 1` rather than replaying or dropping work.
 
-**What gates a merge.** Four independent checks, all of which must hold:
+**What gates a merge.** The controller applies two authorities plus one integrity invariant:
 
-1. The Rust watcher fires `merge_ready` only when reviewer approval **and** CI status `success`/`neutral` are both true. No CI status means no merge, even with an approval.
-2. `adjudicate_review` returns a closed verdict — `GO`, `GO-WITH-NITS`, or `NO-GO`.
-3. Policy gates in `.exo/review-policy.toml` can veto a `GO` (minimum rounds, `external_review_paths`, line-count and complexity thresholds) by marking it `second_review_required`.
-4. The reviewed head SHA must still be the PR's current head, so a verdict for one commit can never merge another.
+```text
+merge_allowed =
+      tl_adjudicated_go(current_head_sha)
+   && ci_success_or_neutral(current_head_sha)
+   && current_head_sha == live_pr_head_sha
+```
+
+The reviewer supplies binding findings for the exact head; the TL's
+`adjudicate_review` call turns those findings and the TL-owned acceptance
+criteria into `GO`, `GO-WITH-NITS`, or `NO-GO`. CI is the machine authority and
+must be `success` or `neutral` for the same head. Head binding is an integrity
+invariant, not a separate approval authority.
+
+Projects may add optional policy checks for declared risk paths or large diffs
+through `.exo/review-policy.toml`. These checks are not universal approval
+layers. A review timeout parks the slice at a named gate and never permits a
+merge.
 
 A `NO-GO` composes a seven-section repair handoff and dispatches it through `resume_pr` — same owner, same worktree, same branch, same PR. Never a new branch, never a `-2` suffix.
 

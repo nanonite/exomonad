@@ -23,10 +23,10 @@ cleanup belongs to the host orphan reconciler:
 | Reconciles exited reviewer resources | `services/orphan_reconciler.rs` -> `dispose_exited_reviewer_resources` |
 | Tracks review rounds against `reviewer_max_rounds` | `distinct_changes_requested_rounds` (:185) |
 
-Meanwhile `tl_loop` independently adjudicates review, applies policy gates,
-binds the reviewed head, and calls `merge_pr`. The documented merge path is
-four layers deep — watcher `merge_ready`, RLM adjudicator verdict, policy veto,
-head binding — and only two of those are authorities anyone can point at.
+Meanwhile `tl_loop` independently adjudicates review, applies optional policy,
+binds the reviewed head, and calls `merge_pr`. The old documentation mixed a
+derived watcher signal with the TL decision, optional policy, and head binding,
+which made the authority model unclear.
 
 This ADR narrows the gate set and moves review workflow to the controller.
 
@@ -187,14 +187,13 @@ M10, Agent loop ownership (#723).
 
 ### Phase 1 — Documentation (no code)
 
-Cheapest, unblocks everything else, and removes the timeout-as-approval
+Cheapest, unblocks everything else, and removes the stale timeout exception
 language that is currently wrong in three places.
 
-1. **`CLAUDE.md`** — replace "A fresh approved head with passing CI, or an
-   allowed review timeout with passing CI, permits `merge_pr`" with "A fresh
+1. **`CLAUDE.md`** — replace the stale timeout exception with "A fresh
    TL-adjudicated GO based on binding reviewer findings, with passing CI,
    permits `merge_pr`. Review timeout parks the slice."
-2. **`docs/guides/programming-the-tl.md`** — replace "Four independent checks
+2. **`docs/guides/programming-the-tl.md`** — replace the old multi-condition merge section
    must all hold" with two authorities plus one integrity invariant. Move the
    second-reviewer rules under an explicit "Optional policy" heading. Remove
    the "forbid the timeout-merge escape" paragraph, which presumes the escape
@@ -322,6 +321,6 @@ effect boundary and give Python two jobs.
 genuinely different lifetimes and failure modes. The split is
 `watcher = sensor`, `TL = state machine + policy + coordinator`.
 
-**Leave the four-layer gate documented as-is.** Only three conditions are
+**Keep the narrowed merge rule.** Only three conditions are
 provably necessary. Documenting four implies an authority model the code does
 not have, and it is what produced the split brain in the first place.
