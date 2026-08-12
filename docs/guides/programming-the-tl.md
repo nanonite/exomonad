@@ -160,8 +160,10 @@ and merging another.
 Projects may require a second reviewer for declared risk paths or large diffs
 using `external_review_paths`, `external_review_threshold`, and the complexity
 threshold. Those are optional policy gates, not universal approval layers. A
-`GO-WITH-NITS` result is mergeable only after every nit has been written to the
-owning Chainlink issue; otherwise the TL parks or repairs the slice.
+`GO-WITH-NITS` remains mergeable, and the TL stores every nit in durable
+per-head review findings for follow-up. It does not require an external
+Chainlink issue writer, because the run checkpoint is the authoritative home
+for review evidence.
 
 ### The repair path when review says NO-GO
 

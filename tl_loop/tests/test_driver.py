@@ -355,6 +355,63 @@ def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -
     assert all(name != "spawn_leaf" for name, _ in transport.calls)
 
 
+def test_go_with_nits_persists_follow_up_in_per_head_state(tmp_path: Path) -> None:
+    backend = ReviewBackend(
+        [
+            RlmResponse(
+                {
+                    "verdict": "GO-WITH-NITS",
+                    "reviewed_head": "head-a",
+                    "reasons": [
+                        {
+                            "severity": "nit",
+                            "file": "src/leaf.py",
+                            "line": 7,
+                            "claim": "Clarify this name",
+                        }
+                    ],
+                    "blocking_count": 0,
+                }
+            )
+        ]
+    )
+    store = _review_store(tmp_path)
+    _route_review_event(
+        WorkPlan.from_mapping(
+            {
+                "leaves": [
+                    {
+                        "name": "leaf-a",
+                        "task": "implement the requested change",
+                        "boundary": ["src/leaf.py"],
+                        "verify": ["just tl-loop-test"],
+                    }
+                ]
+            }
+        ),
+        store,
+        store.load(),
+        TLPlanning(),
+        _review_event(finding_severity="nit"),
+        1,
+        TLLoopConfig(
+            active=True,
+            review_model_choice=_review_choice(backend),
+            review_policy_path=Path(".exo/review-policy.toml"),
+        ),
+        EffectClient(RecordingTransport()),
+        [],
+    )
+
+    restored = store.load().slices["leaf-a"]
+    assert restored.verdict is Verdict.GO_WITH_NITS
+    assert {
+        "severity": "nit",
+        "path": "src/leaf.py:7",
+        "rationale": "Clarify this name",
+    } in restored.review_findings["head-a"]
+
+
 def test_ci_failure_records_head_and_resumes_same_pr(tmp_path: Path) -> None:
     backend = ReviewBackend(
         [
@@ -437,7 +494,7 @@ def _review_store(tmp_path: Path, *, verdict: Verdict | None = None) -> RunStore
     return store
 
 
-def _review_event() -> EventEnvelope:
+def _review_event(*, finding_severity: str = "blocking") -> EventEnvelope:
     return project(
         {
             "type": "pr.review",
@@ -453,7 +510,7 @@ def _review_event() -> EventEnvelope:
                 "kind": "changes_requested",
                 "findings": [
                     {
-                        "severity": "blocking",
+                        "severity": finding_severity,
                         "path": "src/leaf.py",
                         "rationale": "The failure path is unhandled",
                     }

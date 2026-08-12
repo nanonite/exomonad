@@ -1087,9 +1087,8 @@ def _route_review_event(
         head_sha,
         model_choice=config.review_model_choice,
         policy_path=config.review_policy_path or Path(".exo/review-policy.toml"),
-        chainlink_issue_id=config.chainlink_issue_id,
-        issue_commenter=cast(EffectClient, effects),
     )
+    review_findings = _persist_adjudication_nits(review_findings, head_sha, result.reasons)
     updated = dict(state.slices)
     updated[slice_id] = replace(
         current,
@@ -1113,6 +1112,28 @@ def _route_review_event(
             effects_log,
         )
     return state
+
+
+def _persist_adjudication_nits(
+    review_findings: Mapping[str, tuple[Mapping[str, str], ...]],
+    head_sha: str,
+    reasons: Sequence[Mapping[str, object]],
+) -> Mapping[str, tuple[Mapping[str, str], ...]]:
+    """Store model-identified nits in the durable per-head review evidence."""
+    nits = tuple(
+        {
+            "severity": "nit",
+            "path": f"{reason['file']}:{reason['line']}",
+            "rationale": str(reason["claim"]),
+        }
+        for reason in reasons
+        if reason.get("severity") == "nit"
+    )
+    if not nits:
+        return review_findings
+    existing = list(review_findings.get(head_sha, ()))
+    existing.extend(nit for nit in nits if nit not in existing)
+    return {**review_findings, head_sha: tuple(existing)}
 
 
 def _review_diff(event: EventEnvelope) -> Mapping[str, object] | str:

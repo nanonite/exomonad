@@ -240,9 +240,9 @@ anything is deleted.
 6. Narrow `verify_review` to the canonical rule. Make the extra-review policy
    an explicit optional predicate rather than an inline veto.
 7. Keep `adjudicate_review` as the TL's workflow decision over binding reviewer
-   findings. Decide explicitly whether `GO-WITH-NITS` survives — it currently
-   gates on nits being written to the Chainlink issue, which is real behavior
-   that needs a new home or a deliberate removal.
+   findings. Keep `GO-WITH-NITS`: the TL stores its nit reasons in durable,
+   head-bound `review_findings` state, so no external Chainlink writer is
+   required for merge authorization.
 8. Timeout parks with a named gate. No merge path from a timeout.
 
 **Verify:** `just rust-test` unaffected; new Python tests for each transition
@@ -300,8 +300,8 @@ cognition tree") and needs the same treatment `root.md` received in `957a921e`.
 
 **Making reviewer evidence binding is the big one.** `adjudicate_review` has
 closed output schemas, context-budget handling, replay fixtures, policy gate
-integration, and a `GO-WITH-NITS` path that writes nits to Chainlink. Phase 2
-step 7 must decide what survives rather than leaving it half-wired — the TL
+integration, and a `GO-WITH-NITS` path that stores nits in per-head run state.
+Phase 2 step 7 must decide what survives rather than leaving it half-wired — the TL
 must not adjudicate without reviewer evidence or ignore a blocking finding.
 
 **Phase 2 and Phase 3 must not overlap in a live run.** Both components driving

@@ -65,7 +65,7 @@ GO-WITH-NITS, and NO-GO with structured reasons and an echoed head. Python
 loads the canonical review policy and applies minimum-round, external-path,
 line-count, and complexity gates; a GO behind a gate is marked
 second_review_required and is not mergeable. GO-WITH-NITS remains mergeable
-only after every nit is written to the supplied Chainlink issue writer.
+and its nit reasons are stored in durable per-head `review_findings` state.
 
 ## Checkpoint and resume layout
 

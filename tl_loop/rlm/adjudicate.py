@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import cast
 
-from tl_loop.client.effects import ToolResult
 from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.state.schema import Verdict
 
@@ -17,7 +16,6 @@ from .review_contract import (
     AdjudicationInputError,
     AdjudicationResult,
     AdjudicationValidationError,
-    NitRecordingError,
     ReviewedHeadMismatch,
     ReviewPolicy,
 )
@@ -66,8 +64,6 @@ def adjudicate_review(
     model_choice: object | None = None,
     policy: ReviewPolicy | Mapping[str, object] | None = None,
     policy_path: str = str(DEFAULT_REVIEW_POLICY),
-    chainlink_issue_id: int | None = None,
-    issue_commenter: object | Callable[[int, str], object] | None = None,
 ) -> AdjudicationResult:
     """Return a head-bound verdict after Python policy gates are evaluated."""
     if model_choice is None:
@@ -88,8 +84,6 @@ def adjudicate_review(
     gates = policy_gates(diff, selected_policy)
     if gates:
         result = _apply_policy_gates(result, gates, policy_source)
-    if result.verdict is Verdict.GO_WITH_NITS:
-        _record_nits(result, chainlink_issue_id, issue_commenter)
     return result
 
 
@@ -171,6 +165,10 @@ def _result(output: JsonObject, expected_head: str) -> AdjudicationResult:
         raise AdjudicationValidationError(
             f"{verdict.value} cannot contain blocking reasons"
         )
+    if verdict is Verdict.GO_WITH_NITS and not any(
+        reason["severity"] == "nit" for reason in reasons
+    ):
+        raise AdjudicationValidationError("GO-WITH-NITS requires at least one nit reason")
     return AdjudicationResult(
         verdict=verdict,
         reviewed_head=raw_head,
@@ -234,43 +232,6 @@ def _apply_policy_gates(
     )
 
 
-def _record_nits(
-    result: AdjudicationResult,
-    issue_id: int | None,
-    commenter: object | Callable[[int, str], object] | None,
-) -> None:
-    nits = [reason for reason in result.reasons if reason.get("severity") == "nit"]
-    if not nits:
-        raise NitRecordingError(
-            "GO-WITH-NITS must include at least one nit reason"
-        )
-    if issue_id is None or issue_id <= 0 or commenter is None:
-        raise NitRecordingError(
-            "GO-WITH-NITS requires a positive Chainlink issue and commenter"
-        )
-    message = _nit_message(result.reviewed_head, nits)
-    if callable(commenter) and not hasattr(commenter, "chainlink_issue_comment"):
-        outcome = commenter(issue_id, message)
-    else:
-        method = getattr(commenter, "chainlink_issue_comment", None)
-        if not callable(method):
-            raise NitRecordingError("issue commenter has no comment capability")
-        outcome = method(issue_id=issue_id, message=message)
-    if isinstance(outcome, ToolResult) and outcome.success is not True:
-        raise NitRecordingError(outcome.error or "Chainlink nit comment failed")
-    if outcome is False:
-        raise NitRecordingError("Chainlink nit comment failed")
-
-
-def _nit_message(head: str, nits: Sequence[JsonObject]) -> str:
-    lines = [f"GO-WITH-NITS follow-up for reviewed head {head}:"]
-    lines.extend(
-        f"- {reason['file']}:{reason['line']}: {reason['claim']}"
-        for reason in nits
-    )
-    return chr(10).join(lines)
-
-
 __all__ = [
     "ADJUDICATE_PROMPT",
     "ADJUDICATION_SCHEMA",
@@ -279,7 +240,6 @@ __all__ = [
     "AdjudicationInputError",
     "AdjudicationResult",
     "AdjudicationValidationError",
-    "NitRecordingError",
     "ReviewPolicy",
     "ReviewedHeadMismatch",
     "adjudicate_review",

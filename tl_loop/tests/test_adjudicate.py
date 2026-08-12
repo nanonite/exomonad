@@ -9,7 +9,6 @@ import pytest
 
 from tl_loop.rlm.adjudicate import (
     AdjudicationResult,
-    NitRecordingError,
     ReviewedHeadMismatch,
     ReviewPolicy,
     adjudicate_review,
@@ -29,14 +28,6 @@ class FakeBackend:
         if not self.responses:
             raise AssertionError("backend was called more times than expected")
         return self.responses.pop(0)
-
-
-@dataclass
-class FakeCommenter:
-    calls: list[tuple[int, str]] = field(default_factory=list)
-
-    def chainlink_issue_comment(self, *, issue_id: int, message: str) -> None:
-        self.calls.append((issue_id, message))
 
 
 def _choice(backend: FakeBackend, *, context_length: int = 10_000) -> RlmModelChoice:
@@ -103,8 +94,6 @@ def _adjudicate(
     *,
     diff: dict[str, object] | None = None,
     policy: ReviewPolicy | None = None,
-    commenter: object | None = None,
-    issue_id: int | None = None,
     context_length: int = 10_000,
 ) -> AdjudicationResult:
     return adjudicate_review(
@@ -114,8 +103,6 @@ def _adjudicate(
         "head-a",
         model_choice=_choice(backend, context_length=context_length),
         policy=policy or _policy(),
-        chainlink_issue_id=issue_id,
-        issue_commenter=commenter,
     )
 
 
@@ -131,8 +118,7 @@ def test_go_is_mergeable_when_policy_gates_pass() -> None:
     assert result.second_review_required is False
 
 
-def test_go_with_nits_is_mergeable_and_records_follow_up() -> None:
-    commenter = FakeCommenter()
+def test_go_with_nits_is_mergeable_without_external_writer() -> None:
     backend = FakeBackend(
         [
             _output(
@@ -149,16 +135,11 @@ def test_go_with_nits_is_mergeable_and_records_follow_up() -> None:
         ]
     )
 
-    result = _adjudicate(
-        backend,
-        commenter=commenter,
-        issue_id=42,
-    )
+    result = _adjudicate(backend)
 
     assert result.verdict is Verdict.GO_WITH_NITS
     assert result.mergeable is True
-    assert commenter.calls[0][0] == 42
-    assert "src/app.py:7: Clarify this name" in commenter.calls[0][1]
+    assert result.reasons[0]["claim"] == "Clarify this name"
 
 
 def test_no_go_is_not_mergeable_and_preserves_blocking_reason() -> None:
@@ -227,7 +208,7 @@ def test_policy_gates_require_a_second_review(
     )
 
 
-def test_go_with_nits_without_issue_writer_is_rejected() -> None:
+def test_go_with_nits_without_issue_writer_is_still_mergeable() -> None:
     backend = FakeBackend(
         [
             _output(
@@ -244,8 +225,10 @@ def test_go_with_nits_without_issue_writer_is_rejected() -> None:
         ]
     )
 
-    with pytest.raises(NitRecordingError):
-        _adjudicate(backend)
+    result = _adjudicate(backend)
+
+    assert result.verdict is Verdict.GO_WITH_NITS
+    assert result.mergeable is True
 
 
 def test_required_diff_overflow_is_raised_before_adjudication() -> None:

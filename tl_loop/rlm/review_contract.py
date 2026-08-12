@@ -51,10 +51,6 @@ class AdjudicationValidationError(AdjudicationError):
     """The structured judgment is internally inconsistent."""
 
 
-class NitRecordingError(AdjudicationError):
-    """GO-WITH-NITS findings could not be recorded for follow-up."""
-
-
 @dataclass(frozen=True)
 class AdjudicationResult:
     """A model verdict plus Python-owned merge and second-review decisions."""
@@ -141,7 +137,6 @@ __all__ = [
     "AdjudicationInputError",
     "AdjudicationResult",
     "AdjudicationValidationError",
-    "NitRecordingError",
     "ReviewPolicy",
     "ReviewedHeadMismatch",
 ]
