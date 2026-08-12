@@ -293,6 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E13 :: E13.3 Implement read endpoints (#802)
 - E13 :: E13.2 Add the /control route group over the existing UDS (#801)
 - E13 :: E13.1 Define the read-model projection (#800)
 - E12 :: E12.4 Remove the in-memory authority and assert no workflow authority leaks (#796)

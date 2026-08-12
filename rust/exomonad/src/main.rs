@@ -8,6 +8,7 @@
 
 mod app_state;
 mod control;
+mod control_read_model;
 mod dashboard;
 #[cfg(debug_assertions)]
 mod experiment_analysis;

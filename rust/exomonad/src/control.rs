@@ -14,7 +14,6 @@ pub const CONTROL_CREDENTIAL_HEADER: HeaderName =
     HeaderName::from_static("x-exomonad-control-credential");
 pub const AGENT_CREDENTIAL_HEADER: HeaderName =
     HeaderName::from_static("x-exomonad-agent-credential");
-
 #[derive(Clone, Default)]
 pub struct RouteAuth {
     control_credential: Option<Arc<str>>,

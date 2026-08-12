@@ -1,5 +1,6 @@
 use crate::app_state::AppState;
 use crate::control;
+use crate::control_read_model;
 use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV};
 use std::time::Duration;
 
@@ -105,6 +106,11 @@ pub struct HookQueryParams {
     pub session_id: Option<String>,
     /// CHAINLINK_DB value from the agent-side hook process.
     pub chainlink_db: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ControlTransitionQuery {
+    limit: Option<usize>,
 }
 
 /// Server-side hook handler state, shared across requests.
@@ -944,6 +950,71 @@ async fn control_root() -> Json<serde_json::Value> {
     }))
 }
 
+async fn control_run(
+    Path(run_id): Path<String>,
+    Query(query): Query<ControlTransitionQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    control_read_response(control_read_model::read_run_model(
+        &state.project_dir,
+        &run_id,
+        query.limit,
+    ))
+}
+
+async fn control_slice(
+    Path((run_id, slice_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Response {
+    control_read_response(control_read_model::read_slice_model(
+        &state.project_dir,
+        &run_id,
+        &slice_id,
+    ))
+}
+
+async fn control_transitions(
+    Path(run_id): Path<String>,
+    Query(query): Query<ControlTransitionQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    control_read_response(control_read_model::read_transitions_model(
+        &state.project_dir,
+        &run_id,
+        query.limit,
+    ))
+}
+
+fn control_read_response(
+    result: Result<serde_json::Value, control_read_model::ReadModelError>,
+) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            let status = match &error {
+                control_read_model::ReadModelError::InvalidState(message)
+                    if message.contains("limit") =>
+                {
+                    axum::http::StatusCode::BAD_REQUEST
+                }
+                control_read_model::ReadModelError::InvalidIdentifier(_) => {
+                    axum::http::StatusCode::BAD_REQUEST
+                }
+                control_read_model::ReadModelError::MissingRun => axum::http::StatusCode::NOT_FOUND,
+                control_read_model::ReadModelError::InvalidState(_)
+                | control_read_model::ReadModelError::Io(_) => {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[instrument(skip_all, fields(hook = ?params.event, hook.type = %params.event, agent_id = tracing::field::Empty, agent.parent = tracing::field::Empty))]
 pub async fn handle_hook_request(
     Query(params): Query<HookQueryParams>,
@@ -1611,6 +1682,7 @@ Run `exomonad recompile` first to build it.",
     });
 
     let app_state = AppState {
+        project_dir: project_dir.clone(),
         plugins: plugins.clone(),
         registry: rt_registry.clone(),
         wasm_path: wasm_path.clone(),
@@ -1661,6 +1733,9 @@ Run `exomonad recompile` first to build it.",
 
     let control_routes = Router::new()
         .route("/", get(control_root))
+        .route("/runs/{run_id}", get(control_run))
+        .route("/runs/{run_id}/slices/{slice_id}", get(control_slice))
+        .route("/runs/{run_id}/transitions", get(control_transitions))
         .layer(middleware::from_fn_with_state(
             route_auth.clone(),
             control::require_control,

@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub project_dir: PathBuf,
     pub plugins: Arc<RwLock<HashMap<AgentName, Arc<PluginManager>>>>,
     pub registry: Arc<EffectRegistry>,
     pub wasm_path: PathBuf,
