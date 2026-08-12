@@ -56,10 +56,18 @@ def test_interpretation_uses_injected_backend_and_no_tools() -> None:
     sections = request.inputs["sections"]
     assert isinstance(sections, list)
     assert [section["name"] for section in sections] == [
-        "utterance",
+        "operator_utterance",
         "instructions",
         "read_model",
     ]
+    utterance = sections[0]["content"]
+    read_model = sections[2]["content"]
+    assert utterance["provenance"] == "operator_input"
+    assert utterance["authority"] == "instruction"
+    assert read_model["provenance"] == "tl_loop.read_model"
+    assert read_model["authority"] == "observation_only"
+    assert read_model["content"]["body"] == "untrusted"
+    assert "only instruction-bearing input" in sections[1]["content"]
     assert choice.store.events[0]["name"] == "interpret_operator_intent"
 
 
