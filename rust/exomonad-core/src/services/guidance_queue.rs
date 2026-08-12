@@ -1235,6 +1235,196 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_claims_allow_independent_agents_to_progress() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+        use tempfile::TempDir;
+
+        let directory = TempDir::new()?;
+        let first_store = Arc::new(InboxStore::open(directory.path())?);
+        let second_store = Arc::new(InboxStore::open(directory.path())?);
+        let first_batch = first_store
+            .enqueue_batch(request("agent-a", QueueClass::Steering, Some("a")))?
+            .batch;
+        let second_batch = first_store
+            .enqueue_batch(request("agent-b", QueueClass::Steering, Some("b")))?
+            .batch;
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let second_barrier = Arc::clone(&barrier);
+        let first = Arc::clone(&first_store);
+        let second = Arc::clone(&second_store);
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.claim_next(
+                &BoundaryEvidence::turn_finished("agent-a"),
+                &GuidanceConsumer {
+                    consumer_id: "consumer-a".to_string(),
+                    invocation_id: Some("invocation-a".to_string()),
+                    generation: Some(1),
+                },
+                60,
+            )
+        });
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.claim_next(
+                &BoundaryEvidence::turn_finished("agent-b"),
+                &GuidanceConsumer {
+                    consumer_id: "consumer-b".to_string(),
+                    invocation_id: Some("invocation-a".to_string()),
+                    generation: Some(1),
+                },
+                60,
+            )
+        });
+        let first_claim = first_thread
+            .join()
+            .expect("first claim thread")?
+            .expect("claim");
+        let second_claim = second_thread
+            .join()
+            .expect("second claim thread")?
+            .expect("claim");
+        assert_eq!(first_claim.batch_id, first_batch.batch_id);
+        assert_eq!(second_claim.batch_id, second_batch.batch_id);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_enqueue_is_atomic_and_queue_limits_are_enforced() -> Result<()> {
+        let store = InboxStore::open_in_memory()?;
+        let mut invalid = request("agent", QueueClass::Steering, None);
+        invalid.items[0].from_agent = " ".to_string();
+        assert!(store.enqueue_batch(invalid).is_err());
+
+        let mut too_many = request("agent", QueueClass::Steering, None);
+        too_many.items = (0..=MAX_BATCH_ITEMS)
+            .map(|position| GuidanceItemInput {
+                from_agent: "root".to_string(),
+                content: format!("item-{position}"),
+                summary: None,
+                injection_options: Value::Null,
+            })
+            .collect();
+        assert!(store.enqueue_batch(too_many).is_err());
+
+        let batch_count: i64 =
+            store
+                .connection()?
+                .query_row("SELECT COUNT(*) FROM guidance_batches", [], |row| {
+                    row.get(0)
+                })?;
+        let item_count: i64 =
+            store
+                .connection()?
+                .query_row("SELECT COUNT(*) FROM guidance_items", [], |row| row.get(0))?;
+        assert_eq!(batch_count, 0);
+        assert_eq!(item_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn leased_batch_recovers_after_store_restart() -> Result<()> {
+        use tempfile::TempDir;
+
+        let directory = TempDir::new()?;
+        let batch_id = {
+            let store = InboxStore::open(directory.path())?;
+            let batch = store
+                .enqueue_batch(request("agent", QueueClass::Steering, None))?
+                .batch;
+            store
+                .claim_next(
+                    &BoundaryEvidence::turn_finished("agent"),
+                    &GuidanceConsumer {
+                        consumer_id: "consumer-a".to_string(),
+                        invocation_id: Some("invocation-a".to_string()),
+                        generation: Some(1),
+                    },
+                    1,
+                )?
+                .expect("leased batch");
+            batch.batch_id
+        };
+
+        let store = InboxStore::open(directory.path())?;
+        let recovery_now = now_epoch_secs() + MAX_RETRY_BACKOFF_SECONDS + 2;
+        assert_eq!(
+            store.recover_expired_leases(recovery_now)?,
+            vec![batch_id.clone()]
+        );
+        store.connection()?.execute(
+            "UPDATE guidance_batches SET available_at = ?1 WHERE batch_id = ?2",
+            params![now_epoch_secs(), batch_id],
+        )?;
+        let reclaimed = store
+            .claim_next(
+                &BoundaryEvidence::turn_finished("agent"),
+                &GuidanceConsumer {
+                    consumer_id: "consumer-b".to_string(),
+                    invocation_id: Some("invocation-a".to_string()),
+                    generation: Some(1),
+                },
+                60,
+            )?
+            .expect("reclaimed batch");
+        assert_eq!(reclaimed.batch_id, batch_id);
+        assert_eq!(reclaimed.state, GuidanceState::Leased);
+        Ok(())
+    }
+
+    #[test]
+    fn retry_preserves_sequence_and_abandonment_is_terminal() -> Result<()> {
+        let store = InboxStore::open_in_memory()?;
+        let first = store
+            .enqueue_batch(request("agent", QueueClass::Steering, Some("first")))?
+            .batch;
+        let second = store
+            .enqueue_batch(request("agent", QueueClass::Steering, Some("second")))?
+            .batch;
+        assert_eq!(first.queue_seq, 0);
+        assert_eq!(second.queue_seq, 1);
+
+        let consumer = GuidanceConsumer {
+            consumer_id: "consumer-a".to_string(),
+            invocation_id: Some("invocation-a".to_string()),
+            generation: Some(1),
+        };
+        let claimed = store
+            .claim_next(&BoundaryEvidence::turn_finished("agent"), &consumer, 60)?
+            .expect("claim");
+        store.release_for_retry(
+            &claimed.batch_id,
+            &consumer.consumer_id,
+            "transient transport failure",
+            now_epoch_secs(),
+        )?;
+        let retried = store
+            .claim_next(&BoundaryEvidence::turn_finished("agent"), &consumer, 60)?
+            .expect("retry claim");
+        assert_eq!(retried.batch_id, first.batch_id);
+        assert_eq!(retried.queue_seq, first.queue_seq);
+
+        store.connection()?.execute(
+            "UPDATE guidance_batches SET attempt_count = ?1 WHERE batch_id = ?2",
+            params![MAX_RETRY_ATTEMPTS, first.batch_id],
+        )?;
+        assert_eq!(
+            store.release_for_retry(
+                &first.batch_id,
+                &consumer.consumer_id,
+                "retry budget exhausted",
+                now_epoch_secs(),
+            )?,
+            GuidanceState::Abandoned
+        );
+        assert!(store
+            .claim_next(&BoundaryEvidence::turn_finished("agent"), &consumer, 60)?
+            .is_some());
+        Ok(())
+    }
+
+    #[test]
     fn transport_success_does_not_accept_and_exact_ack_is_atomic() -> Result<()> {
         let store = InboxStore::open_in_memory()?;
         let batch = store
