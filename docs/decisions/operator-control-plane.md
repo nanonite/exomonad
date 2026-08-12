@@ -91,6 +91,63 @@ Adopt lanius's grammar as the naming scheme for guidance and observation:
 {verb}/{category}/{noun}/{locators}
 ```
 
+#### Topic grammar and encoding
+
+The grammar is intentionally small and closed. In ABNF-like notation, a
+serialized topic is:
+
+```text
+topic    = verb "/" category "/" noun *( "/" locator )
+verb     = "in" / "obs" / "signal"
+category = segment
+noun     = segment
+locator  = segment
+segment  = 1*(UTF-8 character)
+```
+
+`category` and `noun` are required; a topic may have zero or more locators.
+Each segment is non-empty and opaque to the generic parser. `/` is the level
+separator and therefore is not valid inside a segment. Empty levels, a leading
+or trailing `/`, `.` and `..` segments, NUL, and malformed UTF-8 are invalid.
+The meaning and required number of locators belong to the contract for the
+specific category, not to the generic grammar.
+
+Before joining segments with `/`, the serializer must percent-encode these
+three characters in every path-derived segment:
+
+| Raw character | Serialized form | Reason |
+|---|---|---|
+| `+` | `%2B` | Prevents a future MQTT single-level wildcard |
+| `#` | `%23` | Prevents a future MQTT multi-level wildcard and URI fragment ambiguity |
+| `%` | `%25` | Makes the encoding unambiguous and round-trippable |
+
+The hexadecimal digits are uppercase. Encoding is a single pass over the raw
+segment, so a literal `%2B` becomes `%252B`; it must not be decoded as a plus.
+All other characters, including Unicode characters, are preserved by this
+contract. A raw `/` is rejected rather than encoded because it would conceal a
+level boundary. A serialized topic must never contain an unescaped `+`, `#`,
+or `%` in a segment.
+
+Decoding happens after splitting on `/` and reverses only `%2B`, `%23`, and
+`%25`. Other percent triplets and incomplete triplets are rejected. The
+serializer and parser must satisfy `decode(encode(segment)) == segment` for
+every valid segment.
+
+The verb set is closed: `in`, `obs`, and `signal` are the only valid verbs.
+There is deliberately no `out/` verb. The recipient's `in/` topic is the
+durable copy; introducing `out/` would imply a second delivery vocabulary and
+authority.
+
+For example, these are canonical serialized topics:
+
+```text
+in/agent/codex%2Breview%231%25/steering
+signal/park/root/ci%23failed
+```
+
+They decode respectively to an agent identifier of `codex+review#1%` and a
+park cause of `ci#failed`.
+
 | Verb | Contract | Rides on |
 |---|---|---|
 | `in/` | Addressed, at-least-once, durable; the recipient's mailbox is the single durable copy | M11 guidance queue (`enqueue_batch`) |

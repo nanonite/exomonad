@@ -293,6 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E15 :: E15.1 Specify the grammar and its encoding rules (#811)
 - E14 :: E14.5 Replay fixtures and hermetic tests (#810)
 - E14 :: E14.4 Establish the prompt-injection boundary (#809)
 - E14 :: E14.3 Route intents through the same validation as CLI arguments (#808)
