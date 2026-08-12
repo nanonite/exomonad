@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E4 :: E4.4 Decide where reviewer disposal lives (#744)
 - E4 :: E4.3 Remove repair-handoff composition (#743)
 - E4 :: E4.2 Remove authoritative merge readiness (#742)
 - E4 :: E4.1 Remove reviewer-spawn decision logic (#741)

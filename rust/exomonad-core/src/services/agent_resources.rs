@@ -1,51 +1,18 @@
 use crate::domain::RoutingInfo;
+use crate::services::agent_control::read_invocation;
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::tmux_ipc::TmuxIpc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-pub async fn dispose_reviewers_for_pr(
-    project_dir: &Path,
-    git_wt: Arc<GitWorktreeService>,
-    pr_number: u64,
-) -> Vec<String> {
-    let slugs = reviewer_slugs_for_pr(project_dir, pr_number).await;
-    for slug in &slugs {
-        info!(pr_number, reviewer = %slug, "Disposing ephemeral reviewer agent");
-        dispose_agent_resources(project_dir, git_wt.clone(), slug).await;
+fn reviewer_pr_number(slug: &str) -> Option<u64> {
+    let rest = slug.strip_prefix("review-pr-")?;
+    let (digits, suffix) = rest.split_once('-')?;
+    if digits.is_empty() || suffix.is_empty() {
+        return None;
     }
-    slugs
-}
-
-async fn reviewer_slugs_for_pr(project_dir: &Path, pr_number: u64) -> Vec<String> {
-    let worktrees_dir = project_dir.join(".exo/worktrees");
-    let Ok(mut entries) = tokio::fs::read_dir(&worktrees_dir).await else {
-        return Vec::new();
-    };
-
-    let mut slugs = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(file_type) = entry.file_type().await else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if is_reviewer_slug_for_pr(&name, pr_number) {
-            slugs.push(name);
-        }
-    }
-    slugs.sort();
-    slugs
-}
-
-fn is_reviewer_slug_for_pr(slug: &str, pr_number: u64) -> bool {
-    let prefix = format!("review-pr-{}-", pr_number);
-    slug.starts_with(&prefix)
+    digits.parse().ok()
 }
 
 pub async fn dispose_agent_resources(
@@ -180,14 +147,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_reviewer_slug_for_pr_matches_exact_pr_prefix() {
-        assert!(is_reviewer_slug_for_pr("review-pr-12-codex", 12));
-        assert!(is_reviewer_slug_for_pr("review-pr-12-opencode", 12));
-        assert!(!is_reviewer_slug_for_pr("review-pr-123-codex", 12));
-        assert!(!is_reviewer_slug_for_pr("issue-12-codex", 12));
-    }
-
-    #[test]
     fn test_parent_tab_matches_agent_slug() {
         assert!(parent_tab_matches_slug(
             Some("agent trivial-contributing-codex"),
@@ -217,4 +176,106 @@ mod tests {
             ]
         );
     }
+}
+
+/// Dispose reviewer resources whose latest invocation is terminal.
+///
+/// Cleanup is intentionally resource-driven: an exited invocation proves that
+/// its tmux process no longer owns the reviewer worktree. Forgejo verdicts are
+/// observations and do not trigger this reconciler.
+pub async fn dispose_exited_reviewer_resources(
+    project_dir: &Path,
+    git_wt: Arc<GitWorktreeService>,
+) -> Vec<String> {
+    let agents_dir = project_dir.join(".exo/agents");
+    let Ok(mut entries) = tokio::fs::read_dir(&agents_dir).await else {
+        return Vec::new();
+    };
+
+    let mut slugs = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(slug) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if reviewer_pr_number(&slug).is_none() {
+            continue;
+        }
+        let invocation = match read_invocation(&entry.path()).await {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                warn!(agent = %slug, %error, "Skipping reviewer cleanup with malformed invocation metadata");
+                continue;
+            }
+        };
+        let Some(invocation) = invocation else {
+            continue;
+        };
+        if invocation.is_live() {
+            continue;
+        }
+        slugs.push(slug);
+    }
+
+    slugs.sort();
+    for slug in &slugs {
+        info!(reviewer = %slug, "Disposing exited reviewer agent");
+        dispose_agent_resources(project_dir, git_wt.clone(), slug).await;
+    }
+    slugs
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn dispose_exited_reviewer_resources_preserves_live_reviewers() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let exited_slug = "review-pr-1-codex";
+    let live_slug = "review-pr-2-codex";
+    let exited_dir = temp_dir.path().join(".exo/agents").join(exited_slug);
+    let live_dir = temp_dir.path().join(".exo/agents").join(live_slug);
+    tokio::fs::create_dir_all(&exited_dir).await.unwrap();
+    tokio::fs::create_dir_all(&live_dir).await.unwrap();
+
+    let invocation = |status: &str, ended_at: Option<u64>| {
+        serde_json::json!({
+            "invocation_id": status,
+            "runtime": "codex",
+            "trigger": "review",
+            "routing": {"window_id": null, "pane_id": null, "parent_tab": null},
+            "started_at": 1,
+            "ended_at": ended_at,
+            "status": status,
+            "exit_code": 0,
+            "pr_number": 1,
+            "head_sha": "abc123",
+            "generation": 1
+        })
+    };
+    tokio::fs::write(
+        exited_dir.join("invocation.json"),
+        serde_json::to_vec(&invocation("exited", Some(2))).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        live_dir.join("invocation.json"),
+        serde_json::to_vec(&invocation("running", None)).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let cleaned = dispose_exited_reviewer_resources(
+        temp_dir.path(),
+        Arc::new(GitWorktreeService::new(temp_dir.path().to_path_buf())),
+    )
+    .await;
+
+    assert_eq!(cleaned, vec![exited_slug]);
+    assert!(!exited_dir.exists());
+    assert!(live_dir.exists());
 }

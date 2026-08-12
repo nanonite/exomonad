@@ -11,7 +11,8 @@ move review orchestration. The result is a split brain: two components both
 decide when a PR is ready.
 
 `rust/exomonad-core/src/services/worktree_event_watcher.rs` is a large service
-whose remaining responsibilities are observation and resource cleanup:
+whose remaining responsibilities are observation; exited reviewer resource
+cleanup belongs to the host orphan reconciler:
 
 | Behavior | Location |
 |----------|----------|
@@ -19,7 +20,7 @@ whose remaining responsibilities are observation and resource cleanup:
 | Spawns the reviewer | `tl_loop` `spawn_reviewer` effect |
 | Computes authoritative merge readiness | Removed in E4.2 (#742); merge eligibility is derived by the TL from head-bound evidence and CI |
 | Composes and delivers repair handoffs | Removed in E4.3 (#743); the TL consumes canonical review, CI, timeout, and stuck facts |
-| Disposes reviewers | `dispose_reviewers_for_pr` (:2029) |
+| Reconciles exited reviewer resources | `services/orphan_reconciler.rs` -> `dispose_exited_reviewer_resources` |
 | Tracks review rounds against `reviewer_max_rounds` | `distinct_changes_requested_rounds` (:185) |
 
 Meanwhile `tl_loop` independently adjudicates review, applies policy gates,
@@ -263,9 +264,11 @@ Only after Phase 2 is proven in a live run.
    consumes canonical review, CI, timeout, and stuck facts directly.
 4. Keep: PR state, head SHA, review state, CI state observation; canonical
    ledger emission; `watcher_pr_state` as a read effect.
-5. Decide where reviewer disposal lives. `dispose_reviewers_for_pr` (:2029) is
-   resource cleanup, not workflow — it can stay, but it currently fires on
-   watcher-observed terminal review state, which is a semantic judgment.
+5. Completed in E4.4 (#744): reviewer cleanup lives in the host orphan
+   reconciler. `dispose_exited_reviewer_resources` is driven by terminal
+   invocation metadata, so the watcher only observes Forgejo verdicts and
+   never decides when reviewer resources are disposed. Live or unverifiable
+   invocations are preserved conservatively.
 
 **Verify:** `just test`; watcher line count should drop substantially; every
 removed behavior must have a Python test that now covers it.

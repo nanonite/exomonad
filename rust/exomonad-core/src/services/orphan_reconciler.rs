@@ -3,7 +3,9 @@ use crate::services::agent_control::{
     finish_invocation_and_tombstone, read_invocation, InvocationFinishResult, InvocationRecord,
     InvocationStatus,
 };
-use crate::services::agent_resources::dispose_agent_resources;
+use crate::services::agent_resources::{
+    dispose_agent_resources, dispose_exited_reviewer_resources,
+};
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::EventLog;
 use anyhow::{anyhow, Context, Result};
@@ -66,6 +68,10 @@ async fn reconcile_once_with_event_log(
     tmux_session: Option<&str>,
     event_log: Option<&EventLog>,
 ) -> Result<()> {
+    let disposed_reviewers = dispose_exited_reviewer_resources(project_dir, git_wt.clone()).await;
+    if !disposed_reviewers.is_empty() {
+        info!(reviewers = ?disposed_reviewers, "Reconciled exited reviewer resources");
+    }
     reconcile_issue_worktrees(project_dir, git_wt.clone(), event_log).await?;
     let _ = git_wt;
     reconcile_session_timeouts(

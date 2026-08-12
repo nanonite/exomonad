@@ -1,7 +1,6 @@
 use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
-use crate::services::agent_resources::dispose_reviewers_for_pr;
 use crate::services::event_log::{
     canonical_review_wakeup_data, canonical_sibling_merged_data, PR_REVIEW_EVENT_TYPE,
 };
@@ -137,17 +136,6 @@ fn dropped_review_by_sha_log_line(pr_number: u64, review_commit: &str, head_sha:
     )
 }
 
-fn reviewer_disposal_log_line(pr_number: u64, reviewer_slugs: &[String]) -> String {
-    if reviewer_slugs.is_empty() {
-        format!("terminal review observed for PR #{pr_number} but no reviewer slug matched for disposal")
-    } else {
-        format!(
-            "terminal review observed for PR #{pr_number}; disposing reviewer slugs: {}",
-            reviewer_slugs.join(",")
-        )
-    }
-}
-
 fn review_event_target(pr: &PrEntry) -> (BranchName, AgentType, String) {
     (
         BranchName::try_from_str(pr.head_branch.as_str())
@@ -157,7 +145,7 @@ fn review_event_target(pr: &PrEntry) -> (BranchName, AgentType, String) {
     )
 }
 
-fn review_state_disposes_reviewer(review_state: &ForgejoReviewState) -> bool {
+fn review_state_is_terminal(review_state: &ForgejoReviewState) -> bool {
     matches!(
         review_state,
         ForgejoReviewState::Approved
@@ -262,7 +250,6 @@ struct WatchState {
     rounds: u32,
     stuck: bool,
     reviewer_spawned: bool,
-    reviewer_disposed: bool,
     reviewer_attempt: Option<ReviewerAttempt>,
     review_approved_at: Option<Instant>,
     ci_triggered_sha: Option<String>,
@@ -395,7 +382,6 @@ impl WatchState {
             rounds: 0,
             stuck: false,
             reviewer_spawned: false,
-            reviewer_disposed: false,
             reviewer_attempt: None,
             review_approved_at: None,
             ci_triggered_sha: None,
@@ -410,7 +396,6 @@ impl WatchState {
         self.rounds = 0;
         self.stuck = false;
         self.reviewer_spawned = false;
-        self.reviewer_disposed = false;
         self.reviewer_attempt = None;
         self.review_approved_at = None;
         self.ci_triggered_sha = None;
@@ -1512,7 +1497,6 @@ where
         self.reconcile_reviewer_attempts().await?;
         let mut removed_prs = Vec::new();
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
-        let mut reviewer_disposals: Vec<u64> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
         let watcher_state = self.read_watcher_state().await.unwrap_or_default();
 
@@ -1581,11 +1565,8 @@ where
                 };
                 let stale_reviews = !obs.reviews.is_empty() && current_reviews.is_empty();
                 let stale_terminal_review_after_head_change = head_sha_changed
-                    && review_state_disposes_reviewer(&obs.review_state)
+                    && review_state_is_terminal(&obs.review_state)
                     && !current_review_present;
-                let terminal_review_observed = review_state_disposes_reviewer(&obs.review_state)
-                    && !stale_terminal_review_after_head_change
-                    && current_review_present;
                 let local_reviews = if stale_terminal_review_after_head_change {
                     Vec::new()
                 } else {
@@ -1601,7 +1582,6 @@ where
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
                     if head_sha_changed {
                         old_state.reviewer_spawned = false;
-                        old_state.reviewer_disposed = false;
                         old_state.reviewer_attempt = None;
                         old_state.stuck = false;
                     }
@@ -1647,17 +1627,6 @@ where
                                 ReviewerAttemptPhase::Claimed | ReviewerAttemptPhase::Running
                             )
                         });
-                    new_state.reviewer_disposed =
-                        new_state.reviewer_attempt.as_ref().is_some_and(|attempt| {
-                            matches!(
-                                attempt.phase,
-                                ReviewerAttemptPhase::Approved
-                                    | ReviewerAttemptPhase::ChangesRequested
-                                    | ReviewerAttemptPhase::Commented
-                                    | ReviewerAttemptPhase::Disposed
-                                    | ReviewerAttemptPhase::Stuck
-                            )
-                        });
                     new_state.ci_triggered_sha = persisted.ci_triggered_sha.clone();
                     new_state.ci_blocked_notified = persisted.ci_blocked_notified;
                     state_guard.insert(*pr_number, new_state);
@@ -1681,35 +1650,6 @@ where
                     );
                     actions
                 };
-
-                if terminal_review_observed && !head_sha_changed {
-                    if let Some(ws) = state_guard.get_mut(pr_number) {
-                        if !ws.reviewer_disposed {
-                            tracing::info!(
-                                pr_number = *pr_number,
-                                head_sha_changed,
-                                "disposing reviewer after terminal review observed"
-                            );
-                            reviewer_disposals.push(*pr_number);
-                            ws.reviewer_disposed = true;
-                            if let Some(attempt) = ws.reviewer_attempt.as_mut() {
-                                attempt.phase = match obs.review_state {
-                                    ForgejoReviewState::Approved => ReviewerAttemptPhase::Approved,
-                                    ForgejoReviewState::ChangesRequested => {
-                                        ReviewerAttemptPhase::ChangesRequested
-                                    }
-                                    ForgejoReviewState::Commented => {
-                                        ReviewerAttemptPhase::Commented
-                                    }
-                                    ForgejoReviewState::PendingReview => {
-                                        ReviewerAttemptPhase::Disposed
-                                    }
-                                };
-                                attempt.finished_at = Some(Utc::now());
-                            }
-                        }
-                    }
-                }
 
                 if !actions.is_empty() {
                     pending_actions.push(PendingPrActions {
@@ -1738,21 +1678,6 @@ where
         }
 
         self.persist_runtime_pr_state(&head_sha_updates).await?;
-        for pr_number in reviewer_disposals {
-            let reviewer_slugs = dispose_reviewers_for_pr(
-                self.ctx.project_dir(),
-                self.ctx.git_worktree_service().clone(),
-                pr_number,
-            )
-            .await;
-            let log_line = reviewer_disposal_log_line(pr_number, &reviewer_slugs);
-            if reviewer_slugs.is_empty() {
-                warn!(pr_number, "{log_line}");
-            } else {
-                info!(pr_number, reviewer_slugs = ?reviewer_slugs, "terminal review triggered reviewer disposal");
-            }
-            self.append_watcher_log(&log_line).await;
-        }
 
         for pending in pending_actions {
             for action in pending.actions.iter().cloned() {
@@ -5430,7 +5355,7 @@ mod tests {
     }
 
     #[test]
-    fn test_comment_only_observation_aggregates_to_commented_emits_actions_and_disposes() {
+    fn test_comment_only_observation_aggregates_to_commented_emits_actions() {
         let mut observation = test_observation("abc");
         observation.comments = vec![test_comment("Consider this inline suggestion")];
 
@@ -5465,7 +5390,7 @@ mod tests {
                         .as_str()
                         .is_some_and(|message| message.contains("Consider this inline suggestion"))
         )));
-        assert!(review_state_disposes_reviewer(&review_state));
+        assert!(review_state_is_terminal(&review_state));
     }
 
     // ---------------------------------------------------------------------------
@@ -5674,7 +5599,6 @@ mod tests {
         let state = watcher.state.prs.lock().await;
         let state = state.get(&1).unwrap();
         assert_eq!(state.last_review_state, ForgejoReviewVerdict::None);
-        assert!(!state.reviewer_disposed);
         assert!(state.reviewer_attempt.is_none());
     }
 
@@ -5944,7 +5868,6 @@ mod tests {
         watch_state.rounds = 3;
         watch_state.stuck = true;
         watch_state.reviewer_spawned = true;
-        watch_state.reviewer_disposed = true;
         watch_state.review_approved_at = Some(Instant::now());
         watch_state.ci_triggered_sha = Some("abc123".to_string());
         watch_state.ci_blocked_notified = true;
@@ -5961,7 +5884,6 @@ mod tests {
         assert_eq!(reset.rounds, 0);
         assert!(!reset.stuck);
         assert!(!reset.reviewer_spawned);
-        assert!(!reset.reviewer_disposed);
         assert!(reset.review_approved_at.is_none());
         assert!(reset.ci_triggered_sha.is_none());
         assert!(!reset.ci_blocked_notified);
@@ -6158,23 +6080,15 @@ mod tests {
     }
 
     #[test]
-    fn watcher_log_line_formatters_include_review_disposal_and_sha_drop_context() {
+    fn watcher_log_line_formatters_include_sha_drop_context() {
         assert_eq!(
             dropped_review_by_sha_log_line(7, "old-sha", "new-sha"),
             "dropped-review-by-SHA: PR #7 review commit old-sha does not match head new-sha"
         );
-        assert_eq!(
-            reviewer_disposal_log_line(7, &["review-pr-7-codex".to_string()]),
-            "terminal review observed for PR #7; disposing reviewer slugs: review-pr-7-codex"
-        );
-        assert_eq!(
-            reviewer_disposal_log_line(7, &[]),
-            "terminal review observed for PR #7 but no reviewer slug matched for disposal"
-        );
     }
 
     #[tokio::test]
-    async fn test_process_observations_disposes_reviewer_when_restart_sees_approved_pr() {
+    async fn test_process_observations_keeps_reviewer_resources_for_terminal_review() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
@@ -6221,22 +6135,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !reviewer_agent_dir.exists(),
-            "already-approved PRs observed after restart should dispose reviewer agent resources"
+            reviewer_agent_dir.exists(),
+            "terminal review observations must not dispose reviewer agent resources"
         );
-        let state = watcher.state.prs.lock().await;
-        assert!(state.get(&1).is_some_and(|state| state.reviewer_disposed));
-        drop(state);
-        let watcher_log = tokio::fs::read_to_string(temp_dir.path().join(".exo/logs/watcher.log"))
-            .await
-            .unwrap();
-        assert!(watcher_log.contains(
-            "terminal review observed for PR #1; disposing reviewer slugs: review-pr-1-codex"
-        ));
     }
 
     #[tokio::test]
-    async fn test_process_observations_disposes_commented_reviewer_once_across_polls_and_restart() {
+    async fn test_process_observations_keeps_commented_reviewer_across_polls_and_restart() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
@@ -6270,11 +6175,16 @@ mod tests {
             .process_observations(&registry, &observations)
             .await
             .unwrap();
-        {
-            let state = watcher.state.prs.lock().await;
-            let state = state.get(&1).unwrap();
-            assert!(state.reviewer_disposed);
-        }
+        assert!(temp_dir
+            .path()
+            .join(".exo/worktrees")
+            .join(reviewer_slug)
+            .exists());
+        assert!(temp_dir
+            .path()
+            .join(".exo/agents")
+            .join(reviewer_slug)
+            .exists());
 
         watcher
             .process_observations(&registry, &observations)
@@ -6290,24 +6200,20 @@ mod tests {
             .await
             .unwrap();
 
-        let state = restarted_watcher.state.prs.lock().await;
-        assert!(state.get(&1).is_some_and(|state| state.reviewer_disposed));
-        drop(state);
-
-        let watcher_log = tokio::fs::read_to_string(temp_dir.path().join(".exo/logs/watcher.log"))
-            .await
-            .unwrap();
-        assert_eq!(
-            watcher_log
-                .matches("terminal review observed for PR #1; disposing reviewer slugs:")
-                .count(),
-            1,
-            "a COMMENT observation must dispose its reviewer only once per head SHA"
-        );
+        assert!(temp_dir
+            .path()
+            .join(".exo/worktrees")
+            .join(reviewer_slug)
+            .exists());
+        assert!(temp_dir
+            .path()
+            .join(".exo/agents")
+            .join(reviewer_slug)
+            .exists());
     }
 
     #[tokio::test]
-    async fn test_process_observations_warns_when_terminal_review_has_no_reviewer_slug() {
+    async fn test_process_observations_does_not_emit_disposal_log_for_terminal_review() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
@@ -6348,10 +6254,8 @@ mod tests {
 
         let watcher_log = tokio::fs::read_to_string(temp_dir.path().join(".exo/logs/watcher.log"))
             .await
-            .unwrap();
-        assert!(watcher_log.contains(
-            "terminal review observed for PR #1 but no reviewer slug matched for disposal"
-        ));
+            .unwrap_or_default();
+        assert!(!watcher_log.contains("terminal review observed for PR #1"));
     }
 
     #[tokio::test]
