@@ -55,6 +55,7 @@ from tl_loop.select.policy import HarnessPolicy, load_policy
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
     BudgetLedger,
+    GateStatus,
     GoalState,
     ParkCause,
     RunState,
@@ -67,6 +68,8 @@ from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
 LOGGER = logging.getLogger(__name__)
+TIMEOUT_GATE_NAME = "tl-timeout"
+
 
 
 class TLLoopError(RuntimeError):
@@ -421,7 +424,12 @@ def _run_loop(
     while len(consumed) < config.max_events:
         if isinstance(phase, (TLDone, TLFailed)):
             break
-        event = _next_event(source, config, deadline)
+        try:
+            event = _next_event(source, config, deadline)
+        except LoopTimeout as error:
+            return _park_timeout(
+                store, state, effects_log, transitions, consumed, str(error)
+            )
         if event is None:
             if config.heartbeat is not None:
                 heartbeat = heartbeat_once(
@@ -442,7 +450,6 @@ def _run_loop(
                             state.events.last_consumed_offset,
                         )
                         phase = _phase_from_state(state)
-            deadline = time.monotonic() + config.idle_timeout
             continue
         event_seq = event.run_seq
         if event_seq is None:
@@ -542,6 +549,27 @@ def _run_loop(
     return TLRunResult(
         state, tuple(effects_log), tuple(transitions), tuple(consumed), tuple(heartbeat_events)
     )
+
+
+def _park_timeout(
+    store: RunStore,
+    state: RunState,
+    effects_log: list[EffectIntent],
+    transitions: list[LoopTransition],
+    consumed: list[int],
+    reason: str,
+) -> TLRunResult:
+    """Persist a named timeout gate before returning a terminal failed run."""
+    state = store.set_gate(TIMEOUT_GATE_NAME, GateStatus.PENDING)
+    message = f"timeout parked at gate {TIMEOUT_GATE_NAME!r}: {reason}"
+    state = store.checkpoint(
+        TLFailed(message),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    LOGGER.warning("[TL loop] %s", message)
+    return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
 
 
 def _dispatch_children(
@@ -1787,6 +1815,7 @@ def _optional_argument(arguments: dict[str, object], key: str, value: object) ->
 
 
 __all__ = [
+    "TIMEOUT_GATE_NAME",
     "DepthLimitExceeded",
     "EffectFailed",
     "EffectIntent",

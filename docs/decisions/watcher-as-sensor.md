@@ -124,15 +124,11 @@ as `resume_pr(..., repair_harness="dev")`, never as a new leaf.
 
 ### A timeout is not an approval
 
-Current documentation says a review timeout with passing CI may permit merge.
-That is wrong and must be removed. A timeout means no one approved. It parks
-the slice with a named gate.
+A review timeout with passing CI is not mergeable. A timeout means no one
+approved. The controller parks the run at the durable `tl-timeout` gate.
 
-Note: `tl_loop/loop/review.py::verify_review` already requires a verdict and a
-matching head — there is **no implemented Python bypass**. This is a
-documentation defect (CLAUDE.md, `docs/guides/programming-the-tl.md`) plus
-whatever the watcher's timeout path does, not a live merge vulnerability.
-Phase 1 fixes the wording; Phase 3 confirms the watcher path.
+The controller's idle timeout now records `tl-timeout` as pending and returns
+`TLFailed`; no subsequent event or gate approval can enter the merge path.
 
 ### Per-head review state
 
@@ -156,7 +152,7 @@ Transitions the controller owns:
 | TL adjudicates GO | Record `review_ok(head_sha)`; wait for CI on the same head |
 | CI success/neutral | Record `ci_ok(head_sha)`; if `review_ok(head_sha)` then `merge_pr`, then verify post-merge state |
 | CI failure | Record `ci_failed(head_sha)`; compose repair; `resume_pr` on same PR/worktree/branch |
-| Review timeout / missing CI / stale reviewer | Park with a named gate. No merge |
+| Review timeout / missing CI / stale reviewer | Park at `tl-timeout`. No merge |
 
 ### Repair uses `resume_pr`, never a new leaf
 

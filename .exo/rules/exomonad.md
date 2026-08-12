@@ -78,9 +78,10 @@ owner.
 
 ### 4. Merge, park, or gate
 
-An approved current head with passing CI is mergeable. A bounded timeout may
-merge only when policy permits and CI passes. Retry, parallelism, recursion,
-budget, and review-round ceilings are explicit. Exhaustion parks the run with
+An approved current head with passing CI is mergeable. A timeout is never an
+approval: the controller parks at the durable `tl-timeout` gate. Retry,
+parallelism, recursion, budget, and review-round ceilings are explicit.
+Exhaustion parks the run with
 an auditable cause; the operator can approve or reject a named gate with the
 `tl_loop gate` command and resume from the checkpoint.
 

@@ -33,7 +33,14 @@ from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.select.policy import validate_policy
-from tl_loop.state.schema import BudgetLedger, SliceState, SliceStatus, Verdict
+from tl_loop.state.schema import (
+    BudgetLedger,
+    GateState,
+    GateStatus,
+    SliceState,
+    SliceStatus,
+    Verdict,
+)
 from tl_loop.state.store import RunStore, create, load as load_state
 
 
@@ -137,6 +144,31 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert result.final_state.slices["worker-a"].status.value == "merged"
     assert result.final_state.slices["leaf-a"].status.value == "merged"
     assert source.acknowledged == [1, 2, 3, 4, 5]
+
+
+def test_idle_timeout_parks_with_named_gate_and_never_merges(tmp_path: Path) -> None:
+    transport = RecordingTransport()
+    result = run_tl_loop(
+        "timeout-run",
+        _plan(),
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=TLLoopConfig(
+            max_workers=1,
+            max_leaves=1,
+            max_events=5,
+            poll_interval=0.001,
+            idle_timeout=0.01,
+        ),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLFailed
+    assert result.final_state.gates == (
+        GateState(name="tl-timeout", status=GateStatus.PENDING),
+    )
+    assert [name for name, _ in transport.calls] == ["spawn_worker", "spawn_leaf"]
+    assert "merge_pr" not in [name for name, _ in transport.calls]
 
 
 def test_pr_head_change_clears_per_head_gate_state() -> None:

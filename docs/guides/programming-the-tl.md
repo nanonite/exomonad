@@ -188,9 +188,9 @@ external_review_paths = [
 external_review_threshold = 200
 ```
 
-Review timeout is never approval. It parks the slice with a named gate;
-`reviewer_max_wait_seconds` controls when the timeout is detected, and
-`reviewer_max_rounds` controls when repeated review attempts park the PR for a
+Review timeout is never approval. The controller parks the run at the durable
+`tl-timeout` gate. `reviewer_max_wait_seconds` controls when the timeout is detected,
+and `reviewer_max_rounds` controls when repeated review attempts park the PR for a
 human.
 
 ---

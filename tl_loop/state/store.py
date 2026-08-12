@@ -123,6 +123,30 @@ class RunStore:
         apply(self.run_dir, mutate)
         return self.load()
 
+    def set_gate(
+        self,
+        name: str,
+        status: GateStatus = GateStatus.PENDING,
+    ) -> RunState:
+        """Create or update one named human gate through the atomic writer."""
+        if not isinstance(name, str) or not name:
+            raise ValueError("gate name must be a non-empty string")
+        if not isinstance(status, GateStatus):
+            raise TypeError("gate status must be a GateStatus")
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            gates = document.get("gates")
+            if not isinstance(gates, list):
+                raise CorruptCheckpoint("run state gates are not an array")
+            for gate in gates:
+                if isinstance(gate, dict) and gate.get("name") == name:
+                    gate["status"] = status.value
+                    return document
+            gates.append({"name": name, "status": status.value})
+            return document
+        apply(self.run_dir, mutate)
+        return self.load()
+
 
 def create(run_id: str, root_spec: RootSpec, *, root_dir: str | Path = DEFAULT_ROOT) -> RunState:
     """Create a run at ``.exo/tl-loop/<run_id>/run.json``.
