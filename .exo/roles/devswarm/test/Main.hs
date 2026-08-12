@@ -22,6 +22,7 @@ import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word8)
+import Data.Vector qualified as V
 import DevPhase (DevEvent (..), DevPhase (..))
 import DevRole qualified
 import Effects.Envelope qualified as Envelope
@@ -738,12 +739,18 @@ assertReviewerVerdictSchemas =
               Just (Aeson.Object properties) -> do
                 assertBool (T.unpack toolName <> " has head_sha") (hasKey "head_sha" properties)
                 assertBool (T.unpack toolName <> " has findings") (hasKey "findings" properties)
+                forM_ ["pr_number", "head_sha", "body", "findings"] $ \field ->
+                  assertBool (T.unpack toolName <> " requires " <> T.unpack field) (hasRequired field schema)
                 case KM.lookup (AesonKey.fromText "findings") properties of
-                  Just (Aeson.Object findings) ->
+                  Just (Aeson.Object findings) -> do
+                    assertSchemaType (T.unpack toolName <> " findings type") "array" "type" findings
                     case KM.lookup (AesonKey.fromText "items") findings of
                       Just (Aeson.Object item) ->
                         case KM.lookup (AesonKey.fromText "properties") item of
-                          Just (Aeson.Object itemProperties) ->
+                          Just (Aeson.Object itemProperties) -> do
+                            assertSchemaType (T.unpack toolName <> " finding item type") "object" "type" item
+                            forM_ ["severity", "path", "rationale"] $ \field ->
+                              assertBool (T.unpack toolName <> " requires finding " <> T.unpack field) (hasRequired field item)
                             forM_ ["severity", "path", "rationale"] $ \field ->
                               assertBool (T.unpack toolName <> " finding has " <> T.unpack field) (hasKey field itemProperties)
                           other -> fail $ T.unpack toolName <> " finding items must define object properties, got " <> show other
@@ -753,19 +760,44 @@ assertReviewerVerdictSchemas =
           other -> fail $ "expected one reviewer schema for " <> T.unpack toolName <> ", got " <> show (length other)
   where
     hasKey key object = KM.member (AesonKey.fromText key) object
+    hasRequired key object =
+      case KM.lookup (AesonKey.fromText "required") object of
+        Just (Aeson.Array values) -> V.any (== Aeson.String key) values
+        _ -> False
+    assertSchemaType label_ expected key object =
+      case KM.lookup (AesonKey.fromText key) object of
+        Just (Aeson.String actual) -> assertEqual label_ expected actual
+        other -> fail $ label_ <> " should be a JSON schema string, got " <> show other
 
 assertReviewerEventPayload :: IO ()
-assertReviewerEventPayload =
-  case ReviewerRole.reviewEventPayload 7 "main.review-pr-7-codex" "approved" "GO" "abc123" "Looks good." [ReviewerRole.ReviewFinding "info" "src/Main.hs" "The change is covered by tests."] of
-    Aeson.Object payload -> do
-      assertJsonString "review payload kind" "approved" "kind" payload
-      assertJsonString "review payload verdict" "GO" "verdict" payload
-      assertJsonString "review payload head" "abc123" "head_sha" payload
-      assertJsonString "review payload branch" "main.review-pr-7-codex" "branch" payload
-      assertBool "review payload includes findings" (hasKey "findings" payload)
-    other -> fail $ "review payload should be an object, got " <> show other
+assertReviewerEventPayload = do
+  assertPayload "approved" "GO" "info" "The change is covered by tests."
+  assertPayload "changes_requested" "NO-GO" "blocking" "A blocking issue remains."
   where
-    hasKey key object = KM.member (AesonKey.fromText key) object
+    assertPayload kind verdict severity rationale =
+      case ReviewerRole.reviewEventPayload 7 "main.review-pr-7-codex" kind verdict "abc123" "Review outcome." [ReviewerRole.ReviewFinding severity "src/Main.hs" rationale] of
+        Aeson.Object payload -> do
+          assertJsonString "review payload kind" kind "kind" payload
+          assertJsonString "review payload verdict" verdict "verdict" payload
+          assertJsonString "review payload state" kind "review_state" payload
+          assertJsonString "review payload head" "abc123" "head_sha" payload
+          assertJsonString "review payload branch" "main.review-pr-7-codex" "branch" payload
+          assertJsonString "review payload body" "Review outcome." "body" payload
+          assertJsonString "review payload notification" "Review outcome." "notification" payload
+          case KM.lookup (AesonKey.fromText "findings") payload of
+            Just (Aeson.Array findings) ->
+              case V.toList findings of
+                [Aeson.Object finding] -> do
+                  assertJsonString "finding severity" severity "severity" finding
+                  assertJsonString "finding path" "src/Main.hs" "path" finding
+                  assertJsonString "finding rationale" rationale "rationale" finding
+                other -> fail $ "review payload should contain one finding object, got " <> show other
+            other -> fail $ "review payload findings should be an array, got " <> show other
+          let encoded = T.pack (BSL.unpack (Aeson.encode (Aeson.Object payload)))
+          assertContains "review payload includes finding path" "src/Main.hs" encoded
+          assertContains "review payload includes finding rationale" rationale encoded
+        other -> fail $ "review payload should be an object, got " <> show other
+
     assertJsonString label_ expected key object =
       case KM.lookup (AesonKey.fromText key) object of
         Just (Aeson.String actual) -> assertEqual label_ expected actual
