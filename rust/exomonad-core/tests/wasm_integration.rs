@@ -919,7 +919,6 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     for expected in [
-        "fork_wave",
         "spawn_leaf",
         "spawn_worker",
         "merge_pr",
@@ -991,10 +990,6 @@ async fn wasm_dev_tools_include_file_pr() {
 
     // Dev should NOT have spawn or merge tools
     assert!(
-        !names.contains(&"fork_wave"),
-        "Dev role should not have fork_wave"
-    );
-    assert!(
         !names.contains(&"merge_pr"),
         "Dev role should not have merge_pr"
     );
@@ -1019,10 +1014,6 @@ async fn wasm_worker_tools_include_notify_parent() {
     );
 
     // Worker should have minimal tools
-    assert!(
-        !names.contains(&"fork_wave"),
-        "Worker should not have fork_wave"
-    );
     assert!(
         !names.contains(&"file_pr"),
         "Worker should not have file_pr"
@@ -1052,10 +1043,6 @@ async fn wasm_reviewer_tools_include_review_commands() {
     assert!(
         !names.contains(&"notify_parent"),
         "Reviewer should not have notify_parent (#268: ephemeral reviewer, no parent messaging)"
-    );
-    assert!(
-        !names.contains(&"fork_wave"),
-        "Reviewer should not have fork_wave"
     );
     assert!(
         !names.contains(&"file_pr"),
@@ -1294,26 +1281,6 @@ async fn wasm_poll_workers_roundtrip_returns_worker_liveness_and_chainlink_state
 // ============================================================================
 // Tool Roundtrip Tests (multi-effect trampoline)
 // ============================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn wasm_fork_wave_roundtrip() {
-    let runtime = build_test_runtime().await;
-
-    let output = call_tool(
-        &runtime,
-        "tl",
-        "fork_wave",
-        json!({
-            "children": [
-                {"slug": "feature-x", "task": "Implement feature X"}
-            ]
-        }),
-    )
-    .await;
-
-    assert_tool_success(&output, "fork_wave");
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
@@ -1569,17 +1536,6 @@ async fn wasm_notify_parent_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn wasm_tool_missing_required_field() {
-    let runtime = build_test_runtime().await;
-
-    // fork_wave requires "children"
-    let output = call_tool(&runtime, "tl", "fork_wave", json!({})).await;
-
-    assert_tool_error(&output, "fork_wave (missing children)");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn wasm_tool_unknown_name_returns_error() {
     let runtime = build_test_runtime().await;
 
@@ -1588,114 +1544,9 @@ async fn wasm_tool_unknown_name_returns_error() {
     assert_tool_error(&output, "nonexistent tool");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn wasm_tool_wrong_role_returns_error() {
-    let runtime = build_test_runtime().await;
-
-    // Dev role should not have fork_wave
-    let output = call_tool(
-        &runtime,
-        "dev",
-        "fork_wave",
-        json!({"children": [{"slug": "test", "task": "test"}]}),
-    )
-    .await;
-
-    assert_tool_error(&output, "fork_wave as dev");
-}
-
 // ============================================================================
 // Error Propagation Tests
 // ============================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn wasm_unhandled_effect_returns_error() {
-    // Build runtime with only log handler — agent effects will fail
-    let wasm_bytes = wasm_binary_bytes();
-    let runtime = RuntimeBuilder::new()
-        .with_effect_handler(MockLogHandler)
-        .with_wasm_bytes(wasm_bytes)
-        .build()
-        .await
-        .expect("Failed to build runtime");
-
-    let output = call_tool(
-        &runtime,
-        "tl",
-        "fork_wave",
-        json!({
-            "children": [{"slug": "test-branch", "task": "test"}]
-        }),
-    )
-    .await;
-
-    assert_tool_error(&output, "fork_wave without agent handler");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn wasm_effect_handler_error_propagates() {
-    /// Handler that always returns an error.
-    struct FailingAgentHandler;
-
-    #[async_trait]
-    impl EffectHandler for FailingAgentHandler {
-        fn namespace(&self) -> &str {
-            "agent"
-        }
-
-        async fn handle(
-            &self,
-            _effect_type: &str,
-            _payload: &[u8],
-            _ctx: &exomonad_core::effects::EffectContext,
-        ) -> EffectResult<Vec<u8>> {
-            Err(EffectError::custom(
-                "spawn_failed",
-                "tmux session not found",
-            ))
-        }
-    }
-
-    let wasm_bytes = wasm_binary_bytes();
-    let runtime = RuntimeBuilder::new()
-        .with_effect_handler(MockGitHandler)
-        .with_effect_handler(MockLogHandler)
-        .with_effect_handler(FailingAgentHandler)
-        .with_effect_handler(MockFsHandler)
-        .with_wasm_bytes(wasm_bytes)
-        .build()
-        .await
-        .expect("Failed to build runtime");
-
-    let output = call_tool(
-        &runtime,
-        "tl",
-        "fork_wave",
-        json!({
-            "children": [{"slug": "test-branch", "task": "test"}]
-        }),
-    )
-    .await;
-
-    // fork_wave returns success=true with per-child errors in the result
-    assert_tool_success(&output, "fork_wave with failing handler (partial success)");
-
-    let errors = output["result"]["errors"]
-        .as_array()
-        .expect("fork_wave result should have errors array");
-    assert!(
-        !errors.is_empty(),
-        "fork_wave errors array should contain the handler error"
-    );
-    let error_msg = errors[0].as_str().unwrap_or_default();
-    assert!(
-        error_msg.contains("tmux session"),
-        "Error message should contain handler error info, got: {error_msg}"
-    );
-}
 
 // ============================================================================
 // Hook Tests
@@ -1910,111 +1761,11 @@ async fn wasm_hook_pre_tool_use_allows_words_containing_gh() {
     );
 }
 
-// ============================================================================
-// Multi-Suspend Verification
-// ============================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn wasm_tool_multiple_suspends() {
-    // fork_wave yields multiple effects:
-    // 1. git.get_status (clean check)
-    // 2. git.has_unpushed_commits (push check)
-    // 3. agent.spawn_subtree (per child)
-    // 4. log.emit_event (per child)
-    // Each suspend/resume cycle goes through the trampoline.
-    let runtime = build_test_runtime().await;
-
-    let output = call_tool(
-        &runtime,
-        "tl",
-        "fork_wave",
-        json!({
-            "children": [{"slug": "multi-suspend", "task": "Multi-suspend test"}]
-        }),
-    )
-    .await;
-
-    assert_tool_success(&output, "fork_wave (multi-suspend)");
-
-    // The result should contain spawned array from the mock handler
-    let result = &output["result"];
-    assert!(
-        result.is_object() || result.is_string(),
-        "fork_wave result should contain spawned info: {output:#}"
-    );
-}
-
-/// Test if sending a long task text to fork_wave causes a hang.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn wasm_fork_wave_long_text() {
-    let runtime = build_test_runtime().await;
-
-    let long_task = "A".repeat(600);
-
-    let output = call_tool(
-        &runtime,
-        "tl",
-        "fork_wave",
-        json!({
-            "children": [{"slug": "long-text-test", "task": long_task}]
-        }),
-    )
-    .await;
-
-    assert_tool_success(&output, "fork_wave (long text)");
-}
-
-/// Diagnostic: does fork_wave hang with multiline text containing newlines?
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn wasm_fork_wave_multiline_text() {
-    let runtime = build_test_runtime().await;
-
-    let multiline_task = "## TASK\nImplement the Rust handler\n\n## Details\nMultiple lines of context.\n\n**DO NOT:**\n- Merge your own PR\n- Push to main";
-
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        call_tool(
-            &runtime,
-            "tl",
-            "fork_wave",
-            json!({
-                "children": [{"slug": "multiline-test", "task": multiline_task}]
-            }),
-        ),
-    )
-    .await;
-
-    match result {
-        Ok(output) => {
-            eprintln!("=== fork_wave with multiline text completed: {output:#} ===");
-            assert_tool_success(&output, "fork_wave (multiline)");
-        }
-        Err(_) => {
-            panic!("fork_wave with multiline text hung after 30s — text encoding issue");
-        }
-    }
-}
-
 /// Diagnostic: spawn_leaf with timeout to observe trampoline logs.
-/// Calls fork_wave first to warm up the WASM runtime, then tries spawn_leaf.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn wasm_spawn_leaf_timeout_diagnostic() {
     let runtime = build_test_runtime().await;
-
-    // Warm up: call fork_wave first (this works)
-    eprintln!("=== DIAGNOSTIC: Warming up with fork_wave ===");
-    let warmup = call_tool(
-        &runtime,
-        "tl",
-        "fork_wave",
-        json!({"children": [{"slug": "warmup", "task": "warmup"}]}),
-    )
-    .await;
-    eprintln!("=== Warmup completed: success={} ===", warmup["success"]);
 
     eprintln!("=== DIAGNOSTIC: Starting spawn_leaf call ===");
 

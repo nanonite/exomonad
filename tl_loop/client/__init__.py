@@ -2,7 +2,6 @@
 
 from .effects import (
     TOOL_METHODS,
-    ChildSpec,
     CompletedTask,
     EffectClient,
     EffectTransport,
@@ -25,7 +24,6 @@ __all__ = [
     "MUTATING_METHODS",
     "READ_METHODS",
     "TOOL_METHODS",
-    "ChildSpec",
     "CompletedTask",
     "DecodeError",
     "EffectClient",

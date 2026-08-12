@@ -122,7 +122,7 @@ tlProfile =
             "   - Commit and push. Children fork from this commit.",
             "",
             "**2. Fork** \x2014 Spawn wave N children. Zero deps between siblings in the same wave.",
-            "   - Sub-TLs/devs with isolation: `fork_wave` (worktree + branch + PR; agent type defaults to server's --worker setting; omit agent_type to inherit the default)",
+            "   - Sub-TLs/devs with isolation: `spawn_leaf` (worktree + branch + PR; agent type defaults to server's --worker setting; omit agent_type to inherit the default)",
             "   - Ephemeral helpers (no branch, no PR): `spawn_worker` (agent type defaults to server's --worker setting; omit agent_type to inherit the default)",
             "",
             "**3. Converge** \x2014 Wait for child notifications. Merge their PRs. Write an integration commit:",

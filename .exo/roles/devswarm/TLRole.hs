@@ -58,17 +58,12 @@ import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
-    ForkWaveArgs,
     SpawnLeafArgs,
     SpawnLeafSubtreeArgs,
     SpawnWorkerToolArgs,
     closeWorkerPaneCore,
     closeWorkerPaneDescription,
     closeWorkerPaneSchema,
-    forkWaveCore,
-    forkWaveDescription,
-    forkWaveRender,
-    forkWaveSchema,
     spawnLeafCore,
     spawnLeafDescription,
     spawnLeafRender,
@@ -124,19 +119,6 @@ instance MCPTool TLMergePR where
       Left err -> pure $ errorResult err
       Right output -> pure $ mergePRRender output
 
--- | TL-specific fork_wave RPC wrapper.
-data TLForkWave
-
-instance MCPTool TLForkWave where
-  type ToolArgs TLForkWave = ForkWaveArgs
-  toolName = "fork_wave"
-  toolDescription = forkWaveDescription
-  toolSchema = forkWaveSchema
-  toolHandlerEff args = do
-    result <- forkWaveCore args
-    case result of
-      Left err -> pure $ errorResult err
-      Right fwResult -> pure $ forkWaveRender fwResult
 
 -- | TL-specific spawn_leaf RPC wrapper.
 data TLSpawnLeaf
@@ -199,8 +181,7 @@ instance MCPTool TLNotifyParent where
       Right _ -> pure $ successResult $ object ["success" .= True]
 
 data Tools mode = Tools
-  { forkWave :: mode :- TLForkWave,
-    spawnLeaf :: mode :- TLSpawnLeaf,
+  { spawnLeaf :: mode :- TLSpawnLeaf,
     spawnWorker :: mode :- TLSpawnWorker,
     spawnReviewer :: mode :- SpawnReviewer,
     cleanupReviewerLeaf :: mode :- CleanupReviewerLeaf,
@@ -254,8 +235,7 @@ config =
     { roleName = "tl",
       tools =
         Tools
-          { forkWave = mkHandler @TLForkWave,
-            spawnLeaf = mkHandler @TLSpawnLeaf,
+          { spawnLeaf = mkHandler @TLSpawnLeaf,
             spawnWorker = mkHandler @TLSpawnWorker,
             spawnReviewer = mkHandler @SpawnReviewer,
             cleanupReviewerLeaf = mkHandler @CleanupReviewerLeaf,

@@ -9,7 +9,6 @@ from typing import cast
 
 from tl_loop.client.effects import (
     TOOL_METHODS,
-    ChildSpec,
     CompletedTask,
     EffectClient,
     ToolResult,
@@ -86,9 +85,6 @@ def _load_schemas() -> dict[str, JsonObject]:
 
 def _invoke_sample_effects(client: EffectClient) -> None:
     """Exercise every method, including optional fields and nested dataclasses."""
-    client.fork_wave(
-        children=[ChildSpec(slug="child", task="sample", agent_type="codex", fork_session=False)]
-    )
     client.spawn_leaf(
         name="leaf",
         task="sample",

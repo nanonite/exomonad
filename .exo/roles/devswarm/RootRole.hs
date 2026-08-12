@@ -9,7 +9,7 @@
 --   Used for the root human-facing TL window (exomonad init).
 module RootRole (config, Tools) where
 
-import Control.Monad (forM_, void, when)
+import Control.Monad (void, when)
 import Data.Text (Text)
 import ExoMonad
 import ExoMonad.Guest.Effects.AgentControl (SpawnResult (..))
@@ -55,18 +55,12 @@ import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
-    ForkWaveArgs (..),
-    ForkWaveResult (..),
     SpawnLeafArgs (..),
     SpawnLeafSubtreeArgs,
     SpawnWorkerToolArgs,
     closeWorkerPaneCore,
     closeWorkerPaneDescription,
     closeWorkerPaneSchema,
-    forkWaveCore,
-    forkWaveDescription,
-    forkWaveRender,
-    forkWaveSchema,
     spawnLeafCore,
     spawnLeafDescription,
     spawnLeafRender,
@@ -95,23 +89,6 @@ rootRedispatchMessage toolName =
     <> "If neither path fits, re-decompose with spawn_leaf or spawn_worker.\n"
     <> "See CLAUDE.md § Tech Lead Praxis for the full protocol."
 
-data RootForkWave
-
-instance MCPTool RootForkWave where
-  type ToolArgs RootForkWave = ForkWaveArgs
-  toolName = "fork_wave"
-  toolDescription = forkWaveDescription
-  toolSchema = forkWaveSchema
-  toolHandlerEff args = do
-    result <- forkWaveCore args
-    case result of
-      Left err -> pure $ errorResult err
-      Right fwResult -> do
-        forM_ (fwrSpawned fwResult) $ \(slug, sr) -> do
-          let handle = ChildHandle {chSlug = slug, chBranch = branchName sr, chAgentType = agentTypeResult sr}
-          branch <- getCurrentBranch
-          void $ applyEvent @TLPhase @TLEvent branch TLPlanning (ChildSpawned handle)
-        pure $ forkWaveRender fwResult
 
 data RootSpawnLeaf
 
@@ -186,8 +163,7 @@ instance MCPTool RootMergePR where
         pure $ mergePRRender output
 
 data Tools mode = Tools
-  { forkWave :: mode :- RootForkWave,
-    spawnLeaf :: mode :- RootSpawnLeaf,
+  { spawnLeaf :: mode :- RootSpawnLeaf,
     spawnWorker :: mode :- RootSpawnWorker,
     spawnReviewer :: mode :- SpawnReviewer,
     cleanupReviewerLeaf :: mode :- CleanupReviewerLeaf,
@@ -241,8 +217,7 @@ config =
     { roleName = "root",
       tools =
         Tools
-          { forkWave = mkHandler @RootForkWave,
-            spawnLeaf = mkHandler @RootSpawnLeaf,
+          { spawnLeaf = mkHandler @RootSpawnLeaf,
             spawnWorker = mkHandler @RootSpawnWorker,
             spawnReviewer = mkHandler @SpawnReviewer,
             cleanupReviewerLeaf = mkHandler @CleanupReviewerLeaf,

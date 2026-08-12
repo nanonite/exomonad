@@ -1,53 +1,6 @@
 {
   "tools": [
     {
-      "description": "Fork any number of parallel agents. Each starts in a worktree branched off your branch. Children inherit your full context window by default when supported (fork_session defaults to true). Set fork_session: false for children that need a fresh start. Requires clean git state (committed and pushed). Claude Code parents should create a team using TeamCreate before spawning Claude Code children.",
-      "inputSchema": {
-        "properties": {
-          "children": {
-            "description": "Array of children to spawn, each with a slug and task",
-            "items": {
-              "properties": {
-                "agent_type": {
-                  "description": "Agent type for the child: 'claude' (default), 'opencode', or 'codex'. OpenCode and Codex children get TL role and can spawn their own children.",
-                  "enum": [
-                    "claude",
-                    "shoal",
-                    "opencode",
-                    "codex"
-                  ],
-                  "type": "string"
-                },
-                "fork_session": {
-                  "description": "Inherit parent conversation context via --fork-session (default: true). Set false to start the child with a fresh context window.",
-                  "type": "boolean"
-                },
-                "slug": {
-                  "description": "Branch name suffix (will be prefixed with current branch)",
-                  "type": "string"
-                },
-                "task": {
-                  "description": "One-line task description — the child inherits your full context, so keep it brief",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "slug",
-                "task"
-              ],
-              "type": "object"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "children"
-        ],
-        "type": "object"
-      },
-      "name": "fork_wave"
-    },
-    {
       "description": "Spawn a leaf agent in its own worktree and branch. The agent gets dev role (files PR, cannot spawn children). The TL worktree must be clean before spawning because dev-leaves fork from branch HEAD and cannot see uncommitted scaffold. Agent type defaults to the server config; pass agent_type only when this leaf needs a specific supported runtime. Use structured fields (steps, verify, boundary) for precise specs, or put everything in task for simple cases. Claude Code parents should create a team using TeamCreate before spawning Claude Code leaves. After spawning, return immediately.",
       "inputSchema": {
         "properties": {

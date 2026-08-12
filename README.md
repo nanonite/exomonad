@@ -157,7 +157,6 @@ Sub-TLs run sequentially and each blocks until terminal — that is how you expr
 
 | Tool | Role | Description |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel agents, each in its own worktree |
 | `spawn_leaf` | root, tl | Spawn a leaf agent in its own worktree + branch; files a PR |
 | `spawn_worker` | root, tl | Spawn an ephemeral worker in a tmux pane (no branch, no PR) |
 | `resume_pr` | root, tl | Resume the existing issue-owned PR worktree after review or CI feedback |

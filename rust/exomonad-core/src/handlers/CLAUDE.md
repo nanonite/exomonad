@@ -67,7 +67,7 @@ Handles effects in the `session.*` namespace.
 - **`register_claude_id`**: Registers a mapping between a session's unique ID and its Claude Code session UUID.
   - This is called by the `SessionStart` hook handler in WASM.
   - The ID is stored in the `ClaudeSessionRegistry` (keyed by `AgentName`, not raw strings).
-  - Used by `fork_wave` to resolve the parent's Claude session ID when spawning children with `--resume --fork-session`.
+  - Used by child spawning to resolve the parent's Claude session ID when spawning children with `--resume --fork-session`.
 - **`register_team`**: Registers agent's Claude Teams membership in `TeamRegistry`. Called by PostToolUse hook after `TeamCreate`. Stores under agent_name, birth_branch, and slug variant keys.
 - **`deregister_team`**: Removes agent's Teams membership from `TeamRegistry`. Called by PostToolUse hook after `TeamDelete`. Mirrors `register_team` — removes all 3 key variants.
 - **`register_supervisor`**: Registers a supervisor mapping in `SupervisorRegistry`. Maps child birth-branches to their supervisor's identity (agent name + team name). Called by TL when spawning children.

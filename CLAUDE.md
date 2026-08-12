@@ -328,9 +328,9 @@ automatically. Omit the flag to keep today's auto-detect behavior.
 
 **Hook configuration** is auto-generated in two places:
 - **`exomonad init`**: Writes `.claude/settings.local.json` with hooks for workers and companions; the root TL controller is not an interactive harness session
-- **`fork_wave`**: Writes `.claude/settings.local.json` into each spawned Claude worktree
+- **`spawn_leaf`**: Writes `.claude/settings.local.json` into each spawned Claude worktree
 
-The `SessionStart` hook is critical — it registers the Claude session UUID in `ClaudeSessionRegistry`, which `fork_wave` reads to pass `--resume <uuid> --fork-session` for context inheritance. Without it, spawned subtrees start with no context.
+The `SessionStart` hook is critical for child processes that request context inheritance — it registers the Claude session UUID in `ClaudeSessionRegistry` for the host spawn handler. Without it, such child processes start with no inherited context.
 
 Codex agents use per-agent `.codex/config.toml` files for MCP and hook settings.
 
@@ -363,7 +363,7 @@ The reviewer convergence loop is configured via `.exo/review-policy.toml`. To ov
 
 ### Companion Agents
 
-Companion agents are persistent agents spawned alongside the root TL during `exomonad init`. Claude companions get their own git worktree at `.exo/companions/{name}/` on branch `companion/{name}`, providing isolated `.mcp.json` discovery via CWD — the same mechanism that makes `fork_wave` reliable.
+Companion agents are persistent agents spawned alongside the root TL during `exomonad init`. Claude companions get their own git worktree at `.exo/companions/{name}/` on branch `companion/{name}`, providing isolated `.mcp.json` discovery via CWD — the same mechanism used by child spawning.
 
 Each Claude companion worktree contains:
 - `.mcp.json` — MCP config with the companion's role/name identity
@@ -385,7 +385,6 @@ What you can do with exomonad right now, end-to-end.
 
 Spawn heterogeneous agent teams as a recursive tree:
 
-- **`fork_wave`** — Fork N parallel agents (Claude, Codex, or OpenCode), each in its own worktree. Agent type defaults to server config; set `agent_type` explicitly to override. Claude agents inherit context via `--fork-session`; Codex and OpenCode agents require context injected via the task spec (no team messaging support). Requires clean git state (committed and pushed).
 - **`spawn_leaf`** — Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields (steps, verify, boundary, context, read_first). Continuation context is prefixed automatically when available, while the caller's task remains verbatim after a blank-line separator.
 - **`resume_pr`** — Resume the existing issue-owned PR worktree and invocation after review or CI feedback. Continuation context is prefixed automatically and review feedback is scoped to the exact current PR head SHA.
 - **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
@@ -552,7 +551,7 @@ Claude Code starts → exomonad hook session-start
 → Server stores in ClaudeSessionRegistry
 → root/TL WASM hooks yield memory.brief and append a nonempty continuation brief
   after the TeamCreate instruction; unavailable memory fails open with the instruction alone
-→ fork_wave uses this ID for --fork-session
+→ host child spawning uses this ID when --fork-session is explicitly requested
 ```
 
 **Event Handler Call:**
@@ -572,7 +571,6 @@ All tools implemented in Haskell WASM (`haskell/wasm-guest/src/ExoMonad/Guest/To
 
 | Tool | Role | Description |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel agents, each in its own worktree. Agent type defaults to server config; supported explicit runtimes include Claude, OpenCode, and Codex. Context inheritance is runtime-specific. |
 | `spawn_leaf` | root, tl | Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields: steps, verify, boundary, context, read_first. Continuation context is prefixed automatically when available. |
 | `resume_pr` | root, tl | Resume an existing issue-owned PR worktree and invocation with continuation context prefixed automatically; review feedback is scoped to the exact current PR head SHA. |
 | `spawn_opencode` | root, tl | Spawn OpenCode agent in own worktree+branch. Files PR when done. Structured spec fields: steps, verify, boundary, context, read_first. |

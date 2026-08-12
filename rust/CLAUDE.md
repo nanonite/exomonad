@@ -42,7 +42,7 @@ Human in tmux session
     └── Claude Code (main window, role=tl)
             ├── MCP server: exomonad mcp-stdio
             ├── WASM: loaded from .exo/wasm/ at runtime
-            └── fork_wave / spawn_leaf creates:
+            └── spawn_leaf / spawn_worker creates:
                 ├── Window subtree-1 (Claude, worktree off current branch, role=tl)
                 ├── Window leaf-1 (Codex, worktree off current branch, role=dev)
                 ├── Pane worker-a (Codex, in parent dir, ephemeral, role=worker)
@@ -171,7 +171,7 @@ In `mcp-stdio` mode, the agent's identity is passed via command-line flags: `--r
 
 Roles are defined in Haskell WASM (`AllRoles.hs`). Adding a role is a Haskell-only change — Rust uses a lazy cache that creates a `PluginManager` per role on first request.
 
-At spawn time, `fork_wave`/`spawn_leaf` writes per-agent MCP config with the agent's identity flags. Identity is unforgeable and visible in logs.
+At spawn time, `spawn_leaf`/`spawn_worker` writes per-agent MCP config with the agent's identity flags. Identity is unforgeable and visible in logs.
 
 ## MCP Tools
 
@@ -179,7 +179,6 @@ All tools are defined in Haskell WASM and executed via host functions.
 
 | Tool | Role | Description |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree |
 | `spawn_leaf` | root, tl | Spawn the configured leaf agent (worktree, inline, or standalone isolation) |
 | `file_pr` | tl, dev | Create/update PR for current branch (auto-detects base branch from naming) |
 | `merge_pr` | tl | Merge child PR (gh pr merge + git fetch) |

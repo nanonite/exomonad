@@ -47,7 +47,6 @@ The controller has an architectural no-edit boundary: implementation belongs to 
 
 | Tool | root | tl | dev | reviewer | worker |
 |------|:----:|:--:|:---:|:--------:|:------:|
-| `fork_wave` | x | x | | | |
 | `spawn_leaf` | x | x | | | |
 | `spawn_codex` | x | x | | | |
 | `spawn_worker` | x | x | | | |

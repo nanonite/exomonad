@@ -24,22 +24,6 @@ class EffectTransport(Protocol):
         """Call a named server-side tool."""
 
 
-@dataclass(frozen=True)
-class ChildSpec:
-    """One child in a ``fork_wave`` request."""
-
-    slug: str
-    task: str
-    agent_type: str | None = None
-    fork_session: bool | None = None
-
-    def to_json(self) -> JsonObject:
-        """Encode the child using the server's JSON shape."""
-        result: JsonObject = {"slug": self.slug, "task": self.task}
-        _put(result, "agent_type", self.agent_type)
-        _put(result, "fork_session", self.fork_session)
-        return result
-
 
 @dataclass(frozen=True)
 class CompletedTask:
@@ -75,7 +59,6 @@ class ToolResult:
 
 
 TOOL_METHODS: tuple[str, ...] = (
-    "fork_wave",
     "spawn_leaf",
     "spawn_worker",
     "spawn_reviewer",
@@ -142,9 +125,6 @@ class EffectClient:
         response = self.transport.call_tool(self.role, self.name, tool_name, arguments)
         return ToolResult.from_raw(response)
 
-    def fork_wave(self, *, children: Sequence[ChildSpec | JsonObject]) -> ToolResult:
-        arguments: JsonObject = {"children": [_structured(child) for child in children]}
-        return self._call("fork_wave", arguments)
 
     def spawn_leaf(
         self,
@@ -535,7 +515,7 @@ def _put_list(arguments: JsonObject, key: str, value: StringList | None) -> None
         arguments[key] = list(value)
 
 
-def _structured(value: ChildSpec | CompletedTask | JsonObject) -> JsonObject:
-    if isinstance(value, (ChildSpec, CompletedTask)):
+def _structured(value: CompletedTask | JsonObject) -> JsonObject:
+    if isinstance(value, CompletedTask):
         return value.to_json()
     return cast(JsonObject, dict(value))

@@ -1150,7 +1150,7 @@ pub async fn run(
         }
     }
 
-    // Write root agent birth branch so fork_wave resolves the correct parent prefix.
+    // Write root agent birth branch so child spawning resolves the correct parent prefix.
     // Without this, BirthBranch::root() falls back to `git branch --show-current` in the
     // server process CWD, which may differ from the TL's actual branch.
     {

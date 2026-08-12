@@ -1,10 +1,9 @@
--- | Hylo spawn primitives: fork_wave, spawn_leaf_subtree, spawn_workers.
+-- | Hylo spawn primitives: spawn_leaf_subtree, spawn_workers.
 --
 -- Core I/O functions are role-agnostic. Role-specific MCP wrappers
 -- apply their own state transitions.
 module ExoMonad.Guest.Tools.Spawn
   ( -- * Marker types
-    ForkWave,
     SpawnLeafSubtree,
     SpawnWorkers,
     SpawnLeaf,
@@ -12,8 +11,6 @@ module ExoMonad.Guest.Tools.Spawn
     CloseWorkerPaneTool,
 
     -- * Args types
-    ForkWaveArgs (..),
-    ForkWaveChild (..),
     SpawnLeafSubtreeArgs (..),
     SpawnWorkersArgs (..),
     SpawnLeafArgs (..),
@@ -23,7 +20,6 @@ module ExoMonad.Guest.Tools.Spawn
     WorkerType (..),
 
     -- * Core functions (role wrappers call these)
-    forkWaveCore,
     spawnLeafSubtreeCore,
     spawnWorkersCore,
     spawnLeafCore,
@@ -31,15 +27,11 @@ module ExoMonad.Guest.Tools.Spawn
     closeWorkerPaneCore,
 
     -- * Result types
-    ForkWaveResult (..),
 
     -- * Render functions
-    forkWaveRender,
     spawnLeafRender,
 
     -- * Shared descriptions/schemas (role wrappers reuse these)
-    forkWaveDescription,
-    forkWaveSchema,
     spawnLeafSubtreeDescription,
     spawnLeafSubtreeSchema,
     spawnWorkersDescription,
@@ -70,12 +62,11 @@ import Data.Text.Lazy qualified as TL
 import Effects.EffectError (Custom (..), EffectError (..), EffectErrorKind (..), InvalidInput (..), NetworkError (..), NotFound (..), PermissionDenied (..), Timeout (..))
 import Effects.Git qualified as Git
 import Effects.Log qualified as Log
-import ExoMonad.Effects.Git (GitGetStatus, GitHasUnpushedCommits)
 import ExoMonad.Effects.Log (LogEmitEvent)
 import ExoMonad.Guest.Effects.AgentControl qualified as AC
 import ExoMonad.Guest.Tool.Class (MCPCallOutput (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (JsonSchema (..), genericToolSchemaWith)
-import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
+import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
 import ExoMonad.Guest.Tools.Chainlink.Pure (chainlinkWorkerProtocolText)
 import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
@@ -103,128 +94,6 @@ spawnErrorMessage (EffectError kind) = case kind of
 hasCustomCode :: Text -> EffectError -> Bool
 hasCustomCode code (EffectError (Just (EffectErrorKindCustom c))) = customCode c == TL.fromStrict code
 hasCustomCode _ _ = False
-
--- ============================================================================
--- ForkWave
--- ============================================================================
-
-data ForkWave
-
-data ForkWaveChild = ForkWaveChild
-  { fwcSlug :: Text,
-    fwcTask :: Text,
-    fwcForkSession :: Maybe Bool,
-    fwcAgentType :: Maybe AC.AgentType
-  }
-  deriving (Show, Eq, Generic)
-
-instance FromJSON ForkWaveChild where
-  parseJSON = withObject "ForkWaveChild" $ \v ->
-    ForkWaveChild
-      <$> v .: "slug"
-      <*> v .: "task"
-      <*> v .:? "fork_session"
-      <*> v .:? "agent_type"
-
-instance JsonSchema ForkWaveChild where
-  toSchema =
-    Aeson.Object $
-      genericToolSchemaWith @ForkWaveChild
-        [ ("slug", "Branch name suffix (will be prefixed with current branch)"),
-          ("task", "One-line task description — the child inherits your full context, so keep it brief"),
-          ("fork_session", "Inherit parent conversation context via --fork-session (default: true). Set false to start the child with a fresh context window."),
-          ("agent_type", "Agent type for the child: 'claude' (default), 'opencode', or 'codex'. OpenCode and Codex children get TL role and can spawn their own children.")
-        ]
-
-data ForkWaveArgs = ForkWaveArgs
-  { fwaChildren :: [ForkWaveChild]
-  }
-  deriving (Show, Eq, Generic)
-
-instance FromJSON ForkWaveArgs where
-  parseJSON = withObject "ForkWaveArgs" $ \v ->
-    ForkWaveArgs <$> v .: "children"
-
--- | Structured result from fork_wave core logic.
-data ForkWaveResult = ForkWaveResult
-  { fwrSpawned :: [(Text, AC.SpawnResult)], -- [(actualSlug, spawnResult)]
-    fwrErrors :: [Text]
-  }
-
--- | Shared tool description for fork_wave.
-forkWaveDescription :: Text
-forkWaveDescription = "Fork any number of parallel agents. Each starts in a worktree branched off your branch. Children inherit your full context window by default when supported (fork_session defaults to true). Set fork_session: false for children that need a fresh start. Requires clean git state (committed and pushed). Claude Code parents should create a team using TeamCreate before spawning Claude Code children."
-
--- | Shared tool schema for fork_wave.
-forkWaveSchema :: Aeson.Object
-forkWaveSchema =
-  genericToolSchemaWith @ForkWaveArgs
-    [ ("children", "Array of children to spawn, each with a slug and task")
-    ]
-
--- | Core fork_wave I/O: validate git state + spawn each child.
--- Returns structured result so wrappers can fire state transitions per child.
-forkWaveCore :: ForkWaveArgs -> Eff Effects (Either Text ForkWaveResult)
-forkWaveCore args = do
-  -- Check for uncommitted changes
-  statusResult <- suspendEffect @GitGetStatus (Git.GetStatusRequest {Git.getStatusRequestWorkingDir = "."})
-  case statusResult of
-    Right resp
-      | not (null (Git.getStatusResponseDirtyFiles resp))
-          || not (null (Git.getStatusResponseStagedFiles resp)) ->
-          pure $ Left "Working tree has uncommitted changes. Commit and push your changes first, then call fork_wave."
-    Left err ->
-      pure $ Left ("Failed to check git status: " <> spawnErrorMessage err)
-    _ -> do
-      -- Check for unpushed commits
-      unpushedResult <- suspendEffect @GitHasUnpushedCommits (Git.HasUnpushedCommitsRequest {Git.hasUnpushedCommitsRequestWorkingDir = ".", Git.hasUnpushedCommitsRequestRemote = "origin"})
-      case unpushedResult of
-        Right resp
-          | Git.hasUnpushedCommitsResponseHasUnpushed resp ->
-              pure $ Left "Local commits not pushed to remote. Run 'git push' first, then call fork_wave."
-        Left err ->
-          pure $ Left ("Failed to check unpushed commits: " <> spawnErrorMessage err)
-        _ -> do
-          -- Spawn each child
-          results <- forM (fwaChildren args) $ \child -> do
-            let childAgentType = fwcAgentType child
-                labelStr = maybe "auto" AC.agentTypeLabel childAgentType
-                cfg =
-                  AC.SpawnSubtreeConfig
-                    { AC.stcTask = fwcTask child,
-                      AC.stcBranchName = fwcSlug child,
-                      AC.stcForkSession = fromMaybe True (fwcForkSession child),
-                      AC.stcRole = Nothing,
-                      AC.stcAgentType = childAgentType,
-                      AC.stcPerms = AC.defaultPermFlags,
-                      AC.stcWorkingDir = Nothing,
-                      AC.stcPermissions = Nothing,
-                      AC.stcStandaloneRepo = False,
-                      AC.stcAllowedDirs = []
-                    }
-            result <- AC.spawnSubtree cfg
-            case result of
-              Left err -> pure (Left (spawnErrorMessage err))
-              Right spawnResult -> do
-                emitSpawnEvent (fwcSlug child) labelStr (fwcTask child)
-                pure (Right (fwcSlug child, spawnResult))
-
-          let (errs, successes) = partitionEithers results
-          pure $
-            Right $
-              ForkWaveResult
-                { fwrSpawned = successes,
-                  fwrErrors = errs
-                }
-
--- | Render a ForkWaveResult to MCPCallOutput.
-forkWaveRender :: ForkWaveResult -> MCPCallOutput
-forkWaveRender r =
-  successResult $
-    object
-      [ "spawned" .= map (Aeson.toJSON . snd) (fwrSpawned r),
-        "errors" .= map Aeson.String (fwrErrors r)
-      ]
 
 -- ============================================================================
 -- SpawnLeafSubtree

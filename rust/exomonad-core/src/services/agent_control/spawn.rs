@@ -70,7 +70,6 @@ fn reviewer_harness_denied_tools() -> Vec<String> {
         "Write",
         "MultiEdit",
         "NotebookEdit",
-        "fork_wave",
         "spawn_leaf",
         "spawn_worker",
         "merge_pr",
@@ -303,7 +302,7 @@ These names are MCP tools exposed inside your agent tool interface. They are not
 
 ## Key Rules
 - Work only in your worktree. Never checkout another branch.
-- Never call fork_wave or spawn_leaf — you are a leaf, not a TL.
+- Never call spawn_leaf — you are a leaf, not a TL.
 - NEVER merge PRs. Never call merge_pr, never run `gh pr merge`, never use any bash tool (ctx_execute, shell commands) to merge. Merging is exclusively the parent TL's responsibility.
 - Git operations (status, commit, push) use bash. EXCEPTION: file_pr is the MCP tool for PRs — never use `gh pr create`.
 - Do not create a new owner, branch, or stacked PR for review fixes.
@@ -393,7 +392,7 @@ While this invocation is alive, continue consuming durable inbox guidance delive
 
 ## Key Rules
 - Work only in your worktree. Never checkout another branch.
-- Never call fork_wave or spawn_leaf; you are a leaf, not a TL.
+- Never call spawn_leaf; you are a leaf, not a TL.
 - Git operations use shell commands. Use file_pr for PR creation.
 - Do not create a new owner, branch, or stacked PR for review fixes.
 ";
@@ -2424,7 +2423,6 @@ mod tests {
             "Write",
             "MultiEdit",
             "NotebookEdit",
-            "fork_wave",
             "spawn_leaf",
             "spawn_worker",
             "merge_pr",

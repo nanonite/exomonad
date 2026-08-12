@@ -43,7 +43,7 @@ import ExoMonad.Guest.Tool.Suspend.Types (EffectRequest (..))
 import ExoMonad.Guest.Tools.FilePR (filePRDescription, filePRSchema)
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), mergePRDescription, mergePRSchema)
 import ExoMonad.Guest.Tools.ResumePr (ResumePrArgs (..), renderResumePrTask, resumePrDescription, resumePrSchema)
-import ExoMonad.Guest.Tools.Spawn (forkWaveSchema, spawnLeafSchema, spawnWorkersSchema)
+import ExoMonad.Guest.Tools.Spawn (spawnLeafSchema, spawnWorkersSchema)
 import ExoMonad.Guest.Types (Effects, HookEventType (..), HookInput (..), HookOutput (..), HookSpecificOutput (..), Runtime (..))
 import ExoMonad.Types (ChainlinkDbPathState (..), HookConfig (..), RoleConfig (..), validateChainlinkDbEnv)
 import Proto3.Suite.Class (Message, toLazyByteString)
@@ -715,8 +715,7 @@ assertSpawnSchemasPreserveRetiredBoundary = do
   let retiredProvider = T.concat ["ge", "mini"]
       schemaText schema = T.pack (BSL.unpack (Aeson.encode schema))
       schemas =
-        [ ("fork_wave", schemaText forkWaveSchema),
-          ("spawn_leaf", schemaText spawnLeafSchema),
+        [ ("spawn_leaf", schemaText spawnLeafSchema),
           ("spawn_workers", schemaText spawnWorkersSchema)
         ]
   forM_ schemas $ \(toolName, schema) ->

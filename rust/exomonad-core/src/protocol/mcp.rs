@@ -35,18 +35,18 @@ mod tests {
     #[test]
     fn test_tool_definition_serde_roundtrip() {
         let td = ToolDefinition {
-            name: ToolName::try_from_str("fork_wave")
+            name: ToolName::try_from_str("spawn_leaf")
                 .expect("literal validated string is non-empty"),
             description: "Fork a worktree".into(),
             input_schema: serde_json::json!({"type": "object"}),
         };
         let json = serde_json::to_value(&td).unwrap();
-        assert_eq!(json["name"], "fork_wave");
+        assert_eq!(json["name"], "spawn_leaf");
         assert_eq!(json["inputSchema"]["type"], "object");
         assert!(!json.as_object().unwrap().contains_key("input_schema"));
 
         let back: ToolDefinition = serde_json::from_value(json).unwrap();
-        assert_eq!(back.name.as_str(), "fork_wave");
+        assert_eq!(back.name.as_str(), "spawn_leaf");
     }
 }
 

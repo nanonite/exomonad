@@ -132,7 +132,6 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
         "spawn_leaf",
         "merge_pr",
     ]
-    assert "fork_wave" not in {name for name, _ in transport.calls}
     assert [intent.operation for intent in result.effects] == [
         "spawn_worker",
         "spawn_leaf",

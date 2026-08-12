@@ -1,15 +1,6 @@
 -- | Spawn core re-exports for role code.
 module ExoMonad.Guest.Records.Spawn
-  ( -- * ForkWave
-    ForkWaveArgs (..),
-    ForkWaveChild (..),
-    ForkWaveResult (..),
-    forkWaveCore,
-    forkWaveRender,
-    forkWaveDescription,
-    forkWaveSchema,
-
-    -- * SpawnLeafSubtree
+  ( -- * SpawnLeafSubtree
     SpawnLeafSubtreeArgs (..),
     spawnLeafSubtreeCore,
     spawnLeafRender,

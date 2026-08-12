@@ -132,7 +132,6 @@ Register manually in `.mcp.json`:
 
 | Tool | Role | Description |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree |
 | `spawn_leaf` | root, tl | Spawn the configured leaf agent (worktree, inline, or standalone isolation) |
 | `file_pr` | tl, dev | Create/update PR for current branch |
 | `merge_pr` | root, tl | Merge child PR (gh merge + git fetch) |
