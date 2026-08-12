@@ -7,8 +7,6 @@ from copy import deepcopy
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from tl_loop.loop.driver import WorkPlan
-
 _PLAN_KEYS = frozenset({"run_id", "budgets", "plan", "workers", "leaves", "sub_tls"})
 _PROPOSAL_KEYS = frozenset({"plan", "workers", "leaves", "sub_tls"})
 _TASK_KEYS = {
@@ -80,6 +78,8 @@ def validate_plan_proposal(value: object) -> dict[str, object]:
 
 
 def _validate_work_plan(value: Mapping[str, object], path: str) -> None:
+    from tl_loop.loop.driver import WorkPlan
+
     try:
         WorkPlan.from_mapping(value)
     except (TypeError, ValueError) as error:

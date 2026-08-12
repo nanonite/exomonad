@@ -293,6 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E14 :: E14.1 Define the closed intent schema (#806)
 - E13 :: E13.6 Staleness and authority test suite (#805)
 - E13 :: E13.5 Implement propose-plan-mutation endpoint (#804)
 - E13 :: E13.4 Implement answer-named-gate endpoint (#803)
