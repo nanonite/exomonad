@@ -49,12 +49,21 @@ pub async fn propose_plan(
     run_id: &str,
     request: PlanProposalRequest,
 ) -> Result<Value, PlanProposalError> {
+    let python = std::env::var(PYTHON_ENV).unwrap_or_else(|_| "python3".to_string());
+    propose_plan_with_python(project_dir, run_id, request, &python).await
+}
+
+async fn propose_plan_with_python(
+    project_dir: &Path,
+    run_id: &str,
+    request: PlanProposalRequest,
+    python: &str,
+) -> Result<Value, PlanProposalError> {
     validate_identifier(run_id)?;
     if !run_path(project_dir, run_id).is_file() {
         return Err(PlanProposalError::MissingRun);
     }
 
-    let python = std::env::var(PYTHON_ENV).unwrap_or_else(|_| "python3".to_string());
     let mut child = Command::new(python)
         .args([
             "-m",
@@ -120,6 +129,8 @@ fn validate_identifier(value: &str) -> Result<(), PlanProposalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn proposal_body_is_closed() {
@@ -135,5 +146,42 @@ mod tests {
         assert!(validate_identifier("root").is_ok());
         assert!(validate_identifier("../other").is_err());
         assert!(validate_identifier("nested/run").is_err());
+    }
+
+    #[tokio::test]
+    async fn proposal_validation_does_not_write_run_state() {
+        let project = tempdir().unwrap();
+        let run_path = project.path().join(".exo/tl-loop/root/run.json");
+        fs::create_dir_all(run_path.parent().unwrap()).unwrap();
+        let original = br#"{"sentinel":"unchanged"}"#;
+        fs::write(&run_path, original).unwrap();
+        let validator = project.path().join("validator");
+        fs::write(
+            &validator,
+            b"#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"run_id\":\"root\",\"plan\":{\"leaves\":[]},\"inert\":true,\"status\":\"proposed\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&validator).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&validator, permissions).unwrap();
+        }
+
+        let result = propose_plan_with_python(
+            project.path(),
+            "root",
+            PlanProposalRequest {
+                plan: serde_json::json!({"leaves": []}),
+            },
+            validator.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], "proposed");
+        assert_eq!(result["inert"], true);
+        assert_eq!(fs::read(&run_path).unwrap(), original);
     }
 }

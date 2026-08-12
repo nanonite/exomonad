@@ -949,6 +949,19 @@ async fn control_root() -> Json<serde_json::Value> {
         "status": "ok",
         "authority": "control",
         "route_group": "/control",
+        "allowed_actions": [
+            "read_projection",
+            "answer_named_gate",
+            "propose_plan_mutation"
+        ],
+        "forbidden_actions": [
+            "merge_pr",
+            "approve_review",
+            "set_verdict",
+            "alter_phase",
+            "widen_harness_policy",
+            "raise_budget_ceiling"
+        ],
     }))
 }
 
@@ -1916,6 +1929,28 @@ mod tests {
     use super::*;
     use exomonad_core::mcp::tools::MCPCallOutput;
     use exomonad_core::services::InboxMessageRecord;
+
+    #[tokio::test]
+    async fn control_root_exposes_only_non_authoritative_actions() {
+        let Json(document) = control_root().await;
+        assert_eq!(document["allowed_actions"][0], "read_projection");
+        assert_eq!(document["allowed_actions"][1], "answer_named_gate");
+        assert_eq!(document["allowed_actions"][2], "propose_plan_mutation");
+        for action in [
+            "merge_pr",
+            "approve_review",
+            "set_verdict",
+            "alter_phase",
+            "widen_harness_policy",
+            "raise_budget_ceiling",
+        ] {
+            assert!(document["forbidden_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == action));
+        }
+    }
 
     fn message() -> InboxMessageRecord {
         InboxMessageRecord {
