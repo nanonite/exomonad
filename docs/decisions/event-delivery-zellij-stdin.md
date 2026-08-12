@@ -1,6 +1,8 @@
 # Event Delivery: Teams Inbox + tmux Fallback
 
-**Status:** Superseded — tmux replaced the previous engine (2026-03-13). Delivery model unchanged: Teams inbox primary, tmux STDIN injection fallback.
+**Status:** Superseded — tmux replaced the previous engine (2026-03-13). For
+current routing, failure modes, and ledger measurements, see
+[agent-steering-transport-evidence.md](agent-steering-transport-evidence.md).
 
 ## Decision
 
