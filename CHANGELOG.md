@@ -121,6 +121,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- E14: interpret_operator_intent as a fourth RLM judgment (#798)
 - E13: Read model and /control surface on the existing UDS (#797)
 - E11: Observability contract for the guidance queue (#768)
 - E10: Runtime adapters with boundary and acceptance evidence (#767)
