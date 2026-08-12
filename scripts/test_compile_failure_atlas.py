@@ -64,13 +64,26 @@ def _create_database(path: Path) -> None:
     )
     connection.execute(
         "INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?)",
-        ("source-1", "jsonl", 512, "source-hash", 3, 0),
+        ("source-1", "jsonl", 512, "source-hash", 5, 0),
     )
     private_payload = json.dumps(fixture, sort_keys=True)
+    guidance_payload = json.dumps(
+        {
+            "batch_id": "batch-guidance-private",
+            "item_ids": ["item-guidance-private"],
+            "queue_class": "steering",
+            "queue_seq": 7,
+            "content": "GUIDANCE_PRIVATE_BODY_MARKER",
+            "summary": "GUIDANCE_PRIVATE_SUMMARY_MARKER",
+        },
+        sort_keys=True,
+    )
     rows = [
         ("event-1", "source-1", "event-1", "session-1", "agent.spawned", "CLIENT_ORION_INTERNAL", "CLIENT_ORION_INTERNAL", "CLIENT_ORION_INTERNAL", "CLIENT_ORION_INTERNAL", "CLIENT_ORION_INTERNAL", 1, 500, "emitted", "accepted", private_payload),
         ("event-2", "source-1", "event-2", "session-1", "agent.invocation.finished", "success", "claude", "claude", "exo", "worker", 1, 1200, "emitted", "accepted", private_payload),
         ("event-3", "source-1", "event-3", "session-2", "agent.spawned", "failed", "claude", "claude", "exo", "worker", 1, 700, "emitted", "failed", private_payload),
+        ("event-4", "source-1", "event-4", "session-1", "message.delivery", "accepted", "codex", "codex", "exomonad", "worker", 1, 40, "emitted", "accepted", guidance_payload),
+        ("event-5", "source-1", "event-5", "session-1", "inbox.state_changed", "accepted", "codex", "codex", "exomonad", "worker", 1, 40, "emitted", "accepted", guidance_payload),
     ]
     connection.executemany(
         "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -158,11 +171,15 @@ def main() -> int:
         assert analysis["metrics"]["completeness_filter"]["excluded_incomplete_rows"] == 1
         assert sum(
             item["count"]["value"] for item in analysis["metrics"]["event_counts"]
-        ) == 2
+        ) == 4
         assert privacy["allowlist_first"] is True
         assert privacy["serialized_raw_rows"] is False
         assert privacy["passed"] is True
         assert "CLIENT_ORION_INTERNAL" not in serialized
+        assert "GUIDANCE_PRIVATE_BODY_MARKER" not in serialized
+        assert "GUIDANCE_PRIVATE_SUMMARY_MARKER" not in serialized
+        assert "batch-guidance-private" not in serialized
+        assert "item-guidance-private" not in serialized
         assert any(
             item["value"] == "other"
             for item in analysis["metrics"]["dimension_counts"]
