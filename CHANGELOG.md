@@ -292,6 +292,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E10 :: E10.5 Shadow-mode comparison harness (#788)
 - E10 :: E10.4 OpenCode adapter (#787)
 - E10 :: E10.3 Codex adapter (#786)
 - E10 :: E10.2 Claude Code adapter (#785)

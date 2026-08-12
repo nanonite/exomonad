@@ -23,6 +23,7 @@ pub mod git_worktree;
 pub mod github;
 pub mod guidance_adapters;
 pub mod guidance_queue;
+pub mod guidance_shadow;
 pub mod immutable_ledger;
 pub mod inbox_store;
 pub mod inbox_watcher;
@@ -80,6 +81,9 @@ pub use self::guidance_queue::{
     GuidanceAckResult, GuidanceBatch, GuidanceBatchRequest, GuidanceConsumer,
     GuidanceEnqueueResult, GuidanceIdentity, GuidanceItem, GuidanceItemInput, GuidanceState,
     QueueClass,
+};
+pub use self::guidance_shadow::{
+    ShadowComparison, ShadowDiff, ShadowLegacyProjection, ShadowQueueProjection,
 };
 pub use self::immutable_ledger::{
     resolve_superseded_events, sequence_status, LedgerEvent, LedgerRecord, LedgerWriter,

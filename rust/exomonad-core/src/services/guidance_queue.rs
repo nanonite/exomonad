@@ -268,10 +268,16 @@ impl InboxStore {
                 let batch = load_batch(&tx, &existing)?;
                 tx.commit()
                     .context("failed to commit idempotent compatible enqueue")?;
-                return Ok(GuidanceEnqueueResult {
+                drop(conn);
+                let result = GuidanceEnqueueResult {
                     batch,
                     created: false,
-                });
+                };
+                let comparison =
+                    super::guidance_shadow::compare_batch(self, &result.batch.batch_id)
+                        .context("failed to compare compatibility delivery projections")?;
+                super::guidance_shadow::emit_comparison(self, &comparison);
+                return Ok(result);
             }
         }
 
@@ -294,6 +300,7 @@ impl InboxStore {
         let result = enqueue_batch_in_transaction(&tx, &request, &agent_id, now)?;
         tx.commit()
             .context("failed to commit compatible guidance enqueue")?;
+        drop(conn);
         append_state_change(
             self.db_path(),
             "inbox.state_changed",
@@ -320,6 +327,9 @@ impl InboxStore {
             }),
         );
         append_enqueue_event(self, &result);
+        let comparison = super::guidance_shadow::compare_batch(self, &result.batch.batch_id)
+            .context("failed to compare compatibility delivery projections")?;
+        super::guidance_shadow::emit_comparison(self, &comparison);
         Ok(result)
     }
 

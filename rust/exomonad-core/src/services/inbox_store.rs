@@ -73,6 +73,17 @@ impl InboxStore {
         &self.db_path
     }
 
+    /// Compare a durable batch with its legacy compatibility projection.
+    ///
+    /// This is observation-only: a mismatch is reported to the caller and
+    /// never changes queue or inbox state.
+    pub fn compare_guidance_shadow(
+        &self,
+        batch_id: &str,
+    ) -> Result<super::guidance_shadow::ShadowComparison> {
+        super::guidance_shadow::compare_batch(self, batch_id)
+    }
+
     pub fn clear_all(&self) -> Result<()> {
         let conn = self.connection()?;
         let abandoned_count: i64 = conn
