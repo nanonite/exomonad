@@ -234,13 +234,37 @@ impl InboxStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("failed to start guidance enqueue transaction")?;
+        let result = enqueue_batch_in_transaction(&tx, &request, &agent_id, now)?;
+        tx.commit().context("failed to commit guidance enqueue")?;
+        append_enqueue_event(self, &result);
+        Ok(result)
+    }
+
+    /// Atomically retain a legacy messages row and link it from the durable
+    /// batch before any runtime transport is attempted.
+    pub fn enqueue_batch_with_compatibility(
+        &self,
+        mut request: GuidanceBatchRequest,
+        from_agent: &str,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<GuidanceEnqueueResult> {
+        validate_batch_request(&request)?;
+        validate_identity(from_agent, "sender agent")?;
+        let agent_id = normalize_agent_id(&request.agent_id).into_owned();
+        let now = now_epoch_secs();
+        let mut conn = self.connection()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("failed to start compatible guidance enqueue transaction")?;
 
         if let Some(idempotency_key) = request.idempotency_key.as_deref() {
             if let Some(existing) =
                 find_idempotent_batch(&tx, &agent_id, idempotency_key, request.queue_class)?
             {
                 let batch = load_batch(&tx, &existing)?;
-                tx.commit().context("failed to commit idempotent enqueue")?;
+                tx.commit()
+                    .context("failed to commit idempotent compatible enqueue")?;
                 return Ok(GuidanceEnqueueResult {
                     batch,
                     created: false,
@@ -248,77 +272,52 @@ impl InboxStore {
             }
         }
 
-        let queue_seq: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(queue_seq), -1) + 1 FROM guidance_batches WHERE agent_id = ?1",
-                params![&agent_id],
-                |row| row.get(0),
-            )
-            .context("failed to allocate guidance queue sequence")?;
-        let batch_id = uuid::Uuid::new_v4().to_string();
+        let normalized_to_agent = normalize_agent_id(&agent_id);
         tx.execute(
-            "INSERT INTO guidance_batches (
-               batch_id, agent_id, queue_class, queue_seq, state, created_at,
-               available_at, attempt_count, run_id, session_id, invocation_id,
-               generation, runtime, harness, role, source_message_id, idempotency_key
-             ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO messages (from_agent, to_agent, content, summary, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                &batch_id,
-                &agent_id,
-                request.queue_class.as_str(),
-                queue_seq,
-                now,
-                request.identity.run_id.as_deref(),
-                request.identity.session_id.as_deref(),
-                request.identity.invocation_id.as_deref(),
-                request.identity.generation,
-                request.identity.runtime.as_deref(),
-                request.identity.harness.as_deref(),
-                request.identity.role.as_deref(),
-                request.source_message_id,
-                request.idempotency_key.as_deref(),
+                from_agent,
+                normalized_to_agent.as_ref(),
+                content,
+                summary,
+                now
             ],
         )
-        .context("failed to insert guidance batch")?;
-        for (position, item) in request.items.iter().enumerate() {
-            let item_id = uuid::Uuid::new_v4().to_string();
-            let injection_options = serde_json::to_string(&item.injection_options)
-                .context("failed to encode guidance injection options")?;
-            tx.execute(
-                "INSERT INTO guidance_items (
-                   batch_id, position, item_id, from_agent, content, summary, injection_options
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    &batch_id,
-                    i64::try_from(position).context("guidance item position overflow")?,
-                    item_id,
-                    item.from_agent,
-                    item.content,
-                    item.summary,
-                    injection_options,
-                ],
-            )
-            .context("failed to insert guidance item")?;
-        }
-        let batch = load_batch(&tx, &batch_id)?;
-        tx.commit().context("failed to commit guidance enqueue")?;
-        append_queue_event(
-            self,
+        .context("failed to insert compatibility inbox message")?;
+        let source_message_id = tx.last_insert_rowid();
+        request.source_message_id = Some(source_message_id);
+
+        let result = enqueue_batch_in_transaction(&tx, &request, &agent_id, now)?;
+        tx.commit()
+            .context("failed to commit compatible guidance enqueue")?;
+        append_state_change(
+            self.db_path(),
             "inbox.state_changed",
             serde_json::json!({
-                "operation": "enqueue",
-                "batch_id": batch.batch_id,
-                "agent_id": batch.agent_id,
-                "queue_class": batch.queue_class.as_str(),
-                "queue_seq": batch.queue_seq,
-                "item_count": batch.items.len(),
-                "idempotency_key": batch.idempotency_key,
+                "operation": "write_message",
+                "message_id": source_message_id,
+                "from_agent": from_agent,
+                "to_agent": normalized_to_agent,
+                "content": content,
+                "summary": summary,
+                "created_at": now
             }),
         );
-        Ok(GuidanceEnqueueResult {
-            batch,
-            created: true,
-        })
+        append_state_change(
+            self.db_path(),
+            "message.delivery",
+            serde_json::json!({
+                "message_id": source_message_id,
+                "from_agent": from_agent,
+                "to_agent": normalized_to_agent,
+                "attempt": 1,
+                "outcome": "accepted",
+                "transport": "durable_inbox"
+            }),
+        );
+        append_enqueue_event(self, &result);
+        Ok(result)
     }
 
     /// Claim one whole batch only when the adapter reports a safe boundary.
@@ -764,6 +763,102 @@ impl InboxStore {
             .map(|(batch_id, _)| batch_id)
             .collect())
     }
+}
+
+fn enqueue_batch_in_transaction(
+    tx: &Transaction<'_>,
+    request: &GuidanceBatchRequest,
+    agent_id: &str,
+    now: i64,
+) -> Result<GuidanceEnqueueResult> {
+    if let Some(idempotency_key) = request.idempotency_key.as_deref() {
+        if let Some(existing) =
+            find_idempotent_batch(tx, agent_id, idempotency_key, request.queue_class)?
+        {
+            let batch = load_batch(tx, &existing)?;
+            return Ok(GuidanceEnqueueResult {
+                batch,
+                created: false,
+            });
+        }
+    }
+
+    let queue_seq: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(queue_seq), -1) + 1 FROM guidance_batches WHERE agent_id = ?1",
+            params![agent_id],
+            |row| row.get(0),
+        )
+        .context("failed to allocate guidance queue sequence")?;
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO guidance_batches (
+           batch_id, agent_id, queue_class, queue_seq, state, created_at,
+           available_at, attempt_count, run_id, session_id, invocation_id,
+           generation, runtime, harness, role, source_message_id, idempotency_key
+         ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            &batch_id,
+            agent_id,
+            request.queue_class.as_str(),
+            queue_seq,
+            now,
+            request.identity.run_id.as_deref(),
+            request.identity.session_id.as_deref(),
+            request.identity.invocation_id.as_deref(),
+            request.identity.generation,
+            request.identity.runtime.as_deref(),
+            request.identity.harness.as_deref(),
+            request.identity.role.as_deref(),
+            request.source_message_id,
+            request.idempotency_key.as_deref(),
+        ],
+    )
+    .context("failed to insert guidance batch")?;
+    for (position, item) in request.items.iter().enumerate() {
+        let item_id = uuid::Uuid::new_v4().to_string();
+        let injection_options = serde_json::to_string(&item.injection_options)
+            .context("failed to encode guidance injection options")?;
+        tx.execute(
+            "INSERT INTO guidance_items (
+               batch_id, position, item_id, from_agent, content, summary, injection_options
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &batch_id,
+                i64::try_from(position).context("guidance item position overflow")?,
+                item_id,
+                &item.from_agent,
+                &item.content,
+                &item.summary,
+                injection_options,
+            ],
+        )
+        .context("failed to insert guidance item")?;
+    }
+    Ok(GuidanceEnqueueResult {
+        batch: load_batch(tx, &batch_id)?,
+        created: true,
+    })
+}
+
+fn append_enqueue_event(store: &InboxStore, result: &GuidanceEnqueueResult) {
+    if !result.created {
+        return;
+    }
+    let batch = &result.batch;
+    append_queue_event(
+        store,
+        "inbox.state_changed",
+        serde_json::json!({
+            "operation": "enqueue",
+            "batch_id": batch.batch_id,
+            "agent_id": batch.agent_id,
+            "queue_class": batch.queue_class.as_str(),
+            "queue_seq": batch.queue_seq,
+            "item_count": batch.items.len(),
+            "idempotency_key": batch.idempotency_key,
+        }),
+    );
 }
 
 fn validate_batch_request(request: &GuidanceBatchRequest) -> Result<()> {

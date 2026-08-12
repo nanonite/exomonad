@@ -729,7 +729,7 @@ async fn record_inbox_delivery(
     queue_class: QueueClass,
 ) -> bool {
     let to_agent = canonical_recipient_key(ctx.agent_resolver(), agent_key).await;
-    let batch = match ctx.inbox_store().enqueue_batch(GuidanceBatchRequest {
+    let request = GuidanceBatchRequest {
         agent_id: to_agent.clone(),
         queue_class,
         items: vec![GuidanceItemInput {
@@ -741,37 +741,21 @@ async fn record_inbox_delivery(
         identity: GuidanceIdentity::default(),
         idempotency_key: None,
         source_message_id: None,
-    }) {
-        Ok(result) => result.batch,
-        Err(error) => {
-            warn!(
-                from = %from,
-                to = %to_agent,
-                error = %error,
-                "Failed to commit durable guidance batch before transport"
-            );
-            return false;
-        }
     };
-    debug!(
-        batch_id = %batch.batch_id,
-        queue_class = ?batch.queue_class,
-        from = %from,
-        to = %to_agent,
-        "Committed durable guidance batch before transport"
-    );
-
-    match ctx
-        .inbox_store()
-        .write_message(from.as_str(), &to_agent, message, Some(summary))
-    {
-        Ok(message_id) => {
+    match ctx.inbox_store().enqueue_batch_with_compatibility(
+        request,
+        from.as_str(),
+        message,
+        Some(summary),
+    ) {
+        Ok(result) => {
             debug!(
-                message_id,
-                batch_id = %batch.batch_id,
+                batch_id = %result.batch.batch_id,
+                source_message_id = ?result.batch.source_message_id,
+                queue_class = ?result.batch.queue_class,
                 from = %from,
                 to = %to_agent,
-                "Recorded message in durable inbox"
+                "Committed durable guidance batch and compatibility message before transport"
             );
             true
         }
@@ -780,7 +764,7 @@ async fn record_inbox_delivery(
                 from = %from,
                 to = %to_agent,
                 error = %error,
-                "Failed to record message in durable inbox"
+                "Failed to commit durable guidance batch before transport"
             );
             false
         }
@@ -1906,22 +1890,34 @@ mod tests {
             .await
         );
 
-        let (queue_class, state, content): (String, String, String) = services
+        let (queue_class, state, content, source_message_id): (String, String, String, i64) =
+            services
+                .inbox_store
+                .connection()
+                .expect("guidance connection should open")
+                .query_row(
+                    "SELECT b.queue_class, b.state, i.content, b.source_message_id
+                 FROM guidance_batches b
+                 JOIN guidance_items i ON i.batch_id = b.batch_id
+                 WHERE b.agent_id = ?1",
+                    ["patch-step-over-opencode"],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("guidance batch should be committed");
+        assert_eq!(queue_class, "follow_up");
+        assert_eq!(state, "pending");
+        assert_eq!(content, "hello");
+        let compatibility_message_id: i64 = services
             .inbox_store
             .connection()
             .expect("guidance connection should open")
             .query_row(
-                "SELECT b.queue_class, b.state, i.content
-                 FROM guidance_batches b
-                 JOIN guidance_items i ON i.batch_id = b.batch_id
-                 WHERE b.agent_id = ?1",
-                ["patch-step-over-opencode"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                "SELECT id FROM messages WHERE to_agent = ?1 AND content = ?2",
+                ["patch-step-over-opencode", "hello"],
+                |row| row.get(0),
             )
-            .expect("guidance batch should be committed");
-        assert_eq!(queue_class, "follow_up");
-        assert_eq!(state, "pending");
-        assert_eq!(content, "hello");
+            .expect("compatibility message should be retained");
+        assert_eq!(source_message_id, compatibility_message_id);
 
         let messages = services
             .inbox_store
