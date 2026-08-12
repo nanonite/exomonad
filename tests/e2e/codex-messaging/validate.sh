@@ -104,15 +104,12 @@ main() {
     wait_for "root Codex config exists" "[[ -f '$REPO_DIR/.codex/config.toml' ]]"
     validate_root_config
 
-    wait_for_config_role "Codex TL worktree config exists" "tl"
     wait_for_config_role "Codex dev worktree config exists" "dev"
 
-    wait_for "send_message agent event recorded" "grep -R 'agent.message_sent' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'codex-messaging-dev-codex' | grep 'success=true' | grep -q ."
-    wait_for "send_message tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'codex-messaging-dev-codex' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
-    wait_for "TL notify_parent event recorded" "grep -R 'CODEX-MSG-TL-NOTIFY' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
-    wait_for "TL notify_parent tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'codex-messaging-tl-codex' | grep 'main' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
+    wait_for "send_tmux_message agent event recorded" "grep -R 'agent.message_sent' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'codex-messaging-dev-codex' | grep 'success=true' | grep -q ."
+    wait_for "send_tmux_message delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'codex-messaging-dev-codex' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
     wait_for "dev notify_parent event recorded" "grep -R 'CODEX-MSG-DEV-NOTIFY' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
-    wait_for "dev notify_parent tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'codex-messaging-dev-codex' | grep 'main.codex-messaging-tl-codex' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
+    wait_for "dev notify_parent tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'codex-messaging-dev-codex' | grep 'main' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
 
     {
         printf 'Codex messaging E2E validation completed at %s\n' "$(date -Iseconds)"

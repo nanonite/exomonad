@@ -218,7 +218,7 @@ wait_for "new Claude team directory created" 10 "test -n \"\$(comm -13 '$BASELIN
 if capture_window TL | grep -q 'TL agents cannot use Write'; then
     fail "TL attempted a direct Write; harness prompt is not role-safe"
 fi
-if capture_window TL | grep -Eq 'spawn_leaf|spawn_worker|fork_wave'; then
+if capture_window TL | grep -Eq 'spawn_leaf|spawn_worker'; then
     fail "TL appeared to discuss spawning in bounded smoke; harness prompt is too broad"
 fi
 

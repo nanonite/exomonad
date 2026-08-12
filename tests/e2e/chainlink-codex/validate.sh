@@ -100,15 +100,9 @@ find_agent_config_by_role() {
         done
 }
 
-if [[ "${1:-}" == "--find-tl" ]]; then
+if [[ "${1:-}" == "--find-dev" ]]; then
     REPO_DIR="${2:?repo dir required}"
-    find_worktree_config_by_role tl
-    exit 0
-fi
-
-if [[ "${1:-}" == "--find-worker" ]]; then
-    REPO_DIR="${2:?repo dir required}"
-    find_agent_config_by_role worker
+    find_worktree_config_by_role dev
     exit 0
 fi
 
@@ -161,29 +155,21 @@ main() {
     wait_for "root Codex config exists" "[[ -f '$REPO_DIR/.codex/config.toml' ]]"
     validate_codex_config "root" "$REPO_DIR/.codex/config.toml" "root" "root" "ExoMonad Root TL Protocol"
 
-    wait_for "Codex TL worktree config exists" "[[ -n \"\$(find '$REPO_DIR/.exo/worktrees' -path '*/.codex/config.toml' -print 2>/dev/null)\" ]] && [[ -n \"\$(bash '$0' --find-tl '$REPO_DIR')\" ]]"
-    tl_config="$(find_worktree_config_by_role tl || true)"
-    if [[ -z "$tl_config" ]]; then
-        record_failure "could not locate TL config after wait"
+
+    wait_for "Codex dev leaf worktree config exists" "[[ -n \"\$(bash '$0' --find-dev '$REPO_DIR')\" ]]"
+    dev_config="$(find_worktree_config_by_role dev || true)"
+    if [[ -z "$dev_config" ]]; then
+        record_failure "could not locate dev leaf config after wait"
     else
-        tl_agent="$(basename "$(dirname "$(dirname "$tl_config")")")"
-        validate_codex_config "tl" "$tl_config" "tl" "$tl_agent" "ExoMonad Root TL Protocol"
+        dev_agent="$(basename "$(dirname "$(dirname "$dev_config")")")"
+        validate_codex_config "dev leaf" "$dev_config" "dev" "$dev_agent" "Dev Agent Protocol"
     fi
 
-    wait_for "Codex worker agent config exists" "[[ -n \"\$(bash '$0' --find-worker '$REPO_DIR')\" ]]"
-    worker_config="$(find_agent_config_by_role worker || true)"
-    if [[ -z "$worker_config" ]]; then
-        record_failure "could not locate worker config after wait"
-    else
-        worker_agent="$(basename "$(dirname "$(dirname "$worker_config")")")"
-        validate_codex_config "worker" "$worker_config" "worker" "$worker_agent" "ExoMonad Worker Agent Protocol"
-    fi
-
-    wait_for "worker Chainlink comment recorded" "grep -R 'CHAINLINK-CODEX-WORKER-COMMENT' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q . || (cd '$REPO_DIR' && chainlink list --json --status all | grep -Fq 'CHAINLINK-CODEX-WORKER-COMMENT')"
-    wait_for "worker Chainlink issue closed" "cd '$REPO_DIR' && chainlink list --json --status closed | grep -Fq 'E2E chainlink codex worker'"
-    wait_for "worker session completion notification recorded" "grep -R 'CHAINLINK-CODEX-WORKER-DONE' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
-    wait_for "TL Chainlink issue close recorded" "grep -R 'CHAINLINK-CODEX-TL-CLOSE' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q . || (cd '$REPO_DIR' && chainlink list --json --status closed | grep -Fq 'E2E chainlink codex worker')"
-    wait_for "worker notify_parent tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'chainlink-codex-worker-codex' | grep 'main.chainlink-codex-tl-codex' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
+    wait_for "dev leaf Chainlink comment recorded" "grep -R 'CHAINLINK-CODEX-WORKER-COMMENT' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q . || (cd '$REPO_DIR' && chainlink list --json --status all | grep -Fq 'CHAINLINK-CODEX-WORKER-COMMENT')"
+    wait_for "dev leaf Chainlink issue closed" "cd '$REPO_DIR' && chainlink list --json --status closed | grep -Fq 'E2E chainlink codex worker'"
+    wait_for "dev leaf session completion notification recorded" "grep -R 'CHAINLINK-CODEX-WORKER-DONE' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
+    wait_for "root Chainlink issue close recorded" "grep -R 'CHAINLINK-CODEX-TL-CLOSE' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q . || (cd '$REPO_DIR' && chainlink list --json --status closed | grep -Fq 'E2E chainlink codex worker')"
+    wait_for "dev leaf notify_parent tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'chainlink-codex-dev-codex' | grep 'main' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
     wait_for "Chainlink lock worktree not created" "cd '$REPO_DIR' && ! git worktree list --porcelain | grep -Fq '.chainlink/.locks-cache' && [[ ! -e '$REPO_DIR/.chainlink/.locks-cache' ]]"
 
     {

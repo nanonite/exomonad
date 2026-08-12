@@ -386,7 +386,7 @@ e2e-oc-rewrite:
 e2e-opencode-tl:
     ./tests/e2e/opencode-tl/run.sh
 
-# Run E2E OpenCode worker test (fork_wave agent_type=opencode, model forwarding, notify_parent)
+# Run E2E OpenCode leaf test (spawn_leaf agent_type=opencode, model forwarding, notify_parent)
 e2e-opencode-worker:
     ./tests/e2e/opencode-worker/run.sh
 
@@ -394,7 +394,7 @@ e2e-opencode-worker:
 e2e-codex-hook-parity:
     nix develop --command cargo nextest run -p exomonad-core --lib codex_hook_hash_matches_installed_codex_cli --run-ignored ignored-only --no-capture
 
-# Run E2E Codex messaging test (send_message + notify_parent tmux delivery)
+# Run E2E Codex messaging test (send_tmux_message + notify_parent delivery)
 e2e-codex-messaging:
     ./tests/e2e/codex-messaging/run.sh
 
@@ -413,34 +413,21 @@ check-e2e-tl-to-worker-messaging:
     bash -n tests/e2e/tl-to-worker-messaging/run.sh
     bash -n tests/e2e/tl-to-worker-messaging/validate.sh
 
-# Run E2E sub-TL worker notify_parent pane-pinning test
+# Run E2E worker notify_parent pane-pinning test
 e2e-subtl-worker-notify:
     ./tests/e2e/subtl-worker-notify/run.sh
 
-# Check E2E sub-TL worker notify harness scripts without launching Codex/tmux
+# Check E2E worker notify harness scripts without launching Codex/tmux
 check-e2e-subtl-worker-notify:
     bash -n tests/e2e/subtl-worker-notify/run.sh
     bash -n tests/e2e/subtl-worker-notify/validate.sh
 
-# Run recursive sub-TL fork_wave E2E for one runtime: claude, codex, or opencode
-e2e-subtl-recursive-fork-wave runtime="codex":
-    ./tests/e2e/subtl-recursive-fork-wave/run.sh {{runtime}}
-
-# Run recursive sub-TL fork_wave E2E across Claude, Codex, and OpenCode
-e2e-subtl-recursive-fork-wave-all:
-    ./tests/e2e/subtl-recursive-fork-wave/run-all.sh
-
-# Check recursive sub-TL fork_wave harness scripts without launching agents/tmux
-check-e2e-subtl-recursive-fork-wave:
-    bash -n tests/e2e/subtl-recursive-fork-wave/run.sh
-    bash -n tests/e2e/subtl-recursive-fork-wave/run-all.sh
-    bash -n tests/e2e/subtl-recursive-fork-wave/validate.sh
 
 # Run E2E chainlink issue create test (chainlink_issue_create MCP tool via ProcessRun)
 e2e-chainlink:
     ./tests/e2e/chainlink/run.sh
 
-# Run E2E Chainlink Codex flow test (Codex TL + Codex worker Chainlink MCP flow)
+# Run E2E Chainlink Codex flow test (root Codex + direct dev leaf Chainlink MCP flow)
 e2e-chainlink-codex:
     ./tests/e2e/chainlink-codex/run.sh
 

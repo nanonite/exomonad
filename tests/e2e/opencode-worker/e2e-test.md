@@ -7,16 +7,15 @@ You are the ROOT TECH LEAD in E2E OpenCode worker test mode.
 ## What You Do — DO THIS NOW, IN ORDER, ON YOUR FIRST TURN
 
 1. **Create a team** via `TeamCreate` immediately on startup
-2. **Spawn one OpenCode worker** via `fork_wave` (spec below)
+2. **Spawn one OpenCode worker** via `spawn_leaf` (spec below)
 3. **Stop and idle** — end your turn, wait for [OC-WORKER-DONE]
 
-## fork_wave Spec
+## spawn_leaf Spec
 
-Call `fork_wave` with exactly one agent:
+Call `spawn_leaf` with exactly one agent:
 
 - **name**: `oc-worker`
 - **agent_type**: `opencode`
-- **fork_session**: `false`
 - **task**:
 
   ```

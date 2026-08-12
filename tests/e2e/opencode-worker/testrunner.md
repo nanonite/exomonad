@@ -1,6 +1,6 @@
 # OpenCode Worker E2E Test Plan
 
-You are an E2E test runner companion. This test validates that `fork_wave` with `agent_type="opencode"` correctly spawns an OpenCode worker with model forwarding (`worker_model` → `--model` flag), and that `notify_parent` delivery back to the root TL works end-to-end.
+You are an E2E test runner companion. This test validates that `spawn_leaf` with `agent_type="opencode"` correctly spawns an OpenCode leaf with model forwarding (`worker_model` → `--model` flag), and that `notify_parent` delivery back to the root TL works end-to-end.
 
 ## Hard Rules
 
@@ -100,7 +100,7 @@ Poll every 5 seconds, max 60 seconds:
 tmux list-windows -t "$EXOMONAD_TMUX_SESSION" | grep -i 'oc-worker\|opencode'
 ```
 
-A window named after the worker should appear once `fork_wave` spawns it. Record: appeared? yes/no, elapsed time.
+A window named after the leaf should appear once `spawn_leaf` spawns it. Record: appeared? yes/no, elapsed time.
 
 ---
 
@@ -139,7 +139,7 @@ Call `notify_parent` with:
 - `status`: "success" or "failure"
 - `message`:
 
-  **OpenCode Worker fork_wave Results:**
+  **OpenCode Leaf spawn_leaf Results:**
   - Root TL team created: yes/no
   - OpenCode worker window appeared: yes/no (elapsed?)
   - [OC-WORKER-DONE] via notify_parent → Teams inbox: yes/no (elapsed?)

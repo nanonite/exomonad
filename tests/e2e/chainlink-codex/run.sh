@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # E2E Chainlink Codex Test
-# Validates Codex TL + Codex worker Chainlink MCP flow:
-#   TL creates issue and checks session status
-#   worker marks session work, comments, ends session
-#   TL closes issue without Chainlink locks after worker notify_parent
+# Validates root Codex + Codex dev leaf Chainlink MCP flow:
+#   root creates the issue
+#   dev leaf marks session work, comments, ends session
+#   root closes the issue after dev leaf notify_parent
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -43,7 +43,7 @@ if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-g
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
 
-for tool in chainlink_issue_create chainlink_session_status chainlink_session_start chainlink_session_work chainlink_issue_comment chainlink_session_end chainlink_issue_close spawn_worker; do
+for tool in chainlink_issue_create chainlink_session_status chainlink_session_start chainlink_session_work chainlink_issue_comment chainlink_session_end chainlink_issue_close spawn_codex; do
     if grep -q "$tool" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
         echo "  MCP tool '$tool': FOUND"
     else
@@ -158,10 +158,7 @@ cat > "$CODEX_HOME_DIR/config.toml" <<EOF
 [projects."$REPO_DIR"]
 trust_level = "trusted"
 
-[projects."$REPO_DIR/.exo/worktrees/chainlink-codex-tl-codex"]
-trust_level = "trusted"
-
-[projects."$REPO_DIR/.exo/agents/chainlink-codex-worker-codex"]
+[projects."$REPO_DIR/.exo/worktrees/chainlink-codex-dev-codex"]
 trust_level = "trusted"
 EOF
 
@@ -186,11 +183,9 @@ echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
 echo ""
 echo "  Chain under test:"
-echo "    Codex root -> Codex TL"
-echo "    Codex TL -> chainlink_issue_create + chainlink_session_status"
-echo "    Codex TL -> spawn_worker(agent_type=codex)"
-echo "    Codex worker -> session_work + comment + session_end"
-echo "    Codex worker -> notify_parent, then TL closes issue"
+echo "    Codex root -> chainlink_issue_create + spawn_codex"
+echo "    Codex dev leaf -> session_work + comment + session_end"
+echo "    Codex dev leaf -> notify_parent, then root closes issue"
 echo "============================================"
 echo ""
 

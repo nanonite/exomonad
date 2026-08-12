@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# E2E Sub-TL Worker Notify Test
-# Validates worker notify_parent delivery into the sub-TL pane 0 while a worker
+# E2E Worker Notify Test
+# Validates worker notify_parent delivery into the root pane 0 while a worker
 # pane is active, covering the tmux pane-pinning fix.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -141,9 +141,6 @@ cat > "$CODEX_HOME_DIR/config.toml" <<EOF
 [projects."$REPO_DIR"]
 trust_level = "trusted"
 
-[projects."$REPO_DIR/.exo/worktrees/subtl-worker-notify-tl-codex"]
-trust_level = "trusted"
-
 [projects."$REPO_DIR/.exo/agents/subtl-worker-notify-worker-codex"]
 trust_level = "trusted"
 EOF
@@ -164,14 +161,13 @@ echo "  Codex config isolated to $CODEX_HOME"
 echo ">>> [Phase 3] Launching exomonad init..."
 echo ""
 echo "============================================"
-echo "  E2E Sub-TL Worker Notify Test Ready"
+echo "  E2E Worker Notify Test Ready"
 echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
 echo ""
 echo "  Chain under test:"
-echo "    Codex root -> Codex sub-TL"
-echo "    Codex sub-TL -> Codex worker pane"
-echo "    Codex worker notify_parent -> sub-TL pane 0"
+echo "    Codex root -> Codex worker pane"
+echo "    Codex worker notify_parent -> root pane 0"
 echo "============================================"
 echo ""
 

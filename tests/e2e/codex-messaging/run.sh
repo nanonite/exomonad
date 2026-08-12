@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # E2E Codex Messaging Test
-# Validates Codex send_message and notify_parent delivery through tmux routing.
+# Validates Codex send_tmux_message and notify_parent delivery through tmux routing.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -145,9 +145,6 @@ cat > "$CODEX_HOME_DIR/config.toml" <<EOF
 [projects."$REPO_DIR"]
 trust_level = "trusted"
 
-[projects."$REPO_DIR/.exo/worktrees/codex-messaging-tl-codex"]
-trust_level = "trusted"
-
 [projects."$REPO_DIR/.exo/worktrees/codex-messaging-dev-codex"]
 trust_level = "trusted"
 EOF
@@ -173,9 +170,9 @@ echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
 echo ""
 echo "  Chain under test:"
-echo "    Codex root -> Codex TL"
-echo "    Codex TL send_message -> Codex dev leaf"
-echo "    Codex TL/dev notify_parent -> parent via tmux"
+echo "    Codex root -> Codex dev leaf"
+echo "    Codex root send_tmux_message -> Codex dev leaf"
+echo "    Codex dev notify_parent -> root via tmux"
 echo "============================================"
 echo ""
 

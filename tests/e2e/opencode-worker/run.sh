@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # E2E OpenCode Worker Test
-# Validates fork_wave with agent_type="opencode": spawns OpenCode worker,
+# Validates spawn_leaf with agent_type="opencode": spawns OpenCode worker,
 # model forwarding (worker_model → --model flag), OpenCode spawn lifecycle,
 # and notify_parent delivery back to the Claude root TL.
 
@@ -162,7 +162,7 @@ model = "sonnet"
 yolo = true
 initial_prompt = """You are in automated E2E OpenCode worker test mode. Do exactly these steps on your first turn and nothing else:
 1. Create a team via TeamCreate.
-2. Call fork_wave with exactly one agent named oc-worker, agent_type='opencode', fork_session=false, and this task: You are an E2E test subject. Write oc-worker-output.txt containing the single line OpenCode worker test passed. Stage and commit it with git add oc-worker-output.txt && git commit -m 'e2e: add oc-worker-output.txt'. Push to your branch. Call notify_parent with status='success' and message='[OC-WORKER-DONE] OpenCode worker test complete. File written and committed.' Then stop.
+2. Call spawn_leaf with name='oc-worker', agent_type='opencode', and this task: You are an E2E test subject. Write oc-worker-output.txt containing the single line OpenCode worker test passed. Stage and commit it with git add oc-worker-output.txt && git commit -m 'e2e: add oc-worker-output.txt'. Push to your branch. Call notify_parent with status='success' and message='[OC-WORKER-DONE] OpenCode worker test complete. File written and committed.' Then stop.
 3. Stop and idle. Do not edit files yourself, do not merge PRs, and wait for [OC-WORKER-DONE]."""
 
 [opencode]
@@ -182,7 +182,7 @@ EOF
 mkdir -p .exo/roles/devswarm/context
 cp "$SCRIPT_DIR/testrunner.md" .exo/roles/devswarm/context/testrunner.md
 
-# Root TL rules: create team, fork_wave one OpenCode worker, idle
+# Root TL rules: create team, spawn_leaf one OpenCode worker, idle
 mkdir -p .claude/rules
 cp "$SCRIPT_DIR/e2e-test.md" .claude/rules/e2e-test.md
 
@@ -207,7 +207,7 @@ echo "  Work dir: $WORK_DIR/repo"
 echo ""
 echo "  Chain under test:"
 echo "    Claude haiku root TL creates team"
-echo "    → fork_wave agent_type=opencode"
+echo "    → spawn_leaf agent_type=opencode"
 echo "    → OpenCode spawns with --model haiku"
 echo "    → worker writes oc-worker-output.txt"
 echo "    → notify_parent → Teams inbox → root TL"

@@ -15,7 +15,7 @@ stopping.
    `merge_pr`.
 3. Confirm both merges through the normal event/inbox path, then stop.
 
-Do not edit files in the root worktree, call `fork_wave`, call `merge_pr`
+Do not edit files in the root worktree, call unsupported spawn tools, call `merge_pr`
 before reviewer approval, skip the review loop, spawn a third child, or stop
 after the first merge. The shadow companion is observing the immutable ledger
 and must not be contacted or treated as a worker.

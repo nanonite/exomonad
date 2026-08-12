@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E5 :: E5.2 Repoint or delete fork_wave e2e tests (#747)
 - E5 :: E5.1 Remove fork_wave from code (#746)
 - E4 :: E4.5 Confirm no Rust timeout path permits merge (#745)
 - E4 :: E4.4 Decide where reviewer disposal lives (#744)

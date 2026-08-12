@@ -8,28 +8,27 @@ writes its report below the temporary E2E work directory.
 | bucket | count |
 |---|---:|
 | MATCH | 0 |
-| DIVERGENT | 3 |
-| EXTRA | 1 |
+| DIVERGENT | 4 |
+| EXTRA | 0 |
 | MISSING | 0 |
 
-The fixture deliberately preserves both sides, including the fan-out call,
-so replay tests cannot hide an action by dropping noisy or unmatched rows.
+The fixture deliberately preserves both sides, including both direct leaf
+calls, so replay tests cannot hide an action by dropping noisy or unmatched rows.
 
 ## Triage
 
 Every non-MATCH row is listed below. In this report format, `EXTRA` means an
 unmatched shadow action; an actual-only action would be `MISSING`.
 
-### Child fan-out — DIVERGENT and EXTRA
+### Child dispatch — DIVERGENT
 
 Classification: accepted-intentional-difference. The shadow loop receives one
 `ChildSpawned` event per child and records one deterministic `dispatch` intent
-for each child. The fixture actual stream records the equivalent fan-out as one
-`fork_wave` tool call whose child list contains both slices. The first child is
-therefore paired as a DIVERGENT row, and the second shadow dispatch remains an
-EXTRA row because the actual fan-out already includes it. No child is lost and
-the event-coverage audit marks `agent.spawned` as covered; this is a difference
-in action granularity, not a shadow state or coverage bug. Owner: M3 shadow
+for each child. The fixture actual stream records the equivalent work as one
+`spawn_leaf` tool call per slice, so both child rows are paired as DIVERGENT.
+No child is lost and the event-coverage audit marks `agent.spawned` as covered;
+this is a difference in action vocabulary, not a shadow state or coverage bug.
+Owner: M3 shadow
 maintainer. Status: accepted for the read-only M3 gate.
 
 ### Merge `shadow-slice-a` — DIVERGENT

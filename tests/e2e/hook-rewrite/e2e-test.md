@@ -10,7 +10,7 @@ You are the ROOT TECH LEAD in E2E OC rewrite test mode. An OpenCode companion is
 
 ## NEVER Do These Things
 
-- NEVER spawn agents (no fork_wave, spawn_leaf, spawn_worker)
+- NEVER spawn agents (no spawn_leaf, spawn_worker)
 - NEVER create files, branches, or commits
 - NEVER run `gh` commands
 - NEVER curl the server socket directly
