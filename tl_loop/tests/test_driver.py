@@ -14,10 +14,12 @@ from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.fsm.event import PRFiled, PRUpdated
-from tl_loop.fsm.phase import TLPhase
+from tl_loop.fsm.phase import TLPhase, TLPlanning
 from tl_loop.loop.driver import (
     DepthLimitExceeded,
     LoopLimitExceeded,
+    _route_ci_event,
+    _route_review_event,
     SubTLTask,
     TLLoopConfig,
     WorkerTask,
@@ -29,9 +31,10 @@ from tl_loop.loop.shadow import TLEventDecoder, _update_slices
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
+from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import BudgetLedger, SliceState, SliceStatus, Verdict
-from tl_loop.state.store import load as load_state
+from tl_loop.state.store import RunStore, create, load as load_state
 
 
 @dataclass
@@ -65,6 +68,42 @@ class RecordingTransport:
         del role, name
         self.calls.append((tool_name, arguments))
         return {"success": True, "result": None}
+
+
+@dataclass
+class ReviewRepairTransport(RecordingTransport):
+    """Effect double that exposes the PR state required by compose_repair."""
+
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        del role, name
+        self.calls.append((tool_name, arguments))
+        if tool_name == "watcher_pr_state":
+            return {
+                "success": True,
+                "result": {
+                    "open": True,
+                    "merged": False,
+                    "head_branch": "main.leaf-a",
+                    "head_sha": "head-a",
+                },
+            }
+        return {"success": True, "result": None}
+
+
+@dataclass
+class ReviewBackend:
+    responses: list[object]
+    requests: list[RlmRequest] = field(default_factory=list)
+
+    def complete(self, request: RlmRequest) -> object:
+        self.requests.append(request)
+        return self.responses.pop(0)
 
 
 def test_active_loop_dispatches_direct_children_and_merges_leaf(
@@ -231,6 +270,223 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
     slice_state = result.final_state.slices["leaf-a"]
     assert slice_state.reviewer_attempt == {"head-a": 1}
     assert source.acknowledged == [1, 2]
+
+
+def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -> None:
+    backend = ReviewBackend(
+        [
+            RlmResponse(
+                {
+                    "verdict": "NO-GO",
+                    "reviewed_head": "head-a",
+                    "reasons": [
+                        {
+                            "severity": "blocking",
+                            "file": "src/leaf.py",
+                            "line": 8,
+                            "claim": "The failure path is unhandled",
+                        }
+                    ],
+                    "blocking_count": 1,
+                }
+            ),
+            RlmResponse(
+                {
+                    "root_cause": "The failure path is unhandled in src/leaf.py",
+                    "proposed_solution": "Handle the failure in src/leaf.py",
+                    "read_first": ["src/leaf.py"],
+                    "steps": ["Update src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                    "boundary": ["Only edit src/leaf.py"],
+                    "done_criteria": ["The failure path is covered"],
+                }
+            ),
+        ]
+    )
+    transport = ReviewRepairTransport()
+    store = _review_store(tmp_path)
+    event = _review_event()
+    state = store.load()
+    config = TLLoopConfig(
+        active=True,
+        review_model_choice=_review_choice(backend),
+        review_policy_path=Path(".exo/review-policy.toml"),
+    )
+    effects_log: list[object] = []
+
+    _route_review_event(
+        WorkPlan.from_mapping(
+            {
+                "leaves": [
+                    {
+                        "name": "leaf-a",
+                        "task": "implement the requested change",
+                        "boundary": ["src/leaf.py"],
+                        "verify": ["just tl-loop-test"],
+                        "done_criteria": ["the failure path is covered"],
+                    }
+                ]
+            }
+        ),
+        store,
+        state,
+        TLPlanning(),
+        event,
+        1,
+        config,
+        EffectClient(transport),
+        effects_log,
+    )
+
+    restored = store.load().slices["leaf-a"]
+    assert [request.name for request in backend.requests] == [
+        "adjudicate_review",
+        "compose_repair",
+    ]
+    assert [name for name, _ in transport.calls] == [
+        "watcher_pr_state",
+        "resume_pr",
+    ]
+    assert restored.status is SliceStatus.REPAIRING
+    assert restored.reviewed_head == "head-a"
+    assert restored.verdict is Verdict.NO_GO
+    assert restored.repair_attempts == 1
+    assert restored.review_findings["head-a"][0]["path"] == "src/leaf.py"
+    assert all(name != "spawn_leaf" for name, _ in transport.calls)
+
+
+def test_ci_failure_records_head_and_resumes_same_pr(tmp_path: Path) -> None:
+    backend = ReviewBackend(
+        [
+            RlmResponse(
+                {
+                    "root_cause": "CI exposed a failure in src/leaf.py",
+                    "proposed_solution": "Fix the failure in src/leaf.py",
+                    "read_first": ["src/leaf.py"],
+                    "steps": ["Update src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                    "boundary": ["Only edit src/leaf.py"],
+                    "done_criteria": ["CI passes"],
+                }
+            )
+        ]
+    )
+    transport = ReviewRepairTransport()
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    state = store.load()
+    _route_ci_event(
+        store,
+        state,
+        TLPlanning(),
+        _ci_failure_event(),
+        1,
+        TLLoopConfig(
+            active=True,
+            review_model_choice=_review_choice(backend),
+            review_policy_path=Path(".exo/review-policy.toml"),
+        ),
+        EffectClient(transport),
+        [],
+    )
+
+    restored = store.load().slices["leaf-a"]
+    assert restored.ci_state == {"head-a": "failure"}
+    assert restored.status is SliceStatus.REPAIRING
+    assert restored.verdict is Verdict.NO_GO
+    assert [name for name, _ in transport.calls] == [
+        "watcher_pr_state",
+        "resume_pr",
+    ]
+
+
+def _review_choice(backend: ReviewBackend) -> RlmModelChoice:
+    return RlmModelChoice(
+        model_id="test-model",
+        backend=backend,
+        store=RlmCallStore(),
+        context_length=10_000,
+    )
+
+
+def _review_store(tmp_path: Path, *, verdict: Verdict | None = None) -> RunStore:
+    store = RunStore("review-run", tmp_path)
+    create("review-run", {}, root_dir=tmp_path)
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": SliceState(
+                id="leaf-a",
+                status=SliceStatus.IN_REVIEW,
+                paths=("src/leaf.py",),
+                depends_on=(),
+                base_ref="main",
+                test_plan=("just tl-loop-test",),
+                agent_type="codex",
+                model="test-model",
+                branch="main.leaf-a",
+                worktree=".worktrees/leaf-a",
+                pr_number=42,
+                reviewed_head="head-a",
+                attempts=1,
+                verdict=verdict,
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+    return store
+
+
+def _review_event() -> EventEnvelope:
+    return project(
+        {
+            "type": "pr.review",
+            "run_seq": 1,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "kind": "changes_requested",
+                "findings": [
+                    {
+                        "severity": "blocking",
+                        "path": "src/leaf.py",
+                        "rationale": "The failure path is unhandled",
+                    }
+                ],
+                "diff": {
+                    "diff": "@@ -1 +1 @@\\n-old\\n+new\\n",
+                    "lines_changed": 1,
+                    "paths": ["src/leaf.py"],
+                    "review_rounds": 1,
+                },
+            },
+        }
+    )
+
+
+def _ci_failure_event() -> EventEnvelope:
+    return project(
+        {
+            "type": "ci.status_changed",
+            "run_seq": 1,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "status": "failure",
+                "message": "tests failed",
+            },
+        }
+    )
 
 
 def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> None:

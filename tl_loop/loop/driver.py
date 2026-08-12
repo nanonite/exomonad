@@ -43,6 +43,8 @@ from tl_loop.loop.review import (
     watcher_head,
 )
 from tl_loop.loop.schedule import ScheduleDeadlock, ready
+from tl_loop.rlm.adjudicate import adjudicate_review
+from tl_loop.rlm.repair import RepairHandoff, compose_repair
 from tl_loop.select.agent_type import select_agent_type, selection_failure
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.learned_policy import LearnedPolicy
@@ -50,6 +52,7 @@ from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model
 from tl_loop.select.policy import HarnessPolicy, load_policy
 from tl_loop.state.schema import (
+    CI_STATUS_VALUES,
     BudgetLedger,
     GoalState,
     ParkCause,
@@ -219,6 +222,7 @@ class TLLoopConfig:
     role: str = "worker"
     review_policy_path: str | Path | None = None
     enable_reviewer_spawn: bool = False
+    review_model_choice: object | None = None
     branch: str = "main"
     worktree: str | Path | None = None
     agent_id: str | None = None
@@ -455,7 +459,18 @@ def _run_loop(
         if config.heartbeat is not None:
             state = _note_heartbeat_progress(store, state)
         if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW}:
-            state = _record_review_event(store, state, phase, event, event_seq)
+            if _review_workflow_enabled(config):
+                state = _route_review_event(
+                    plan, store, state, phase, event, event_seq, config, effects, effects_log
+                )
+            else:
+                state = _record_review_event(store, state, phase, event, event_seq)
+            source.acknowledge(event)
+            continue
+        if event.kind is EventKind.CI_STATUS_CHANGED:
+            state = _route_ci_event(
+                store, state, phase, event, event_seq, config, effects, effects_log
+            )
             source.acknowledge(event)
             continue
         try:
@@ -926,17 +941,31 @@ def _record_review_event(
     event: EventEnvelope,
     event_seq: int,
 ) -> RunState:
-    slice_id = event.slice_id or event.agent_id
+    slice_id = _review_slice_id(event, state)
     if slice_id is None:
         raise TLLoopError(f"{event.event_type!r} has no slice identity")
     current = state.slices.get(slice_id)
     if current is None:
         raise TLLoopError(f"review event references unknown slice {slice_id!r}")
+    findings = _event_findings(event)
+    if event.head_sha is None:
+        if findings is not None:
+            raise TLLoopError(f"{event.event_type!r} findings have no head SHA")
+        return store.checkpoint(phase, state.slices, state.budgets, event_seq)
+    review_findings = _review_findings(current, event.head_sha, findings)
+    if current.reviewed_head is not None and current.reviewed_head != event.head_sha:
+        updated = dict(state.slices)
+        updated[slice_id] = replace(current, review_findings=review_findings)
+        return store.checkpoint(phase, updated, state.budgets, event_seq)
     verdict = _review_verdict(event)
     if verdict is None:
-        return store.checkpoint(phase, state.slices, state.budgets, event_seq)
-    if event.head_sha is None:
-        raise TLLoopError(f"{event.event_type!r} verdict has no reviewed head SHA")
+        updated = dict(state.slices)
+        updated[slice_id] = replace(
+            current,
+            pr_number=event.pr_number or current.pr_number,
+            review_findings=review_findings,
+        )
+        return store.checkpoint(phase, updated, state.budgets, event_seq)
     updated = dict(state.slices)
     updated[slice_id] = replace(
         current,
@@ -944,8 +973,294 @@ def _record_review_event(
         reviewed_head=event.head_sha,
         verdict=verdict,
         verdict_at=event.observed_at,
+        review_findings=review_findings,
     )
     return store.checkpoint(phase, updated, state.budgets, event_seq)
+
+
+def _review_workflow_enabled(config: TLLoopConfig) -> bool:
+    return config.active and config.review_model_choice is not None
+
+
+def _review_slice_id(event: EventEnvelope, state: RunState) -> str | None:
+    direct = event.slice_id or event.agent_id
+    if direct in state.slices:
+        return direct
+    if event.pr_number is None:
+        return direct
+    matches = [
+        slice_id
+        for slice_id, current in state.slices.items()
+        if current.pr_number == event.pr_number
+    ]
+    return matches[0] if len(matches) == 1 else direct
+
+
+def _event_findings(event: EventEnvelope) -> list[dict[str, str]] | None:
+    if "findings" not in event.data:
+        return None
+    raw_findings = event.data["findings"]
+    if not isinstance(raw_findings, list):
+        raise TLLoopError(f"{event.event_type!r} findings must be an array")
+    findings: list[dict[str, str]] = []
+    for index, raw_finding in enumerate(raw_findings):
+        if not isinstance(raw_finding, Mapping):
+            raise TLLoopError(f"{event.event_type!r} findings[{index}] must be an object")
+        finding: dict[str, str] = {}
+        for key in ("severity", "path", "rationale"):
+            value = raw_finding.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise TLLoopError(
+                    f"{event.event_type!r} findings[{index}].{key} must be non-empty"
+                )
+            finding[key] = value
+        findings.append(finding)
+    return findings
+
+
+def _review_findings(
+    current: SliceState,
+    head_sha: str,
+    findings: list[dict[str, str]] | None,
+) -> Mapping[str, tuple[Mapping[str, str], ...]]:
+    updated = dict(current.review_findings)
+    if findings is not None:
+        updated[head_sha] = tuple(findings)
+    return updated
+
+
+def _route_review_event(
+    plan: WorkPlan,
+    store: RunStore,
+    state: RunState,
+    phase: PhaseValue,
+    event: EventEnvelope,
+    event_seq: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    slice_id = _review_slice_id(event, state)
+    if slice_id is None:
+        raise TLLoopError(f"{event.event_type!r} has no slice identity")
+    current = state.slices.get(slice_id)
+    if current is None:
+        raise TLLoopError(f"review event references unknown slice {slice_id!r}")
+    head_sha = event.head_sha
+    findings = _event_findings(event)
+    if head_sha is None:
+        raise TLLoopError(f"{event.event_type!r} findings have no head SHA")
+    review_findings = _review_findings(current, head_sha, findings)
+    if findings is None:
+        LOGGER.warning(
+            "[TL loop] ignoring review without binding findings target=%s head=%s",
+            slice_id,
+            head_sha,
+        )
+        updated = dict(state.slices)
+        updated[slice_id] = replace(current, review_findings=review_findings)
+        return store.checkpoint(phase, updated, state.budgets, event_seq)
+    if current.reviewed_head is not None and current.reviewed_head != head_sha:
+        LOGGER.warning(
+            "[TL loop] ignoring stale review target=%s reviewed=%s event=%s",
+            slice_id,
+            current.reviewed_head,
+            head_sha,
+        )
+        updated = dict(state.slices)
+        updated[slice_id] = replace(current, review_findings=review_findings)
+        return store.checkpoint(phase, updated, state.budgets, event_seq)
+    leaf = next((candidate for candidate in plan.leaves if candidate.name == slice_id), None)
+    if leaf is None:
+        raise TLLoopError(f"review event references non-leaf slice {slice_id!r}")
+    criteria = compose_acceptance_criteria(current, leaf)
+    result = adjudicate_review(
+        _review_diff(event),
+        findings,
+        list(criteria),
+        head_sha,
+        model_choice=config.review_model_choice,
+        policy_path=config.review_policy_path or Path(".exo/review-policy.toml"),
+        chainlink_issue_id=config.chainlink_issue_id,
+        issue_commenter=cast(EffectClient, effects),
+    )
+    updated = dict(state.slices)
+    updated[slice_id] = replace(
+        current,
+        pr_number=event.pr_number or current.pr_number,
+        reviewed_head=result.reviewed_head,
+        verdict=result.verdict,
+        verdict_at=event.observed_at,
+        review_findings=review_findings,
+    )
+    state = store.checkpoint(phase, updated, state.budgets, event_seq)
+    if result.verdict is Verdict.NO_GO:
+        return _route_repair(
+            store,
+            state,
+            phase,
+            event_seq,
+            slice_id,
+            result,
+            config,
+            effects,
+            effects_log,
+        )
+    return state
+
+
+def _review_diff(event: EventEnvelope) -> Mapping[str, object] | str:
+    candidate = event.data.get("diff", event.data.get("patch"))
+    if isinstance(candidate, (Mapping, str)):
+        return candidate
+    if candidate is not None:
+        raise TLLoopError(f"{event.event_type!r} diff must be an object or string")
+    return event.data
+
+
+def _route_ci_event(
+    store: RunStore,
+    state: RunState,
+    phase: PhaseValue,
+    event: EventEnvelope,
+    event_seq: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    slice_id = _review_slice_id(event, state)
+    if slice_id is None:
+        raise TLLoopError(f"{event.event_type!r} has no slice identity")
+    current = state.slices.get(slice_id)
+    if current is None:
+        raise TLLoopError(f"CI event references unknown slice {slice_id!r}")
+    head_sha = event.head_sha
+    if head_sha is None:
+        raise TLLoopError(f"{event.event_type!r} has no head SHA")
+    status = _ci_status(event)
+    ci_state = dict(current.ci_state)
+    ci_state[head_sha] = status
+    updated = dict(state.slices)
+    updated[slice_id] = replace(
+        current,
+        pr_number=event.pr_number or current.pr_number,
+        ci_state=ci_state,
+        verdict=Verdict.NO_GO if status == "failure" else current.verdict,
+        verdict_at=event.observed_at if status == "failure" else current.verdict_at,
+    )
+    state = store.checkpoint(phase, updated, state.budgets, event_seq)
+    should_repair = (
+        _review_workflow_enabled(config)
+        and status == "failure"
+        and current.reviewed_head == head_sha
+        and current.status is not SliceStatus.REPAIRING
+        and current.ci_state.get(head_sha) != "failure"
+    )
+    if not should_repair:
+        return state
+    reason = {
+        "severity": "blocking",
+        "file": _ci_reason_file(event),
+        "line": 0,
+        "claim": _ci_reason(event),
+    }
+    return _route_repair(
+        store,
+        state,
+        phase,
+        event_seq,
+        slice_id,
+        {"verdict": Verdict.NO_GO.value, "reasons": [reason]},
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _ci_status(event: EventEnvelope) -> str:
+    value = event.ci_status
+    aliases = {"passed": "success", "error": "failure", "cancelled": "failure"}
+    status = aliases.get(value, value)
+    if status not in CI_STATUS_VALUES:
+        raise TLLoopError(f"{event.event_type!r} has unsupported CI status {value!r}")
+    return status
+
+
+def _ci_reason(event: EventEnvelope) -> str:
+    value = event.data.get("message", event.notification)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return "CI reported a failure for the reviewed PR head"
+
+
+def _ci_reason_file(event: EventEnvelope) -> str:
+    value = event.data.get("path")
+    return value.strip() if isinstance(value, str) and value.strip() else "CI"
+
+
+def _route_repair(
+    store: RunStore,
+    state: RunState,
+    phase: PhaseValue,
+    event_seq: int,
+    slice_id: str,
+    review: object,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    current = state.slices.get(slice_id)
+    if current is None or current.pr_number is None:
+        raise TLLoopError(f"repair event references slice without PR {slice_id!r}")
+    live = cast(EffectClient, effects)
+    pr = {
+        "pr_number": current.pr_number,
+        "paths": list(current.paths),
+        "slice_id": slice_id,
+        "attempts": current.attempts,
+    }
+    effects_log.append(
+        EffectIntent(
+            "watcher_pr_state",
+            slice_id,
+            {"pr_number": current.pr_number},
+            True,
+        )
+    )
+    handoff = compose_repair(
+        pr,
+        Verdict.NO_GO,
+        review,
+        client=live,
+        model_choice=config.review_model_choice,
+        store=store,
+        slice_id=slice_id,
+    )
+    effects_log.append(
+        EffectIntent(
+            "resume_pr",
+            slice_id,
+            _repair_arguments(current.pr_number, handoff),
+            True,
+        )
+    )
+    refreshed = store.load()
+    return store.checkpoint(phase, refreshed.slices, refreshed.budgets, event_seq)
+
+
+def _repair_arguments(pr_number: int, handoff: RepairHandoff) -> dict[str, object]:
+    root_cause = handoff.root_cause
+    proposed_solution = handoff.proposed_solution
+    return {
+        "pr_number": pr_number,
+        "task": proposed_solution,
+        "context": f"ROOT CAUSE: {root_cause}\nPROPOSED SOLUTION: {proposed_solution}",
+        "read_first": list(handoff.read_first),
+        "steps": list(handoff.steps),
+        "verify": list(handoff.verify),
+        "boundary": list(handoff.boundary),
+        "done_criteria": list(handoff.done_criteria),
+    }
 
 
 def _review_verdict(event: EventEnvelope) -> Verdict | None:
