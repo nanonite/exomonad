@@ -159,7 +159,7 @@ Concretely:
 ```
 in/agent/<agent_id>/steering        -> enqueue_batch(agent_id, class=steering, …)
 in/agent/<agent_id>/follow_up       -> enqueue_batch(agent_id, class=follow_up, …)
-obs/run/<run_id>/slice/<slice_id>   -> ledger projection of slice transitions
+obs/event/pr.review/<run_id>/<slice_id> -> ledger view of the `pr.review` event
 signal/park/<run_id>/<cause>        -> park cause reaching the operator
 ```
 

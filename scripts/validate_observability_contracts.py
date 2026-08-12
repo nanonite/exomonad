@@ -199,13 +199,45 @@ def validate_fixtures(fixtures: dict[str, Any], event_types: set[str], rule_ids:
         raise ContractError("fixture bundle: required event contracts do not match the registry")
 
 
+def validate_topic_mappings(mapping: dict[str, Any], event_types: set[str]) -> None:
+    require_keys(mapping, {"contract_id", "version", "obs_topics"}, "topic mappings")
+    if mapping["version"] != 1:
+        raise ContractError("topic mappings: version must be 1")
+    topics = mapping["obs_topics"]
+    if not isinstance(topics, list) or not topics:
+        raise ContractError("topic mappings: obs_topics must be non-empty")
+
+    seen_topics: set[str] = set()
+    for index, entry in enumerate(topics):
+        context = f"topic mappings obs_topics[{index}]"
+        require_keys(entry, {"topic", "event_type"}, context)
+        topic = entry["topic"]
+        event_type = entry["event_type"]
+        if not isinstance(topic, str) or not isinstance(event_type, str):
+            raise ContractError(f"{context}: topic and event_type must be strings")
+        if topic in seen_topics:
+            raise ContractError(f"{context}: duplicate topic {topic!r}")
+        seen_topics.add(topic)
+        parts = topic.split("/")
+        if len(parts) != 3 or parts[0] != "obs" or parts[1] != "event":
+            raise ContractError(f"{context}: topic must be obs/event/<event_type>")
+        if parts[2] != event_type:
+            raise ContractError(f"{context}: topic identity does not match event_type")
+        if event_type not in event_types:
+            raise ContractError(
+                f"{context}: event_type is absent from the event registry: {event_type}"
+            )
+
+
 def validate(root: Path) -> None:
     registry = load_json(root / "docs/observability/event-registry.json")
     contract = load_json(root / "docs/observability/expected-events.v1.json")
     measurement = load_json(root / "docs/observability/measurement-contract.v1.json")
     fixtures = load_json(root / "docs/observability/fixtures/phase0-contract-fixtures.json")
+    topic_mapping = load_json(root / "docs/observability/topic-mappings.v1.json")
     event_types = validate_registry(registry)
     rule_ids = validate_expected_events(contract, event_types)
+    validate_topic_mappings(topic_mapping, event_types)
     required_measurement_keys = {
         "contract_id",
         "version",

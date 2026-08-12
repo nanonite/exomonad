@@ -4,6 +4,8 @@ These files freeze the Phase 0 contracts used by the append-only observability p
 
 - `event-registry.json` defines the versioned envelope, event namespaces, payload classes,
   emitter sources, and compatibility rules.
+- `topic-mappings.v1.json` defines `obs/` views over those event identities; the
+  contract validator rejects a topic whose event counterpart is absent.
 - `expected-events.v1.json` defines deterministic denominator rules for required workflow
   transitions.
 - `fixtures/phase0-contract-fixtures.json` provides non-sensitive multi-harness coverage

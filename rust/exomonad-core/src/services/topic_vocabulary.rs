@@ -142,6 +142,32 @@ impl InTopic {
     }
 }
 
+/// An observation topic that names one existing ledger event identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObsTopic {
+    pub event_type: String,
+}
+
+impl ObsTopic {
+    /// Parse exactly `obs/event/<event_type>`.
+    ///
+    /// The registry counterpart is checked by the observability contract gate;
+    /// this parser only enforces the topic shape and preserves the identity.
+    pub fn parse(topic: &str) -> Result<Self> {
+        let segments = parse_topic(topic)?;
+        if segments.len() != 3 || segments[0] != "obs" || segments[1] != "event" {
+            bail!("obs topic must be obs/event/<event_type>")
+        }
+        Ok(Self {
+            event_type: segments[2].clone(),
+        })
+    }
+
+    pub fn topic(&self) -> Result<String> {
+        serialize_topic(&["obs", "event", self.event_type.as_str()])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +214,14 @@ mod tests {
         assert_eq!(result.batch.queue_class, QueueClass::FollowUp);
         assert_eq!(result.batch.items[0].content, "follow up");
         assert!(!store.has_unread("agent-a")?);
+        Ok(())
+    }
+
+    #[test]
+    fn obs_topic_preserves_the_existing_event_identity() -> Result<()> {
+        let topic = ObsTopic::parse("obs/event/pr.review")?;
+        assert_eq!(topic.event_type, "pr.review");
+        assert_eq!(topic.topic()?, "obs/event/pr.review");
         Ok(())
     }
 
