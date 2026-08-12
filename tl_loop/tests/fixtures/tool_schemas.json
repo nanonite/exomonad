@@ -145,9 +145,20 @@
       "description": "Spawn only a reviewer for an existing open Forgejo PR. Returns already_active=true without spawning when a reviewer is still running, unless force=true.",
       "inputSchema": {
         "properties": {
+          "acceptance_criteria": {
+            "description": "TL-owned acceptance criteria supplied to the reviewer",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "force": {
             "description": "Spawn a fresh reviewer even if a reviewer for this PR is already active. Defaults to false.",
             "type": "boolean"
+          },
+          "head_sha": {
+            "description": "Exact PR head SHA that the reviewer must inspect",
+            "type": "string"
           },
           "pr_number": {
             "description": "Existing open PR number to review",
@@ -156,6 +167,8 @@
         },
         "required": [
           "pr_number",
+          "head_sha",
+          "acceptance_criteria",
           "force"
         ],
         "type": "object"

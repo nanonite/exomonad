@@ -172,8 +172,17 @@ class EffectClient:
         _put(arguments, "agent_type", agent_type)
         return self._call("spawn_worker", arguments)
 
-    def spawn_reviewer(self, *, pr_number: int, force: bool) -> ToolResult:
-        return self._call("spawn_reviewer", {"pr_number": pr_number, "force": force})
+    def spawn_reviewer(
+        self,
+        *,
+        pr_number: int,
+        head_sha: str,
+        acceptance_criteria: StringList,
+        force: bool,
+    ) -> ToolResult:
+        arguments: JsonObject = {"pr_number": pr_number, "head_sha": head_sha, "force": force}
+        _put_list(arguments, "acceptance_criteria", acceptance_criteria)
+        return self._call("spawn_reviewer", arguments)
 
     def cleanup_reviewer_leaf(self, *, pr_number: int) -> ToolResult:
         return self._call("cleanup_reviewer_leaf", {"pr_number": pr_number})
