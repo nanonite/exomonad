@@ -19,6 +19,8 @@ pub mod forgejo_ci;
 pub mod git;
 pub mod git_worktree;
 pub mod github;
+pub mod guidance_adapters;
+pub mod guidance_queue;
 pub mod immutable_ledger;
 pub mod inbox_store;
 pub mod inbox_watcher;
@@ -65,6 +67,15 @@ pub use self::filesystem::FileSystemService;
 pub use self::forgejo::ForgejoClient;
 pub use self::git_worktree::GitWorktreeService;
 pub use self::github::GitHubClient;
+pub use self::guidance_adapters::{
+    AcceptanceConfidence, AcceptanceKind, BoundaryEvidence, BoundaryPhase, GuidanceRuntimeAdapter,
+    RuntimeAcceptanceEvidence, RuntimeKind, TransportAttempt, TransportOutcome,
+};
+pub use self::guidance_queue::{
+    GuidanceAckResult, GuidanceBatch, GuidanceBatchRequest, GuidanceConsumer,
+    GuidanceEnqueueResult, GuidanceIdentity, GuidanceItem, GuidanceItemInput, GuidanceState,
+    QueueClass,
+};
 pub use self::immutable_ledger::{
     resolve_superseded_events, sequence_status, LedgerEvent, LedgerRecord, LedgerWriter,
 };

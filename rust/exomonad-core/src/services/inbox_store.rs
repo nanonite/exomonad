@@ -79,7 +79,9 @@ impl InboxStore {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .context("count inbox messages before clear")?;
         conn.execute_batch(
-            "DELETE FROM messages;
+            "DELETE FROM guidance_items;
+             DELETE FROM guidance_batches;
+             DELETE FROM messages;
              DELETE FROM agent_inbox_meta;",
         )
         .context("failed to clear inbox")?;
@@ -416,6 +418,7 @@ impl InboxStore {
         let mut conn = self.connection()?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS messages (
                id          INTEGER PRIMARY KEY,
                from_agent  TEXT    NOT NULL,
@@ -437,6 +440,7 @@ impl InboxStore {
              );",
         )
         .context("failed to migrate inbox database")?;
+        super::guidance_queue::migrate(&conn)?;
         ensure_column(&conn, "agent_inbox_meta", "last_poke_at", "INTEGER")?;
         ensure_column(&conn, "agent_inbox_meta", "last_poke_message_id", "INTEGER")?;
         ensure_column(&conn, "agent_inbox_meta", "poke_backoff_secs", "INTEGER")?;
@@ -445,7 +449,7 @@ impl InboxStore {
         Ok(())
     }
 
-    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
+    pub(crate) fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
         self.conn
             .lock()
             .map_err(|_| anyhow::anyhow!("inbox database mutex poisoned"))
@@ -456,7 +460,7 @@ impl InboxStore {
 /// branch). This is a pure structural strip: semantic recipient resolution
 /// (e.g. a top-level branch like `main` belonging to the root agent) happens at
 /// the notify_parent source via `delivery::canonical_parent_recipient`, not here.
-fn normalize_agent_id(agent_id: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn normalize_agent_id(agent_id: &str) -> std::borrow::Cow<'_, str> {
     match agent_id.rsplit_once('.') {
         Some((_, bare)) if !bare.is_empty() => std::borrow::Cow::Borrowed(bare),
         _ => std::borrow::Cow::Borrowed(agent_id),
@@ -639,7 +643,7 @@ where
         .context("failed to decode inbox rows")
 }
 
-fn now_epoch_secs() -> i64 {
+pub(crate) fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

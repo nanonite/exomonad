@@ -289,6 +289,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Implement durable steering queue and runtime adapters (#762)
 - Move timeout and stall classification into the TL loop (#761)
 - Remove watcher merge-ready compatibility actions (#760)
 - Enforce reviewed-head and passing-CI gates inside merge capability (#759)
