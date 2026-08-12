@@ -50,6 +50,7 @@ pub mod supervisor_registry;
 pub mod synthetic_members;
 pub mod tmux_events;
 pub mod tmux_ipc;
+pub mod topic_vocabulary;
 pub mod tui_consumption;
 pub mod worktree_event_watcher;
 
@@ -109,6 +110,9 @@ pub use self::session_state::{
 };
 pub use self::sink_health::{read as read_sink_health, SinkHealth};
 pub use self::supervisor_registry::SupervisorRegistry;
+pub use self::topic_vocabulary::{
+    decode_segment, encode_segment, parse_topic, serialize_topic, InTopic,
+};
 pub use self::worktree_event_watcher::WatcherRuntimeState;
 use claude_teams_bridge::TeamRegistry;
 use std::path::PathBuf;

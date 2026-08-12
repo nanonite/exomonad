@@ -250,6 +250,24 @@ impl InboxStore {
         Ok(result)
     }
 
+    /// Resolve an `in/` topic onto the existing durable enqueue operation.
+    pub fn enqueue_in_topic(
+        &self,
+        topic: &str,
+        items: Vec<GuidanceItemInput>,
+        identity: GuidanceIdentity,
+        idempotency_key: Option<String>,
+        source_message_id: Option<i64>,
+    ) -> Result<GuidanceEnqueueResult> {
+        let destination = super::topic_vocabulary::InTopic::parse(topic)?;
+        self.enqueue_batch(destination.into_request(
+            items,
+            identity,
+            idempotency_key,
+            source_message_id,
+        ))
+    }
+
     /// Atomically retain a legacy messages row and link it from the durable
     /// batch before any runtime transport is attempted.
     pub fn enqueue_batch_with_compatibility(
