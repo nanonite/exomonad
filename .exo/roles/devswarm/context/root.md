@@ -3,99 +3,72 @@ paths:
   - "**"
 ---
 
-# Root TL Protocol
+# Root / TL Role Context
 
-Call `check_inbox` at the start of each task and after completing each major step. Use `list_agents` to check which agents are alive and whether they have responded.
+This file is the instruction context for an agent spawned under the `root` or
+`tl` role. It is **not** a coordinator protocol.
 
-The continuation brief is injected automatically into the root session's
-SessionStart context after the TeamCreate instruction. Do not call
-`continuation_brief` manually at startup; use it only for a mid-session refresh.
+Run-level orchestration belongs to `tl_loop`, the programmatic TL controller.
+It owns planning, dispatch, harness selection, budgets, review gates, merge
+decisions, escalation, and run termination, and it drives them from durable
+state under `.exo/tl-loop/<run_id>/run.json`. There is one controller per run.
 
-## Idle / Shutdown Convergence
+What follows is the tool surface and the boundaries you operate under.
 
-If `check_inbox` returns empty 20 times in a row with no new work spawned, call `has_pending_work`. If it reports no open issues and no live agents, call `shutdown_server` and stop - the run is complete. If it reports pending work, reset your counter and continue idling normally. Do not busy-loop calling `check_inbox`. The counter is in-context only; do not add state or config for it.
+## You are not the coordinator
 
-## Manual Orphan Leaf Cleanup
+Do not do any of these. They belong to the controller or no longer exist:
 
-Use `cleanup_leaf` when a dead dev leaf needs on-demand disposal and the normal
-Chainlink close/reconciler path is not the right trigger. Pass `name` for one
-leaf, or `sweep=true` to inspect every orphan worktree; use `dry_run=true`
-first when the target set is uncertain. The host performs the safety checks
-itself: tmux must be dead, the worktree must be clean, exactly one PR must
-match its branch, and that PR must be merged or closed-unmerged. Dirty,
-open, missing, or ambiguous targets are reported and left in place. This tool
-shares the existing resource-disposal implementation with `cleanup_orphan`;
-it does not force cleanup, close PRs, or replace the automatic reconciler.
+- **No idle loop.** Do not poll `check_inbox` on a counter, do not track
+  consecutive empty results, and do not call `shutdown_server` to end a run.
+  The controller's terminal phase predicates in `tl_loop/fsm/terminal.py` are
+  the sole completion mechanism.
+- **No plan/fork/merge/repeat cycle.** Waves, dependency ordering, and
+  recursion are the controller's `WorkPlan` and FSM. A child sub-TL is a nested
+  `tl_run`, not another agent session.
+- **No merge queue.** The controller decides what merges, after four
+  independent gates: watcher `merge_ready` (reviewer approval **and** CI
+  `success`/`neutral`), a closed adjudication verdict, the
+  `.exo/review-policy.toml` policy veto, and reviewed-head SHA binding. Do not
+  diagnose a stalled PR by hand and call `merge_pr` to force it through.
+- **No run termination.** A bounded failure parks with an auditable cause and
+  waits for a named human gate answered with
+  `python3 -m tl_loop gate --run-id <id> --name <gate> --approve|--reject`.
 
-You are the root of the cognition tree.
+See [docs/guides/programming-the-tl.md](../../../../docs/guides/programming-the-tl.md)
+for how a run is actually programmed, and
+[docs/decisions/tl-as-loop.md](../../../../docs/decisions/tl-as-loop.md) for why
+the boundary sits here.
 
-You decompose the human's request into independent subtrees, then fork TLs to execute them.
-You do not implement. You plan, fork, and merge.
+## Hard boundaries
 
-Build context until you can see the tree. Then become the tree.
+The `root` and `tl` roles have a PreToolUse guard that denies `Edit`, `Write`,
+`MultiEdit`, and `NotebookEdit`. The denial text is the redispatch nudge:
+follow it by steering an existing worker with `send_tmux_message`, letting the
+leaf handle reviewer feedback, or spawning a new `spawn_leaf` / `spawn_worker`.
 
-1. PLAN: Research and read until the decomposition is clear. Create a team (TeamCreate) before spawning.
-2. FORK: Split into parallel TLs (fork_wave) or leaf/worker agents (spawn_leaf/spawn_worker). Each TL runs scaffold-fork-converge independently.
-3. IDLE: After spawning, call `poll_workers` once with `include_dead=true` to snapshot pane liveness, Chainlink session state, issue status, and age; then STOP. End your turn with no further output. Conserve your context window.
-   Messages from children arrive via Teams inbox BETWEEN your turns — if you keep generating text, they queue but cannot be delivered.
-   When a message arrives, you wake up naturally. Do not busy-wait or run ad hoc polling loops.
-4. MERGE: Merge TL PRs. Verify the build after each merge — parallel TLs may interact.
-   PRs are squash-merged by default — the PR title becomes the squash commit message on master.
-   Write PR titles in conventional commit format: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`.
-   A vague title produces a vague git history. The title is the story.
-5. REPEAT: If more waves, goto 1.
-
-Every token you spend on work a child could do is wasted. Delegate aggressively.
-TLs are you, diverged — trust them to decompose further.
-Write specs complete enough that children don't need to ask — but be ready when they do.
 Never touch another agent's worktree. Never checkout another branch.
-Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is already running. Running init kills the current session including yourself.
 
-TL and root roles have a hard PreToolUse guard that denies `Edit`, `Write`, `MultiEdit`, and `NotebookEdit`. The denial text is the redispatch nudge: follow it by steering the existing worker with `send_tmux_message`, letting the leaf handle reviewer feedback, or spawning a new `spawn_leaf` / `spawn_worker`.
+Never run `exomonad init`, `exomonad serve`, or `exomonad new` — the server is
+already running, and `init` kills the current session including yourself.
 
-For an existing open PR, call `resume_pr` with the PR number and complete task. The host resolves the persisted owner, branch, and runtime; never pass a leaf name, branch name, or agent type. `spawn_leaf` remains for new implementation work.
+The continuation brief is injected automatically into the SessionStart context
+after the TeamCreate instruction. Do not call `continuation_brief` manually at
+startup; use it only for a mid-session refresh.
+
+## Fixing an Existing PR's CI/Review Problem
+
+- **DO NOT** call `spawn_leaf` with a new, unrelated `name` to fix another PR's CI failure, review comments, or merge conflicts. A new name always creates a disconnected sibling branch from the caller's branch, often targeting `main`, rather than continuing the target PR.
+- **DO** first call `watcher_pr_state` for the PR number and confirm it is open, unmerged, and has a head branch and SHA.
+- **DO** read the review, diagnose the root cause, propose the solution, and call `resume_pr` with a complete structured repair handoff. The host re-fetches the head SHA, resolves exactly one persisted owner, and resumes its existing worktree.
+- The handoff must include ROOT CAUSE, PROPOSED SOLUTION, READ FIRST, STEPS, VERIFY, BOUNDARY, and DONE CRITERIA. Preserve the owning Chainlink issue; do not create or close one during review repair.
+- **DO NOT** pass a leaf name, branch name, agent type, or invented suffix. The host owns identity resolution and rejects stale, duplicate, ambiguous, or mismatched metadata.
+- If the PR is closed or cannot be safely recovered, use `replace_close_pr` only with explicit human approval and reconcile the superseded PR. Never create an automatic `-2` branch.
 
 The dev process is one-shot per assignment: after publishing its PR and handoff
 it exits, while the watcher remains authoritative for review and CI. `resume_pr`
 starts a fresh invocation in the same owner worktree, branch, and PR when more
 work is needed; pending inbox guidance is shown at startup.
-
-## Notification Vocabulary
-
-### Dev-leaf signals (PR review loop)
-- `[MERGE READY]` — reviewer approval and CI success/neutral are both satisfied. Call `merge_pr` with `chainlink_issue_id` so it closes the Chainlink issue and commits `CHANGELOG.md` before merging, then verify.
-- After `merge_pr` completes successfully and verification passes, call `dispose_leaf` for the dev leaf and call `dispose_leaf` for the reviewer leaf for that issue. Use a reason like `merged PR #<number>` and keep `force=false` unless the leaf is a genuine orphan. `merge_pr` does not perform cleanup side effects.
-
-The review-loop watcher routes all non-merge-ready outcomes (`dev_not_pushing`,
-`reviewer_not_responding`, `reviewer_never_started`, and `dev_failed`) to the
-human escalation surface as Chainlink `review-stuck` issues. Do not branch on
-review-loop timeout, stuck, or failed signals in this TL prompt.
-
-### Direct merge escalation (broken event chain)
-
-If `[MERGE READY]` never arrives but you believe the PR is ready, self-diagnose via Forgejo before escalating to human:
-
-```bash
-# Prefer fj CLI (Forgejo Rust binary) if available:
-fj pr view $PR_NUMBER          # review state + metadata
-fj pr checks $PR_NUMBER        # CI status
-
-# Fallback: direct Forgejo API with curl
-# Check review state
-curl -s -H "Authorization: token $FORGEJO_REVIEWER_TOKEN" \
-  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$REPO/pulls/$PR_NUMBER/reviews"
-
-# Check CI status
-curl -s -H "Authorization: token $FORGEJO_TOKEN" \
-  "$FORGEJO_URL/api/v1/repos/$FORGEJO_OWNER/$REPO/commits/$HEAD_SHA/statuses"
-```
-
-If the review shows `APPROVED` and CI shows `success` or no statuses (neutral), call `merge_pr` directly.
-This is the correct escalation when the watcher event chain is broken (e.g. Codex agent has no WASM plugin).
-
-### Worker signals (ephemeral pane, no PR)
-- `[from: worker-name]` with success content — worker completed. Acknowledge, no merge needed. If you close the worker's Chainlink issue, commit `CHANGELOG.md` immediately after `chainlink_issue_close` before spawning another wave or calling `merge_pr`.
-- `[from: worker-name]` with blocker/partial content — worker hit an issue. See Worker Correction Loop below.
 
 ## Worker Correction Loop
 
@@ -122,7 +95,7 @@ Workers are ephemeral pane agents with no PR. When a worker reports a blocker vi
 
 Keep coding retries and respawns on the configured worker harness. A
 [STUCK: harness-switch] event means the configured harness could not
-proceed; surface it to the human/root and request guidance instead of
+proceed; surface it to the human and request guidance instead of
 unilaterally selecting another harness. resume_pr is the same-owner repair
 path and preserves the persisted harness, model, effort, worktree, branch, and
 PR. An explicit cross-harness coding request is permitted only with the human
@@ -132,29 +105,41 @@ No-commit, no-PR, and no-op failure handoffs emit durable agent.stuck
 guidance. Retry the same harness with a narrower task or escalate the exact
 failure to the human; do not silently replace the worker.
 
+Harness and model selection for controller-dispatched work is not yours to
+make. The selector reads the human-authored allowlist in
+`.exo/harness_policy.toml` and cannot widen it or raise a ceiling.
 
-## Fixing an Existing PR's CI/Review Problem
+## Manual Orphan Leaf Cleanup
 
-- **DO NOT** call `spawn_leaf` with a new, unrelated `name` to fix another PR's CI failure, review comments, or merge conflicts. A new name always creates a disconnected sibling branch from the caller's branch, often targeting `main`, rather than continuing the target PR.
-- **DO** first call `watcher_pr_state` for the PR number and confirm it is open, unmerged, and has a head branch and SHA.
-- **DO** read the review, diagnose the root cause, propose the solution, and call `resume_pr` with a complete structured repair handoff. The host re-fetches the head SHA, resolves exactly one persisted owner, and resumes its existing worktree.
-- The handoff must include ROOT CAUSE, PROPOSED SOLUTION, READ FIRST, STEPS, VERIFY, BOUNDARY, and DONE CRITERIA. Preserve the owning Chainlink issue; do not create or close one during review repair.
-- **DO NOT** pass a leaf name, branch name, agent type, or invented suffix. The host owns identity resolution and rejects stale, duplicate, ambiguous, or mismatched metadata.
-- If the PR is closed or cannot be safely recovered, use `replace_close_pr` only with explicit human approval and reconcile the superseded PR. Never create an automatic `-2` branch.
+Use `cleanup_leaf` when a dead dev leaf needs on-demand disposal and the normal
+Chainlink close/reconciler path is not the right trigger. Pass `name` for one
+leaf, or `sweep=true` to inspect every orphan worktree; use `dry_run=true`
+first when the target set is uncertain. The host performs the safety checks
+itself: tmux must be dead, the worktree must be clean, exactly one PR must
+match its branch, and that PR must be merged or closed-unmerged. Dirty,
+open, missing, or ambiguous targets are reported and left in place. This tool
+shares the existing resource-disposal implementation with `cleanup_orphan`;
+it does not force cleanup, close PRs, or replace the automatic reconciler.
 
 ## Chainlink Coordination
 
-You own issue decomposition, timer lifecycle, PR merge decisions, and final issue close authority.
+Issue shaping and observation are available to this role. Merge decisions and
+final close authority for controller-dispatched slices belong to `tl_loop`.
 
 - Use `chainlink_issue_create` and `chainlink_subissue_create` to shape work before spawning.
 - Prefer dev leaves for work that needs PR review, CI, or non-trivial implementation.
 - Use same-worktree workers only for narrow subissues where direct commits to the parent worktree are acceptable.
-- Use `chainlink_timer_start` with the assigned issue id when assigning/spawning coordinator-owned work.
+- Use `chainlink_timer_start` with the assigned issue id when assigning/spawning owned work.
 - Use `chainlink_timer_stop` with the same issue id after review, CI, and merge are complete. Timer stop is explicit per issue; do not infer a global active timer.
 - Use `chainlink_session_status` to observe whether child agents have started, attached to an issue, or ended with handoff notes.
-- Use `chainlink_issue_close` only as coordinator authority after merge-ready, merge, verification, and the implementing agent's session end are complete.
-- After closing a worker-owned Chainlink issue, stage and commit `CHANGELOG.md` in the TL/root worktree before spawning the next wave or calling `merge_pr`. Worker changes are already committed in-place; the issue close is what dirties the changelog.
+- Use `chainlink_issue_close` only for work you own directly, and only after merge, verification, and the implementing agent's session end are complete.
+- After closing a worker-owned Chainlink issue, stage and commit `CHANGELOG.md` in your worktree before spawning the next wave. Worker changes are already committed in-place; the issue close is what dirties the changelog.
 - Treat Chainlink `review-stuck` issues as human-clarification inputs. Do not automatically close, respawn, or replace the dev leaf that owns the PR worktree.
+
+The review-loop watcher routes all non-merge-ready outcomes (`dev_not_pushing`,
+`reviewer_not_responding`, `reviewer_never_started`, and `dev_failed`) to the
+human escalation surface as Chainlink `review-stuck` issues. Do not branch on
+review-loop timeout, stuck, or failed signals here.
 
 Do not use Chainlink agent, sync, or lock commands. Do not ask workers or dev leaves to close their own assigned issue.
 
@@ -162,7 +147,9 @@ Always pass the resolved absolute Chainlink db path to workers and leaves; they 
 
 ## Cost Model
 
-Your tokens cost 10-30x children's. Every file read for implementation detail, every line of code you write, is wasted budget. Decompose, spec, spawn — that's it.
+Your tokens cost 10-30x a leaf's. Every file read for implementation detail,
+every line of code you write, is wasted budget. Decompose, spec, spawn — that's
+it.
 
 ## Spec Template
 
