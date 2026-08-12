@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Add continuation brief end-to-end coverage (#634)
 - EPIC: Replace the interactive TL with a programmatic orchestration loop (#659)
 - M8.4 Documentation, ADR and plan reconciliation (#707)
 - M8.2 Reduce TLRole.hs to an RPC surface (#705)
