@@ -1,8 +1,10 @@
 # ExoMonad
 
-Exomonad builds on the agentic loop to provide a Tree-of-agents model where a root 'tech lead' agent forks its context windows across multiple worktrees to recursively unfold an 'agentic tree' that accumulates scaffolding commits and context as it grows. Swarms of fast cheap agents implement specs at the leaf nodes. Each node is an agent that files PRs against its parent over waves of recursively nested trunk based development. Agents form a supervision hierarchy, reviewing and merging PRs filed by their child agents. All agents can communicate with their spawned child agents and their parent agent, using the tree to route messages.
+Exomonad builds on the agentic loop to provide a Tree-of-agents model that recursively unfolds work across git worktrees, accumulating scaffolding commits and context as it grows. Swarms of fast cheap agents implement specs at the leaf nodes. Each node files PRs against its parent over waves of recursively nested trunk-based development, and the tree folds back up as those PRs are reviewed, CI-checked, and merged.
 
-It hooks into Claude Code and Codex CLI, using their existing binaries and your existing subscription plans. Opus decomposes and dispatches. Codex implements. Reviewer agent reviews. Each model does what it's best at. All orchestration logic — tool dispatch, hooks, event handling, PR review routing — is defined in Haskell effects executed by a shared Rust server. Agents run in tmux windows and panes, isolated via git worktrees. No Docker, no web dashboard, no new UI to learn.
+The tech lead that drives this is **a program, not a prompt**. `tl_loop` is a bounded, resumable Python controller: it loads a structured plan, selects a harness within human-authored budgets, dispatches leaves and recursive sub-TLs, consumes an immutable event ledger, applies review and CI gates, and merges — or parks the run at a named human gate. The model is called only for three narrow structured judgments (`decompose`, `adjudicate_review`, `compose_repair`). Control flow lives in Python and durable state, not in a conversation.
+
+It hooks into Claude Code and Codex CLI, using their existing binaries and your existing subscription plans. Codex implements. A reviewer agent reviews. Each model does what it's best at. All orchestration logic — tool dispatch, hooks, event handling, PR review routing — is defined in Haskell effects executed by a shared Rust server. Agents run in tmux windows and panes, isolated via git worktrees. No Docker, no web dashboard, no new UI to learn.
 
 ![tmux devswarm — TL dispatching to three Codex workers in parallel, each in its own worktree. Bottom panes show workers mid-execution.](img/exomonad_tmux_devswarm.png)
 
@@ -50,61 +52,124 @@ First build downloads Nix dependencies and initializes the WASM toolchain — su
 
 ## Getting Started
 
+ExoMonad works on any git repository. Three files program the TL; the rest is defaults.
+
 ```bash
 cd your-project/
-exomonad init       # Creates tmux session with Server + TL windows
-exomonad init --reviewer-max-rounds 5  # Session-only reviewer cap override
-                    # Writes .mcp.json (auto-registers MCP tools)
-                    # Starts background server on .exo/server.sock
+exomonad new        # One-time: .exo/config.toml, .gitignore, WASM, CI + rules templates
 ```
 
-You're now in a tmux session. Switch to the **TL window** and run `claude`. ExoMonad's MCP tools are available immediately — Claude can spawn agents, file PRs, and coordinate work.
+Then author the two required inputs:
 
-### Use on any project
+```toml
+# .exo/harness_policy.toml — the human-authored allowlist and budget ceiling.
+# Required. A missing or invalid file is a startup error; no default is synthesized.
+[roles.tl]
+allow = ["codex/gpt-luna"]
+cost_rank = { "codex/gpt-luna" = 1 }
+token_budget = 120000
+escalate_after_attempts = 1
+# ... and the same for [roles.worker] and [roles.reviewer]
+```
 
-ExoMonad works on any git repository. After installing, just init:
+```json
+// .exo/tl-loop/plan.json — the work. Closed keys; unknown keys are rejected.
+{
+  "run_id": "root",
+  "budgets": { "tokens": 400000, "wall_seconds": 14400 },
+  "plan": {
+    "leaves": [
+      {
+        "name": "token-refresh",
+        "task": "Implement refresh-token rotation for the OAuth provider.",
+        "boundary": ["src/auth/**"],
+        "verify": ["cargo test -p auth refresh"]
+      }
+    ]
+  }
+}
+```
 
 ```bash
-cd ~/my-project
-exomonad init
-# → Copies WASM from ~/.exo/wasm/, starts server, MCP registered
+exomonad init       # Creates tmux session with Server + TL windows
+                    # Writes .mcp.json (auto-registers MCP tools)
+                    # Starts background server on .exo/server.sock
+                    # TL window runs `python3 -m tl_loop` — the controller
 ```
+
+The **TL window is the controller**, not a harness session — do not type `claude` into it. It is an observation and gate surface:
+
+```bash
+python3 -m tl_loop status --project-root . --run-id root
+python3 -m tl_loop gate   --project-root . --run-id root --name <gate> --approve
+```
+
+A run ends at `TLDone` or `TLFailed`. Bounded failures — retries exhausted, budget exhausted, review stuck, no capable harness, stall detected — park with an auditable cause and wait for an explicit human gate. The controller never retries past a ceiling or silently switches harness.
+
+**New to this?** Read [Programming the TL](docs/guides/programming-the-tl.md). **Coming from an older ExoMonad project?** Read [Migrating an existing project](docs/guides/migrating-to-the-tl-loop.md).
 
 ## How It Works
 
-**Three layers, each doing one thing:**
+**Four layers, each doing one thing:**
 
 | Layer | What | Why |
 |-------|------|-----|
+| **Python `tl_loop`** | The TL controller: FSM, checkpoints, budgets, harness selection, review gates, merge decisions | Deterministic, resumable, replayable, unit-testable |
 | **Haskell WASM** | Typed config DSL: tool schemas, dispatch, hooks, event routing | Deterministic, testable, hot-reloadable |
-| **Rust runtime** | Executes effects (git, GitHub API, filesystem, tmux CLI) | Performance, safety |
+| **Rust runtime** | Executes effects (git, Forgejo API, filesystem, tmux CLI), owns the immutable ledger | Performance, safety |
 | **tmux** | Process isolation (windows for subtrees, panes for workers) | Multiplexing without Docker |
 
 Haskell WASM is a typed configuration DSL — tool schemas, dispatch logic, hooks, event routing — with the full power of a type system and effect system. The WASM yields typed effects; Rust executes the I/O. This means tool logic is deterministic, testable, and hot-reloadable — edit a Haskell tool, run `just wasm-all`, and the next MCP call picks up the change.
 
+The controller sits on top and calls that same boundary. It owns orchestration *policy*; it never edits source code, never reviews a diff by hand, and never scrapes tmux.
+
+**The loop:**
+
+```
+load plan → validate state → select harness → dispatch
+    → consume ledger events → apply review gates → merge or park
+```
+
+Every transition is a durable write under `.exo/tl-loop/<run_id>/run.json`. Events come from the immutable ledger at `.exo/ledger/segments/` by global sequence number, and are acknowledged only after handling succeeds — so a restart resumes at `cursor + 1` rather than replaying or dropping work.
+
+**What gates a merge.** Four independent checks, all of which must hold:
+
+1. The Rust watcher fires `merge_ready` only when reviewer approval **and** CI status `success`/`neutral` are both true. No CI status means no merge, even with an approval.
+2. `adjudicate_review` returns a closed verdict — `GO`, `GO-WITH-NITS`, or `NO-GO`.
+3. Policy gates in `.exo/review-policy.toml` can veto a `GO` (minimum rounds, `external_review_paths`, line-count and complexity thresholds) by marking it `second_review_required`.
+4. The reviewed head SHA must still be the PR's current head, so a verdict for one commit can never merge another.
+
+A `NO-GO` composes a seven-section repair handoff and dispatches it through `resume_pr` — same owner, same worktree, same branch, same PR. Never a new branch, never a `-2` suffix.
+
 **Agent types:**
 
-| Spawn tool | Creates | Isolation | Use case |
-|------------|---------|-----------|----------|
-| `spawn_leaf` (inline) | Codex panes in your window | Shared directory, no branch | Fast parallel tasks (10-30x cheaper than Opus) |
-| `spawn_leaf` (worktree) | Codex in own worktree + window | Own branch, files PR | Independent features that need isolation |
-| `fork_wave` | Claude in own worktree + window | Own branch, can spawn children | Complex decomposition (TL role, recursive) |
+| Plan entry / tool | Creates | Isolation | Use case |
+|-------------------|---------|-----------|----------|
+| `leaves` / `spawn_leaf` | Codex in own worktree + window | Own branch, files PR | Implementation work that needs review and CI |
+| `workers` / `spawn_worker` | Ephemeral agent in a tmux pane | Shared directory, no branch, no PR | Research or narrow in-place edits |
+| `sub_tls` | A nested `tl_run` with its own checkpoint | Own branch, PR targets the parent | Recursive decomposition and stage ordering |
 
-**Communication:** Child agents call `notify_parent` when done. Messages arrive in your Claude conversation as native teammate notifications via the Teams inbox. No polling, no stdin hacks.
+Sub-TLs run sequentially and each blocks until terminal — that is how you express "documentation after the code merges". Top-level leaves run in parallel with no ordering.
+
+**Communication:** Child agents call `notify_parent` when done; messages arrive as native teammate notifications via the Teams inbox. The inbox is a human and worker delivery surface — the controller coordinates on the durable ledger, and a free-form message can never approve a merge.
 
 ## Available Tools
 
 | Tool | Role | Description |
 |------|------|-------------|
-| `fork_wave` | root, tl | Fork N parallel Claude agents, each in its own worktree |
-| `spawn_leaf` | root, tl | Spawn Codex agent (worktree, inline, or standalone isolation) |
+| `fork_wave` | root, tl | Fork N parallel agents, each in its own worktree |
+| `spawn_leaf` | root, tl | Spawn a leaf agent in its own worktree + branch; files a PR |
+| `spawn_worker` | root, tl | Spawn an ephemeral worker in a tmux pane (no branch, no PR) |
+| `resume_pr` | root, tl | Resume the existing issue-owned PR worktree after review or CI feedback |
 | `file_pr` | tl, dev | Create or update a PR for the current branch |
 | `merge_pr` | root, tl | Merge a child agent's PR and fetch changes |
 | `notify_parent` | tl, dev, worker | Send message to parent agent via Teams inbox |
 | `send_message` | all | Send message to any agent (Teams, UDS, or tmux) |
-| `task_list` | dev, worker | List tasks from shared task list |
-| `task_get` | dev, worker | Get task by ID |
-| `task_update` | dev, worker | Update task status/owner/activeForm |
+| `memory_append` / `memory_list` | root, tl, dev, worker | Append to / read the session-memory ledger |
+| `continuation_brief` | root, tl | Render the deterministic continuation brief |
+| `task_list` / `task_get` / `task_update` | dev, worker | Shared Claude Code task list |
+
+All tools are defined in Haskell WASM. Rust never defines a tool schema, parses tool arguments, or contains tool logic.
 
 ## Development
 
@@ -113,13 +178,25 @@ just install-all-dev    # Full build (WASM + Rust + install)
 just wasm-all           # Rebuild WASM only (after Haskell changes)
 just role-hook-tests    # Run devswarm role hook/state-machine tests in WASM
 just proto-gen          # Regenerate proto types (Rust + Haskell)
-cargo test --workspace  # Rust tests
+just test               # Full Rust workspace tests (builds WASM first)
+just rust-test          # Fast library-only Rust loop
+just tl-loop-golden     # Regenerate the TLPhase parity fixture after a phase change
+just e2e-tl-loop-active # Bounded controller run over a scratch repo (non-interactive)
 just fmt                # Format all code
 ```
 
 All `just` recipes handle their own Nix dependencies — no need to be in a `nix develop` shell.
 
-See [CLAUDE.md](CLAUDE.md) for the full architecture, data flows, and contributor guide.
+## Documentation
+
+| I want to... | Read this |
+|--------------|-----------|
+| Program the TL for a new project | [docs/guides/programming-the-tl.md](docs/guides/programming-the-tl.md) |
+| Migrate an existing ExoMonad project | [docs/guides/migrating-to-the-tl-loop.md](docs/guides/migrating-to-the-tl-loop.md) |
+| Understand the controller boundary | [docs/decisions/tl-as-loop.md](docs/decisions/tl-as-loop.md) |
+| Work on the controller itself | [tl_loop/CLAUDE.md](tl_loop/CLAUDE.md) |
+| See role tool matrix, hooks, state machines, review flow | [docs/architecture/agent-system.md](docs/architecture/agent-system.md) |
+| Get the full architecture and data flows | [CLAUDE.md](CLAUDE.md) |
 
 ## License
 

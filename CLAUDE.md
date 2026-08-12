@@ -166,6 +166,22 @@ exomonad reload                  # Clear WASM plugin cache (next call loads fres
 exomonad shutdown                # Gracefully shut down the running server
 ```
 
+**Log and evidence management:**
+```bash
+exomonad logs import --source <path> [--source <path>] [--format auto|jsonl|json|sqlite|text] [--dry-run] [--rebuild]
+                                 # Normalize log sources into .exo/analysis/atlas.db. Explicit,
+                                 # idempotent, and read-only with respect to the source files.
+exomonad logs drop-segments --older-than-seconds 2592000 [--dry-run]
+                                 # Whole-segment retention on closed ledger segments
+exomonad logs export --mode aggregate --output .exo/analysis/export
+                                 # L4 compile — the only shareable output
+exomonad logs measure --output .exo/analysis/measurement [--require-ready]
+                                 # Local detectors, incidents, adjudication, measurement gate
+```
+See [docs/guides/migrating-to-the-tl-loop.md](docs/guides/migrating-to-the-tl-loop.md)
+for using `logs import` to bring an older project's history into the same
+Failure Atlas view.
+
 ### MCP Registration
 
 `exomonad init` automatically registers the `tl/root` MCP identity in `.mcp.json`; the Python controller uses the same UDS runtime boundary. Worker and companion harnesses receive their own role/name registrations. For manual Codex access, register via stdio:
@@ -784,14 +800,19 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 ├── tests/e2e/                 ← E2E tests (see § E2E Test Pattern)
 │   ├── messaging/             ← Teams inbox delivery test
 │   └── hook-rewrite/          ← PII rewriting hooks test
+├── docs/guides/               ← Operator-facing how-to guides
+│   ├── programming-the-tl.md  ← Authoring harness_policy.toml, review-policy.toml, plan.json (+ worked examples)
+│   └── migrating-to-the-tl-loop.md ← Carrying an existing project forward (credentials + log import)
 ├── docs/architecture/         ← Cross-cutting architecture references
-│   └── agent-system.md        ← Role × tool matrix, hook deny rules, per-role state machines, PR review flow (+ .html view)
+│   └── agent-system.md        ← Role × tool matrix, hook deny rules, per-role state machines, PR review flow, controller gates (+ .html view)
 └── docs/decisions/            ← Architecture decision records (living docs)
     └── tl-as-loop.md          ← Programmatic TL boundary and borrowed patterns
 ```
 
 | I want to... | Read this |
 |--------------|-----------|
+| Program the TL for a new project | `docs/guides/programming-the-tl.md` |
+| Migrate an existing ExoMonad project | `docs/guides/migrating-to-the-tl-loop.md` |
 | Add FFI boundary types | `proto/CLAUDE.md` |
 | Understand MCP tool architecture | `rust/exomonad/CLAUDE.md` |
 | Work on exomonad-core framework | `rust/exomonad-core/CLAUDE.md` |

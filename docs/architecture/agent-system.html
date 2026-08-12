@@ -32,17 +32,19 @@
 <body>
 
 <h1>ExoMonad — Agent System Reference</h1>
-<p class="note">Generated companion to <code>docs/architecture/agent-system.md</code>. Update both files together. Sources of truth live in <code>.exo/roles/devswarm/</code>, <code>.exo/lib/</code>, and <code>rust/exomonad-core/src/services/worktree_event_watcher.rs</code>.</p>
+<p class="note">Generated companion to <code>docs/architecture/agent-system.md</code>. Update both files together. Sources of truth live in <code>.exo/roles/devswarm/</code>, <code>.exo/lib/</code>, <code>rust/exomonad-core/src/services/worktree_event_watcher.rs</code>, and <code>tl_loop/</code>.</p>
 
 <h2>1. Roles</h2>
+<p>The coordinator is not an agent. <code>tl_loop</code> is a Python controller process — no worktree of its own by default, no context window, no inbox. It calls the same Rust UDS runtime that agents call, and consumes the immutable ledger rather than messages. The <code>root</code> and <code>tl</code> <em>roles</em> persist as the RPC surface (tool registration, hook policy, event handlers); they are no longer an interactive session.</p>
 <table>
-<tr><th>Role</th><th>Model</th><th>Spawns</th><th>Files PR</th><th>Merges PR</th><th>Lifecycle</th></tr>
-<tr><td><code>root</code></td><td>Opus</td><td>yes</td><td>no</td><td>yes</td><td>persistent (TL window)</td></tr>
-<tr><td><code>tl</code></td><td>Opus</td><td>yes</td><td>yes</td><td>yes</td><td>per-subtree</td></tr>
-<tr><td><code>dev</code></td><td>Codex / OpenCode</td><td>no</td><td>yes</td><td>no</td><td>one assignment per invocation, exits after handoff</td></tr>
-<tr><td><code>reviewer</code></td><td>Codex / OpenCode</td><td>no</td><td>no</td><td>no</td><td>ephemeral per review round</td></tr>
-<tr><td><code>worker</code></td><td>Codex / OpenCode</td><td>no</td><td>no</td><td>no</td><td>ephemeral, same-worktree edits</td></tr>
+<tr><th>Actor</th><th>Model</th><th>Spawns</th><th>Files PR</th><th>Merges PR</th><th>Lifecycle</th></tr>
+<tr><td><code>tl_loop</code> controller</td><td>Python; calls a model only for <code>decompose</code>, <code>adjudicate_review</code>, <code>compose_repair</code></td><td>yes</td><td>via children</td><td>yes</td><td>one per run; resumable from <code>.exo/tl-loop/&lt;run_id&gt;/run.json</code></td></tr>
+<tr><td><code>root</code> / <code>tl</code> roles</td><td>from <code>[roles.tl]</code></td><td>yes</td><td>yes</td><td>yes</td><td>RPC surface + branch coordinates; a sub-TL is a nested <code>tl_run</code></td></tr>
+<tr><td><code>dev</code></td><td>from <code>[roles.worker]</code></td><td>no</td><td>yes</td><td>no</td><td>one assignment per invocation, exits after handoff</td></tr>
+<tr><td><code>reviewer</code></td><td>from <code>[roles.reviewer]</code></td><td>no</td><td>no</td><td>no</td><td>ephemeral per review round</td></tr>
+<tr><td><code>worker</code></td><td>from <code>[roles.worker]</code></td><td>no</td><td>no</td><td>no</td><td>ephemeral, same-worktree edits</td></tr>
 </table>
+<p class="note">Harness and model are never chosen by a plan or a prompt. The selector reads the human-authored allowlist in <code>.exo/harness_policy.toml</code> and picks the cheapest allowed entry meeting the slice's capability and budget constraints. The controller has an architectural no-edit boundary: a failed or stuck run becomes a durable named gate, not a redispatch prompt.</p>
 
 <h2>2. Tool Matrix</h2>
 
@@ -201,17 +203,19 @@ stateDiagram-v2
 
 <h2>5. PR Review Convergence Flow</h2>
 
+<p>Two delivery paths run side by side and must not be confused. <strong>Agent-facing:</strong> the watcher calls <code>handle_event</code> on the agent's WASM plugin and acts on the returned <code>EventAction</code>. <strong>Controller-facing:</strong> the same world observations are appended to the immutable ledger at <code>.exo/ledger/segments/</code>, and <code>tl_loop</code> consumes them by global <code>run_seq</code>. The controller does not read the inbox for coordination — a free-form message cannot approve a merge.</p>
+
 <h3>Happy path</h3>
 <div class="mermaid">
 sequenceDiagram
   autonumber
-  participant TL
+  participant Ctl as tl_loop controller
   participant Dev
   participant Watcher as Worktree Watcher
   participant Reviewer
   participant CI as Forgejo CI
 
-  TL->>Dev: spawn_leaf(spec)
+  Ctl->>Dev: spawn_leaf(spec)
   Dev->>Dev: implement, commit
   Dev->>Dev: file_pr (opens Forgejo PR)
   Note over Dev: DevPhase: DevPRFiled
@@ -223,9 +227,11 @@ sequenceDiagram
   Note over Dev: DevPhase: DevApproved (MustBlock)
   CI-->>Watcher: CIStatus = success
   Watcher->>Dev: handle_event(CIStatus, mergeReady=true)
-  Watcher->>TL: deliver [from: dev] [MERGE READY] PR #N
+  Watcher->>Ctl: ledger append (ci.status_changed, pr.review)
   Note over Dev: DevPhase: DevDone
-  TL->>TL: merge_pr
+  Ctl->>Ctl: verify_review — verdict fresh AND reviewed_head == current head
+  Ctl->>Ctl: merge_pr, then verify post-merge state
+  Ctl->>Ctl: checkpoint slice = merged, advance dependents
   Watcher->>Dev: PR branch gone — dev exits cleanly
 </div>
 
@@ -236,7 +242,7 @@ sequenceDiagram
   participant Dev
   participant Watcher
   participant Reviewer
-  participant TL
+  participant Ctl as tl_loop controller
 
   Reviewer->>Reviewer: request_changes
   Watcher->>Dev: handle_event(ReviewReceived) -> InjectMessage(comments)
@@ -251,9 +257,13 @@ sequenceDiagram
     Watcher->>Dev: ReviewApproved -> DevApproved
   else changes requested round 2
     Watcher->>Dev: ReviewReceived -> DevNeedsHumanDirection
-    Watcher->>TL: [STUCK] PR #N requires human direction
+    Watcher->>Ctl: ledger append (agent.stuck)
+    Ctl->>Ctl: compose_repair -> resume_pr (same owner/branch/PR)
+    Ctl->>Ctl: attempts++ ; park review_stuck past escalate_after_attempts
   end
 </div>
+
+<p class="note">Repair never creates a new branch, leaf name, agent type, or <code>-2</code> suffix. <code>compose_repair</code> calls <code>watcher_pr_state</code> first and requires the PR to be open, unmerged, and identified by both head branch and SHA.</p>
 
 <h3>Event vocabulary</h3>
 <table>
@@ -265,8 +275,8 @@ sequenceDiagram
 <tr><td><code>FixesPushed</code></td><td>SHA change after <code>changes_requested</code></td><td><code>FixesPushedEv</code> -&gt; round++</td><td>inject <code>[FIXES PUSHED]</code> to re-review</td></tr>
 <tr><td><code>CommitsPushed</code></td><td>SHA change outside changes-requested window</td><td><code>CommitsPushedEv</code> -&gt; round++</td><td><code>ReviewerCommitsPushedEv</code></td></tr>
 <tr><td><code>ReviewTimeout</code></td><td>no reviewer response within <code>reviewer_max_wait_seconds</code></td><td>log only</td><td><code>ReviewerTimedOutEv</code> -&gt; Done</td></tr>
-<tr><td><code>MergeReady</code></td><td>reviewer approval AND CI success/neutral both seen</td><td><code>MergeReadyEv</code> -&gt; Dev sends <code>[MERGE READY]</code> to TL</td><td><code>ReviewerMergeReadyEv</code> -&gt; Done</td></tr>
-<tr><td><code>Stuck</code></td><td>rounds exceed <code>reviewer_max_rounds</code></td><td>notify TL; use <code>resume_pr</code> for repair</td><td><code>ReviewerStuckEv</code> -&gt; Done</td></tr>
+<tr><td><code>MergeReady</code></td><td>reviewer approval AND CI success/neutral both seen</td><td><code>MergeReadyEv</code> -&gt; Dev sends <code>[MERGE READY]</code> upward</td><td><code>ReviewerMergeReadyEv</code> -&gt; Done</td></tr>
+<tr><td><code>Stuck</code></td><td>rounds exceed <code>reviewer_max_rounds</code></td><td>notify upward; controller repairs via <code>resume_pr</code></td><td><code>ReviewerStuckEv</code> -&gt; Done</td></tr>
 <tr><td><code>RateLimited</code></td><td>rate-limit hit</td><td>log only</td><td>log only</td></tr>
 <tr><td><code>DevNotPushing</code> / <code>ReviewerNotResponding</code> / <code>ReviewerNeverStarted</code> / <code>ReviewDevFailed</code></td><td>health probes</td><td>log only (escalated by watcher to chainlink <code>review-stuck</code>)</td><td>n/a</td></tr>
 </table>
@@ -282,10 +292,20 @@ flowchart TD
   D -- no --> Z
   D -- yes --> E[fire MergeReady event]
   E --> F[Dev: NotifyParentAction]
-  F --> G[TL receives 'from: dev MERGE READY']
+  F --> G[ledger append; controller consumes by run_seq]
 </div>
 
-<p class="note">Without Forgejo Actions producing a CI status, <code>ci_mergeable_at</code> stays <code>None</code> and <code>MergeReady</code> never fires even with reviewer approval.</p>
+<p class="note">Without Forgejo Actions producing a CI status, <code>ci_mergeable_at</code> stays <code>None</code> and <code>MergeReady</code> never fires even with reviewer approval. On a new project this is the most common cause of a PR that sits approved and unmerged — check that <code>.forgejo/workflows/ci.yml</code> actually runs.</p>
+
+<h3>Controller-side merge gates</h3>
+<p><code>MergeReady</code> is necessary, not sufficient. <code>tl_loop</code> applies three further gates before it calls <code>merge_pr</code>.</p>
+<table>
+<tr><th>Gate</th><th>Where</th><th>Failure mode it prevents</th></tr>
+<tr><td>Closed verdict</td><td><code>tl_loop/rlm/adjudicate.py</code> — only <code>GO</code>, <code>GO-WITH-NITS</code>, <code>NO-GO</code>. Diff and criteria are <em>required</em> RLM sections, so a context overflow raises rather than judging a compacted-away diff</td><td>Merging on a verdict the model produced without seeing the change</td></tr>
+<tr><td>Policy veto</td><td><code>.exo/review-policy.toml</code> — <code>min_review_rounds</code>, <code>external_review_paths</code>, <code>external_review_threshold</code>, <code>complexity_line_threshold</code>. A <code>GO</code> behind any of these is marked <code>second_review_required</code> and is not mergeable</td><td>Single-reviewer merges on high-risk surfaces</td></tr>
+<tr><td>Head binding</td><td><code>tl_loop/loop/review.py</code> — the verdict's <code>reviewed_head</code> must equal the PR's current head, within <code>review_freshness_window_secs</code></td><td>Approving one commit and merging another</td></tr>
+</table>
+<p class="note"><code>GO-WITH-NITS</code> is mergeable only after every nit has been written to the owning Chainlink issue. After merging, the controller verifies post-merge state before advancing dependent slices.</p>
 
 <h2>6. Watcher Escalation Outputs</h2>
 <table>
@@ -294,8 +314,52 @@ flowchart TD
 <tr><td><code>reviewer_not_responding</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
 <tr><td><code>reviewer_never_started</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
 <tr><td><code>dev_failed</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
-<tr><td><code>Stuck</code> (rounds exceeded)</td><td>notify TL; a later repair uses <code>resume_pr</code>, dev moves to <code>DevNeedsHumanDirection</code></td></tr>
+<tr><td><code>Stuck</code> (rounds exceeded)</td><td>notify upward; a later repair uses <code>resume_pr</code>, dev moves to <code>DevNeedsHumanDirection</code></td></tr>
 </table>
+<p class="note">These are human-clarification inputs — do not auto-close them and do not respawn the dev leaf.</p>
+
+<h2>7. Controller Run State and Human Gates</h2>
+<p>The controller's own state machine is durable at <code>.exo/tl-loop/&lt;run_id&gt;/run.json</code>, guarded by the shared writer lock <code>.exo/tl-loop/run.lock</code>. A sub-TL nests below its parent's directory.</p>
+
+<h3>Slice lifecycle</h3>
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> pending
+  pending --> ready: dependencies satisfied
+  ready --> spawned: harness selected, budget reserved
+  spawned --> in_review: PR filed
+  in_review --> repairing: NO-GO
+  repairing --> in_review: resume_pr, fixes pushed
+  in_review --> merged: fresh GO + CI pass + head match
+  spawned --> failed
+  in_review --> parked
+  repairing --> parked
+  pending --> blocked: dependency parked or failed
+  merged --> [*]
+  failed --> [*]
+  parked --> [*]
+  blocked --> [*]
+</div>
+<p class="note">Path ownership is validated across all non-terminal slices: two active slices may not own overlapping <code>paths</code> globs.</p>
+
+<h3>Park causes</h3>
+<p>Every bounded failure ends in one of these, with an auditable cause recorded in <code>park_audit</code>. None of them is retried around.</p>
+<table>
+<tr><th>Cause</th><th>Trigger</th><th>Human action</th></tr>
+<tr><td><code>retries_exhausted</code></td><td>NO-GO past <code>escalate_after_attempts</code></td><td>Re-plan the slice or approve a gate</td></tr>
+<tr><td><code>budget_exhausted</code></td><td>Role or per-harness ceiling reached</td><td>Raise the ceiling deliberately, or narrow the plan</td></tr>
+<tr><td><code>no_capable_harness</code></td><td>No allowed entry meets the capability requirement</td><td>Widen <code>allow</code> deliberately</td></tr>
+<tr><td><code>schedule_deadlock</code></td><td>Nothing dispatchable, or <code>max_depth</code> exceeded</td><td>Fix plan structure</td></tr>
+<tr><td><code>review_stuck</code></td><td>Review rounds exceeded without convergence</td><td>Read the PR</td></tr>
+<tr><td><code>harness_switch_requested</code></td><td>Configured harness could not proceed</td><td>Approve explicitly; <code>EXOMONAD_ALLOW_HARNESS_SWITCH=1</code></td></tr>
+<tr><td><code>stall_detected</code></td><td>Dead pane or no progress past the heartbeat threshold</td><td>Investigate the worker</td></tr>
+</table>
+
+<h3>Answering a gate</h3>
+<pre>python3 -m tl_loop status --project-root . --run-id root
+python3 -m tl_loop gate   --project-root . --run-id root --name &lt;gate&gt; --approve
+python3 -m tl_loop gate   --project-root . --run-id root --name &lt;gate&gt; --reject</pre>
+<p class="note">Gates are durable, uniquely named, and tri-state (<code>pending</code>, <code>approved</code>, <code>rejected</code>). The controller resumes from the checkpoint after an answer. It never coaxes a model into continuing and never asks a second interactive coordinator to decide. See <a href="../guides/programming-the-tl.md">Programming the TL</a> for authoring the controller's inputs.</p>
 
 <hr/>
 <p class="note">Regenerate or hand-edit this file when role behavior changes. The markdown master at <code>docs/architecture/agent-system.md</code> is the diff-friendly canonical version.</p>
