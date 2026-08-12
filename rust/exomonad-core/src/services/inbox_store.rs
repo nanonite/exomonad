@@ -237,6 +237,8 @@ impl InboxStore {
                         "to_agent": message.to_agent,
                         "consumer": normalized_agent_id,
                         "outcome": "consumed",
+                        "ack_kind": "inbox_read",
+                        "confidence": "unknown",
                         "read_at": now
                     }),
                 );
@@ -690,14 +692,16 @@ mod tests {
         assert_eq!(store.unread_count("worker-1").unwrap(), 0);
         assert!(!store.has_unread("worker-1").unwrap());
         assert!(store.last_check_inbox_at("worker-1").unwrap().is_some());
-        let consumed_after_drain = crate::services::LedgerWriter::open_project(dir.path())
+        let consumed_events = crate::services::LedgerWriter::open_project(dir.path())
             .unwrap()
             .read_events()
             .unwrap()
-            .iter()
+            .into_iter()
             .filter(|record| record.event.event_type == "message.consumed")
-            .count();
-        assert_eq!(consumed_after_drain, 1);
+            .collect::<Vec<_>>();
+        assert_eq!(consumed_events.len(), 1);
+        assert_eq!(consumed_events[0].event.data["ack_kind"], "inbox_read");
+        assert_eq!(consumed_events[0].event.data["confidence"], "unknown");
     }
 
     #[test]

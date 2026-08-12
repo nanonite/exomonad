@@ -615,7 +615,7 @@ impl InboxStore {
                 "batch_id": evidence.batch_id,
                 "agent_id": agent_id,
                 "consumer": evidence.consumer_id,
-                "ack_kind": format!("{:?}", evidence.evidence_kind).to_lowercase(),
+                "ack_kind": "runtime_accepted",
                 "confidence": evidence.confidence,
                 "item_count": evidence.item_ids.len(),
             }),
@@ -1523,7 +1523,8 @@ mod tests {
 
     #[test]
     fn transport_success_does_not_accept_and_exact_ack_is_atomic() -> Result<()> {
-        let store = InboxStore::open_in_memory()?;
+        let directory = tempfile::TempDir::new()?;
+        let store = InboxStore::open(directory.path())?;
         let batch = store
             .enqueue_batch(request("agent", QueueClass::Steering, None))?
             .batch;
@@ -1549,6 +1550,15 @@ mod tests {
         assert_eq!(accepted, GuidanceAckResult::Accepted);
         let duplicate = store.acknowledge_runtime(&ack(&claimed, "consumer-a"))?;
         assert_eq!(duplicate, GuidanceAckResult::AlreadyAccepted);
+        let consumed = crate::services::LedgerWriter::open_project(directory.path())
+            .unwrap()
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.event.event_type == "message.consumed")
+            .expect("runtime acceptance should emit consumption evidence");
+        assert_eq!(consumed.event.data["ack_kind"], "runtime_accepted");
+        assert_eq!(consumed.event.data["confidence"], "exact");
         Ok(())
     }
 

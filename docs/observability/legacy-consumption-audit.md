@@ -43,7 +43,7 @@ The legacy path should be represented as:
 {
   "event_type": "message.consumed",
   "ack_kind": "inbox_read",
-  "confidence": "observed"
+  "confidence": "unknown"
 }
 ```
 
@@ -69,4 +69,3 @@ events.
 - E9.3 (#782) ensures transport success cannot emit `runtime_accepted`.
 - E9.4 (#783) keeps batches without acceptance evidence visible as
   `pending`/`unknown` rather than silently consumed.
-
