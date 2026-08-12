@@ -250,10 +250,7 @@ MOCK_PID=$!
 wait_for "mock Forgejo API ready" "curl -fsS '$MOCK_URL/api/v1/repos/e2e/repo/pulls'" 20
 
 # Push the PR's head branch so the reviewer can `git diff base..HEAD` locally,
-# and create a placeholder author worktree dir. spawn_reviewer_for_pr skips
-# stale-looking PRs when the author's worktree directory is absent
-# (rust/exomonad-core/src/services/agent_control/spawn.rs, "Guard: if the
-# author's worktree is gone").
+# and create the author worktree fixture used by the review sandbox.
 git checkout -q -b "$BRANCH"
 echo 'reviewer sandbox fixture' > fixture.txt
 git add fixture.txt

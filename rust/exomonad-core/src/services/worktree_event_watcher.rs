@@ -14,7 +14,7 @@ use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     capture_memory, CiStatusMap, HasAgentResolver, HasEventLog, HasEventQueue, HasForgejoClient,
     HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSessionMemory, HasTeamRegistry,
-    MemoryCapture, MemoryKind, ReviewerSpawner,
+    MemoryCapture, MemoryKind,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -125,15 +125,6 @@ struct PendingPrActions {
     issue_id: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
-struct ReviewerSpawnRequest {
-    pr_number: u64,
-    head_sha: String,
-    reason: &'static str,
-    attempt_id: String,
-    pr: PrEntry,
-}
-
 fn evict_closed_prs_from_state(state: &mut WatcherStateFile, registry: &PrRegistry) -> Vec<u64> {
     let mut evicted = Vec::new();
     state.prs.retain(|pr_number, _| {
@@ -206,50 +197,6 @@ fn approved_review_round(old_rounds: u32, changes_requested_rounds: u32) -> u32 
     } else {
         old_rounds + 1
     }
-}
-
-fn should_spawn_reviewer_for_new_head(state: &WatchState, head_sha: &str, max_rounds: u32) -> bool {
-    if state.rounds >= max_rounds || state.reviewer_disposed {
-        return false;
-    }
-
-    match state.reviewer_attempt.as_ref() {
-        Some(attempt) if attempt.head_sha == head_sha && attempt.round == state.rounds => {
-            matches!(attempt.phase, ReviewerAttemptPhase::Failed)
-        }
-        Some(_) => true,
-        None => !state.reviewer_spawned,
-    }
-}
-
-fn claim_reviewer_attempt(
-    state: &mut WatchState,
-    pr_number: u64,
-    head_sha: &str,
-    max_rounds: u32,
-) -> Option<String> {
-    if !should_spawn_reviewer_for_new_head(state, head_sha, max_rounds) {
-        return None;
-    }
-
-    let attempt_id = Uuid::new_v4().to_string();
-    state.reviewer_attempt = Some(ReviewerAttempt {
-        pr_number,
-        head_sha: head_sha.to_string(),
-        round: state.rounds,
-        attempt_id: attempt_id.clone(),
-        phase: ReviewerAttemptPhase::Claimed,
-        invocation_id: None,
-        reviewer_agent: None,
-        routing: None,
-        claimed_at: Utc::now(),
-        started_at: None,
-        finished_at: None,
-        failure: None,
-    });
-    state.reviewer_spawned = false;
-    state.reviewer_disposed = false;
-    Some(attempt_id)
 }
 
 fn reviewer_attempt_is_current(
@@ -871,8 +818,6 @@ pub struct WorktreeEventWatcher<C> {
     /// Shared CI status map updated by Forgejo webhook fast-path notifications.
     ci_status_map: Arc<RwLock<CiStatusMap>>,
     ci_source_configured: bool,
-    /// Spawns reviewer agents on PR creation.
-    reviewer_spawner: Option<Arc<dyn ReviewerSpawner>>,
     forgejo_absent_warned: Arc<AtomicBool>,
 }
 
@@ -901,7 +846,6 @@ where
             policy: ReviewPolicy::default(),
             ci_status_map: Arc::new(RwLock::new(HashMap::new())),
             ci_source_configured: false,
-            reviewer_spawner: None,
             forgejo_absent_warned: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -926,11 +870,6 @@ where
         self
     }
 
-    pub fn with_reviewer_spawner(mut self, spawner: Arc<dyn ReviewerSpawner>) -> Self {
-        self.reviewer_spawner = Some(spawner);
-        self
-    }
-
     pub fn with_runtime_state(mut self, state: Arc<WatcherRuntimeState>) -> Self {
         self.state = state;
         self
@@ -951,119 +890,6 @@ where
 
     fn ci_source_configured(&self) -> bool {
         self.ci_source_configured || self.ctx.forgejo_client().is_some()
-    }
-
-    async fn spawn_reviewer_for_pr(&self, request: ReviewerSpawnRequest) {
-        let Some(spawner) = &self.reviewer_spawner else {
-            warn!(
-                pr_number = request.pr_number,
-                head_sha = %request.head_sha,
-                reason = request.reason,
-                "Reviewer spawner is not configured; skipping reviewer auto-spawn"
-            );
-            let mut state = self.state.prs.lock().await;
-            if let Some(ws) = state.get_mut(&request.pr_number) {
-                if reviewer_attempt_is_current(
-                    ws,
-                    request.pr_number,
-                    &request.head_sha,
-                    &request.attempt_id,
-                ) {
-                    if let Some(attempt) = ws.reviewer_attempt.as_mut() {
-                        attempt.phase = ReviewerAttemptPhase::Failed;
-                        attempt.finished_at = Some(Utc::now());
-                        attempt.failure = Some("reviewer spawner is not configured".to_string());
-                    }
-                    ws.reviewer_spawned = false;
-                }
-            }
-            drop(state);
-            if let Err(error) = self
-                .persist_runtime_pr_state(&[(request.pr_number, request.head_sha)], &[])
-                .await
-            {
-                warn!(
-                    pr_number = request.pr_number,
-                    %error,
-                    "Failed to persist unavailable reviewer spawner state"
-                );
-            }
-            return;
-        };
-
-        let spawner = spawner.clone();
-        let pr_number = request.pr_number;
-        let head_sha = request.head_sha;
-        let attempt_id = request.attempt_id;
-        info!(
-            pr_number,
-            head_sha = %head_sha,
-            reason = request.reason,
-            attempt_id = %attempt_id,
-            "Spawning reviewer agent for PR"
-        );
-        match spawner.spawn_reviewer_for_pr(&request.pr).await {
-            Ok(metadata) => {
-                let mut state = self.state.prs.lock().await;
-                if state.get(&pr_number).is_some_and(|ws| {
-                    reviewer_attempt_is_current(ws, pr_number, &head_sha, &attempt_id)
-                }) {
-                    let ws = state
-                        .get_mut(&pr_number)
-                        .expect("reviewer attempt was present during claim");
-                    if let Some(attempt) = ws.reviewer_attempt.as_mut() {
-                        attempt.phase = ReviewerAttemptPhase::Running;
-                        attempt.invocation_id = metadata.invocation_id;
-                        attempt.reviewer_agent = metadata.reviewer_agent;
-                        attempt.routing = metadata.routing;
-                        attempt.started_at = Some(Utc::now());
-                        attempt.failure = None;
-                    }
-                    ws.reviewer_spawned = true;
-                } else {
-                    warn!(
-                        pr_number,
-                        head_sha = %head_sha,
-                        attempt_id = %attempt_id,
-                        "Ignoring reviewer spawn result for a replaced attempt"
-                    );
-                }
-                drop(state);
-                if let Err(error) = self
-                    .persist_runtime_pr_state(&[(pr_number, head_sha.clone())], &[])
-                    .await
-                {
-                    warn!(pr_number, %error, "Failed to persist successful reviewer attempt");
-                }
-            }
-            Err(error) => {
-                warn!(
-                    pr_number,
-                    head_sha = %head_sha,
-                    attempt_id = %attempt_id,
-                    error = %error,
-                    "Failed to spawn reviewer for PR"
-                );
-                let mut state = self.state.prs.lock().await;
-                if let Some(ws) = state.get_mut(&pr_number) {
-                    if reviewer_attempt_is_current(ws, pr_number, &head_sha, &attempt_id) {
-                        if let Some(attempt) = ws.reviewer_attempt.as_mut() {
-                            attempt.phase = ReviewerAttemptPhase::Failed;
-                            attempt.finished_at = Some(Utc::now());
-                            attempt.failure = Some(error.to_string());
-                        }
-                        ws.reviewer_spawned = false;
-                    }
-                }
-                drop(state);
-                if let Err(persist_error) = self
-                    .persist_runtime_pr_state(&[(pr_number, head_sha.clone())], &[])
-                    .await
-                {
-                    warn!(pr_number, %persist_error, "Failed to persist failed reviewer attempt");
-                }
-            }
-        }
     }
 
     async fn observed_ci_status(&self, branch: &BranchName, head_sha: &str) -> CIStatus {
@@ -1743,7 +1569,6 @@ where
         let mut removed_prs = Vec::new();
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
         let mut reviewer_disposals: Vec<u64> = Vec::new();
-        let mut reviewer_spawns: Vec<ReviewerSpawnRequest> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
         let watcher_state = self.read_watcher_state().await.unwrap_or_default();
 
@@ -1837,28 +1662,6 @@ where
                         old_state.parent_handoff_fingerprint = None;
                         old_state.stuck = false;
                     }
-                    if let Some(attempt_id) = claim_reviewer_attempt(
-                        old_state,
-                        *pr_number,
-                        &obs.head_sha,
-                        self.policy.reviewer_max_rounds,
-                    ) {
-                        let reason = if head_sha_changed {
-                            "new_head_sha"
-                        } else {
-                            "retry_missing_reviewer"
-                        };
-                        reviewer_spawns.push(ReviewerSpawnRequest {
-                            pr_number: *pr_number,
-                            head_sha: obs.head_sha.clone(),
-                            reason,
-                            attempt_id,
-                            pr: PrEntry {
-                                last_head_sha: Some(obs.head_sha.clone()),
-                                ..pr.clone()
-                            },
-                        });
-                    }
                     compute_pr_actions_with_context(
                         old_state,
                         PRNumber::new(*pr_number),
@@ -1936,32 +1739,6 @@ where
                         self.policy.reviewer_max_rounds,
                         self.policy.reviewer_max_wait_seconds,
                     );
-                    // Spawn reviewer immediately on first sighting of a new open PR
-                    // unless the watcher restarted after a terminal review verdict.
-                    let attempt_id = if !terminal_review_observed {
-                        state_guard.get_mut(pr_number).and_then(|state| {
-                            claim_reviewer_attempt(
-                                state,
-                                *pr_number,
-                                &obs.head_sha,
-                                self.policy.reviewer_max_rounds,
-                            )
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some(attempt_id) = attempt_id {
-                        reviewer_spawns.push(ReviewerSpawnRequest {
-                            pr_number: *pr_number,
-                            head_sha: obs.head_sha.clone(),
-                            reason: "first_sighting",
-                            attempt_id,
-                            pr: PrEntry {
-                                last_head_sha: Some(obs.head_sha.clone()),
-                                ..pr.clone()
-                            },
-                        });
-                    }
                     actions
                 };
 
@@ -2020,11 +1797,7 @@ where
             }
         }
 
-        self.persist_runtime_pr_state(&head_sha_updates, &reviewer_spawns)
-            .await?;
-        for request in reviewer_spawns {
-            self.spawn_reviewer_for_pr(request).await;
-        }
+        self.persist_runtime_pr_state(&head_sha_updates).await?;
         for pr_number in reviewer_disposals {
             let reviewer_slugs = dispose_reviewers_for_pr(
                 self.ctx.project_dir(),
@@ -2231,49 +2004,13 @@ where
     }
 
     /// Persist the complete runtime projection for the supplied PRs.
-    ///
-    /// `expected_claims` is used immediately before reviewer spawn. Keeping
-    /// the claim validation under the same runtime lock as the snapshot means
-    /// a request cannot proceed unless its exact PR/SHA/attempt claim is
-    /// included in the atomically replaced watcher-state file.
-    async fn persist_runtime_pr_state(
-        &self,
-        updates: &[(u64, String)],
-        expected_claims: &[ReviewerSpawnRequest],
-    ) -> Result<()> {
-        if updates.is_empty() && expected_claims.is_empty() {
+    async fn persist_runtime_pr_state(&self, updates: &[(u64, String)]) -> Result<()> {
+        if updates.is_empty() {
             return Ok(());
         }
 
         let mut state = self.read_watcher_state().await.unwrap_or_default();
         let runtime_state = self.state.prs.lock().await;
-        for request in expected_claims {
-            let Some(watch_state) = runtime_state.get(&request.pr_number) else {
-                anyhow::bail!(
-                    "reviewer claim for PR #{} disappeared before persistence",
-                    request.pr_number
-                );
-            };
-            let Some(attempt) = watch_state.reviewer_attempt.as_ref() else {
-                anyhow::bail!(
-                    "reviewer claim for PR #{} has no durable attempt before spawn",
-                    request.pr_number
-                );
-            };
-            if !reviewer_attempt_is_current(
-                watch_state,
-                request.pr_number,
-                &request.head_sha,
-                &request.attempt_id,
-            ) || attempt.phase != ReviewerAttemptPhase::Claimed
-            {
-                anyhow::bail!(
-                    "reviewer claim {} for PR #{} is no longer current before spawn",
-                    request.attempt_id,
-                    request.pr_number
-                );
-            }
-        }
         for (pr_number, head_sha) in updates {
             let entry = state.prs.entry(*pr_number).or_default();
             entry.last_head_sha = Some(head_sha.clone());
@@ -2295,11 +2032,7 @@ where
         }
         drop(runtime_state);
         self.write_watcher_state(&state).await?;
-        debug!(
-            count = updates.len(),
-            claim_count = expected_claims.len(),
-            "Persisted PR runtime state"
-        );
+        debug!(count = updates.len(), "Persisted PR runtime state");
         Ok(())
     }
 
@@ -2419,7 +2152,7 @@ where
         }
         drop(runtime);
         if let Err(error) = self
-            .persist_runtime_pr_state(&[(pr_number, head_sha.to_string())], &[])
+            .persist_runtime_pr_state(&[(pr_number, head_sha.to_string())])
             .await
         {
             warn!(pr_number, %error, "Failed to persist parent handoff retry state");
@@ -6406,116 +6139,6 @@ mod tests {
         )));
     }
 
-    // ---------------------------------------------------------------------------
-    // Reviewer spawner tests
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn reviewer_attempt_claim_is_idempotent_and_sha_scoped() {
-        let branch = BranchName::try_from_str("main.feature-codex").unwrap();
-        let mut state = WatchState::new(&branch, AgentType::Codex, "sha-1", CIStatus::Unknown, 0);
-
-        let first = claim_reviewer_attempt(&mut state, 7, "sha-1", 3).unwrap();
-        assert!(claim_reviewer_attempt(&mut state, 7, "sha-1", 3).is_none());
-
-        state.reviewer_attempt.as_mut().unwrap().phase = ReviewerAttemptPhase::Failed;
-        let retry = claim_reviewer_attempt(&mut state, 7, "sha-1", 3).unwrap();
-        assert_ne!(first, retry);
-
-        state.reviewer_attempt = None;
-        let next_head = claim_reviewer_attempt(&mut state, 7, "sha-2", 3).unwrap();
-        assert_ne!(retry, next_head);
-        assert_eq!(state.reviewer_attempt.as_ref().unwrap().head_sha, "sha-2");
-    }
-
-    #[tokio::test]
-    async fn reviewer_attempt_persists_current_sha_before_spawn_and_exact_invocation() {
-        struct MetadataSpawner {
-            project_dir: std::path::PathBuf,
-        }
-
-        #[async_trait::async_trait]
-        impl ReviewerSpawner for MetadataSpawner {
-            async fn spawn_reviewer_for_pr(
-                &self,
-                pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                assert_eq!(
-                    pr.last_head_sha.as_deref(),
-                    Some("sha-current"),
-                    "reviewer must receive the verified observation SHA, not stale registry metadata"
-                );
-                let state: serde_json::Value = serde_json::from_str(
-                    &tokio::fs::read_to_string(self.project_dir.join(".exo/watcher-state.json"))
-                        .await?,
-                )?;
-                assert_eq!(state["prs"]["1"]["last_head_sha"], "sha-current");
-                assert_eq!(
-                    state["prs"]["1"]["reviewer_attempt"]["head_sha"],
-                    "sha-current"
-                );
-                assert_eq!(state["prs"]["1"]["reviewer_attempt"]["phase"], "claimed");
-                Ok(crate::services::ReviewerSpawnMetadata {
-                    invocation_id: Some("review-invocation-1".to_string()),
-                    reviewer_agent: Some("review-pr-1-codex".to_string()),
-                    routing: Some(crate::domain::RoutingInfo::pane(
-                        crate::services::tmux_ipc::PaneId::parse("%42").unwrap(),
-                        "review-pr-1",
-                    )),
-                })
-            }
-        }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(
-            Arc::new(MetadataSpawner {
-                project_dir: temp_dir.path().to_path_buf(),
-            }),
-        );
-        let mut pr = test_pr_entry();
-        pr.last_head_sha = Some("sha-stale".to_string());
-        let registry = test_registry(pr);
-        let mut observations = HashMap::new();
-        observations.insert(1u64, test_observation("sha-current"));
-
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-
-        let state = watcher.state.prs.lock().await;
-        let attempt = state
-            .get(&1)
-            .and_then(|state| state.reviewer_attempt.as_ref())
-            .unwrap();
-        assert_eq!(attempt.head_sha, "sha-current");
-        assert_eq!(attempt.phase, ReviewerAttemptPhase::Running);
-        assert_eq!(
-            attempt.invocation_id.as_deref(),
-            Some("review-invocation-1")
-        );
-        assert_eq!(attempt.reviewer_agent.as_deref(), Some("review-pr-1-codex"));
-        assert_eq!(
-            attempt
-                .routing
-                .as_ref()
-                .unwrap()
-                .pane_id
-                .as_ref()
-                .unwrap()
-                .as_str(),
-            "%42"
-        );
-        drop(state);
-
-        let persisted = watcher.read_watcher_state().await.unwrap();
-        let persisted_attempt = persisted.prs[&1].reviewer_attempt.as_ref().unwrap();
-        assert_eq!(persisted_attempt.attempt_id.len(), 36);
-        assert_eq!(persisted_attempt.phase, ReviewerAttemptPhase::Running);
-    }
-
     #[tokio::test]
     async fn stale_reviewer_verdict_does_not_advance_authoritative_phase() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -6545,28 +6168,7 @@ mod tests {
         let state = state.get(&1).unwrap();
         assert_eq!(state.last_review_state, ForgejoReviewVerdict::None);
         assert!(!state.reviewer_disposed);
-        assert!(!matches!(
-            state.reviewer_attempt.as_ref().unwrap().phase,
-            ReviewerAttemptPhase::Approved
-                | ReviewerAttemptPhase::ChangesRequested
-                | ReviewerAttemptPhase::Commented
-                | ReviewerAttemptPhase::Disposed
-        ));
-    }
-
-    struct MockReviewerSpawner {
-        called: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    #[async_trait::async_trait]
-    impl ReviewerSpawner for MockReviewerSpawner {
-        async fn spawn_reviewer_for_pr(
-            &self,
-            _pr: &crate::services::pr_registry::PrEntry,
-        ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(Default::default())
-        }
+        assert!(state.reviewer_attempt.is_none());
     }
 
     fn test_pr_entry() -> crate::services::pr_registry::PrEntry {
@@ -6723,40 +6325,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_observations_does_not_spawn_reviewer_without_publication() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountingSpawner(Arc<AtomicUsize>);
-
-        #[async_trait::async_trait]
-        impl ReviewerSpawner for CountingSpawner {
-            async fn spawn_reviewer_for_pr(
-                &self,
-                _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(Default::default())
-            }
-        }
-
-        let call_count = Arc::new(AtomicUsize::new(0));
+    async fn test_process_observations_does_not_auto_spawn_reviewer() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
-        let watcher = WorktreeEventWatcher::new(Arc::new(services))
-            .with_reviewer_spawner(Arc::new(CountingSpawner(call_count.clone())));
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
         let registry = test_registry(test_pr_entry());
-        let mut observation = test_observation("abc123");
-        observation.publication = None;
-        let observations = HashMap::from([(1u64, observation)]);
+        let observations = HashMap::from([(1u64, test_observation("abc123"))]);
 
         watcher
             .process_observations(&registry, &observations)
             .await
             .unwrap();
 
-        assert_eq!(call_count.load(Ordering::SeqCst), 0);
-        assert!(watcher.state.prs.lock().await.is_empty());
+        let state = watcher.state.prs.lock().await;
+        let state = state.get(&1).unwrap();
+        assert!(!state.reviewer_spawned);
+        assert!(state.reviewer_attempt.is_none());
     }
 
     #[tokio::test]
@@ -7089,13 +6674,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_observations_disposes_reviewer_when_restart_sees_approved_pr() {
-        use std::sync::atomic::Ordering;
-
-        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let spawner = Arc::new(MockReviewerSpawner {
-            called: called.clone(),
-        });
-
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
@@ -7108,7 +6686,7 @@ mod tests {
             .await
             .unwrap();
 
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
         let pr = pr_with_reviewer(1, reviewer_slug, "review-pr-1");
         let registry = test_registry(pr);
 
@@ -7141,12 +6719,6 @@ mod tests {
             .process_observations(&registry, &observations)
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert!(
-            !called.load(Ordering::SeqCst),
-            "already-approved PRs observed after restart must not spawn a fresh reviewer"
-        );
         assert!(
             !reviewer_agent_dir.exists(),
             "already-approved PRs observed after restart should dispose reviewer agent resources"
@@ -7164,24 +6736,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_observations_disposes_commented_reviewer_once_across_polls_and_restart() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountingSpawner {
-            count: Arc<AtomicUsize>,
-        }
-
-        #[async_trait::async_trait]
-        impl ReviewerSpawner for CountingSpawner {
-            async fn spawn_reviewer_for_pr(
-                &self,
-                _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                self.count.fetch_add(1, Ordering::SeqCst);
-                Ok(Default::default())
-            }
-        }
-
-        let call_count = Arc::new(AtomicUsize::new(0));
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
@@ -7194,11 +6748,7 @@ mod tests {
             .await
             .unwrap();
 
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(
-            Arc::new(CountingSpawner {
-                count: call_count.clone(),
-            }),
-        );
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
         let registry = test_registry(pr_with_reviewer(1, reviewer_slug, "review-pr-1"));
 
         watcher
@@ -7208,7 +6758,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         let mut commented = test_observation("abc123");
         commented.review_state = ForgejoReviewState::Commented;
@@ -7224,10 +6773,6 @@ mod tests {
             let state = watcher.state.prs.lock().await;
             let state = state.get(&1).unwrap();
             assert!(state.reviewer_disposed);
-            assert_eq!(
-                state.reviewer_attempt.as_ref().unwrap().phase,
-                ReviewerAttemptPhase::Commented
-            );
         }
 
         watcher
@@ -7238,28 +6783,14 @@ mod tests {
 
         let mut restarted_services = crate::services::Services::test();
         restarted_services.project_dir = temp_dir.path().to_path_buf();
-        let restarted_watcher = WorktreeEventWatcher::new(Arc::new(restarted_services))
-            .with_reviewer_spawner(Arc::new(CountingSpawner {
-                count: call_count.clone(),
-            }));
+        let restarted_watcher = WorktreeEventWatcher::new(Arc::new(restarted_services));
         restarted_watcher
             .process_observations(&registry, &observations)
             .await
             .unwrap();
 
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            1,
-            "a COMMENT observation must not respawn its reviewer after restart"
-        );
         let state = restarted_watcher.state.prs.lock().await;
-        assert!(state.get(&1).is_some_and(|state| {
-            state.reviewer_disposed
-                && state
-                    .reviewer_attempt
-                    .as_ref()
-                    .is_some_and(|attempt| attempt.phase == ReviewerAttemptPhase::Commented)
-        }));
+        assert!(state.get(&1).is_some_and(|state| state.reviewer_disposed));
         drop(state);
 
         let watcher_log = tokio::fs::read_to_string(temp_dir.path().join(".exo/logs/watcher.log"))
@@ -7345,381 +6876,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_failed_reviewer_spawn_leaves_flag_false() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct FailingSpawner {
-            called: Arc<AtomicBool>,
-        }
-
-        #[async_trait::async_trait]
-        impl ReviewerSpawner for FailingSpawner {
-            async fn spawn_reviewer_for_pr(
-                &self,
-                _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                self.called.store(true, Ordering::SeqCst);
-                anyhow::bail!("spawn failed")
-            }
-        }
-
-        let called = Arc::new(AtomicBool::new(false));
-        let spawner = Arc::new(FailingSpawner {
-            called: called.clone(),
-        });
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
-        let pr = test_pr_entry();
-        let registry = test_registry(pr);
-        let mut observations = HashMap::new();
-        observations.insert(1u64, test_observation("abc123"));
-
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert!(called.load(Ordering::SeqCst));
-        let state = watcher.state.prs.lock().await;
-        assert!(
-            !state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(true),
-            "reviewer_spawned should remain false after a failed spawn"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_failed_reviewer_spawn_retries_without_head_sha_change() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct FailsOnceSpawner {
-            count: Arc<AtomicUsize>,
-        }
-
-        #[async_trait::async_trait]
-        impl ReviewerSpawner for FailsOnceSpawner {
-            async fn spawn_reviewer_for_pr(
-                &self,
-                _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                let previous = self.count.fetch_add(1, Ordering::SeqCst);
-                if previous == 0 {
-                    anyhow::bail!("spawn failed")
-                }
-                Ok(Default::default())
-            }
-        }
-
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let spawner = Arc::new(FailsOnceSpawner {
-            count: call_count.clone(),
-        });
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
-        let mut pr = test_pr_entry();
-        pr.last_head_sha = Some("abc123".to_string());
-        let registry = test_registry(pr);
-        let mut observations = HashMap::new();
-        observations.insert(1u64, test_observation("abc123"));
-
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        {
-            let state = watcher.state.prs.lock().await;
-            assert!(
-                !state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(true),
-                "reviewer_spawned should remain false after the first failed spawn"
-            );
-        }
-        let persisted = watcher.read_watcher_state().await.unwrap();
-        let attempt = persisted.prs[&1].reviewer_attempt.as_ref().unwrap();
-        assert_eq!(attempt.phase, ReviewerAttemptPhase::Failed);
-        assert_eq!(attempt.failure.as_deref(), Some("spawn failed"));
-
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert_eq!(call_count.load(Ordering::SeqCst), 2);
-        let state = watcher.state.prs.lock().await;
-        assert!(
-            state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(false),
-            "reviewer_spawned should become true after retry succeeds"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reviewer_spawner_called_for_new_pr() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let called = Arc::new(AtomicBool::new(false));
-        let spawner = Arc::new(MockReviewerSpawner {
-            called: called.clone(),
-        });
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
-
-        let pr = test_pr_entry();
-        let registry = test_registry(pr);
-        let mut observations = HashMap::new();
-        observations.insert(1u64, test_observation("abc123"));
-
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-
-        // Give the tokio::spawn task a moment to complete.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert!(
-            called.load(Ordering::SeqCst),
-            "spawner should be called for first sighting of new PR"
-        );
-
-        let state = watcher.state.prs.lock().await;
-        assert!(
-            state.get(&1).map(|s| s.reviewer_spawned).unwrap_or(false),
-            "reviewer_spawned should be true after first sighting"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reviewer_spawner_called_for_new_head_sha() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountingSpawner {
-            count: Arc<AtomicUsize>,
-        }
-        #[async_trait::async_trait]
-        impl ReviewerSpawner for CountingSpawner {
-            async fn spawn_reviewer_for_pr(
-                &self,
-                _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                self.count.fetch_add(1, Ordering::SeqCst);
-                Ok(Default::default())
-            }
-        }
-
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let spawner = Arc::new(CountingSpawner {
-            count: call_count.clone(),
-        });
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
-        let branch = BranchName::try_from_str("main.feature-codex")
-            .expect("literal validated string is non-empty");
-        watcher.state.prs.lock().await.insert(
-            1,
-            WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0),
-        );
-
-        let mut pr = test_pr_entry();
-        pr.last_head_sha = Some("def456".to_string());
-        let registry = test_registry(pr);
-        let mut observations = HashMap::new();
-        observations.insert(1u64, test_observation("def456"));
-
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_reviewer_spawner_called_for_new_head_after_changes_requested() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountingSpawner {
-            count: Arc<AtomicUsize>,
-        }
-        #[async_trait::async_trait]
-        impl ReviewerSpawner for CountingSpawner {
-            async fn spawn_reviewer_for_pr(
-                &self,
-                _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                self.count.fetch_add(1, Ordering::SeqCst);
-                Ok(Default::default())
-            }
-        }
-
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let spawner = Arc::new(CountingSpawner {
-            count: call_count.clone(),
-        });
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
-        let branch = BranchName::try_from_str("main.feature-codex")
-            .expect("literal validated string is non-empty");
-        let mut watch_state =
-            WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0);
-        watch_state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
-        watch_state.rounds = 1;
-        watch_state.reviewer_spawned = true;
-        watch_state.reviewer_disposed = true;
-        watcher.state.prs.lock().await.insert(1, watch_state);
-
-        let mut pr = test_pr_entry();
-        pr.last_head_sha = Some("def456".to_string());
-        let registry = test_registry(pr);
-        let mut observations = HashMap::new();
-        observations.insert(
-            1u64,
-            Observation {
-                publication: Some(PublishedHead {
-                    pr_number: 1,
-                    head_branch: "main.feat-codex".to_string(),
-                    base_branch: "main".to_string(),
-                    head_sha: "def456".to_string(),
-                    author_agent: None,
-                    author_role: None,
-                    invocation_id: None,
-                    invocation_trigger: None,
-                    invocation_runtime: None,
-                }),
-                head_sha: "def456".to_string(),
-                review_state: ForgejoReviewState::ChangesRequested,
-                comments: vec![],
-                reviews: vec![],
-                changes_requested_rounds: 1,
-                ci_status: CIStatus::Unknown,
-                forgejo_review_present: false,
-            },
-        );
-
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-        let state = watcher.state.prs.lock().await;
-        let pr_state = state.get(&1).unwrap();
-        assert!(pr_state.reviewer_spawned);
-        assert!(!pr_state.reviewer_disposed);
-        assert_eq!(pr_state.last_review_state, ForgejoReviewVerdict::None);
-        assert_eq!(pr_state.rounds, 1);
-    }
-
-    #[tokio::test]
-    async fn test_reviewer_spawner_called_when_stale_changes_requested_review_was_missed() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountingSpawner {
-            count: Arc<AtomicUsize>,
-        }
-
-        #[async_trait::async_trait]
-        impl ReviewerSpawner for CountingSpawner {
-            async fn spawn_reviewer_for_pr(
-                &self,
-                _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                self.count.fetch_add(1, Ordering::SeqCst);
-                Ok(Default::default())
-            }
-        }
-
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let spawner = Arc::new(CountingSpawner {
-            count: call_count.clone(),
-        });
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
-        let branch = BranchName::try_from_str("main.feature-codex")
-            .expect("literal validated string is non-empty");
-        let mut watch_state =
-            WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Unknown, 0);
-        watch_state.reviewer_spawned = true;
-        watch_state.reviewer_disposed = true;
-        watcher.state.prs.lock().await.insert(1, watch_state);
-
-        let mut pr = test_pr_entry();
-        pr.last_head_sha = Some("def456".to_string());
-        let registry = test_registry(pr);
-        let mut observations = HashMap::new();
-        observations.insert(
-            1u64,
-            Observation {
-                publication: Some(PublishedHead {
-                    pr_number: 1,
-                    head_branch: "main.feat-codex".to_string(),
-                    base_branch: "main".to_string(),
-                    head_sha: "def456".to_string(),
-                    author_agent: None,
-                    author_role: None,
-                    invocation_id: None,
-                    invocation_trigger: None,
-                    invocation_runtime: None,
-                }),
-                head_sha: "def456".to_string(),
-                review_state: ForgejoReviewState::PendingReview,
-                comments: vec![],
-                reviews: vec![],
-                changes_requested_rounds: 1,
-                ci_status: CIStatus::Unknown,
-                forgejo_review_present: false,
-            },
-        );
-
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
-        let state = watcher.state.prs.lock().await;
-        let pr_state = state.get(&1).unwrap();
-        assert!(pr_state.reviewer_spawned);
-        assert!(!pr_state.reviewer_disposed);
-        assert_eq!(pr_state.last_review_state, ForgejoReviewVerdict::None);
-        assert_eq!(pr_state.rounds, 1);
-        drop(state);
-
-        let persisted = watcher.read_watcher_state().await.unwrap();
-        let persisted_pr = persisted.prs.get(&1).unwrap();
-        assert_eq!(persisted_pr.rounds, 1);
-        assert_eq!(persisted_pr.last_head_sha.as_deref(), Some("def456"));
-    }
-
-    #[tokio::test]
     async fn test_process_observations_persists_last_observed_head_sha() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut services = crate::services::Services::test();
@@ -7744,65 +6900,6 @@ mod tests {
                 .get(&1)
                 .and_then(|state| state.last_head_sha.as_deref()),
             Some("def456")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reviewer_spawner_not_called_twice() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let call_count = Arc::new(AtomicUsize::new(0));
-
-        struct CountingSpawner {
-            count: Arc<AtomicUsize>,
-        }
-        #[async_trait::async_trait]
-        impl ReviewerSpawner for CountingSpawner {
-            async fn spawn_reviewer_for_pr(
-                &self,
-                _pr: &crate::services::pr_registry::PrEntry,
-            ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-                self.count.fetch_add(1, Ordering::SeqCst);
-                Ok(Default::default())
-            }
-        }
-
-        let spawner = Arc::new(CountingSpawner {
-            count: call_count.clone(),
-        });
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut services = crate::services::Services::test();
-        services.project_dir = temp_dir.path().to_path_buf();
-
-        let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_reviewer_spawner(spawner);
-
-        let pr = test_pr_entry();
-        let registry = test_registry(pr);
-        let mut observations = HashMap::new();
-        observations.insert(1u64, test_observation("abc123"));
-
-        // First call — spawns reviewer
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Second call — PR is already in state, no second spawn
-        let mut pr = test_pr_entry();
-        pr.last_head_sha = Some("abc123".to_string());
-        let registry = test_registry(pr);
-        watcher
-            .process_observations(&registry, &observations)
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            1,
-            "spawner should only be called once per PR"
         );
     }
 }

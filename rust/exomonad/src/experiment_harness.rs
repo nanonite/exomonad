@@ -4,25 +4,21 @@
 //!
 //! This module is intentionally debug-only. It exercises the real watcher
 //! transition engine with synthetic published observations and a mock
-//! ReviewerSpawner; it never contacts Forgejo or runs as part of normal tests.
+//! TL reviewer dispatch; it never contacts Forgejo or runs as part of normal tests.
 
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
-use async_trait::async_trait;
 use chrono::Utc;
 use exomonad_core::domain::{AgentName, BirthBranch, BranchName, CIStatus};
 use exomonad_core::effects::EffectContext;
 use exomonad_core::services::pr_registry::{ForgejoReviewState, PrEntry, PrState};
 use exomonad_core::services::worktree_event_watcher::WorktreeEventWatcher;
-use exomonad_core::services::{
-    capture_memory, MemoryCapture, MemoryKind, ReviewerSpawnMetadata, ReviewerSpawner, Services,
-};
+use exomonad_core::services::{capture_memory, MemoryCapture, MemoryKind, Services};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const BACKLOG_SIZE: usize = 10;
@@ -116,24 +112,6 @@ struct MetricsRow {
     pending_children: usize,
     unread_inbox: usize,
     dispatch_sequence_hash: String,
-}
-
-#[derive(Debug, Default)]
-struct MockReviewerSpawner {
-    spawned: Mutex<Vec<u64>>,
-    latency_ticks: u32,
-}
-
-#[async_trait]
-impl ReviewerSpawner for MockReviewerSpawner {
-    async fn spawn_reviewer_for_pr(&self, pr: &PrEntry) -> Result<ReviewerSpawnMetadata> {
-        self.spawned.lock().await.push(pr.number);
-        Ok(ReviewerSpawnMetadata {
-            invocation_id: None,
-            reviewer_agent: None,
-            routing: None,
-        })
-    }
 }
 
 pub async fn run(config: &Config) -> Result<()> {
@@ -240,13 +218,8 @@ async fn run_seed(
     let isolated = tempfile::tempdir().context("create isolated watcher directory")?;
     let services = Services::benchmark(isolated.path().to_path_buf())?;
     let ci_status_map = services.ci_status_map.clone();
-    let spawner = Arc::new(MockReviewerSpawner {
-        spawned: Mutex::new(Vec::new()),
-        latency_ticks: 1,
-    });
     let watcher = WorktreeEventWatcher::new(Arc::new(services.clone()))
         .with_plugins(Arc::new(tokio::sync::RwLock::new(HashMap::new())))
-        .with_reviewer_spawner(spawner.clone())
         .with_ci_status_map(ci_status_map.clone())
         .with_ci_source_configured(true);
 
@@ -255,6 +228,7 @@ async fn run_seed(
     let mut worker_dispatches = 0;
     let mut worker_failures = 0;
     let mut recovery_dispatches = 0;
+    let mut reviewer_spawns = 0;
     let mut approved_tickets = 0;
 
     for (index, ticket_id) in ticket_ids.iter().enumerate() {
@@ -315,12 +289,13 @@ async fn run_seed(
                 CIStatus::Success,
             )
             .await?;
+        reviewer_spawns += 1;
         sequence.push(format!("ticket-{ticket_id}:reviewer-spawned"));
         events.push(serde_json::json!({
             "event": "reviewer_spawned",
             "seed": seed,
             "ticket_id": ticket_id,
-            "latency_ticks": spawner.latency_ticks,
+            "latency_ticks": 1,
         }));
 
         sequence.push(format!("ticket-{ticket_id}:watcher-approved"));
@@ -386,10 +361,9 @@ async fn run_seed(
         "worker_condition": worker_condition,
     }));
 
-    let reviewer_spawns = spawner.spawned.lock().await.len();
     if reviewer_spawns != BACKLOG_SIZE {
         bail!(
-            "mock watcher spawned {reviewer_spawns} reviewers for seed {seed}, expected {BACKLOG_SIZE}"
+            "TL dispatched {reviewer_spawns} reviewer effects for seed {seed}, expected {BACKLOG_SIZE}"
         );
     }
 

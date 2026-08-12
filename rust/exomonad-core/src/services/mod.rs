@@ -143,33 +143,6 @@ pub trait HasCiStatusMap: Send + Sync {
 pub trait HasWatcherRuntimeState: Send + Sync {
     fn watcher_runtime_state(&self) -> &Arc<WatcherRuntimeState>;
 }
-/// Metadata returned after a reviewer process has been started.
-///
-/// The watcher persists this exact invocation and routing identity with the
-/// SHA-scoped attempt.  A missing optional field means the runtime predates
-/// invocation metadata; it must not be replaced with a root-pane fallback.
-#[derive(Debug, Clone, Default)]
-pub struct ReviewerSpawnMetadata {
-    pub invocation_id: Option<String>,
-    pub reviewer_agent: Option<String>,
-    pub routing: Option<crate::domain::RoutingInfo>,
-}
-
-/// Spawns a reviewer agent for a Forgejo PR. Implemented by `AgentControlService`.
-///
-/// Reviewer creation is owned by the Forgejo PR watcher for automatic review
-/// rounds. TL/root roles may request explicit reviewer-only recovery when a PR
-/// outlives its original author worktree.
-///
-/// Decouples `WorktreeEventWatcher` from the concrete `AgentControlService` type.
-#[async_trait::async_trait]
-pub trait ReviewerSpawner: Send + Sync {
-    async fn spawn_reviewer_for_pr(
-        &self,
-        pr: &pr_registry::PrEntry,
-    ) -> anyhow::Result<ReviewerSpawnMetadata>;
-}
-
 // ============================================================================
 // Services — the concrete type that implements all traits
 // ============================================================================

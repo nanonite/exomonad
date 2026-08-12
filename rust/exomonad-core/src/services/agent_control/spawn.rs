@@ -2200,52 +2200,6 @@ impl<
     }
 }
 
-#[async_trait::async_trait]
-impl<
-        C: crate::services::HasGitHubClient
-            + crate::services::HasForgejoClient
-            + crate::services::HasTeamRegistry
-            + crate::services::HasAgentResolver
-            + crate::services::HasProjectDir
-            + crate::services::HasGitWorktreeService
-            + crate::services::HasInboxStore
-            + crate::services::HasSessionMemory
-            + 'static,
-    > crate::services::ReviewerSpawner for AgentControlService<C>
-{
-    async fn spawn_reviewer_for_pr(
-        &self,
-        pr: &crate::services::pr_registry::PrEntry,
-    ) -> anyhow::Result<crate::services::ReviewerSpawnMetadata> {
-        // Guard: if the author's worktree is gone, this PR is stale from a previous
-        // session (crash or --recreate). Skip — no agent will respond to feedback.
-        let worktree_path = self.worktree_base.join(&pr.author_agent);
-        if !worktree_path.exists() {
-            tracing::warn!(
-                pr_number = pr.number,
-                agent = %pr.author_agent,
-                path = %worktree_path.display(),
-                "Skipping reviewer spawn — author worktree absent (stale PR from previous session)"
-            );
-            anyhow::bail!(
-                "reviewer spawn skipped for PR #{} because author worktree is absent",
-                pr.number
-            );
-        }
-        let caller_bb = BirthBranch::try_from_str(pr.base_branch.as_str())
-            .expect("validated string input is non-empty");
-        let result = self.spawn_reviewer_for_recovery(pr, &caller_bb).await?;
-        let invocation = read_invocation(&result.agent_dir).await?;
-        Ok(crate::services::ReviewerSpawnMetadata {
-            invocation_id: invocation
-                .as_ref()
-                .map(|record| record.invocation_id.clone()),
-            reviewer_agent: Some(result.agent_name.to_string()),
-            routing: invocation.map(|record| record.routing),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

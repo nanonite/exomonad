@@ -1541,7 +1541,6 @@ Run `exomonad recompile` first to build it.",
         services.clone(),
     )
     .with_plugins(plugins.clone())
-    .with_reviewer_spawner(agent_control.clone())
     .with_runtime_state(watcher_runtime_state.clone())
     .with_ci_status_map(ci_status_map.clone())
     .with_policy(review_policy);

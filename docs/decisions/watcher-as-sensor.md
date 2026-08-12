@@ -10,13 +10,13 @@ The TL-as-loop epic moved run-level orchestration into `tl_loop`. It did not
 move review orchestration. The result is a split brain: two components both
 decide when a PR is ready.
 
-`rust/exomonad-core/src/services/worktree_event_watcher.rs` is 7,808 lines and
-currently owns semantics, not just observation:
+`rust/exomonad-core/src/services/worktree_event_watcher.rs` is a large service
+whose remaining responsibilities are observation and resource cleanup:
 
 | Behavior | Location |
 |----------|----------|
-| Decides when to spawn a reviewer for a new head | `should_spawn_reviewer_for_new_head` (:211), `claim_reviewer_attempt` (:225) |
-| Spawns the reviewer | `spawn_reviewer_for_pr` (:956, :1005, :2026) |
+| Decides when to spawn a reviewer for a new head | `tl_loop/loop/driver.py` head-change transition |
+| Spawns the reviewer | `tl_loop` `spawn_reviewer` effect |
 | Computes authoritative merge readiness | `ci_mergeable_at` (:329, :469), `merge_ready_notified` (:2682, :2699) |
 | Composes and delivers repair handoffs | `parent_repair_handoff_message` (:562), `deliver_parent_repair_handoff` (:2306), seven `parent_handoff_fingerprint` sites |
 | Disposes reviewers | `dispose_reviewers_for_pr` (:2029) |
@@ -228,8 +228,8 @@ anything is deleted.
    `tl_loop/fsm/transition.py` and `tl_loop/loop/driver.py`. A head change
    clears prior review and CI state for that slice.
 3. Add a `spawn_reviewer` effect call to `tl_loop/client/effects.py` and invoke
-   it from the head-change transition. Attempt claiming moves from
-   `claim_reviewer_attempt` into durable run state.
+   it from the head-change transition. Attempt claiming lives in durable run
+   state keyed by the reviewed head.
 4. Record review and CI state by head SHA rather than as a bare slice verdict.
 5. Route review comments and CI failure to `compose_repair` → `resume_pr`.
    `compose_repair` already exists and already refuses anything but `resume_pr`.
@@ -249,10 +249,9 @@ must not merge; `just e2e-tl-loop-active` green.
 
 Only after Phase 2 is proven in a live run.
 
-1. Stop spawning the reviewer by default — remove
-   `should_spawn_reviewer_for_new_head`, `claim_reviewer_attempt`, and the
-   `spawn_reviewer_for_pr` call sites (:1005, :2026). Keep the spawn effect
-   itself; the controller calls it now.
+1. Completed in E4.1 (#741): stop spawning reviewers from the watcher by
+   removing its decision, claim, and automatic-spawn paths. The TL retains the
+   `spawn_reviewer` effect and calls it from the head-change transition.
 2. Stop computing authoritative `merge_ready` — remove `ci_mergeable_at` and
    `merge_ready_notified`. Emit the compatibility event behind a temporary flag,
    then delete.

@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E4 :: E4.1 Remove reviewer-spawn decision logic (#741)
 - E3 :: E3.7 Timeout parks with a named gate (#740)
 - E3 :: E3.6 Decide the fate of GO-WITH-NITS (#739)
 - E3 :: E3.5 Narrow verify_review to the canonical rule (#738)
