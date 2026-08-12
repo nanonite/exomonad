@@ -489,6 +489,16 @@ check-e2e-authorship:
 e2e-lifecycle:
     ./tests/e2e/lifecycle/run.sh
 
+# Run the cross-provider one-shot lifecycle E2E with a deterministic Codex fixture
+e2e-one-shot-lifecycle:
+    ./tests/e2e/one-shot-lifecycle/run.sh
+
+# Check the one-shot lifecycle E2E harness without launching server or tmux
+check-e2e-one-shot-lifecycle:
+    bash -n tests/e2e/one-shot-lifecycle/run.sh
+    bash -n tests/e2e/one-shot-lifecycle/fake-codex.sh
+    python3 -m py_compile tests/e2e/one-shot-lifecycle/validate.py tests/e2e/one-shot-lifecycle/mock_forgejo.py
+
 # Check E2E agent lifecycle scripts without launching the server
 check-e2e-lifecycle:
     bash -n tests/e2e/lifecycle/run.sh
