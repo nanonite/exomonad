@@ -169,6 +169,70 @@ def test_decoder_maps_wire_pr_filed_and_pr_updated_events() -> None:
     assert updated == PRUpdated(42, "head-b", "leaf-a")
 
 
+def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Path) -> None:
+    run_id = "reviewer-spawn-run"
+    raw_pr_filed = {
+        "type": "pr.filed",
+        "run_seq": 1,
+        "run_id": run_id,
+        "agent_id": "leaf-a",
+        "lifecycle_state": "emitted",
+        "observed_at": "2026-08-12T00:00:00Z",
+        "data": {
+            "slice_id": "leaf-a",
+            "pr_number": 42,
+            "head_sha": "head-a",
+        },
+    }
+    source = SyntheticQueue(
+        [
+            project(cast(dict[str, object], raw_pr_filed)),
+            _event(2, "all_children_done", run_id=run_id),
+        ]
+    )
+    transport = RecordingTransport()
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": "leaf-a",
+                    "task": "implement the change",
+                    "boundary": ["src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                    "done_criteria": ["the changed behavior is covered"],
+                }
+            ]
+        }
+    )
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(transport),
+        config=TLLoopConfig(
+            enable_reviewer_spawn=True,
+            max_workers=0,
+            max_leaves=1,
+            max_events=2,
+            poll_interval=0.001,
+            idle_timeout=0.1,
+        ),
+        root_dir=tmp_path,
+    )
+
+    assert [name for name, _ in transport.calls] == ["spawn_leaf", "spawn_reviewer"]
+    reviewer_args = transport.calls[1][1]
+    assert reviewer_args["pr_number"] == 42
+    assert reviewer_args["head_sha"] == "head-a"
+    assert reviewer_args["force"] is False
+    criteria = cast(list[object], reviewer_args["acceptance_criteria"])
+    assert any("DONE CRITERIA: the changed behavior is covered" in str(item) for item in criteria)
+    slice_state = result.final_state.slices["leaf-a"]
+    assert slice_state.reviewer_attempt == {"head-a": 1}
+    assert source.acknowledged == [1, 2]
+
+
 def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> None:
     transport = RecordingTransport()
     run_id = "selector-run"

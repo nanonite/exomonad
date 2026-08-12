@@ -20,7 +20,9 @@ from tl_loop.fsm.event import (
     ChildCompleted,
     ChildFailed,
     ChildSpawned,
+    PRFiled,
     PRMerged,
+    PRUpdated,
     TLEvent,
 )
 from tl_loop.fsm.phase import (
@@ -34,7 +36,12 @@ from tl_loop.fsm.phase import (
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
-from tl_loop.loop.review import ReviewGateError, verify_review, watcher_head
+from tl_loop.loop.review import (
+    ReviewGateError,
+    compose_acceptance_criteria,
+    verify_review,
+    watcher_head,
+)
 from tl_loop.loop.schedule import ScheduleDeadlock, ready
 from tl_loop.select.agent_type import select_agent_type, selection_failure
 from tl_loop.select.capability import CapabilityMap, load_capability
@@ -211,6 +218,7 @@ class TLLoopConfig:
     requested_model: str | None = None
     role: str = "worker"
     review_policy_path: str | Path | None = None
+    enable_reviewer_spawn: bool = False
     branch: str = "main"
     worktree: str | Path | None = None
     agent_id: str | None = None
@@ -235,6 +243,8 @@ class TLLoopConfig:
             raise ValueError("poll_interval must be non-negative")
         if self.idle_timeout <= 0:
             raise ValueError("idle_timeout must be positive")
+        if type(self.enable_reviewer_spawn) is not bool:
+            raise ValueError("enable_reviewer_spawn must be a boolean")
         if self.chainlink_issue_id is not None and self.chainlink_issue_id <= 0:
             raise ValueError("chainlink_issue_id must be positive")
         _optional_text(self.merge_strategy, "merge_strategy")
@@ -479,7 +489,18 @@ def _run_loop(
         next_slices = _update_slices(
             state.slices, fsm_event, slice_id=_event_slice_id(event, state)
         )
+        head_changed = _pr_head_changed(
+            state.slices, fsm_event, _event_slice_id(event, state)
+        )
+        if head_changed and config.enable_reviewer_spawn:
+            next_slices = _claim_reviewer_attempt(
+                next_slices, fsm_event, _event_slice_id(event, state)
+            )
         state = store.checkpoint(next_phase, next_slices, state.budgets, event_seq)
+        if head_changed and config.enable_reviewer_spawn:
+            _spawn_reviewer_for_head(
+                plan, state, fsm_event, event, config, effects, effects_log
+            )
         source.acknowledge(event)
         before_tag = _phase_tag(phase)
         after_tag = _phase_tag(next_phase)
@@ -1014,6 +1035,86 @@ def _event_slice_id(event: EventEnvelope, state: RunState) -> str | None:
     if event.kind in {EventKind.PR_FILED, EventKind.PR_UPDATED} and event.agent_id in state.slices:
         return event.agent_id
     return None
+
+
+def _pr_event_target(
+    slices: Mapping[str, SliceState], event: TLEvent, slice_id: str | None
+) -> str | None:
+    if not isinstance(event, (PRFiled, PRUpdated)):
+        return None
+    target_id = event.slice_id or slice_id
+    if target_id is not None:
+        return target_id
+    matches = [
+        candidate_id
+        for candidate_id, candidate in slices.items()
+        if candidate.pr_number == event.pr_number
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _pr_head_changed(
+    slices: Mapping[str, SliceState], event: TLEvent, slice_id: str | None
+) -> bool:
+    if not isinstance(event, (PRFiled, PRUpdated)):
+        return False
+    target_id = _pr_event_target(slices, event, slice_id)
+    current = slices.get(target_id) if target_id is not None else None
+    return current is not None and current.reviewed_head != event.head_sha
+
+
+def _claim_reviewer_attempt(
+    slices: Mapping[str, SliceState], event: TLEvent, slice_id: str | None
+) -> dict[str, SliceState]:
+    if not isinstance(event, (PRFiled, PRUpdated)):
+        return dict(slices)
+    target_id = _pr_event_target(slices, event, slice_id)
+    current = slices.get(target_id) if target_id is not None else None
+    if target_id is None or current is None:
+        return dict(slices)
+    attempts = dict(current.reviewer_attempt)
+    attempts[event.head_sha] = attempts.get(event.head_sha, 0) + 1
+    return {**slices, target_id: replace(current, reviewer_attempt=attempts)}
+
+
+def _spawn_reviewer_for_head(
+    plan: WorkPlan,
+    state: RunState,
+    event: TLEvent,
+    envelope: EventEnvelope,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    if not isinstance(event, (PRFiled, PRUpdated)):
+        return
+    target_id = _pr_event_target(state.slices, event, envelope.slice_id)
+    current = state.slices.get(target_id) if target_id is not None else None
+    leaf = next((candidate for candidate in plan.leaves if candidate.name == target_id), None)
+    if target_id is None or current is None or leaf is None:
+        return
+    criteria = compose_acceptance_criteria(current, leaf)
+    arguments: dict[str, object] = {
+        "pr_number": event.pr_number,
+        "head_sha": event.head_sha,
+        "acceptance_criteria": list(criteria),
+        "force": False,
+    }
+    live = cast(EffectClient, effects) if config.active else None
+    _invoke(
+        "spawn_reviewer",
+        target_id,
+        arguments,
+        config.active,
+        live,
+        lambda client: client.spawn_reviewer(
+            pr_number=event.pr_number,
+            head_sha=event.head_sha,
+            acceptance_criteria=criteria,
+            force=False,
+        ),
+        effects_log,
+    )
 
 
 def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool:
