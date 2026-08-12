@@ -111,7 +111,7 @@ pub use self::session_state::{
 pub use self::sink_health::{read as read_sink_health, SinkHealth};
 pub use self::supervisor_registry::SupervisorRegistry;
 pub use self::topic_vocabulary::{
-    decode_segment, encode_segment, parse_topic, serialize_topic, InTopic, ObsTopic,
+    decode_segment, encode_segment, parse_topic, serialize_topic, InTopic, ObsTopic, ParkSignal,
 };
 pub use self::worktree_event_watcher::WatcherRuntimeState;
 use claude_teams_bridge::TeamRegistry;

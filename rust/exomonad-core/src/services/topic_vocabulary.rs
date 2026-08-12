@@ -168,6 +168,45 @@ impl ObsTopic {
     }
 }
 
+const PARK_CAUSES: &[&str] = &[
+    "retries_exhausted",
+    "budget_exhausted",
+    "no_capable_harness",
+    "schedule_deadlock",
+    "review_stuck",
+    "harness_switch_requested",
+    "stall_detected",
+];
+
+/// An immediate park signal. It is a presentation of durable TL state, not a
+/// queue item and not a gate mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkSignal {
+    pub run_id: String,
+    pub cause: String,
+}
+
+impl ParkSignal {
+    /// Parse exactly `signal/park/<run_id>/<cause>`.
+    pub fn parse(topic: &str) -> Result<Self> {
+        let segments = parse_topic(topic)?;
+        if segments.len() != 4 || segments[0] != "signal" || segments[1] != "park" {
+            bail!("park signal must be signal/park/<run_id>/<cause>")
+        }
+        if !PARK_CAUSES.contains(&segments[3].as_str()) {
+            bail!("unsupported park cause `{}`", segments[3])
+        }
+        Ok(Self {
+            run_id: segments[2].clone(),
+            cause: segments[3].clone(),
+        })
+    }
+
+    pub fn topic(&self) -> Result<String> {
+        serialize_topic(&["signal", "park", self.run_id.as_str(), self.cause.as_str()])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +265,15 @@ mod tests {
     }
 
     #[test]
+    fn park_signal_maps_to_a_closed_cause_without_queue_semantics() -> Result<()> {
+        let signal = ParkSignal::parse("signal/park/run%2B1/review_stuck")?;
+        assert_eq!(signal.run_id, "run+1");
+        assert_eq!(signal.cause, "review_stuck");
+        assert_eq!(signal.topic()?, "signal/park/run%2B1/review_stuck");
+        Ok(())
+    }
+
+    #[test]
     fn parser_rejects_other_verbs_shapes_and_unescaped_wildcards() {
         for topic in [
             "out/agent/agent-a/steering",
@@ -234,6 +282,8 @@ mod tests {
             "in/agent/agent+a/steering",
             "in/agent/agent%2b/steering",
             "in//agent-a/steering",
+            "signal/park/run/unknown_cause",
+            "signal/gate/run/tl-timeout",
         ] {
             assert!(
                 InTopic::parse(topic).is_err(),
