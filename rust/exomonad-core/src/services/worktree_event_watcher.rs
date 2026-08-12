@@ -33,6 +33,7 @@ const DEFAULT_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(600);
 const WATCHER_CAPTURE_TEXT_CHARS: usize = 160;
 const WATCHER_CAPTURE_SHA_CHARS: usize = 80;
+const EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT: bool = true;
 
 fn inbox_poke_message(unread_count: usize) -> String {
     format!(
@@ -40,8 +41,6 @@ fn inbox_poke_message(unread_count: usize) -> String {
         unread_count
     )
 }
-#[cfg(test)]
-const MERGE_READY_SIGNAL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Overall verdict derived from Forgejo reviews for a single open PR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -273,8 +272,6 @@ struct WatchState {
     reviewer_attempt: Option<ReviewerAttempt>,
     parent_handoff_fingerprint: Option<String>,
     review_approved_at: Option<Instant>,
-    ci_mergeable_at: Option<Instant>,
-    merge_ready_notified: bool,
     ci_triggered_sha: Option<String>,
     ci_blocked_notified: bool,
 }
@@ -337,8 +334,6 @@ struct WatcherPrState {
     notified_parent_approved: bool,
     #[serde(default)]
     addressed_changes: bool,
-    #[serde(default)]
-    merge_ready_notified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ci_triggered_sha: Option<String>,
     #[serde(default)]
@@ -413,12 +408,6 @@ impl WatchState {
             reviewer_attempt: None,
             parent_handoff_fingerprint: None,
             review_approved_at: None,
-            ci_mergeable_at: if matches!(ci_status, CIStatus::Success | CIStatus::Neutral) {
-                Some(Instant::now())
-            } else {
-                None
-            },
-            merge_ready_notified: false,
             ci_triggered_sha: None,
             ci_blocked_notified: false,
         }
@@ -427,7 +416,6 @@ impl WatchState {
     fn reset_review_cycle(&mut self) {
         self.notified_parent_timeout = false;
         self.notified_parent_approved = false;
-        self.merge_ready_notified = false;
         self.addressed_changes = false;
         self.rounds = 0;
         self.stuck = false;
@@ -436,7 +424,6 @@ impl WatchState {
         self.reviewer_attempt = None;
         self.parent_handoff_fingerprint = None;
         self.review_approved_at = None;
-        self.ci_mergeable_at = None;
         self.ci_triggered_sha = None;
         self.ci_blocked_notified = false;
         self.last_review_fingerprint = None;
@@ -1717,7 +1704,6 @@ where
                                     | ReviewerAttemptPhase::Stuck
                             )
                         });
-                    new_state.merge_ready_notified = persisted.merge_ready_notified;
                     new_state.ci_triggered_sha = persisted.ci_triggered_sha.clone();
                     new_state.ci_blocked_notified = persisted.ci_blocked_notified;
                     state_guard.insert(*pr_number, new_state);
@@ -1840,8 +1826,6 @@ where
                             kind = %payload_kind,
                             "Dispatching WasmEvent"
                         );
-                        let requests_merge_ready_delivery =
-                            requests_merge_ready_parent_delivery(event_type, &payload);
                         let dispatch_to_parent =
                             review_event_dispatches_to_parent(event_type, &payload);
                         let mut event_targets = vec![(
@@ -1884,12 +1868,6 @@ where
                                             target_agent_type,
                                         )
                                         .await;
-                                    if confirmed
-                                        && target_index == 0
-                                        && requests_merge_ready_delivery
-                                    {
-                                        self.mark_merge_ready_notified(pending.pr_number).await;
-                                    }
                                     if confirmed && target_index == 0 {
                                         if let Some(message) = release_message.as_ref() {
                                             self.deliver_release_message(
@@ -1989,9 +1967,7 @@ where
                                 &pending, &head_sha, round, &outcome, &context,
                             )
                             .await;
-                        if delivered && outcome == "merge_ready" {
-                            self.mark_merge_ready_notified(pending.pr_number).await;
-                        } else if !delivered {
+                        if !delivered {
                             self.reset_parent_handoff(pending.pr_number, &head_sha, &outcome)
                                 .await;
                         }
@@ -2023,7 +1999,6 @@ where
                 entry.notified_parent_timeout = watch_state.notified_parent_timeout;
                 entry.notified_parent_approved = watch_state.notified_parent_approved;
                 entry.addressed_changes = watch_state.addressed_changes;
-                entry.merge_ready_notified = watch_state.merge_ready_notified;
                 entry.ci_triggered_sha = watch_state.ci_triggered_sha.clone();
                 entry.ci_blocked_notified = watch_state.ci_blocked_notified;
                 entry.reviewer_attempt = watch_state.reviewer_attempt.clone();
@@ -2143,7 +2118,7 @@ where
                 state.last_ci_status = CIStatus::Unknown;
                 state.stuck = false;
             }
-            "merge_ready" => state.merge_ready_notified = false,
+            "merge_ready" => {}
             "approved" => {}
             _ => warn!(
                 pr_number,
@@ -2407,37 +2382,6 @@ where
         }
 
         AgentName::try_from_str(branch_tail).expect("validated string input is non-empty")
-    }
-
-    async fn mark_merge_ready_notified(&self, pr_number: u64) {
-        let mut state_guard = self.state.prs.lock().await;
-        let marked = if let Some(state) = state_guard.get_mut(&pr_number) {
-            state.merge_ready_notified = true;
-            true
-        } else {
-            warn!(
-                pr_number,
-                "Cannot mark merge-ready notification delivered because watcher state is missing"
-            );
-            false
-        };
-        drop(state_guard);
-
-        if marked {
-            let mut persisted = self.read_watcher_state().await.unwrap_or_default();
-            persisted
-                .prs
-                .entry(pr_number)
-                .or_default()
-                .merge_ready_notified = true;
-            if let Err(error) = self.write_watcher_state(&persisted).await {
-                warn!(
-                    pr_number,
-                    %error,
-                    "Failed to persist merge-ready notification state"
-                );
-            }
-        }
     }
 
     async fn skip_legacy_delivery(&self, branch: &str, event_kind: &str) -> bool {
@@ -2820,20 +2764,11 @@ fn compute_pr_actions_with_context(
     max_wait_seconds: u64,
 ) -> Vec<PendingAction> {
     let mut pending_actions = Vec::new();
-    let mut emitted_merge_ready_notification = false;
     let comment_count = comments.len() + reviews.len();
 
     let now = Instant::now();
     let ci_changed = ci_status != old_state.last_ci_status;
     let ci_now_mergeable = ci_status == CIStatus::Success || ci_status == CIStatus::Neutral;
-    if ci_changed {
-        old_state.ci_mergeable_at = if ci_now_mergeable { Some(now) } else { None };
-    }
-    let mut merge_ready_now = !old_state.merge_ready_notified
-        && signals_within_merge_ready_window(
-            old_state.review_approved_at,
-            old_state.ci_mergeable_at,
-        );
     let recover_after_ci_block = merge_blocked_on_ci && ci_changed && ci_now_mergeable;
 
     if pr_sha != old_state.last_sha {
@@ -2844,13 +2779,11 @@ fn compute_pr_actions_with_context(
         old_state.notified_parent_approved = false;
         old_state.notified_parent_timeout = false;
         old_state.review_approved_at = None;
-        old_state.merge_ready_notified = false;
         old_state.ci_triggered_sha = None;
         old_state.ci_blocked_notified = false;
         old_state.stuck = false;
         old_state.parent_handoff_fingerprint = None;
         old_state.first_seen = Instant::now();
-        merge_ready_now = false;
         if was_changes_requested {
             old_state.addressed_changes = true;
 
@@ -2927,9 +2860,8 @@ fn compute_pr_actions_with_context(
         });
     }
 
-    let terminal_parent_notified =
-        old_state.merge_ready_notified || old_state.notified_parent_timeout || old_state.stuck;
-    if terminal_parent_notified && !recover_after_ci_block && !merge_ready_now {
+    let terminal_parent_notified = old_state.notified_parent_timeout || old_state.stuck;
+    if terminal_parent_notified && !recover_after_ci_block {
         return pending_actions;
     }
 
@@ -2965,11 +2897,7 @@ fn compute_pr_actions_with_context(
             old_state.rounds,
             context,
         ));
-        let merge_ready_now = !old_state.merge_ready_notified
-            && signals_within_merge_ready_window(
-                old_state.review_approved_at,
-                old_state.ci_mergeable_at,
-            );
+        let merge_ready_now = EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT && ci_now_mergeable;
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
             payload: serde_json::json!({
@@ -2987,7 +2915,6 @@ fn compute_pr_actions_with_context(
             context: context.to_string(),
         });
         if merge_ready_now {
-            emitted_merge_ready_notification = true;
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
                 payload: serde_json::json!({
@@ -3202,14 +3129,9 @@ fn compute_pr_actions_with_context(
 
     if ci_changed {
         let reviewer_approved = old_state.notified_parent_approved;
-        let ci_completed_merge_ready = !old_state.merge_ready_notified
-            && signals_within_merge_ready_window(
-                old_state.review_approved_at,
-                old_state.ci_mergeable_at,
-            );
-        if ci_completed_merge_ready {
-            emitted_merge_ready_notification = true;
-        }
+        let ci_completed_merge_ready = EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT
+            && old_state.review_approved_at.is_some()
+            && ci_now_mergeable;
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "ci_status",
             payload: serde_json::json!({
@@ -3231,37 +3153,8 @@ fn compute_pr_actions_with_context(
         old_state.last_ci_status = ci_status;
     }
 
-    if merge_ready_now && !emitted_merge_ready_notification {
-        let context = format!(
-            "Reviewer approval and CI status {} are both satisfied for this verified head.",
-            ci_status.as_str()
-        );
-        old_state.parent_handoff_fingerprint = Some(parent_repair_handoff_fingerprint(
-            "merge_ready",
-            pr_sha,
-            old_state.rounds,
-            &context,
-        ));
-        pending_actions.push(PendingAction::WasmEvent {
-            event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": "merge_ready",
-                "pr_number": pr_number.as_u64(),
-                "ci_status": ci_status.as_str(),
-                "branch": branch,
-            }),
-        });
-        pending_actions.push(PendingAction::NotifyParentRepair {
-            head_sha: pr_sha.to_string(),
-            round: old_state.rounds,
-            outcome: "merge_ready".to_string(),
-            context,
-        });
-    }
-
     if (!old_state.notified_parent_timeout
         || old_state.parent_handoff_fingerprint.as_deref().is_none())
-        && !old_state.merge_ready_notified
         && old_state.first_seen.elapsed() > Duration::from_secs(max_wait_seconds)
     {
         let classification =
@@ -3460,13 +3353,6 @@ fn state_name(state: &ForgejoReviewVerdict) -> &'static str {
     }
 }
 
-fn signals_within_merge_ready_window(
-    review_approved_at: Option<Instant>,
-    ci_mergeable_at: Option<Instant>,
-) -> bool {
-    review_approved_at.is_some() && ci_mergeable_at.is_some()
-}
-
 fn classify_review_stall(
     state: &WatchState,
     reviewer_registered: bool,
@@ -3514,17 +3400,6 @@ fn review_event_dispatches_to_parent(event_type: &str, payload: &serde_json::Val
             payload.get("kind").and_then(|value| value.as_str()),
             Some("review_received") | Some("review_commented") | Some("reviewer_requested_changes")
         )
-}
-
-fn requests_merge_ready_parent_delivery(event_type: &str, payload: &serde_json::Value) -> bool {
-    match event_type {
-        "pr_review" => payload.get("kind").and_then(|value| value.as_str()) == Some("merge_ready"),
-        "ci_status" => payload
-            .get("merge_ready")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false),
-        _ => false,
-    }
 }
 
 fn merge_ready_release_message(payload: &serde_json::Value) -> Option<String> {
@@ -4441,7 +4316,6 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        state.ci_mergeable_at = Some(Instant::now());
         let reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
@@ -4920,7 +4794,6 @@ mod tests {
             a,
             PendingAction::WasmEvent { payload, .. } if payload["kind"] == "merge_ready"
         )));
-        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -4929,7 +4802,6 @@ mod tests {
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.last_ci_status = CIStatus::Success;
-        state.ci_mergeable_at = Some(Instant::now() - Duration::from_secs(60));
         let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
@@ -4971,7 +4843,6 @@ mod tests {
             a,
             PendingAction::NotifyParentRepair { outcome, .. } if outcome == "merge_ready"
         )));
-        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -5008,7 +4879,6 @@ mod tests {
                 payload,
             } if payload["status"] == "success"
         )));
-        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -5038,26 +4908,21 @@ mod tests {
                 payload,
             } if payload["kind"] == "merge_ready" && payload["ci_status"] == "neutral"
         )));
-        assert!(!state.merge_ready_notified);
     }
 
     #[test]
-    fn test_merge_ready_retries_until_delivery_marks_notified() {
+    fn test_merge_ready_compatibility_event_is_not_persisted() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        state.notified_parent_approved = true;
-        state.last_review_state = ForgejoReviewVerdict::Approved;
-        state.last_ci_status = CIStatus::Success;
-        state.review_approved_at = Some(Instant::now() - Duration::from_secs(60));
-        state.ci_mergeable_at = Some(Instant::now() - Duration::from_secs(60));
+        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
 
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
             "abc123",
             &[],
-            &[],
+            &reviews,
             CIStatus::Success,
             false,
             branch.as_str(),
@@ -5072,10 +4937,6 @@ mod tests {
                 payload,
             } if payload["kind"] == "merge_ready"
         )));
-        assert!(
-            !state.merge_ready_notified,
-            "pure compute must not mark merge_ready_notified before async delivery succeeds"
-        );
     }
 
     #[tokio::test]
@@ -5138,7 +4999,6 @@ mod tests {
                 payload,
             } if payload["merge_ready"] == true && payload["reviewer_approved"] == true
         )));
-        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -5168,7 +5028,6 @@ mod tests {
                 payload,
             } if payload["status"] == "success" && payload["merge_ready"] == false
         )));
-        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -5218,8 +5077,7 @@ mod tests {
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.notified_parent_approved = true;
         state.last_review_state = ForgejoReviewVerdict::Approved;
-        state.review_approved_at =
-            Some(Instant::now() - MERGE_READY_SIGNAL_WINDOW - Duration::from_secs(1));
+        state.review_approved_at = Some(Instant::now() - Duration::from_secs(1));
         state.last_ci_status = CIStatus::Pending;
 
         let actions = compute_pr_actions(
@@ -5246,7 +5104,6 @@ mod tests {
             action,
             PendingAction::WasmEvent { payload, .. } if payload["kind"] == "merge_ready"
         )));
-        assert!(!state.merge_ready_notified);
     }
 
     #[test]
@@ -5583,10 +5440,7 @@ mod tests {
         state.notified_parent_approved = true;
         state.last_review_state = ForgejoReviewVerdict::Approved;
         state.last_ci_status = CIStatus::Success;
-        state.review_approved_at =
-            Some(Instant::now() - MERGE_READY_SIGNAL_WINDOW - Duration::from_secs(60));
-        state.ci_mergeable_at =
-            Some(Instant::now() - MERGE_READY_SIGNAL_WINDOW - Duration::from_secs(60));
+        state.review_approved_at = Some(Instant::now() - Duration::from_secs(60));
         state.first_seen = Instant::now() - Duration::from_secs(16 * 60);
 
         let actions = compute_pr_actions(
@@ -5613,13 +5467,12 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_ready_delivery_suppresses_timeout_after_approval() {
+    fn test_approved_pr_without_merge_ready_state_can_timeout() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
         state.notified_parent_approved = true;
         state.last_review_state = ForgejoReviewVerdict::Approved;
-        state.merge_ready_notified = true;
         state.last_ci_status = CIStatus::Success;
         state.first_seen = Instant::now() - Duration::from_secs(16 * 60);
 
@@ -5636,8 +5489,14 @@ mod tests {
             5,
         );
 
-        assert!(actions.is_empty());
-        assert!(!state.notified_parent_timeout);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::FileHumanEscalation {
+                classification: ReviewStallKind::ReviewerNotResponding,
+                ..
+            }
+        )));
+        assert!(state.notified_parent_timeout);
     }
 
     #[test]
@@ -6433,14 +6292,12 @@ mod tests {
             WatchState::new(&branch, AgentType::Codex, "abc123", CIStatus::Failure, 2);
         watch_state.notified_parent_timeout = true;
         watch_state.notified_parent_approved = true;
-        watch_state.merge_ready_notified = true;
         watch_state.addressed_changes = true;
         watch_state.rounds = 3;
         watch_state.stuck = true;
         watch_state.reviewer_spawned = true;
         watch_state.reviewer_disposed = true;
         watch_state.review_approved_at = Some(Instant::now());
-        watch_state.ci_mergeable_at = Some(Instant::now());
         watch_state.ci_triggered_sha = Some("abc123".to_string());
         watch_state.ci_blocked_notified = true;
         runtime_state.prs.lock().await.insert(7, watch_state);
@@ -6452,14 +6309,12 @@ mod tests {
         let reset = state.get(&7).unwrap();
         assert!(!reset.notified_parent_timeout);
         assert!(!reset.notified_parent_approved);
-        assert!(!reset.merge_ready_notified);
         assert!(!reset.addressed_changes);
         assert_eq!(reset.rounds, 0);
         assert!(!reset.stuck);
         assert!(!reset.reviewer_spawned);
         assert!(!reset.reviewer_disposed);
         assert!(reset.review_approved_at.is_none());
-        assert!(reset.ci_mergeable_at.is_none());
         assert!(reset.ci_triggered_sha.is_none());
         assert!(!reset.ci_blocked_notified);
     }
@@ -6540,7 +6395,6 @@ mod tests {
                 last_head_sha: Some("abc123".to_string()),
                 last_review_fingerprint: Some("persisted-review".to_string()),
                 notified_parent_timeout: true,
-                merge_ready_notified: true,
                 ci_blocked_notified: true,
                 ..Default::default()
             },
@@ -6569,7 +6423,6 @@ mod tests {
             Some("persisted-review")
         );
         assert!(state.notified_parent_timeout);
-        assert!(state.merge_ready_notified);
         assert!(state.ci_blocked_notified);
     }
 

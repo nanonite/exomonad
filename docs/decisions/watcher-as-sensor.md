@@ -17,7 +17,7 @@ whose remaining responsibilities are observation and resource cleanup:
 |----------|----------|
 | Decides when to spawn a reviewer for a new head | `tl_loop/loop/driver.py` head-change transition |
 | Spawns the reviewer | `tl_loop` `spawn_reviewer` effect |
-| Computes authoritative merge readiness | `ci_mergeable_at` (:329, :469), `merge_ready_notified` (:2682, :2699) |
+| Computes authoritative merge readiness | Removed in E4.2 (#742); merge eligibility is derived by the TL from head-bound evidence and CI |
 | Composes and delivers repair handoffs | `parent_repair_handoff_message` (:562), `deliver_parent_repair_handoff` (:2306), seven `parent_handoff_fingerprint` sites |
 | Disposes reviewers | `dispose_reviewers_for_pr` (:2029) |
 | Tracks review rounds against `reviewer_max_rounds` | `distinct_changes_requested_rounds` (:185) |
@@ -70,8 +70,10 @@ No other approval layer is required.
 **1. Watcher `merge_ready` — demoted to derived state.** The controller can
 compute it from `pr.review` and `ci.status_changed` keyed by head SHA. A
 separate watcher decision adds a second opinion with no extra information.
-Keep the event only as a temporary compatibility signal behind a flag, then
-remove it.
+E4.2 (#742) removed the watcher's durable merge-readiness state. The event
+remains only as a temporary compatibility signal behind
+`EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT` until the remaining consumers are
+migrated.
 
 **2. TL `adjudicate_review` — the workflow approval decision.** The reviewer
 submits structured findings for the exact head it inspected. Those findings are
@@ -252,9 +254,10 @@ Only after Phase 2 is proven in a live run.
 1. Completed in E4.1 (#741): stop spawning reviewers from the watcher by
    removing its decision, claim, and automatic-spawn paths. The TL retains the
    `spawn_reviewer` effect and calls it from the head-change transition.
-2. Stop computing authoritative `merge_ready` — remove `ci_mergeable_at` and
-   `merge_ready_notified`. Emit the compatibility event behind a temporary flag,
-   then delete.
+2. Completed in E4.2 (#742): stop computing authoritative `merge_ready` by
+   removing `ci_mergeable_at` and `merge_ready_notified`. The compatibility
+   event remains behind `EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT` until its
+   remaining consumers are migrated.
 3. Stop composing repair handoffs — remove `parent_repair_handoff_message`,
    `deliver_parent_repair_handoff`, and the seven
    `parent_handoff_fingerprint` sites.
