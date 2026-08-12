@@ -13,39 +13,6 @@ const DEFAULT_HARD_CAP: usize = 32;
 
 pub static GLOBAL_AGENT_INBOX: LazyLock<AgentInbox> = LazyLock::new(AgentInbox::default);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DedupKey {
-    recipient: String,
-    event_type: String,
-    scope_key: Option<u64>,
-    idempotency_key: String,
-}
-
-impl DedupKey {
-    fn structured(recipient: &str, event_type: &str, scope_key: Option<u64>) -> Self {
-        Self {
-            recipient: recipient.to_string(),
-            event_type: event_type.to_string(),
-            scope_key,
-            idempotency_key: format!(
-                "structured:{recipient}:{event_type}:{}",
-                scope_key
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string())
-            ),
-        }
-    }
-
-    fn freeform(recipient: &str) -> Self {
-        Self {
-            recipient: recipient.to_string(),
-            event_type: "notify_parent_freeform".to_string(),
-            scope_key: None,
-            idempotency_key: uuid::Uuid::new_v4().to_string(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxMessage {
     pub id: u64,
@@ -56,7 +23,9 @@ pub struct InboxMessage {
     pub body: String,
     pub detail: String,
     pub injection_options: InjectionOptions,
-    dedup_key: DedupKey,
+    /// A durable batch identity used only to avoid copying one queued row
+    /// into this process-local cache more than once at a time.
+    cache_key: Option<String>,
 }
 
 impl InboxMessage {
@@ -68,7 +37,6 @@ impl InboxMessage {
         body: String,
         detail: String,
     ) -> Self {
-        let dedup_key = dedup_key_for_message(&from, &recipient, &body);
         Self {
             id: 0,
             target,
@@ -78,7 +46,7 @@ impl InboxMessage {
             body,
             detail,
             injection_options: InjectionOptions::claude_default(),
-            dedup_key,
+            cache_key: None,
         }
     }
 
@@ -87,19 +55,16 @@ impl InboxMessage {
         self
     }
 
-    pub fn with_idempotency_key(mut self, idempotency_key: impl Into<String>) -> Self {
-        self.dedup_key.idempotency_key = idempotency_key.into();
+    pub fn with_cache_key(mut self, cache_key: impl Into<String>) -> Self {
+        self.cache_key = Some(cache_key.into());
         self
     }
 }
 
-/// Return the stable key for a structured message or a fresh UUID for a
-/// free-form message. Callers persist this key with the durable batch.
+/// Return the durable producer identity for a structured message or a fresh
+/// UUID for a free-form message. This key is persisted with the durable batch;
+/// it is deliberately not used by the process-local transport cache.
 pub fn idempotency_key_for_message(from: &str, recipient: &str, body: &str) -> String {
-    dedup_key_for_message(from, recipient, body).idempotency_key
-}
-
-fn dedup_key_for_message(_from: &str, recipient: &str, body: &str) -> DedupKey {
     for (tag, event_type) in [
         ("[MERGE READY]", "MergeReady"),
         ("[PR READY]", "ReviewApproved"),
@@ -109,19 +74,30 @@ fn dedup_key_for_message(_from: &str, recipient: &str, body: &str) -> DedupKey {
         ("[CI Status]", "CIStatus"),
     ] {
         if body.contains(tag) {
-            return DedupKey::structured(recipient, event_type, parse_pr_number(body));
+            return format!(
+                "structured:{recipient}:{event_type}:{}",
+                parse_pr_number(body)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
         }
     }
 
     if body.contains("## Review on PR #") || body.contains("[CHANGES REQUESTED] PR #") {
-        return DedupKey::structured(recipient, "ReviewReceived", parse_pr_number(body));
+        return format!(
+            "structured:{recipient}:ReviewReceived:{}",
+            parse_pr_number(body)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
     }
 
     if let Some(scope_key) = parse_stuck_scope(body) {
-        return DedupKey::structured(recipient, "Stuck", Some(scope_key));
+        return format!("structured:{recipient}:Stuck:{scope_key}");
     }
 
-    DedupKey::freeform(recipient)
+    let _ = from;
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn append_inbox_event(
@@ -168,7 +144,9 @@ pub struct EnqueueOutcome {
 struct AgentQueue {
     messages: VecDeque<InboxMessage>,
     consumer_active: bool,
-    pending: HashSet<DedupKey>,
+    /// Cache-local identities for durable batches currently represented in the
+    /// FIFO. SQLite remains the authority for idempotency and lifecycle.
+    queued_cache_keys: HashSet<String>,
 }
 
 /// Process-local transport cache rebuilt from durable guidance rows.
@@ -204,40 +182,38 @@ impl AgentInbox {
         let mut queues = self.queues.lock().await;
         let queue = queues.entry(agent.to_string()).or_default();
 
-        if queue.pending.contains(&message.dedup_key) {
-            append_inbox_event(
-                &message.project_dir,
-                &message.recipient,
-                "agent_inbox.duplicates_dropped",
-                serde_json::json!({
-                    "recipient": message.recipient,
-                    "event_type": message.dedup_key.event_type,
-                    "scope_key": message.dedup_key.scope_key,
-                    "idempotency_key": message.dedup_key.idempotency_key,
-                    "outcome": "dropped"
-                }),
-            );
-            tracing::debug!(
-                recipient = %message.recipient,
-                event_type = %message.dedup_key.event_type,
-                scope_key = ?message.dedup_key.scope_key,
-                idempotency_key = %message.dedup_key.idempotency_key,
-                "dropping duplicate pending agent inbox message"
-            );
-            tracing::info!(
-                otel.name = "agent_inbox.duplicates_dropped",
-                recipient = %message.recipient,
-                event_type = %message.dedup_key.event_type,
-                scope_key = ?message.dedup_key.scope_key,
-                idempotency_key = %message.dedup_key.idempotency_key,
-                "[metric] agent_inbox.duplicates_dropped"
-            );
-            return Ok(EnqueueOutcome {
-                depth: queue.messages.len(),
-                warning_emitted: false,
-                should_start_consumer: !queue.consumer_active && !queue.messages.is_empty(),
-                dropped_as_duplicate: true,
-            });
+        if let Some(cache_key) = message.cache_key.as_deref() {
+            if queue.queued_cache_keys.contains(cache_key) {
+                append_inbox_event(
+                    &message.project_dir,
+                    &message.recipient,
+                    "agent_inbox.duplicates_dropped",
+                    serde_json::json!({
+                        "recipient": message.recipient,
+                        "cache_key": cache_key,
+                        "outcome": "dropped",
+                        "authority": "transport_cache"
+                    }),
+                );
+                tracing::debug!(
+                    recipient = %message.recipient,
+                    cache_key,
+                    "dropping duplicate durable batch already present in transport cache"
+                );
+                tracing::info!(
+                    otel.name = "agent_inbox.duplicates_dropped",
+                    recipient = %message.recipient,
+                    cache_key,
+                    authority = "transport_cache",
+                    "[metric] agent_inbox.duplicates_dropped"
+                );
+                return Ok(EnqueueOutcome {
+                    depth: queue.messages.len(),
+                    warning_emitted: false,
+                    should_start_consumer: !queue.consumer_active && !queue.messages.is_empty(),
+                    dropped_as_duplicate: true,
+                });
+            }
         }
 
         if queue.messages.len() >= self.hard_cap {
@@ -250,7 +226,9 @@ impl AgentInbox {
         }
 
         message.id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        queue.pending.insert(message.dedup_key.clone());
+        if let Some(cache_key) = message.cache_key.as_ref() {
+            queue.queued_cache_keys.insert(cache_key.clone());
+        }
         queue.messages.push_back(message);
         let depth = queue.messages.len();
         let should_start_consumer = !queue.consumer_active;
@@ -266,8 +244,9 @@ impl AgentInbox {
     ///
     /// SQLite remains authoritative: expired leases are recovered there first,
     /// and only available pending batches are copied into the FIFO. The durable
-    /// batch ID is used as the cache idempotency key, so repeating reconstruction
-    /// cannot create a second in-memory delivery.
+    /// The durable batch ID is used only as a cache key, so repeating
+    /// reconstruction cannot create a second in-memory delivery while the
+    /// first copy remains queued.
     pub async fn rebuild_from_durable(
         &self,
         store: &InboxStore,
@@ -333,16 +312,17 @@ impl AgentInbox {
                 .is_some_and(|message| message.id == message_id)
         {
             if let Some(message) = queue.messages.pop_front() {
-                queue.pending.remove(&message.dedup_key);
+                if let Some(cache_key) = message.cache_key {
+                    queue.queued_cache_keys.remove(&cache_key);
+                }
             }
         }
 
         queue.consumer_active = false;
     }
 
-    /// Drop the head message after delivery attempts are exhausted. Clears the
-    /// dedup `pending` entry without marking it recently-delivered, so an
-    /// identical event can be re-enqueued immediately.
+    /// Drop the head message after delivery attempts are exhausted. Clears its
+    /// cache-local key so a later durable rebuild can retry the batch.
     pub async fn abandon_delivery(&self, agent: &str, message_id: u64) {
         let mut queues = self.queues.lock().await;
         let Some(queue) = queues.get_mut(agent) else {
@@ -355,7 +335,9 @@ impl AgentInbox {
             .is_some_and(|message| message.id == message_id)
         {
             if let Some(message) = queue.messages.pop_front() {
-                queue.pending.remove(&message.dedup_key);
+                if let Some(cache_key) = message.cache_key {
+                    queue.queued_cache_keys.remove(&cache_key);
+                }
             }
         }
 
@@ -401,10 +383,6 @@ fn message_from_batch(
         .next()
         .unwrap_or("durable guidance")
         .to_string();
-    let idempotency_key = batch
-        .idempotency_key
-        .clone()
-        .unwrap_or_else(|| batch.batch_id.clone());
     Ok(InboxMessage::new(
         target.to_string(),
         project_dir.to_path_buf(),
@@ -414,7 +392,7 @@ fn message_from_batch(
         format!("durable guidance batch {}: {summary}", batch.batch_id),
     )
     .with_injection_options(injection_options)
-    .with_idempotency_key(idempotency_key))
+    .with_cache_key(batch.batch_id.clone()))
 }
 
 #[cfg(test)]
@@ -437,6 +415,10 @@ mod tests {
             body.to_string(),
             "%1".to_string(),
         )
+    }
+
+    fn cached_message(body: &str, cache_key: &str) -> InboxMessage {
+        message(body).with_cache_key(cache_key)
     }
 
     fn durable_request(agent: &str, key: &str, body: &str) -> GuidanceBatchRequest {
@@ -638,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_delivery_keeps_message_at_head_for_retry() {
+    async fn failed_delivery_preserves_message_identity_for_retry() {
         let inbox = AgentInbox::new(8, 32);
         inbox.enqueue("agent", message("first")).await.unwrap();
         let first = inbox.begin_delivery("agent").await.unwrap();
@@ -650,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_after_failed_delivery_still_requests_a_consumer() {
+    async fn repeated_body_after_failed_delivery_is_queued_again() {
         let inbox = AgentInbox::new(8, 32);
         let body = "[MERGE READY] PR #42 approved";
 
@@ -663,10 +645,10 @@ mod tests {
         assert_eq!(inbox.queue_depth("agent").await, 1);
         assert!(!inbox.is_consumer_active("agent").await);
 
-        // A repeat of the same event is the only thing that could restart the
-        // consumer; it must not leave the queue stranded.
+        // The cache no longer infers identity from the body. Durable SQLite
+        // decides whether this is a duplicate before transport enqueue.
         let second = inbox.enqueue("agent", message(body)).await.unwrap();
-        assert!(second.dropped_as_duplicate);
+        assert!(!second.dropped_as_duplicate);
         assert!(
             second.should_start_consumer,
             "stranded queue (depth {}) with no active consumer must request a restart",
@@ -698,8 +680,7 @@ mod tests {
         assert_eq!(inbox.queue_depth("agent").await, 0);
         assert!(!inbox.is_consumer_active("agent").await);
 
-        // Abandoned messages are not marked recently-delivered, so an identical
-        // event is accepted rather than suppressed by the dedup window.
+        // An abandoned durable batch may be rebuilt for retry.
         let retry = inbox.enqueue("agent", message(body)).await.unwrap();
         assert!(!retry.dropped_as_duplicate);
         assert!(retry.should_start_consumer);
@@ -730,7 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_structured_identity_is_dropped_while_pending() {
+    async fn structured_message_bodies_do_not_control_cache_identity() {
         let inbox = AgentInbox::new(8, 32);
         let body =
             "[MERGE READY] PR #42 on branch main.a has CI status success and reviewer approval.";
@@ -739,21 +720,40 @@ mod tests {
         let second = inbox.enqueue("agent", message(body)).await.unwrap();
 
         assert!(!first.dropped_as_duplicate);
-        assert!(second.dropped_as_duplicate);
-        assert_eq!(second.depth, 1);
-        assert_eq!(inbox.queue_depth("agent").await, 1);
+        assert!(!second.dropped_as_duplicate);
+        assert_eq!(second.depth, 2);
+        assert_eq!(inbox.queue_depth("agent").await, 2);
     }
 
     #[tokio::test]
-    async fn duplicate_structured_identity_is_allowed_after_delivery() {
+    async fn durable_batch_cache_key_only_suppresses_same_queued_batch() {
         let inbox = AgentInbox::new(8, 32);
-        let body =
-            "[MERGE READY] PR #42 on branch main.a has CI status success and reviewer approval.";
-        inbox.enqueue("agent", message(body)).await.unwrap();
+        let first = inbox
+            .enqueue("agent", cached_message("first durable body", "batch-42"))
+            .await
+            .unwrap();
+        let duplicate = inbox
+            .enqueue(
+                "agent",
+                cached_message("same batch, different body", "batch-42"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!first.dropped_as_duplicate);
+        assert!(duplicate.dropped_as_duplicate);
+        assert_eq!(duplicate.depth, 1);
+
         let first = inbox.begin_delivery("agent").await.unwrap();
         inbox.complete_delivery("agent", first.id, true).await;
 
-        let outcome = inbox.enqueue("agent", message(body)).await.unwrap();
+        let outcome = inbox
+            .enqueue(
+                "agent",
+                cached_message("retry after cache eviction", "batch-42"),
+            )
+            .await
+            .unwrap();
 
         assert!(!outcome.dropped_as_duplicate);
         assert_eq!(inbox.queue_depth("agent").await, 1);
@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_delivery_keeps_identity_pending_for_retry() {
+    async fn failed_delivery_keeps_message_at_head_for_retry() {
         let inbox = AgentInbox::new(8, 32);
         let body = "[MERGE READY] PR #42 on branch main.a";
         inbox.enqueue("agent", message(body)).await.unwrap();

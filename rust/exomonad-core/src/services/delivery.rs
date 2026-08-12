@@ -399,7 +399,8 @@ pub async fn route_tmux_notification(
             let tab_name = resolve_tab_name_for_agent(name, Some(ctx.agent_resolver()));
             let agent_key = name.as_str();
             let result =
-                deliver_via_tmux(ctx.project_dir(), agent_key, &tab_name, from, content).await;
+                deliver_via_tmux(ctx.project_dir(), agent_key, &tab_name, from, content, None)
+                    .await;
             DeliveryOutcome::from_result(result, agent_key)
         }
         Address::Team { team, member } => {
@@ -414,12 +415,20 @@ pub async fn route_tmux_notification(
             let agent_name = crate::domain::AgentName::try_from_str(agent_key.as_str())
                 .expect("validated agent key is non-empty");
             let tab_name = resolve_tab_name_for_agent(&agent_name, Some(ctx.agent_resolver()));
-            let result =
-                deliver_via_tmux(ctx.project_dir(), &agent_key, &tab_name, from, content).await;
+            let result = deliver_via_tmux(
+                ctx.project_dir(),
+                &agent_key,
+                &tab_name,
+                from,
+                content,
+                None,
+            )
+            .await;
             DeliveryOutcome::from_result(result, &agent_key)
         }
         Address::Supervisor => {
-            let result = deliver_via_tmux(ctx.project_dir(), "root", "TL", from, content).await;
+            let result =
+                deliver_via_tmux(ctx.project_dir(), "root", "TL", from, content, None).await;
             DeliveryOutcome::from_result(result, "root")
         }
     }
@@ -561,13 +570,21 @@ async fn deliver_to_agent_for(
             .await
         }
         MessageDeliveryPath::TmuxOnly => {
-            if record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class)
-                .await
-                .is_none()
-            {
+            let Some(batch) =
+                record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class).await
+            else {
                 return DeliveryResult::Failed;
-            }
-            match deliver_via_tmux(ctx.project_dir(), agent_key, tmux_target, from, message).await {
+            };
+            match deliver_via_tmux(
+                ctx.project_dir(),
+                agent_key,
+                tmux_target,
+                from,
+                message,
+                Some(&batch.batch_id),
+            )
+            .await
+            {
                 DeliveryResult::Failed => DeliveryResult::Durable,
                 result => result,
             }
@@ -1122,8 +1139,9 @@ async fn enqueue_tmux_delivery(
     from: &crate::domain::AgentName,
     message: &str,
     detail: &str,
+    cache_key: Option<&str>,
 ) -> DeliveryResult {
-    let inbox_message = InboxMessage::new(
+    let mut inbox_message = InboxMessage::new(
         target.to_string(),
         effective_pd,
         from.as_str().to_string(),
@@ -1132,6 +1150,9 @@ async fn enqueue_tmux_delivery(
         detail.to_string(),
     )
     .with_injection_options(tmux_injection_options(agent_type_from_key(agent_key)));
+    if let Some(cache_key) = cache_key {
+        inbox_message = inbox_message.with_cache_key(cache_key);
+    }
 
     match GLOBAL_AGENT_INBOX.enqueue(agent_key, inbox_message).await {
         Ok(outcome) => {
@@ -1231,6 +1252,7 @@ async fn deliver_via_tmux(
     tmux_target: &str,
     from: &crate::domain::AgentName,
     message: &str,
+    cache_key: Option<&str>,
 ) -> DeliveryResult {
     let slug = agent_key
         .rsplit_once('.')
@@ -1299,8 +1321,16 @@ async fn deliver_via_tmux(
             crate::services::resolve_working_dir(agent_key)
         };
         let effective_pd = project_dir.join(worktree);
-        return enqueue_tmux_delivery(agent_key, &target, effective_pd, from, message, &target)
-            .await;
+        return enqueue_tmux_delivery(
+            agent_key,
+            &target,
+            effective_pd,
+            from,
+            message,
+            &target,
+            cache_key,
+        )
+        .await;
     }
 
     tracing::Span::current().record("delivery_method", "tmux");
@@ -1354,6 +1384,7 @@ async fn deliver_via_tmux(
         from,
         message,
         tmux_target,
+        cache_key,
     )
     .await
 }
@@ -1625,6 +1656,7 @@ async fn deliver_to_agent_with_class(
                 let agent = agent_key.to_string();
                 let target = tmux_target.to_string();
                 let msg = message.to_string();
+                let batch_id = batch.batch_id.clone();
                 let has_tmux_fallback = is_in_memory;
                 let worktree = if agent_key.contains('.') {
                     crate::services::resolve_working_dir(agent_key)
@@ -1680,9 +1712,16 @@ async fn deliver_to_agent_with_class(
                     );
                     let fallback_sender = crate::domain::AgentName::try_from_str("teams-fallback")
                         .expect("literal validated string is non-empty");
-                    let _ =
-                        enqueue_tmux_delivery(&agent, &target, pd, &fallback_sender, &msg, &target)
-                            .await;
+                    let _ = enqueue_tmux_delivery(
+                        &agent,
+                        &target,
+                        pd,
+                        &fallback_sender,
+                        &msg,
+                        &target,
+                        Some(batch_id.as_str()),
+                    )
+                    .await;
                 });
                 return DeliveryResult::Teams;
             }
@@ -1747,7 +1786,15 @@ async fn deliver_to_agent_with_class(
     }
 
     // Fall back to tmux STDIN injection
-    let result = deliver_via_tmux(project_dir, agent_key, tmux_target, from, message).await;
+    let result = deliver_via_tmux(
+        project_dir,
+        agent_key,
+        tmux_target,
+        from,
+        message,
+        Some(&batch.batch_id),
+    )
+    .await;
     crate::services::lifecycle::record_guidance_delivery_with_batch(
         project_dir,
         agent_key,

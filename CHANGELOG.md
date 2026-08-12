@@ -293,6 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E12 :: E12.2 Demote the in-memory dedup window (#794)
 - E12 :: E12.1 Rebuild AgentInbox from durable rows on restart (#793)
 - E11 :: E11.4 Verify no body leakage into aggregate projections (#792)
 - E11 :: E11.3 Add replay projection for queue state (#791)
