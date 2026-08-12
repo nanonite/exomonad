@@ -19,6 +19,8 @@ pub struct ExpectedEventRule {
     pub legacy_confidence_rule: String,
     pub denominator_effect: String,
     #[serde(default)]
+    pub prerequisite_data: BTreeMap<String, String>,
+    #[serde(default)]
     pub required_data: BTreeMap<String, String>,
     #[serde(default)]
     pub correlation_fields: Vec<String>,
@@ -84,7 +86,10 @@ pub fn reconcile_events(events: &[EventObservation]) -> Result<DenominatorReport
         let mut observed = 0;
         let prerequisites = events
             .iter()
-            .filter(|event| event.event_type == rule.prerequisite_event)
+            .filter(|event| {
+                event.event_type == rule.prerequisite_event
+                    && event_data_matches(event, &rule.prerequisite_data)
+            })
             .collect::<Vec<_>>();
         let mut matched_required = std::collections::HashSet::new();
         for prerequisite in prerequisites {
@@ -168,6 +173,16 @@ fn required_data_matches(
         let prerequisite_value = prerequisite.data.get(field);
         let required_value = required.data.get(field);
         prerequisite_value.is_some() && prerequisite_value == required_value
+    })
+}
+
+fn event_data_matches(event: &EventObservation, expected: &BTreeMap<String, String>) -> bool {
+    expected.iter().all(|(field, value)| {
+        event
+            .data
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|actual| actual == value)
     })
 }
 
@@ -267,6 +282,52 @@ mod tests {
                 .context("merge gate rule")?;
             assert_eq!((row.expected, row.observed, row.missing), (1, 0, 1));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn guidance_enqueue_requires_acceptance_or_explicit_abandonment() -> Result<()> {
+        let mut enqueue = LedgerEvent::new(
+            "inbox.state_changed",
+            None,
+            serde_json::json!({"operation": "enqueue", "batch_id": "batch-1"}),
+        );
+        enqueue.session_id = Some("session-guidance".to_string());
+        enqueue.run_seq = Some(1);
+        let mut accepted = LedgerEvent::new(
+            "message.consumed",
+            None,
+            serde_json::json!({"batch_id": "batch-1", "ack_kind": "runtime_accepted"}),
+        );
+        accepted.session_id = Some("session-guidance".to_string());
+        accepted.run_seq = Some(2);
+        let mut abandoned_enqueue = LedgerEvent::new(
+            "inbox.state_changed",
+            None,
+            serde_json::json!({"operation": "enqueue", "batch_id": "batch-2"}),
+        );
+        abandoned_enqueue.session_id = Some("session-guidance".to_string());
+        abandoned_enqueue.run_seq = Some(3);
+        let mut abandoned = LedgerEvent::new(
+            "agent_inbox.messages_abandoned",
+            None,
+            serde_json::json!({"batch_id": "batch-2"}),
+        );
+        abandoned.session_id = Some("session-guidance".to_string());
+        abandoned.run_seq = Some(4);
+
+        let report = reconcile(&[
+            record(enqueue),
+            record(accepted),
+            record(abandoned_enqueue),
+            record(abandoned),
+        ])?;
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.rule_id == "guidance_enqueue_requires_acceptance_or_abandonment")
+            .context("guidance enqueue rule")?;
+        assert_eq!((row.expected, row.observed, row.missing), (2, 2, 0));
         Ok(())
     }
 }

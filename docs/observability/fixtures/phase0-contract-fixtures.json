@@ -13,7 +13,7 @@
       "scenario_id": "resume_retry_and_delivery",
       "session_id": "fixture-session-002",
       "harnesses": ["claude", "python-loop"],
-      "events": ["agent.resumed", "agent.invocation.started", "agent.notify_parent", "message.delivery", "message.consumed", "agent_inbox.duplicates_dropped", "agent_inbox.messages_abandoned"]
+      "events": ["agent.resumed", "agent.invocation.started", "agent.notify_parent", "inbox.state_changed", "message.delivery", "message.consumed", "agent_inbox.duplicates_dropped", "agent_inbox.messages_abandoned"]
     },
     {
       "scenario_id": "review_and_merge_loop",
@@ -64,6 +64,7 @@
     "published_pr_requires_review_current_head",
     "head_change_requires_ci_status_current_head",
     "merge_request_requires_approved_current_head",
-    "merge_request_requires_passing_ci_current_head"
+    "merge_request_requires_passing_ci_current_head",
+    "guidance_enqueue_requires_acceptance_or_abandonment"
   ]
 }

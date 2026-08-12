@@ -293,6 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E11 :: E11.2 Update event registry and expected-event rules (#790)
 - E11 :: E11.1 Extend event payloads with queue identities (#789)
 - E10 :: E10.5 Shadow-mode comparison harness (#788)
 - E10 :: E10.4 OpenCode adapter (#787)

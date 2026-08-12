@@ -45,6 +45,18 @@
       "denominator_effect": "Add one expected consumption observation for each durable delivery attempt."
     },
     {
+      "rule_id": "guidance_enqueue_requires_acceptance_or_abandonment",
+      "prerequisite_event": "inbox.state_changed",
+      "required_event": "message.consumed/agent_inbox.messages_abandoned",
+      "allowed_delay_ms": null,
+      "allowed_window": "until acceptance, explicit abandonment, cancellation, or session termination",
+      "prerequisite_data": {"operation": "enqueue"},
+      "correlation_fields": ["batch_id"],
+      "applicable_sources": ["rust", "sqlite"],
+      "legacy_confidence_rule": "A durable guidance enqueue without same-batch acceptance or explicit abandonment remains pending or unknown; a transport write alone is not success.",
+      "denominator_effect": "Add one expected terminal guidance outcome for each observed durable enqueue."
+    },
+    {
       "rule_id": "published_pr_requires_observation",
       "prerequisite_event": "pr.published",
       "required_event": "watcher.pr_observation",

@@ -130,7 +130,8 @@ def validate_expected_events(contract: dict[str, Any], event_types: set[str]) ->
         rule_ids.add(rule["rule_id"])
         for event_key in ("prerequisite_event", "required_event"):
             event_type = rule[event_key]
-            if event_type not in event_types:
+            alternatives = event_type.split("/")
+            if not event_type or not all(candidate in event_types for candidate in alternatives):
                 raise ContractError(f"{context}: undeclared {event_key} {event_type}")
         if "allowed_delay_ms" not in rule and "allowed_window" not in rule:
             raise ContractError(f"{context}: allowed delay or window is required")
@@ -145,6 +146,11 @@ def validate_expected_events(contract: dict[str, Any], event_types: set[str]) ->
             or not all(isinstance(key, str) and isinstance(value, str) for key, value in rule["required_data"].items())
         ):
             raise ContractError(f"{context}: required_data must map string fields to strings")
+        if "prerequisite_data" in rule and (
+            not isinstance(rule["prerequisite_data"], dict)
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in rule["prerequisite_data"].items())
+        ):
+            raise ContractError(f"{context}: prerequisite_data must map string fields to strings")
     expected_rules = {
         "spawn_requires_invocation_start",
         "invocation_requires_finish",
@@ -156,6 +162,7 @@ def validate_expected_events(contract: dict[str, Any], event_types: set[str]) ->
         "head_change_requires_ci_status_current_head",
         "merge_request_requires_approved_current_head",
         "merge_request_requires_passing_ci_current_head",
+        "guidance_enqueue_requires_acceptance_or_abandonment",
     }
     if rule_ids != expected_rules:
         raise ContractError(f"expected-event contract: rules must be {sorted(expected_rules)}")
