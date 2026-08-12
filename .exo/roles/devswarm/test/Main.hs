@@ -13,6 +13,8 @@ import Control.Monad.Freer.Coroutine (runC)
 import Control.Monad.Freer.Coroutine qualified as C
 import Data.Aeson (Value)
 import Data.Aeson qualified as Aeson
+import Data.Aeson.Key qualified as AesonKey
+import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Lazy.Char8 qualified as BSL
@@ -35,7 +37,7 @@ import ExoMonad.Guest.Prompt qualified as Prompt
 import ExoMonad.Guest.ReviewHandoff (ReviewFixTask (..), renderReviewFixTask, reviewHandoffInstructions)
 import ExoMonad.Guest.StateMachine (StateMachine (..), StopCheckResult (..), TransitionResult (..))
 import ExoMonad.Guest.StateMachine qualified as StateMachine
-import ExoMonad.Guest.Tool.Class (ToolDefinition (tdDescription, tdName))
+import ExoMonad.Guest.Tool.Class (ToolDefinition (tdDescription, tdInputSchema, tdName))
 import ExoMonad.Guest.Tool.Suspend.Types (EffectRequest (..))
 import ExoMonad.Guest.Tools.FilePR (filePRDescription, filePRSchema)
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), mergePRDescription, mergePRSchema)
@@ -77,6 +79,7 @@ runRoleHookTests = do
   assertRoleAllow "tl" TLRole.config
   assertRoleAllow "root" RootRole.config
   assertReviewerToolList
+  assertReviewerVerdictSchemas
   assertNoRoleExposesShutdown
   assertReviewerPostToolUseEventName
   assertReviewerCanExitDecisions
@@ -721,6 +724,34 @@ assertSpawnSchemasPreserveRetiredBoundary = do
     Aeson.Success AgentControl.Retired -> pure ()
     Aeson.Success value -> fail ("unexpected compatibility agent type: " <> show value)
     Aeson.Error message -> fail ("retired provider did not reach the effect boundary: " <> message)
+
+assertReviewerVerdictSchemas :: IO ()
+assertReviewerVerdictSchemas =
+  case lookupRole "reviewer" of
+    Nothing -> fail "reviewer role missing from registry"
+    Just roleCfg ->
+      forM_ ["approve_pr", "request_changes"] $ \toolName ->
+        case [tdInputSchema definition | definition <- roleListTools roleCfg, tdName definition == toolName] of
+          [schema] ->
+            case KM.lookup (AesonKey.fromText "properties") schema of
+              Just (Aeson.Object properties) -> do
+                assertBool (T.unpack toolName <> " has head_sha") (hasKey "head_sha" properties)
+                assertBool (T.unpack toolName <> " has findings") (hasKey "findings" properties)
+                case KM.lookup (AesonKey.fromText "findings") properties of
+                  Just (Aeson.Object findings) ->
+                    case KM.lookup (AesonKey.fromText "items") findings of
+                      Just (Aeson.Object item) ->
+                        case KM.lookup (AesonKey.fromText "properties") item of
+                          Just (Aeson.Object itemProperties) ->
+                            forM_ ["severity", "path", "rationale"] $ \field ->
+                              assertBool (T.unpack toolName <> " finding has " <> T.unpack field) (hasKey field itemProperties)
+                          other -> fail $ T.unpack toolName <> " finding items must define object properties, got " <> show other
+                      other -> fail $ T.unpack toolName <> " findings schema must define object items, got " <> show other
+                  other -> fail $ T.unpack toolName <> " findings property must be an object, got " <> show other
+              other -> fail $ T.unpack toolName <> " schema must define object properties, got " <> show other
+          other -> fail $ "expected one reviewer schema for " <> T.unpack toolName <> ", got " <> show (length other)
+  where
+    hasKey key object = KM.member (AesonKey.fromText key) object
 
 assertReviewerAcceptanceCriteriaGuidance :: IO ()
 assertReviewerAcceptanceCriteriaGuidance = do

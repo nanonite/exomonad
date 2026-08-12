@@ -6,7 +6,7 @@
 
 -- | Reviewer role: diff review only — no spawn, merge, or PR tools.
 --   Tool restrictions enforced at the WASM hook layer.
-module ReviewerRole (config, Tools, appendVerdict, emptyReviewFile, ReviewFile (..), ReviewVerdict (..), reviewerAcceptanceCriteriaGuidance) where
+module ReviewerRole (config, Tools, appendVerdict, emptyReviewFile, ReviewFile (..), ReviewVerdict (..), ReviewFinding (..), reviewerAcceptanceCriteriaGuidance) where
 
 import Control.Monad (void)
 import Control.Monad.Freer (Eff)
@@ -29,7 +29,7 @@ import ExoMonad.Guest.Events
     defaultEventHandlers,
   )
 import ExoMonad.Guest.StateMachine (StopCheckResult (..), applyEvent, checkExit)
-import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
+import ExoMonad.Guest.Tool.Schema (JsonSchema, genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
 import ExoMonad.Guest.Tools.Agents (ListAgents (..))
 import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
@@ -64,7 +64,9 @@ reviewerPostToolUse input =
 
 data ApprovePRArgs = ApprovePRArgs
   { apPrNumber :: Int,
-    apBody :: Text
+    apHeadSha :: Text,
+    apBody :: Text,
+    apFindings :: [ReviewFinding]
   }
   deriving (Show, Eq, Generic)
 
@@ -72,11 +74,31 @@ instance Aeson.FromJSON ApprovePRArgs where
   parseJSON = Aeson.withObject "ApprovePRArgs" $ \v ->
     ApprovePRArgs
       <$> v Aeson..: "pr_number"
+      <*> v Aeson..: "head_sha"
       <*> v Aeson..: "body"
+      <*> v Aeson..: "findings"
+
+data ReviewFinding = ReviewFinding
+  { findingSeverity :: Text,
+    findingPath :: Text,
+    findingRationale :: Text
+  }
+  deriving (Show, Eq, Generic)
+
+instance JsonSchema ReviewFinding
+
+instance Aeson.FromJSON ReviewFinding where
+  parseJSON = Aeson.withObject "ReviewFinding" $ \v ->
+    ReviewFinding
+      <$> v Aeson..: "severity"
+      <*> v Aeson..: "path"
+      <*> v Aeson..: "rationale"
 
 data RequestChangesArgs = RequestChangesArgs
   { rcPrNumber :: Int,
+    rcHeadSha :: Text,
     rcBody :: Text,
+    rcFindings :: [ReviewFinding],
     rcPath :: Maybe Text,
     rcDiffHunk :: Maybe Text
   }
@@ -86,7 +108,9 @@ instance Aeson.FromJSON RequestChangesArgs where
   parseJSON = Aeson.withObject "RequestChangesArgs" $ \v ->
     RequestChangesArgs
       <$> v Aeson..: "pr_number"
+      <*> v Aeson..: "head_sha"
       <*> v Aeson..: "body"
+      <*> v Aeson..: "findings"
       <*> v Aeson..:? "path"
       <*> v Aeson..:? "diff_hunk"
 
@@ -272,7 +296,9 @@ instance MCPTool ReviewerApprovePR where
   toolSchema =
     genericToolSchemaWith @ApprovePRArgs
       [ ("pr_number", "Local PR number to approve"),
-        ("body", "Concise approval summary")
+        ("head_sha", "Exact PR head SHA that the reviewer inspected"),
+        ("body", "Concise approval summary"),
+        ("findings", "Structured findings with severity, path, and rationale")
       ]
   toolHandlerEff args = do
     branchResult <- getReviewerBranch
@@ -295,7 +321,9 @@ instance MCPTool ReviewerRequestChanges where
   toolSchema =
     genericToolSchemaWith @RequestChangesArgs
       [ ("pr_number", "Local PR number to review"),
+        ("head_sha", "Exact PR head SHA that the reviewer inspected"),
         ("body", "Specific requested change"),
+        ("findings", "Structured findings with severity, path, and rationale"),
         ("path", "Optional file path for the comment"),
         ("diff_hunk", "Optional diff hunk for the comment")
       ]
