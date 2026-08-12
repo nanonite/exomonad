@@ -1,6 +1,7 @@
 use crate::app_state::AppState;
 use crate::control;
 use crate::control_gate;
+use crate::control_plan;
 use crate::control_read_model;
 use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV};
 use std::time::Duration;
@@ -1014,6 +1015,34 @@ async fn control_answer_gate(
     }
 }
 
+async fn control_propose_plan(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<control_plan::PlanProposalRequest>,
+) -> Response {
+    match control_plan::propose_plan(&state.project_dir, &run_id, request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            let status = match &error {
+                control_plan::PlanProposalError::InvalidIdentifier
+                | control_plan::PlanProposalError::InvalidProposal(_) => {
+                    axum::http::StatusCode::BAD_REQUEST
+                }
+                control_plan::PlanProposalError::MissingRun => axum::http::StatusCode::NOT_FOUND,
+                control_plan::PlanProposalError::CommandFailed(_)
+                | control_plan::PlanProposalError::Io(_) => {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn control_read_response(
     result: Result<serde_json::Value, control_read_model::ReadModelError>,
 ) -> Response {
@@ -1769,6 +1798,7 @@ Run `exomonad recompile` first to build it.",
             "/runs/{run_id}/gates/{gate_name}",
             post(control_answer_gate),
         )
+        .route("/runs/{run_id}/plan/proposals", post(control_propose_plan))
         .layer(middleware::from_fn_with_state(
             route_auth.clone(),
             control::require_control,

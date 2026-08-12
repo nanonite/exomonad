@@ -18,6 +18,11 @@ from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
+from tl_loop.plan_validation import (
+    PlanValidationError,
+    validate_plan_document,
+    validate_plan_proposal,
+)
 from tl_loop.state.read_model import project_read_model
 from tl_loop.state.schema import GateStatus, RunState
 from tl_loop.state.store import RunStore
@@ -37,7 +42,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the controller or one of its operator-facing read/write commands."""
     parser = _parser()
     parsed_argv = list(argv) if argv is not None else sys.argv[1:]
-    if not parsed_argv or parsed_argv[0] not in {"run", "status", "gate", "-h", "--help"}:
+    if not parsed_argv or parsed_argv[0] not in {
+        "run",
+        "status",
+        "gate",
+        "plan-proposal",
+        "-h",
+        "--help",
+    }:
         parsed_argv.insert(0, "run")
     args = parser.parse_args(parsed_argv)
     _configure_logging(args.verbose if hasattr(args, "verbose") else False)
@@ -47,9 +59,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_result(result)
         elif args.command == "status":
             _print_status(args)
+        elif args.command == "plan-proposal":
+            _print_plan_proposal(args)
         else:
             _set_gate(args)
-    except (LauncherError, OSError, RuntimeError, ValueError) as error:
+    except (LauncherError, OSError, RuntimeError, ValueError, PlanValidationError) as error:
         LOGGER.error("[TL loop] %s", error)
         return 2
     return 0
@@ -85,6 +99,15 @@ def _parser() -> argparse.ArgumentParser:
     decision.add_argument("--approve", action="store_true")
     decision.add_argument("--reject", action="store_true")
     gate.set_defaults(command="gate")
+
+    proposal = subcommands.add_parser(
+        "plan-proposal", help="validate an inert control-plane plan proposal"
+    )
+    _add_project_options(proposal)
+    proposal.add_argument(
+        "--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID)
+    )
+    proposal.set_defaults(command="plan-proposal")
 
     return parser
 
@@ -167,9 +190,10 @@ def _load_plan(path: Path, wait_for_plan: bool) -> dict[str, object]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         raise LauncherError(f"plan {path} is not valid JSON: {error}") from error
-    if not isinstance(value, dict):
-        raise LauncherError(f"plan {path} must contain a JSON object")
-    return cast(dict[str, object], value)
+    try:
+        return validate_plan_document(value)
+    except PlanValidationError as error:
+        raise LauncherError(f"plan {path} is invalid: {error}") from error
 
 
 def _plan_from_document(document: Mapping[str, object]) -> WorkPlan:
@@ -182,6 +206,23 @@ def _plan_from_document(document: Mapping[str, object]) -> WorkPlan:
         return WorkPlan.from_mapping(value)
     except (TypeError, ValueError) as error:
         raise LauncherError(f"invalid WorkPlan: {error}") from error
+
+
+def _print_plan_proposal(args: argparse.Namespace) -> None:
+    try:
+        value = json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        raise LauncherError(f"plan proposal is not valid JSON: {error}") from error
+    proposal = validate_plan_proposal(value)
+    plan = proposal["plan"]
+    if not isinstance(plan, Mapping):
+        raise LauncherError("validated plan proposal is not an object")
+    print(
+        json.dumps(
+            {"run_id": args.run_id, "plan": dict(plan), "inert": True, "status": "proposed"},
+            sort_keys=True,
+        )
+    )
 
 
 def _run_id(document: Mapping[str, object], configured: str) -> str:
