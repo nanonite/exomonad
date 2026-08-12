@@ -8,15 +8,17 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import cast
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import TransportClient
+from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.queue import LedgerQueue
-from tl_loop.events.reader import LedgerReader
+from tl_loop.events.reader import LedgerReader, SequenceStatus
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
+from tl_loop.state.read_model import project_read_model
 from tl_loop.state.schema import GateStatus, RunState
 from tl_loop.state.store import RunStore
 from tl_loop.state.write import apply
@@ -71,7 +73,9 @@ def _parser() -> argparse.ArgumentParser:
 
     status = subcommands.add_parser("status", help="show a durable TL run state")
     _add_project_options(status)
-    status.add_argument("--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID))
+    status.add_argument(
+        "--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID)
+    )
     status.set_defaults(command="status")
 
     gate = subcommands.add_parser("gate", help="answer a durable human gate")
@@ -214,9 +218,23 @@ def _print_result(result: TLRunResult) -> None:
 
 
 def _print_status(args: argparse.Namespace) -> None:
-    root = args.project_root.expanduser().resolve() / ".exo" / "tl-loop"
+    project_root = args.project_root.expanduser().resolve()
+    root = project_root / ".exo" / "tl-loop"
     state = RunStore(args.run_id, root).load()
-    print(json.dumps(_state_document(state), indent=2, sort_keys=True))
+    reader = LedgerReader(
+        project_root / ".exo" / "ledger" / "segments",
+        run_id=args.run_id,
+        state_root=root,
+        scope_run_id=args.run_id,
+    )
+    replay = reader.read_from(0)
+    print(
+        json.dumps(
+            _state_document(state, replay.events, replay.sequence_status),
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def _set_gate(args: argparse.Namespace) -> None:
@@ -239,20 +257,19 @@ def _set_gate(args: argparse.Namespace) -> None:
     LOGGER.info("[TL loop] gate name=%s status=%s", args.name, status)
 
 
-def _state_document(state: RunState) -> dict[str, object]:
-    # Status is intentionally a small, read-only operator view; the canonical
-    # closed schema remains owned by tl_loop.state.store.
-    return {
-        "run_id": state.run_id,
-        "phase": state.fsm.phase.value,
-        "waiting": list(state.fsm.waiting),
-        "gates": [{"name": gate.name, "status": gate.status.value} for gate in state.gates],
-        "slices": {
-            key: {"status": value.status.value, "pr_number": value.pr_number}
-            for key, value in state.slices.items()
-        },
-        "last_consumed_offset": state.events.last_consumed_offset,
-    }
+def _state_document(
+    state: RunState,
+    events: Iterable[EventEnvelope] = (),
+    sequence_status: SequenceStatus | None = None,
+) -> dict[str, object]:
+    """Serialize the cursor-carrying read model for the status client."""
+    document = project_read_model(
+        state,
+        events,
+        sequence_status=sequence_status,
+    ).to_document()
+    document["last_consumed_offset"] = state.events.last_consumed_offset
+    return document
 
 
 def _resolve_under_project(project_root: Path, value: Path) -> Path:

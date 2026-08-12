@@ -293,6 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E13 :: E13.1 Define the read-model projection (#800)
 - E12 :: E12.4 Remove the in-memory authority and assert no workflow authority leaks (#796)
 - E12 :: E12.3 Run the full gate matrix across all three runtimes (#795)
 - E12 :: E12.2 Demote the in-memory dedup window (#794)
