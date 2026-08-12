@@ -289,6 +289,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E6 :: E6.4 Design a durable per-agent steering queue (#755)
 - E6 :: E6.3 Assess owning the loop per harness (#754)
 - E6 :: E6.2 Study prime-agent's queue model (#753)
 - E6 :: E6.1 Document current injection paths and failure modes (#752)
