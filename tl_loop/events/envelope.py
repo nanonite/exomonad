@@ -9,6 +9,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import TypeAlias, cast
 
+from .stall import ReviewStallClassification, classify_review_stall
+
 LedgerEventInput: TypeAlias = Mapping[str, object]
 
 
@@ -99,6 +101,16 @@ class EventEnvelope:
     def reviewed_head(self) -> str | None:
         """Compatibility name used by the run-state slice schema."""
         return self.head_sha
+
+    @property
+    def stall_classification(self) -> ReviewStallClassification | None:
+        """Derive a stall class from raw watcher evidence at the TL boundary."""
+        payload = dict(self.data)
+        if self.review_kind is not None:
+            payload.setdefault("kind", self.review_kind)
+        if self.ci_status is not None:
+            payload.setdefault("ci_status", self.ci_status)
+        return classify_review_stall(payload)
 
 
 def project(event: LedgerEventInput) -> EventEnvelope:

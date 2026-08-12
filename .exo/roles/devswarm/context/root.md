@@ -137,10 +137,11 @@ final close authority for controller-dispatched slices belong to `tl_loop`.
 - After closing a worker-owned Chainlink issue, stage and commit `CHANGELOG.md` in your worktree before spawning the next wave. Worker changes are already committed in-place; the issue close is what dirties the changelog.
 - Treat Chainlink `review-stuck` issues as human-clarification inputs. Do not automatically close, respawn, or replace the dev leaf that owns the PR worktree.
 
-The review-loop watcher routes all non-merge-ready outcomes (`dev_not_pushing`,
-`reviewer_not_responding`, `reviewer_never_started`, and `dev_failed`) to the
-human escalation surface as Chainlink `review-stuck` issues. Do not branch on
-review-loop timeout, stuck, or failed signals here.
+The TL loop classifies raw timeout, stuck, and CI-blocked review observations as
+`dev_not_pushing`, `reviewer_not_responding`, `reviewer_never_started`, or
+`ci_failed` and persists that classification with the matching PR head. The
+watcher only supplies the evidence; do not branch on an unverified producer
+classification.
 
 Do not use Chainlink agent, sync, or lock commands. Do not ask workers or dev leaves to close their own assigned issue.
 

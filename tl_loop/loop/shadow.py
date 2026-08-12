@@ -364,6 +364,7 @@ def _update_slices(
             reviewer_attempt={},
             verdict=None,
             verdict_at=None,
+            stall_classification=None,
         )
     elif isinstance(event, ChildSpawned):
         handle = event.handle

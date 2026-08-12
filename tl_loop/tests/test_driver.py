@@ -20,6 +20,7 @@ from tl_loop.loop.driver import (
     LoopLimitExceeded,
     _route_ci_event,
     _route_review_event,
+    _record_review_event,
     SubTLTask,
     TLLoopConfig,
     WorkerTask,
@@ -555,6 +556,35 @@ def _review_event(*, finding_severity: str = "blocking") -> EventEnvelope:
             },
         }
     )
+
+
+def test_review_stall_classification_is_persisted_by_tl_projection(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    event = project(
+        {
+            "type": "pr.review",
+            "run_seq": 2,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:01:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "kind": "timeout",
+                "last_review_state": "changes_requested",
+                "reviewer_registered": True,
+                "forgejo_review_present": True,
+                "addressed_changes": False,
+                "wait_seconds": 900,
+            },
+        }
+    )
+
+    _record_review_event(store, store.load(), TLPlanning(), event, 2)
+
+    assert store.load().slices["leaf-a"].stall_classification == "dev_not_pushing"
 
 
 def _ci_failure_event() -> EventEnvelope:

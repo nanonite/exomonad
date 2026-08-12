@@ -13,6 +13,7 @@ from tl_loop.events.envelope import (
     MAPPED_EVENT_TYPES,
     SERVER_EMIT_HEAD_SHA_GAPS,
     EventEnvelope,
+    ReviewStallClassification,
     UnmappedEventType,
     project,
 )
@@ -89,3 +90,74 @@ def test_unmapped_allowlisted_event_type_is_rejected_at_read_time() -> None:
         project(unmapped)
 
     assert error.value.event_type == "agent.guidance.delivery"
+
+
+def test_stall_classification_is_derived_from_raw_review_evidence() -> None:
+    base = {
+        "type": "pr.review",
+        "run_seq": 900,
+        "run_id": "run-a",
+        "agent_id": "slice-a",
+        "lifecycle_state": "observed",
+        "observed_at": "2026-08-12T15:00:00Z",
+    }
+    cases = (
+        (
+            {
+                "kind": "stuck",
+                "head_sha": "head-a",
+                "last_review_state": "changes_requested",
+                "reviewer_registered": True,
+                "forgejo_review_present": True,
+                "addressed_changes": False,
+            },
+            ReviewStallClassification.DEV_NOT_PUSHING,
+        ),
+        (
+            {
+                "kind": "timeout",
+                "head_sha": "head-a",
+                "last_review_state": "none",
+                "reviewer_registered": True,
+                "forgejo_review_present": True,
+                "addressed_changes": True,
+            },
+            ReviewStallClassification.REVIEWER_NOT_RESPONDING,
+        ),
+        (
+            {
+                "kind": "timeout",
+                "head_sha": "head-a",
+                "last_review_state": "none",
+                "reviewer_registered": True,
+                "forgejo_review_present": False,
+                "addressed_changes": False,
+            },
+            ReviewStallClassification.REVIEWER_NEVER_STARTED,
+        ),
+        (
+            {
+                "kind": "ci_blocked",
+                "head_sha": "head-a",
+                "ci_status": "failure",
+            },
+            ReviewStallClassification.CI_FAILED,
+        ),
+    )
+    for evidence, expected in cases:
+        event = project({**base, "data": {"slice_id": "slice-a", **evidence}})
+        assert event.stall_classification is expected
+
+    mislabeled = project(
+        {
+            **base,
+            "data": {
+                "slice_id": "slice-a",
+                "kind": "stuck",
+                "head_sha": "head-a",
+                "last_review_state": "changes_requested",
+                "stall_classification": "reviewer_never_started",
+            },
+        }
+    )
+    assert mislabeled.stall_classification is ReviewStallClassification.DEV_NOT_PUSHING

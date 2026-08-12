@@ -55,6 +55,14 @@ class GateStatus(str, Enum):
 
 REVIEW_FINDING_KEYS = frozenset({"severity", "path", "rationale"})
 CI_STATUS_VALUES = frozenset({"unknown", "pending", "success", "failure", "neutral"})
+STALL_CLASSIFICATION_VALUES = frozenset(
+    {
+        "dev_not_pushing",
+        "reviewer_not_responding",
+        "reviewer_never_started",
+        "ci_failed",
+    }
+)
 
 
 TERMINAL_SLICE_STATUSES = frozenset(
@@ -110,6 +118,7 @@ SLICE_KEYS = frozenset(
         "park_issue_id",
         "park_audit",
         "blocked_by",
+        "stall_classification",
     }
 )
 PARK_AUDIT_KEYS = frozenset(
@@ -190,6 +199,7 @@ class SliceState:
     park_issue_id: int | None = None
     park_audit: Mapping[str, object] | None = None
     blocked_by: str | None = None
+    stall_classification: str | None = None
 
 
 @dataclass(frozen=True)
@@ -390,6 +400,12 @@ def _validate_slice(
     _nullable_enum_value(value, "park_cause", path, ParkCause, errors)
     _nullable_positive_int(value, "park_issue_id", path, errors)
     _nullable_string(value, "blocked_by", path, errors)
+    _nullable_string(value, "stall_classification", path, errors)
+    classification = value.get("stall_classification")
+    if classification is not None and classification not in STALL_CLASSIFICATION_VALUES:
+        errors.append(
+            (f"{path}.stall_classification", "is not a recognised review-stall classification")
+        )
     _park_audit(value.get("park_audit"), path, errors)
 
 

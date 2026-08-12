@@ -22,6 +22,7 @@ cleanup belongs to the host orphan reconciler:
 | Composes and delivers repair handoffs | Removed in E4.3 (#743); the TL consumes canonical review, CI, timeout, and stuck facts |
 | Reconciles exited reviewer resources | `services/orphan_reconciler.rs` -> `dispose_exited_reviewer_resources` |
 | Tracks review rounds against `reviewer_max_rounds` | `distinct_changes_requested_rounds` (:185) |
+| Classifies timeout and review stalls | Removed in #761; the watcher emits raw evidence and `tl_loop/events/stall.py` classifies it |
 
 Meanwhile `tl_loop` independently adjudicates review, applies optional policy,
 binds the reviewed head, and calls `merge_pr`. The old documentation mixed a

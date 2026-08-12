@@ -961,6 +961,7 @@ def _discard_review(slices: Mapping[str, SliceState], slice_id: str) -> dict[str
             verdict=None,
             reviewed_head=None,
             verdict_at=None,
+            stall_classification=None,
         ),
     }
 
@@ -984,6 +985,7 @@ def _record_review_event(
             raise TLLoopError(f"{event.event_type!r} findings have no head SHA")
         return store.checkpoint(phase, state.slices, state.budgets, event_seq)
     review_findings = _review_findings(current, event.head_sha, findings)
+    stall_classification = _event_stall_classification(event)
     if current.reviewed_head is not None and current.reviewed_head != event.head_sha:
         updated = dict(state.slices)
         updated[slice_id] = replace(current, review_findings=review_findings)
@@ -995,6 +997,7 @@ def _record_review_event(
             current,
             pr_number=event.pr_number or current.pr_number,
             review_findings=review_findings,
+            stall_classification=stall_classification or current.stall_classification,
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     updated = dict(state.slices)
@@ -1005,6 +1008,7 @@ def _record_review_event(
         verdict=verdict,
         verdict_at=event.observed_at,
         review_findings=review_findings,
+        stall_classification=stall_classification or current.stall_classification,
     )
     return store.checkpoint(phase, updated, state.budgets, event_seq)
 
@@ -1060,6 +1064,11 @@ def _review_findings(
     return updated
 
 
+def _event_stall_classification(event: EventEnvelope) -> str | None:
+    classification = event.stall_classification
+    return classification.value if classification is not None else None
+
+
 def _route_review_event(
     plan: WorkPlan,
     store: RunStore,
@@ -1082,6 +1091,7 @@ def _route_review_event(
     if head_sha is None:
         raise TLLoopError(f"{event.event_type!r} findings have no head SHA")
     review_findings = _review_findings(current, head_sha, findings)
+    stall_classification = _event_stall_classification(event)
     if findings is None:
         LOGGER.warning(
             "[TL loop] ignoring review without binding findings target=%s head=%s",
@@ -1089,7 +1099,11 @@ def _route_review_event(
             head_sha,
         )
         updated = dict(state.slices)
-        updated[slice_id] = replace(current, review_findings=review_findings)
+        updated[slice_id] = replace(
+            current,
+            review_findings=review_findings,
+            stall_classification=stall_classification or current.stall_classification,
+        )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     if current.reviewed_head is not None and current.reviewed_head != head_sha:
         LOGGER.warning(
@@ -1122,6 +1136,7 @@ def _route_review_event(
         verdict=result.verdict,
         verdict_at=event.observed_at,
         review_findings=review_findings,
+        stall_classification=stall_classification or current.stall_classification,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
     if result.verdict is Verdict.NO_GO:

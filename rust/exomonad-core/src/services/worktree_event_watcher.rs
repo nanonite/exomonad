@@ -93,11 +93,6 @@ enum PendingAction {
         pr_number: u64,
         rounds: u32,
     },
-    FileHumanEscalation {
-        pr_number: u64,
-        classification: ReviewStallKind,
-        diagnostic: ReviewStallDiagnostic,
-    },
     TriggerManualCi {
         pr_number: u64,
         branch: String,
@@ -255,26 +250,6 @@ struct WatchState {
     ci_blocked_notified: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ReviewStallKind {
-    DevNotPushing,
-    ReviewerNotResponding,
-    ReviewerNeverStarted,
-    CiFailed,
-}
-
-impl ReviewStallKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            ReviewStallKind::DevNotPushing => "dev_not_pushing",
-            ReviewStallKind::ReviewerNotResponding => "reviewer_not_responding",
-            ReviewStallKind::ReviewerNeverStarted => "reviewer_never_started",
-            ReviewStallKind::CiFailed => "ci_failed",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct ReviewStallDiagnostic {
     branch: String,
@@ -283,6 +258,8 @@ struct ReviewStallDiagnostic {
     rounds: u32,
     reviewer_registered: bool,
     forgejo_review_present: bool,
+    last_review_state: String,
+    addressed_changes: bool,
     wait_seconds: u64,
     ci_status: String,
 }
@@ -1194,70 +1171,6 @@ where
         }
     }
 
-    fn log_review_stall(
-        &self,
-        pending: &PendingPrActions,
-        pr_number: u64,
-        classification: ReviewStallKind,
-        diagnostic: &ReviewStallDiagnostic,
-    ) {
-        let Some(log) = self.ctx.event_log() else {
-            return;
-        };
-        let kind = match classification {
-            ReviewStallKind::CiFailed => "ci_blocked",
-            ReviewStallKind::DevNotPushing => "dev_not_pushing",
-            ReviewStallKind::ReviewerNotResponding => "reviewer_not_responding",
-            ReviewStallKind::ReviewerNeverStarted => "reviewer_never_started",
-        };
-        let payload = serde_json::json!({
-            "kind": kind,
-            "pr_number": pr_number,
-            "branch": diagnostic.branch,
-            "head_sha": diagnostic.head_sha,
-            "rounds": diagnostic.rounds,
-            "stall_classification": classification.as_str(),
-            "reviewer_registered": diagnostic.reviewer_registered,
-            "forgejo_review_present": diagnostic.forgejo_review_present,
-            "wait_seconds": diagnostic.wait_seconds,
-            "ci_status": diagnostic.ci_status.as_str(),
-        });
-        let mut data = canonical_review_wakeup_data(
-            pending.branch.as_str(),
-            pr_number,
-            pending.head_sha.as_str(),
-            &payload,
-        );
-        let notification = match classification {
-            ReviewStallKind::CiFailed => {
-                tl_ci_blocked_message(pr_number, diagnostic.ci_status.as_str(), &diagnostic.branch)
-            }
-            ReviewStallKind::DevNotPushing => {
-                format!("[DEV NOT PUSHING] PR #{pr_number} needs TL attention.")
-            }
-            ReviewStallKind::ReviewerNotResponding => {
-                format!("[REVIEWER NOT RESPONDING] PR #{pr_number} needs TL attention.")
-            }
-            ReviewStallKind::ReviewerNeverStarted => {
-                format!("[REVIEWER NEVER STARTED] PR #{pr_number} needs TL attention.")
-            }
-        };
-        if let Some(object) = data.as_object_mut() {
-            object.insert(
-                "notification".to_string(),
-                serde_json::Value::String(notification),
-            );
-        }
-        if let Err(error) = log.append(PR_REVIEW_EVENT_TYPE, &pending.agent_name, &data) {
-            warn!(
-                pr_number,
-                branch = %pending.branch,
-                %error,
-                "Failed to write canonical PR review stall"
-            );
-        }
-    }
-
     async fn poke_unread_inbox_agents(&self) -> Result<()> {
         let candidates = self
             .ctx
@@ -1751,26 +1664,6 @@ where
                         if let Err(e) = self.set_pr_rounds(pr_number, rounds).await {
                             warn!(pr_number, rounds, error = %e, "Failed to persist PR review rounds");
                         }
-                    }
-                    PendingAction::FileHumanEscalation {
-                        pr_number,
-                        classification,
-                        diagnostic,
-                    } => {
-                        self.log_review_stall(&pending, pr_number, classification, &diagnostic);
-                        info!(
-                            pr_number,
-                            classification = classification.as_str(),
-                            branch = %diagnostic.branch,
-                            head_sha = %diagnostic.head_sha,
-                            last_observed_sha = %diagnostic.last_observed_sha,
-                            rounds = diagnostic.rounds,
-                            reviewer_registered = diagnostic.reviewer_registered,
-                            forgejo_review_present = diagnostic.forgejo_review_present,
-                            wait_seconds = diagnostic.wait_seconds,
-                            ci_status = %diagnostic.ci_status,
-                            "Review-loop human handoff required; watcher does not create Chainlink issues"
-                        );
                     }
                     PendingAction::TriggerManualCi {
                         pr_number,
@@ -2494,27 +2387,22 @@ fn compute_pr_actions_with_context(
             pr_number: pr_number.as_u64(),
             rounds: old_state.rounds,
         });
-        pending_actions.push(PendingAction::FileHumanEscalation {
-            pr_number: pr_number.as_u64(),
-            classification: ReviewStallKind::CiFailed,
-            diagnostic: review_stall_diagnostic(
-                old_state,
-                pr_sha,
-                branch,
-                reviewer_registered,
-                forgejo_review_present,
-                max_wait_seconds,
-                ci_status,
-            ),
-        });
+        let diagnostic = review_stall_diagnostic(
+            old_state,
+            pr_sha,
+            branch,
+            reviewer_registered,
+            forgejo_review_present,
+            max_wait_seconds,
+            ci_status,
+        );
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": "ci_blocked",
-                "pr_number": pr_number.as_u64(),
-                "ci_status": ci_status.as_str(),
-                "branch": branch,
-            }),
+            payload: review_stall_observation_payload(
+                "ci_blocked",
+                pr_number.as_u64(),
+                &diagnostic,
+            ),
         });
     }
 
@@ -2599,27 +2487,18 @@ fn compute_pr_actions_with_context(
                 pr_number: pr_number.as_u64(),
                 rounds: old_state.rounds,
             });
-            pending_actions.push(PendingAction::FileHumanEscalation {
-                pr_number: pr_number.as_u64(),
-                classification: ReviewStallKind::DevNotPushing,
-                diagnostic: review_stall_diagnostic(
-                    old_state,
-                    pr_sha,
-                    branch,
-                    reviewer_registered,
-                    forgejo_review_present,
-                    max_wait_seconds,
-                    ci_status,
-                ),
-            });
+            let diagnostic = review_stall_diagnostic(
+                old_state,
+                pr_sha,
+                branch,
+                reviewer_registered,
+                forgejo_review_present,
+                max_wait_seconds,
+                ci_status,
+            );
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
-                payload: serde_json::json!({
-                    "kind": "stuck",
-                    "pr_number": pr_number.as_u64(),
-                    "branch": branch,
-                    "rounds": old_state.rounds,
-                }),
+                payload: review_stall_observation_payload("stuck", pr_number.as_u64(), &diagnostic),
             });
         } else {
             pending_actions.push(PendingAction::WasmEvent {
@@ -2688,27 +2567,18 @@ fn compute_pr_actions_with_context(
                 pr_number: pr_number.as_u64(),
                 rounds: old_state.rounds,
             });
-            pending_actions.push(PendingAction::FileHumanEscalation {
-                pr_number: pr_number.as_u64(),
-                classification: ReviewStallKind::DevNotPushing,
-                diagnostic: review_stall_diagnostic(
-                    old_state,
-                    pr_sha,
-                    branch,
-                    reviewer_registered,
-                    forgejo_review_present,
-                    max_wait_seconds,
-                    ci_status,
-                ),
-            });
+            let diagnostic = review_stall_diagnostic(
+                old_state,
+                pr_sha,
+                branch,
+                reviewer_registered,
+                forgejo_review_present,
+                max_wait_seconds,
+                ci_status,
+            );
             pending_actions.push(PendingAction::WasmEvent {
                 event_type: "pr_review",
-                payload: serde_json::json!({
-                    "kind": "stuck",
-                    "pr_number": pr_number.as_u64(),
-                    "branch": branch,
-                    "rounds": old_state.rounds,
-                }),
+                payload: review_stall_observation_payload("stuck", pr_number.as_u64(), &diagnostic),
             });
         } else {
             pending_actions.push(PendingAction::WriteRegistryRounds {
@@ -2743,30 +2613,27 @@ fn compute_pr_actions_with_context(
     if !old_state.notified_parent_timeout
         && old_state.first_seen.elapsed() > Duration::from_secs(max_wait_seconds)
     {
-        let classification =
-            classify_review_stall(old_state, reviewer_registered, forgejo_review_present);
         old_state.notified_parent_timeout = true;
-        pending_actions.push(PendingAction::FileHumanEscalation {
-            pr_number: pr_number.as_u64(),
-            classification,
-            diagnostic: review_stall_diagnostic(
-                old_state,
-                pr_sha,
-                branch,
-                reviewer_registered,
-                forgejo_review_present,
-                max_wait_seconds,
-                ci_status,
-            ),
-        });
+        let diagnostic = review_stall_diagnostic(
+            old_state,
+            pr_sha,
+            branch,
+            reviewer_registered,
+            forgejo_review_present,
+            max_wait_seconds,
+            ci_status,
+        );
+        let mut payload =
+            review_stall_observation_payload("timeout", pr_number.as_u64(), &diagnostic);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "minutes_elapsed".to_string(),
+                serde_json::json!(max_wait_seconds / 60),
+            );
+        }
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": "timeout",
-                "pr_number": pr_number.as_u64(),
-                "branch": branch,
-                "minutes_elapsed": max_wait_seconds / 60,
-            }),
+            payload,
         });
     }
 
@@ -2925,26 +2792,6 @@ fn state_name(state: &ForgejoReviewVerdict) -> &'static str {
     }
 }
 
-fn classify_review_stall(
-    state: &WatchState,
-    reviewer_registered: bool,
-    forgejo_review_present: bool,
-) -> ReviewStallKind {
-    if state.last_review_state == ForgejoReviewVerdict::ChangesRequested {
-        return ReviewStallKind::DevNotPushing;
-    }
-
-    if state.addressed_changes && forgejo_review_present {
-        return ReviewStallKind::ReviewerNotResponding;
-    }
-
-    if reviewer_registered && !forgejo_review_present {
-        return ReviewStallKind::ReviewerNeverStarted;
-    }
-
-    ReviewStallKind::ReviewerNotResponding
-}
-
 fn review_stall_diagnostic(
     state: &WatchState,
     head_sha: &str,
@@ -2961,9 +2808,32 @@ fn review_stall_diagnostic(
         rounds: state.rounds,
         reviewer_registered,
         forgejo_review_present,
+        last_review_state: state_name(&state.last_review_state).to_string(),
+        addressed_changes: state.addressed_changes,
         wait_seconds,
-        ci_status: ci_status.to_string(),
+        ci_status: ci_status.as_str().to_string(),
     }
+}
+
+fn review_stall_observation_payload(
+    kind: &str,
+    pr_number: u64,
+    diagnostic: &ReviewStallDiagnostic,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "pr_number": pr_number,
+        "branch": diagnostic.branch,
+        "head_sha": diagnostic.head_sha,
+        "last_observed_sha": diagnostic.last_observed_sha,
+        "rounds": diagnostic.rounds,
+        "reviewer_registered": diagnostic.reviewer_registered,
+        "forgejo_review_present": diagnostic.forgejo_review_present,
+        "last_review_state": diagnostic.last_review_state,
+        "addressed_changes": diagnostic.addressed_changes,
+        "wait_seconds": diagnostic.wait_seconds,
+        "ci_status": diagnostic.ci_status,
+    })
 }
 
 fn review_event_dispatches_to_parent(event_type: &str, payload: &serde_json::Value) -> bool {
@@ -3859,15 +3729,11 @@ mod tests {
         assert!(state.ci_blocked_notified);
         assert!(actions.iter().any(|action| matches!(
             action,
-            PendingAction::FileHumanEscalation {
-                classification: ReviewStallKind::CiFailed,
-                ..
-            }
-        )));
-        assert!(actions.iter().any(|action| matches!(
-            action,
             PendingAction::WasmEvent { payload, .. }
-                if payload["kind"] == "ci_blocked" && payload["ci_status"] == "failure"
+                if payload["kind"] == "ci_blocked"
+                    && payload["ci_status"] == "failure"
+                    && payload["reviewer_registered"] == false
+                    && payload["forgejo_review_present"] == false
         )));
     }
     #[test]
@@ -4270,11 +4136,10 @@ mod tests {
         )));
         assert!(actions.iter().any(|action| matches!(
             action,
-            PendingAction::FileHumanEscalation {
-                pr_number: 1,
-                classification: ReviewStallKind::DevNotPushing,
-                ..
-            },
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "stuck"
+                    && payload["last_review_state"] == "changes_requested"
+                    && payload["rounds"] == 2
         )));
     }
 
@@ -4320,11 +4185,10 @@ mod tests {
         )));
         assert!(actions.iter().any(|action| matches!(
             action,
-            PendingAction::FileHumanEscalation {
-                pr_number: 1,
-                classification: ReviewStallKind::DevNotPushing,
-                diagnostic,
-            } if diagnostic.rounds == 2 && diagnostic.head_sha == "sha3"
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "stuck"
+                    && payload["rounds"] == 2
+                    && payload["head_sha"] == "sha3"
         )));
     }
 
@@ -4410,9 +4274,6 @@ mod tests {
             action,
             PendingAction::WasmEvent { payload, .. } if payload["kind"] == "stuck"
         )));
-        assert!(!actions
-            .iter()
-            .any(|action| matches!(action, PendingAction::FileHumanEscalation { .. })));
     }
 
     #[test]
@@ -4510,10 +4371,9 @@ mod tests {
         );
         assert!(actions.iter().any(|a| matches!(
             a,
-            PendingAction::FileHumanEscalation {
-                classification: ReviewStallKind::ReviewerNotResponding,
-                ..
-            }
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "timeout"
+                    && payload["wait_seconds"] == 15 * 60
         )));
         assert!(state.notified_parent_timeout);
     }
@@ -4544,10 +4404,9 @@ mod tests {
 
         assert!(actions.iter().any(|a| matches!(
             a,
-            PendingAction::FileHumanEscalation {
-                classification: ReviewStallKind::ReviewerNotResponding,
-                ..
-            }
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "timeout"
+                    && payload["last_review_state"] == "approved"
         )));
         assert!(state.notified_parent_timeout);
     }
@@ -4577,10 +4436,9 @@ mod tests {
 
         assert!(actions.iter().any(|action| matches!(
             action,
-            PendingAction::FileHumanEscalation {
-                classification: ReviewStallKind::ReviewerNotResponding,
-                ..
-            }
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "timeout"
+                    && payload["addressed_changes"] == false
         )));
         assert!(state.notified_parent_timeout);
     }
@@ -4723,39 +4581,13 @@ mod tests {
             5,
             5 * 60,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, PendingAction::FileHumanEscalation {
-                  classification: ReviewStallKind::ReviewerNotResponding,
-                  diagnostic,
-                  ..
-              } if diagnostic.wait_seconds == 5 * 60)));
-    }
-
-    #[test]
-    fn test_review_stall_classification_names_stuck_actor() {
-        let branch = BranchName::try_from_str("main.feat-codex")
-            .expect("literal validated string is non-empty");
-        let mut state = test_state(&branch, AgentType::Codex, "abc123");
-
-        state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
-        assert_eq!(
-            classify_review_stall(&state, true, true),
-            ReviewStallKind::DevNotPushing
-        );
-
-        state.last_review_state = ForgejoReviewVerdict::None;
-        state.addressed_changes = true;
-        assert_eq!(
-            classify_review_stall(&state, true, true),
-            ReviewStallKind::ReviewerNotResponding
-        );
-
-        state.addressed_changes = false;
-        assert_eq!(
-            classify_review_stall(&state, true, false),
-            ReviewStallKind::ReviewerNeverStarted
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PendingAction::WasmEvent { payload, .. }
+                if payload["kind"] == "timeout"
+                    && payload["wait_seconds"] == 5 * 60
+                    && payload["addressed_changes"] == true
+        )));
     }
 
     #[test]

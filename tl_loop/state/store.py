@@ -378,6 +378,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["park_audit"] = copy.deepcopy(dict(value.park_audit))
         if value.blocked_by is not None:
             record["blocked_by"] = value.blocked_by
+        if value.stall_classification is not None:
+            record["stall_classification"] = value.stall_classification
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
@@ -596,6 +598,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
             else None
         ),
         blocked_by=cast(str | None, value.get("blocked_by")),
+        stall_classification=cast(str | None, value.get("stall_classification")),
     )
 
 
