@@ -7,6 +7,7 @@
 //! WASM plugins are loaded from file (server-side only).
 
 mod app_state;
+mod control;
 mod dashboard;
 #[cfg(debug_assertions)]
 mod experiment_analysis;

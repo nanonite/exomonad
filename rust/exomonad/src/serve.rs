@@ -1,4 +1,5 @@
 use crate::app_state::AppState;
+use crate::control;
 use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV};
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use axum::{
     body::Bytes,
     extract::{Extension, Path, Query, State},
     http::Request,
-    middleware::Next,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -524,9 +525,13 @@ async fn resolve_agent_birth_branch(
 async fn agent_identity_middleware(
     Path((role, name)): Path<(String, String)>,
     State(state): State<AppState>,
+    Extension(route_auth): Extension<control::RouteAuth>,
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    if !route_auth.agent_request_authorized(request.headers()) {
+        return control::unauthorized_response();
+    }
     let wasm_path = resolve_wasm_path_for_role(&state.wasm_dir, &role, &state.wasm_name)
         .unwrap_or_else(|| state.wasm_path.clone());
 
@@ -928,6 +933,14 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "role": state.default_role.as_str(),
         "wasm_hash": wasm_hash,
+    }))
+}
+
+async fn control_root() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "authority": "control",
+        "route_group": "/control",
     }))
 }
 
@@ -1635,12 +1648,22 @@ Run `exomonad recompile` first to build it.",
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let route_auth = control::RouteAuth::from_env();
     let agent_routes = Router::new()
         .route("/{role}/{name}/tools", get(list_tools))
         .route("/{role}/{name}/tools/call", post(call_tool))
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             agent_identity_middleware,
+        ))
+        .layer(Extension(route_auth.clone()))
+        .with_state(app_state.clone());
+
+    let control_routes = Router::new()
+        .route("/", get(control_root))
+        .layer(middleware::from_fn_with_state(
+            route_auth.clone(),
+            control::require_control,
         ))
         .with_state(app_state.clone());
 
@@ -1664,6 +1687,7 @@ Run `exomonad recompile` first to build it.",
                 .with_state(forgejo_ci_state),
         )
         .nest("/agents", agent_routes)
+        .nest("/control", control_routes)
         .route(
             "/events",
             post(handle_events).with_state(services.event_queue.clone()),
