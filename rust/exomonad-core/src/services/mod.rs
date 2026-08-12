@@ -32,6 +32,7 @@ pub mod local;
 pub mod log;
 pub mod merge_pr;
 pub mod mutex_registry;
+pub mod opencode_adapter;
 pub mod orphan_reconciler;
 pub mod pr_registry;
 pub mod repo;
@@ -86,6 +87,10 @@ pub use self::immutable_ledger::{
 pub use self::inbox_store::{InboxMessageRecord, InboxPokeCandidate, InboxStore};
 pub use self::ledger_retention::{drop_expired_segments, SegmentDrop};
 pub use self::mutex_registry::MutexRegistry;
+pub use self::opencode_adapter::{
+    OpenCodeAdapter, OpenCodeSessionEvent, OpenCodeSessionEventKind, OpenCodeSessionEventSource,
+    OpenCodeTransport,
+};
 pub use self::secrets::Secrets;
 pub use self::session_memory::{
     MemoryFilter, MemoryKind, MemoryRecordRow, NewMemoryRecord, SessionMemoryService,
