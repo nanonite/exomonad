@@ -48,7 +48,6 @@ import ExoMonad.Guest.Tools.Events
     notifyParentSchema,
   )
 import ExoMonad.Guest.Tools.FilePR (FilePRArgs, filePRCore, filePRDescription, filePRSchema)
-import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
 import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
@@ -194,7 +193,6 @@ data Tools mode = Tools
     spawnCodex :: mode :- TLSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
     pollWorkers :: mode :- PollWorkers,
-    checkInbox :: mode :- CheckInbox,
     memoryAppend :: mode :- MemoryAppend,
     memoryList :: mode :- MemoryList,
     continuationBrief :: mode :- ContinuationBrief,
@@ -248,7 +246,6 @@ config =
             spawnCodex = mkHandler @TLSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,
             pollWorkers = mkHandler @PollWorkers,
-            checkInbox = mkHandler @CheckInbox,
             memoryAppend = mkHandler @MemoryAppend,
             memoryList = mkHandler @MemoryList,
             continuationBrief = mkHandler @ContinuationBrief,
