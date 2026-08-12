@@ -4,8 +4,8 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 
--- | Root TL role: orchestration-only. Shutdown is exposed only through
---   root-owned idle convergence after pending work is clear.
+-- | Root TL role: orchestration-only. Lifecycle convergence is owned by the
+--   controller; shutdown remains an operator/server path.
 --   Used for the root human-facing TL window (exomonad init).
 module RootRole (config, Tools) where
 
@@ -45,7 +45,6 @@ import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
 import ExoMonad.Guest.Tools.CloseReviewerWindow (CloseReviewerWindow (..))
 import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.Inbox (CheckInbox (..))
-import ExoMonad.Guest.Tools.Lifecycle (HasPendingWork (..), ShutdownServer (..))
 import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
@@ -181,8 +180,6 @@ data Tools mode = Tools
     memoryList :: mode :- MemoryList,
     continuationBrief :: mode :- ContinuationBrief,
     listAgents :: mode :- ListAgents,
-    hasPendingWork :: mode :- HasPendingWork,
-    shutdownServer :: mode :- ShutdownServer,
     mergePr :: mode :- RootMergePR,
     sendTmuxMessage :: mode :- SendTmuxMessage,
     sendMailboxMessage :: mode :- SendMailboxMessage,
@@ -235,8 +232,6 @@ config =
             memoryList = mkHandler @MemoryList,
             continuationBrief = mkHandler @ContinuationBrief,
             listAgents = mkHandler @ListAgents,
-            hasPendingWork = mkHandler @HasPendingWork,
-            shutdownServer = mkHandler @ShutdownServer,
             mergePr = mkHandler @RootMergePR,
             sendTmuxMessage = mkHandler @SendTmuxMessage,
             sendMailboxMessage = mkHandler @SendMailboxMessage,
