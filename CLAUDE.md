@@ -732,9 +732,9 @@ in Python and the state writer, not in a free-form prompt.
    them by sequence number and acknowledges only after handling succeeds.
 4. Review comments go to the live PR owner. A changed head is repaired through
    `resume_pr`; a fresh branch or duplicate coordinator is never created.
-5. A fresh approved head with passing CI, or an allowed review timeout with
-   passing CI, permits `merge_pr`. The controller verifies the post-merge
-   state before advancing dependents.
+5. A fresh TL-adjudicated GO based on binding reviewer findings, with passing
+   CI, permits `merge_pr`. Review timeout parks the slice. The controller
+   verifies the post-merge state before advancing dependents.
 
 ### Depth, waves, and recursion
 
