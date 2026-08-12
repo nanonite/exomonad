@@ -4,6 +4,7 @@ use crate::services::agent_control::{
 };
 use crate::services::agent_inbox::{InboxMessage, GLOBAL_AGENT_INBOX};
 use crate::services::tmux_events;
+use crate::services::{GuidanceBatchRequest, GuidanceIdentity, GuidanceItemInput, QueueClass};
 use claude_teams_bridge as teams_mailbox;
 use claude_teams_bridge::TeamRegistry;
 use exomonad_proto::effects::events::{event, AgentMessage, Event};
@@ -471,30 +472,66 @@ async fn route_message_with(
         Address::Agent(name) => {
             let tab_name = resolve_tab_name_for_agent(name, Some(ctx.agent_resolver()));
             let agent_key = name.as_str();
-            let result =
-                deliver_to_agent_for(ctx, agent_key, &tab_name, from, content, summary, path).await;
+            let result = deliver_to_agent_for(
+                ctx,
+                agent_key,
+                &tab_name,
+                from,
+                content,
+                summary,
+                QueueClass::Steering,
+                path,
+            )
+            .await;
             DeliveryOutcome::from_result(result, agent_key)
         }
         Address::Team { team, member } => {
             if let Some(member_name) = member {
                 let tab_name = resolve_tab_name_for_agent(member_name, Some(ctx.agent_resolver()));
                 let agent_key = member_name.as_str();
-                let result =
-                    deliver_to_agent_for(ctx, agent_key, &tab_name, from, content, summary, path)
-                        .await;
+                let result = deliver_to_agent_for(
+                    ctx,
+                    agent_key,
+                    &tab_name,
+                    from,
+                    content,
+                    summary,
+                    QueueClass::Steering,
+                    path,
+                )
+                .await;
                 DeliveryOutcome::from_result(result, agent_key)
             } else {
-                resolve_and_deliver_to_lead(ctx, team.as_str(), from, content, summary, path).await
+                resolve_and_deliver_to_lead(
+                    ctx,
+                    team.as_str(),
+                    from,
+                    content,
+                    summary,
+                    QueueClass::Steering,
+                    path,
+                )
+                .await
             }
         }
         Address::Supervisor => {
-            let result =
-                deliver_to_agent_for(ctx, "root", "TL", from, content, summary, path).await;
+            let result = deliver_to_agent_for(
+                ctx,
+                "root",
+                "TL",
+                from,
+                content,
+                summary,
+                QueueClass::Steering,
+                path,
+            )
+            .await;
             DeliveryOutcome::from_result(result, "root")
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver_to_agent_for(
     ctx: &(impl super::HasTeamRegistry
           + super::HasAgentResolver
@@ -505,14 +542,24 @@ async fn deliver_to_agent_for(
     from: &crate::domain::AgentName,
     message: &str,
     summary: &str,
+    queue_class: QueueClass,
     path: MessageDeliveryPath,
 ) -> DeliveryResult {
     match path {
         MessageDeliveryPath::Smart => {
-            deliver_to_agent(ctx, agent_key, tmux_target, from, message, summary).await
+            deliver_to_agent_with_class(
+                ctx,
+                agent_key,
+                tmux_target,
+                from,
+                message,
+                summary,
+                queue_class,
+            )
+            .await
         }
         MessageDeliveryPath::TmuxOnly => {
-            if !record_inbox_delivery(ctx, agent_key, from, message, summary).await {
+            if !record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class).await {
                 return DeliveryResult::Failed;
             }
             match deliver_via_tmux(ctx.project_dir(), agent_key, tmux_target, from, message).await {
@@ -521,7 +568,7 @@ async fn deliver_to_agent_for(
             }
         }
         MessageDeliveryPath::MailboxOnly => {
-            if !record_inbox_delivery(ctx, agent_key, from, message, summary).await {
+            if !record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class).await {
                 return DeliveryResult::Failed;
             }
             match deliver_to_agent_mailbox(ctx, agent_key, from, message, summary).await {
@@ -543,6 +590,7 @@ async fn resolve_and_deliver_to_lead(
     from: &crate::domain::AgentName,
     content: &str,
     summary: &str,
+    queue_class: QueueClass,
     path: MessageDeliveryPath,
 ) -> DeliveryOutcome {
     let original = format!("team:{}:lead", team_name);
@@ -562,8 +610,17 @@ async fn resolve_and_deliver_to_lead(
     let lead_agent = crate::domain::AgentName::try_from_str(lead_key.as_str())
         .expect("validated string input is non-empty");
     let tab_name = resolve_tab_name_for_agent(&lead_agent, Some(ctx.agent_resolver()));
-    let result =
-        deliver_to_agent_for(ctx, &lead_key, &tab_name, from, content, summary, path).await;
+    let result = deliver_to_agent_for(
+        ctx,
+        &lead_key,
+        &tab_name,
+        from,
+        content,
+        summary,
+        queue_class,
+        path,
+    )
+    .await;
 
     match result {
         DeliveryResult::Failed => DeliveryOutcome::Failed {
@@ -669,8 +726,41 @@ async fn record_inbox_delivery(
     from: &crate::domain::AgentName,
     message: &str,
     summary: &str,
+    queue_class: QueueClass,
 ) -> bool {
     let to_agent = canonical_recipient_key(ctx.agent_resolver(), agent_key).await;
+    let batch = match ctx.inbox_store().enqueue_batch(GuidanceBatchRequest {
+        agent_id: to_agent.clone(),
+        queue_class,
+        items: vec![GuidanceItemInput {
+            from_agent: from.as_str().to_string(),
+            content: message.to_string(),
+            summary: Some(summary.to_string()),
+            injection_options: serde_json::Value::Null,
+        }],
+        identity: GuidanceIdentity::default(),
+        idempotency_key: None,
+        source_message_id: None,
+    }) {
+        Ok(result) => result.batch,
+        Err(error) => {
+            warn!(
+                from = %from,
+                to = %to_agent,
+                error = %error,
+                "Failed to commit durable guidance batch before transport"
+            );
+            return false;
+        }
+    };
+    debug!(
+        batch_id = %batch.batch_id,
+        queue_class = ?batch.queue_class,
+        from = %from,
+        to = %to_agent,
+        "Committed durable guidance batch before transport"
+    );
+
     match ctx
         .inbox_store()
         .write_message(from.as_str(), &to_agent, message, Some(summary))
@@ -678,6 +768,7 @@ async fn record_inbox_delivery(
         Ok(message_id) => {
             debug!(
                 message_id,
+                batch_id = %batch.batch_id,
                 from = %from,
                 to = %to_agent,
                 "Recorded message in durable inbox"
@@ -1355,11 +1446,35 @@ pub async fn deliver_to_agent(
     message: &str,
     summary: &str,
 ) -> DeliveryResult {
+    deliver_to_agent_with_class(
+        ctx,
+        agent_key,
+        tmux_target,
+        from,
+        message,
+        summary,
+        QueueClass::FollowUp,
+    )
+    .await
+}
+
+async fn deliver_to_agent_with_class(
+    ctx: &(impl super::HasTeamRegistry
+          + super::HasAgentResolver
+          + super::HasInboxStore
+          + super::HasProjectDir),
+    agent_key: &str,
+    tmux_target: &str,
+    from: &crate::domain::AgentName,
+    message: &str,
+    summary: &str,
+    queue_class: QueueClass,
+) -> DeliveryResult {
     let team_registry = ctx.team_registry();
     let _agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
     let agent_type = agent_type_from_key(agent_key);
-    if !record_inbox_delivery(ctx, agent_key, from, message, summary).await {
+    if !record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class).await {
         crate::services::lifecycle::record_guidance_delivery(
             project_dir,
             agent_key,
@@ -1780,8 +1895,33 @@ mod tests {
         let from = agent_name("root");
 
         assert!(
-            record_inbox_delivery(&services, "patch-step-over", &from, "hello", "summary").await
+            record_inbox_delivery(
+                &services,
+                "patch-step-over",
+                &from,
+                "hello",
+                "summary",
+                QueueClass::FollowUp,
+            )
+            .await
         );
+
+        let (queue_class, state, content): (String, String, String) = services
+            .inbox_store
+            .connection()
+            .expect("guidance connection should open")
+            .query_row(
+                "SELECT b.queue_class, b.state, i.content
+                 FROM guidance_batches b
+                 JOIN guidance_items i ON i.batch_id = b.batch_id
+                 WHERE b.agent_id = ?1",
+                ["patch-step-over-opencode"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("guidance batch should be committed");
+        assert_eq!(queue_class, "follow_up");
+        assert_eq!(state, "pending");
+        assert_eq!(content, "hello");
 
         let messages = services
             .inbox_store
