@@ -94,48 +94,69 @@ observable*, not a fabricated 100% delivery rate.
 
 ## Phases
 
-Derived directly from the design doc's migration plan
+Derived from the design doc's migration plan
 (`durable-agent-steering-queue.md:303-316`).
 
-### P1 — Schema and transactional queue API
-Add both tables and all seven operations **without changing legacy
-`drain_unread` behavior**. Pure addition; nothing routes through it yet.
-Concurrency is the hard part: serialized CAS claiming, one lease per agent,
-bounded lease deadlines, `recover_expired_leases` on startup.
+**Status as of 2026-08-12: P1–P4 are complete.** The sections below record what
+landed, so this document is not read as describing unbuilt work.
 
-### P2 — Route producers through `enqueue_batch`
-Steering/follow-up producers commit a batch before transport begins. Retain the
-`messages` row as a compatibility pointer via `source_message_id`. Replace the
-30-second body-hash dedup with identity-based idempotency keys — free-form
-messages get a UUID and stay distinct even when bodies match.
+### P1 — Schema and transactional queue API ✅ DONE (E7 / #764)
+`rust/exomonad-core/src/services/guidance_queue.rs` implements all seven
+operations and all six states, exported from `services/mod.rs`.
 
-### P3 — Separate transport evidence from consumption
-`InboxStore::drain_unread` currently emits `message.consumed` before any
-runtime accepted anything. Split acknowledgement into `ack_kind="inbox_read"`
-(legacy, weak) and `ack_kind="runtime_accepted"` (adapter-proven), each with a
-confidence. A transport success alone must never emit the strong event. This is
-a correctness fix, not just plumbing — today's consumption metrics are
-overstated.
+### P2 — Route producers through `enqueue_batch` ✅ DONE (E8 / #765)
+`delivery.rs` and `guidance_shadow.rs` now call `enqueue_batch`. Identity-based
+idempotency landed in `agent_inbox.rs` (`dedup_key.idempotency_key`), replacing
+the 30-second body-hash window.
 
-### P4 — Runtime adapters, strongest evidence first
-Claude → Codex → OpenCode. Each adapter reports a boundary phase
-(`turn_finished` / `would_stop`) and supplies acceptance evidence carrying
-`batch_id`, `item_id`, `queue_class`, and invocation generation where the
-runtime can echo them. Keep legacy delivery in shadow mode until queue and
-ledger projections agree.
+### P3 — Separate transport evidence from consumption ✅ DONE (E9 / #766)
+`ack_kind` distinguishes `inbox_read` from `runtime_accepted`;
+`runtime_accepted` is emitted only from the acknowledgement path
+(`guidance_queue.rs:661`) and is covered by a test. The overstated-consumption
+bug is fixed.
 
-### P5 — Observability contract
-Extend the existing vocabulary by payload fields — do **not** create a second
-message authority. `inbox.state_changed`, `message.delivery`,
-`message.consumed` (+ `ack_kind`/confidence), `agent.guidance.delivery`,
-`agent_inbox.messages_abandoned`. Update the event registry,
-`expected-events.v1.json`, fixtures, and replay projections. Bodies stay local;
-ledger carries identities and bounded dimensions only.
+### P4 — Runtime adapters ✅ DONE (E10 / #767)
+`guidance_adapters.rs` provides the `GuidanceRuntimeAdapter` trait with
+`turn_finished`/`would_stop` boundaries; Claude Teams, Codex, and OpenCode
+adapters landed. `guidance_shadow.rs` provides the shadow comparison harness
+(`compare_batch`, `in_sync`, `diff_count`).
 
-### P6 — Retire the in-memory FIFO as authority
-Rebuild `AgentInbox` from durable pending/expired rows on restart, then remove
-it as an authority **only after** restart, lease, duplicate, retry, and
-abandonment gates pass for all supported runtimes.
+---
+
+### P5 — Observability contract ⬅ CURRENT (E11 / #768, tasks #789-792)
+
+**Narrower than originally scoped.** The five event *names* are already in
+`docs/observability/event-registry.json`: `inbox.state_changed`,
+`message.delivery`, `message.consumed`, `agent.guidance.delivery`,
+`agent_inbox.messages_abandoned`. Do not re-add them.
+
+The actual gaps:
+
+- **Payload identity fields.** The registry has essentially no declaration of
+  `batch_id`, `item_id`, `queue_class`, `queue_seq`, `consumer`, etc. Extend
+  payloads, do not mint new event identities.
+- **Denominator rules.** `expected-events.v1.json` has *zero* guidance-related
+  rules. A durable enqueue must expect eventual acceptance or explicit
+  abandonment; a transport success with neither stays pending/unknown.
+- **Replay projection.** Ledger replay must reconstruct
+  pending/accepted/terminal identically to SQLite state.
+- **Body-leakage check.** Bodies stay in L1/L2; aggregate projections carry
+  identities and bounded dimensions only.
+
+### P6 — Retire the in-memory FIFO as authority (E12 / #769, tasks #793-796)
+
+**Scope needs assessment before removal — two distinct things share the name.**
+
+- `services/agent_inbox.rs` still holds a `VecDeque`. This is the candidate for
+  demotion. Whether it is still an *authority* or already reduced to a
+  transport cache by P2 is the first question E12.1 must answer.
+- `services/continuation/{mod,adapters,renderer}.rs` reference
+  `AgentInboxSummary`, which is a **read-side summary type for the continuation
+  brief**, not the delivery FIFO. It is not in scope for removal.
+
+Rebuild from durable pending/expired rows on restart, then remove the authority
+**only after** restart, lease, duplicate, retry, and abandonment gates pass for
+all three runtimes.
 
 ## Verification
 
@@ -166,17 +187,17 @@ just validate-observability-contracts   # P5
 
 **Milestone 27 — M11: Durable agent steering queue.** Created 2026-08-12.
 
-| Phase | Epic | Tasks |
-|---|---|---|
-| P1 Schema + queue API | **#764** | #770–775 |
-| P2 Producer routing | #765 | #776–779 |
-| P3 Evidence separation | #766 | #780–783 |
-| P4 Runtime adapters | #767 | #784–788 |
-| P5 Observability | #768 | #789–792 |
-| P6 Retire in-memory authority | #769 | #793–796 |
+| Phase | Epic | Tasks | State |
+|---|---|---|---|
+| P1 Schema + queue API | #764 | #770–775 | ✅ closed |
+| P2 Producer routing | #765 | #776–779 | ✅ closed |
+| P3 Evidence separation | #766 | #780–783 | ✅ closed |
+| P4 Runtime adapters | #767 | #784–788 | ✅ closed |
+| P5 Observability | **#768** | #789–792 | ⬅ frontier |
+| P6 Retire in-memory authority | #769 | #793–796 | open |
 
-`#764` is blocked by `#723` (E6). Since E6 is closed that gate is already
-satisfied, so the frontier is `#764` / `#770`.
+Frontier is `#768` / `#789`. M12 (operator control plane, `#797–799`,
+tasks `#800–815`) is chained behind `#769`.
 
 **Sequencing is strictly linear.** All 27 tasks form a single chain
 `#770 → #771 → … → #796` that runs *through* epic boundaries, and the epics are
