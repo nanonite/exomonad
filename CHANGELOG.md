@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E3 :: E3.1 Per-head review state in tl_loop/state/schema.py (#734)
 - E2 :: E2.5 Extend role tests for the new args and ledger event (#733)
 - E2 :: E2.4 Compose acceptance criteria in the TL (#732)
 - E2 :: E2.3 Add spawn_reviewer to tl_loop/client/effects.py (#731)

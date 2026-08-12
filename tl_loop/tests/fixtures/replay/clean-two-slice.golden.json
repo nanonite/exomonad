@@ -51,6 +51,7 @@
       "attempts": 1,
       "base_ref": null,
       "branch": "main.leaf-a",
+      "ci_state": {},
       "depends_on": [],
       "id": "leaf-a",
       "model": null,
@@ -58,7 +59,10 @@
         "src/leaf.py"
       ],
       "pr_number": null,
+      "repair_attempts": 0,
+      "review_findings": {},
       "reviewed_head": null,
+      "reviewer_attempt": {},
       "status": "merged",
       "test_plan": [
         "just tl-loop-test"
@@ -71,6 +75,7 @@
       "attempts": 1,
       "base_ref": null,
       "branch": "main.worker-a",
+      "ci_state": {},
       "depends_on": [],
       "id": "worker-a",
       "model": null,
@@ -78,7 +83,10 @@
         "tl-loop/worker-a"
       ],
       "pr_number": null,
+      "repair_attempts": 0,
+      "review_findings": {},
       "reviewed_head": null,
+      "reviewer_attempt": {},
       "status": "merged",
       "test_plan": [
         "controller"

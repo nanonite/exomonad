@@ -3,6 +3,7 @@
 from .lock import LockOwner, LockTimeout, RunLock, owner_is_stale
 from .schema import (
     BUDGET_KEYS,
+    CI_STATUS_VALUES,
     EVENT_KEYS,
     FSM_KEYS,
     GATE_KEYS,
@@ -49,6 +50,7 @@ from .write import (
 
 __all__ = [
     "BUDGET_KEYS",
+    "CI_STATUS_VALUES",
     "DEFAULT_ROOT",
     "EVENT_KEYS",
     "FSM_KEYS",

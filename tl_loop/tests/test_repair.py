@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import cast
 
 import pytest
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.client.transport import JsonObject
+from tl_loop.fsm.phase import TLPhase
 from tl_loop.rlm.repair import (
     RepairPRStateError,
     compose_repair,
 )
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
-from tl_loop.state.schema import Verdict
+from tl_loop.state.schema import BudgetLedger, FSMState, SliceState, SliceStatus, Verdict
+from tl_loop.state.store import RunStore, create
 
 
 @dataclass
@@ -184,6 +187,67 @@ def test_attempts_increments_once_per_repair_dispatch() -> None:
     )
     assert pr["attempts"] == 5
     assert len([name for name, _ in client.calls if name == "resume_pr"]) == 1
+
+
+def test_repair_store_preserves_per_head_state_and_increments_repair_attempt(
+    tmp_path: Path,
+) -> None:
+    store = RunStore("run-1", tmp_path)
+    create("run-1", {}, root_dir=tmp_path)
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        {
+            "slice-a": SliceState(
+                id="slice-a",
+                status=SliceStatus.IN_REVIEW,
+                paths=("src/owned.py",),
+                depends_on=(),
+                base_ref="main",
+                test_plan=("just tl-loop-test",),
+                agent_type="codex",
+                model="gpt-5",
+                branch="task/slice-a",
+                worktree=".worktrees/slice-a",
+                pr_number=42,
+                reviewed_head="head-a",
+                review_findings={
+                    "head-a": (
+                        {
+                            "severity": "blocking",
+                            "path": "src/owned.py",
+                            "rationale": "failure is unhandled",
+                        },
+                    )
+                },
+                ci_state={"head-a": "failure"},
+                reviewer_attempt={"head-a": 1},
+                repair_attempts=2,
+                attempts=2,
+                verdict=Verdict.NO_GO,
+            )
+        },
+        BudgetLedger(tokens=0, wall_seconds=0),
+        offset=0,
+    )
+    client = FakeClient()
+    pr = _pr(client)
+    pr["slice_id"] = "slice-a"
+
+    compose_repair(
+        pr,
+        Verdict.NO_GO,
+        _review(),
+        model_choice=_choice(FakeBackend([RlmResponse(_handoff())])),
+        store=store,
+        slice_id="slice-a",
+    )
+
+    restored = store.load().slices["slice-a"]
+    assert restored.review_findings["head-a"][0]["rationale"] == "failure is unhandled"
+    assert restored.ci_state == {"head-a": "failure"}
+    assert restored.reviewer_attempt == {"head-a": 1}
+    assert restored.repair_attempts == 3
+    assert restored.attempts == 3
 
 
 def test_closed_handoff_schema_has_exactly_seven_sections() -> None:

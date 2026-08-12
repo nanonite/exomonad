@@ -9,7 +9,14 @@ import pytest
 
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.state.schema import BudgetLedger, FSMState, SliceState, SliceStatus, Verdict
-from tl_loop.state.store import CorruptCheckpoint, RunStore, WorktreeClaimError, create, load, resume
+from tl_loop.state.store import (
+    CorruptCheckpoint,
+    RunStore,
+    WorktreeClaimError,
+    create,
+    load,
+    resume,
+)
 
 
 def test_mid_wave_resume_reconstructs_exact_local_state(tmp_path: Path) -> None:
@@ -35,6 +42,28 @@ def test_mid_wave_resume_reconstructs_exact_local_state(tmp_path: Path) -> None:
     assert resumed.budgets == budgets
     assert resumed.offset == 17
     assert loaded.revision == 1
+
+
+def test_legacy_checkpoint_defaults_new_review_state(tmp_path: Path) -> None:
+    store = RunStore("run-1", tmp_path)
+    create("run-1", {}, root_dir=tmp_path)
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("in-review",)),
+        {"in-review": _slice("in-review", SliceStatus.IN_REVIEW, "src/review.py")},
+        BudgetLedger(tokens=0, wall_seconds=0),
+        offset=0,
+    )
+    document = json.loads(store.path.read_text(encoding="utf-8"))
+    record = document["slices"]["in-review"]
+    for key in ("review_findings", "ci_state", "reviewer_attempt", "repair_attempts"):
+        record.pop(key)
+    store.path.write_text(json.dumps(document), encoding="utf-8")
+
+    restored = load(store.path).slices["in-review"]
+    assert restored.review_findings == {}
+    assert restored.ci_state == {}
+    assert restored.reviewer_attempt == {}
+    assert restored.repair_attempts == 0
 
 
 def test_load_rejects_waiting_slice_with_terminal_status(tmp_path: Path) -> None:
@@ -73,6 +102,18 @@ def _slice(slice_id: str, status: SliceStatus, path: str) -> SliceState:
         reviewed_head="abc123"
         if status in {SliceStatus.IN_REVIEW, SliceStatus.MERGED}
         else None,
+        review_findings={
+            "abc123": (
+                {
+                    "severity": "info",
+                    "path": path,
+                    "rationale": "covered",
+                },
+            )
+        },
+        ci_state={"abc123": "success"},
+        reviewer_attempt={"abc123": 2},
+        repair_attempts=3,
         attempts=1,
         verdict=Verdict.GO if status is SliceStatus.MERGED else None,
     )

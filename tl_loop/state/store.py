@@ -336,6 +336,10 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             "branch": value.branch,
             "worktree": value.worktree,
             "pr_number": value.pr_number,
+            "review_findings": _encode_review_findings(value.review_findings),
+            "ci_state": dict(value.ci_state),
+            "reviewer_attempt": dict(value.reviewer_attempt),
+            "repair_attempts": value.repair_attempts,
             "reviewed_head": value.reviewed_head,
             "attempts": value.attempts,
             "verdict": value.verdict.value if value.verdict else None,
@@ -354,6 +358,15 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
     raise TypeError(f"slice {slice_id!r} is not a SliceState or object")
+
+
+def _encode_review_findings(
+    findings: Mapping[str, tuple[Mapping[str, str], ...]],
+) -> dict[str, list[dict[str, str]]]:
+    return {
+        head_sha: [dict(finding) for finding in values]
+        for head_sha, values in findings.items()
+    }
 
 
 def _encode_budgets(budgets: BudgetInput) -> dict[str, object]:
@@ -487,6 +500,45 @@ def _decode_charge(value: dict[str, object]) -> BudgetCharge:
     )
 
 
+def _decode_review_findings(
+    value: object,
+) -> Mapping[str, tuple[Mapping[str, str], ...]]:
+    if not isinstance(value, dict):
+        return MappingProxyType({})
+    result: dict[str, tuple[Mapping[str, str], ...]] = {}
+    for head_sha, raw_findings in value.items():
+        if not isinstance(head_sha, str) or not isinstance(raw_findings, list):
+            continue
+        result[head_sha] = tuple(
+            MappingProxyType(copy.deepcopy(dict(finding)))
+            for finding in raw_findings
+            if isinstance(finding, dict)
+        )
+    return MappingProxyType(result)
+
+
+def _decode_string_map(value: object) -> Mapping[str, str]:
+    if not isinstance(value, dict):
+        return MappingProxyType({})
+    return MappingProxyType(
+        {
+            key: item
+            for key, item in value.items()
+            if isinstance(key, str) and isinstance(item, str)
+        }
+    )
+
+
+def _decode_int_map(value: object) -> Mapping[str, int]:
+    if not isinstance(value, dict):
+        return MappingProxyType({})
+    return MappingProxyType(
+        {
+            key: item
+            for key, item in value.items()
+            if isinstance(key, str) and type(item) is int
+        }
+    )
 def _decode_slice(value: dict[str, object]) -> SliceState:
     return SliceState(
         id=cast(str, value["id"]),
@@ -501,6 +553,10 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         worktree=cast(str | None, value["worktree"]),
         pr_number=cast(int | None, value["pr_number"]),
         reviewed_head=cast(str | None, value["reviewed_head"]),
+        review_findings=_decode_review_findings(value.get("review_findings")),
+        ci_state=_decode_string_map(value.get("ci_state")),
+        reviewer_attempt=_decode_int_map(value.get("reviewer_attempt")),
+        repair_attempts=cast(int, value.get("repair_attempts", 0)),
         attempts=cast(int, value["attempts"]),
         verdict=Verdict(cast(str, value["verdict"])) if value["verdict"] is not None else None,
         verdict_at=cast(str | None, value.get("verdict_at")),

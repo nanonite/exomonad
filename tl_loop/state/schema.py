@@ -53,6 +53,9 @@ class GateStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
 
+REVIEW_FINDING_KEYS = frozenset({"severity", "path", "rationale"})
+CI_STATUS_VALUES = frozenset({"unknown", "pending", "success", "failure", "neutral"})
+
 
 TERMINAL_SLICE_STATUSES = frozenset(
     {
@@ -95,6 +98,10 @@ SLICE_KEYS = frozenset(
         "branch",
         "worktree",
         "pr_number",
+        "review_findings",
+        "ci_state",
+        "reviewer_attempt",
+        "repair_attempts",
         "reviewed_head",
         "verdict_at",
         "attempts",
@@ -174,6 +181,10 @@ class SliceState:
     reviewed_head: str | None
     attempts: int
     verdict: Verdict | None
+    review_findings: Mapping[str, tuple[Mapping[str, str], ...]] = field(default_factory=dict)
+    ci_state: Mapping[str, str] = field(default_factory=dict)
+    reviewer_attempt: Mapping[str, int] = field(default_factory=dict)
+    repair_attempts: int = 0
     verdict_at: str | None = None
     park_cause: ParkCause | None = None
     park_issue_id: int | None = None
@@ -371,10 +382,84 @@ def _validate_slice(
         not isinstance(value.get("reviewed_head"), str) or not value.get("reviewed_head")
     ):
         errors.append((f"{path}.reviewed_head", "is required when verdict is present"))
+    _review_findings(value.get("review_findings"), path, errors)
+    _ci_state(value.get("ci_state"), path, errors)
+    _reviewer_attempt(value.get("reviewer_attempt"), path, errors)
+    if "repair_attempts" in value:
+        _non_negative_int(value, "repair_attempts", path, errors)
     _nullable_enum_value(value, "park_cause", path, ParkCause, errors)
     _nullable_positive_int(value, "park_issue_id", path, errors)
     _nullable_string(value, "blocked_by", path, errors)
     _park_audit(value.get("park_audit"), path, errors)
+
+
+def _review_findings(
+    value: object,
+    path: str,
+    errors: list[tuple[str, str]],
+) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        errors.append((f"{path}.review_findings", "must be an object"))
+        return
+    for head_sha, raw_findings in value.items():
+        head_path = f"{path}.review_findings[{head_sha!r}]"
+        if not isinstance(head_sha, str) or not head_sha:
+            errors.append((f"{path}.review_findings", "keys must be non-empty head SHAs"))
+            continue
+        if not isinstance(raw_findings, list):
+            errors.append((head_path, "must be an array"))
+            continue
+        for index, raw_finding in enumerate(raw_findings):
+            finding_path = f"{head_path}[{index}]"
+            finding = _object(raw_finding, finding_path, REVIEW_FINDING_KEYS, errors)
+            if finding is None:
+                continue
+            for key in REVIEW_FINDING_KEYS:
+                _non_empty_string(finding, key, finding_path, errors)
+
+
+def _ci_state(
+    value: object,
+    path: str,
+    errors: list[tuple[str, str]],
+) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        errors.append((f"{path}.ci_state", "must be an object"))
+        return
+    for head_sha, status in value.items():
+        status_path = f"{path}.ci_state[{head_sha!r}]"
+        if not isinstance(head_sha, str) or not head_sha:
+            errors.append((f"{path}.ci_state", "keys must be non-empty head SHAs"))
+            continue
+        if not isinstance(status, str) or status not in CI_STATUS_VALUES:
+            errors.append(
+                (status_path, f"must be one of {sorted(CI_STATUS_VALUES)}")
+            )
+
+
+def _reviewer_attempt(
+    value: object,
+    path: str,
+    errors: list[tuple[str, str]],
+) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        errors.append((f"{path}.reviewer_attempt", "must be an object"))
+        return
+    for head_sha, attempt in value.items():
+        attempt_path = f"{path}.reviewer_attempt[{head_sha!r}]"
+        if not isinstance(head_sha, str) or not head_sha:
+            errors.append(
+                (f"{path}.reviewer_attempt", "keys must be non-empty head SHAs")
+            )
+            continue
+        if type(attempt) is not int or attempt < 0:
+            errors.append((attempt_path, "must be a non-negative integer"))
 
 
 def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None:

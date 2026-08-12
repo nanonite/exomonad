@@ -12,6 +12,48 @@ def test_valid_run_state_document_is_accepted() -> None:
     validate(_valid_document())
 
 
+def test_per_head_review_state_is_valid_and_closed() -> None:
+    document = _valid_document()
+    slice_state = _slice(document, "slice-a")
+    slice_state["review_findings"] = {
+        "head-a": [
+            {
+                "severity": "blocking",
+                "path": "src/a.py",
+                "rationale": "The error path is unhandled",
+            }
+        ]
+    }
+    slice_state["ci_state"] = {"head-a": "success"}
+    slice_state["reviewer_attempt"] = {"head-a": 2}
+    slice_state["repair_attempts"] = 1
+    validate(document)
+
+    unknown = _valid_document()
+    unknown_slice = _slice(unknown, "slice-a")
+    unknown_slice["review_findings"] = {}
+    findings = cast(dict[str, object], unknown_slice["review_findings"])
+    findings["head-a"] = [
+        {"severity": "info", "path": "src/a.py", "rationale": "covered"}
+    ]
+    cast(list[dict[str, object]], findings["head-a"])[0]["extra"] = True
+    _assert_rejected(unknown, "run.slices['slice-a'].review_findings['head-a'][0]")
+
+
+def test_per_head_review_state_rejects_invalid_values() -> None:
+    invalid_ci = _valid_document()
+    _slice(invalid_ci, "slice-a")["ci_state"] = {"head-a": "passed"}
+    _assert_rejected(invalid_ci, "run.slices['slice-a'].ci_state['head-a']")
+
+    invalid_attempt = _valid_document()
+    _slice(invalid_attempt, "slice-a")["reviewer_attempt"] = {"head-a": -1}
+    _assert_rejected(invalid_attempt, "run.slices['slice-a'].reviewer_attempt['head-a']")
+
+    invalid_repair = _valid_document()
+    _slice(invalid_repair, "slice-a")["repair_attempts"] = -1
+    _assert_rejected(invalid_repair, "run.slices['slice-a'].repair_attempts")
+
+
 def test_unknown_keys_are_rejected_at_every_nesting_level() -> None:
     cases: list[tuple[str, dict[str, object]]] = []
 
