@@ -1176,6 +1176,65 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_claims_exclude_one_agent_but_independent_agents_progress() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+        use tempfile::TempDir;
+
+        let directory = TempDir::new()?;
+        let first_store = Arc::new(InboxStore::open(directory.path())?);
+        let second_store = Arc::new(InboxStore::open(directory.path())?);
+        first_store.enqueue_batch(request("agent-a", QueueClass::Steering, Some("a")))?;
+        first_store.enqueue_batch(request("agent-b", QueueClass::Steering, Some("b")))?;
+        let barrier = Arc::new(Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let second_barrier = Arc::clone(&barrier);
+        let first = Arc::clone(&first_store);
+        let second = Arc::clone(&second_store);
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.claim_next(
+                &BoundaryEvidence::turn_finished("agent-a"),
+                &GuidanceConsumer {
+                    consumer_id: "consumer-a".to_string(),
+                    invocation_id: Some("invocation-a".to_string()),
+                    generation: Some(1),
+                },
+                60,
+            )
+        });
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.claim_next(
+                &BoundaryEvidence::turn_finished("agent-a"),
+                &GuidanceConsumer {
+                    consumer_id: "consumer-b".to_string(),
+                    invocation_id: Some("invocation-a".to_string()),
+                    generation: Some(1),
+                },
+                60,
+            )
+        });
+        let first_claim = first_thread.join().expect("first claim thread")?;
+        let second_claim = second_thread.join().expect("second claim thread")?;
+        assert_eq!(
+            first_claim.is_some() as u8 + second_claim.is_some() as u8,
+            1
+        );
+
+        let independent = first_store.claim_next(
+            &BoundaryEvidence::turn_finished("agent-b"),
+            &GuidanceConsumer {
+                consumer_id: "consumer-c".to_string(),
+                invocation_id: Some("invocation-a".to_string()),
+                generation: Some(1),
+            },
+            60,
+        )?;
+        assert!(independent.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn transport_success_does_not_accept_and_exact_ack_is_atomic() -> Result<()> {
         let store = InboxStore::open_in_memory()?;
         let batch = store
