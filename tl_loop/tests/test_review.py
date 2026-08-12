@@ -20,7 +20,10 @@ from tl_loop.loop.driver import (
     _merge_completed_leaf,
 )
 from tl_loop.loop.review import (
+    CIStatusNotApproved,
+    MissingCIStatus,
     ReviewHeadMismatch,
+    OptionalPolicyRejected,
     StaleVerdict,
     verify_review,
 )
@@ -56,6 +59,41 @@ def test_matching_head_within_freshness_window_is_accepted() -> None:
 
     assert evidence.reviewed_head == "abc123"
     assert evidence.age_seconds == 300
+
+
+def test_canonical_rule_does_not_require_review_timestamp() -> None:
+    evidence = verify_review(_slice(verdict_at=None), "abc123")
+
+    assert evidence.reviewed_head == "abc123"
+    assert evidence.age_seconds == 0.0
+
+
+def test_missing_ci_status_rejects_the_reviewed_head() -> None:
+    with pytest.raises(MissingCIStatus, match="no CI status"):
+        verify_review(_slice(verdict_at=None, ci_status=None), "abc123")
+
+
+def test_failed_ci_status_rejects_the_reviewed_head() -> None:
+    with pytest.raises(CIStatusNotApproved, match="failure"):
+        verify_review(_slice(verdict_at=None, ci_status="failure"), "abc123")
+
+
+def test_neutral_ci_status_satisfies_the_canonical_ci_gate() -> None:
+    evidence = verify_review(
+        _slice(verdict_at=None, ci_status="neutral"),
+        "abc123",
+    )
+
+    assert evidence.reviewed_head == "abc123"
+
+
+def test_optional_policy_predicate_is_not_an_implicit_gate() -> None:
+    with pytest.raises(OptionalPolicyRejected, match="optional review policy"):
+        verify_review(
+            _slice(verdict_at=None),
+            "abc123",
+            policy_predicate=lambda _slice: False,
+        )
 
 
 def test_changed_head_rejects_the_verdict() -> None:
@@ -113,7 +151,10 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
         {"leaf"},
         set(),
         EffectClient(transport),
-        TLLoopConfig(poll_interval=0.001),
+        TLLoopConfig(
+            poll_interval=0.001,
+            review_policy_path=Path(".exo/review-policy.toml"),
+        ),
         effects_log,
         state,
     )
@@ -133,7 +174,10 @@ def test_expired_matching_head_is_refused_before_merge(tmp_path: Path) -> None:
         {"leaf"},
         set(),
         EffectClient(transport),
-        TLLoopConfig(poll_interval=0.001),
+        TLLoopConfig(
+            poll_interval=0.001,
+            review_policy_path=Path(".exo/review-policy.toml"),
+        ),
         effects_log,
         state,
     )
@@ -146,7 +190,11 @@ def _fresh_verdict_at() -> str:
     return (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
 
 
-def _slice(*, verdict_at: str | None) -> SliceState:
+def _slice(
+    *,
+    verdict_at: str | None,
+    ci_status: str | None = "success",
+) -> SliceState:
     return SliceState(
         id="leaf",
         status=SliceStatus.IN_REVIEW,
@@ -162,6 +210,7 @@ def _slice(*, verdict_at: str | None) -> SliceState:
         reviewed_head="abc123",
         attempts=1,
         verdict=Verdict.GO,
+        ci_state={} if ci_status is None else {"abc123": ci_status},
         verdict_at=verdict_at,
     )
 
@@ -201,6 +250,7 @@ def _state(tmp_path: Path, head: str, verdict_at: str) -> tuple[RunState, RunSto
     record = cast(dict[str, object], cast(dict[str, object], document["slices"])["leaf"])
     record["reviewed_head"] = head
     record["verdict"] = Verdict.GO.value
+    record["ci_state"] = {head: "success"}
     record["verdict_at"] = verdict_at
     root_spec = {
         key: document[key]

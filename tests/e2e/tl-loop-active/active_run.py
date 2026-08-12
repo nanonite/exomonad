@@ -317,9 +317,9 @@ def _assert_result(
         raise AssertionError(f"ledger sequence is not gap-free: {read_result.sequence_status}")
     if read_result.findings:
         raise AssertionError(f"ledger reader findings: {read_result.findings}")
-    if [event.run_seq for event in read_result.events] != list(range(1, 8)):
-        raise AssertionError("active ledger did not contain the expected seven events")
-    if state.events.last_consumed_offset != 7:
+    if [event.run_seq for event in read_result.events] != list(range(1, 10)):
+        raise AssertionError("active ledger did not contain the expected nine events")
+    if state.events.last_consumed_offset != 9:
         raise AssertionError(f"unexpected consumed ledger offset: {state.events.last_consumed_offset}")
     if len(state.budgets.charges) != 2 or not all(
         charge.reconciled for charge in state.budgets.charges
@@ -383,25 +383,47 @@ def _write_ledger(segments: Path) -> None:
             ),
             _event(
                 5,
+                "ci.status_changed",
+                "active-slice-a",
+                {
+                    "slice_id": "active-slice-a",
+                    "head_sha": REVIEW_SHAS["active-slice-a"],
+                    "pr_number": PR_NUMBERS["active-slice-a"],
+                    "status": "success",
+                },
+            ),
+            _event(
+                6,
+                "ci.status_changed",
+                "active-slice-b",
+                {
+                    "slice_id": "active-slice-b",
+                    "head_sha": REVIEW_SHAS["active-slice-b"],
+                    "pr_number": PR_NUMBERS["active-slice-b"],
+                    "status": "success",
+                },
+            ),
+            _event(
+                7,
                 "agent.completed",
                 "active-slice-a",
                 {"status": "success", "pr_number": PR_NUMBERS["active-slice-a"]},
             ),
             _event(
-                6,
+                8,
                 "agent.completed",
                 "active-slice-b",
                 {"status": "success", "pr_number": PR_NUMBERS["active-slice-b"]},
             ),
             _event(
-                7,
+                9,
                 "agent.notify_parent",
                 None,
                 {"status": "success", "shadow_event": {"kind": "all_children_done"}},
             ),
         ]
     )
-    if [cast(int, row["run_seq"]) for row in rows] != list(range(1, 8)):
+    if [cast(int, row["run_seq"]) for row in rows] != list(range(1, 10)):
         raise AssertionError("active ledger fixture has a sequence gap")
     segment = segments / "segment-0001.jsonl"
     segment.write_text(

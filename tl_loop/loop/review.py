@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -94,6 +94,18 @@ class VerdictNotApproved(ReviewGateError):
     """The recorded verdict is not an approval."""
 
 
+class MissingCIStatus(ReviewGateError):
+    """The reviewed head has no recorded CI result."""
+
+
+class CIStatusNotApproved(ReviewGateError):
+    """The reviewed head does not have a successful or neutral CI result."""
+
+
+class OptionalPolicyRejected(ReviewGateError):
+    """An explicitly supplied project-specific merge predicate rejected."""
+
+
 @dataclass(frozen=True)
 class ReviewEvidence:
     """The verified current head and verdict age used for one merge."""
@@ -109,15 +121,20 @@ def verify_review(
     now: datetime | None = None,
     freshness_window_secs: int | None = None,
     policy_path: str | Path = DEFAULT_REVIEW_POLICY,
+    policy_predicate: Callable[[SliceState], bool] | None = None,
 ) -> ReviewEvidence:
-    """Require an approved, SHA-matching, fresh verdict."""
+    """Require TL approval, CI success, and exact live-head binding.
+
+    Freshness and project-specific second-review rules are optional predicates;
+    the canonical merge rule does not load or apply them implicitly.
+    """
     if slice.verdict is None:
         raise MissingVerdict(f"slice {slice.id!r} has no review verdict")
     if slice.reviewed_head is None:
         raise MissingReviewedHead(
             f"slice {slice.id!r} verdict has no reviewed_head"
         )
-    if slice.verdict is Verdict.NO_GO:
+    if slice.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
         raise VerdictNotApproved(f"slice {slice.id!r} verdict is {slice.verdict.value}")
     if not current_head:
         raise ReviewHeadMismatch("watcher_pr_state returned an empty head_sha")
@@ -125,21 +142,46 @@ def verify_review(
         raise ReviewHeadMismatch(
             f"slice {slice.id!r} reviewed {slice.reviewed_head}, current head is {current_head}"
         )
+    ci_status = slice.ci_state.get(slice.reviewed_head)
+    if ci_status is None:
+        raise MissingCIStatus(
+            f"slice {slice.id!r} has no CI status for {slice.reviewed_head}"
+        )
+    if ci_status not in {"success", "neutral"}:
+        raise CIStatusNotApproved(
+            f"slice {slice.id!r} CI status for {slice.reviewed_head} is {ci_status}"
+        )
+    if policy_predicate is not None and policy_predicate(slice) is not True:
+        raise OptionalPolicyRejected(
+            f"optional review policy rejected slice {slice.id!r}"
+        )
+    age_seconds = _freshness_age(
+        slice,
+        now=now,
+        freshness_window_secs=freshness_window_secs,
+    )
+    return ReviewEvidence(slice.reviewed_head, age_seconds)
+
+
+def _freshness_age(
+    slice: SliceState,
+    *,
+    now: datetime | None,
+    freshness_window_secs: int | None,
+) -> float:
+    if freshness_window_secs is None:
+        return 0.0
     if slice.verdict_at is None:
         raise StaleVerdict(f"slice {slice.id!r} verdict has no observed timestamp")
     observed = _parse_timestamp(slice.verdict_at)
     current = now or datetime.now(UTC)
     age_seconds = max(0.0, (current - observed).total_seconds())
-    window = (
-        freshness_window_secs
-        if freshness_window_secs is not None
-        else load_freshness_window(policy_path)
-    )
-    if age_seconds > window:
+    if age_seconds > freshness_window_secs:
         raise StaleVerdict(
-            f"slice {slice.id!r} verdict age {age_seconds:g}s exceeds {window}s"
+            f"slice {slice.id!r} verdict age {age_seconds:g}s exceeds "
+            f"{freshness_window_secs}s"
         )
-    return ReviewEvidence(slice.reviewed_head, age_seconds)
+    return age_seconds
 
 
 def watcher_head(result: ToolResult) -> str:
@@ -183,8 +225,11 @@ def _parse_timestamp(value: str) -> datetime:
 __all__ = [
     "DEFAULT_REVIEW_POLICY",
     "AcceptanceCriteriaError",
+    "CIStatusNotApproved",
+    "MissingCIStatus",
     "MissingReviewedHead",
     "MissingVerdict",
+    "OptionalPolicyRejected",
     "ReviewEvidence",
     "ReviewGateError",
     "ReviewHeadMismatch",

@@ -39,6 +39,7 @@ from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, hea
 from tl_loop.loop.review import (
     ReviewGateError,
     compose_acceptance_criteria,
+    load_freshness_window,
     verify_review,
     watcher_head,
 )
@@ -882,10 +883,15 @@ def _merge_completed_leaf(
         if watcher_result.success is False:
             raise EffectFailed(watcher_result.error or "watcher_pr_state returned failure")
         try:
+            freshness_window_secs = (
+                load_freshness_window(config.review_policy_path)
+                if config.review_policy_path is not None
+                else None
+            )
             verify_review(
                 current,
                 watcher_head(watcher_result),
-                policy_path=config.review_policy_path or Path(".exo/review-policy.toml"),
+                freshness_window_secs=freshness_window_secs,
             )
         except ReviewGateError as error:
             LOGGER.warning(

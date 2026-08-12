@@ -36,14 +36,14 @@
     }
   },
   "events": {
-    "last_consumed_offset": 7
+    "last_consumed_offset": 8
   },
   "fsm": {
     "phase": "tl_done",
     "waiting": []
   },
   "gates": [],
-  "revision": 9,
+  "revision": 10,
   "run_id": "<run-id>",
   "slices": {
     "leaf-a": {
@@ -51,7 +51,9 @@
       "attempts": 1,
       "base_ref": null,
       "branch": "main.leaf-a",
-      "ci_state": {},
+      "ci_state": {
+        "head-a": "success"
+      },
       "depends_on": [],
       "id": "leaf-a",
       "model": null,

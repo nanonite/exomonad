@@ -81,8 +81,8 @@ artifact = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert artifact["final_phase"] == "tl_done"
 assert artifact["merged_prs"] == [1001, 1002]
 assert artifact["ledger"]["sequence_status"] == "complete"
-assert artifact["ledger"]["event_count"] == 7
-assert artifact["ledger"]["last_consumed_offset"] == 7
+assert artifact["ledger"]["event_count"] == 9
+assert artifact["ledger"]["last_consumed_offset"] == 9
 assert artifact["ledger"]["charges_reconciled"] is True
 assert artifact["ledger"]["reserved_tokens"] == {}
 assert artifact["mutation_blocked"] == 0

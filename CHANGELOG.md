@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E3 :: E3.5 Narrow verify_review to the canonical rule (#738)
 - E3 :: E3.4 Route findings to adjudicate_review; NO-GO and CI failure to compose_repair (#737)
 - E3 :: E3.3 Reviewer spawn from the head-change transition (#736)
 - E3 :: E3.2 Add pr.filed and pr.updated/head-change transitions (#735)
