@@ -1541,6 +1541,16 @@ mod tests {
             "consumer-a",
             &TransportAttempt::success("tmux"),
         )?;
+        let events_after_transport = crate::services::LedgerWriter::open_project(directory.path())
+            .unwrap()
+            .read_events()
+            .unwrap();
+        assert!(events_after_transport
+            .iter()
+            .any(|record| record.event.event_type == "message.delivery"));
+        assert!(events_after_transport
+            .iter()
+            .all(|record| record.event.event_type != "message.consumed"));
         let rejected = store.acknowledge_runtime(&RuntimeAcceptanceEvidence {
             confidence: AcceptanceConfidence::Unknown,
             ..ack(&claimed, "consumer-a")
