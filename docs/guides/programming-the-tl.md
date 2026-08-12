@@ -130,33 +130,38 @@ built-in default.
 
 ### What actually gates a merge
 
-Four independent checks must all hold. Each lives in a different layer, which is
-why a merge can stall for a reason that is not visible in any single place.
+The rule has two authorities and one integrity invariant:
 
-**a. The watcher decides `merge_ready`.** The Rust worktree event watcher is the
-only component that observes the world. It fires `merge_ready` on the first tick
-where *both* review approval and CI status in `success`/`neutral` are true. If
-Forgejo Actions never posts a status, `ci_mergeable_at` stays `None` and
-`merge_ready` never fires — even with an approval sitting on the PR. That is the
-single most common "why won't it merge" cause on a new project; check that
-`.forgejo/workflows/ci.yml` actually runs.
+```text
+merge_allowed =
+      tl_adjudicated_go(current_head_sha)  # binding reviewer findings
+   && ci_success_or_neutral(current_head_sha)
+   && current_head_sha == live_pr_head_sha
+```
 
-**b. The adjudicator returns a closed verdict.** `adjudicate_review` receives
-the diff, comments, criteria, and the exact reviewed head, and may return only
-`GO`, `GO-WITH-NITS`, or `NO-GO`. The diff and criteria are *required* RLM
-sections, so if they will not fit the context budget the call raises
-`ContextOverflow` rather than judging a diff that was compacted away.
+**a. TL adjudication on binding reviewer findings.** The reviewer supplies
+structured findings for the exact head it inspected. The TL's
+`adjudicate_review` call turns those findings, the TL-owned acceptance criteria,
+and the diff into `GO` or `NO-GO`. The TL cannot invent a verdict without
+reviewer evidence or ignore an unresolved blocking finding.
 
-**c. Policy gates can veto a `GO`.** Minimum rounds, `external_review_paths`,
-`external_review_threshold`, and the complexity threshold are applied in Python
-after the verdict. A `GO` behind any of these is marked
-`second_review_required` and is **not** mergeable. `GO-WITH-NITS` is mergeable
-only after every nit has been written to the owning Chainlink issue.
+**b. CI is the machine authority.** The current head must have CI status
+`success` or `neutral`. If Forgejo Actions does not post a status, the CI
+condition is not satisfied; check that `.forgejo/workflows/ci.yml` actually
+runs.
 
-**d. The reviewed head must still be the current head.** The controller binds
-each verdict to a head SHA. If the PR moved after the review, the verdict is
-stale and does not merge — this is what prevents approving one commit and
-merging another.
+**c. Head binding is an integrity invariant.** The controller binds every
+review and CI observation to a head SHA. If the PR moved after review, the
+previous decision is stale and cannot merge. This prevents approving one commit
+and merging another.
+
+### Optional policy
+
+Projects may require a second reviewer for declared risk paths or large diffs
+using `external_review_paths`, `external_review_threshold`, and the complexity
+threshold. Those are optional policy gates, not universal approval layers. A
+`GO-WITH-NITS` result is mergeable only after every nit has been written to the
+owning Chainlink issue; otherwise the TL parks or repairs the slice.
 
 ### The repair path when review says NO-GO
 
@@ -181,9 +186,10 @@ external_review_paths = [
 external_review_threshold = 200
 ```
 
-To forbid the timeout-merge escape entirely, set
-`reviewer_max_wait_seconds` high enough that a timeout means a genuinely dead
-reviewer, and let `reviewer_max_rounds` park the PR for a human instead.
+Review timeout is never approval. It parks the slice with a named gate;
+`reviewer_max_wait_seconds` controls when the timeout is detected, and
+`reviewer_max_rounds` controls when repeated review attempts park the PR for a
+human.
 
 ---
 
@@ -459,7 +465,7 @@ scraping is not a liveness source.
 2. Write `.exo/harness_policy.toml`. Start with one allowed entry per role.
 3. Set Forgejo credentials — `forgejo_url`, `forgejo_token`,
    `forgejo_webhook_secret` in `.exo/config.toml`. Without a working CI status,
-   `merge_ready` never fires.
+   the canonical merge rule cannot pass.
 4. Adjust `.exo/review-policy.toml` if the defaults are wrong for your risk
    surface — mainly `external_review_paths`.
 5. Write `.exo/tl-loop/plan.json`. Disjoint `boundary` globs, real commands in
