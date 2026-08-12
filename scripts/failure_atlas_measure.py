@@ -20,7 +20,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-DETECTOR_REVISION = "mvp-e-mechanical-v1"
+DETECTOR_REVISION = "mvp-e-mechanical-v2"
 INCIDENT_REVISION = "mvp-e-incident-cluster-v1"
 ADJUDICATION_REVISION = "mvp-e-adjudication-v1"
 MEASUREMENT_REVISION = "mvp-e-contrast-gate-v1"
@@ -243,12 +243,277 @@ def _sequence_gaps(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return signals
 
 
+def _pr_identity(payload: dict[str, Any]) -> str | None:
+    """Return a bounded PR key without using branch text as workflow authority."""
+    for key in ("pr_number", "number", "branch"):
+        value = payload.get(key)
+        if value is not None and str(value):
+            return str(value)
+    return None
+
+
+def _head_sha(payload: dict[str, Any]) -> str | None:
+    value = payload.get("head_sha") or payload.get("sha")
+    return str(value) if value is not None and str(value) else None
+
+
+def _review_is_approved(payload: dict[str, Any]) -> bool:
+    values = {
+        str(payload.get(key, "")).lower()
+        for key in ("kind", "review_state", "verdict", "state")
+    }
+    return bool(values.intersection({"approved", "review_approved", "merge_ready"}))
+
+
+def _ci_status(payload: dict[str, Any]) -> str | None:
+    for key in ("ci_status", "status", "state", "outcome"):
+        value = payload.get(key)
+        if value is not None and str(value):
+            return str(value).lower()
+    return None
+
+
+def _is_ci_passing(payload: dict[str, Any]) -> bool:
+    return _ci_status(payload) in {"success", "passed", "pass", "neutral", "green"}
+
+
+def _pr_rows(rows: list[dict[str, Any]]) -> dict[str, list[tuple[dict[str, Any], dict[str, Any]]]]:
+    grouped: defaultdict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
+    for row in rows:
+        payload = _payload(row)
+        identity = _pr_identity(payload)
+        if identity is not None:
+            grouped[identity].append((row, payload))
+    return grouped
+
+
+def _event_order(row: dict[str, Any]) -> tuple[bool, int, str, str]:
+    run_seq = row.get("run_seq")
+    return (
+        run_seq is None,
+        int(run_seq) if run_seq is not None else 0,
+        str(row.get("event_time") or row.get("observed_at") or ""),
+        str(row["event_key"]),
+    )
+
+
+def _missing_review(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    signals = []
+    for row in rows:
+        if row["event_type"] not in {"pr.published", "pr.updated"}:
+            continue
+        payload = _payload(row)
+        identity = _pr_identity(payload)
+        head_sha = _head_sha(payload)
+        if identity is None or head_sha is None:
+            continue
+        observed_review = any(
+            event["event_type"] == "pr.review"
+            and _pr_identity(event_payload) == identity
+            and _head_sha(event_payload) == head_sha
+            for event, event_payload in _pr_rows(rows).get(identity, [])
+        )
+        if not observed_review:
+            signals.append(
+                _signal(
+                    "missing_review",
+                    row,
+                    1.0,
+                    "mechanical",
+                    {
+                        "pr_key": identity,
+                        "head_sha": head_sha,
+                        "missing_event": "pr.review",
+                    },
+                )
+            )
+    return signals
+
+
+def _missing_ci(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    signals = []
+    grouped = _pr_rows(rows)
+    for row in rows:
+        if row["event_type"] not in {"pr.published", "pr.updated"}:
+            continue
+        payload = _payload(row)
+        identity = _pr_identity(payload)
+        head_sha = _head_sha(payload)
+        if identity is None or head_sha is None:
+            continue
+        observed_ci = any(
+            event["event_type"] == "ci.status_changed"
+            and _head_sha(event_payload) == head_sha
+            for event, event_payload in grouped.get(identity, [])
+        )
+        if not observed_ci:
+            signals.append(
+                _signal(
+                    "missing_ci",
+                    row,
+                    1.0,
+                    "mechanical",
+                    {
+                        "pr_key": identity,
+                        "head_sha": head_sha,
+                        "missing_event": "ci.status_changed",
+                    },
+                )
+            )
+    return signals
+
+
+def _stale_head_approvals(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    signals = []
+    for identity, events in _pr_rows(rows).items():
+        head_events = [
+            (event, _head_sha(payload))
+            for event, payload in events
+            if event["event_type"] in {"pr.published", "pr.updated", "watcher.pr_observation"}
+            and _head_sha(payload) is not None
+        ]
+        head_events.sort(key=lambda item: _event_order(item[0]))
+        current_head = head_events[-1][1] if head_events else None
+        if current_head is None:
+            continue
+        for row, payload in events:
+            approved_head = _head_sha(payload)
+            if row["event_type"] != "pr.review" or not _review_is_approved(payload):
+                continue
+            if approved_head is not None and approved_head != current_head:
+                signals.append(
+                    _signal(
+                        "stale_head_approval",
+                        row,
+                        1.0,
+                        "mechanical",
+                        {
+                            "pr_key": identity,
+                            "approved_head_sha": approved_head,
+                            "current_head_sha": current_head,
+                            "review_state": "approved",
+                        },
+                    )
+                )
+    return signals
+
+
+def _review_timeouts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        _signal(
+            "review_timeout",
+            row,
+            1.0,
+            "mechanical",
+            {
+                "pr_key": _pr_identity(_payload(row)),
+                "head_sha": _head_sha(_payload(row)),
+                "kind": _payload(row).get("kind"),
+            },
+        )
+        for row in rows
+        if row["event_type"] == "pr.review"
+        and str(_payload(row).get("kind", "")).lower() == "timeout"
+    ]
+
+
+def _review_loop_stalls(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    signals = []
+    for identity, events in _pr_rows(rows).items():
+        review_cycles = {
+            _head_sha(payload)
+            for event, payload in events
+            if event["event_type"] in {"pr.review", "ci.status_changed"}
+            and _head_sha(payload) is not None
+        }
+        has_merge = any(event["event_type"] == "pr.merged" for event, _ in events)
+        explicit_stall = [
+            (event, payload)
+            for event, payload in events
+            if event["event_type"] == "pr.review"
+            and str(payload.get("kind", "")).lower() in {"stuck", "ci_blocked"}
+        ]
+        if has_merge or (len(review_cycles) < 2 and not explicit_stall):
+            continue
+        row, payload = explicit_stall[-1] if explicit_stall else max(
+            events,
+            key=lambda item: (item[0].get("event_time") or item[0].get("observed_at") or "", item[0]["event_key"]),
+        )
+        signals.append(
+            _signal(
+                "review_loop_stall",
+                row,
+                1.0,
+                "mechanical",
+                {
+                    "pr_key": identity,
+                    "review_cycle_count": len(review_cycles),
+                    "kind": payload.get("kind"),
+                    "missing_terminal_event": "pr.merged",
+                },
+            )
+        )
+    return signals
+
+
+def _merge_without_gates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    signals = []
+    grouped = _pr_rows(rows)
+    for row in rows:
+        if row["event_type"] != "pr.merge_requested":
+            continue
+        payload = _payload(row)
+        identity = _pr_identity(payload)
+        requested_head = _head_sha(payload)
+        if identity is None or requested_head is None:
+            continue
+        events = grouped.get(identity, [])
+        approved = any(
+            event["event_type"] == "pr.review"
+            and _review_is_approved(event_payload)
+            and _head_sha(event_payload) == requested_head
+            for event, event_payload in events
+        )
+        ci_passed = any(
+            event["event_type"] == "ci.status_changed"
+            and _is_ci_passing(event_payload)
+            and _head_sha(event_payload) == requested_head
+            for event, event_payload in events
+        )
+        missing_gates = []
+        if not approved:
+            missing_gates.append("approved_review_current_head")
+        if not ci_passed:
+            missing_gates.append("passing_ci_current_head")
+        if missing_gates:
+            signals.append(
+                _signal(
+                    "merge_without_gates",
+                    row,
+                    1.0,
+                    "mechanical",
+                    {
+                        "pr_key": identity,
+                        "head_sha": requested_head,
+                        "missing_gates": missing_gates,
+                    },
+                )
+            )
+    return signals
+
+
 DETECTORS: tuple[Callable[[list[dict[str, Any]]], list[dict[str, Any]]], ...] = (
     _completion_gaps,
     _delivery_gaps,
     _generation_retries,
     _sink_failures,
     _sequence_gaps,
+    _missing_review,
+    _missing_ci,
+    _stale_head_approvals,
+    _review_timeouts,
+    _review_loop_stalls,
+    _merge_without_gates,
 )
 
 

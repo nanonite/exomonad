@@ -136,6 +136,15 @@ def validate_expected_events(contract: dict[str, Any], event_types: set[str]) ->
             raise ContractError(f"{context}: allowed delay or window is required")
         if not rule["applicable_sources"]:
             raise ContractError(f"{context}: applicable_sources cannot be empty")
+        if "correlation_fields" in rule and not all(
+            isinstance(field, str) and field for field in rule["correlation_fields"]
+        ):
+            raise ContractError(f"{context}: correlation_fields must contain names")
+        if "required_data" in rule and (
+            not isinstance(rule["required_data"], dict)
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in rule["required_data"].items())
+        ):
+            raise ContractError(f"{context}: required_data must map string fields to strings")
     expected_rules = {
         "spawn_requires_invocation_start",
         "invocation_requires_finish",
@@ -143,6 +152,10 @@ def validate_expected_events(contract: dict[str, Any], event_types: set[str]) ->
         "delivery_requires_consumption_observation",
         "published_pr_requires_observation",
         "merge_request_requires_merge_outcome",
+        "published_pr_requires_review_current_head",
+        "head_change_requires_ci_status_current_head",
+        "merge_request_requires_approved_current_head",
+        "merge_request_requires_passing_ci_current_head",
     }
     if rule_ids != expected_rules:
         raise ContractError(f"expected-event contract: rules must be {sorted(expected_rules)}")

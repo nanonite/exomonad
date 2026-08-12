@@ -748,7 +748,7 @@ fn insert_import_error(
 fn refresh_derived_tables(store: &AnalysisStore) -> Result<()> {
     let connection = store.connection()?;
     let mut statement = connection.prepare(
-        "SELECT session_id, event_time, event_type, run_seq
+        "SELECT session_id, event_time, event_type, run_seq, local_payload_json
          FROM resolved_events
          WHERE session_id IS NOT NULL
          ORDER BY session_id, event_time",
@@ -771,6 +771,11 @@ fn refresh_derived_tables(store: &AnalysisStore) -> Result<()> {
             .get::<_, Option<i64>>(3)?
             .map(|value| u64::try_from(value).context("negative run_seq in L2"))
             .transpose()?;
+        let local_payload_json: String = row.get(4)?;
+        let data = serde_json::from_str::<Value>(&local_payload_json)
+            .ok()
+            .and_then(|value| value.get("data").cloned())
+            .unwrap_or(Value::Null);
         let entry = sessions
             .entry(session_id)
             .or_insert_with(|| (None, None, 0, Vec::new()));
@@ -783,6 +788,7 @@ fn refresh_derived_tables(store: &AnalysisStore) -> Result<()> {
             session_id: None,
             event_type,
             run_seq,
+            data,
         });
     }
     drop(rows);

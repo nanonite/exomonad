@@ -103,6 +103,11 @@ metadata only: provide independent per-judge labels with --labels labels.json.
 Without complete per-judge labels, precision remains pending and cannot be
 published; single-judge precision is marked provisional.
 
+The current semantic detector set includes `missing_review`, `missing_ci`,
+`stale_head_approval`, `review_timeout`, `review_loop_stall`, and
+`merge_without_gates`. These are local mechanical candidates: they require
+adjudication and never authorize a review, CI, or merge decision.
+
 The measurement gate requires session-level units, an explicit baseline and
 treatment, assignment method, fixed primary outcome/denominator, missingness
 rule, stopping rule, and all declared confound controls. Provider/runtime/

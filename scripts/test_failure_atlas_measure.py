@@ -97,6 +97,34 @@ def _create_database(path: Path) -> None:
     connection.close()
 
 
+def _row(key: str, seq: int, event_type: str, payload: dict) -> dict:
+    columns = [
+        "event_key",
+        "event_id",
+        "source_offset",
+        "event_time",
+        "observed_at",
+        "run_seq",
+        "session_id",
+        "run_id",
+        "agent_id",
+        "invocation_id",
+        "generation",
+        "event_type",
+        "outcome",
+        "lifecycle_state",
+        "sink_status",
+        "local_payload_json",
+    ]
+    return dict(
+        zip(
+            columns,
+            _event(key, "semantic-session", seq, event_type, payload),
+            strict=True,
+        )
+    )
+
+
 def main() -> int:
     preregistration = {
         "experiment_id": "mvp-e-test",
@@ -173,6 +201,45 @@ def main() -> int:
         assert unlabelled["claim_gate"]["architecture_effect_claim_allowed"] is False
         invalid = measure(database, root / "invalid", None)
         assert invalid["claim_gate"]["architecture_effect_claim_allowed"] is False
+
+        semantic_rows = [
+            _row("published-a", 1, "pr.published", {"pr_number": 42, "head_sha": "head-a"}),
+            _row(
+                "review-a",
+                2,
+                "pr.review",
+                {"pr_number": 42, "head_sha": "head-a", "kind": "approved"},
+            ),
+            _row(
+                "ci-a",
+                3,
+                "ci.status_changed",
+                {"pr_number": 42, "head_sha": "head-a", "status": "success"},
+            ),
+            _row("updated-a", 4, "pr.updated", {"pr_number": 42, "head_sha": "head-b"}),
+            _row(
+                "timeout-a",
+                5,
+                "pr.review",
+                {"pr_number": 42, "head_sha": "head-b", "kind": "timeout"},
+            ),
+            _row(
+                "merge-a",
+                6,
+                "pr.merge_requested",
+                {"pr_number": 42, "head_sha": "head-b"},
+            ),
+            _row("published-b", 7, "pr.published", {"pr_number": 43, "head_sha": "head-c"}),
+        ]
+        semantic_detectors = {signal["detector"] for signal in detect(semantic_rows)}
+        assert semantic_detectors >= {
+            "missing_review",
+            "missing_ci",
+            "stale_head_approval",
+            "review_timeout",
+            "review_loop_stall",
+            "merge_without_gates",
+        }
     print("Failure Atlas measurement pipeline smoke tests passed")
     return 0
 

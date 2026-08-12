@@ -54,6 +54,50 @@
       "denominator_effect": "Add one expected PR observation for each eligible published PR."
     },
     {
+      "rule_id": "published_pr_requires_review_current_head",
+      "prerequisite_event": "pr.published",
+      "required_event": "pr.review",
+      "allowed_delay_ms": 600000,
+      "correlation_fields": ["pr_number", "head_sha"],
+      "applicable_sources": ["rust", "watcher"],
+      "legacy_confidence_rule": "A published PR without a review carrying the same PR and verified head is unknown, not reviewed.",
+      "denominator_effect": "Add one expected current-head review observation for each published PR."
+    },
+    {
+      "rule_id": "head_change_requires_ci_status_current_head",
+      "prerequisite_event": "pr.updated",
+      "required_event": "ci.status_changed",
+      "allowed_delay_ms": 600000,
+      "correlation_fields": ["pr_number", "head_sha"],
+      "applicable_sources": ["rust", "watcher"],
+      "legacy_confidence_rule": "A head update without a CI status carrying the same PR and verified head is unknown, not green.",
+      "denominator_effect": "Add one expected current-head CI observation for each PR head update."
+    },
+    {
+      "rule_id": "merge_request_requires_approved_current_head",
+      "prerequisite_event": "pr.merge_requested",
+      "required_event": "pr.review",
+      "allowed_delay_ms": null,
+      "allowed_window": "until merge outcome, cancellation, or session termination",
+      "required_data": {"kind": "approved"},
+      "correlation_fields": ["pr_number", "head_sha"],
+      "applicable_sources": ["rust", "haskell", "watcher"],
+      "legacy_confidence_rule": "A merge request without an approved review for the exact requested head is unknown and unsafe.",
+      "denominator_effect": "Add one expected exact-head approval for each merge request."
+    },
+    {
+      "rule_id": "merge_request_requires_passing_ci_current_head",
+      "prerequisite_event": "pr.merge_requested",
+      "required_event": "ci.status_changed",
+      "allowed_delay_ms": null,
+      "allowed_window": "until merge outcome, cancellation, or session termination",
+      "required_data": {"status": "success"},
+      "correlation_fields": ["pr_number", "head_sha"],
+      "applicable_sources": ["rust", "watcher"],
+      "legacy_confidence_rule": "A merge request without passing CI for the exact requested head is unknown and unsafe.",
+      "denominator_effect": "Add one expected passing exact-head CI observation for each merge request."
+    },
+    {
       "rule_id": "merge_request_requires_merge_outcome",
       "prerequisite_event": "pr.merge_requested",
       "required_event": "pr.merged",

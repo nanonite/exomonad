@@ -3,6 +3,7 @@
 use crate::services::LedgerRecord;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 const CONTRACT_JSON: &str = include_str!("../../../../docs/observability/expected-events.v1.json");
@@ -17,6 +18,10 @@ pub struct ExpectedEventRule {
     pub applicable_sources: Vec<String>,
     pub legacy_confidence_rule: String,
     pub denominator_effect: String,
+    #[serde(default)]
+    pub required_data: BTreeMap<String, String>,
+    #[serde(default)]
+    pub correlation_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -49,6 +54,7 @@ pub struct EventObservation {
     pub session_id: Option<String>,
     pub event_type: String,
     pub run_seq: Option<u64>,
+    pub data: Value,
 }
 
 pub fn load_contract() -> Result<ExpectedEventContract> {
@@ -64,6 +70,7 @@ pub fn reconcile(records: &[LedgerRecord]) -> Result<DenominatorReport> {
             session_id: record.event.session_id.clone(),
             event_type: record.event.event_type.clone(),
             run_seq: record.event.run_seq,
+            data: record.event.data.clone(),
         })
         .collect::<Vec<_>>();
     reconcile_events(&observations)
@@ -75,28 +82,22 @@ pub fn reconcile_events(events: &[EventObservation]) -> Result<DenominatorReport
     for rule in &contract.rules {
         let mut expected = 0;
         let mut observed = 0;
-        let mut session_prerequisites = BTreeMap::<String, u64>::new();
-        let mut session_required = BTreeMap::<String, u64>::new();
-        for event in events {
-            let session = event
-                .session_id
-                .as_deref()
-                .unwrap_or("<unknown>")
-                .to_string();
-            if event.event_type == rule.prerequisite_event {
-                *session_prerequisites.entry(session.clone()).or_default() += 1;
+        let prerequisites = events
+            .iter()
+            .filter(|event| event.event_type == rule.prerequisite_event)
+            .collect::<Vec<_>>();
+        let mut matched_required = std::collections::HashSet::new();
+        for prerequisite in prerequisites {
+            expected += 1;
+            if let Some((index, _)) = events.iter().enumerate().find(|(index, required)| {
+                !matched_required.contains(index)
+                    && same_session(prerequisite, required)
+                    && required_matches(&rule.required_event, &required.event_type)
+                    && required_data_matches(rule, prerequisite, required)
+            }) {
+                matched_required.insert(index);
+                observed += 1;
             }
-            if required_matches(&rule.required_event, &event.event_type) {
-                *session_required.entry(session).or_default() += 1;
-            }
-        }
-        for (session, count) in session_prerequisites {
-            expected += count;
-            observed += session_required
-                .get(&session)
-                .copied()
-                .unwrap_or_default()
-                .min(count);
         }
         rows.push(DenominatorRow {
             rule_id: rule.rule_id.clone(),
@@ -143,6 +144,31 @@ fn required_matches(required: &str, event_type: &str) -> bool {
     required
         .split(['/', '|'])
         .any(|candidate| candidate == event_type)
+}
+
+fn same_session(left: &EventObservation, right: &EventObservation) -> bool {
+    left.session_id == right.session_id
+}
+
+fn required_data_matches(
+    rule: &ExpectedEventRule,
+    prerequisite: &EventObservation,
+    required: &EventObservation,
+) -> bool {
+    if !rule.required_data.iter().all(|(field, expected)| {
+        required
+            .data
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|actual| actual == expected)
+    }) {
+        return false;
+    }
+    rule.correlation_fields.iter().all(|field| {
+        let prerequisite_value = prerequisite.data.get(field);
+        let required_value = required.data.get(field);
+        prerequisite_value.is_some() && prerequisite_value == required_value
+    })
 }
 
 #[cfg(test)]
@@ -195,6 +221,52 @@ mod tests {
             .context("finish rule")?;
         assert_eq!((row.expected, row.observed, row.missing), (1, 1, 0));
         assert_eq!(report.completeness_status, "complete");
+        Ok(())
+    }
+
+    #[test]
+    fn merge_gate_contract_requires_approved_review_and_passing_ci_on_same_head() -> Result<()> {
+        let mut requested = LedgerEvent::new(
+            "pr.merge_requested",
+            None,
+            serde_json::json!({"pr_number": 42, "head_sha": "head-b"}),
+        );
+        requested.session_id = Some("session-merge".to_string());
+        requested.run_seq = Some(1);
+        let mut stale_review = LedgerEvent::new(
+            "pr.review",
+            None,
+            serde_json::json!({
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "kind": "approved"
+            }),
+        );
+        stale_review.session_id = Some("session-merge".to_string());
+        stale_review.run_seq = Some(2);
+        let mut stale_ci = LedgerEvent::new(
+            "ci.status_changed",
+            None,
+            serde_json::json!({
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "status": "success"
+            }),
+        );
+        stale_ci.session_id = Some("session-merge".to_string());
+        stale_ci.run_seq = Some(3);
+        let report = reconcile(&[record(requested), record(stale_review), record(stale_ci)])?;
+        for rule_id in [
+            "merge_request_requires_approved_current_head",
+            "merge_request_requires_passing_ci_current_head",
+        ] {
+            let row = report
+                .rows
+                .iter()
+                .find(|row| row.rule_id == rule_id)
+                .context("merge gate rule")?;
+            assert_eq!((row.expected, row.observed, row.missing), (1, 0, 1));
+        }
         Ok(())
     }
 }
