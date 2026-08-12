@@ -250,15 +250,15 @@ standard EventLog row:
 
 - `message.delivery`: delivery channel, method, outcome, detail, and attempt;
 - `agent.message_sent`: address, method, and success;
-- `agent_inbox.duplicates_dropped`: recipient, event type, and deduplication key;
+- `agent_inbox.duplicates_dropped`: recipient, durable cache key, and transport-cache authority;
 - `agent_inbox.messages_abandoned`: recipient and retry count;
 - `agent.guidance.delivery`: also has a lifecycle EventLog representation;
 - delivery/inbox retry and backoff spans.
 
-The in-memory inbox deduplicates event classes such as `MergeReady`, `ReviewApproved`,
-`FixesPushed`, `CommitsPushed`, `ReviewTimeout`, `CIStatus`, `ReviewReceived`, and
-`Stuck`; free-form messages are also supported. The queue has retry and abandonment
-behavior, but its state is not a durable event ledger.
+The process-local inbox is a transport cache, not an identity authority. It only
+suppresses a durable batch that is already represented in its FIFO; durable SQLite
+idempotency decides whether a batch is a duplicate. The cache has retry and
+abandonment behavior, but its state is not a durable event ledger.
 
 ### SQLite state stores
 
@@ -365,7 +365,7 @@ suspension, and worker exit diagnostics.
 | `log.emit_event` event type | Standard EventLog and OTel | caller-selected type, event ID, JSON payload |
 | `message.delivery` | OTel/tracing | sender, recipient, channel/method, outcome, detail, attempt |
 | `agent.message_sent` | OTel/tracing | address, method, success |
-| `agent_inbox.duplicates_dropped` | OTel/tracing | recipient, event type, deduplication scope/key |
+| `agent_inbox.duplicates_dropped` | OTel/tracing | recipient, durable cache key, transport-cache authority |
 | `agent_inbox.messages_abandoned` | OTel/tracing | recipient, attempts |
 
 WASM effect dispatch is also traced with effect type, namespace, and agent. Host

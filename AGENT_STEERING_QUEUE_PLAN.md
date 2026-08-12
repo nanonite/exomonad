@@ -3,27 +3,31 @@
 Follow-on to E6 (#723). The ADR
 [`docs/decisions/agent-loop-and-steering.md`](docs/decisions/agent-loop-and-steering.md)
 is Accepted but explicitly research-only: *"implementation work follows the
-queue and adapter plan below."* Nothing is built yet.
+queue and adapter plan below."* The implementation is now tracked by the
+completed phases below; this document records the authority boundaries and
+remaining follow-on work.
 
 ## Context
 
 E6 answered the question and stopped. Current state:
 
-- `#752–#756` produced research and four decision documents, no code.
+- `#752–#756` produced the research and four decision documents that bounded
+  the implementation below.
 - Runtime loops remain Claude/Codex/OpenCode-owned — and per the ADR, **that
   is the decision**, not a gap. ExoMonad owns workflow and queue authority, not
   the active model loop.
 - Roles remain `dev` + `worker` (`.exo/roles/devswarm/AllRoles.hs:92`). No new
   role is required; this is a non-goal.
-- No durable steering queue, leases, acknowledgements, or adapters exist.
+- The durable guidance queue, leases, acknowledgements, and runtime adapters
+  are implemented in `rust/exomonad-core`.
 
 What *does* exist, and matters:
 
 | Component | Lines | State |
 |---|---|---|
-| `.exo/inbox.db` | 20KB | Only `messages` + `agent_inbox_meta`. No batches, classes, leases, or states |
+| `.exo/inbox.db` | current | Legacy `messages` plus durable `guidance_batches`/`guidance_items` lifecycle tables |
 | `services/inbox_store.rs` | 955 | `InboxStore`; `drain_unread` marks read **and emits `message.consumed` before any runtime accepted anything** |
-| `services/agent_inbox.rs` | 596 | In-memory `VecDeque`, 32-message cap, 30s body-hash dedup, lost on restart |
+| `services/agent_inbox.rs` | current | Process-local `VecDeque` transport cache, 32-message cap, rebuilt from durable rows |
 | `services/delivery.rs` | 2010 | Transport: Teams, UDS, tmux |
 | `services/inbox_watcher.rs` | 178 | Poke/backoff |
 
@@ -97,7 +101,7 @@ observable*, not a fabricated 100% delivery rate.
 Derived from the design doc's migration plan
 (`durable-agent-steering-queue.md:303-316`).
 
-**Status as of 2026-08-12: P1–P4 are complete.** The sections below record what
+**Status as of 2026-08-12: P1–P6 are complete.** The sections below record what
 landed, so this document is not read as describing unbuilt work.
 
 ### P1 — Schema and transactional queue API ✅ DONE (E7 / #764)
@@ -106,8 +110,9 @@ operations and all six states, exported from `services/mod.rs`.
 
 ### P2 — Route producers through `enqueue_batch` ✅ DONE (E8 / #765)
 `delivery.rs` and `guidance_shadow.rs` now call `enqueue_batch`. Identity-based
-idempotency landed in `agent_inbox.rs` (`dedup_key.idempotency_key`), replacing
-the 30-second body-hash window.
+idempotency is persisted by the durable queue; `AgentInbox` no longer infers
+identity from message bodies and only uses explicit durable batch IDs for its
+cache-local queued-row guard.
 
 ### P3 — Separate transport evidence from consumption ✅ DONE (E9 / #766)
 `ack_kind` distinguishes `inbox_read` from `runtime_accepted`;
@@ -123,7 +128,7 @@ adapters landed. `guidance_shadow.rs` provides the shadow comparison harness
 
 ---
 
-### P5 — Observability contract ⬅ CURRENT (E11 / #768, tasks #789-792)
+### P5 — Observability contract ✅ DONE (E11 / #768, tasks #789-792)
 
 **Narrower than originally scoped.** The five event *names* are already in
 `docs/observability/event-registry.json`: `inbox.state_changed`,
@@ -154,9 +159,10 @@ The actual gaps:
   `AgentInboxSummary`, which is a **read-side summary type for the continuation
   brief**, not the delivery FIFO. It is not in scope for removal.
 
-Rebuild from durable pending/expired rows on restart, then remove the authority
-**only after** restart, lease, duplicate, retry, and abandonment gates pass for
-all three runtimes.
+Rebuild from durable pending/expired rows on restart. The FIFO is now a
+transport cache only: restart, lease, duplicate, retry, abandonment, and
+workflow-authority-boundary gates pass for Claude, Codex, and OpenCode. The
+continuation `AgentInboxSummary` remains a separate read-side type.
 
 ## Verification
 
@@ -193,10 +199,10 @@ just validate-observability-contracts   # P5
 | P2 Producer routing | #765 | #776–779 | ✅ closed |
 | P3 Evidence separation | #766 | #780–783 | ✅ closed |
 | P4 Runtime adapters | #767 | #784–788 | ✅ closed |
-| P5 Observability | **#768** | #789–792 | ⬅ frontier |
-| P6 Retire in-memory authority | #769 | #793–796 | open |
+| P5 Observability | **#768** | #789–792 | ✅ closed |
+| P6 Retire in-memory authority | #769 | #793–796 | ✅ closed |
 
-Frontier is `#768` / `#789`. M12 (operator control plane, `#797–799`,
+Frontier is M12 / `#797–799`. M12 (operator control plane, `#797–799`,
 tasks `#800–815`) is chained behind `#769`.
 
 **Sequencing is strictly linear.** All 27 tasks form a single chain
