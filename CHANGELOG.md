@@ -291,6 +291,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E7 :: E7.5 Implement recover_expired_leases and startup recovery (#774)
 - E7 :: E7.4 Implement submit/acknowledge/retry/cancel transitions (#773)
 - E7 :: E7.3 Implement claim_next with CAS leasing (#772)
 - E7 :: E7.2 Implement enqueue_batch as one transaction (#771)
