@@ -73,6 +73,11 @@ expected-events.v1.json is embedded in the core and reconciled by session;
 missing required outcomes remain denominator gaps and produce partial or
 unknown completeness rather than zero-valued success.
 
+The production `message.consumed` emitters and their evidence boundaries are
+audited in [legacy-consumption-audit.md](legacy-consumption-audit.md). In
+particular, a legacy `inbox.check` read is not proof that a runtime accepted a
+message into its next turn.
+
 ## Runtime MVP-D export
 
 After importing a session into L2, compile the only shareable artifact with:

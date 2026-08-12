@@ -291,6 +291,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E9 :: E9.1 Audit and document current premature-consumption paths (#780)
 - E8 :: E8.4 Preserve queue_seq across retry, cancel, and abandon (#779)
 - E8 :: E8.3 Replace the 30s body-hash dedup with identity-based idempotency (#778)
 - E8 :: E8.2 Retain messages row as compatibility pointer (#777)
