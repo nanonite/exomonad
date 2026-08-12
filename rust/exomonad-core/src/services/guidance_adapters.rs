@@ -141,12 +141,13 @@ pub enum AcceptanceConfidence {
 /// Boundary, transport, and acceptance operations supplied by a runtime
 /// integration. The trait intentionally has no method that drives a model
 /// response loop.
+#[async_trait::async_trait]
 pub trait GuidanceRuntimeAdapter: Send + Sync {
     fn runtime(&self) -> RuntimeKind;
     fn target_agent(&self) -> &str;
-    fn report_boundary(&self) -> Result<BoundaryEvidence>;
-    fn submit_batch(&self, batch: &GuidanceBatch) -> Result<TransportAttempt>;
-    fn acceptance_evidence(
+    async fn report_boundary(&self) -> Result<BoundaryEvidence>;
+    async fn submit_batch(&self, batch: &GuidanceBatch) -> Result<TransportAttempt>;
+    async fn acceptance_evidence(
         &self,
         batch: &GuidanceBatch,
         transport: &TransportAttempt,
@@ -160,6 +161,7 @@ mod tests {
 
     struct StubAdapter;
 
+    #[async_trait::async_trait]
     impl GuidanceRuntimeAdapter for StubAdapter {
         fn runtime(&self) -> RuntimeKind {
             RuntimeKind::Custom
@@ -169,15 +171,15 @@ mod tests {
             "agent"
         }
 
-        fn report_boundary(&self) -> Result<BoundaryEvidence> {
+        async fn report_boundary(&self) -> Result<BoundaryEvidence> {
             Ok(BoundaryEvidence::turn_finished(self.target_agent()))
         }
 
-        fn submit_batch(&self, _batch: &GuidanceBatch) -> Result<TransportAttempt> {
+        async fn submit_batch(&self, _batch: &GuidanceBatch) -> Result<TransportAttempt> {
             Ok(TransportAttempt::success("test"))
         }
 
-        fn acceptance_evidence(
+        async fn acceptance_evidence(
             &self,
             _batch: &GuidanceBatch,
             _transport: &TransportAttempt,
@@ -245,13 +247,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn adapter_trait_is_object_safe_and_does_not_drive_a_model_loop() {
+    #[tokio::test]
+    async fn adapter_trait_is_object_safe_and_does_not_drive_a_model_loop() {
         let adapter: &dyn GuidanceRuntimeAdapter = &StubAdapter;
         assert_eq!(adapter.runtime(), RuntimeKind::Custom);
         assert_eq!(adapter.target_agent(), "agent");
         assert_eq!(
-            adapter.report_boundary().unwrap().phase,
+            adapter.report_boundary().await.unwrap().phase,
             BoundaryPhase::TurnFinished
         );
     }

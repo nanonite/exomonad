@@ -116,6 +116,7 @@ impl ClaudeCodeAdapter {
     }
 }
 
+#[async_trait::async_trait]
 impl GuidanceRuntimeAdapter for ClaudeCodeAdapter {
     fn runtime(&self) -> RuntimeKind {
         RuntimeKind::Claude
@@ -125,11 +126,11 @@ impl GuidanceRuntimeAdapter for ClaudeCodeAdapter {
         &self.target_agent
     }
 
-    fn report_boundary(&self) -> Result<BoundaryEvidence> {
+    async fn report_boundary(&self) -> Result<BoundaryEvidence> {
         Ok(self.boundary.clone())
     }
 
-    fn submit_batch(&self, batch: &GuidanceBatch) -> Result<TransportAttempt> {
+    async fn submit_batch(&self, batch: &GuidanceBatch) -> Result<TransportAttempt> {
         if batch.agent_id != self.target_agent {
             bail!(
                 "guidance batch targets `{}`, adapter targets `{}`",
@@ -169,7 +170,7 @@ impl GuidanceRuntimeAdapter for ClaudeCodeAdapter {
         Ok(TransportAttempt::success("claude_teams_inbox"))
     }
 
-    fn acceptance_evidence(
+    async fn acceptance_evidence(
         &self,
         batch: &GuidanceBatch,
         transport: &TransportAttempt,
@@ -325,21 +326,23 @@ mod tests {
         )
     }
 
-    #[test]
-    fn mailbox_read_is_required_before_acceptance_evidence() {
+    #[tokio::test]
+    async fn mailbox_read_is_required_before_acceptance_evidence() {
         let mailbox = Arc::new(FakeMailbox::default());
         let adapter = adapter(mailbox.clone());
         let batch = batch();
-        let transport = adapter.submit_batch(&batch).expect("submit batch");
+        let transport = adapter.submit_batch(&batch).await.expect("submit batch");
         assert_eq!(transport.outcome, TransportOutcome::Success);
         assert!(adapter
             .acceptance_evidence(&batch, &transport)
+            .await
             .expect("poll mailbox")
             .is_none());
 
         mailbox.mark_all_read();
         let evidence = adapter
             .acceptance_evidence(&batch, &transport)
+            .await
             .expect("poll mailbox")
             .expect("mailbox acceptance");
         assert_eq!(evidence.evidence_kind, AcceptanceKind::MailboxRead);
@@ -349,23 +352,28 @@ mod tests {
         assert_eq!(evidence.generation, Some(2));
     }
 
-    #[test]
-    fn failed_transport_and_missing_session_correlation_never_accept() {
+    #[tokio::test]
+    async fn failed_transport_and_missing_session_correlation_never_accept() {
         let mailbox = Arc::new(FakeMailbox::default());
         let adapter = adapter(mailbox.clone());
         let batch = batch();
         let failed = TransportAttempt::failure("claude_teams_inbox", "write failed");
         assert!(adapter
             .acceptance_evidence(&batch, &failed)
+            .await
             .expect("inspect failed transport")
             .is_none());
 
         let mut no_identity = batch;
         no_identity.identity.invocation_id = None;
-        let transport = adapter.submit_batch(&no_identity).expect("submit batch");
+        let transport = adapter
+            .submit_batch(&no_identity)
+            .await
+            .expect("submit batch");
         mailbox.mark_all_read();
         assert!(adapter
             .acceptance_evidence(&no_identity, &transport)
+            .await
             .expect("inspect uncorrelated mailbox")
             .is_none());
     }

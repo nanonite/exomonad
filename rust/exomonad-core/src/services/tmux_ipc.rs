@@ -713,6 +713,24 @@ impl TmuxIpc {
         }
     }
 
+    /// Capture the current pane contents for a runtime-owned consumption
+    /// signal. The caller decides whether the observed change is meaningful.
+    pub async fn capture_pane(&self, target: &str) -> Result<String> {
+        let qualified_target = qualify_tmux_target(&self.session_name, target);
+        let output = Command::new("tmux")
+            .args(["capture-pane", "-p", "-t", &qualified_target])
+            .output()
+            .await
+            .context("Failed to run tmux capture-pane")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux capture-pane failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     async fn verify_input_consumed(qualified_target: &str, payload: &str) -> Result<bool> {
         if payload.trim().is_empty() {
             return Ok(true);

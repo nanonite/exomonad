@@ -5,6 +5,7 @@ pub mod agent_resources;
 pub mod analysis_import;
 pub mod claude_adapter;
 pub mod claude_session_registry;
+pub mod codex_adapter;
 pub mod command;
 pub mod complexity_classifier;
 pub mod continuation;
@@ -59,6 +60,7 @@ pub use self::analysis_import::{
 };
 pub use self::claude_adapter::ClaudeCodeAdapter;
 pub use self::claude_session_registry::ClaudeSessionRegistry;
+pub use self::codex_adapter::CodexAdapter;
 pub use self::event_log::EventLog;
 pub use self::event_queue::EventQueue;
 pub use self::expected_events::{
