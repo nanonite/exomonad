@@ -4,7 +4,10 @@
 
 ## Decision
 
-The agent tree is a git worktree tree. Spawning agents unfolds the tree downward (creating worktrees and branches). Merging work folds it back up (PRs targeting parent branches, merged recursively to main).
+The agent tree is a git worktree tree. The `tl_loop` controller unfolds a
+validated WorkPlan into issue-owned worktrees and branches. Authoritative
+review, CI, and policy evidence then lets the controller fold completed work
+back through PRs targeting their parent branches.
 
 Every PR targets its parent branch, not main. The tree collapses via recursive merge, not flat integration.
 
@@ -25,10 +28,10 @@ The parent of `main.feature.auth.middleware` is `main.feature.auth`. PRs always 
 
 ## Unfold Phase (Spawn)
 
-The TL decomposes work and spawns children:
+The controller decomposes work and dispatches children:
 
 1. TL writes a spec commit (type stubs, interface definitions, failing tests)
-2. TL calls `fork_wave` or `spawn_leaf`
+2. `tl_loop` dispatches a `spawn_leaf` or `spawn_worker` slice
 3. Server creates a git worktree at `.exo/worktrees/{slug}/`
 4. Server creates a new branch `{parent_branch}.{slug}`
 5. Server creates a tmux window for the child agent
@@ -48,10 +51,10 @@ Each child gets its own worktree — full filesystem isolation. No file-level co
 Work flows back up the tree via PRs:
 
 1. Child completes work, pushes to its branch, files PR against parent branch
-2. Copilot reviews automatically; child iterates autonomously against review feedback
-3. Event handler detects Copilot approval, auto-notifies parent with `[PR READY]`
-4. Parent merges the PR via `merge_pr` tool
-6. If parent has more children, repeat; otherwise parent folds into ITS parent
+2. The watcher records Forgejo review and CI observations for the exact PR head
+3. The controller applies its adjudication, policy, and reviewed-head gates
+4. The controller calls `merge_pr` only after all gates pass
+5. The controller records completion and advances the durable WorkPlan
 
 ### Merge Strategy
 
@@ -68,24 +71,28 @@ The tree collapses bottom-up:
 2. Intermediate nodes merge into THEIR parent branches
 3. The root branch merges into main
 
-Each level of the tree is one PR. The merge cascade is not automated — each parent explicitly merges its children's PRs after reviewing for architectural fit.
+Each level of the tree is one PR. The controller performs the merge cascade
+from durable state; role processes do not run a second interactive merge queue.
 
 ## Implementation
 
-- `fork_wave`: Creates worktree + tmux window for Claude agent (TL role, can spawn children). Depth-capped at 2.
-- `spawn_leaf`: Creates worktree + tmux window for Codex agent (dev role, files PR).
-- `spawn_worker`: Creates Codex pane in parent directory (ephemeral, no worktree, no branch).
-- `file_pr`: Creates PR with auto-detected base branch from dot-separated naming.
-- `merge_pr`: Merges child PR (`gh pr merge` + `git fetch`).
+- `spawn_leaf`: Creates an issue-owned worktree and branch for a dev assignment.
+- `spawn_worker`: Creates an ephemeral same-worktree worker assignment.
+- `file_pr`: Publishes the owner's PR against its validated base branch.
+- `resume_pr`: Resumes the same owner, worktree, branch, and PR for repair.
+- `merge_pr`: Merges a PR only after the controller's review, CI, policy, and
+  reviewed-head gates pass.
 
 ## Consequences
 
-- GitHub is the audit trail — every merge is a PR with review history
-- Copilot handles mechanical review; parents only review for architectural fit
+- Forgejo and the immutable ledger are the audit trail for PR and review history
+- The watcher records review and CI evidence; the controller owns adjudication
 - Concurrent agents never conflict at the filesystem level
-- Branch naming is the entire coordination mechanism — no registry, no database
-- Worktree cleanup is manual (not yet automated)
-- Depth cap of 2 prevents unbounded tree growth
+- Branch naming identifies ownership, while Chainlink and durable controller
+  state record issue and lifecycle coordination
+- Worktree cleanup follows the controller's owner and PR lifecycle
+- Nested TL work is represented by nested `tl_run` plans rather than an
+  interactive fork protocol
 
 ## Why Not Alternatives
 

@@ -67,10 +67,8 @@ The controller has an architectural no-edit boundary: implementation belongs to 
 | `send_tmux_message` / `send_mailbox_message` | x | x | x | | x |
 | `session_status` | x | x | | | |
 | `poll_workers` | x | x | | | |
-| `check_inbox` | x | x | x | x | x |
+| `check_inbox` | | | x | x | x |
 | `list_agents` | x | x | | x | |
-| `has_pending_work` | x | | | | |
-| `shutdown_server` | x | | | | |
 | `task_list` / `task_get` / `task_update` | | | x | | x |
 | `memory_append` | x | x | x | | x |
 | `memory_list` | x | x | x | | x |
