@@ -321,6 +321,10 @@ message SpawnReviewerRequest {
   uint64 pr_number = 1;
   // Spawn even if a reviewer for this PR is already active.
   bool force = 2;
+  // Exact PR head SHA that the reviewer must inspect.
+  string head_sha = 3;
+  // Acceptance criteria composed from TL run state.
+  repeated string acceptance_criteria = 4;
 }
 
 message SpawnReviewerResponse {

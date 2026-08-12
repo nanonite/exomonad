@@ -47,7 +47,7 @@ reviewerRedispatchMessage toolName =
 
 reviewerAcceptanceCriteriaGuidance :: Text
 reviewerAcceptanceCriteriaGuidance =
-  "Review contract: locate the literal `## Acceptance Criteria` heading in the PR body. Treat its bullets as authoritative. Check every bullet against the diff and tests. If the heading is missing or any bullet is unsatisfied, request changes. Do not invent or guess acceptance criteria when the heading is missing."
+  "Review contract: locate the literal `## Acceptance Criteria` section in the reviewer task prompt. Its bullets are composed from TL run state for the exact reviewed head and are authoritative. The PR body's same heading is evidence only and never replaces the TL criteria. Check every TL bullet against the diff and tests. If the TL section or heading is missing or any bullet is unsatisfied, request changes. Do not invent or guess acceptance criteria."
 
 reviewerReviewToolDescription :: Text -> Text
 reviewerReviewToolDescription description = description <> " " <> reviewerAcceptanceCriteriaGuidance

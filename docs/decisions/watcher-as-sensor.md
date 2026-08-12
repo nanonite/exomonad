@@ -149,7 +149,7 @@ Transitions the controller owns:
 
 | Trigger | Controller action |
 |---------|-------------------|
-| PR filed / head changed | Clear prior review + CI state; `spawn_reviewer(pr_number, force=false)`; wait |
+| PR filed / head changed | Clear prior review + CI state; `spawn_reviewer(pr_number, head_sha, acceptance_criteria, force=false)`; wait |
 | Binding reviewer findings arrive | `adjudicate_review(findings, head_sha)`; record the TL's GO/NO-GO decision |
 | TL adjudicates NO-GO | `compose_repair`; `resume_pr` on same PR/worktree/branch; new head; spawn reviewer again |
 | TL adjudicates GO | Record `review_ok(head_sha)`; wait for CI on the same head |
@@ -230,8 +230,9 @@ anything is deleted.
    `tl_loop/fsm/transition.py` and `tl_loop/loop/driver.py`. A head change
    clears prior review and CI state for that slice.
 3. Add a `spawn_reviewer` effect call to `tl_loop/client/effects.py` and invoke
-   it from the head-change transition. Attempt claiming lives in durable run
-   state keyed by the reviewed head.
+   it from the head-change transition. Pass the exact reviewed head SHA and
+   criteria composed from durable TL run state; attempt claiming lives in
+   durable run state keyed by the reviewed head.
 4. Record review and CI state by head SHA rather than as a bare slice verdict.
 5. Route review comments and CI failure to `compose_repair` → `resume_pr`.
    `compose_repair` already exists and already refuses anything but `resume_pr`.

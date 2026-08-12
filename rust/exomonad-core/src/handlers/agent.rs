@@ -1185,6 +1185,30 @@ impl<
         }
 
         let pr = self.resolve_open_forgejo_pr_entry(req.pr_number).await?;
+        let requested_head_sha = req.head_sha.trim();
+        if requested_head_sha.is_empty() {
+            return Err(EffectError::invalid_input("head_sha is required"));
+        }
+        if req.acceptance_criteria.is_empty()
+            || req
+                .acceptance_criteria
+                .iter()
+                .any(|criterion| criterion.trim().is_empty())
+        {
+            return Err(EffectError::invalid_input(
+                "acceptance_criteria must contain only non-empty items",
+            ));
+        }
+        let live_head_sha = pr
+            .last_head_sha
+            .as_deref()
+            .filter(|sha| !sha.trim().is_empty());
+        if live_head_sha != Some(requested_head_sha) {
+            return Err(EffectError::invalid_input(format!(
+                "reviewer head SHA mismatch: requested {requested_head_sha}, live PR head is {}",
+                live_head_sha.unwrap_or("unavailable"),
+            )));
+        }
         let active_reviewer = live_reviewer_for_pr(&self.service, req.pr_number).await;
         if !req.force {
             if let Some(reviewer_name) = active_reviewer.as_ref() {
@@ -1210,7 +1234,12 @@ impl<
         };
         let result = self
             .service
-            .spawn_reviewer_for_recovery_named(&pr, &ctx.birth_branch, &reviewer_branch)
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &pr,
+                &ctx.birth_branch,
+                &reviewer_branch,
+                &req.acceptance_criteria,
+            )
             .await
             .effect_err_preserve("agent")?;
         let agent_info = subtree_result_to_proto(&reviewer_branch, &result)?;

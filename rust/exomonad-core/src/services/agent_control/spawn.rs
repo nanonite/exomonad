@@ -532,6 +532,20 @@ pub(crate) fn render_reviewer_context_section(
     format!("\n\nRead first:\n{lines}")
 }
 
+pub(crate) fn render_reviewer_acceptance_criteria(criteria: &[String]) -> String {
+    if criteria.is_empty() {
+        return String::new();
+    }
+    let bullets = criteria
+        .iter()
+        .map(|criterion| format!("- {}", criterion.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "\n\n## Acceptance Criteria\nThese criteria come from TL run state for the exact reviewed head; the PR body is evidence only.\n{bullets}"
+    )
+}
+
 impl<
         C: super::super::HasGitHubClient
             + super::super::HasForgejoClient
@@ -2009,26 +2023,29 @@ impl<
         caller_bb: &BirthBranch,
     ) -> Result<SpawnResult> {
         let branch_name = format!("review-pr-{}", pr_entry.number);
-        self.spawn_reviewer_subtree_named(pr_entry, caller_bb, &branch_name)
+        self.spawn_reviewer_subtree_with_criteria_named(pr_entry, caller_bb, &branch_name, &[])
             .await
     }
 
-    pub async fn spawn_reviewer_subtree_named(
+    pub async fn spawn_reviewer_subtree_with_criteria_named(
         &self,
         pr_entry: &crate::services::pr_registry::PrEntry,
         caller_bb: &BirthBranch,
         branch_name: &str,
+        acceptance_criteria: &[String],
     ) -> Result<SpawnResult> {
         let context_section =
             render_reviewer_context_section(&self.reviewer_context, self.project_dir());
+        let criteria_section = render_reviewer_acceptance_criteria(acceptance_criteria);
         let task = format!(
-            "Review PR #{}: {}\n\nBranch: {}\nBase: {}\nAuthor: {}{}",
+            "Review PR #{}: {}\n\nBranch: {}\nBase: {}\nAuthor: {}{}{}",
             pr_entry.number,
             pr_entry.title,
             pr_entry.head_branch,
             pr_entry.base_branch,
             pr_entry.author_agent,
             context_section,
+            criteria_section,
         );
 
         // Compute the reviewer's own identity and path — same derivation spawn_subtree uses
@@ -2122,7 +2139,7 @@ impl<
         caller_bb: &BirthBranch,
     ) -> Result<SpawnResult> {
         let reviewer_branch_name = format!("review-pr-{}", pr.number);
-        self.spawn_reviewer_with_metadata_named(pr, caller_bb, &reviewer_branch_name)
+        self.spawn_reviewer_with_metadata_named(pr, caller_bb, &reviewer_branch_name, &[])
             .await
     }
 
@@ -2132,8 +2149,23 @@ impl<
         caller_bb: &BirthBranch,
         reviewer_branch_name: &str,
     ) -> Result<SpawnResult> {
-        self.spawn_reviewer_with_metadata_named(pr, caller_bb, reviewer_branch_name)
+        self.spawn_reviewer_with_metadata_named(pr, caller_bb, reviewer_branch_name, &[])
             .await
+    }
+    pub async fn spawn_reviewer_for_recovery_with_criteria_named(
+        &self,
+        pr: &crate::services::pr_registry::PrEntry,
+        caller_bb: &BirthBranch,
+        reviewer_branch_name: &str,
+        acceptance_criteria: &[String],
+    ) -> Result<SpawnResult> {
+        self.spawn_reviewer_with_metadata_named(
+            pr,
+            caller_bb,
+            reviewer_branch_name,
+            acceptance_criteria,
+        )
+        .await
     }
 
     async fn spawn_reviewer_with_metadata_named(
@@ -2141,13 +2173,19 @@ impl<
         pr: &crate::services::pr_registry::PrEntry,
         caller_bb: &BirthBranch,
         reviewer_branch_name: &str,
+        acceptance_criteria: &[String],
     ) -> Result<SpawnResult> {
         let reviewer_identity =
             AgentIdentity::new(slugify(reviewer_branch_name), self.reviewer_agent_type);
         let reviewer_internal_name = reviewer_identity.internal_name().to_string();
         let reviewer_birth_branch = caller_bb.child(&reviewer_internal_name).to_string();
         let result = self
-            .spawn_reviewer_subtree_named(pr, caller_bb, reviewer_branch_name)
+            .spawn_reviewer_subtree_with_criteria_named(
+                pr,
+                caller_bb,
+                reviewer_branch_name,
+                acceptance_criteria,
+            )
             .await?;
         self.persist_reviewer_assignment(pr, &reviewer_internal_name, &reviewer_birth_branch)
             .await;

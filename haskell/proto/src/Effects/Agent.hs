@@ -4085,7 +4085,9 @@ instance (HsJSONPB.FromJSON SpawnSubtreeResponse) where
 data SpawnReviewerRequest
   = SpawnReviewerRequest
   { spawnReviewerRequestPrNumber :: Hs.Word64,
-    spawnReviewerRequestForce :: Hs.Bool
+    spawnReviewerRequestForce :: Hs.Bool,
+    spawnReviewerRequestHeadSha :: Hs.Text,
+    spawnReviewerRequestAcceptanceCriteria :: (Hs.Vector Hs.Text)
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -4101,16 +4103,37 @@ instance (HsProtobuf.Message SpawnReviewerRequest) where
     _
     SpawnReviewerRequest
       { spawnReviewerRequestPrNumber,
-        spawnReviewerRequestForce
+        spawnReviewerRequestForce,
+        spawnReviewerRequestHeadSha,
+        spawnReviewerRequestAcceptanceCriteria
       } =
       Hs.mappend
-        ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 1)
-            spawnReviewerRequestPrNumber
+        ( Hs.mappend
+            ( Hs.mappend
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 1)
+                    spawnReviewerRequestPrNumber
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 2)
+                    spawnReviewerRequestForce
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 3)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    spawnReviewerRequestHeadSha
+                )
+            )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 2)
-            spawnReviewerRequestForce
+            (HsProtobuf.FieldNumber 4)
+            ( ( Hs.coerce
+                  @(Hs.Vector Hs.Text)
+                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+              )
+                spawnReviewerRequestAcceptanceCriteria
+            )
         )
   decodeMessage _ =
     Hs.pure SpawnReviewerRequest
@@ -4120,6 +4143,21 @@ instance (HsProtobuf.Message SpawnReviewerRequest) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 2)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -4132,14 +4170,50 @@ instance (HsProtobuf.Message SpawnReviewerRequest) where
         (HsProtobufAST.Prim HsProtobufAST.Bool)
         (HsProtobufAST.Single "force")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "head_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "acceptance_criteria")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB SpawnReviewerRequest) where
-  toJSONPB (SpawnReviewerRequest f1 f2) =
-    HsJSONPB.object ["pr_number" .= f1, "force" .= f2]
-  toEncodingPB (SpawnReviewerRequest f1 f2) =
-    HsJSONPB.pairs ["pr_number" .= f1, "force" .= f2]
+  toJSONPB (SpawnReviewerRequest f1 f2 f3 f4) =
+    HsJSONPB.object
+      [ "pr_number" .= f1,
+        "force" .= f2,
+        "head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "acceptance_criteria"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f4
+             )
+      ]
+  toEncodingPB (SpawnReviewerRequest f1 f2 f3 f4) =
+    HsJSONPB.pairs
+      [ "pr_number" .= f1,
+        "force" .= f2,
+        "head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "acceptance_criteria"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f4
+             )
+      ]
 
 instance (HsJSONPB.FromJSONPB SpawnReviewerRequest) where
   parseJSONPB =
@@ -4149,6 +4223,15 @@ instance (HsJSONPB.FromJSONPB SpawnReviewerRequest) where
           Hs.pure SpawnReviewerRequest
             <*> obj .: "pr_number"
             <*> obj .: "force"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "head_sha")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "acceptance_criteria")
+                )
       )
 
 instance (HsJSONPB.ToJSON SpawnReviewerRequest) where

@@ -42,7 +42,7 @@ Submit the final verdict through the `approve_pr`, `request_changes`, and `post_
 
 ## Acceptance Criteria review contract
 
-The literal `## Acceptance Criteria` heading in the PR body is the authoritative review contract. Locate it before deciding, then check every bullet against the diff and tests. If the heading is missing or any bullet is missing or unsatisfied, request changes. Do not invent, guess, or substitute acceptance criteria from surrounding prose when the heading is absent.
+The literal `## Acceptance Criteria` section in the reviewer task prompt is the authoritative review contract. Its bullets are composed from TL run state for the exact reviewed head. The PR body's same heading is evidence only and never replaces the TL criteria. Locate the task-prompt section before deciding, then check every TL bullet against the diff and tests. If the section or heading is missing or any bullet is missing or unsatisfied, request changes. Do not invent, guess, or substitute acceptance criteria from surrounding prose when the TL section is absent.
 
 ## Workflow
 
