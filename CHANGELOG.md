@@ -119,6 +119,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- E3: Move review workflow into tl_loop (#720)
 - E2: Reviewer->TL evidence channel with head-SHA binding (#719)
 - feat: session memory ledger + TL continuation brief (#620)
 - Add E2E coverage for the one-shot dev leaf lifecycle (#588)
