@@ -1514,6 +1514,17 @@ Run `exomonad recompile` first to build it.",
         "Recorded authoritative session server start"
     );
 
+    match exomonad_core::services::delivery::rebuild_durable_inbox_caches(
+        &inbox_store,
+        &agent_resolver,
+        &project_dir,
+    )
+    .await
+    {
+        Ok(restored) => info!(restored, "Rebuilt durable guidance transport caches"),
+        Err(error) => warn!(%error, "Failed to rebuild durable guidance transport caches"),
+    }
+
     // Write server.pid
     let pid_info = serde_json::json!({
         "pid": std::process::id(),

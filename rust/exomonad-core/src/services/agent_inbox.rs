@@ -1,5 +1,7 @@
+use super::guidance_queue::GuidanceBatch;
+use super::inbox_store::{now_epoch_secs, InboxStore};
 use super::tmux_events::InjectionOptions;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -169,6 +171,11 @@ struct AgentQueue {
     pending: HashSet<DedupKey>,
 }
 
+/// Process-local transport cache rebuilt from durable guidance rows.
+///
+/// SQLite's guidance queue owns lifecycle, ordering, retry, and terminal
+/// state. This FIFO only serializes runtime injection attempts between cache
+/// rebuilds.
 #[derive(Debug)]
 pub struct AgentInbox {
     queues: Mutex<HashMap<String, AgentQueue>>,
@@ -255,6 +262,53 @@ impl AgentInbox {
         })
     }
 
+    /// Rebuild this transport cache from durable guidance after a process restart.
+    ///
+    /// SQLite remains authoritative: expired leases are recovered there first,
+    /// and only available pending batches are copied into the FIFO. The durable
+    /// batch ID is used as the cache idempotency key, so repeating reconstruction
+    /// cannot create a second in-memory delivery.
+    pub async fn rebuild_from_durable(
+        &self,
+        store: &InboxStore,
+        agent: &str,
+        target: &str,
+        project_dir: PathBuf,
+        injection_options: InjectionOptions,
+    ) -> Result<usize> {
+        self.rebuild_from_durable_at(
+            store,
+            agent,
+            target,
+            project_dir,
+            injection_options,
+            now_epoch_secs(),
+        )
+        .await
+    }
+
+    async fn rebuild_from_durable_at(
+        &self,
+        store: &InboxStore,
+        agent: &str,
+        target: &str,
+        project_dir: PathBuf,
+        injection_options: InjectionOptions,
+        now: i64,
+    ) -> Result<usize> {
+        store.recover_expired_leases(now)?;
+        let batches = store.pending_batches_for_agent(agent, now)?;
+        let mut restored = 0;
+        for batch in batches {
+            let message = message_from_batch(&batch, target, &project_dir, injection_options)?;
+            let outcome = self.enqueue(agent, message).await?;
+            if !outcome.dropped_as_duplicate {
+                restored += 1;
+            }
+        }
+        Ok(restored)
+    }
+
     pub async fn begin_delivery(&self, agent: &str) -> Option<InboxMessage> {
         let mut queues = self.queues.lock().await;
         let queue = queues.get_mut(agent)?;
@@ -327,9 +381,52 @@ impl AgentInbox {
     }
 }
 
+fn message_from_batch(
+    batch: &GuidanceBatch,
+    target: &str,
+    project_dir: &std::path::Path,
+    injection_options: InjectionOptions,
+) -> Result<InboxMessage> {
+    let first_item = batch.items.first().context("guidance batch has no items")?;
+    let body = batch
+        .items
+        .iter()
+        .map(|item| item.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let summary = batch
+        .items
+        .iter()
+        .filter_map(|item| item.summary.as_deref())
+        .next()
+        .unwrap_or("durable guidance")
+        .to_string();
+    let idempotency_key = batch
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| batch.batch_id.clone());
+    Ok(InboxMessage::new(
+        target.to_string(),
+        project_dir.to_path_buf(),
+        first_item.from_agent.clone(),
+        batch.agent_id.clone(),
+        body,
+        format!("durable guidance batch {}: {summary}", batch.batch_id),
+    )
+    .with_injection_options(injection_options)
+    .with_idempotency_key(idempotency_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::guidance_adapters::BoundaryEvidence;
+    use crate::services::guidance_queue::{
+        GuidanceBatchRequest, GuidanceConsumer, GuidanceIdentity, GuidanceItemInput, QueueClass,
+    };
+    use crate::services::InboxStore;
+    use serde_json::json;
+    use tempfile::TempDir;
 
     fn message(body: &str) -> InboxMessage {
         InboxMessage::new(
@@ -340,6 +437,22 @@ mod tests {
             body.to_string(),
             "%1".to_string(),
         )
+    }
+
+    fn durable_request(agent: &str, key: &str, body: &str) -> GuidanceBatchRequest {
+        GuidanceBatchRequest {
+            agent_id: agent.to_string(),
+            queue_class: QueueClass::Steering,
+            items: vec![GuidanceItemInput {
+                from_agent: "root".to_string(),
+                content: body.to_string(),
+                summary: Some(format!("summary-{key}")),
+                injection_options: json!({"submit": true}),
+            }],
+            identity: GuidanceIdentity::default(),
+            idempotency_key: Some(key.to_string()),
+            source_message_id: None,
+        }
     }
 
     #[test]
@@ -369,6 +482,107 @@ mod tests {
 
         let second = inbox.begin_delivery("agent").await.unwrap();
         assert_eq!(second.body, "second");
+    }
+
+    #[tokio::test]
+    async fn rebuild_from_durable_restores_pending_batches_in_order_once() -> Result<()> {
+        let directory = TempDir::new()?;
+        let store = InboxStore::open(directory.path())?;
+        store.enqueue_batch(durable_request("agent", "first", "first body"))?;
+        store.enqueue_batch(durable_request("agent", "second", "second body"))?;
+        let inbox = AgentInbox::new(8, 32);
+
+        let restored = inbox
+            .rebuild_from_durable(
+                &store,
+                "agent",
+                "%42",
+                directory.path().to_path_buf(),
+                InjectionOptions::inline_submit(),
+            )
+            .await?;
+        assert_eq!(restored, 2);
+        assert_eq!(inbox.queue_depth("agent").await, 2);
+        let restored_again = inbox
+            .rebuild_from_durable(
+                &store,
+                "agent",
+                "%42",
+                directory.path().to_path_buf(),
+                InjectionOptions::inline_submit(),
+            )
+            .await?;
+        assert_eq!(restored_again, 0);
+        assert_eq!(inbox.queue_depth("agent").await, 2);
+        let first = inbox.begin_delivery("agent").await.context("first batch")?;
+        assert_eq!(first.body, "first body");
+        assert_eq!(first.target, "%42");
+        inbox.complete_delivery("agent", first.id, true).await;
+        let second = inbox
+            .begin_delivery("agent")
+            .await
+            .context("second batch")?;
+        assert_eq!(second.body, "second body");
+
+        assert_eq!(inbox.queue_depth("agent").await, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_recovers_expired_lease_before_backoff_window() -> Result<()> {
+        let directory = TempDir::new()?;
+        let store = InboxStore::open(directory.path())?;
+        let batch = store
+            .enqueue_batch(durable_request("agent", "expired", "expired body"))?
+            .batch;
+        store
+            .claim_next(
+                &BoundaryEvidence::turn_finished("agent"),
+                &GuidanceConsumer {
+                    consumer_id: "consumer".to_string(),
+                    invocation_id: None,
+                    generation: None,
+                },
+                1,
+            )?
+            .context("lease")?;
+        let inbox = AgentInbox::new(8, 32);
+        let recovery_now = now_epoch_secs() + 301;
+        let restored = inbox
+            .rebuild_from_durable_at(
+                &store,
+                "agent",
+                "%42",
+                directory.path().to_path_buf(),
+                InjectionOptions::inline_submit(),
+                recovery_now,
+            )
+            .await?;
+        assert_eq!(restored, 0, "recovery applies bounded retry backoff");
+        assert_eq!(
+            store
+                .inspect_batch(&batch.batch_id)?
+                .context("batch")?
+                .state,
+            crate::services::GuidanceState::Pending
+        );
+        store.connection()?.execute(
+            "UPDATE guidance_batches SET available_at = ?1 WHERE batch_id = ?2",
+            rusqlite::params![recovery_now, batch.batch_id],
+        )?;
+        let restored = inbox
+            .rebuild_from_durable_at(
+                &store,
+                "agent",
+                "%42",
+                directory.path().to_path_buf(),
+                InjectionOptions::inline_submit(),
+                recovery_now,
+            )
+            .await?;
+        assert_eq!(restored, 1);
+        assert_eq!(inbox.queue_depth("agent").await, 1);
+        Ok(())
     }
 
     #[tokio::test]

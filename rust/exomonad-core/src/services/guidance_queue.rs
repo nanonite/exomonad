@@ -486,6 +486,44 @@ impl InboxStore {
         load_batch_optional(&conn, batch_id)
     }
 
+    /// Load available pending batches for the transport cache after restart.
+    pub(crate) fn pending_batches_for_agent(
+        &self,
+        agent_id: &str,
+        now: i64,
+    ) -> Result<Vec<GuidanceBatch>> {
+        let agent_id = normalize_agent_id(agent_id);
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT batch_id FROM guidance_batches
+             WHERE agent_id = ?1 AND state = 'pending' AND available_at <= ?2
+             ORDER BY queue_seq ASC",
+        )?;
+        let batch_ids = statement
+            .query_map(params![agent_id.as_ref(), now], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        batch_ids
+            .iter()
+            .map(|batch_id| load_batch(&conn, batch_id))
+            .collect()
+    }
+
+    pub(crate) fn pending_agent_ids(&self, now: i64) -> Result<Vec<String>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT agent_id FROM guidance_batches
+             WHERE state = 'pending' AND available_at <= ?1
+             ORDER BY agent_id ASC",
+        )?;
+        let agent_ids = statement
+            .query_map(params![now], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(agent_ids)
+    }
+
     /// Record one transport attempt without acknowledging runtime consumption.
     pub fn record_transport_attempt(
         &self,

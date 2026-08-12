@@ -728,6 +728,46 @@ async fn canonical_recipient_key(
     agent_key.to_string()
 }
 
+/// Rebuild transport caches from durable guidance at process startup.
+///
+/// The durable store recovers expired leases and determines which agents have
+/// available pending batches. `AgentInbox` only receives those rows; it never
+/// decides which batches exist or whether a batch is terminal.
+pub async fn rebuild_durable_inbox_caches(
+    store: &crate::services::InboxStore,
+    resolver: &crate::services::AgentResolver,
+    project_dir: &std::path::Path,
+) -> anyhow::Result<usize> {
+    store.recover_expired_leases(crate::services::inbox_store::now_epoch_secs())?;
+    let agent_ids = store.pending_agent_ids(crate::services::inbox_store::now_epoch_secs())?;
+    let mut restored = 0;
+    for agent_id in agent_ids {
+        let (target, agent_type) = if agent_id == "root" {
+            ("TL".to_string(), crate::services::AgentType::Claude)
+        } else if let Ok(agent_name) = AgentName::try_from_str(&agent_id) {
+            let record = resolver.get(&agent_name).await;
+            (
+                resolve_tab_name_for_agent(&agent_name, Some(resolver)),
+                record
+                    .map(|record| record.agent_type)
+                    .unwrap_or_else(|| agent_type_from_key(&agent_id)),
+            )
+        } else {
+            (agent_id.clone(), agent_type_from_key(&agent_id))
+        };
+        restored += GLOBAL_AGENT_INBOX
+            .rebuild_from_durable(
+                store,
+                &agent_id,
+                &target,
+                project_dir.to_path_buf(),
+                tmux_injection_options(agent_type),
+            )
+            .await?;
+    }
+    Ok(restored)
+}
+
 async fn record_inbox_delivery(
     ctx: &(impl super::HasInboxStore + super::HasAgentResolver),
     agent_key: &str,
@@ -1467,6 +1507,18 @@ async fn deliver_to_agent_with_class(
     let _agent_resolver = ctx.agent_resolver();
     let project_dir = ctx.project_dir();
     let agent_type = agent_type_from_key(agent_key);
+    if let Err(error) = GLOBAL_AGENT_INBOX
+        .rebuild_from_durable(
+            ctx.inbox_store(),
+            agent_key,
+            tmux_target,
+            project_dir.to_path_buf(),
+            tmux_injection_options(agent_type),
+        )
+        .await
+    {
+        warn!(agent = %agent_key, %error, "Failed to rebuild durable guidance transport cache");
+    }
     let Some(batch) =
         record_inbox_delivery(ctx, agent_key, from, message, summary, queue_class).await
     else {
