@@ -23,6 +23,7 @@ pub mod git_worktree;
 pub mod github;
 pub mod guidance_adapters;
 pub mod guidance_queue;
+pub mod guidance_replay;
 pub mod guidance_shadow;
 pub mod immutable_ledger;
 pub mod inbox_store;
@@ -81,6 +82,9 @@ pub use self::guidance_queue::{
     GuidanceAckResult, GuidanceBatch, GuidanceBatchRequest, GuidanceConsumer,
     GuidanceEnqueueResult, GuidanceIdentity, GuidanceItem, GuidanceItemInput, GuidanceState,
     QueueClass,
+};
+pub use self::guidance_replay::{
+    replay_guidance_batches, GuidanceReplayBatch, GuidanceReplayProjection,
 };
 pub use self::guidance_shadow::{
     ShadowComparison, ShadowDiff, ShadowLegacyProjection, ShadowQueueProjection,

@@ -40,7 +40,7 @@ impl QueueClass {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "steering" => Ok(Self::Steering),
             "follow_up" => Ok(Self::FollowUp),
@@ -62,7 +62,7 @@ pub enum GuidanceState {
 }
 
 impl GuidanceState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Leased => "leased",
@@ -73,7 +73,7 @@ impl GuidanceState {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "pending" => Ok(Self::Pending),
             "leased" => Ok(Self::Leased),
@@ -83,6 +83,10 @@ impl GuidanceState {
             "cancelled" => Ok(Self::Cancelled),
             _ => bail!("unsupported guidance state `{value}`"),
         }
+    }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(self, Self::Accepted | Self::Abandoned | Self::Cancelled)
     }
 }
 
