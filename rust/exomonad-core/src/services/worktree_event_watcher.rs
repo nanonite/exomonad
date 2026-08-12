@@ -487,7 +487,7 @@ fn pr_ready_message(pr_number: u64) -> String {
 
 fn review_timeout_message(pr_number: u64, minutes: u64) -> String {
     format!(
-        "[REVIEW TIMEOUT] PR #{pr_number} - no Forgejo reviewer response after {minutes} minutes. Merge with `merge_pr` using `force: true`."
+        "[REVIEW TIMEOUT] PR #{pr_number} - no Forgejo reviewer response after {minutes} minutes. Review timeout parks the slice at the `tl-timeout` gate; no merge is permitted."
     )
 }
 
@@ -3499,6 +3499,27 @@ mod tests {
                 }
                 other => panic!("expected TL InjectMessage fallback for {payload}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn test_native_tl_timeout_fallback_never_advises_merge() {
+        let payload = serde_json::json!({
+            "kind": "timeout",
+            "pr_number": 47,
+            "minutes_elapsed": 15,
+        });
+
+        match native_event_action("pr_review", &payload, "tl") {
+            Some(EventActionResponse::InjectMessage { message }) => {
+                assert_eq!(
+                    message,
+                    "[REVIEW TIMEOUT] PR #47 - no Forgejo reviewer response after 15 minutes. Review timeout parks the slice at the `tl-timeout` gate; no merge is permitted."
+                );
+                assert!(!message.contains("merge_pr"));
+                assert!(!message.contains("force"));
+            }
+            other => panic!("expected TL timeout InjectMessage fallback, got {other:?}"),
         }
     }
 

@@ -314,7 +314,7 @@ ForgejoReviewVerdict::None ──(Forgejo review approves)──→ ForgejoRevie
 
 ### Stale Notification Guard
 
-Once the parent has been notified (via `[PR READY]` approval or `[REVIEW TIMEOUT]`), `compute_pr_actions` suppresses all further events for that PR. Late Copilot reviews, CI status changes, and new commits are silently dropped — the TL has already been told to merge, so any further notifications are stale and confusing.
+Once the parent has been notified (via `[PR READY]` approval or `[REVIEW TIMEOUT]`), `compute_pr_actions` suppresses all further events for that PR. Late Copilot reviews, CI status changes, and new commits are silently dropped — the timeout is already parked for controller adjudication, so any further notifications are stale and confusing.
 
 ### Merge Detection
 
