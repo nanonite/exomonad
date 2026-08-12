@@ -18,7 +18,7 @@ whose remaining responsibilities are observation and resource cleanup:
 | Decides when to spawn a reviewer for a new head | `tl_loop/loop/driver.py` head-change transition |
 | Spawns the reviewer | `tl_loop` `spawn_reviewer` effect |
 | Computes authoritative merge readiness | Removed in E4.2 (#742); merge eligibility is derived by the TL from head-bound evidence and CI |
-| Composes and delivers repair handoffs | `parent_repair_handoff_message` (:562), `deliver_parent_repair_handoff` (:2306), seven `parent_handoff_fingerprint` sites |
+| Composes and delivers repair handoffs | Removed in E4.3 (#743); the TL consumes canonical review, CI, timeout, and stuck facts |
 | Disposes reviewers | `dispose_reviewers_for_pr` (:2029) |
 | Tracks review rounds against `reviewer_max_rounds` | `distinct_changes_requested_rounds` (:185) |
 
@@ -258,9 +258,9 @@ Only after Phase 2 is proven in a live run.
    removing `ci_mergeable_at` and `merge_ready_notified`. The compatibility
    event remains behind `EMIT_LEGACY_MERGE_READY_COMPATIBILITY_EVENT` until its
    remaining consumers are migrated.
-3. Stop composing repair handoffs — remove `parent_repair_handoff_message`,
-   `deliver_parent_repair_handoff`, and the seven
-   `parent_handoff_fingerprint` sites.
+3. Completed in E4.3 (#743): stop composing repair handoffs by removing the
+   watcher message/delivery path and durable handoff fingerprints. The TL now
+   consumes canonical review, CI, timeout, and stuck facts directly.
 4. Keep: PR state, head SHA, review state, CI state observation; canonical
    ledger emission; `watcher_pr_state` as a read effect.
 5. Decide where reviewer disposal lives. `dispose_reviewers_for_pr` (:2029) is
