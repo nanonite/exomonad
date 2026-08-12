@@ -568,6 +568,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_lifecycle_matrix_covers_all_supported_runtimes() -> Result<()> {
+        let runtimes = [
+            ("claude", InjectionOptions::claude_default()),
+            ("codex", InjectionOptions::inline_submit()),
+            ("opencode", InjectionOptions::inline_submit()),
+        ];
+
+        for (runtime, injection_options) in runtimes {
+            let directory = TempDir::new()?;
+            let agent = format!("matrix-{runtime}");
+            let idempotency_key = format!("matrix-duplicate-{runtime}");
+            let mut request = durable_request(&agent, &idempotency_key, "matrix body");
+            request.identity.runtime = Some(runtime.to_string());
+            request.identity.harness = Some(runtime.to_string());
+            let store = InboxStore::open(directory.path())?;
+            let first = store.enqueue_batch(request.clone())?;
+            assert!(first.created, "{runtime} initial enqueue");
+            let duplicate = store.enqueue_batch(request)?;
+            assert!(!duplicate.created, "{runtime} durable duplicate");
+            assert_eq!(duplicate.batch.batch_id, first.batch.batch_id);
+            assert_eq!(
+                first.batch.identity.runtime.as_deref(),
+                Some(runtime),
+                "{runtime} runtime identity"
+            );
+
+            let first_consumer = GuidanceConsumer {
+                consumer_id: format!("{runtime}-lease-consumer"),
+                invocation_id: Some(format!("{runtime}-invocation-1")),
+                generation: Some(1),
+            };
+            let claimed = store
+                .claim_next(&BoundaryEvidence::turn_finished(&agent), &first_consumer, 1)?
+                .context("initial lease")?;
+            assert_eq!(claimed.state, crate::services::GuidanceState::Leased);
+
+            drop(store);
+            let restarted = InboxStore::open(directory.path())?;
+            let recovery_now = now_epoch_secs() + 301;
+            assert_eq!(
+                restarted.recover_expired_leases(recovery_now)?,
+                vec![first.batch.batch_id.clone()],
+                "{runtime} restart recovers lease"
+            );
+            restarted.connection()?.execute(
+                "UPDATE guidance_batches SET available_at = ?1 WHERE batch_id = ?2",
+                rusqlite::params![now_epoch_secs(), first.batch.batch_id],
+            )?;
+
+            let cache = AgentInbox::new(8, 32);
+            assert_eq!(
+                cache
+                    .rebuild_from_durable(
+                        &restarted,
+                        &agent,
+                        &format!("%{runtime}"),
+                        directory.path().to_path_buf(),
+                        injection_options,
+                    )
+                    .await?,
+                1,
+                "{runtime} restart rebuild"
+            );
+            assert_eq!(
+                cache
+                    .rebuild_from_durable(
+                        &restarted,
+                        &agent,
+                        &format!("%{runtime}"),
+                        directory.path().to_path_buf(),
+                        injection_options,
+                    )
+                    .await?,
+                0,
+                "{runtime} cache duplicate"
+            );
+            let cached = cache.begin_delivery(&agent).await.context("cached batch")?;
+            assert_eq!(cached.injection_options, injection_options);
+
+            let retry_consumer = GuidanceConsumer {
+                consumer_id: format!("{runtime}-retry-consumer"),
+                invocation_id: Some(format!("{runtime}-invocation-2")),
+                generation: Some(2),
+            };
+            let retried = restarted
+                .claim_next(
+                    &BoundaryEvidence::turn_finished(&agent),
+                    &retry_consumer,
+                    60,
+                )?
+                .context("retry lease")?;
+            assert_eq!(
+                restarted.release_for_retry(
+                    &retried.batch_id,
+                    &retry_consumer.consumer_id,
+                    "matrix retry",
+                    now_epoch_secs(),
+                )?,
+                crate::services::GuidanceState::Pending,
+                "{runtime} retry returns pending"
+            );
+
+            let abandon_consumer = GuidanceConsumer {
+                consumer_id: format!("{runtime}-abandon-consumer"),
+                invocation_id: Some(format!("{runtime}-invocation-3")),
+                generation: Some(3),
+            };
+            let abandoned = restarted
+                .claim_next(
+                    &BoundaryEvidence::turn_finished(&agent),
+                    &abandon_consumer,
+                    60,
+                )?
+                .context("abandon lease")?;
+            restarted.connection()?.execute(
+                "UPDATE guidance_batches SET attempt_count = 8 WHERE batch_id = ?1",
+                rusqlite::params![abandoned.batch_id],
+            )?;
+            assert_eq!(
+                restarted.release_for_retry(
+                    &abandoned.batch_id,
+                    &abandon_consumer.consumer_id,
+                    "matrix abandonment",
+                    now_epoch_secs(),
+                )?,
+                crate::services::GuidanceState::Abandoned,
+                "{runtime} retry budget abandons"
+            );
+            assert!(
+                restarted
+                    .claim_next(
+                        &BoundaryEvidence::turn_finished(&agent),
+                        &abandon_consumer,
+                        60,
+                    )?
+                    .is_none(),
+                "{runtime} abandoned batch is terminal"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn single_consumer_per_agent_even_with_concurrent_enqueues() {
         let inbox = AgentInbox::new(8, 32);
         let first = inbox.enqueue("agent", message("first")).await.unwrap();
