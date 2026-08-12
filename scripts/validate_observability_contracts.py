@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the versioned Phase 0 observability contracts and fixtures."""
+"""Validate versioned observability contracts, topic mappings, and fixtures."""
 
 from __future__ import annotations
 

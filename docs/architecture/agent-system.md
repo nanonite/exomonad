@@ -123,6 +123,34 @@ Message delivery is serialized per recipient. Claude Code uses its native Teams 
 
 **Reserved alias `parent`.** The literal string `parent` is not an agent name — it is a reserved alias meaning "the caller's parent". To reach your parent, call `notify_parent`; never address a message to the literal recipient `parent`. The two delivery entrypoints treat it differently, on purpose: `notify_parent` accepts `parent` as a sentinel and resolves it to the real parent agent before delivery, while `send_message` **rejects** it (peer messaging requires a concrete agent name). No inbox row is ever written under `to_agent = "parent"`.
 
+### Addressing and presentation topics
+
+The operator-control vocabulary is an addressing and presentation layer over
+these existing authorities. Its grammar is
+`{verb}/{category}/{noun}/{locators}` with the closed verbs `in`, `obs`, and
+`signal`. It does not add a broker, listener, event log, inbox, or second
+writer. A topic is a name for an existing boundary, not a new way to reach it.
+
+| Topic class | Example | Existing authority | Delivery rule |
+|---|---|---|---|
+| `in/` | `in/agent/<agent_id>/steering` | M11 durable guidance queue | `enqueue_batch` only; at-least-once and durable |
+| `obs/` | `obs/event/pr.review` | Immutable ledger and `event-registry.json` | Droppable view; the event identity is not renamed |
+| `signal/` | `signal/park/<run_id>/review_stuck` | `tl_loop` park state and named gates | Immediate presentation; never queued or coalesced |
+
+Path-derived segments percent-encode `+`, `#`, and `%` as uppercase `%2B`,
+`%23`, and `%25`. `/` remains the level separator, so it is rejected inside a
+segment. There is no `out/` topic: the recipient's `in/` queue is the durable
+copy. The complete grammar and encoding rules are in
+[the operator control-plane decision](../decisions/operator-control-plane.md#topic-grammar-and-encoding).
+
+`obs/` topics are views over existing ledger identities. The checked-in
+[`topic-mappings.v1.json`](../observability/topic-mappings.v1.json) catalog and
+`just validate-observability-contracts` guard every observation topic against
+[`event-registry.json`](../observability/event-registry.json); adding an `obs/`
+name never mints an event. `signal/park` exposes a closed park cause so an
+operator can see escalation; it does not answer a gate or mutate run state.
+Only the controller and its existing control routes can make those decisions.
+
 ---
 
 ## 3. Hook Rules — per role

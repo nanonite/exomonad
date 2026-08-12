@@ -293,6 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E15 :: E15.5 Document the grammar and its boundary (#815)
 - E15 :: E15.4 Map signal/ topics onto park causes and gates (#814)
 - E15 :: E15.3 Map obs/ topics as a view over the existing event registry (#813)
 - E15 :: E15.2 Map in/ topics onto the M11 guidance queue (#812)

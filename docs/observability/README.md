@@ -10,7 +10,7 @@ These files freeze the Phase 0 contracts used by the append-only observability p
   transitions.
 - `fixtures/phase0-contract-fixtures.json` provides non-sensitive multi-harness coverage
   for identity, delivery, review, gaps, state reconstruction, privacy, and provenance.
-- `scripts/validate_observability_contracts.py` validates all three artifacts with only the
+- `scripts/validate_observability_contracts.py` validates these contracts and fixtures with only the
   Python standard library.
 
 Run the contract gate from the repository root:
@@ -23,6 +23,31 @@ The gate must pass before an emitter, importer, exporter, detector, or architect
 comparison is considered measurement-ready. Changes to event names, required envelope
 fields, payload classes, or expected-event rules require a versioned contract update and
 fixture coverage in the same change.
+
+## Verb-first topic boundary
+
+The topic grammar is `{verb}/{category}/{noun}/{locators}` with the closed verb
+set `in`, `obs`, and `signal`. It is an addressing and presentation layer, not
+a second authority and not a transport:
+
+- `in/agent/<agent_id>/{steering,follow_up}` resolves to the existing durable
+  guidance queue's `enqueue_batch` operation. It does not add a broker, listener,
+  or `out/` delivery path.
+- `obs/event/<event_type>` is a droppable view over the immutable ledger. Every
+  topic must name an event already present in `event-registry.json`; the
+  `topic-mappings.v1.json` guard fails closed when that counterpart is absent.
+- `signal/park/<run_id>/<cause>` presents one of the controller's closed park
+  causes immediately. It is never queued or coalesced and cannot create or
+  answer a named gate; `tl_loop` remains the authority for those mutations.
+
+Path-derived segments encode `+`, `#`, and `%` as uppercase `%2B`, `%23`, and
+`%25`; `/` is the level separator. See the [operator control-plane grammar](../decisions/operator-control-plane.md#topic-grammar-and-encoding)
+for the complete round-trip and rejection rules. The contract gate checks the
+registry-backed observation mappings:
+
+```bash
+just validate-observability-contracts
+```
 
 The registry permits sensitive evidence in local L1, L2, and L3 layers. The L4 compile
 step is the share boundary: it selects allowlisted dimensions and must not emit raw
