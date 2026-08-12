@@ -152,3 +152,107 @@ pub trait GuidanceRuntimeAdapter: Send + Sync {
         transport: &TransportAttempt,
     ) -> Result<Option<RuntimeAcceptanceEvidence>>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct StubAdapter;
+
+    impl GuidanceRuntimeAdapter for StubAdapter {
+        fn runtime(&self) -> RuntimeKind {
+            RuntimeKind::Custom
+        }
+
+        fn target_agent(&self) -> &str {
+            "agent"
+        }
+
+        fn report_boundary(&self) -> Result<BoundaryEvidence> {
+            Ok(BoundaryEvidence::turn_finished(self.target_agent()))
+        }
+
+        fn submit_batch(&self, _batch: &GuidanceBatch) -> Result<TransportAttempt> {
+            Ok(TransportAttempt::success("test"))
+        }
+
+        fn acceptance_evidence(
+            &self,
+            _batch: &GuidanceBatch,
+            _transport: &TransportAttempt,
+        ) -> Result<Option<RuntimeAcceptanceEvidence>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn boundary_phases_only_offer_work_at_safe_points() {
+        assert!(BoundaryPhase::TurnFinished.can_offer_steering());
+        assert!(BoundaryPhase::WouldStop.can_offer_steering());
+        assert!(BoundaryPhase::WouldStop.can_offer_follow_up());
+        assert!(!BoundaryPhase::ToolExecuting.can_offer_steering());
+        assert!(!BoundaryPhase::ToolExecuting.can_offer_follow_up());
+        assert!(!BoundaryPhase::HardStopped.can_offer_steering());
+        assert!(!BoundaryPhase::HardStopped.can_offer_follow_up());
+        assert!(!BoundaryPhase::TurnFinished.can_offer_follow_up());
+    }
+
+    #[test]
+    fn acceptance_envelope_round_trips_with_stable_wire_names() {
+        let evidence = RuntimeAcceptanceEvidence {
+            batch_id: "batch-1".to_string(),
+            agent_id: "agent".to_string(),
+            queue_class: "steering".to_string(),
+            item_ids: vec!["item-1".to_string(), "item-2".to_string()],
+            consumer_id: "consumer-1".to_string(),
+            invocation_id: Some("invocation-1".to_string()),
+            generation: Some(3),
+            evidence_kind: AcceptanceKind::RuntimeBoundary,
+            confidence: AcceptanceConfidence::Exact,
+            correlation_id: Some("boundary-1".to_string()),
+        };
+        let encoded = serde_json::to_value(&evidence).expect("serialize evidence envelope");
+        assert_eq!(
+            encoded,
+            json!({
+                "batch_id": "batch-1",
+                "agent_id": "agent",
+                "queue_class": "steering",
+                "item_ids": ["item-1", "item-2"],
+                "consumer_id": "consumer-1",
+                "invocation_id": "invocation-1",
+                "generation": 3,
+                "evidence_kind": "runtime_boundary",
+                "confidence": "exact",
+                "correlation_id": "boundary-1"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RuntimeAcceptanceEvidence>(encoded)
+                .expect("deserialize evidence envelope"),
+            evidence
+        );
+    }
+
+    #[test]
+    fn transport_success_has_no_acceptance_confidence() {
+        let transport = TransportAttempt::success("tmux");
+        assert_eq!(transport.outcome, TransportOutcome::Success);
+        assert_eq!(
+            serde_json::to_value(transport).expect("serialize transport attempt"),
+            json!({"method": "tmux", "outcome": "success", "detail": null})
+        );
+    }
+
+    #[test]
+    fn adapter_trait_is_object_safe_and_does_not_drive_a_model_loop() {
+        let adapter: &dyn GuidanceRuntimeAdapter = &StubAdapter;
+        assert_eq!(adapter.runtime(), RuntimeKind::Custom);
+        assert_eq!(adapter.target_agent(), "agent");
+        assert_eq!(
+            adapter.report_boundary().unwrap().phase,
+            BoundaryPhase::TurnFinished
+        );
+    }
+}

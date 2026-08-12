@@ -292,6 +292,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E10 :: E10.1 Define the adapter trait and evidence envelope (#784)
 - E9 :: E9.4 Surface unproven batches as pending/unknown (#783)
 - E8: Route guidance producers through enqueue_batch (#765)
 - E9 :: E9.3 Stop emitting runtime_accepted from transport success (#782)
