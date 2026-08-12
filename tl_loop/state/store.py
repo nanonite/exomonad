@@ -144,6 +144,27 @@ class RunStore:
                     return document
             gates.append({"name": name, "status": status.value})
             return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
+    def answer_gate(self, name: str, status: GateStatus) -> RunState:
+        """Answer an existing named gate without creating a new one."""
+        if not isinstance(name, str) or not name:
+            raise ValueError("gate name must be a non-empty string")
+        if not isinstance(status, GateStatus):
+            raise TypeError("status must be a GateStatus")
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            gates = document.get("gates")
+            if not isinstance(gates, list):
+                raise CorruptCheckpoint("run state gates are not an array")
+            for gate in gates:
+                if isinstance(gate, dict) and gate.get("name") == name:
+                    gate["status"] = status.value
+                    return document
+            raise ValueError(f"gate {name!r} does not exist")
+
         apply(self.run_dir, mutate)
         return self.load()
 
@@ -390,8 +411,7 @@ def _encode_review_findings(
     findings: Mapping[str, tuple[Mapping[str, str], ...]],
 ) -> dict[str, list[dict[str, str]]]:
     return {
-        head_sha: [dict(finding) for finding in values]
-        for head_sha, values in findings.items()
+        head_sha: [dict(finding) for finding in values] for head_sha, values in findings.items()
     }
 
 
@@ -547,11 +567,7 @@ def _decode_string_map(value: object) -> Mapping[str, str]:
     if not isinstance(value, dict):
         return MappingProxyType({})
     return MappingProxyType(
-        {
-            key: item
-            for key, item in value.items()
-            if isinstance(key, str) and isinstance(item, str)
-        }
+        {key: item for key, item in value.items() if isinstance(key, str) and isinstance(item, str)}
     )
 
 
@@ -559,12 +575,10 @@ def _decode_int_map(value: object) -> Mapping[str, int]:
     if not isinstance(value, dict):
         return MappingProxyType({})
     return MappingProxyType(
-        {
-            key: item
-            for key, item in value.items()
-            if isinstance(key, str) and type(item) is int
-        }
+        {key: item for key, item in value.items() if isinstance(key, str) and type(item) is int}
     )
+
+
 def _decode_slice(value: dict[str, object]) -> SliceState:
     return SliceState(
         id=cast(str, value["id"]),

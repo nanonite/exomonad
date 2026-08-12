@@ -1,5 +1,6 @@
 use crate::app_state::AppState;
 use crate::control;
+use crate::control_gate;
 use crate::control_read_model;
 use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV};
 use std::time::Duration;
@@ -985,6 +986,34 @@ async fn control_transitions(
     ))
 }
 
+async fn control_answer_gate(
+    Path((run_id, gate_name)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<control_gate::GateAnswerRequest>,
+) -> Response {
+    match control_gate::answer_gate(&state.project_dir, &run_id, &gate_name, request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            let status = match &error {
+                control_gate::GateAnswerError::InvalidIdentifier(_) => {
+                    axum::http::StatusCode::BAD_REQUEST
+                }
+                control_gate::GateAnswerError::MissingRun
+                | control_gate::GateAnswerError::MissingGate => axum::http::StatusCode::NOT_FOUND,
+                control_gate::GateAnswerError::CommandFailed(_)
+                | control_gate::GateAnswerError::Io(_) => {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn control_read_response(
     result: Result<serde_json::Value, control_read_model::ReadModelError>,
 ) -> Response {
@@ -1736,6 +1765,10 @@ Run `exomonad recompile` first to build it.",
         .route("/runs/{run_id}", get(control_run))
         .route("/runs/{run_id}/slices/{slice_id}", get(control_slice))
         .route("/runs/{run_id}/transitions", get(control_transitions))
+        .route(
+            "/runs/{run_id}/gates/{gate_name}",
+            post(control_answer_gate),
+        )
         .layer(middleware::from_fn_with_state(
             route_auth.clone(),
             control::require_control,

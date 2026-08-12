@@ -8,7 +8,14 @@ from pathlib import Path
 import pytest
 
 from tl_loop.fsm.phase import TLPhase
-from tl_loop.state.schema import BudgetLedger, FSMState, SliceState, SliceStatus, Verdict
+from tl_loop.state.schema import (
+    BudgetLedger,
+    FSMState,
+    GateStatus,
+    SliceState,
+    SliceStatus,
+    Verdict,
+)
 from tl_loop.state.store import (
     CorruptCheckpoint,
     RunStore,
@@ -66,6 +73,18 @@ def test_legacy_checkpoint_defaults_new_review_state(tmp_path: Path) -> None:
     assert restored.repair_attempts == 0
 
 
+def test_answer_gate_requires_an_existing_gate(tmp_path: Path) -> None:
+    store = RunStore("run-1", tmp_path)
+    create("run-1", {}, root_dir=tmp_path)
+
+    with pytest.raises(ValueError, match="does not exist"):
+        store.answer_gate("missing", GateStatus.APPROVED)
+
+    store.set_gate("review")
+    answered = store.answer_gate("review", GateStatus.APPROVED)
+    assert answered.gates[0].status is GateStatus.APPROVED
+
+
 def test_load_rejects_waiting_slice_with_terminal_status(tmp_path: Path) -> None:
     store = RunStore("run-1", tmp_path)
     create("run-1", {}, root_dir=tmp_path)
@@ -86,7 +105,6 @@ def test_load_rejects_waiting_slice_with_terminal_status(tmp_path: Path) -> None
 
 
 def _slice(slice_id: str, status: SliceStatus, path: str) -> SliceState:
-
     return SliceState(
         id=slice_id,
         status=status,
@@ -99,9 +117,7 @@ def _slice(slice_id: str, status: SliceStatus, path: str) -> SliceState:
         branch=f"task/{slice_id}",
         worktree=f".worktrees/{slice_id}",
         pr_number=42 if status is SliceStatus.IN_REVIEW else None,
-        reviewed_head="abc123"
-        if status in {SliceStatus.IN_REVIEW, SliceStatus.MERGED}
-        else None,
+        reviewed_head="abc123" if status in {SliceStatus.IN_REVIEW, SliceStatus.MERGED} else None,
         review_findings={
             "abc123": (
                 {
@@ -118,9 +134,12 @@ def _slice(slice_id: str, status: SliceStatus, path: str) -> SliceState:
         verdict=Verdict.GO if status is SliceStatus.MERGED else None,
     )
 
+
 def test_live_run_cannot_claim_an_owned_worktree_twice(tmp_path: Path) -> None:
     worktree = str(tmp_path / "shared-worktree")
     create("first", {"owner_branch": "main", "owner_worktree": worktree}, root_dir=tmp_path)
 
     with pytest.raises(WorktreeClaimError, match="already claimed"):
-        create("second", {"owner_branch": "main.second", "owner_worktree": worktree}, root_dir=tmp_path)
+        create(
+            "second", {"owner_branch": "main.second", "owner_worktree": worktree}, root_dir=tmp_path
+        )

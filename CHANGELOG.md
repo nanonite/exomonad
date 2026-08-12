@@ -293,6 +293,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E13 :: E13.4 Implement answer-named-gate endpoint (#803)
 - E13 :: E13.3 Implement read endpoints (#802)
 - E13 :: E13.2 Add the /control route group over the existing UDS (#801)
 - E13 :: E13.1 Define the read-model projection (#800)

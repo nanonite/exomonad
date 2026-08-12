@@ -21,7 +21,6 @@ from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.state.read_model import project_read_model
 from tl_loop.state.schema import GateStatus, RunState
 from tl_loop.state.store import RunStore
-from tl_loop.state.write import apply
 
 LOGGER = logging.getLogger("tl_loop")
 DEFAULT_RUN_ID = "root"
@@ -241,19 +240,10 @@ def _set_gate(args: argparse.Namespace) -> None:
     root = args.project_root.expanduser().resolve() / ".exo" / "tl-loop"
     store = RunStore(args.run_id, root)
     status = GateStatus.APPROVED.value if args.approve else GateStatus.REJECTED.value
-
-    def mutate(document: dict[str, object]) -> dict[str, object]:
-        gates = document.get("gates")
-        if not isinstance(gates, list):
-            raise LauncherError("run state gates are not an array")
-        for gate in gates:
-            if isinstance(gate, dict) and gate.get("name") == args.name:
-                gate["status"] = status
-                return document
-        gates.append({"name": args.name, "status": status})
-        return document
-
-    apply(store.run_dir, mutate)
+    try:
+        store.answer_gate(args.name, GateStatus(status))
+    except ValueError as error:
+        raise LauncherError(str(error)) from error
     LOGGER.info("[TL loop] gate name=%s status=%s", args.name, status)
 
 
