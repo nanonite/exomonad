@@ -267,7 +267,9 @@ Worker has no `canExit` guards — workers are ephemeral and may end at any time
 
 ## 5. PR Review Convergence Flow
 
-This is the loop the watcher + dev + reviewer + controller collectively run. The watcher is the only place that observes the world (filesystem, CI, time). Every other actor reacts to events the watcher dispatches.
+The TL runs the workflow; the watcher only observes world state (filesystem, CI,
+Forgejo, and time). The reviewer supplies binding evidence, the TL adjudicates
+that evidence, and the controller owns repair and merge decisions.
 
 Two delivery paths run side by side and must not be confused:
 
@@ -291,20 +293,18 @@ sequenceDiagram
   Dev->>Dev: implement, commit
   Dev->>Dev: file_pr (opens Forgejo PR)
   Note over Dev: DevPhase: DevPRFiled
-  Watcher->>Reviewer: spawn (ephemeral) via review-loop
+  Ctl->>Reviewer: spawn (ephemeral) with TL-owned acceptance criteria
   Reviewer->>Reviewer: read diff
-  Reviewer->>Reviewer: approve_pr (submits Forgejo review)
+  Reviewer->>Reviewer: submit findings for the exact head SHA
   Note over Reviewer: ReviewerPhase: ReviewerPosted
-  Watcher->>Dev: handle_event(ReviewApproved) -> NoAction
-  Note over Dev: DevPhase: DevApproved (Clean; watcher owns CI)
+  Watcher->>Ctl: ledger append (pr.review, ci.status_changed)
+  Ctl->>Ctl: adjudicate_review(findings, head_sha)
   CI-->>Watcher: CIStatus = success
-  Watcher->>Dev: handle_event(CIStatus, mergeReady=true) -> NotifyParentAction
-  Watcher->>Ctl: ledger append (ci.status_changed, pr.review)
-  Note over Dev: DevPhase: DevDone
-  Ctl->>Ctl: verify_review — verdict fresh AND reviewed_head == current head
+  Watcher->>Ctl: ledger append (ci.status_changed)
+  Ctl->>Ctl: verify_review — TL GO, CI success/neutral, head binding
   Ctl->>Ctl: merge_pr, then verify post-merge state
   Ctl->>Ctl: checkpoint slice = merged, advance dependents
-  Watcher->>Dev: PR branch gone -> dev exits cleanly
+  Watcher->>Ctl: observe PR branch gone
 ```
 
 ### Sequence — fixes-pushed loop
@@ -317,22 +317,18 @@ sequenceDiagram
   participant Reviewer
   participant Ctl as tl_loop controller
 
-  Reviewer->>Reviewer: request_changes
-  Watcher->>Dev: handle_event(ReviewReceived) -> InjectMessage(comments)
-  Note over Dev: DevPhase: DevChangesRequested
+  Reviewer->>Reviewer: submit findings (NO-GO)
+  Watcher->>Ctl: ledger append (pr.review)
+  Ctl->>Ctl: adjudicate_review -> NO-GO
+  Ctl->>Ctl: compose_repair -> resume_pr (same owner/branch/PR)
+  Ctl->>Dev: repair guidance through resume_pr
   Dev->>Dev: fix, commit, push (SHA changes)
-  Watcher->>Dev: handle_event(FixesPushed) -> NoAction
-  Note over Dev: DevPhase: DevUnderReview round=1
-  Watcher->>Reviewer: handle_event(FixesPushed) -> InjectMessage
-  Note over Reviewer: ReviewerPhase: ReviewerReviewing
-  Reviewer->>Reviewer: approve_pr OR request_changes again
-  alt approved
-    Watcher->>Dev: ReviewApproved -> DevApproved
-  else changes requested round 2
-    Watcher->>Dev: ReviewReceived -> DevNeedsHumanDirection
-    Watcher->>Ctl: ledger append (agent.stuck)
-    Ctl->>Ctl: compose_repair -> resume_pr (same owner/branch/PR)
-    Ctl->>Ctl: attempts++ ; park review_stuck past escalate_after_attempts
+  Watcher->>Ctl: ledger append (pr.head_changed)
+  Ctl->>Reviewer: spawn reviewer for the new head
+  alt GO after binding findings
+    Ctl->>Ctl: wait for CI on the same head
+  else repeated NO-GO or timeout
+    Ctl->>Ctl: park named gate; no merge
   end
 ```
 
@@ -351,39 +347,44 @@ These are the `PRReviewEvent` constructors the watcher emits. Each role's `prRev
 | `FixesPushed` | SHA change after `changes_requested` | `FixesPushedEv` -> round++ | inject `[FIXES PUSHED]` to re-review |
 | `CommitsPushed` | SHA change outside the changes-requested window | `CommitsPushedEv` -> round++ | `ReviewerCommitsPushedEv` |
 | `ReviewTimeout` | no reviewer response within `reviewer_max_wait_seconds` | log only | `ReviewerTimedOutEv` -> Done |
-| `MergeReady` | reviewer approval AND CI success/neutral both seen | `MergeReadyEv` -> Dev sends `[MERGE READY]` upward | `ReviewerMergeReadyEv` -> Done |
+| `MergeReady` | **Deprecated derived state:** inferred from `pr.review` + `ci.status_changed`; not a source event | compatibility notification only; the TL derives merge eligibility | no required handler |
 | `Stuck` | rounds exceed `reviewer_max_rounds` | notify upward; controller repairs via `resume_pr` | `ReviewerStuckEv` -> Done |
 | `RateLimited` | rate-limit hit | log only | log only |
 | `DevNotPushing` / `ReviewerNotResponding` / `ReviewerNeverStarted` / `ReviewDevFailed` | health probes | log only (escalated by watcher to chainlink `review-stuck`) | n/a |
 
-### CI gating — why `MergeReady` requires both
+### CI and review evidence
 
 ```mermaid
 flowchart TD
-  A[Watcher tick] --> B{review approved?}
-  B -- no --> Z[no merge_ready]
-  B -- yes --> C{CI status in success or neutral?}
-  C -- no --> Z
-  C -- yes --> D{first time both true?}
-  D -- no --> Z
-  D -- yes --> E[fire MergeReady event]
-  E --> F[Dev: NotifyParentAction]
-  F --> G[ledger append; controller consumes by run_seq]
+  A[Watcher observes PR review and CI] --> B[ledger: pr.review + ci.status_changed]
+  B --> C{binding reviewer findings?}
+  C -- no --> Z[park named gate]
+  C -- yes --> D[TL adjudicate_review]
+  D -- NO-GO --> R[compose_repair -> resume_pr same owner]
+  D -- GO --> E{CI success or neutral on same head?}
+  E -- no --> Z
+  E -- yes --> F{head SHA equals live PR head?}
+  F -- no --> Z
+  F -- yes --> G[merge_pr]
 ```
 
-Without Forgejo Actions producing a CI status, `ci_mergeable_at` stays `None` and `MergeReady` never fires even with reviewer approval. On a new project this is the most common cause of a PR that sits approved and unmerged — check that `.forgejo/workflows/ci.yml` actually runs.
+Without Forgejo Actions producing a CI status, the canonical merge rule cannot
+pass even when the TL has adjudicated GO. Review timeout is never approval; it
+parks the slice with a named gate.
 
 ### Controller-side merge gates
 
-The watcher's `MergeReady` is necessary, not sufficient. `tl_loop` applies three further gates before it calls `merge_pr`:
+`tl_loop` applies the canonical merge rule before it calls `merge_pr`:
 
 | Gate | Where | Failure mode it prevents |
 |------|-------|--------------------------|
-| Closed verdict | `tl_loop/rlm/adjudicate.py` — only `GO`, `GO-WITH-NITS`, `NO-GO`. Diff and criteria are *required* RLM sections, so a context overflow raises rather than judging a compacted-away diff | Merging on a verdict the model produced without seeing the change |
-| Policy veto | `.exo/review-policy.toml` — `min_review_rounds`, `external_review_paths`, `external_review_threshold`, `complexity_line_threshold`. A `GO` behind any of these is marked `second_review_required` and is not mergeable | Single-reviewer merges on high-risk surfaces |
-| Head binding | `tl_loop/loop/review.py` — the verdict's `reviewed_head` must equal the PR's current head, within `review_freshness_window_secs` | Approving one commit and merging another |
+| TL adjudicated GO | `tl_loop/rlm/adjudicate.py` consumes binding reviewer findings plus TL-owned criteria; no verdict is invented without reviewer evidence | Merging without a reviewer-evidence-backed workflow decision |
+| CI success or neutral | watcher ledger projection for the current head | Merging code that does not satisfy the machine gate |
+| Head binding | `tl_loop/loop/review.py` — the reviewed head must equal the live PR head | Approving one commit and merging another |
 
-`GO-WITH-NITS` is mergeable only after every nit has been written to the owning Chainlink issue. After merging, the controller verifies post-merge state before advancing dependent slices.
+Optional second-review policy and `GO-WITH-NITS` handling are additional
+project policy, not universal approval layers. After merging, the controller
+verifies post-merge state before advancing dependent slices.
 
 ---
 

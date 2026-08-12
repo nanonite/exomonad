@@ -203,7 +203,7 @@ stateDiagram-v2
 
 <h2>5. PR Review Convergence Flow</h2>
 
-<p>Two delivery paths run side by side and must not be confused. <strong>Agent-facing:</strong> the watcher calls <code>handle_event</code> on the agent's WASM plugin and acts on the returned <code>EventAction</code>. <strong>Controller-facing:</strong> the same world observations are appended to the immutable ledger at <code>.exo/ledger/segments/</code>, and <code>tl_loop</code> consumes them by global <code>run_seq</code>. The controller does not read the inbox for coordination — a free-form message cannot approve a merge.</p>
+<p>The TL runs the workflow; the watcher only observes world state (filesystem, CI, Forgejo, and time). The reviewer supplies binding evidence, the TL adjudicates that evidence, and the controller owns repair and merge decisions. Two delivery paths run side by side and must not be confused. <strong>Agent-facing:</strong> the watcher calls <code>handle_event</code> on the agent's WASM plugin and acts on the returned <code>EventAction</code>. <strong>Controller-facing:</strong> the same world observations are appended to the immutable ledger at <code>.exo/ledger/segments/</code>, and <code>tl_loop</code> consumes them by global <code>run_seq</code>. The controller does not read the inbox for coordination — a free-form message cannot approve a merge.</p>
 
 <h3>Happy path</h3>
 <div class="mermaid">
@@ -219,20 +219,18 @@ sequenceDiagram
   Dev->>Dev: implement, commit
   Dev->>Dev: file_pr (opens Forgejo PR)
   Note over Dev: DevPhase: DevPRFiled
-  Watcher->>Reviewer: spawn (ephemeral) via review-loop
+  Ctl->>Reviewer: spawn (ephemeral) with TL-owned acceptance criteria
   Reviewer->>Reviewer: read diff
-  Reviewer->>Reviewer: approve_pr (submits Forgejo review)
+  Reviewer->>Reviewer: submit findings for the exact head SHA
   Note over Reviewer: ReviewerPhase: ReviewerPosted
-  Watcher->>Dev: handle_event(ReviewApproved)
-  Note over Dev: DevPhase: DevApproved (MustBlock)
+  Watcher->>Ctl: ledger append (pr.review, ci.status_changed)
+  Ctl->>Ctl: adjudicate_review(findings, head_sha)
   CI-->>Watcher: CIStatus = success
-  Watcher->>Dev: handle_event(CIStatus, mergeReady=true)
-  Watcher->>Ctl: ledger append (ci.status_changed, pr.review)
-  Note over Dev: DevPhase: DevDone
-  Ctl->>Ctl: verify_review — verdict fresh AND reviewed_head == current head
+  Watcher->>Ctl: ledger append (ci.status_changed)
+  Ctl->>Ctl: verify_review — TL GO, CI success/neutral, head binding
   Ctl->>Ctl: merge_pr, then verify post-merge state
   Ctl->>Ctl: checkpoint slice = merged, advance dependents
-  Watcher->>Dev: PR branch gone — dev exits cleanly
+  Watcher->>Ctl: observe PR branch gone
 </div>
 
 <h3>Fixes-pushed loop</h3>
@@ -244,22 +242,18 @@ sequenceDiagram
   participant Reviewer
   participant Ctl as tl_loop controller
 
-  Reviewer->>Reviewer: request_changes
-  Watcher->>Dev: handle_event(ReviewReceived) -> InjectMessage(comments)
-  Note over Dev: DevPhase: DevChangesRequested
+  Reviewer->>Reviewer: submit findings (NO-GO)
+  Watcher->>Ctl: ledger append (pr.review)
+  Ctl->>Ctl: adjudicate_review -> NO-GO
+  Ctl->>Ctl: compose_repair -> resume_pr (same owner/branch/PR)
+  Ctl->>Dev: repair guidance through resume_pr
   Dev->>Dev: fix, commit, push (SHA changes)
-  Watcher->>Dev: handle_event(FixesPushed)
-  Note over Dev: DevPhase: DevUnderReview round=1
-  Watcher->>Reviewer: handle_event(FixesPushed) -> re-review
-  Note over Reviewer: ReviewerPhase: ReviewerReviewing
-  Reviewer->>Reviewer: approve_pr OR request_changes again
-  alt approved
-    Watcher->>Dev: ReviewApproved -> DevApproved
-  else changes requested round 2
-    Watcher->>Dev: ReviewReceived -> DevNeedsHumanDirection
-    Watcher->>Ctl: ledger append (agent.stuck)
-    Ctl->>Ctl: compose_repair -> resume_pr (same owner/branch/PR)
-    Ctl->>Ctl: attempts++ ; park review_stuck past escalate_after_attempts
+  Watcher->>Ctl: ledger append (pr.head_changed)
+  Ctl->>Reviewer: spawn reviewer for the new head
+  alt GO after binding findings
+    Ctl->>Ctl: wait for CI on the same head
+  else repeated NO-GO or timeout
+    Ctl->>Ctl: park named gate; no merge
   end
 </div>
 
@@ -275,37 +269,38 @@ sequenceDiagram
 <tr><td><code>FixesPushed</code></td><td>SHA change after <code>changes_requested</code></td><td><code>FixesPushedEv</code> -&gt; round++</td><td>inject <code>[FIXES PUSHED]</code> to re-review</td></tr>
 <tr><td><code>CommitsPushed</code></td><td>SHA change outside changes-requested window</td><td><code>CommitsPushedEv</code> -&gt; round++</td><td><code>ReviewerCommitsPushedEv</code></td></tr>
 <tr><td><code>ReviewTimeout</code></td><td>no reviewer response within <code>reviewer_max_wait_seconds</code></td><td>log only</td><td><code>ReviewerTimedOutEv</code> -&gt; Done</td></tr>
-<tr><td><code>MergeReady</code></td><td>reviewer approval AND CI success/neutral both seen</td><td><code>MergeReadyEv</code> -&gt; Dev sends <code>[MERGE READY]</code> upward</td><td><code>ReviewerMergeReadyEv</code> -&gt; Done</td></tr>
+<tr><td><code>MergeReady</code></td><td><strong>Deprecated derived state:</strong> inferred from <code>pr.review</code> + <code>ci.status_changed</code>; not a source event</td><td>compatibility notification only; the TL derives merge eligibility</td><td>no required handler</td></tr>
 <tr><td><code>Stuck</code></td><td>rounds exceed <code>reviewer_max_rounds</code></td><td>notify upward; controller repairs via <code>resume_pr</code></td><td><code>ReviewerStuckEv</code> -&gt; Done</td></tr>
 <tr><td><code>RateLimited</code></td><td>rate-limit hit</td><td>log only</td><td>log only</td></tr>
 <tr><td><code>DevNotPushing</code> / <code>ReviewerNotResponding</code> / <code>ReviewerNeverStarted</code> / <code>ReviewDevFailed</code></td><td>health probes</td><td>log only (escalated by watcher to chainlink <code>review-stuck</code>)</td><td>n/a</td></tr>
 </table>
 
-<h3>CI gating</h3>
+<h3>CI and review evidence</h3>
 <div class="mermaid">
 flowchart TD
-  A[Watcher tick] --> B{review approved?}
-  B -- no --> Z[no merge_ready]
-  B -- yes --> C{CI status in success or neutral?}
-  C -- no --> Z
-  C -- yes --> D{first time both true?}
-  D -- no --> Z
-  D -- yes --> E[fire MergeReady event]
-  E --> F[Dev: NotifyParentAction]
-  F --> G[ledger append; controller consumes by run_seq]
+  A[Watcher observes PR review and CI] --> B[ledger: pr.review + ci.status_changed]
+  B --> C{binding reviewer findings?}
+  C -- no --> Z[park named gate]
+  C -- yes --> D[TL adjudicate_review]
+  D -- NO-GO --> R[compose_repair -> resume_pr same owner]
+  D -- GO --> E{CI success or neutral on same head?}
+  E -- no --> Z
+  E -- yes --> F{head SHA equals live PR head?}
+  F -- no --> Z
+  F -- yes --> G[merge_pr]
 </div>
 
-<p class="note">Without Forgejo Actions producing a CI status, <code>ci_mergeable_at</code> stays <code>None</code> and <code>MergeReady</code> never fires even with reviewer approval. On a new project this is the most common cause of a PR that sits approved and unmerged — check that <code>.forgejo/workflows/ci.yml</code> actually runs.</p>
+<p class="note">Without Forgejo Actions producing a CI status, the canonical merge rule cannot pass even when the TL has adjudicated GO. Review timeout is never approval; it parks the slice with a named gate.</p>
 
 <h3>Controller-side merge gates</h3>
-<p><code>MergeReady</code> is necessary, not sufficient. <code>tl_loop</code> applies three further gates before it calls <code>merge_pr</code>.</p>
+<p><code>tl_loop</code> applies the canonical merge rule before it calls <code>merge_pr</code>:</p>
 <table>
 <tr><th>Gate</th><th>Where</th><th>Failure mode it prevents</th></tr>
-<tr><td>Closed verdict</td><td><code>tl_loop/rlm/adjudicate.py</code> — only <code>GO</code>, <code>GO-WITH-NITS</code>, <code>NO-GO</code>. Diff and criteria are <em>required</em> RLM sections, so a context overflow raises rather than judging a compacted-away diff</td><td>Merging on a verdict the model produced without seeing the change</td></tr>
-<tr><td>Policy veto</td><td><code>.exo/review-policy.toml</code> — <code>min_review_rounds</code>, <code>external_review_paths</code>, <code>external_review_threshold</code>, <code>complexity_line_threshold</code>. A <code>GO</code> behind any of these is marked <code>second_review_required</code> and is not mergeable</td><td>Single-reviewer merges on high-risk surfaces</td></tr>
-<tr><td>Head binding</td><td><code>tl_loop/loop/review.py</code> — the verdict's <code>reviewed_head</code> must equal the PR's current head, within <code>review_freshness_window_secs</code></td><td>Approving one commit and merging another</td></tr>
+<tr><td>TL adjudicated GO</td><td><code>tl_loop/rlm/adjudicate.py</code> consumes binding reviewer findings plus TL-owned criteria; no verdict is invented without reviewer evidence</td><td>Merging without a reviewer-evidence-backed workflow decision</td></tr>
+<tr><td>CI success or neutral</td><td>watcher ledger projection for the current head</td><td>Merging code that does not satisfy the machine gate</td></tr>
+<tr><td>Head binding</td><td><code>tl_loop/loop/review.py</code> — the reviewed head must equal the live PR head</td><td>Approving one commit and merging another</td></tr>
 </table>
-<p class="note"><code>GO-WITH-NITS</code> is mergeable only after every nit has been written to the owning Chainlink issue. After merging, the controller verifies post-merge state before advancing dependent slices.</p>
+<p class="note">Optional second-review policy and <code>GO-WITH-NITS</code> handling are additional project policy, not universal approval layers. After merging, the controller verifies post-merge state before advancing dependent slices.</p>
 
 <h2>6. Watcher Escalation Outputs</h2>
 <table>
