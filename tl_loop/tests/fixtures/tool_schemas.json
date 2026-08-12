@@ -560,7 +560,7 @@
       "name": "file_pr"
     },
     {
-      "description": "Merge a GitHub pull request and fetch changes. Checks Forgejo reviewer status before merging: requires either a clean review (no change requests) or commits pushed after the latest review. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact.",
+      "description": "Merge a GitHub pull request and fetch changes. Before merging, requires a Forgejo reviewer approval for the exact current PR head and passing CI (success or neutral) for that same head; stale approvals, review changes/comments, pending/failed/unknown CI, and missing evidence are rejected. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact.",
       "inputSchema": {
         "properties": {
           "chainlink_issue_id": {

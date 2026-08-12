@@ -655,6 +655,8 @@ assertReviewerFacingTextDoesNotMentionCopilot = do
   assertContains "merge_pr description issue id" "chainlink_issue_id" mergePRDescription
   assertNotContains "merge_pr description force bypass" "force=true" mergePRDescription
   assertNotContains "merge_pr schema force bypass" "force" mergePrSchemaText
+  assertContains "merge_pr description exact head gate" "exact current PR head" mergePRDescription
+  assertContains "merge_pr description CI gate" "passing CI" mergePRDescription
   assertContains "prReady" "Forgejo reviewer" (Tpl.prReady 42)
   assertContains "reviewTimeout" "Forgejo reviewer" (Tpl.reviewTimeout 42 15)
   assertNotContains "reviewTimeout merge bypass" "force" (Tpl.reviewTimeout 42 15)

@@ -535,23 +535,41 @@ impl EffectHandler for MockAgentHandler {
                 }
                 .encode_to_vec())
             }
-            "agent.watcher_pr_state" => Ok(WatcherPrStateResponse {
-                success: true,
-                error: String::new(),
-                pr_number: 42,
-                found: true,
-                merge_ready: true,
-                blocker: String::new(),
-                review_state: "approved".into(),
-                ci_status: "success".into(),
-                head_sha: "abc123".into(),
-                head_branch: "main.test-leaf".into(),
-                base_branch: "main".into(),
-                pr_state: "open".into(),
-                merged: false,
-                review_count: 1,
+            "agent.watcher_pr_state" => {
+                let req = WatcherPrStateRequest::decode(payload)
+                    .expect("mock agent handler should decode watcher_pr_state request");
+                let (ci_status, review_state) = match req.pr_number {
+                    44 => ("failure", "approved"),
+                    45 => ("success", "changes_requested"),
+                    46 => ("pending", "approved"),
+                    47 => ("unknown", "approved"),
+                    48 => ("success", "commented"),
+                    _ => ("success", "approved"),
+                };
+                let head_sha = if req.pr_number == 43 || req.pr_number == 45 || req.pr_number == 48
+                {
+                    "abc-new"
+                } else {
+                    "abc123"
+                };
+                Ok(WatcherPrStateResponse {
+                    success: true,
+                    error: String::new(),
+                    pr_number: req.pr_number,
+                    found: true,
+                    merge_ready: true,
+                    blocker: String::new(),
+                    review_state: review_state.into(),
+                    ci_status: ci_status.into(),
+                    head_sha: head_sha.into(),
+                    head_branch: "main.test-leaf".into(),
+                    base_branch: "main".into(),
+                    pr_state: "open".into(),
+                    merged: false,
+                    review_count: 1,
+                }
+                .encode_to_vec())
             }
-            .encode_to_vec()),
             _ => Err(EffectError::not_found(format!("mock_agent/{effect_type}"))),
         }
     }
@@ -758,7 +776,7 @@ impl EffectHandler for MockGitHubHandler {
     async fn handle(
         &self,
         effect_type: &str,
-        _payload: &[u8],
+        payload: &[u8],
         _ctx: &exomonad_core::effects::EffectContext,
     ) -> EffectResult<Vec<u8>> {
         use exomonad_proto::effects::github::*;
@@ -774,22 +792,32 @@ impl EffectHandler for MockGitHubHandler {
                 pull_requests: vec![],
             }
             .encode_to_vec()),
-            "github.get_pull_request" => Ok(GetPullRequestResponse {
-                pull_request: Some(PullRequest {
-                    number: 42,
-                    state: IssueState::Open as i32,
-                    head_ref: "main.test-leaf".into(),
-                    base_ref: "main".into(),
-                    head_sha: "abc123".into(),
-                    ..Default::default()
-                }),
-                reviews: vec![Review {
-                    state: ReviewState::Approved as i32,
-                    commit_id: "abc123".into(),
-                    ..Default::default()
-                }],
+            "github.get_pull_request" => {
+                let req = GetPullRequestRequest::decode(payload)
+                    .expect("mock GitHub handler should decode get_pull_request request");
+                let (head_sha, review_state, review_sha) = match req.number {
+                    43 => ("abc-new", ReviewState::Approved, "abc-old"),
+                    45 => ("abc-new", ReviewState::ChangesRequested, "abc-old"),
+                    48 => ("abc-new", ReviewState::Commented, "abc-old"),
+                    _ => ("abc123", ReviewState::Approved, "abc123"),
+                };
+                Ok(GetPullRequestResponse {
+                    pull_request: Some(PullRequest {
+                        number: req.number,
+                        state: IssueState::Open as i32,
+                        head_ref: "main.test-leaf".into(),
+                        base_ref: "main".into(),
+                        head_sha: head_sha.into(),
+                        ..Default::default()
+                    }),
+                    reviews: vec![Review {
+                        state: review_state as i32,
+                        commit_id: review_sha.into(),
+                        ..Default::default()
+                    }],
+                }
+                .encode_to_vec())
             }
-            .encode_to_vec()),
             "github.create_pull_request" => Ok(CreatePullRequestResponse {
                 pull_request: None,
                 url: "https://github.com/test/test/pull/99".into(),
@@ -1519,6 +1547,32 @@ async fn wasm_merge_pr_roundtrip() {
     .await;
 
     assert_tool_success(&output, "merge_pr");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_merge_pr_rejects_stale_reviews_and_nonpassing_ci() {
+    let runtime = build_test_runtime().await;
+    let cases = [
+        (43, "stale"),
+        (44, "CI status"),
+        (45, "requested changes"),
+        (46, "CI status"),
+        (47, "CI status"),
+        (48, "commented"),
+    ];
+
+    for (pr_number, expected_error) in cases {
+        let output = call_tool(&runtime, "tl", "merge_pr", json!({"pr_number": pr_number})).await;
+
+        assert_tool_error(&output, "merge_pr gate");
+        assert!(
+            output["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(expected_error)),
+            "merge_pr error for PR #{pr_number} should mention {expected_error}: {output:#}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

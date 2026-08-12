@@ -40,7 +40,7 @@ import Effects.Github qualified as GH
 import Effects.Log qualified as Log
 import Effects.MergePr qualified as MP
 import Effects.Process qualified as Proc
-import ExoMonad.Effects.Agent (AgentCleanup)
+import ExoMonad.Effects.Agent (AgentCleanup, AgentWatcherPrState)
 import ExoMonad.Effects.FilePR (FilePRLocalPrGet)
 import ExoMonad.Effects.Git (GitGetBranch, GitGetRepoInfo)
 import ExoMonad.Effects.GitHub (GitHubGetPullRequest)
@@ -94,7 +94,7 @@ instance Aeson.ToJSON MergePROutput where
 
 -- | Shared tool description for merge_pr.
 mergePRDescription :: Text
-mergePRDescription = "Merge a GitHub pull request and fetch changes. Checks Forgejo reviewer status before merging: requires either a clean review (no change requests) or commits pushed after the latest review. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact."
+mergePRDescription = "Merge a GitHub pull request and fetch changes. Before merging, requires a Forgejo reviewer approval for the exact current PR head and passing CI (success or neutral) for that same head; stale approvals, review changes/comments, pending/failed/unknown CI, and missing evidence are rejected. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact."
 
 -- | Shared tool schema for merge_pr.
 mergePRSchema :: Aeson.Object
@@ -259,10 +259,57 @@ mergeFromHostedPr args prNum owner repo currentBranch localPrResult = do
         else do
           let readiness = checkReviewerReadinessFromPR prNum resp
           case readiness of
-            Ready -> doMerge args
-            NotReady reason -> do
-              void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict $ "MergePR: blocked: " <> reason, Log.errorRequestFields = ""})
-              pure $ Left reason
+            NotReady reason -> mergeBlocked reason
+            Ready -> do
+              watcherResult <-
+                suspendEffect @AgentWatcherPrState
+                  Agent.WatcherPrStateRequest
+                    { Agent.watcherPrStateRequestPrNumber = fromIntegral prNum
+                    }
+              case watcherResult of
+                Left err ->
+                  mergeBlocked $
+                    "Failed to fetch canonical review/CI evidence for PR #"
+                      <> T.pack (show prNum)
+                      <> ": "
+                      <> T.pack (show err)
+                Right watcher ->
+                  case watcherMergeGate prNum resp watcher of
+                    Ready -> doMerge args
+                    NotReady reason -> mergeBlocked reason
+
+mergeBlocked :: Text -> Eff Effects (Either Text MergePROutput)
+mergeBlocked reason = do
+  void $ suspendEffect_ @LogError (Log.ErrorRequest {Log.errorRequestMessage = TL.fromStrict $ "MergePR: blocked: " <> reason, Log.errorRequestFields = ""})
+  pure $ Left reason
+
+watcherMergeGate :: Int -> GH.GetPullRequestResponse -> Agent.WatcherPrStateResponse -> Readiness
+watcherMergeGate prNum resp watcher =
+  let hostedHead = maybe "" (TL.toStrict . GH.pullRequestHeadSha) (GH.getPullRequestResponsePullRequest resp)
+      observedHead = TL.toStrict (Agent.watcherPrStateResponseHeadSha watcher)
+      reviewState = T.toLower (TL.toStrict (Agent.watcherPrStateResponseReviewState watcher))
+      ciStatus = T.toLower (TL.toStrict (Agent.watcherPrStateResponseCiStatus watcher))
+      prState = T.toLower (TL.toStrict (Agent.watcherPrStateResponsePrState watcher))
+      prefix = "Canonical merge evidence for PR #" <> T.pack (show prNum) <> ": "
+   in case () of
+        _
+          | not (Agent.watcherPrStateResponseSuccess watcher) ->
+              NotReady $ prefix <> TL.toStrict (Agent.watcherPrStateResponseError watcher)
+          | not (Agent.watcherPrStateResponseFound watcher) ->
+              NotReady $ prefix <> "PR was not found"
+          | T.null observedHead ->
+              NotReady $ prefix <> "current PR head SHA is unavailable"
+          | Agent.watcherPrStateResponseMerged watcher ->
+              NotReady $ prefix <> "PR is already merged"
+          | prState /= "open" ->
+              NotReady $ prefix <> "PR is not open"
+          | observedHead /= hostedHead ->
+              NotReady $ prefix <> "hosted PR head SHA changed during the merge check"
+          | reviewState /= "approved" ->
+              NotReady $ prefix <> "review approval is not recorded for the current PR head"
+          | ciStatus == "success" || ciStatus == "neutral" -> Ready
+          | otherwise ->
+              NotReady $ prefix <> "CI status for the current PR head is " <> ciStatus
 
 -- | Check Forgejo reviewer readiness from an already-fetched PR response.
 checkReviewerReadinessFromPR :: Int -> GH.GetPullRequestResponse -> Readiness
@@ -273,35 +320,44 @@ checkReviewerReadinessFromPR prNum resp =
         Just p -> TL.toStrict (GH.pullRequestHeadSha p)
         Nothing -> ""
       reviewerReviews = reviews
-   in case reverse reviewerReviews of
-        [] ->
+   in if T.null headSha
+        then
           NotReady $
-            "No Forgejo reviewer response yet on PR #"
+            "Current PR head SHA is unavailable for PR #"
               <> T.pack (show prNum)
-              <> ". Wait for [PR READY] or [REVIEW TIMEOUT] from the event system."
-        (latest : _) ->
-          let reviewSha = TL.toStrict (GH.reviewCommitId latest)
-              state = GH.reviewState latest
-           in case state of
-                Protobuf.Enumerated (Right GH.ReviewStateREVIEW_STATE_APPROVED) ->
-                  Ready
-                Protobuf.Enumerated (Right GH.ReviewStateREVIEW_STATE_CHANGES_REQUESTED) ->
-                  if headSha /= reviewSha && not (T.null headSha) && not (T.null reviewSha)
-                    then Ready
-                    else
-                      NotReady $
-                        "Forgejo reviewer requested changes on PR #"
-                          <> T.pack (show prNum)
-                          <> ". Wait for the agent to push fixes ([FIXES PUSHED]) before merging."
-                Protobuf.Enumerated (Right GH.ReviewStateREVIEW_STATE_COMMENTED) ->
-                  if headSha /= reviewSha && not (T.null headSha) && not (T.null reviewSha)
-                    then Ready
-                    else
-                      NotReady $
-                        "Forgejo reviewer commented on PR #"
-                          <> T.pack (show prNum)
-                          <> ". Wait for the agent to address comments ([FIXES PUSHED]) before merging."
-                _ -> Ready
+        else case reverse reviewerReviews of
+          [] ->
+            NotReady $
+              "No Forgejo reviewer response yet on PR #"
+                <> T.pack (show prNum)
+                <> ". Wait for [PR READY] or [REVIEW TIMEOUT] from the event system."
+          (latest : _) ->
+            let reviewSha = TL.toStrict (GH.reviewCommitId latest)
+                state = GH.reviewState latest
+             in case state of
+                  Protobuf.Enumerated (Right GH.ReviewStateREVIEW_STATE_APPROVED) ->
+                    if headSha == reviewSha && not (T.null reviewSha)
+                      then Ready
+                      else
+                        NotReady $
+                          "Forgejo approval for PR #"
+                            <> T.pack (show prNum)
+                            <> " is stale; wait for approval of the current head before merging."
+                  Protobuf.Enumerated (Right GH.ReviewStateREVIEW_STATE_CHANGES_REQUESTED) ->
+                    NotReady $
+                      "Forgejo reviewer requested changes on PR #"
+                        <> T.pack (show prNum)
+                        <> ". Wait for a new review of the current head before merging."
+                  Protobuf.Enumerated (Right GH.ReviewStateREVIEW_STATE_COMMENTED) ->
+                    NotReady $
+                      "Forgejo reviewer commented on PR #"
+                        <> T.pack (show prNum)
+                        <> ". Wait for a new review of the current head before merging."
+                  _ ->
+                    NotReady $
+                      "Forgejo reviewer has not approved the current head of PR #"
+                        <> T.pack (show prNum)
+                        <> "."
 
 -- | Extract the agent name (last dot-segment) from a branch name.
 -- After the unified namespace change, the last segment IS the agent name (suffixed).

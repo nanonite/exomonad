@@ -289,6 +289,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Enforce reviewed-head and passing-CI gates inside merge capability (#759)
 - Remove timeout force guidance and enforce merge gate policy (#758)
 - E6: Evaluate owning the agent loop for durable TL->agent steering (#723)
 - E6 :: E6.5 Write the ADR (#756)
