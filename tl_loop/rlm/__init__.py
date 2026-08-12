@@ -54,6 +54,11 @@ from .intent_contract import (
     UnclearIntent,
     parse_operator_intent,
 )
+from .intent import (
+    INTERPRET_OPERATOR_INTENT_PROMPT,
+    IntentInputError,
+    interpret_operator_intent,
+)
 from .repair import (
     REPAIR_HANDOFF_FIELDS,
     REPAIR_HANDOFF_SCHEMA,
@@ -103,6 +108,8 @@ __all__ = [
     "DecompositionParked",
     "DecompositionValidationError",
     "InputSection",
+    "INTERPRET_OPERATOR_INTENT_PROMPT",
+    "IntentInputError",
     "IntentValidationError",
     "JudgmentFailed",
     "OutputSchemaError",
@@ -140,6 +147,7 @@ __all__ = [
     "judgment_hash",
     "load_review_policy",
     "parse_operator_intent",
+    "interpret_operator_intent",
     "resolve_token_counter",
     "rlm",
     "sections_from_inputs",
