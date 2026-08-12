@@ -114,6 +114,7 @@ class LeafTask:
     read_first: tuple[str, ...] = ()
     steps: tuple[str, ...] = ()
     verify: tuple[str, ...] = ()
+    done_criteria: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.name, "leaf name")
@@ -125,6 +126,7 @@ class LeafTask:
             ("read_first", self.read_first),
             ("steps", self.steps),
             ("verify", self.verify),
+            ("done_criteria", self.done_criteria),
         ):
             _text_tuple(values, f"leaf {field_name}")
 
@@ -1278,6 +1280,7 @@ def _leaf(value: object) -> LeafTask:
         _string_tuple(value.get("read_first", ()), "leaf read_first"),
         _string_tuple(value.get("steps", ()), "leaf steps"),
         _string_tuple(value.get("verify", ()), "leaf verify"),
+        _string_tuple(value.get("done_criteria", ()), "leaf done_criteria"),
     )
 
 

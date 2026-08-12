@@ -39,6 +39,7 @@ from .heartbeat import (
 )
 from .review import (
     DEFAULT_REVIEW_POLICY,
+    AcceptanceCriteriaError,
     MissingReviewedHead,
     MissingVerdict,
     ReviewEvidence,
@@ -46,6 +47,7 @@ from .review import (
     ReviewHeadMismatch,
     StaleVerdict,
     VerdictNotApproved,
+    compose_acceptance_criteria,
     load_freshness_window,
     verify_review,
     watcher_head,
@@ -66,6 +68,7 @@ from .shadow import (
 __all__ = [
     "DEFAULT_REVIEW_POLICY",
     "DEFAULT_SHADOW_ROOT",
+    "AcceptanceCriteriaError",
     "ActionRecorder",
     "DepthLimitExceeded",
     "DeterministicJudgments",
@@ -107,6 +110,7 @@ __all__ = [
     "WorkerTask",
     "active_count",
     "authorize_harness_switch",
+    "compose_acceptance_criteria",
     "derive_child_branch",
     "derive_child_worktree",
     "heartbeat_due",

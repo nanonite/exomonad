@@ -244,6 +244,10 @@ The workhorse. One leaf owns one branch, one worktree, one PR.
     "cargo test -p auth refresh",
     "cargo clippy -p auth -- -D warnings"
   ],
+  "done_criteria": [
+    "Refresh rotation is covered by the auth tests.",
+    "The revoked-token response is documented."
+  ],
   "boundary": [
     "src/auth/**",
     "migrations/0007_refresh.sql"
@@ -258,12 +262,18 @@ The workhorse. One leaf owns one branch, one worktree, one PR.
 | `agent_type` | no | Explicit harness override; otherwise the selector picks from the allowlist |
 | `boundary` | no | **Becomes the slice's owned `paths`.** Overlapping boundaries between non-terminal slices are a schema error |
 | `verify` | no | **Becomes the slice's `test_plan`** (falls back to `steps`) |
+| `done_criteria` | no | Becomes TL-owned reviewer acceptance criteria |
 | `context`, `read_first`, `steps` | no | Passed through to `spawn_leaf` as structured spec fields |
 
 `boundary` and `verify` are doing double duty: they are both instructions to the
 leaf and the controller's own ownership and test-plan records. Two leaves whose
 boundaries overlap will fail path-ownership validation rather than race — write
 disjoint boundaries or merge the slices.
+
+The TL composes reviewer acceptance criteria from the run-state `test_plan`,
+plan-level `verify` and `boundary`, owned paths, and `done_criteria`. The PR
+body may document the work, but it is not the authoritative source for review
+acceptance.
 
 ### `workers` — ephemeral, no branch, no PR
 

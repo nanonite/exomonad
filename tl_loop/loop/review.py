@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +12,62 @@ from tl_loop.client.effects import ToolResult
 from tl_loop.state.schema import SliceState, Verdict
 
 DEFAULT_REVIEW_POLICY = Path(".exo/review-policy.toml")
+
+
+class AcceptanceCriteriaError(ValueError):
+    """The TL cannot compose a complete reviewer acceptance contract."""
+
+
+def compose_acceptance_criteria(
+    slice_state: SliceState,
+    plan: Mapping[str, object] | object,
+) -> tuple[str, ...]:
+    """Compose reviewer bullets from TL-owned state and the structured plan.
+
+    The PR body is deliberately not an input. Run-state verification remains
+    authoritative, while the plan supplies its additional verification,
+    boundary, and Definition-of-Done statements.
+    """
+    sources = (
+        ("Run-state test plan", slice_state.test_plan),
+        ("Plan verification", _plan_values(plan, "verify")),
+        ("Owned paths", slice_state.paths),
+        ("Plan boundary", _plan_values(plan, "boundary")),
+        ("DONE CRITERIA", _plan_values(plan, "done_criteria")),
+    )
+    criteria: list[str] = []
+    seen: set[str] = set()
+    for label, values in sources:
+        for value in values:
+            entry = f"{label}: {value}"
+            if entry not in seen:
+                criteria.append(entry)
+                seen.add(entry)
+    if not criteria:
+        raise AcceptanceCriteriaError(
+            f"slice {slice_state.id!r} has no reviewer acceptance criteria"
+        )
+    return tuple(criteria)
+
+
+def _plan_values(
+    plan: Mapping[str, object] | object,
+    field_name: str,
+) -> tuple[str, ...]:
+    value = (
+        plan.get(field_name, ())
+        if isinstance(plan, Mapping)
+        else getattr(plan, field_name, ())
+    )
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise AcceptanceCriteriaError(f"plan {field_name} must be an array")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise AcceptanceCriteriaError(
+            f"plan {field_name} must contain non-empty strings"
+        )
+    return tuple(item.strip() for item in value)
 
 
 class ReviewGateError(ValueError):
@@ -126,6 +182,7 @@ def _parse_timestamp(value: str) -> datetime:
 
 __all__ = [
     "DEFAULT_REVIEW_POLICY",
+    "AcceptanceCriteriaError",
     "MissingReviewedHead",
     "MissingVerdict",
     "ReviewEvidence",
@@ -133,6 +190,7 @@ __all__ = [
     "ReviewHeadMismatch",
     "StaleVerdict",
     "VerdictNotApproved",
+    "compose_acceptance_criteria",
     "load_freshness_window",
     "verify_review",
     "watcher_head",
