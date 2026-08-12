@@ -289,6 +289,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E5: Remove TL-specific MCP tools built for an interactive coordinator (#722)
 - E5 :: E5.6 Update the role x tool matrix (#751)
 - E5 :: E5.5 Rewrite .exo/roles/devswarm/context/chainlink-tl.md (#750)
 - E5 :: E5.4 Drop check_inbox from root/tl registration (#749)
