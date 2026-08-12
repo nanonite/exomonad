@@ -3,130 +3,96 @@ paths:
   - "**"
 ---
 
-# Chainlink TL Protocol
+# Chainlink Issue Context
 
-You are a TL enhanced with chainlink for structured issue tracking across the cognition tree.
+This file supplies Chainlink vocabulary for controller-dispatched `root` and
+`tl` role processes. It is a reference, not an interactive coordinator
+protocol. `tl_loop` is the programmatic controller: it owns the WorkPlan,
+dispatch, event consumption, review gates, merge decisions, escalation, and
+run termination through durable state under `.exo/tl-loop/`.
 
-Chainlink is your single source of truth for what work exists, who owns it, and what blocks what. Every spawned agent, every subtask, every dependency — tracked in chainlink, not in your head.
+## Controller boundary
 
-## Definition-of-Done PR contract
+There is one controller per run. The `root` and `tl` roles remain RPC surfaces
+for role-scoped agent work; they do not implement a second coordinator.
 
-Copy the issue's Definition of Done bullets verbatim into the PR body under the literal `## Acceptance Criteria` heading on every new or updated `file_pr` call. For review repairs, pass the same bullets through `resume_pr`'s `done_criteria` field and require the resumed owner to preserve or update that heading rather than dropping it.
+- Planning, dependency ordering, retries, harness selection, and budgets belong
+  to the controller's policy and FSM.
+- Review and CI observations come from the watcher and Forgejo. A reviewed
+  head SHA, the closed adjudication verdict, repository policy, and CI state
+  are required before the controller can authorize a merge.
+- A bounded failure becomes a named durable gate. It is not resolved by a
+  redispatch prompt or by ending the server.
+- A child sub-TL is a nested `tl_run` represented in the WorkPlan, not a new
+  interactive coordinator session.
 
-## One-shot lifecycle and guidance contract
+See [the programming guide](../../../../docs/guides/programming-the-tl.md) and
+[the TL-as-loop decision](../../../../docs/decisions/tl-as-loop.md) for the
+authoritative controller contracts.
 
-Chainlink keeps one workflow owner per issue: one agent identity, one
-worktree, one branch, and one PR. Each dev or reviewer process handles one
-assignment per process invocation. One-shot means one assignment per process,
-not non-interactive execution.
+## Issue ownership and one-shot work
 
-While an invocation is live, guidance is available through the durable inbox
-and exact validated tmux-pane injection for that invocation. Stale or
-unverifiable targets are rejected and never redirected to the root pane. When
-the invocation is dormant, guidance remains unread for `resume_pr`. A resume
-starts a fresh invocation in the same issue-owned worktree, branch, and PR; it
-does not create a new owner or a stacked PR. Reviewer guidance is SHA-scoped.
+Every assigned issue has one owner, worktree, branch, and PR. A process handles
+one assignment and publishes its authoritative result before exiting. The
+issue ID belongs in the task specification and in the PR's acceptance
+criteria.
 
-The watcher and Forgejo PR publication, review verdict, and CI observations are
-authoritative. Inbox delivery, tmux injection, process exit, and local pushes
-are not PR, review, or CI state transitions. After a dev publishes a PR or a
-reviewer submits its exact-SHA verdict, that invocation exits; later work uses
-`resume_pr`. Stacked PRs are out of scope.
+- Leaves implement in issue-owned worktrees and file PRs.
+- Reviewers judge the exact PR head and record an exact-SHA verdict.
+- Watcher observations, Forgejo PR publication, review verdicts, and CI are
+  authoritative. Inbox delivery, tmux injection, process exit, and local
+  pushes are lifecycle signals only.
+- A review repair resumes the existing owner with `resume_pr`; it does not
+  create a sibling owner, replacement suffix, new branch, or stacked PR.
+- The PR body must retain the literal `## Acceptance Criteria` heading with
+  the issue's criteria on every `file_pr` update.
 
-## Canonical DB Location
+## WorkPlan authoring
 
-The project's chainlink DB lives at `<project_root>/.chainlink/` regardless of which worktree any agent runs in. ExoMonad sets `CHAINLINK_DB` to that directory in every spawned agent's environment, so leaves and workers resolve the same DB you do.
+When writing a root or child plan, use this order:
 
-- Run `chainlink ...` and `chainlink_*` MCP tools normally; never pass `--db` explicitly.
-- When you spec a leaf, you do not need to tell it where the DB is — assume it has the env var. If it does not, that is an infrastructure bug to report, not a per-leaf workaround.
-- Sub-TLs you spawn inherit the same env var; they orchestrate against the same canonical DB.
+1. **ANTI-PATTERNS** — explicit prohibitions first.
+2. **READ FIRST** — exact files, interfaces, and tests.
+3. **STEPS** — bounded actions with named ownership paths.
+4. **VERIFY** — exact commands and expected evidence.
+5. **DONE CRITERIA** — observable completion conditions.
 
-## TL Chainlink Workflow
+Each slice declares its paths, dependencies, base ref, test plan, and bounded
+retry expectations. Harness, model, budget, and fallback choices are not
+invented in the prompt; they come from `.exo/harness_policy.toml` and the
+controller selector.
 
-### 1. Scaffold the Issue Tree
+## Chainlink issue handling
 
-Before spawning any child, create the chainlink issue tree so children can claim their work:
+Use the shared Chainlink database and issue IDs consistently:
 
-```
-chainlink_issue_create title="Feature title" priority="<priority>" labels=["<label>"]
-chainlink_milestone_create title="M<number>" description="..."
-chainlink_issue_update issue_id=<id> milestone="<milestone-name>"
-chainlink_subissue_create parent_id=<parent-id> title="Child task description"
-```
+- Create or shape the issue tree before dispatching work.
+- Include the issue ID in every worker or leaf task description.
+- Record discoveries and decisions as bounded issue comments.
+- Express dependencies with issue blocks and keep the WorkPlan aligned with
+  the issue tree.
+- Close an issue only after its implementation, verification, review, and
+  merge obligations are complete and the changelog update is committed.
 
-- `chainlink_cascade` — show what breaks if this assumption is wrong
+Controller-dispatched slices keep their close authority in `tl_loop`. A role
+process may close only work it directly owns under the local workflow.
 
-### 2. Spawn Workers with Issue IDs
+## Tool boundaries
 
-When calling `spawn_worker` or `spawn_leaf`, include the chainlink issue ID in the task description so the child knows what to claim:
+Role tools are scoped by the authority matrix in
+`docs/architecture/agent-system.md`:
 
-```
-spawn_worker(
-  task="Implement X (chainlink issue #42)"
-)
-```
+- `poll_workers` is a heartbeat observation, not an idle-loop completion
+  protocol.
+- `merge_pr` is callable only within the controller's verified merge gates; a
+  role must not force a stalled or unreviewed PR through.
+- `check_inbox` is for human, worker, and reviewer delivery where registered;
+  it is not the controller's state machine.
+- `shutdown_server` is not run termination. Terminal phases and named gates
+  belong to the controller.
+- `fork_wave` is not a dispatch primitive. Recursive TL work is a nested
+  `tl_run` in the WorkPlan.
 
-Omit `agent_type` to use `{{spawn_agent_type}}`; set it only when the task explicitly requires a different type.
-
-### 3. Supervise Via Session Status
-
-Use `chainlink_session_status` to check progress of spawned workers without polling them directly:
-
-- Shows whether a session exists, which issue is active, and the last recorded action
-- Non-blocking — does not consume worker context window
-
-### 4. Handle Blocks and Dependencies
-
-When a child reports a blocking issue:
-
-```
-chainlink_block child_id=<child-id> blocker_id=<blocker-id>
-chainlink_cascade issue_id=<id>
-chainlink_issue_update issue_id=<id> status="blocked"
-```
-
-Use `chainlink_issue_list` to inspect open work when a blocker is resolved.
-
-### 5. Merge and Close
-
-When a child sends `notify_parent` with success:
-1. Confirm the child ended its Chainlink session with handoff notes
-2. Verify CI passes on the child's PR
-3. Merge the child's PR. For dev-leaf PRs, pass `chainlink_issue_id` to `merge_pr` so it closes the issue and commits `CHANGELOG.md` before merging
-4. Close any worker-owned Chainlink issue with `chainlink_issue_close`, then immediately stage and commit `CHANGELOG.md` before spawning the next wave or calling `merge_pr`
-5. If all children are done and no more waves remain, file PR upward and `notify_parent` with success
-
-## Available MCP Tools
-
-| Tool | Purpose |
-|------|---------|
-| `chainlink_issue_create` | Create a new issue with title, priority, labels |
-| `chainlink_issue_show` | Show full issue details including description and comments |
-| `chainlink_issue_list` | List issues by status, priority, label, milestone |
-| `chainlink_issue_update` | Update status, priority, labels, milestone |
-| `chainlink_issue_close` | Close an issue (auto-updates CHANGELOG.md) |
-| `chainlink_subissue_create` | Create a child issue under a parent |
-| `chainlink_session_status` | Read session progress for active work |
-| `chainlink_timer_start` | Start coordinator-owned lifecycle timing |
-| `chainlink_timer_stop` | Stop coordinator-owned lifecycle timing for a specific issue |
-| `chainlink_timer_status` | Check active timer state for one issue or all active timers |
-| `chainlink_block` | Set a blocking dependency between issues |
-| `chainlink_cascade` | Show falsification cascade for an issue |
-| `chainlink_milestone_create` | Create a milestone for grouping issues |
-| `chainlink_milestone_list` | List milestones and their progress |
-| `send_tmux_message` | Send notifications to parent/peers |
-
-## Cost Model
-
-Chainlink operations are cheap. Use them liberally. Prefer chainlink for coordination metadata; reserve Teams messages for content that requires human-like handoff.
-
-## Hard Rules
-
-- Always create the chainlink issue BEFORE spawning a child for it
-- Include the chainlink issue ID in every spawn_worker/spawn_leaf task description
-- Use `chainlink_session_status` for supervision — never send a probing message
-- Start timers when assigning work and stop them with the same issue id after review, CI, and merge complete
-- Close the issue when the work is merged, not when the PR is filed
-- Never ask a worker or dev leaf to close its own assigned issue
-- Never use Chainlink agent, sync, or lock commands
-- Use `chainlink_issue_comment` for progress notes, use `send_tmux_message` for urgent coordination only
+Do not create a duplicate coordinator, scrape tmux or peer messages for
+authoritative state, or bypass the issue-owned repair path. Never touch another
+agent's worktree or checkout another branch.
