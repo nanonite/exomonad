@@ -1513,9 +1513,11 @@ mod tests {
             )?,
             GuidanceState::Abandoned
         );
-        assert!(store
+        let next = store
             .claim_next(&BoundaryEvidence::turn_finished("agent"), &consumer, 60)?
-            .is_some());
+            .expect("next batch after abandonment");
+        assert_eq!(next.batch_id, second.batch_id);
+        assert_eq!(next.queue_seq, second.queue_seq);
         Ok(())
     }
 
@@ -1579,13 +1581,18 @@ mod tests {
     fn cancel_is_terminal_and_not_claimable() -> Result<()> {
         let store = InboxStore::open_in_memory()?;
         let batch = store
-            .enqueue_batch(request("agent", QueueClass::Steering, None))?
+            .enqueue_batch(request("agent", QueueClass::Steering, Some("cancelled")))?
             .batch;
+        assert_eq!(batch.queue_seq, 0);
         assert_eq!(
             store.cancel_batch(&batch.batch_id, "operator_stop")?,
             GuidanceState::Cancelled
         );
-        assert!(store
+        let next = store
+            .enqueue_batch(request("agent", QueueClass::Steering, Some("after-cancel")))?
+            .batch;
+        assert_eq!(next.queue_seq, 1);
+        let claimed = store
             .claim_next(
                 &BoundaryEvidence::turn_finished("agent"),
                 &GuidanceConsumer {
@@ -1595,7 +1602,9 @@ mod tests {
                 },
                 60,
             )?
-            .is_none());
+            .expect("post-cancel batch");
+        assert_eq!(claimed.batch_id, next.batch_id);
+        assert_eq!(claimed.queue_seq, 1);
         Ok(())
     }
 }
