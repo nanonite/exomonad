@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E2 :: E2.2 Emit canonical pr.review ledger event (#730)
 - E2 :: E2.1 Add head_sha and structured findings to reviewer tool args (#729)
 - E1 :: E1.5 Declare target event contract in tl-loop-event-bridge.md (#728)
 - E1 :: E1.4 Fix docs/architecture/agent-system.md and .html (#727)

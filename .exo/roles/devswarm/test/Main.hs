@@ -80,6 +80,7 @@ runRoleHookTests = do
   assertRoleAllow "root" RootRole.config
   assertReviewerToolList
   assertReviewerVerdictSchemas
+  assertReviewerEventPayload
   assertNoRoleExposesShutdown
   assertReviewerPostToolUseEventName
   assertReviewerCanExitDecisions
@@ -752,6 +753,23 @@ assertReviewerVerdictSchemas =
           other -> fail $ "expected one reviewer schema for " <> T.unpack toolName <> ", got " <> show (length other)
   where
     hasKey key object = KM.member (AesonKey.fromText key) object
+
+assertReviewerEventPayload :: IO ()
+assertReviewerEventPayload =
+  case ReviewerRole.reviewEventPayload 7 "main.review-pr-7-codex" "approved" "GO" "abc123" "Looks good." [ReviewerRole.ReviewFinding "info" "src/Main.hs" "The change is covered by tests."] of
+    Aeson.Object payload -> do
+      assertJsonString "review payload kind" "approved" "kind" payload
+      assertJsonString "review payload verdict" "GO" "verdict" payload
+      assertJsonString "review payload head" "abc123" "head_sha" payload
+      assertJsonString "review payload branch" "main.review-pr-7-codex" "branch" payload
+      assertBool "review payload includes findings" (hasKey "findings" payload)
+    other -> fail $ "review payload should be an object, got " <> show other
+  where
+    hasKey key object = KM.member (AesonKey.fromText key) object
+    assertJsonString label_ expected key object =
+      case KM.lookup (AesonKey.fromText key) object of
+        Just (Aeson.String actual) -> assertEqual label_ expected actual
+        other -> fail $ label_ <> " should be a JSON string, got " <> show other
 
 assertReviewerAcceptanceCriteriaGuidance :: IO ()
 assertReviewerAcceptanceCriteriaGuidance = do

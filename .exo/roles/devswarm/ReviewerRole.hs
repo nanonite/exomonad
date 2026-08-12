@@ -6,10 +6,11 @@
 
 -- | Reviewer role: diff review only — no spawn, merge, or PR tools.
 --   Tool restrictions enforced at the WASM hook layer.
-module ReviewerRole (config, Tools, appendVerdict, emptyReviewFile, ReviewFile (..), ReviewVerdict (..), ReviewFinding (..), reviewerAcceptanceCriteriaGuidance) where
+module ReviewerRole (config, Tools, appendVerdict, emptyReviewFile, ReviewFile (..), ReviewVerdict (..), ReviewFinding (..), reviewEventPayload, reviewerAcceptanceCriteriaGuidance) where
 
 import Control.Monad (void)
 import Control.Monad.Freer (Eff)
+import Data.ByteString.Lazy qualified as BSL
 import Data.Aeson (object, (.=))
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
@@ -86,6 +87,14 @@ data ReviewFinding = ReviewFinding
   deriving (Show, Eq, Generic)
 
 instance JsonSchema ReviewFinding
+
+instance Aeson.ToJSON ReviewFinding where
+  toJSON finding =
+    object
+      [ "severity" .= findingSeverity finding,
+        "path" .= findingPath finding,
+        "rationale" .= findingRationale finding
+      ]
 
 instance Aeson.FromJSON ReviewFinding where
   parseJSON = Aeson.withObject "ReviewFinding" $ \v ->
@@ -287,6 +296,34 @@ reviewBodyWithLocation body path diffHunk =
         <> maybe [] (\h -> ["```diff\n" <> h <> "\n```"]) diffHunk
     )
 
+reviewEventPayload :: Int -> Text -> Text -> Text -> Text -> Text -> [ReviewFinding] -> Aeson.Value
+reviewEventPayload prNumber branch kind verdict headSha body findings =
+  object
+    [ "kind" .= kind,
+      "verdict" .= verdict,
+      "review_state" .= kind,
+      "pr_number" .= prNumber,
+      "branch" .= branch,
+      "head_sha" .= headSha,
+      "body" .= body,
+      "notification" .= body,
+      "findings" .= findings
+    ]
+
+emitReviewEvent :: Text -> Int -> Text -> Text -> Text -> Text -> [ReviewFinding] -> Eff Effects ()
+emitReviewEvent branch prNumber kind verdict headSha body findings =
+  void $
+    suspendEffect_ @Log.LogEmitEvent
+      ( Log.EmitEventRequest
+          { Log.emitEventRequestEventType = "pr.review",
+            Log.emitEventRequestPayload =
+              BSL.toStrict $
+                Aeson.encode $
+                  reviewEventPayload prNumber branch kind verdict headSha body findings,
+            Log.emitEventRequestTimestamp = 0
+          }
+      )
+
 data ReviewerApprovePR
 
 instance MCPTool ReviewerApprovePR where
@@ -309,6 +346,7 @@ instance MCPTool ReviewerApprovePR where
         case result of
           Left err -> pure $ errorResult err
           Right status -> do
+            emitReviewEvent branch (apPrNumber args) "approved" "GO" (apHeadSha args) (apBody args) (apFindings args)
             void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerApprovedEv (apPrNumber args))
             pure $ successResult $ object ["success" .= True, "status" .= status]
 
@@ -337,6 +375,7 @@ instance MCPTool ReviewerRequestChanges where
         case result of
           Left err -> pure $ errorResult err
           Right status -> do
+            emitReviewEvent branch (rcPrNumber args) "changes_requested" "NO-GO" (rcHeadSha args) (rcBody args) (rcFindings args)
             void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv (rcPrNumber args) (rcBody args))
             pure $ successResult $ object ["success" .= True, "status" .= status]
 
