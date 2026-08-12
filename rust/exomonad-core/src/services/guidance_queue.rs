@@ -33,7 +33,7 @@ pub enum QueueClass {
 }
 
 impl QueueClass {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Steering => "steering",
             Self::FollowUp => "follow_up",

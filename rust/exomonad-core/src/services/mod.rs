@@ -3,6 +3,7 @@ pub mod agent_inbox;
 pub mod agent_resolver;
 pub mod agent_resources;
 pub mod analysis_import;
+pub mod claude_adapter;
 pub mod claude_session_registry;
 pub mod command;
 pub mod complexity_classifier;
@@ -56,6 +57,7 @@ pub use self::agent_resolver::{AgentIdentityRecord, AgentResolver};
 pub use self::analysis_import::{
     import_sources, AnalysisStore, ImportOptions, ImportSummary, SourceFormat,
 };
+pub use self::claude_adapter::ClaudeCodeAdapter;
 pub use self::claude_session_registry::ClaudeSessionRegistry;
 pub use self::event_log::EventLog;
 pub use self::event_queue::EventQueue;
