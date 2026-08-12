@@ -476,7 +476,9 @@ def _run_loop(
             next_phase = transition(phase, fsm_event)
         except IllegalTransition as error:
             raise TLLoopError(str(error)) from error
-        next_slices = _update_slices(state.slices, fsm_event)
+        next_slices = _update_slices(
+            state.slices, fsm_event, slice_id=_event_slice_id(event, state)
+        )
         state = store.checkpoint(next_phase, next_slices, state.budgets, event_seq)
         source.acknowledge(event)
         before_tag = _phase_tag(phase)
@@ -995,6 +997,8 @@ def _event_belongs_to_plan(event: EventEnvelope, expected: set[str]) -> bool:
             return slug is None or slug in expected
     if event.kind is EventKind.PR_FILED:
         return True
+    if event.kind is EventKind.PR_UPDATED:
+        return True
     if event.agent_id in expected:
         return True
     for key in ("slug", "child_agent", "slice_id"):
@@ -1002,6 +1006,14 @@ def _event_belongs_to_plan(event: EventEnvelope, expected: set[str]) -> bool:
         if isinstance(value, str) and value in expected:
             return True
     return False
+
+
+def _event_slice_id(event: EventEnvelope, state: RunState) -> str | None:
+    if event.slice_id is not None:
+        return event.slice_id
+    if event.kind in {EventKind.PR_FILED, EventKind.PR_UPDATED} and event.agent_id in state.slices:
+        return event.agent_id
+    return None
 
 
 def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool:

@@ -18,7 +18,10 @@ from tl_loop.fsm.event import (
     ChildFailed,
     ChildSpawned,
     OwnPRFiled,
+    PRFiled,
+    PRHeadChanged,
     PRMerged,
+    PRUpdated,
     TLEvent,
 )
 from tl_loop.fsm.phase import (
@@ -142,14 +145,20 @@ class TLEventDecoder:
             return self._decode_completion(event)
         if event.kind is EventKind.AGENT_STUCK:
             return ChildFailed(_agent(event), _string(event.data, "reason", "agent.stuck"))
+        if event.kind is EventKind.PR_FILED:
+            return PRFiled(
+                _positive_int(event.data, "pr_number", event.event_type),
+                _head_sha(event),
+                event.slice_id,
+            )
+        if event.kind is EventKind.PR_UPDATED:
+            return PRUpdated(
+                _positive_int(event.data, "pr_number", event.event_type),
+                _head_sha(event),
+                event.slice_id,
+            )
         if event.kind is EventKind.PR_MERGED:
             return PRMerged(_positive_int(event.data, "pr_number", event.event_type), _agent(event))
-        if event.kind is EventKind.PR_FILED:
-            return OwnPRFiled(
-                _positive_int(event.data, "pr_number", event.event_type),
-                _string(event.data, "url", event.event_type),
-                _string(event.data, "branch", event.event_type),
-            )
         raise ShadowLoopError(f"no shadow FSM mapping for {event.event_type!r}")
 
     def _decode_explicit(self, value: object) -> TLEvent:
@@ -184,6 +193,16 @@ class TLEventDecoder:
                 _required_value(value, "url"),
                 _required_value(value, "branch"),
             )
+        if kind in {"pr_filed", "pr_updated", "pr_head_changed"}:
+            pr_number = value.get("pr_number")
+            if type(pr_number) is not int or pr_number <= 0:
+                raise ShadowLoopError("shadow_event.pr_number must be a positive integer")
+            head_sha = _required_value(value, "head_sha")
+            slice_id = value.get("slice_id")
+            if slice_id is not None and (not isinstance(slice_id, str) or not slice_id):
+                raise ShadowLoopError("shadow_event.slice_id must be null or a non-empty string")
+            event_type = PRFiled if kind == "pr_filed" else PRHeadChanged
+            return event_type(pr_number, head_sha, slice_id)
         raise ShadowLoopError(f"unknown shadow FSM event kind: {kind!r}")
 
     def _decode_parent_notification(self, event: EventEnvelope) -> TLEvent:
@@ -276,7 +295,9 @@ class ShadowLoop:
             if event_seq is None:
                 raise ShadowLoopError(f"event {event.event_type!r} has no run_seq")
             judgment = _judgment(self.judgments, fsm_event, phase, next_phase)
-            slices = _update_slices(state.slices, fsm_event)
+            slices = _update_slices(
+                state.slices, fsm_event, slice_id=event.slice_id or event.agent_id
+            )
             action = IntendedAction(
                 judgment.kind,
                 _target(event, fsm_event),
@@ -314,9 +335,37 @@ def _judgment(
     return judgments.choose_dispatch(event, before, after)
 
 
-def _update_slices(slices: Mapping[str, SliceState], event: TLEvent) -> dict[str, SliceState]:
+def _update_slices(
+    slices: Mapping[str, SliceState], event: TLEvent, *, slice_id: str | None = None
+) -> dict[str, SliceState]:
     updated = dict(slices)
-    if isinstance(event, ChildSpawned):
+    if isinstance(event, (PRFiled, PRUpdated)):
+        target_id = event.slice_id or slice_id
+        if target_id is None:
+            matches = [
+                candidate_id
+                for candidate_id, candidate in slices.items()
+                if candidate.pr_number == event.pr_number
+            ]
+            target_id = matches[0] if len(matches) == 1 else None
+        current = updated.get(target_id) if target_id is not None else None
+        if current is None:
+            return updated
+        if current.reviewed_head == event.head_sha:
+            updated[target_id] = replace(current, pr_number=event.pr_number)
+            return updated
+        updated[target_id] = replace(
+            current,
+            status=SliceStatus.IN_REVIEW,
+            pr_number=event.pr_number,
+            reviewed_head=event.head_sha,
+            review_findings={},
+            ci_state={},
+            reviewer_attempt={},
+            verdict=None,
+            verdict_at=None,
+        )
+    elif isinstance(event, ChildSpawned):
         handle = event.handle
         current = updated.get(handle.slug)
         if current is None:
@@ -414,6 +463,8 @@ def _target(event: EventEnvelope, fsm_event: TLEvent) -> str:
         return fsm_event.handle.slug
     if isinstance(fsm_event, (ChildCompleted, ChildFailed, PRMerged)):
         return fsm_event.slug
+    if isinstance(fsm_event, (PRFiled, PRUpdated)):
+        return fsm_event.slice_id or event.agent_id or "controller"
     return "controller"
 
 
@@ -453,6 +504,12 @@ def _positive_int(value: Mapping[str, object], key: str, event_type: str) -> int
     if type(candidate) is not int or candidate <= 0:
         raise ShadowLoopError(f"{event_type!r}: {key} must be a positive integer")
     return candidate
+
+
+def _head_sha(event: EventEnvelope) -> str:
+    if event.head_sha is None:
+        raise ShadowLoopError(f"{event.event_type!r}: head_sha is required")
+    return event.head_sha
 
 
 __all__ = [

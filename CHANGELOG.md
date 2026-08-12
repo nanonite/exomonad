@@ -287,6 +287,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E3 :: E3.2 Add pr.filed and pr.updated/head-change transitions (#735)
 - E3 :: E3.1 Per-head review state in tl_loop/state/schema.py (#734)
 - E2 :: E2.5 Extend role tests for the new args and ledger event (#733)
 - E2 :: E2.4 Compose acceptance criteria in the TL (#732)

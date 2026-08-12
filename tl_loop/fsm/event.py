@@ -42,6 +42,29 @@ class PRMerged(TLEvent):
 
 
 @dataclass(frozen=True)
+class PRFiled(TLEvent):
+    """A slice PR was filed for a particular head."""
+
+    pr_number: int
+    head_sha: str
+    slice_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PRUpdated(TLEvent):
+    """A slice PR was updated; a new head starts fresh gate state."""
+
+    pr_number: int
+    head_sha: str
+    slice_id: str | None = None
+
+
+# Name the semantic transition explicitly for callers that do not care about
+# the wire event which reported it.
+PRHeadChanged = PRUpdated
+
+
+@dataclass(frozen=True)
 class AllChildrenDone(TLEvent):
     """All children have completed their lifecycle."""
 

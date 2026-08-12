@@ -13,24 +13,26 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
+from tl_loop.fsm.event import PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.driver import (
     DepthLimitExceeded,
-    SubTLTask,
     LoopLimitExceeded,
+    SubTLTask,
     TLLoopConfig,
     WorkerTask,
     WorkPlan,
     run_tl_loop,
     tl_run,
 )
+from tl_loop.loop.shadow import TLEventDecoder, _update_slices
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
-from tl_loop.state.schema import BudgetLedger
-
+from tl_loop.state.schema import BudgetLedger, SliceState, SliceStatus, Verdict
 from tl_loop.state.store import load as load_state
+
 
 @dataclass
 class SyntheticQueue:
@@ -96,6 +98,75 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert result.final_state.slices["worker-a"].status.value == "merged"
     assert result.final_state.slices["leaf-a"].status.value == "merged"
     assert source.acknowledged == [1, 2, 3, 4, 5]
+
+
+def test_pr_head_change_clears_per_head_gate_state() -> None:
+    current = SliceState(
+        id="leaf-a",
+        status=SliceStatus.IN_REVIEW,
+        paths=("src/leaf.py",),
+        depends_on=(),
+        base_ref="main",
+        test_plan=("just tl-loop-test",),
+        agent_type="codex",
+        model="gpt-5",
+        branch="main.leaf-a",
+        worktree=".worktrees/leaf-a",
+        pr_number=42,
+        reviewed_head="head-a",
+        attempts=2,
+        verdict=Verdict.GO,
+        review_findings={
+            "head-a": (
+                {
+                    "severity": "blocking",
+                    "path": "src/leaf.py",
+                    "rationale": "old finding",
+                },
+            )
+        },
+        ci_state={"head-a": "success"},
+        reviewer_attempt={"head-a": 1},
+        repair_attempts=3,
+    )
+
+    updated = _update_slices(
+        {"leaf-a": current}, PRUpdated(42, "head-b", "leaf-a")
+    )["leaf-a"]
+
+    assert updated.status is SliceStatus.IN_REVIEW
+    assert updated.pr_number == 42
+    assert updated.reviewed_head == "head-b"
+    assert updated.review_findings == {}
+    assert updated.ci_state == {}
+    assert updated.reviewer_attempt == {}
+    assert updated.repair_attempts == 3
+
+    assert updated.verdict is None
+    assert updated.verdict_at is None
+
+
+def test_decoder_maps_wire_pr_filed_and_pr_updated_events() -> None:
+    def raw(event_type: str, sequence: int, head_sha: str) -> dict[str, object]:
+        return {
+            "type": event_type,
+            "run_seq": sequence,
+            "run_id": "run-1",
+            "agent_id": "leaf-a",
+            "lifecycle_state": "emitted",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": head_sha,
+            },
+        }
+
+    filed = TLEventDecoder().decode(project(raw("pr.filed", 1, "head-a")))
+    updated = TLEventDecoder().decode(project(raw("pr.updated", 2, "head-b")))
+
+    assert filed == PRFiled(42, "head-a", "leaf-a")
+    assert updated == PRUpdated(42, "head-b", "leaf-a")
 
 
 def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> None:

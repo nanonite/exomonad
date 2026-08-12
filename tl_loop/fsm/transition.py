@@ -10,7 +10,9 @@ from .event import (
     ChildFailed,
     ChildSpawned,
     OwnPRFiled,
+    PRFiled,
     PRMerged,
+    PRUpdated,
     TLEvent,
 )
 from .phase import (
@@ -57,6 +59,8 @@ def transition(phase: PhaseValue, event: TLEvent) -> PhaseValue:
         if isinstance(phase, (TLMerging, TLWaiting)):
             return _without_child(phase.children, event.slug)
         raise IllegalTransition(phase, event)
+    if isinstance(event, (PRFiled, PRUpdated)):
+        return phase
     if isinstance(event, AllChildrenDone):
         return TLDone()
     if isinstance(event, OwnPRFiled):

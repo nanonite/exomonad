@@ -6,7 +6,10 @@ from .event import (
     ChildFailed,
     ChildSpawned,
     OwnPRFiled,
+    PRFiled,
+    PRHeadChanged,
     PRMerged,
+    PRUpdated,
     TLEvent,
 )
 from .phase import (
@@ -34,7 +37,10 @@ __all__ = [
     "ChildSpawned",
     "IllegalTransition",
     "OwnPRFiled",
+    "PRFiled",
+    "PRHeadChanged",
     "PRMerged",
+    "PRUpdated",
     "Phase",
     "PhaseValue",
     "TLAllMerged",

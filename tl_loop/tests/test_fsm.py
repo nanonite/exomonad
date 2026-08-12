@@ -15,20 +15,21 @@ from tl_loop.fsm import (
     ChildSpawned,
     IllegalTransition,
     OwnPRFiled,
+    PRFiled,
     PRMerged,
-    TLEvent,
+    PRUpdated,
     TLAllMerged,
     TLDispatching,
+    TLDone,
+    TLEvent,
     TLFailed,
+    TLMerging,
     TLPhase,
     TLPlanning,
     TLPRFiled,
-    TLDone,
-    TLMerging,
     TLWaiting,
     transition,
 )
-
 
 HANDLE_A = ChildHandle("a", "main.a", "codex")
 HANDLE_B = ChildHandle("b", "main.b", "claude")
@@ -84,6 +85,12 @@ def test_pr_merged_handles_waiting_and_merging_phases() -> None:
     assert transition(TLWaiting({"a": HANDLE_A}), PRMerged(10, "a")) == TLAllMerged()
     merging = TLMerging(10, {"a": HANDLE_A, "b": HANDLE_B})
     assert transition(merging, PRMerged(10, "a")) == TLWaiting({"b": HANDLE_B})
+
+
+def test_pr_lifecycle_transitions_preserve_the_current_tl_phase() -> None:
+    phase = TLWaiting({"a": HANDLE_A})
+    assert transition(phase, PRFiled(10, "head-a", "a")) == phase
+    assert transition(phase, PRUpdated(10, "head-b", "a")) == phase
 
 
 def test_all_children_done_and_own_pr_filed_are_explicit_wildcard_arms() -> None:
