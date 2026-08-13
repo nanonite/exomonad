@@ -94,6 +94,15 @@ def _effect_operations(result: TLRunResult) -> list[str]:
     ]
 
 
+def _merge_decisions(transport: RecordingTransport) -> list[JsonObject]:
+    return [
+        cast(JsonObject, arguments["payload"])
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments["event_type"] == "tl.merge_decided"
+    ]
+
+
 @dataclass
 class ReviewRepairTransport(RecordingTransport):
     """Effect double that exposes the PR state required by compose_repair."""
@@ -185,20 +194,37 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     ]
 
 
-def test_observability_failure_does_not_change_terminal_state(tmp_path: Path) -> None:
-    transport = RecordingTransport(fail_observability=True)
-    result = run_tl_loop(
-        "observability-failure-run",
+def test_observability_failure_does_not_change_terminal_state(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    baseline_transport = RecordingTransport()
+    baseline = run_tl_loop(
+        "observability-baseline-run",
         _plan(),
-        SyntheticQueue(_lifecycle_events("observability-failure-run")),
-        EffectClient(transport),
+        SyntheticQueue(_lifecycle_events("observability-baseline-run")),
+        EffectClient(baseline_transport),
         config=_config(),
-        root_dir=tmp_path,
+        root_dir=tmp_path / "baseline",
     )
+    failed_transport = RecordingTransport(fail_observability=True)
+    with caplog.at_level("WARNING"):
+        result = run_tl_loop(
+            "observability-failure-run",
+            _plan(),
+            SyntheticQueue(_lifecycle_events("observability-failure-run")),
+            EffectClient(failed_transport),
+            config=_config(),
+            root_dir=tmp_path / "failed",
+        )
 
-    assert result.final_state.fsm.phase is TLPhase.TLDone
+    assert result.final_state.fsm.phase is baseline.final_state.fsm.phase is TLPhase.TLDone
+    assert result.final_state.slices["leaf-a"].status is baseline.final_state.slices["leaf-a"].status
     assert result.final_state.slices["leaf-a"].status is SliceStatus.MERGED
-    assert "merge_pr" in _effect_names(transport)
+    assert "merge_pr" in _effect_names(failed_transport)
+    assert _merge_decisions(failed_transport) == _merge_decisions(baseline_transport)
+    assert _merge_decisions(failed_transport)[0]["decision"] == "merge"
+    assert "controller event tl.merge_decided failed: ledger unavailable" in caplog.text
 
 
 def test_idle_timeout_parks_with_named_gate_and_never_merges(tmp_path: Path) -> None:
