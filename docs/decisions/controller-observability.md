@@ -15,6 +15,8 @@ The agent and PR layer is well covered. An audit on 2026-08-12 found:
 - **41 of 41 declared event types have a producer** in non-test source.
   `agent.stop_check` is emitted by the dev stop hook in
   `.exo/lib/HttpDevHooks.hs:73-85`.
+- The observability gate now automates this declared-vs-emitted audit and fails
+  when a non-custom registry type is absent from non-test source.
 - **The 11 denominator rules in `expected-events.v1.json` cover the merge
   path**, including `merge_request_requires_approved_current_head`,
   `merge_request_requires_passing_ci_current_head`, and

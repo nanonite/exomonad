@@ -12,6 +12,8 @@ These files freeze the Phase 0 contracts used by the append-only observability p
   for identity, delivery, review, gaps, state reconstruction, privacy, and provenance.
 - `scripts/validate_observability_contracts.py` validates these contracts and fixtures with only the
   Python standard library.
+- The same gate audits every non-custom registry type against non-test source under
+  `.exo/`, `haskell/`, `rust/`, and `tl_loop/`, excluding test and generated trees.
 
 Run the contract gate from the repository root:
 

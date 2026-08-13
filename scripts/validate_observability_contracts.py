@@ -7,7 +7,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 EVENT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
@@ -28,6 +28,14 @@ REQUIRED_SCENARIOS = {
     "privacy_boundary_inputs",
 }
 REQUIRED_INVARIANTS = {f"I{index}" for index in range(1, 9)}
+SOURCE_ROOTS = (".exo", "haskell", "rust", "tl_loop")
+SOURCE_SUFFIXES = {".hs", ".lhs", ".py", ".rs"}
+IGNORED_SOURCE_DIRECTORIES = {".stack-work", "__pycache__", "dist-newstyle", "target"}
+TEST_DIRECTORY_NAMES = {"test", "tests", "__tests__"}
+TEST_FILE_PATTERN = re.compile(
+    r"(^test[-_].*|.*[-_]test\.(?:hs|lhs|py|rs)|.*\.test\.(?:hs|lhs|py|rs)|.*Spec\.hs$)",
+    re.IGNORECASE,
+)
 
 
 class ContractError(ValueError):
@@ -43,6 +51,49 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ContractError(f"{path}: top-level value must be an object")
     return value
+
+
+def _is_test_source(path: Path, root: Path) -> bool:
+    relative = path.relative_to(root)
+    directory_names = tuple(part.lower() for part in relative.parts[:-1])
+    if any(
+        part in TEST_DIRECTORY_NAMES or part.endswith(("-test", "_test"))
+        for part in directory_names
+    ):
+        return True
+    return TEST_FILE_PATTERN.fullmatch(path.name) is not None or path.stem.lower().startswith("test")
+
+
+def _iter_non_test_sources(root: Path) -> Iterator[Path]:
+    for source_root_name in SOURCE_ROOTS:
+        source_root = root / source_root_name
+        if not source_root.is_dir():
+            continue
+        for path in source_root.rglob("*"):
+            if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
+                continue
+            if any(part in IGNORED_SOURCE_DIRECTORIES for part in path.relative_to(root).parts):
+                continue
+            if not _is_test_source(path, root):
+                yield path
+
+
+def validate_declared_producers(root: Path, event_types: list[dict[str, Any]]) -> None:
+    declared = sorted(event["type"] for event in event_types if event["type"] != "custom")
+    sources = tuple(_iter_non_test_sources(root))
+    source_contents = tuple(
+        path.read_text(encoding="utf-8", errors="replace") for path in sources
+    )
+    missing = [
+        event_type
+        for event_type in declared
+        if not any(event_type in content for content in source_contents)
+    ]
+    if missing:
+        raise ContractError(
+            "event registry: declared non-custom types missing from non-test source: "
+            + ", ".join(missing)
+        )
 
 
 def require_keys(value: dict[str, Any], keys: set[str], context: str) -> None:
@@ -240,6 +291,7 @@ def validate(root: Path) -> None:
     fixtures = load_json(root / "docs/observability/fixtures/phase0-contract-fixtures.json")
     topic_mapping = load_json(root / "docs/observability/topic-mappings.v1.json")
     event_types = validate_registry(registry)
+    validate_declared_producers(root, registry["event_types"])
     rule_ids = validate_expected_events(contract, event_types)
     validate_topic_mappings(topic_mapping, event_types)
     required_measurement_keys = {
