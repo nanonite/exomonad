@@ -297,6 +297,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E17 :: E17.2 Add gate_opened_requires_answer (#826)
 - E17 :: E17.1 Add park_requires_gate_or_terminal (#825)
 - E16 :: E16.7 Best-effort emission and failure test (#824)
 - E16 :: E16.6 Emit tl.judgment from the RLM boundary (#823)

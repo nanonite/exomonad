@@ -67,6 +67,17 @@
       "denominator_effect": "Add one expected gate-opening or terminal-outcome observation for each observed slice park."
     },
     {
+      "rule_id": "gate_opened_requires_answer",
+      "prerequisite_event": "tl.gate_opened",
+      "required_event": "tl.gate_answered",
+      "allowed_delay_ms": null,
+      "allowed_window": "until answer, cancellation, or session termination",
+      "correlation_fields": ["gate_name"],
+      "applicable_sources": ["tl_loop"],
+      "legacy_confidence_rule": "An opened human gate without an answer remains pending or unknown; elapsed time is part of the denominator.",
+      "denominator_effect": "Add one expected gate answer for each observed gate opening and measure answer latency until resolution."
+    },
+    {
       "rule_id": "published_pr_requires_observation",
       "prerequisite_event": "pr.published",
       "required_event": "watcher.pr_observation",
