@@ -57,6 +57,16 @@
       "denominator_effect": "Add one expected terminal guidance outcome for each observed durable enqueue."
     },
     {
+      "rule_id": "park_requires_gate_or_terminal",
+      "prerequisite_event": "tl.slice_parked",
+      "required_event": "tl.gate_opened/tl.phase_changed",
+      "allowed_delay_ms": null,
+      "allowed_window": "until gate opening, terminal phase, or session termination",
+      "applicable_sources": ["tl_loop"],
+      "legacy_confidence_rule": "A parked slice without a gate opening or terminal run outcome is unknown, not safely parked.",
+      "denominator_effect": "Add one expected gate-opening or terminal-outcome observation for each observed slice park."
+    },
+    {
       "rule_id": "published_pr_requires_observation",
       "prerequisite_event": "pr.published",
       "required_event": "watcher.pr_observation",
