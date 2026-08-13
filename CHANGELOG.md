@@ -297,6 +297,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E16 :: E16.3 Emit phase, slice-status, and park events from the FSM (#820)
 - E16 :: E16.2 Add the controller event effect to the client and Rust handler (#819)
 - E16 :: E16.1 Declare the eight tl.* event types (#818)
 - E12: Retire the in-memory FIFO as delivery authority (#769)
