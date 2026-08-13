@@ -1,7 +1,7 @@
 # ADR: Operator control plane for the programmatic TL
 
 Date: 2026-08-12
-Status: Proposed
+Status: Accepted
 Builds on: [tl-as-loop.md](tl-as-loop.md), [watcher-as-sensor.md](watcher-as-sensor.md), [agent-loop-and-steering.md](agent-loop-and-steering.md)
 
 ## Context

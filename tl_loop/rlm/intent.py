@@ -11,7 +11,6 @@ from tl_loop.client.transport import JsonObject, JsonValue
 from .call import rlm
 from .intent_contract import (
     OPERATOR_INTENT_SCHEMA,
-    IntentValidationError,
     OperatorIntent,
     parse_operator_intent,
 )
@@ -71,10 +70,7 @@ def interpret_operator_intent(
         OPERATOR_INTENT_SCHEMA,
         model_choice,
     )
-    try:
-        return parse_operator_intent(output)
-    except IntentValidationError:
-        raise
+    return parse_operator_intent(output)
 
 
 def _intent_inputs(utterance: str, read_model: Mapping[str, object]) -> JsonObject:

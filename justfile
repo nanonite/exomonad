@@ -1,8 +1,24 @@
 # ExoMonad Development Justfile
 
+# Python interpreter for tl_loop tooling.
+#
+# Defaults to the repo-local uv venv declared by tl_loop/pyproject.toml, which
+# carries pytest and ruff. A bare `python3` is not sufficient — the system
+# interpreter has no pytest, which silently fails `just test` at tl-loop-test
+# and tl-loop-replay.
+#
+# Override for a conda env or any other interpreter:
+#   EXOMONAD_PY=/home/you/anaconda3/envs/foo/bin/python just test
+py := env_var_or_default("EXOMONAD_PY", justfile_directory() / "tl_loop/.venv/bin/python")
+
 # Default recipe
 default:
     @just --list
+
+# Verify the configured Python interpreter has the tl_loop test dependencies
+py-check:
+    @{{py}} -c "import pytest, sys; print(f'python {sys.version.split()[0]} pytest {pytest.__version__} -> {sys.executable}')" \
+        || (echo "ERROR: {{py}} lacks pytest. Create the venv (uv sync in tl_loop/) or set EXOMONAD_PY." && exit 1)
 
 # Format all code
 fmt: haskell-fmt rust-fmt
@@ -58,15 +74,15 @@ haskell-test:
 
 # Run the programmatic TL controller smoke tests
 tl-loop-test:
-    python3 -m pytest -q tl_loop/tests
+    {{py}} -m pytest -q tl_loop/tests
 
 # Replay committed TL event streams against the real loop
 tl-loop-replay:
-    python3 -m pytest -q tl_loop/tests/test_replay.py
+    {{py}} -m pytest -q tl_loop/tests/test_replay.py
 
 # Lint the programmatic TL controller
 tl-loop-lint:
-    ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py
+    {{py}} -m ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py
 
 # Type-check the programmatic TL controller
 tl-loop-typecheck:
@@ -351,7 +367,7 @@ e2e-tl-loop-shadow:
 
 check-e2e-tl-loop-shadow:
     bash -n tests/e2e/tl-loop-shadow/run.sh
-    python3 -m py_compile tests/e2e/tl-loop-shadow/shadow_companion.py
+    {{py}} -m py_compile tests/e2e/tl-loop-shadow/shadow_companion.py
 
 # Run the bounded active TL loop and the default TL-window command against a scratch repository; no session is created by this test.
 e2e-tl-loop-active:
@@ -359,7 +375,7 @@ e2e-tl-loop-active:
 
 check-e2e-tl-loop-active:
     bash -n tests/e2e/tl-loop-active/run.sh
-    python3 -m py_compile tests/e2e/tl-loop-active/active_run.py
+    {{py}} -m py_compile tests/e2e/tl-loop-active/active_run.py
 
 # Run bounded Claude-only smoke test (root SessionStart + TeamCreate, no children)
 e2e-claude-only:
@@ -484,7 +500,7 @@ e2e-one-shot-lifecycle:
 check-e2e-one-shot-lifecycle:
     bash -n tests/e2e/one-shot-lifecycle/run.sh
     bash -n tests/e2e/one-shot-lifecycle/fake-codex.sh
-    python3 -m py_compile tests/e2e/one-shot-lifecycle/validate.py tests/e2e/one-shot-lifecycle/mock_forgejo.py
+    {{py}} -m py_compile tests/e2e/one-shot-lifecycle/validate.py tests/e2e/one-shot-lifecycle/mock_forgejo.py
 
 # Check E2E agent lifecycle scripts without launching the server
 check-e2e-lifecycle:
@@ -537,15 +553,15 @@ live-teams-e2e:
 
 # Validate the Phase 0 observability registries and synthetic fixtures
 validate-observability-contracts:
-    python3 scripts/validate_observability_contracts.py
+    {{py}} scripts/validate_observability_contracts.py
 
 # Smoke-test the allowlist-first, deterministic Failure Atlas compiler
 test-observability-export:
-    python3 scripts/test_compile_failure_atlas.py
+    {{py}} scripts/test_compile_failure_atlas.py
 
 # Smoke-test detector, incident, adjudication, and controlled-contrast gates
 test-observability-measurement:
-    python3 scripts/test_failure_atlas_measure.py
+    {{py}} scripts/test_failure_atlas_measure.py
 
 
 # Run E2E review-loop stuck human escalation test
@@ -555,7 +571,7 @@ e2e-review-loop-stuck:
 # Check E2E review-loop stuck harness without launching the server
 check-e2e-review-loop-stuck:
     bash -n tests/e2e/review-loop-stuck/run.sh
-    python3 -m py_compile tests/e2e/mock_github.py
+    {{py}} -m py_compile tests/e2e/mock_github.py
 
 # Run E2E Codex reviewer sandbox/instructions consistency test
 e2e-codex-reviewer-sandbox:
@@ -564,7 +580,7 @@ e2e-codex-reviewer-sandbox:
 # Check E2E Codex reviewer sandbox harness without launching the server
 check-e2e-codex-reviewer-sandbox:
     bash -n tests/e2e/codex-reviewer-sandbox/run.sh
-    python3 -m py_compile tests/e2e/mock_github.py
+    {{py}} -m py_compile tests/e2e/mock_github.py
 
 # Forgejo CI migration E2E
 # Requires: forgejo/docker-compose.yml stack and EXOMONAD_FORGEJO_TOKEN
