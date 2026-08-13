@@ -121,6 +121,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- E17: Controller denominator rules and coverage refresh (#817)
 - E16: Declare and emit tl.* controller events (#816)
 - E15: Verb-first topic vocabulary as an addressing layer (#799)
 - E14: interpret_operator_intent as a fourth RLM judgment (#798)
