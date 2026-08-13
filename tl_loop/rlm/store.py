@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping, MutableMapping
+import logging
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Protocol
 
 from tl_loop.client.transport import JsonObject
+
+LOGGER = logging.getLogger(__name__)
+JudgmentEmitter = Callable[[JsonObject], object]
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,7 @@ class RlmCallStore:
 
     ledger: RlmRoleLedger = field(default_factory=RlmRoleLedger)
     events: list[JsonObject] = field(default_factory=list)
+    judgment_emitter: JudgmentEmitter | None = None
     _lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     def commit(self, role: str, tokens: int, event: JsonObject) -> None:
@@ -106,6 +111,15 @@ class RlmCallStore:
                 self.ledger.spent.update(before_spent)
                 del self.events[before_events:]
                 raise
+
+    def emit_judgment(self, payload: JsonObject) -> None:
+        """Best-effort delivery of an aggregate judgment outside the local store."""
+        if self.judgment_emitter is None:
+            return
+        try:
+            self.judgment_emitter(copy.deepcopy(payload))
+        except Exception as error:  # noqa: BLE001 - aggregate emission is fail-open
+            LOGGER.warning("RLM judgment emission failed: %s", error)
 
 
 @dataclass

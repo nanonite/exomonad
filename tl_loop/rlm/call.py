@@ -6,6 +6,7 @@ import copy
 import hashlib
 import inspect
 import json
+import logging
 from collections.abc import Mapping
 from typing import cast
 
@@ -22,7 +23,9 @@ from .store import (
 )
 
 MAX_ATTEMPTS = 3
+MAX_REDACTED_RESULT_BYTES = 512
 _SENSITIVE_KEY_PARTS = ("api_key", "authorization", "password", "secret", "token")
+LOGGER = logging.getLogger(__name__)
 
 
 class RlmError(RuntimeError):
@@ -290,6 +293,7 @@ def _record_success(
         result=result,
     )
     choice.store.commit(choice.role, response.total_tokens, event)
+    _emit_judgment(choice, event)
 
 
 def _record_failure(
@@ -318,6 +322,45 @@ def _record_failure(
     )
     tokens = response.total_tokens if response is not None else 0
     choice.store.commit(choice.role, tokens, event)
+    _emit_judgment(choice, event)
+
+
+def _emit_judgment(choice: RlmModelChoice, event: JsonObject) -> None:
+    """Project a local call record into the aggregate event contract."""
+    try:
+        choice.store.emit_judgment(_judgment_payload(event))
+    except Exception as error:  # noqa: BLE001 - aggregate projection is fail-open
+        LOGGER.warning("RLM judgment projection failed: %s", error)
+
+
+def _judgment_payload(event: JsonObject) -> JsonObject:
+    """Keep aggregate RLM events to bounded scalar dimensions and redacted output."""
+    payload: JsonObject = {
+        "judgment": cast(str, event["name"]),
+        "attempt": cast(int, event["attempt"]),
+        "outcome": "failure"
+        if event.get("validation_error") is not None
+        or event.get("call_error") is not None
+        else "success",
+        "tokens": cast(int, event["total_tokens"]),
+        "replayed": cast(bool, event["replayed"]),
+        "model": cast(str, event["model"]),
+        "latency_ms": cast(int, event["latency_ms"]),
+    }
+    result = event.get("result")
+    if result is not None:
+        encoded = json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload["redacted_result"] = (
+            encoded
+            if len(encoded.encode("utf-8")) <= MAX_REDACTED_RESULT_BYTES
+            else "<redacted-result-too-large>"
+        )
+    return payload
 
 
 def _event(
