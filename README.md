@@ -118,6 +118,15 @@ curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Token: $EXOMONAD_CONT
 
 The `/control` surface adds a read model over run state (slices, per-head review and CI evidence, budgets, transitions) plus the only two mutations an operator may make: answer an existing named gate, and propose a plan change that stays inert until confirmed. It can never merge, approve a review, set a verdict, or widen a policy — those stay with the controller.
 
+Afterwards, the run is measurable rather than merely reviewable. The controller's own decisions — gates opened and answered, slices parked and why, merge decisions, RLM judgment retries — land in the same append-only ledger as agent and PR activity:
+
+```bash
+exomonad logs import --source .exo/ledger/segments   # -> .exo/analysis/atlas.db
+exomonad logs measure --output .exo/analysis/measurement
+```
+
+That turns "how long do my gates sit unanswered" and "which park cause dominates" into numbers instead of impressions.
+
 > **Start here:** [**Programming the TL**](docs/guides/programming-the-tl.md) is the full guide — the three config files, the plan schema, worked examples, park causes, and the operator control plane.
 >
 > Coming from an older ExoMonad project? [Migrating an existing project](docs/guides/migrating-to-the-tl-loop.md).

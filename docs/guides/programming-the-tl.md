@@ -539,6 +539,71 @@ prompt-injection boundary.
 
 ---
 
+## 5. Measuring a run
+
+`status` answers "what is happening now". The ledger answers "what happened
+across runs" — and since M13 that includes the controller's own decisions, not
+just agent and PR activity.
+
+### Controller events
+
+Eight declared `tl.*` event types land in the ledger alongside agent events,
+all carrying identities and bounded dimensions only — never utterances, diffs,
+repair prose, or plan documents:
+
+| Event | Fires when |
+|---|---|
+| `tl.phase_changed` | Durable FSM transition |
+| `tl.slice_status_changed` | Slice status transition |
+| `tl.slice_parked` | A slice parks, with which of the seven causes |
+| `tl.gate_opened` | A named gate becomes pending |
+| `tl.gate_answered` | You approve or reject — `source` distinguishes `cli` from `control` |
+| `tl.merge_decided` | The controller decides to merge or not |
+| `tl.judgment` | An RLM judgment completes, with attempt and outcome |
+| `tl.plan_proposed` | A `/control` plan proposal is accepted or rejected |
+
+Emission is **fail-open**. If the ledger write fails it is logged and the run
+continues — observability can never stall a run or change a merge decision.
+
+### Reading it back
+
+```bash
+exomonad logs import --source .exo/ledger/segments --dry-run   # inspect first
+exomonad logs import --source .exo/ledger/segments             # -> .exo/analysis/atlas.db
+exomonad logs measure --output .exo/analysis/measurement       # detectors + gate
+exomonad logs export  --mode aggregate --output .exo/analysis/export   # L4, shareable
+```
+
+Import is idempotent and read-only with respect to the source files. Only the
+aggregate export is shareable — L1–L3 stays local.
+
+### What this makes answerable
+
+Questions that were anecdotes before, and are now numbers:
+
+- **How long do my gates sit unanswered?** `gate_opened_requires_answer` has no
+  delay bound, so the interval is measured rather than assumed.
+- **Which park cause dominates?** If `budget_exhausted` leads, your ceilings are
+  wrong; if `review_stuck` leads, your specs are.
+- **Are judgments retrying?** `tl.judgment` carries attempt and outcome, so a
+  decompose that habitually needs three attempts is visible.
+- **Did a merge decision reach an outcome?** `merge_decision_requires_pr_outcome`
+  correlates on `pr_number`, so a decision that vanished is a defect rather than
+  silence.
+
+The denominator rules in
+[`docs/observability/expected-events.v1.json`](../observability/expected-events.v1.json)
+are what make a *missing* event detectable. Without them, a quiet run and a
+broken run look identical.
+
+### Trusting what you see
+
+Check `.exo/sink-health.json` before trusting a denominator — it records
+accepted/rejected counts and the last successful sequence. Health from another
+session is `unknown` and cannot classify the current one.
+
+---
+
 ## Checklist for a new project
 
 1. `exomonad new` — creates `.exo/config.toml`, `.gitignore`, CI scaffold, rules.
@@ -554,6 +619,8 @@ prompt-injection boundary.
 7. `python3 -m tl_loop status` to watch; `python3 -m tl_loop gate` to answer.
 8. Optional: `export EXOMONAD_CONTROL_TOKEN=...` if you want the `/control`
    read model and gate/proposal routes rather than the CLI alone.
+9. After a run, `exomonad logs import --source .exo/ledger/segments` and
+   `exomonad logs measure` to see where the run actually spent its time.
 
 ## Anti-patterns
 
