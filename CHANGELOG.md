@@ -297,6 +297,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E16 :: E16.5 Emit tl.merge_decided and tl.plan_proposed (#822)
 - E16 :: E16.4 Emit gate events from both entry points (#821)
 - E16 :: E16.3 Emit phase, slice-status, and park events from the FSM (#820)
 - E16 :: E16.2 Add the controller event effect to the client and Rust handler (#819)
