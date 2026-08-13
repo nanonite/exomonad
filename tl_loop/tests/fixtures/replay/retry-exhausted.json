@@ -37,6 +37,34 @@
         "include_dead": false,
         "sweep": false
       }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.slice_status_changed",
+        "payload": {
+          "from_status": "pending",
+          "slice_id": "worker-a",
+          "to_status": "parked"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.slice_parked",
+        "payload": {
+          "attempts": 0,
+          "park_cause": "retries_exhausted",
+          "slice_id": "worker-a"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
     }
   ],
   "active": false,

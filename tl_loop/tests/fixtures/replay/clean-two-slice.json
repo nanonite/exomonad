@@ -155,9 +155,107 @@
       }
     },
     {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.slice_status_changed",
+        "payload": {
+          "from_status": "pending",
+          "slice_id": "leaf-a",
+          "to_status": "spawned"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.slice_status_changed",
+        "payload": {
+          "from_status": "pending",
+          "slice_id": "worker-a",
+          "to_status": "spawned"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.phase_changed",
+        "payload": {
+          "from_phase": "tl_planning",
+          "run_id": "replay-clean",
+          "to_phase": "tl_waiting"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.slice_status_changed",
+        "payload": {
+          "from_status": "spawned",
+          "slice_id": "worker-a",
+          "to_status": "merged"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
       "operation": "merge_pr",
       "arguments": {
         "pr_number": 42,
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.slice_status_changed",
+        "payload": {
+          "from_status": "spawned",
+          "slice_id": "leaf-a",
+          "to_status": "merged"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.phase_changed",
+        "payload": {
+          "from_phase": "tl_waiting",
+          "run_id": "replay-clean",
+          "to_phase": "tl_all_merged"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.phase_changed",
+        "payload": {
+          "from_phase": "tl_all_merged",
+          "run_id": "replay-clean",
+          "to_phase": "tl_done"
+        },
         "force": false,
         "include_dead": false,
         "sweep": false

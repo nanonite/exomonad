@@ -36,6 +36,7 @@ from tl_loop.fsm.phase import (
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
+from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.review import (
     ReviewGateError,
     compose_acceptance_criteria,
@@ -69,7 +70,6 @@ from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slice
 
 LOGGER = logging.getLogger(__name__)
 TIMEOUT_GATE_NAME = "tl-timeout"
-
 
 
 class TLLoopError(RuntimeError):
@@ -379,7 +379,7 @@ def run_tl_loop(
     state = store.load()
     effects_log: list[EffectIntent] = []
     state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
-    state = _run_sub_tls(work_plan, state, selected, source, effects, store)
+    state = _run_sub_tls(work_plan, state, selected, source, effects, store, effects_log)
     return _run_loop(
         run_id,
         work_plan,
@@ -413,8 +413,17 @@ def _run_loop(
     consumed: list[int] = []
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
     if not expected and not plan.sub_tls:
+        before_phase = phase
         state = store.checkpoint(
             TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
+        )
+        _emit_phase_change(
+            run_id,
+            before_phase,
+            _phase_from_state(state),
+            config,
+            effects,
+            effects_log,
         )
         return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
 
@@ -427,7 +436,15 @@ def _run_loop(
             event = _next_event(source, config, deadline)
         except LoopTimeout as error:
             return _park_timeout(
-                store, state, effects_log, transitions, consumed, str(error)
+                run_id,
+                store,
+                state,
+                effects,
+                config,
+                effects_log,
+                transitions,
+                consumed,
+                str(error),
             )
         if event is None:
             if config.heartbeat is not None:
@@ -438,10 +455,13 @@ def _run_loop(
                     config.heartbeat,
                 )
                 if heartbeat.fired:
+                    before_phase = phase
                     state = heartbeat.state
                     heartbeat_events.extend(heartbeat.events)
                     phase = _phase_from_state(state)
+                    _emit_phase_change(run_id, before_phase, phase, config, effects, effects_log)
                     if heartbeat.parked_slice_ids and _all_expected_terminal(state, expected):
+                        before_phase = phase
                         state = store.checkpoint(
                             TLFailed("heartbeat parked the remaining active slices"),
                             state.slices,
@@ -449,6 +469,9 @@ def _run_loop(
                             state.events.last_consumed_offset,
                         )
                         phase = _phase_from_state(state)
+                        _emit_phase_change(
+                            run_id, before_phase, phase, config, effects, effects_log
+                        )
             continue
         event_seq = event.run_seq
         if event_seq is None:
@@ -511,22 +534,27 @@ def _run_loop(
         next_slices = _update_slices(
             state.slices, fsm_event, slice_id=_event_slice_id(event, state)
         )
-        head_changed = _pr_head_changed(
-            state.slices, fsm_event, _event_slice_id(event, state)
-        )
+        head_changed = _pr_head_changed(state.slices, fsm_event, _event_slice_id(event, state))
         if head_changed and config.enable_reviewer_spawn:
             next_slices = _claim_reviewer_attempt(
                 next_slices, fsm_event, _event_slice_id(event, state)
             )
+        previous_state = state
         state = store.checkpoint(next_phase, next_slices, state.budgets, event_seq)
+        _emit_slice_status_changes(
+            previous_state.slices,
+            next_slices,
+            config,
+            effects,
+            effects_log,
+        )
         if head_changed and config.enable_reviewer_spawn:
-            _spawn_reviewer_for_head(
-                plan, state, fsm_event, event, config, effects, effects_log
-            )
+            _spawn_reviewer_for_head(plan, state, fsm_event, event, config, effects, effects_log)
         source.acknowledge(event)
         before_tag = _phase_tag(phase)
         after_tag = _phase_tag(next_phase)
         transitions.append(LoopTransition(event_seq, event.event_type, before_tag, after_tag))
+        _emit_phase_change(run_id, phase, next_phase, config, effects, effects_log)
         LOGGER.info(
             "[TL loop] transition run_id=%s event_seq=%d before=%s after=%s",
             run_id,
@@ -551,14 +579,18 @@ def _run_loop(
 
 
 def _park_timeout(
+    run_id: str,
     store: RunStore,
     state: RunState,
+    effects: EffectClient | ReadOnlyEffectClient,
+    config: TLLoopConfig,
     effects_log: list[EffectIntent],
     transitions: list[LoopTransition],
     consumed: list[int],
     reason: str,
 ) -> TLRunResult:
     """Persist a named timeout gate before returning a terminal failed run."""
+    before_phase = _phase_from_state(state)
     state = store.set_gate(TIMEOUT_GATE_NAME, GateStatus.PENDING)
     message = f"timeout parked at gate {TIMEOUT_GATE_NAME!r}: {reason}"
     state = store.checkpoint(
@@ -566,6 +598,14 @@ def _park_timeout(
         state.slices,
         state.budgets,
         state.events.last_consumed_offset,
+    )
+    _emit_phase_change(
+        run_id,
+        before_phase,
+        _phase_from_state(state),
+        config,
+        effects,
+        effects_log,
     )
     LOGGER.warning("[TL loop] %s", message)
     return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
@@ -580,6 +620,7 @@ def _dispatch_children(
     store: RunStore,
 ) -> RunState:
     live = cast(EffectClient, effects) if config.active else None
+    before_slices = state.slices
     for worker in plan.workers:
         try:
             dispatchable = _can_dispatch(worker.name, state, config)
@@ -637,7 +678,15 @@ def _dispatch_children(
             _leaf_call(leaf, selected_harness),
             effects_log,
         )
-    return store.load() if config.policy is not None else state
+    updated = store.load() if config.policy is not None else state
+    _emit_slice_status_changes(
+        before_slices,
+        updated.slices,
+        config,
+        effects,
+        effects_log,
+    )
+    return updated
 
 
 def _run_sub_tls(
@@ -647,6 +696,7 @@ def _run_sub_tls(
     source: EventQueue,
     effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
+    effects_log: list[EffectIntent],
 ) -> RunState:
     """Run direct recursive children and retain only terminal child state."""
     for task in plan.sub_tls:
@@ -663,6 +713,7 @@ def _run_sub_tls(
             )
         )
         if config.depth >= config.max_depth:
+            before_phase = _phase_from_state(state)
             parked = replace(
                 current, status=SliceStatus.PARKED, park_cause=ParkCause.SCHEDULE_DEADLOCK
             )
@@ -672,6 +723,33 @@ def _run_sub_tls(
                 state.budgets,
                 state.events.last_consumed_offset,
             )
+            _emit_slice_status_changes(
+                {task.name: current},
+                {task.name: parked},
+                config,
+                effects,
+                effects_log,
+            )
+            _record_controller_event(
+                task.name,
+                "tl.slice_parked",
+                {
+                    "slice_id": task.name,
+                    "park_cause": ParkCause.SCHEDULE_DEADLOCK.value,
+                    "attempts": parked.attempts,
+                },
+                config,
+                effects,
+                effects_log,
+            )
+            _emit_phase_change(
+                store.run_id,
+                before_phase,
+                _phase_from_state(state),
+                config,
+                effects,
+                effects_log,
+            )
             raise DepthLimitExceeded(f"depth ceiling {config.max_depth} reached for {task.name!r}")
         spawned = replace(
             current,
@@ -680,11 +758,19 @@ def _run_sub_tls(
             branch=branch,
             worktree=worktree,
         )
+        previous_slices = state.slices
         state = store.checkpoint(
             _phase_from_state(state),
             {**state.slices, task.name: spawned},
             state.budgets,
             state.events.last_consumed_offset,
+        )
+        _emit_slice_status_changes(
+            previous_slices,
+            state.slices,
+            config,
+            effects,
+            effects_log,
         )
         child_config = _child_config(config, task, source, effects, store, branch, worktree)
         child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, state.budgets)
@@ -694,22 +780,49 @@ def _run_sub_tls(
             else SliceStatus.FAILED
         )
         completed = replace(spawned, status=status)
+        previous_slices = state.slices
         state = store.checkpoint(
             _phase_from_state(state),
             {**state.slices, task.name: completed},
             state.budgets,
             state.events.last_consumed_offset,
         )
+        _emit_slice_status_changes(
+            previous_slices,
+            state.slices,
+            config,
+            effects,
+            effects_log,
+        )
         if status is SliceStatus.FAILED:
-            return store.checkpoint(
+            before_phase = _phase_from_state(state)
+            state = store.checkpoint(
                 TLFailed(f"recursive child {task.name} failed"),
                 state.slices,
                 state.budgets,
                 state.events.last_consumed_offset,
             )
+            _emit_phase_change(
+                store.run_id,
+                before_phase,
+                _phase_from_state(state),
+                config,
+                effects,
+                effects_log,
+            )
+            return state
     if plan.sub_tls and not plan.workers and not plan.leaves:
+        before_phase = _phase_from_state(state)
         state = store.checkpoint(
             TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
+        )
+        _emit_phase_change(
+            store.run_id,
+            before_phase,
+            _phase_from_state(state),
+            config,
+            effects,
+            effects_log,
         )
     return state
 
@@ -1045,9 +1158,7 @@ def _event_findings(event: EventEnvelope) -> list[dict[str, str]] | None:
         for key in ("severity", "path", "rationale"):
             value = raw_finding.get(key)
             if not isinstance(value, str) or not value.strip():
-                raise TLLoopError(
-                    f"{event.event_type!r} findings[{index}].{key} must be non-empty"
-                )
+                raise TLLoopError(f"{event.event_type!r} findings[{index}].{key} must be non-empty")
             finding[key] = value
         findings.append(finding)
     return findings
@@ -1338,6 +1449,80 @@ def _review_verdict(event: EventEnvelope) -> Verdict | None:
     if event.review_state in {"changes_requested", "request_changes"}:
         return Verdict.NO_GO
     return None
+
+
+def _emit_phase_change(
+    run_id: str,
+    before: PhaseValue,
+    after: PhaseValue,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    before_tag = _phase_tag(before)
+    after_tag = _phase_tag(after)
+    if before_tag is after_tag:
+        return
+    _record_controller_event(
+        "controller",
+        "tl.phase_changed",
+        {
+            "from_phase": before_tag.value,
+            "to_phase": after_tag.value,
+            "run_id": run_id,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _emit_slice_status_changes(
+    before: Mapping[str, SliceState],
+    after: Mapping[str, SliceState],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    for slice_id in sorted(after):
+        current = after[slice_id]
+        previous = before.get(slice_id)
+        from_status = previous.status if previous is not None else SliceStatus.PENDING
+        if from_status is current.status:
+            continue
+        _record_controller_event(
+            slice_id,
+            "tl.slice_status_changed",
+            {
+                "slice_id": slice_id,
+                "from_status": from_status.value,
+                "to_status": current.status.value,
+            },
+            config,
+            effects,
+            effects_log,
+        )
+
+
+def _record_controller_event(
+    target: str,
+    event_type: str,
+    payload: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    effects_log.append(EffectIntent("emit_controller_event", target, payload, config.active))
+    LOGGER.info(
+        "[TL loop] effect=emit_controller_event target=%s event_type=%s active=%s",
+        target,
+        event_type,
+        config.active,
+    )
+    if not config.active:
+        return
+    live = cast(EffectClient, effects)
+    emit_controller_event(live, event_type, payload)
 
 
 def _invoke(

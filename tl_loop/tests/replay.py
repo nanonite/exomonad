@@ -144,9 +144,7 @@ def replay_fixture(fixture: str | Path, root_dir: str | Path) -> ReplayResult:
             target,
             judgment.cause_for_terminal_error(error),
             store=store,
-            issue_creator=lambda title, description: _record_issue(
-                transport, title, description
-            ),
+            issue_creator=effects,
             ledger=state.budgets,
         )
     store = RunStore(run_id, root_dir=Path(root_dir))
@@ -203,16 +201,6 @@ def _normalize_value(key: str, value: object) -> object:
     if key.endswith("_at") and isinstance(value, str):
         return "<timestamp>"
     return value
-
-
-def _record_issue(transport: RecordingTransport, title: str, description: str) -> int:
-    transport.calls.append(
-        (
-            "chainlink_issue_create",
-            {"title": title, "description": description, "labels": ["needs-human"], "priority": "high"},
-        )
-    )
-    return transport.issue_id
 
 
 def _load_fixture(fixture: str | Path) -> dict[str, object]:

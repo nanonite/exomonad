@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-from tl_loop.client.effects import ToolResult
+from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.loop.escalate import (
     HarnessSwitchDecision,
@@ -224,6 +224,49 @@ class RecordingCreator:
         self.labels = tuple(labels) if labels is not None else None
         self.priority = priority
         return _tool_result({"issue_id": 701})
+
+
+class ParkingTransport:
+    """Effect transport that records the durable parking observations."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, JsonObject]] = []
+
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        del role, name
+        self.calls.append((tool_name, arguments))
+        if tool_name == "chainlink_issue_create":
+            return {"success": True, "result": {"issue_id": 701}}
+        return {"success": True, "result": None}
+
+
+def test_durable_parking_emits_bounded_observations(tmp_path: Path) -> None:
+    transport = ParkingTransport()
+    result = park(
+        _slice(),
+        ParkCause.REVIEW_STUCK,
+        store=_store(tmp_path),
+        issue_creator=EffectClient(transport),
+    )
+
+    assert isinstance(result, ParkResult)
+    events = [
+        arguments["payload"]
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    ]
+    assert events == [
+        {"slice_id": "root", "from_status": "pending", "to_status": "parked"},
+        {"slice_id": "child", "from_status": "pending", "to_status": "blocked"},
+        {"slice_id": "grandchild", "from_status": "pending", "to_status": "blocked"},
+        {"slice_id": "root", "park_cause": "review_stuck", "attempts": 2},
+    ]
 
 
 def _tool_result(value: dict[str, object]) -> ToolResult:

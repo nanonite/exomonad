@@ -18,21 +18,22 @@ from tl_loop.fsm.phase import TLPhase, TLPlanning
 from tl_loop.loop.driver import (
     DepthLimitExceeded,
     LoopLimitExceeded,
-    _route_ci_event,
-    _route_review_event,
-    _record_review_event,
     SubTLTask,
     TLLoopConfig,
+    TLRunResult,
     WorkerTask,
     WorkPlan,
+    _record_review_event,
+    _route_ci_event,
+    _route_review_event,
     run_tl_loop,
     tl_run,
 )
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
+from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
-from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import (
     BudgetLedger,
@@ -42,7 +43,8 @@ from tl_loop.state.schema import (
     SliceStatus,
     Verdict,
 )
-from tl_loop.state.store import RunStore, create, load as load_state
+from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import load as load_state
 
 
 @dataclass
@@ -65,6 +67,7 @@ class SyntheticQueue:
 @dataclass
 class RecordingTransport:
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
+    fail_observability: bool = False
 
     def call_tool(
         self,
@@ -75,7 +78,19 @@ class RecordingTransport:
     ) -> JsonObject:
         del role, name
         self.calls.append((tool_name, arguments))
+        if self.fail_observability and tool_name == "emit_controller_event":
+            return {"success": False, "error": "ledger unavailable"}
         return {"success": True, "result": None}
+
+
+def _effect_names(transport: RecordingTransport) -> list[str]:
+    return [name for name, _ in transport.calls if name != "emit_controller_event"]
+
+
+def _effect_operations(result: TLRunResult) -> list[str]:
+    return [
+        effect.operation for effect in result.effects if effect.operation != "emit_controller_event"
+    ]
 
 
 @dataclass
@@ -128,12 +143,12 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
         root_dir=tmp_path,
     )
 
-    assert [name for name, _ in transport.calls] == [
+    assert _effect_names(transport) == [
         "spawn_worker",
         "spawn_leaf",
         "merge_pr",
     ]
-    assert [intent.operation for intent in result.effects] == [
+    assert _effect_operations(result) == [
         "spawn_worker",
         "spawn_leaf",
         "merge_pr",
@@ -144,6 +159,39 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert result.final_state.slices["worker-a"].status.value == "merged"
     assert result.final_state.slices["leaf-a"].status.value == "merged"
     assert source.acknowledged == [1, 2, 3, 4, 5]
+    assert [
+        arguments["payload"]
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    ] == [
+        {"slice_id": "worker-a", "from_status": "pending", "to_status": "spawned"},
+        {
+            "from_phase": "tl_planning",
+            "to_phase": "tl_waiting",
+            "run_id": "active-run",
+        },
+        {"slice_id": "leaf-a", "from_status": "pending", "to_status": "spawned"},
+        {"slice_id": "worker-a", "from_status": "spawned", "to_status": "merged"},
+        {"slice_id": "leaf-a", "from_status": "spawned", "to_status": "merged"},
+        {"from_phase": "tl_waiting", "to_phase": "tl_all_merged", "run_id": "active-run"},
+        {"from_phase": "tl_all_merged", "to_phase": "tl_done", "run_id": "active-run"},
+    ]
+
+
+def test_observability_failure_does_not_change_terminal_state(tmp_path: Path) -> None:
+    transport = RecordingTransport(fail_observability=True)
+    result = run_tl_loop(
+        "observability-failure-run",
+        _plan(),
+        SyntheticQueue(_lifecycle_events("observability-failure-run")),
+        EffectClient(transport),
+        config=_config(),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    assert result.final_state.slices["leaf-a"].status is SliceStatus.MERGED
+    assert "merge_pr" in _effect_names(transport)
 
 
 def test_idle_timeout_parks_with_named_gate_and_never_merges(tmp_path: Path) -> None:
@@ -164,11 +212,9 @@ def test_idle_timeout_parks_with_named_gate_and_never_merges(tmp_path: Path) -> 
     )
 
     assert result.final_state.fsm.phase is TLPhase.TLFailed
-    assert result.final_state.gates == (
-        GateState(name="tl-timeout", status=GateStatus.PENDING),
-    )
-    assert [name for name, _ in transport.calls] == ["spawn_worker", "spawn_leaf"]
-    assert "merge_pr" not in [name for name, _ in transport.calls]
+    assert result.final_state.gates == (GateState(name="tl-timeout", status=GateStatus.PENDING),)
+    assert _effect_names(transport) == ["spawn_worker", "spawn_leaf"]
+    assert "merge_pr" not in _effect_names(transport)
 
 
 def test_pr_head_change_clears_per_head_gate_state() -> None:
@@ -201,9 +247,7 @@ def test_pr_head_change_clears_per_head_gate_state() -> None:
         repair_attempts=3,
     )
 
-    updated = _update_slices(
-        {"leaf-a": current}, PRUpdated(42, "head-b", "leaf-a")
-    )["leaf-a"]
+    updated = _update_slices({"leaf-a": current}, PRUpdated(42, "head-b", "leaf-a"))["leaf-a"]
 
     assert updated.status is SliceStatus.IN_REVIEW
     assert updated.pr_number == 42
@@ -292,8 +336,10 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
         root_dir=tmp_path,
     )
 
-    assert [name for name, _ in transport.calls] == ["spawn_leaf", "spawn_reviewer"]
-    reviewer_args = transport.calls[1][1]
+    assert _effect_names(transport) == ["spawn_leaf", "spawn_reviewer"]
+    reviewer_args = next(
+        arguments for name, arguments in transport.calls if name == "spawn_reviewer"
+    )
     assert reviewer_args["pr_number"] == 42
     assert reviewer_args["head_sha"] == "head-a"
     assert reviewer_args["force"] is False
@@ -375,7 +421,7 @@ def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -
         "adjudicate_review",
         "compose_repair",
     ]
-    assert [name for name, _ in transport.calls] == [
+    assert _effect_names(transport) == [
         "watcher_pr_state",
         "resume_pr",
     ]
@@ -482,7 +528,7 @@ def test_ci_failure_records_head_and_resumes_same_pr(tmp_path: Path) -> None:
     assert restored.ci_state == {"head-a": "failure"}
     assert restored.status is SliceStatus.REPAIRING
     assert restored.verdict is Verdict.NO_GO
-    assert [name for name, _ in transport.calls] == [
+    assert _effect_names(transport) == [
         "watcher_pr_state",
         "resume_pr",
     ]
@@ -633,7 +679,7 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
 
     result = tl_run({"run_id": run_id, "plan": _plan()}, config, BudgetLedger(0, 0))
 
-    assert [name for name, _ in transport.calls] == [
+    assert _effect_names(transport) == [
         "spawn_worker",
         "spawn_leaf",
         "merge_pr",
@@ -676,7 +722,7 @@ def test_tl_run_width_gate_dispatches_next_ready_slice_after_completion(
 
     result = tl_run({"run_id": run_id, "plan": plan}, config, BudgetLedger(0, 0))
 
-    assert [name for name, _ in transport.calls] == ["spawn_worker", "spawn_worker"]
+    assert _effect_names(transport) == ["spawn_worker", "spawn_worker"]
     assert result.final_state.fsm.phase is TLPhase.TLDone
     assert result.final_state.budgets.role_reserved == {"worker": 500}
 
@@ -696,7 +742,7 @@ def test_shadow_loop_uses_the_same_driver_without_mutating_transport(
     )
 
     assert transport.calls == []
-    assert [intent.operation for intent in result.effects] == [
+    assert _effect_operations(result) == [
         "spawn_worker",
         "spawn_leaf",
         "merge_pr",
@@ -726,7 +772,7 @@ def test_canonical_completion_and_parent_notification_are_idempotent(
         root_dir=tmp_path,
     )
 
-    assert [name for name, _ in transport.calls] == [
+    assert _effect_names(transport) == [
         "spawn_worker",
         "spawn_leaf",
         "merge_pr",
@@ -740,9 +786,7 @@ def test_loop_rejects_a_plan_over_its_worker_ceiling(tmp_path: Path) -> None:
     with pytest.raises(LoopLimitExceeded, match="max_workers"):
         run_tl_loop(
             "bounded-run",
-            WorkPlan.from_mapping(
-                {"workers": [{"name": "worker-a", "task": "bounded"}]}
-            ),
+            WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "bounded"}]}),
             source,
             EffectClient(RecordingTransport()),
             config=TLLoopConfig(max_workers=0),
@@ -908,7 +952,6 @@ def _event(
     return project(cast(dict[str, object], raw))
 
 
-
 def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) -> None:
     transport = RecordingTransport()
     grand_source = SyntheticQueue([])
@@ -917,11 +960,7 @@ def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) 
         sub_tls=(
             SubTLTask(
                 "child",
-                WorkPlan(
-                    sub_tls=(
-                        SubTLTask("grandchild", WorkPlan(), source=grand_source),
-                    )
-                ),
+                WorkPlan(sub_tls=(SubTLTask("grandchild", WorkPlan(), source=grand_source),)),
                 source=child_source,
             ),
         )
@@ -946,8 +985,7 @@ def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) 
     assert child.parent_branch == "main"
     assert child.slices["grandchild"].branch == "main.child.grandchild"
     assert child.slices["grandchild"].base_ref == "main.child"
-    assert transport.calls == []
-
+    assert all(name == "emit_controller_event" for name, _ in transport.calls)
 
 
 def test_recursive_depth_ceiling_parks_schedule_deadlock(tmp_path: Path) -> None:
@@ -964,8 +1002,9 @@ def test_recursive_depth_ceiling_parks_schedule_deadlock(tmp_path: Path) -> None
     state = load_state(tmp_path / "depth-run" / "run.json")
     assert state.fsm.phase is TLPhase.TLFailed
     assert state.slices["child"].status.value == "parked"
-__all__ = [
 
+
+__all__ = [
     "RecordingTransport",
     "SyntheticQueue",
     "test_active_loop_dispatches_direct_children_and_merges_leaf",

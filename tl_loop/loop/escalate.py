@@ -16,6 +16,7 @@ from typing import Protocol, cast
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.loop.observability import emit_controller_event
 from tl_loop.select.ledger import LedgerInput
 from tl_loop.state.schema import BudgetLedger, ParkCause, SliceState, SliceStatus
 from tl_loop.state.store import RunStore
@@ -108,6 +109,7 @@ def park(
 
     issue_id = _create_issue(issue_creator, slice, parsed_cause, parked_audit)
     blocked: list[str] = []
+    blocked_statuses: dict[str, str] = {}
 
     def mutate(document: dict[str, object]) -> dict[str, object]:
         raw_slices = document.get("slices")
@@ -137,6 +139,7 @@ def park(
                     continue
                 if not any(dependency in blocked_ids for dependency in dependencies):
                     continue
+                blocked_statuses[dependent_id] = str(raw_dependent.get("status", "pending"))
                 raw_dependent["status"] = SliceStatus.BLOCKED.value
                 raw_dependent["blocked_by"] = slice.id
                 raw_dependent["park_issue_id"] = issue_id
@@ -155,7 +158,18 @@ def park(
                     raw_fsm["phase"] = TLPhase.TLFailed.value
         return document
 
+    prior_phase = store.load().fsm.phase.value
     apply(store.run_dir, mutate)
+    if isinstance(issue_creator, EffectClient):
+        _emit_park_events(
+            issue_creator,
+            slice,
+            parsed_cause,
+            blocked_statuses,
+            prior_phase,
+            store.load().fsm.phase.value,
+            store.run_id,
+        )
     return ParkResult(issue_id, slice.id, tuple(blocked))
 
 
@@ -237,6 +251,57 @@ def _cause(value: ParkCause | str) -> ParkCause:
         return value if isinstance(value, ParkCause) else ParkCause(value)
     except ValueError as error:
         raise EscalationError(f"unsupported parking cause: {value!r}") from error
+
+
+def _emit_park_events(
+    effects: EffectClient,
+    slice: SliceState,
+    cause: ParkCause,
+    blocked_statuses: Mapping[str, str],
+    before_phase: str,
+    after_phase: str,
+    run_id: str,
+) -> None:
+    """Publish parking and related status changes after durable mutation."""
+    if slice.status.value != SliceStatus.PARKED.value:
+        emit_controller_event(
+            effects,
+            "tl.slice_status_changed",
+            {
+                "slice_id": slice.id,
+                "from_status": slice.status.value,
+                "to_status": SliceStatus.PARKED.value,
+            },
+        )
+    for slice_id in sorted(blocked_statuses):
+        emit_controller_event(
+            effects,
+            "tl.slice_status_changed",
+            {
+                "slice_id": slice_id,
+                "from_status": blocked_statuses[slice_id],
+                "to_status": SliceStatus.BLOCKED.value,
+            },
+        )
+    emit_controller_event(
+        effects,
+        "tl.slice_parked",
+        {
+            "slice_id": slice.id,
+            "park_cause": cause.value,
+            "attempts": slice.attempts,
+        },
+    )
+    if before_phase != after_phase:
+        emit_controller_event(
+            effects,
+            "tl.phase_changed",
+            {
+                "from_phase": before_phase,
+                "to_phase": after_phase,
+                "run_id": run_id,
+            },
+        )
 
 
 def _build_audit(

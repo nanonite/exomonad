@@ -107,6 +107,8 @@ def test_silently_dead_worker_is_parked(tmp_path: Path) -> None:
     assert [name for name, _ in transport.calls] == [
         "poll_workers",
         "chainlink_issue_create",
+        "emit_controller_event",
+        "emit_controller_event",
     ]
 
 
