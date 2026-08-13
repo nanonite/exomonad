@@ -471,6 +471,74 @@ scraping is not a liveness source.
 
 ---
 
+## 4. The operator control plane
+
+`status` and `gate` are the CLI floor. The server also exposes a `/control`
+route group for a richer operator surface — a read model over run state plus
+the two mutations you are allowed to make.
+
+See [`docs/decisions/operator-control-plane.md`](../decisions/operator-control-plane.md)
+for why the boundary sits here.
+
+### Routes
+
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/control/runs/{run_id}` | Run read model: phase, slices, budgets, gates, park causes |
+| `GET` | `/control/runs/{run_id}/slices/{slice_id}` | One slice, with per-head review and CI evidence |
+| `GET` | `/control/runs/{run_id}/transitions` | Recent FSM transitions |
+| `POST` | `/control/runs/{run_id}/gates/{gate_name}` | Answer an **existing** named gate |
+| `POST` | `/control/runs/{run_id}/plan/proposals` | Propose a plan mutation — inert until confirmed |
+
+### Authority is enforced server-side
+
+Two separate credentials, and they are mutually exclusive per request
+(`rust/exomonad/src/control.rs`):
+
+```bash
+export EXOMONAD_CONTROL_TOKEN=...   # operator console  -> X-Exomonad-Control-Token
+export EXOMONAD_AGENT_TOKEN=...     # agent effect calls -> X-Exomonad-Agent-Token
+```
+
+A request carrying the agent header is refused on `/control`, and a request
+carrying the control header is refused on `/agents`. Presenting both is refused
+everywhere. Co-location grants nothing — a process on the same host still needs
+the right credential.
+
+**The console can do exactly three things:** read projections, answer a gate
+that already exists, and propose a plan mutation that stays inert until
+confirmed. It cannot merge a PR, approve a review, set a verdict, alter the FSM
+phase, widen `harness_policy.toml`, or raise a budget ceiling. Those stay with
+the controller.
+
+A plan proposal is validated by the same closed-key `WorkPlan` validator that
+`plan.json` uses, so a malformed proposal is rejected at the boundary rather
+than half-applied.
+
+### Read models are projections, and can be stale
+
+Every read model carries the ledger cursor it was built from. Check it before
+acting on what you see — a gate answer decided from a stale projection is the
+failure mode this field exists to prevent.
+
+### Natural language
+
+`tl_loop.rlm.intent.interpret_operator_intent` translates operator prose into
+one of `Query`, `GateAnswer`, `PlanProposal`, or `Unclear`. It is a bounded
+judgment like `decompose` and `adjudicate_review`: closed output schema,
+`tools=()`, no effect client, no filesystem capability.
+
+The model **translates; it does not decide**. Its output passes the same
+validation and authority checks as the equivalent CLI argument, and `Unclear`
+is a first-class result — it asks rather than guessing, because a misread
+instruction moves real work.
+
+Agent-authored text in the read model is tagged `observation_only` and is never
+presented to the judgment as instruction. That provenance envelope is the
+prompt-injection boundary.
+
+---
+
 ## Checklist for a new project
 
 1. `exomonad new` — creates `.exo/config.toml`, `.gitignore`, CI scaffold, rules.
@@ -484,6 +552,8 @@ scraping is not a liveness source.
    `verify`.
 6. `exomonad init` — starts the server and the controller in the TL window.
 7. `python3 -m tl_loop status` to watch; `python3 -m tl_loop gate` to answer.
+8. Optional: `export EXOMONAD_CONTROL_TOKEN=...` if you want the `/control`
+   read model and gate/proposal routes rather than the CLI alone.
 
 ## Anti-patterns
 

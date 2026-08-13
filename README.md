@@ -106,7 +106,21 @@ python3 -m tl_loop gate   --project-root . --run-id root --name <gate> --approve
 
 A run ends at `TLDone` or `TLFailed`. Bounded failures — retries exhausted, budget exhausted, review stuck, no capable harness, stall detected — park with an auditable cause and wait for an explicit human gate. The controller never retries past a ceiling or silently switches harness.
 
-**New to this?** Read [Programming the TL](docs/guides/programming-the-tl.md). **Coming from an older ExoMonad project?** Read [Migrating an existing project](docs/guides/migrating-to-the-tl-loop.md).
+Once a run is live you can steer it three ways, in increasing richness:
+
+```bash
+python3 -m tl_loop status --project-root . --run-id root          # phase, slices, gates
+python3 -m tl_loop gate   --project-root . --run-id root --name <gate> --approve
+export EXOMONAD_CONTROL_TOKEN=...                                  # unlocks /control
+curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Token: $EXOMONAD_CONTROL_TOKEN" \
+     http://localhost/control/runs/root
+```
+
+The `/control` surface adds a read model over run state (slices, per-head review and CI evidence, budgets, transitions) plus the only two mutations an operator may make: answer an existing named gate, and propose a plan change that stays inert until confirmed. It can never merge, approve a review, set a verdict, or widen a policy — those stay with the controller.
+
+> **Start here:** [**Programming the TL**](docs/guides/programming-the-tl.md) is the full guide — the three config files, the plan schema, worked examples, park causes, and the operator control plane.
+>
+> Coming from an older ExoMonad project? [Migrating an existing project](docs/guides/migrating-to-the-tl-loop.md).
 
 ## How It Works
 
