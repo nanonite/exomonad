@@ -60,10 +60,6 @@ data PRReviewEvent
         rrcBranch :: Text,
         rrcAuthorBranch :: Maybe Text
       }
-  | RateLimited
-      { rlRetriesRemaining :: Int,
-        rlSecondsUntilReset :: Int
-      }
   | Stuck
       { prNumber :: Int,
         stuckRounds :: Int
@@ -92,9 +88,6 @@ data PRReviewEvent
   | ReviewerNeverStarted
       { prNumber :: Int
       }
-  | ReviewDevFailed
-      { prNumber :: Int
-      }
   deriving (Show, Generic)
 
 instance FromJSON PRReviewEvent where
@@ -109,7 +102,6 @@ instance FromJSON PRReviewEvent where
       "commits_pushed" -> CommitsPushed <$> v .: "pr_number" <*> v .: "ci_status"
       "reviewer_approved" -> ReviewerApproved <$> v .: "pr_number"
       "reviewer_requested_changes" -> ReviewerRequestedChanges <$> v .: "pr_number" <*> v .: "comments" <*> v .:? "branch" .!= "" <*> v .:? "author_branch"
-      "rate_limited" -> RateLimited <$> v .: "retries_remaining" <*> v .: "seconds_until_reset"
       "stuck" -> Stuck <$> v .: "pr_number" <*> v .: "rounds"
       "ci_triggered" -> CITriggered <$> v .: "pr_number" <*> v .: "branch" <*> v .: "head_sha"
       "ci_blocked" -> CIBlocked <$> v .: "pr_number" <*> v .: "ci_status" <*> v .: "branch"
@@ -117,7 +109,6 @@ instance FromJSON PRReviewEvent where
       "dev_not_pushing" -> DevNotPushing <$> v .: "pr_number"
       "reviewer_not_responding" -> ReviewerNotResponding <$> v .: "pr_number"
       "reviewer_never_started" -> ReviewerNeverStarted <$> v .: "pr_number"
-      "dev_failed" -> ReviewDevFailed <$> v .: "pr_number"
       other -> fail $ "Unknown PRReviewEvent kind: " <> show (other :: Text)
 
 instance ToJSON PRReviewEvent where
@@ -129,7 +120,6 @@ instance ToJSON PRReviewEvent where
   toJSON (CommitsPushed n ci) = object ["kind" .= ("commits_pushed" :: Text), "pr_number" .= n, "ci_status" .= ci]
   toJSON (ReviewerApproved n) = object ["kind" .= ("reviewer_approved" :: Text), "pr_number" .= n]
   toJSON (ReviewerRequestedChanges n c branch authorBranch) = object ["kind" .= ("reviewer_requested_changes" :: Text), "pr_number" .= n, "comments" .= c, "branch" .= branch, "author_branch" .= authorBranch]
-  toJSON (RateLimited r s) = object ["kind" .= ("rate_limited" :: Text), "retries_remaining" .= r, "seconds_until_reset" .= s]
   toJSON (Stuck n r) = object ["kind" .= ("stuck" :: Text), "pr_number" .= n, "rounds" .= r]
   toJSON (CITriggered n branch sha) = object ["kind" .= ("ci_triggered" :: Text), "pr_number" .= n, "branch" .= branch, "head_sha" .= sha]
   toJSON (CIBlocked n ci branch) = object ["kind" .= ("ci_blocked" :: Text), "pr_number" .= n, "ci_status" .= ci, "branch" .= branch]
@@ -137,7 +127,6 @@ instance ToJSON PRReviewEvent where
   toJSON (DevNotPushing n) = object ["kind" .= ("dev_not_pushing" :: Text), "pr_number" .= n]
   toJSON (ReviewerNotResponding n) = object ["kind" .= ("reviewer_not_responding" :: Text), "pr_number" .= n]
   toJSON (ReviewerNeverStarted n) = object ["kind" .= ("reviewer_never_started" :: Text), "pr_number" .= n]
-  toJSON (ReviewDevFailed n) = object ["kind" .= ("dev_failed" :: Text), "pr_number" .= n]
 
 -- | CI status event
 data CIStatusEvent = CIStatusEvent

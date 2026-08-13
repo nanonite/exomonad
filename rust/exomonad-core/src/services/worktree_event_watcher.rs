@@ -549,13 +549,6 @@ fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventAction
         "commits_pushed" => Some(EventActionResponse::InjectMessage {
             message: commits_pushed_message(pr_number, value_str(payload, "ci_status")?),
         }),
-        "rate_limited" => Some(EventActionResponse::InjectMessage {
-            message: format!(
-                "[RATE LIMITED] Review polling has {} retries remaining; reset in {} seconds.",
-                value_u64(payload, "remaining")?,
-                value_u64(payload, "reset_seconds")?
-            ),
-        }),
         "ci_triggered" => Some(EventActionResponse::InjectMessage {
             message: format!(
                 "[CI TRIGGERED] PR #{pr_number} on {}.",
@@ -580,9 +573,6 @@ fn native_tl_pr_review_action(payload: &serde_json::Value) -> Option<EventAction
         }),
         "reviewer_never_started" => Some(EventActionResponse::InjectMessage {
             message: format!("[REVIEWER NEVER STARTED] PR #{pr_number} needs TL attention."),
-        }),
-        "dev_failed" => Some(EventActionResponse::InjectMessage {
-            message: format!("[DEV FAILED] PR #{pr_number} needs TL attention."),
         }),
         _ => None,
     }
@@ -621,11 +611,10 @@ fn native_leaf_pr_review_action(payload: &serde_json::Value) -> Option<EventActi
         | "timeout"
         | "fixes_pushed"
         | "commits_pushed"
-        | "rate_limited"
         | "dev_not_pushing"
         | "reviewer_not_responding"
         | "reviewer_never_started"
-        | "dev_failed" => Some(EventActionResponse::NoAction),
+        => Some(EventActionResponse::NoAction),
         _ => None,
     }
 }

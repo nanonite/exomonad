@@ -39,8 +39,7 @@ ledger.
 | `[DEV NOT PUSHING]` | `tl_loop/events/stall.py` from raw `pr.review` evidence | `pr.review` projection | covered | The TL derives and persists this class when changes remain unaddressed. |
 | `[REVIEWER NOT RESPONDING]` | `tl_loop/events/stall.py` from raw `pr.review` evidence | `pr.review` projection | covered | The TL derives and persists this class after addressed changes with no new response. |
 | `[REVIEWER NEVER STARTED]` | `tl_loop/events/stall.py` from raw `pr.review` evidence | `pr.review` projection | covered | The TL derives and persists this class when a registered reviewer has no Forgejo review. |
-| `[DEV FAILED]` | `tl_loop/events/stall.py` review-stall vocabulary | `pr.review` projection | gap | No active raw watcher observation maps to this legacy guest variant. |
-| `[RATE LIMITED]` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:63-70,112,132`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:697-702` | `pr.review` when produced | covered | The guest accepts the variant, but no current watcher/poller producer exists; there is therefore no live row to replay. |
+| dev stop hook | `.exo/lib/HttpDevHooks.hs:73-85` | `agent.stop_check` | covered | The Haskell dev stop hook emits the branch and bounded stop decision through `LogEmitEvent`; this is the registry's Haskell producer. |
 | `[REPAIR HANDOFF]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:560-568,2085-2101` | `agent.notify_parent` | covered | The parent notification ledger row preserves the handoff message and outcome context. |
 | `[from: agent]` | `rust/exomonad-core/src/services/delivery.rs:215-235,744-805` | `agent.notify_parent` | covered | Success notifications are logged before EventQueue publication and delivery. |
 | `[FAILED: agent]` | `rust/exomonad-core/src/services/delivery.rs:215-235,744-805` | `agent.notify_parent` | covered | Failure status and message are preserved in the canonical row. |
@@ -68,7 +67,6 @@ Rust watcher.
 | `commits_pushed` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:50-53,109`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:2963-2971` | `pr.review` | covered | The transient event and verified head are retained. |
 | `reviewer_approved` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:54-56,110`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3070-3078` | `pr.review` | covered | The active producer’s `approved` kind is the canonical alias for this guest variant. |
 | `reviewer_requested_changes` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:57-62,111`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3180-3193` | `pr.review` and `copilot.review` | covered | The review rows preserve the comments/reviews and verified head. |
-| `rate_limited` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:63-66,112`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:697-702` | `pr.review` when produced | covered | Declared input has no current producer; future producers use the canonical review path. |
 | `stuck` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:67-70,113`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3148-3178` | `pr.review` | covered | Review-loop stuck signals now retain rounds and notification text. |
 | `ci_triggered` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:71-75,114`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3113-3128` | `pr.review` | covered | The manual-CI trigger decision is retained. |
 | `ci_blocked` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:76-80,115`; `rust/exomonad-core/src/services/worktree_event_watcher.rs` raw observation | `pr.review` projection | covered | The review-blocking transition is retained with CI status and projected to `ci_failed` when CI fails. |
@@ -77,7 +75,6 @@ Rust watcher.
 | `reviewer_not_responding` | `tl_loop/events/stall.py` from raw `timeout` evidence | `pr.review` projection | covered | Classification is owned by the TL projection. |
 | `reviewer_never_started` | `tl_loop/events/stall.py` from raw `timeout` evidence | `pr.review` projection | covered | Classification is owned by the TL projection. |
 | `ci_failed` | `tl_loop/events/stall.py` from raw `ci_blocked` evidence | `pr.review` projection | covered | Classification is owned by the TL projection. |
-| `dev_failed` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:95-97,120`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:334-348` | `pr.review` | covered | The canonical review path accepts the guest failure kind; no active watcher producer currently classifies this exact variant. |
 
 ## GitHub poller transitions
 

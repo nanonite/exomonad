@@ -487,9 +487,6 @@ reviewerPRReviewHandler (ReviewerRequestedChanges n comments_ _branch _authorBra
   branch <- getCurrentBranch
   void $ applyEvent @ReviewerPhase @ReviewerEvent branch ReviewerSpawned (ReviewerRequestedChangesEv n comments_)
   pure (InjectMessage $ "[CHANGES REQUESTED] PR #" <> T.pack (show n) <> ":\n" <> comments_)
-reviewerPRReviewHandler (RateLimited remaining secs) = do
-  logHandler $ "Rate limited: " <> T.pack (show remaining) <> " retries, " <> T.pack (show secs) <> "s"
-  pure NoAction
 reviewerPRReviewHandler (Stuck n rounds_) = do
   logHandler $ "PR #" <> T.pack (show n) <> " stuck after " <> T.pack (show rounds_) <> " rounds"
   branch <- getCurrentBranch

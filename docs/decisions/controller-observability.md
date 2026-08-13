@@ -12,8 +12,9 @@ FailureAtlas measures ExoMonad from the append-only ledger at
 
 The agent and PR layer is well covered. An audit on 2026-08-12 found:
 
-- **40 of 41 declared event types are emitted** in non-test source. Only
-  `agent.stop_check` has no producer.
+- **41 of 41 declared event types have a producer** in non-test source.
+  `agent.stop_check` is emitted by the dev stop hook in
+  `.exo/lib/HttpDevHooks.hs:73-85`.
 - **The 11 denominator rules in `expected-events.v1.json` cover the merge
   path**, including `merge_request_requires_approved_current_head`,
   `merge_request_requires_passing_ci_current_head`, and
@@ -114,11 +115,10 @@ M9, M11, and M12. It cites `worktree_event_watcher.rs` line numbers for
 longer exists. Re-audit against the current watcher-as-sensor boundary and
 extend it to the controller and guidance-queue surfaces.
 
-It also self-reports two open items worth resolving in the same pass:
-`[DEV FAILED]` has no raw watcher observation mapping to it, and
-`[RATE LIMITED]` is accepted by the guest with no live producer. Either wire a
-producer or remove the variant — a declared signal with no emitter is the same
-class of defect as `agent.stop_check`.
+The audit also removed two legacy guest-only review variants that had no live
+producer: `[DEV FAILED]` and `[RATE LIMITED]`. Current review observations use
+the canonical `pr.review`/`ci.status_changed` events and TL-side
+classification instead.
 
 ## Rejected alternatives
 

@@ -297,6 +297,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E17 :: E17.6 Resolve the three declared-without-producer signals (#830)
 - E17 :: E17.5 Re-audit tl-loop-event-coverage.md (#829)
 - E17 :: E17.4 Add judgment_failure_requires_retry_or_park (#828)
 - E17 :: E17.3 Add merge_decision_requires_pr_outcome (#827)

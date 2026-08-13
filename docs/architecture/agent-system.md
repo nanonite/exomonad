@@ -375,8 +375,7 @@ These are the `PRReviewEvent` constructors the watcher emits. Each role's `prRev
 | `ReviewTimeout` | no reviewer response within `reviewer_max_wait_seconds` | log only | `ReviewerTimedOutEv` -> Done |
 | `MergeReady` | **Deprecated derived state:** inferred from `pr.review` + `ci.status_changed`; not a source event | compatibility notification only; the TL derives merge eligibility | no required handler |
 | `Stuck` | rounds exceed `reviewer_max_rounds` | notify upward; controller repairs via `resume_pr` | `ReviewerStuckEv` -> Done |
-| `RateLimited` | rate-limit hit | log only | log only |
-| `DevNotPushing` / `ReviewerNotResponding` / `ReviewerNeverStarted` / `ReviewDevFailed` | health probes | log only (escalated by watcher to chainlink `review-stuck`) | n/a |
+| `DevNotPushing` / `ReviewerNotResponding` / `ReviewerNeverStarted` | health probes | log only (escalated by watcher to chainlink `review-stuck`) | n/a |
 
 ### CI and review evidence
 
@@ -423,7 +422,6 @@ Beyond per-PR events, the watcher escalates terminal failure modes to **chainlin
 | `dev_not_pushing` | open chainlink `review-stuck` issue |
 | `reviewer_not_responding` | open chainlink `review-stuck` issue |
 | `reviewer_never_started` | open chainlink `review-stuck` issue |
-| `dev_failed` | open chainlink `review-stuck` issue |
 | `Stuck` (rounds exceeded) | notify TL; a later repair uses `resume_pr`, dev moves to `DevNeedsHumanDirection` |
 
 ---

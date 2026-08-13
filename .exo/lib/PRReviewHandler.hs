@@ -81,9 +81,6 @@ prReviewHandler (ReviewerRequestedChanges n comments_ _reviewBranch _authorBranc
   branch <- getCurrentBranch
   void $ applyEvent @DevPhase @DevEvent branch DevSpawned (ReviewReceivedEv n comments_)
   pure (InjectMessage (Tpl.reviewReceived n comments_))
-prReviewHandler (RateLimited remaining secs) = do
-  logHandler $ "Rate limited: " <> T.pack (show remaining) <> " retries, " <> T.pack (show secs) <> "s until reset"
-  pure NoAction
 prReviewHandler (CITriggered n branch_ headSha) = do
   logHandler $ "CI triggered on PR #" <> T.pack (show n) <> ", branch: " <> branch_
   branch <- getCurrentBranch
@@ -121,10 +118,6 @@ prReviewHandler (ReviewerNotResponding n) = do
 prReviewHandler (ReviewerNeverStarted n) = do
   logHandler $ "PR #" <> T.pack (show n) <> " reviewer never started"
   pure NoAction
-prReviewHandler (ReviewDevFailed n) = do
-  logHandler $ "PR #" <> T.pack (show n) <> " dev leaf reported failure"
-  pure NoAction
-
 tlPrReviewHandler :: PRReviewEvent -> Eff Effects EventAction
 tlPrReviewHandler (ReviewReceived n comments_ branch authorBranch) = do
   logHandler $ "TL observed review comments on PR #" <> T.pack (show n)
@@ -150,9 +143,6 @@ tlPrReviewHandler (CommitsPushed n ci) = do
 tlPrReviewHandler (ReviewerRequestedChanges n comments_ branch authorBranch) = do
   logHandler $ "TL observed reviewer requested changes on PR #" <> T.pack (show n)
   pure (InjectMessage (Tpl.reviewReceivedForParent n branch authorBranch comments_))
-tlPrReviewHandler (RateLimited remaining secs) = do
-  logHandler $ "TL observed review rate limit"
-  pure (InjectMessage $ "[RATE LIMITED] Review polling has " <> T.pack (show remaining) <> " retries remaining; reset in " <> T.pack (show secs) <> " seconds.")
 tlPrReviewHandler (CITriggered n branch_ _headSha) = do
   logHandler $ "TL observed CI triggered on PR #" <> T.pack (show n)
   pure (InjectMessage $ "[CI TRIGGERED] PR #" <> T.pack (show n) <> " on " <> branch_ <> ".")
@@ -174,10 +164,6 @@ tlPrReviewHandler (ReviewerNotResponding n) = do
 tlPrReviewHandler (ReviewerNeverStarted n) = do
   logHandler $ "TL observed PR #" <> T.pack (show n) <> " reviewer never started"
   pure (InjectMessage $ "[REVIEWER NEVER STARTED] PR #" <> T.pack (show n) <> " needs TL attention.")
-tlPrReviewHandler (ReviewDevFailed n) = do
-  logHandler $ "TL observed PR #" <> T.pack (show n) <> " dev leaf failure"
-  pure (InjectMessage $ "[DEV FAILED] PR #" <> T.pack (show n) <> " needs TL attention.")
-
 -- | Handle Chainlink issue closure events for dev leaves.
 issueClosedHandler :: IssueClosedEvent -> Eff Effects EventAction
 issueClosedHandler (IssueClosedEvent issueId closedBy) = do
