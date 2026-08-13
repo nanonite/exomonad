@@ -18,6 +18,7 @@ from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
+from tl_loop.loop.observability import emit_controller_event
 from tl_loop.plan_validation import (
     PlanValidationError,
     validate_plan_document,
@@ -98,6 +99,12 @@ def _parser() -> argparse.ArgumentParser:
     decision = gate.add_mutually_exclusive_group(required=True)
     decision.add_argument("--approve", action="store_true")
     decision.add_argument("--reject", action="store_true")
+    gate.add_argument(
+        "--source",
+        choices=("cli", "control"),
+        default="cli",
+        help=argparse.SUPPRESS,
+    )
     gate.set_defaults(command="gate")
 
     proposal = subcommands.add_parser(
@@ -278,13 +285,28 @@ def _print_status(args: argparse.Namespace) -> None:
 
 
 def _set_gate(args: argparse.Namespace) -> None:
-    root = args.project_root.expanduser().resolve() / ".exo" / "tl-loop"
+    project_root = args.project_root.expanduser().resolve()
+    root = project_root / ".exo" / "tl-loop"
     store = RunStore(args.run_id, root)
     status = GateStatus.APPROVED.value if args.approve else GateStatus.REJECTED.value
     try:
         store.answer_gate(args.name, GateStatus(status))
     except ValueError as error:
         raise LauncherError(str(error)) from error
+    effects = EffectClient(
+        TransportClient(project_root=project_root),
+        role="tl",
+        name="root",
+    )
+    emit_controller_event(
+        effects,
+        "tl.gate_answered",
+        {
+            "gate_name": args.name,
+            "decision": status,
+            "source": args.source,
+        },
+    )
     LOGGER.info("[TL loop] gate name=%s status=%s", args.name, status)
 
 

@@ -86,6 +86,8 @@ pub async fn answer_gate(
             run_id,
             "--name",
             gate_name,
+            "--source",
+            "control",
             request.decision.cli_flag(),
         ])
         .output()

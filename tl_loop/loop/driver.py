@@ -591,7 +591,20 @@ def _park_timeout(
 ) -> TLRunResult:
     """Persist a named timeout gate before returning a terminal failed run."""
     before_phase = _phase_from_state(state)
+    previous_gate = next(
+        (gate for gate in state.gates if gate.name == TIMEOUT_GATE_NAME),
+        None,
+    )
     state = store.set_gate(TIMEOUT_GATE_NAME, GateStatus.PENDING)
+    if previous_gate is None or previous_gate.status is not GateStatus.PENDING:
+        _record_controller_event(
+            "controller",
+            "tl.gate_opened",
+            {"gate_name": TIMEOUT_GATE_NAME, "run_id": run_id},
+            config,
+            effects,
+            effects_log,
+        )
     message = f"timeout parked at gate {TIMEOUT_GATE_NAME!r}: {reason}"
     state = store.checkpoint(
         TLFailed(message),

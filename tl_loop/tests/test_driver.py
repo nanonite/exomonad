@@ -214,6 +214,12 @@ def test_idle_timeout_parks_with_named_gate_and_never_merges(tmp_path: Path) -> 
     assert result.final_state.fsm.phase is TLPhase.TLFailed
     assert result.final_state.gates == (GateState(name="tl-timeout", status=GateStatus.PENDING),)
     assert _effect_names(transport) == ["spawn_worker", "spawn_leaf"]
+    assert [
+        arguments["payload"]
+        for tool_name, arguments in transport.calls
+        if tool_name == "emit_controller_event"
+        and arguments["event_type"] == "tl.gate_opened"
+    ] == [{"gate_name": "tl-timeout", "run_id": "timeout-run"}]
     assert "merge_pr" not in _effect_names(transport)
 
 
