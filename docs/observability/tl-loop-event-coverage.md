@@ -1,14 +1,18 @@
 # TL-loop event coverage
 
-Audit date: 2026-08-11. This is the M2.7 audit required before the loop consumes
+Audit date: 2026-08-12. This is the M2.7 audit required before the loop consumes
 the ledger in shadow mode.
 
 ## Method
 
 The interactive TL can receive a direct message, a WASM `handle_event` input,
-an inbox message, or a parent notification. This audit calls a wakeup
+an inbox message, or a parent notification. This audit calls a sensor wakeup
 “covered” only when the same condition has a durable L1 ledger row whose event
-type is projected by M2.6. The bridge’s closed event set is
+type is projected by the current closed bridge set. Controller events and
+guidance-queue lifecycle rows are also audited here, but remain distinct from
+the TL input projection: controller events are best-effort effects written by
+Rust, while queue rows are durable state transitions owned by the inbox
+services. The bridge’s closed event set is
 `tl_loop/events/envelope.py:30-68`; the lifecycle `agent.spawned` row is
 projected so shadow mode can observe real fan-out; transient `pr_review`, `ci_status`,
 `sibling_merged`, and `issue_closed` inputs are covered only when their
@@ -24,7 +28,6 @@ ledger.
 
 | wakeup | source | bridged kind | status (covered / gap) | notes |
 |---|---|---|---|---|
-| `[MERGE READY]` | `.exo/roles/devswarm/context/root.md:63-67`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:572-575,3324-3338` | `pr.review` plus `agent.notify_parent` repair handoff | covered | The canonical row preserves the exact release notification before injection. |
 | `[PR READY]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:605-607,681-687` | `pr.review` | covered | The `approved` wakeup retains the native TL notification text. |
 | `[REVIEW TIMEOUT]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs` raw observation; `tl_loop/events/stall.py` | `pr.review` | covered | The watcher records elapsed time and review evidence; the TL derives the timeout stall class. |
 | `[FIXES PUSHED]` | `rust/exomonad-core/src/services/worktree_event_watcher.rs:615-626,2951-2962` | `pr.review` | covered | The canonical row retains the transient payload and verified head. |
@@ -69,7 +72,7 @@ Rust watcher.
 | `stuck` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:67-70,113`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3148-3178` | `pr.review` | covered | Review-loop stuck signals now retain rounds and notification text. |
 | `ci_triggered` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:71-75,114`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3113-3128` | `pr.review` | covered | The manual-CI trigger decision is retained. |
 | `ci_blocked` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:76-80,115`; `rust/exomonad-core/src/services/worktree_event_watcher.rs` raw observation | `pr.review` projection | covered | The review-blocking transition is retained with CI status and projected to `ci_failed` when CI fails. |
-| `merge_ready` | legacy event type only; no active watcher producer | `pr.review` | retired | Merge readiness is derived at the merge boundary from current-head review and CI observations; the watcher does not emit or dispatch this event. |
+| `merge_ready` | `haskell/wasm-guest/src/ExoMonad/Guest/Events.hs:116,136`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:3237-3246` | `pr.review` | retired compatibility input | The guest parser retains the legacy shape, but the watcher’s native fallback explicitly ignores it. Readiness is resolved at the merge boundary from current-head review and CI observations; no watcher merge decision is counted as sensor coverage. |
 | `dev_not_pushing` | `tl_loop/events/stall.py` from raw `stuck` evidence | `pr.review` projection | covered | Classification is owned by the TL projection. |
 | `reviewer_not_responding` | `tl_loop/events/stall.py` from raw `timeout` evidence | `pr.review` projection | covered | Classification is owned by the TL projection. |
 | `reviewer_never_started` | `tl_loop/events/stall.py` from raw `timeout` evidence | `pr.review` projection | covered | Classification is owned by the TL projection. |
@@ -99,6 +102,40 @@ is still part of the supported wakeup contract and is audited here.
 | `notify_parent(status=failure)` | `haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs:52-67,130-168`; `rust/exomonad-core/src/services/delivery.rs:182-805` | `agent.completed` then `agent.notify_parent` | covered | Status/message are preserved, and the missing SHA is explicit rather than synthesized. |
 | `notify_parent(status=stuck)` | `rust/exomonad-core/src/services/delivery.rs:182-805` | `agent.notify_parent` | covered | Rust accepts and logs `stuck`; the Haskell tool currently exposes only success/failure. The row records the same explicit finding when no PR context is available. |
 
+## Controller event coverage
+
+The controller declares eight `tl.*` aggregate event types. Each is accepted by
+the Rust TL handler and written through the existing ledger writer; the Python
+controller remains the caller and does not open a second ledger writer. Emission
+is best-effort, so a failed write must not change the controller state transition.
+
+| event | producer | status | notes |
+|---|---|---|---|
+| `tl.phase_changed` | `tl_loop/loop/driver.py:1531-1542`; `rust/exomonad-core/src/handlers/tl.rs:14-30` | covered | Phase transitions carry only bounded phase tags and run identity. |
+| `tl.slice_status_changed` | `tl_loop/loop/escalate.py:267-285`; `rust/exomonad-core/src/handlers/tl.rs:14-30` | covered | Status transitions are emitted from durable slice state changes. |
+| `tl.slice_parked` | `tl_loop/loop/escalate.py:286-293`; `tl_loop/loop/driver.py:747-756` | covered | Park cause and attempt count are bounded dimensions; no body is emitted. |
+| `tl.gate_opened` | `tl_loop/loop/driver.py:599-608`; `rust/exomonad-core/src/handlers/tl.rs:14-30` | covered | Timeout parking opens the named gate before the terminal failed phase. |
+| `tl.gate_answered` | `tl_loop/__main__.py:320-340` | covered | CLI/control answers carry gate name, decision, and source. |
+| `tl.merge_decided` | `tl_loop/loop/driver.py:1109-1118` | covered | The decision carries a PR number and bounded head-SHA hash, not the merge body. |
+| `tl.judgment` | `tl_loop/rlm/call.py:324-355`; `tl_loop/rlm/store.py:114-123` | covered | RLM calls project model, attempt, outcome, tokens, latency, replay, and bounded redacted result. |
+| `tl.plan_proposed` | `tl_loop/__main__.py:242-256` | covered | Proposal outcome is recorded without the plan document or rejection prose beyond the bounded reason. |
+
+## Guidance-queue coverage
+
+The durable guidance path is a queue lifecycle, not a second transport. Batch and
+item identities are committed before delivery; consumption and abandonment remain
+observable even when the compatibility notification path is used.
+
+| lifecycle | producer | event(s) | status | notes |
+|---|---|---|---|---|
+| durable enqueue | `rust/exomonad-core/src/services/delivery.rs:811-824`; `rust/exomonad-core/src/services/inbox_store.rs` | `inbox.state_changed` | covered | The batch identity, queue class, and pending state are durable before transport. |
+| transport delivery | `rust/exomonad-core/src/services/delivery.rs:160-180,730-750` | `message.delivery` | covered | Delivery outcome is recorded for the durable batch and transport attempt. |
+| inbox consumption | `rust/exomonad-core/src/services/inbox_store.rs:246-262` | `message.consumed` | covered | The consumer identity and batch correlation are retained before the read is acknowledged. |
+| delivery abandonment | `rust/exomonad-core/src/services/delivery.rs:1068-1085` | `agent_inbox.messages_abandoned` | covered | Exhausted retries become an explicit terminal outcome rather than disappearing. |
+| identity duplicate suppression | `rust/exomonad-core/src/services/agent_inbox.rs:181-201` | `agent_inbox.duplicates_dropped` | covered | Identity-based idempotency is recorded at the durable inbox boundary. |
+| unread poke bookkeeping | `rust/exomonad-core/src/services/inbox_store.rs:268-400`; `rust/exomonad-core/src/services/worktree_event_watcher.rs:1547-1610` | `inbox.state_changed`, `inbox.poke` | covered | Poke metadata and delivery outcome are separate from message consumption. |
+| lifecycle guidance summary | `docs/exomonad-session-logging.md:228-230` | `agent.guidance.delivery` | explicit finding | The registry declares this event, but no current producer was found in the active tree; current queue coverage relies on the canonical durable delivery/consumption/abandonment rows. |
+
 ## Existing canonical event cross-check
 
 | wakeup | source | bridged kind | status (covered / gap) | notes |
@@ -117,8 +154,11 @@ is still part of the supported wakeup contract and is audited here.
 
 ## Mode decision
 
-Coverage is sufficient for M3 shadow mode (#678): all direct inbox and
-issue-close wakeups in this audit now have projected canonical ledger rows.
+Coverage is sufficient for M3 shadow mode (#678): direct inbox and issue-close
+wakeups have projected canonical ledger rows, controller aggregate events have
+Rust ledger handlers, and the guidance queue has explicit enqueue, delivery,
+consumption, abandonment, and duplicate outcomes. The retired `merge_ready`
+compatibility input is not treated as a watcher decision or a sensor producer.
 
 Coverage is not sufficient for M5 active mode. Active mode still requires the
 separate policy and control-plane gates defined by the milestone.
