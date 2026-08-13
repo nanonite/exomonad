@@ -297,6 +297,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E17 :: E17.4 Add judgment_failure_requires_retry_or_park (#828)
 - E17 :: E17.3 Add merge_decision_requires_pr_outcome (#827)
 - E17 :: E17.2 Add gate_opened_requires_answer (#826)
 - E17 :: E17.1 Add park_requires_gate_or_terminal (#825)

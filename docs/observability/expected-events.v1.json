@@ -90,6 +90,17 @@
       "denominator_effect": "Add one expected PR merge outcome for each tl.merge_decided event whose decision is merge."
     },
     {
+      "rule_id": "judgment_failure_requires_retry_or_park",
+      "prerequisite_event": "tl.judgment",
+      "required_event": "tl.judgment/tl.slice_parked",
+      "allowed_delay_ms": null,
+      "allowed_window": "until a further judgment attempt, park, cancellation, or session termination",
+      "prerequisite_data": {"outcome": "failure"},
+      "applicable_sources": ["tl_loop"],
+      "legacy_confidence_rule": "A failed judgment without a subsequent attempt or explicit park is unknown, not recovered.",
+      "denominator_effect": "Add one expected retry-or-park outcome for each failed tl.judgment."
+    },
+    {
       "rule_id": "published_pr_requires_observation",
       "prerequisite_event": "pr.published",
       "required_event": "watcher.pr_observation",
