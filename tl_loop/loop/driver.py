@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import queue as queue_module
 import time
@@ -1017,6 +1018,7 @@ def _merge_completed_leaf(
     if completion.slug not in leaf_names or pr_number is None or completion.slug in merged:
         return True
     current = state.slices.get(completion.slug)
+    head_sha = event.head_sha or (current.reviewed_head if current is not None else None)
     live = cast(EffectClient, effects) if config.active else None
     if (
         config.active
@@ -1041,18 +1043,38 @@ def _merge_completed_leaf(
                 if config.review_policy_path is not None
                 else None
             )
+            current_head = watcher_head(watcher_result)
             verify_review(
                 current,
-                watcher_head(watcher_result),
+                current_head,
                 freshness_window_secs=freshness_window_secs,
             )
+            head_sha = current_head
         except ReviewGateError as error:
             LOGGER.warning(
                 "[TL loop] refusing merge target=%s reason=%s",
                 completion.slug,
                 error,
             )
+            _emit_merge_decision(
+                completion.slug,
+                pr_number,
+                "blocked",
+                head_sha,
+                config,
+                effects,
+                effects_log,
+            )
             return False
+    _emit_merge_decision(
+        completion.slug,
+        pr_number,
+        "merge",
+        head_sha,
+        config,
+        effects,
+        effects_log,
+    )
     arguments: dict[str, object] = {"pr_number": pr_number}
     _optional_argument(arguments, "chainlink_issue_id", config.chainlink_issue_id)
     _optional_argument(arguments, "strategy", config.merge_strategy)
@@ -1073,6 +1095,36 @@ def _merge_completed_leaf(
     )
     merged.add(completion.slug)
     return True
+
+
+def _emit_merge_decision(
+    slice_id: str,
+    pr_number: int,
+    decision: str,
+    head_sha: str | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    _record_controller_event(
+        "controller",
+        "tl.merge_decided",
+        {
+            "slice_id": slice_id,
+            "pr_number": pr_number,
+            "decision": decision,
+            "head_sha_hash": _hash_head_sha(head_sha),
+        },
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _hash_head_sha(head_sha: str | None) -> str:
+    if head_sha is None:
+        return "missing"
+    return hashlib.sha256(head_sha.encode("utf-8")).hexdigest()
 
 
 def _discard_review(slices: Mapping[str, SliceState], slice_id: str) -> dict[str, SliceState]:

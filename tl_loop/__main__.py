@@ -33,6 +33,7 @@ DEFAULT_RUN_ID = "root"
 DEFAULT_PLAN = Path(".exo/tl-loop/plan.json")
 DEFAULT_IDLE_TIMEOUT = 30.0
 DEFAULT_MAX_EVENTS = 256
+PLAN_REJECTION_REASON_LIMIT = 160
 
 
 class LauncherError(RuntimeError):
@@ -219,17 +220,47 @@ def _print_plan_proposal(args: argparse.Namespace) -> None:
     try:
         value = json.load(sys.stdin)
     except json.JSONDecodeError as error:
+        _emit_plan_proposal(args, False, _bounded_reason(error))
         raise LauncherError(f"plan proposal is not valid JSON: {error}") from error
-    proposal = validate_plan_proposal(value)
+    try:
+        proposal = validate_plan_proposal(value)
+    except PlanValidationError as error:
+        _emit_plan_proposal(args, False, _bounded_reason(error))
+        raise
     plan = proposal["plan"]
     if not isinstance(plan, Mapping):
         raise LauncherError("validated plan proposal is not an object")
+    _emit_plan_proposal(args, True)
     print(
         json.dumps(
             {"run_id": args.run_id, "plan": dict(plan), "inert": True, "status": "proposed"},
             sort_keys=True,
         )
     )
+
+
+def _emit_plan_proposal(
+    args: argparse.Namespace,
+    accepted: bool,
+    rejection_reason: str | None = None,
+) -> None:
+    payload: dict[str, object] = {"run_id": args.run_id, "accepted": accepted}
+    if rejection_reason is not None:
+        payload["rejection_reason"] = rejection_reason
+    project_root = args.project_root.expanduser().resolve()
+    effects = EffectClient(
+        TransportClient(project_root=project_root),
+        role="tl",
+        name="root",
+    )
+    emit_controller_event(effects, "tl.plan_proposed", payload)
+
+
+def _bounded_reason(error: Exception) -> str:
+    reason = " ".join(str(error).split()) or "proposal rejected"
+    if len(reason) <= PLAN_REJECTION_REASON_LIMIT:
+        return reason
+    return reason[: PLAN_REJECTION_REASON_LIMIT - 3] + "..."
 
 
 def _run_id(document: Mapping[str, object], configured: str) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import queue
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -172,6 +173,12 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
         },
         {"slice_id": "leaf-a", "from_status": "pending", "to_status": "spawned"},
         {"slice_id": "worker-a", "from_status": "spawned", "to_status": "merged"},
+        {
+            "slice_id": "leaf-a",
+            "pr_number": 42,
+            "decision": "merge",
+            "head_sha_hash": hashlib.sha256(b"head-a").hexdigest(),
+        },
         {"slice_id": "leaf-a", "from_status": "spawned", "to_status": "merged"},
         {"from_phase": "tl_waiting", "to_phase": "tl_all_merged", "run_id": "active-run"},
         {"from_phase": "tl_all_merged", "to_phase": "tl_done", "run_id": "active-run"},
@@ -860,7 +867,7 @@ def _lifecycle_events(run_id: str) -> list[EventEnvelope]:
         _event(1, "child_spawned", "worker-a", run_id=run_id),
         _event(2, "child_spawned", "leaf-a", run_id=run_id),
         _event(3, "child_completed", "worker-a", run_id=run_id),
-        _event(4, "child_completed", "leaf-a", pr_number=42, run_id=run_id),
+        _event(4, "child_completed", "leaf-a", pr_number=42, head_sha="head-a", run_id=run_id),
         _event(5, "all_children_done", run_id=run_id),
     ]
 
@@ -930,6 +937,7 @@ def _event(
     slug: str | None = None,
     *,
     pr_number: int | None = None,
+    head_sha: str | None = None,
     run_id: str,
 ) -> EventEnvelope:
     shadow_event: dict[str, object] = {"kind": kind}
@@ -941,6 +949,8 @@ def _event(
     data: dict[str, object] = {"shadow_event": shadow_event}
     if pr_number is not None:
         data["pr_number"] = pr_number
+    if head_sha is not None:
+        data["head_sha"] = head_sha
     raw = {
         "schema_version": 1,
         "event_id": f"event-{run_seq}",

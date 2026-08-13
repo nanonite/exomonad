@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,3 +69,41 @@ def test_gate_answer_emits_source_dimension(
             },
         )
     ]
+
+
+def test_accepted_plan_proposal_emits_no_plan_body(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    transport = RecordingTransport()
+    monkeypatch.setattr(launcher, "TransportClient", lambda project_root: transport)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"plan": {"leaves": []}}'))
+
+    launcher._print_plan_proposal(argparse.Namespace(project_root=tmp_path, run_id="run"))
+
+    assert transport.calls[0][1] == {
+        "event_type": "tl.plan_proposed",
+        "payload": {"run_id": "run", "accepted": True},
+    }
+    assert "plan" not in transport.calls[0][1]["payload"]
+    assert '"inert": true' in capsys.readouterr().out
+
+
+def test_rejected_plan_proposal_emits_bounded_reason_without_body(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    transport = RecordingTransport()
+    monkeypatch.setattr(launcher, "TransportClient", lambda project_root: transport)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"plan": {"leaves": []}, "body": "secret"}'))
+
+    with pytest.raises(launcher.PlanValidationError):
+        launcher._print_plan_proposal(argparse.Namespace(project_root=tmp_path, run_id="run"))
+
+    payload = transport.calls[0][1]["payload"]
+    assert payload["run_id"] == "run"
+    assert payload["accepted"] is False
+    assert isinstance(payload["rejection_reason"], str)
+    assert len(payload["rejection_reason"]) <= launcher.PLAN_REJECTION_REASON_LIMIT
+    assert "secret" not in str(payload)

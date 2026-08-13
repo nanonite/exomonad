@@ -211,6 +211,21 @@
       }
     },
     {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.merge_decided",
+        "payload": {
+          "decision": "merge",
+          "head_sha_hash": "missing",
+          "pr_number": 42,
+          "slice_id": "leaf-a"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
       "operation": "merge_pr",
       "arguments": {
         "pr_number": 42,

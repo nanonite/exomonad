@@ -22,8 +22,8 @@ from tl_loop.loop.driver import (
 from tl_loop.loop.review import (
     CIStatusNotApproved,
     MissingCIStatus,
-    ReviewHeadMismatch,
     OptionalPolicyRejected,
+    ReviewHeadMismatch,
     StaleVerdict,
     verify_review,
 )
@@ -135,7 +135,9 @@ def test_pre_merge_watcher_recheck_blocks_a_fix_pushed_after_verdict(
     )
 
     assert allowed is False
-    assert [name for name, _ in transport.calls] == ["watcher_pr_state"]
+    assert [name for name, _ in transport.calls if name != "emit_controller_event"] == [
+        "watcher_pr_state"
+    ]
     assert effects_log[0].operation == "watcher_pr_state"
     assert store.load().slices["leaf"].verdict is not None
 
@@ -160,7 +162,10 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
     )
 
     assert allowed is True
-    assert [name for name, _ in transport.calls] == ["watcher_pr_state", "merge_pr"]
+    assert [name for name, _ in transport.calls if name != "emit_controller_event"] == [
+        "watcher_pr_state",
+        "merge_pr",
+    ]
 
 
 def test_expired_matching_head_is_refused_before_merge(tmp_path: Path) -> None:
@@ -183,7 +188,9 @@ def test_expired_matching_head_is_refused_before_merge(tmp_path: Path) -> None:
     )
 
     assert allowed is False
-    assert [name for name, _ in transport.calls] == ["watcher_pr_state"]
+    assert [name for name, _ in transport.calls if name != "emit_controller_event"] == [
+        "watcher_pr_state"
+    ]
 
 
 def _fresh_verdict_at() -> str:
