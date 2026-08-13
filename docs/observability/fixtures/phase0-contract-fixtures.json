@@ -67,6 +67,7 @@
     "merge_request_requires_passing_ci_current_head",
     "guidance_enqueue_requires_acceptance_or_abandonment",
     "park_requires_gate_or_terminal",
-    "gate_opened_requires_answer"
+    "gate_opened_requires_answer",
+    "merge_decision_requires_pr_outcome"
   ]
 }

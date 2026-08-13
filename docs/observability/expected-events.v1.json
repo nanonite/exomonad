@@ -78,6 +78,18 @@
       "denominator_effect": "Add one expected gate answer for each observed gate opening and measure answer latency until resolution."
     },
     {
+      "rule_id": "merge_decision_requires_pr_outcome",
+      "prerequisite_event": "tl.merge_decided",
+      "required_event": "pr.merged/pr.merge_failed",
+      "allowed_delay_ms": null,
+      "allowed_window": "until merge outcome, cancellation, or session termination",
+      "prerequisite_data": {"decision": "merge"},
+      "correlation_fields": ["pr_number"],
+      "applicable_sources": ["tl_loop", "rust", "haskell", "watcher"],
+      "legacy_confidence_rule": "A merge decision without a correlated PR outcome is unknown, not delivered.",
+      "denominator_effect": "Add one expected PR merge outcome for each tl.merge_decided event whose decision is merge."
+    },
+    {
       "rule_id": "published_pr_requires_observation",
       "prerequisite_event": "pr.published",
       "required_event": "watcher.pr_observation",
