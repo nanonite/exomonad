@@ -12,18 +12,19 @@ use crate::services::Services;
 use super::{
     AgentHandler, CoordinationHandler, EventHandler, FilePRHandler, ForgejoAsGitHubHandler,
     FsHandler, GitHandler, GitHubHandler, InboxHandler, KvHandler, LifecycleHandler, LogHandler,
-    MemoryHandler, MergePRHandler, ProcessHandler, SessionHandler, TasksHandler,
+    MemoryHandler, MergePRHandler, ProcessHandler, SessionHandler, TasksHandler, TlHandler,
 };
 
 /// Core handlers every consumer needs: logging, key-value store, filesystem.
 pub fn core_handlers(project_dir: PathBuf, services: Arc<Services>) -> Vec<Box<dyn EffectHandler>> {
     vec![
-        Box::new(LogHandler::new(services)),
+        Box::new(LogHandler::new(services.clone())),
         Box::new(KvHandler::new(project_dir.clone())),
         Box::new(FsHandler::new(Arc::new(FileSystemService::new(
             project_dir.clone(),
         )))),
         Box::new(ProcessHandler::with_project_dir(project_dir)),
+        Box::new(TlHandler::new(services)),
     ]
 }
 
@@ -107,12 +108,13 @@ mod tests {
         let tmp = tempdir().unwrap();
         let services = Arc::new(Services::test());
         let handlers = core_handlers(tmp.path().to_path_buf(), services);
-        assert_eq!(handlers.len(), 4);
+        assert_eq!(handlers.len(), 5);
         let namespaces: Vec<_> = handlers.iter().map(|h| h.namespace()).collect();
         assert!(namespaces.contains(&"log"));
         assert!(namespaces.contains(&"kv"));
         assert!(namespaces.contains(&"fs"));
         assert!(namespaces.contains(&"process"));
+        assert!(namespaces.contains(&"tl"));
     }
 
     #[test]

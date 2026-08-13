@@ -73,6 +73,7 @@ TOOL_METHODS: tuple[str, ...] = (
     "session_status",
     "poll_workers",
     "check_inbox",
+    "emit_controller_event",
     "memory_append",
     "memory_list",
     "continuation_brief",
@@ -124,6 +125,13 @@ class EffectClient:
     def _call(self, tool_name: str, arguments: JsonObject) -> ToolResult:
         response = self.transport.call_tool(self.role, self.name, tool_name, arguments)
         return ToolResult.from_raw(response)
+
+    def emit_controller_event(self, *, event_type: str, payload: JsonObject) -> ToolResult:
+        """Emit bounded controller dimensions through the Rust ledger writer."""
+        return self._call(
+            "emit_controller_event",
+            {"event_type": event_type, "payload": payload},
+        )
 
 
     def spawn_leaf(

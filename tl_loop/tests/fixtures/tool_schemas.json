@@ -431,6 +431,89 @@
       "name": "check_inbox"
     },
     {
+      "description": "Emit bounded controller observability dimensions to the canonical ledger.",
+      "inputSchema": {
+        "properties": {
+          "event_type": {
+            "description": "Declared tl.* controller event type",
+            "type": "string"
+          },
+          "payload": {
+            "description": "Bounded aggregate dimensions only; no bodies or prose",
+            "properties": {
+              "accepted": {
+                "type": "boolean"
+              },
+              "attempt": {
+                "type": "integer"
+              },
+              "attempts": {
+                "type": "integer"
+              },
+              "decision": {
+                "type": "string"
+              },
+              "from_phase": {
+                "type": "string"
+              },
+              "from_status": {
+                "type": "string"
+              },
+              "gate_name": {
+                "type": "string"
+              },
+              "head_sha_hash": {
+                "type": "string"
+              },
+              "judgment": {
+                "type": "string"
+              },
+              "outcome": {
+                "type": "string"
+              },
+              "park_cause": {
+                "type": "string"
+              },
+              "pr_number": {
+                "type": "integer"
+              },
+              "rejection_reason": {
+                "type": "string"
+              },
+              "replayed": {
+                "type": "boolean"
+              },
+              "run_id": {
+                "type": "string"
+              },
+              "slice_id": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "to_phase": {
+                "type": "string"
+              },
+              "to_status": {
+                "type": "string"
+              },
+              "tokens": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "event_type",
+          "payload"
+        ],
+        "type": "object"
+      },
+      "name": "emit_controller_event"
+    },
+    {
       "description": "Append a durable session-memory record. Valid kind values: unspecified, original_plan, wave_plan, spawned_child, child_handoff, blocker, decision, review_feedback, fix_direction, merge_result, ci_result, next_action, human_clarification, session_summary. The ledger is append-only: records cannot be updated or deleted.",
       "inputSchema": {
         "properties": {

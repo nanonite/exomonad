@@ -68,6 +68,7 @@ The controller has an architectural no-edit boundary: implementation belongs to 
 | `session_status` | x | x | | | |
 | `poll_workers` | x | x | | | |
 | `check_inbox` | | | x | x | x |
+| `emit_controller_event` | | x | | | |
 | `list_agents` | x | x | | x | |
 | `task_list` / `task_get` / `task_update` | | | x | | x |
 | `memory_append` | x | x | x | | x |

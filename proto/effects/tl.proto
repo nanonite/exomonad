@@ -1,0 +1,20 @@
+syntax = "proto3";
+package exomonad.effects.tl;
+
+// Controller-owned observability effects.
+
+message EmitEventRequest {
+  // One of the declared tl.* aggregate-dimension event types.
+  string event_type = 1;
+  // Bounded aggregate dimensions encoded as a JSON object.
+  bytes payload = 2;
+}
+
+message EmitEventResponse {
+  // Canonical ledger event identifier assigned by the host.
+  string event_id = 1;
+}
+
+service TlEffects {
+  rpc EmitEvent(EmitEventRequest) returns (EmitEventResponse);
+}

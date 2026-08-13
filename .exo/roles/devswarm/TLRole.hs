@@ -7,10 +7,15 @@
 -- | TL role config: an RPC surface for the programmatic Python controller.
 module TLRole (config, Tools) where
 
-import Data.Aeson (object, (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:), (.=))
 import Data.Aeson qualified as Aeson
+import Data.ByteString.Lazy qualified as BSL
+import Data.Aeson.KeyMap qualified as KM
 import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Text.Lazy qualified as TL
 import ExoMonad
+import ExoMonad.Effects.Tl qualified as Tl
 import ExoMonad.Guest.ReviewHandoff (reviewHandoffInstructions)
 import ExoMonad.Guest.Tools.Agents (ListAgents (..))
 import ExoMonad.Guest.Tools.Chainlink
@@ -74,6 +79,7 @@ import ExoMonad.Guest.Tools.Spawn
 import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
 import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
 import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
+import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
 import ExoMonad.Types (HookConfig (..), teamRegistrationPostToolUse, tlSessionStartHook)
 import HookPolicy (preToolUseWithImplementationBlock)
@@ -179,6 +185,83 @@ instance MCPTool TLNotifyParent where
       Left err -> pure $ errorResult err
       Right _ -> pure $ successResult $ object ["success" .= True]
 
+data TLEmitControllerEventArgs = TLEmitControllerEventArgs
+  { tleEventType :: Text,
+    tlePayload :: Aeson.Value
+  }
+  deriving (Generic, Show)
+
+instance FromJSON TLEmitControllerEventArgs where
+  parseJSON = withObject "TLEmitControllerEventArgs" $ \value ->
+    TLEmitControllerEventArgs <$> value .: "event_type" <*> value .: "payload"
+
+instance ToJSON TLEmitControllerEventArgs where
+  toJSON args = object ["event_type" .= tleEventType args, "payload" .= tlePayload args]
+
+controllerPayloadSchema :: Aeson.Object
+controllerPayloadSchema =
+  KM.fromList
+    [ ("accepted", Aeson.object ["type" .= ("boolean" :: Text)]),
+      ("attempt", Aeson.object ["type" .= ("integer" :: Text)]),
+      ("attempts", Aeson.object ["type" .= ("integer" :: Text)]),
+      ("decision", Aeson.object ["type" .= ("string" :: Text)]),
+      ("from_phase", Aeson.object ["type" .= ("string" :: Text)]),
+      ("from_status", Aeson.object ["type" .= ("string" :: Text)]),
+      ("gate_name", Aeson.object ["type" .= ("string" :: Text)]),
+      ("head_sha_hash", Aeson.object ["type" .= ("string" :: Text)]),
+      ("judgment", Aeson.object ["type" .= ("string" :: Text)]),
+      ("latency_ms", Aeson.object ["type" .= ("integer" :: Text)]),
+      ("model", Aeson.object ["type" .= ("string" :: Text)]),
+      ("outcome", Aeson.object ["type" .= ("string" :: Text)]),
+      ("park_cause", Aeson.object ["type" .= ("string" :: Text)]),
+      ("pr_number", Aeson.object ["type" .= ("integer" :: Text)]),
+      ("redacted_result", Aeson.object ["type" .= ("string" :: Text)]),
+      ("rejection_reason", Aeson.object ["type" .= ("string" :: Text)]),
+      ("replayed", Aeson.object ["type" .= ("boolean" :: Text)]),
+      ("run_id", Aeson.object ["type" .= ("string" :: Text)]),
+      ("slice_id", Aeson.object ["type" .= ("string" :: Text)]),
+      ("source", Aeson.object ["type" .= ("string" :: Text)]),
+      ("to_phase", Aeson.object ["type" .= ("string" :: Text)]),
+      ("to_status", Aeson.object ["type" .= ("string" :: Text)]),
+      ("tokens", Aeson.object ["type" .= ("integer" :: Text)])
+    ]
+
+data TLEmitControllerEvent
+
+instance MCPTool TLEmitControllerEvent where
+  type ToolArgs TLEmitControllerEvent = TLEmitControllerEventArgs
+  toolName = "emit_controller_event"
+  toolDescription = "Emit bounded controller observability dimensions to the canonical ledger."
+  toolSchema =
+    KM.fromList
+      [ ("type", Aeson.String "object"),
+        ( "properties",
+          Aeson.Object $
+            KM.fromList
+              [ ("event_type", Aeson.object ["type" .= ("string" :: Text), "description" .= ("Declared tl.* controller event type" :: Text)]),
+                ( "payload",
+                  Aeson.object
+                    [ "type" .= ("object" :: Text),
+                      "description" .= ("Bounded aggregate dimensions only; no bodies or prose" :: Text),
+                      "properties" .= Aeson.Object controllerPayloadSchema
+                    ]
+                )
+              ]
+        ),
+        ("required", Aeson.toJSON (["event_type", "payload"] :: [Text]))
+      ]
+  toolHandlerEff args = do
+    result <-
+      suspendEffect @Tl.TlEmitEvent
+        ( Tl.EmitEventRequest
+            { Tl.emitEventRequestEventType = TL.fromStrict (tleEventType args),
+              Tl.emitEventRequestPayload = BSL.toStrict (Aeson.encode (tlePayload args))
+            }
+        )
+    pure $ case result of
+      Left err -> errorResult (T.pack (show err))
+      Right response -> successResult (object ["event_id" .= Tl.emitEventResponseEventId response])
+
 data Tools mode = Tools
   { spawnLeaf :: mode :- TLSpawnLeaf,
     spawnWorker :: mode :- TLSpawnWorker,
@@ -200,6 +283,7 @@ data Tools mode = Tools
     pr :: mode :- TLFilePR,
     mergePr :: mode :- TLMergePR,
     notifyParent :: mode :- TLNotifyParent,
+    emitControllerEvent :: mode :- TLEmitControllerEvent,
     sendTmuxMessage :: mode :- SendTmuxMessage,
     sendMailboxMessage :: mode :- SendMailboxMessage,
     chainlinkIssueCreate :: mode :- ChainlinkIssueCreate,
@@ -253,6 +337,7 @@ config =
             pr = mkHandler @TLFilePR,
             mergePr = mkHandler @TLMergePR,
             notifyParent = mkHandler @TLNotifyParent,
+            emitControllerEvent = mkHandler @TLEmitControllerEvent,
             sendTmuxMessage = mkHandler @SendTmuxMessage,
             sendMailboxMessage = mkHandler @SendMailboxMessage,
             chainlinkIssueCreate = mkHandler @ChainlinkIssueCreate,
