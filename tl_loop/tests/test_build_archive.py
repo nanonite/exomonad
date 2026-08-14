@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import uuid
+import zipfile
 from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 SOURCE_MODULE = REPOSITORY_ROOT / "tl_loop/__init__.py"
+ARCHIVE_BUILDER = REPOSITORY_ROOT / "scripts/build_tl_loop_archive.py"
 
 
 def _build_exomonad() -> None:
@@ -53,3 +56,29 @@ def test_source_edit_is_present_in_rebuilt_embedded_archive() -> None:
     finally:
         SOURCE_MODULE.write_text(original, encoding="utf-8")
         _build_exomonad()
+
+
+def test_archive_excludes_interpreter_artifacts_and_tests(tmp_path: Path) -> None:
+    archive_path = tmp_path / "tl_loop.pyz"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ARCHIVE_BUILDER),
+            "--source",
+            str(REPOSITORY_ROOT / "tl_loop"),
+            "--output",
+            str(archive_path),
+        ],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+    )
+
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
+
+    assert not [name for name in names if name.endswith(".pyc")]
+    assert not [
+        name
+        for name in names
+        if any(part in {"__pycache__", ".venv", "tests"} for part in Path(name).parts)
+    ]
