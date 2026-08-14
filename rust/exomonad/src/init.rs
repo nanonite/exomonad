@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 const TL_LOOP_ARCHIVE: &[u8] = include_bytes!("../../../tl_loop.pyz");
 const TL_LOOP_PYPROJECT: &str = include_str!("../../../tl_loop/pyproject.toml");
+const TL_LOOP_INTERPRETER_POLICY: &str = include_str!("../../../tl_loop/interpreter_policy.toml");
 
 fn read_root_tl_protocol(cwd: &Path, wasm_name: &str) -> Option<String> {
     exomonad_core::services::agent_control::load_role_context(cwd, wasm_name, "root")
@@ -803,16 +804,22 @@ fn ensure_harness_capability(cwd: &Path) -> Result<()> {
 }
 
 fn tl_loop_python(cwd: &Path) -> String {
-    if let Ok(interpreter) = std::env::var("EXOMONAD_TL_LOOP_PYTHON") {
+    let environment = TL_LOOP_INTERPRETER_POLICY
+        .lines()
+        .find_map(|line| line.strip_prefix("environment = "))
+        .map(|value| value.trim_matches('"'))
+        .unwrap_or("EXOMONAD_TL_LOOP_PYTHON");
+    if let Ok(interpreter) = std::env::var(environment) {
         if !interpreter.trim().is_empty() {
             return interpreter;
         }
     }
-    let local = cwd.join("tl_loop/.venv/bin/python");
-    if local.is_file() {
-        return local.display().to_string();
-    }
-    "python3".to_string()
+    let _ = cwd;
+    TL_LOOP_INTERPRETER_POLICY
+        .lines()
+        .find_map(|line| line.strip_prefix("fallback = "))
+        .map(|value| value.trim_matches('"').to_string())
+        .unwrap_or_else(|| "python3".to_string())
 }
 
 fn tl_loop_required_python() -> Result<(u32, u32)> {
@@ -2827,6 +2834,14 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("Python 3.10.9"));
         assert!(message.contains("Python >= 3.11"));
+    }
+
+    #[test]
+    fn controller_interpreter_policy_is_shared_by_runtime_and_build() {
+        assert!(TL_LOOP_INTERPRETER_POLICY.contains("environment = \"EXOMONAD_TL_LOOP_PYTHON\""));
+        assert!(TL_LOOP_INTERPRETER_POLICY.contains("fallback = \"python3\""));
+        assert!(include_str!("../../../scripts/resolve_tl_loop_python.py")
+            .contains("tl_loop/interpreter_policy.toml"));
     }
 
     #[test]

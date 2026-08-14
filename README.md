@@ -28,10 +28,11 @@ See [try-exomonad/README.md](try-exomonad/README.md) for details.
 **Prerequisites:** [Nix](https://nixos.org/) (with flakes), Python 3.11 or newer, [tmux](https://github.com/tmux/tmux/wiki), and [just](https://github.com/casey/just).
 
 The TL controller is stdlib-only and requires the Python version declared in
-`tl_loop/pyproject.toml` (currently Python 3.11 or newer). Init resolves
-`EXOMONAD_TL_LOOP_PYTHON` first, so set that variable when the required
-interpreter is not your default `python3`. Development-only pytest and ruff
-may continue to use the repo-local `tl_loop/.venv` through `EXOMONAD_PY`.
+`tl_loop/pyproject.toml` (currently Python 3.11 or newer). Its build and
+runtime resolver is defined in `tl_loop/interpreter_policy.toml`: it uses
+`EXOMONAD_TL_LOOP_PYTHON` first and then `python3`. Development-only pytest
+and ruff may continue to use the repo-local `tl_loop/.venv` through
+`EXOMONAD_PY`; that environment is not used to build or run the controller.
 
 Install Nix if you don't have it:
 

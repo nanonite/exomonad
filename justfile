@@ -300,41 +300,22 @@ tl-loop-archive:
     set -euo pipefail
     stage=$(mktemp -d)
     trap 'rm -rf "$stage"' EXIT
+    controller=$(python3 scripts/resolve_tl_loop_python.py)
+    echo "TL controller archive interpreter: $controller"
     cp -R tl_loop "$stage/tl_loop"
     rm -rf "$stage/tl_loop/.venv" "$stage/tl_loop/tests" "$stage/tl_loop/__pycache__"
     printf '%s\n' 'from tl_loop.__main__ import main' 'import sys' 'sys.exit(main())' > "$stage/__main__.py"
-    python3 -m zipapp "$stage" -o tl_loop.pyz -p "/usr/bin/env python3"
+    "$controller" -m zipapp "$stage" -o tl_loop.pyz -p "/usr/bin/env python3"
 
 tl-loop-python-check:
-    python3 - <<'PY'
-import re
-import sys
-from pathlib import Path
-
-text = Path("tl_loop/pyproject.toml").read_text()
-requirement = re.search(r'^requires-python\s*=\s*"(>=\d+\.\d+)"\s*$', text, re.MULTILINE)
-if requirement is None:
-    raise SystemExit("ERROR: tl_loop/pyproject.toml must declare requires-python")
-needed = tuple(map(int, requirement.group(1)[2:].split(".")))
-found = sys.version_info[:2]
-print(f"TL controller build interpreter: Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}; needed >= {needed[0]}.{needed[1]}")
-if found < needed:
-    raise SystemExit(f"ERROR: TL controller needs Python >= {needed[0]}.{needed[1]}, found Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
-PY
+    #!/usr/bin/env bash
+    set -euo pipefail
+    controller=$(python3 scripts/resolve_tl_loop_python.py)
+    echo "TL controller build interpreter: $controller"
+    "$controller" scripts/check_tl_loop_python.py
 
 tl-loop-archive-test: tl-loop-archive
-    python3 - "$(pwd)/tl_loop.pyz" <<'PY'
-import importlib
-import pkgutil
-import sys
-
-sys.path.insert(0, sys.argv[1])
-import tl_loop
-
-for module in pkgutil.walk_packages(tl_loop.__path__, tl_loop.__name__ + "."):
-    if ".tests" not in module.name and not module.name.rsplit(".", 1)[-1].startswith("test"):
-        importlib.import_module(module.name)
-PY
+    python3 scripts/check_tl_loop_archive.py "$(pwd)/tl_loop.pyz"
 
 # Compatibility entry point for profile-based install commands
 install profile:

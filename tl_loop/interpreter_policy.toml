@@ -1,0 +1,3 @@
+# Controller build and runtime interpreter resolution.
+environment = "EXOMONAD_TL_LOOP_PYTHON"
+fallback = "python3"
