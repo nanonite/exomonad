@@ -2913,12 +2913,15 @@ mod tests {
     #[test]
     fn embedded_archive_contains_expected_source() {
         let marker = std::env::var("EXOMONAD_TL_LOOP_EXPECT_MARKER").unwrap_or_default();
+        let member = std::env::var("EXOMONAD_TL_LOOP_EXPECT_MEMBER")
+            .unwrap_or_else(|_| "tl_loop/__init__.py".to_owned());
         let mut child = Command::new("python3")
             .arg("-c")
             .arg(
-                "import io, sys, zipfile; source = zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())).read('tl_loop/__init__.py').decode(); assert not sys.argv[1] or sys.argv[1] in source",
+                "import io, sys, zipfile; source = zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())).read(sys.argv[2]).decode(); assert not sys.argv[1] or sys.argv[1] in source",
             )
             .arg(marker)
+            .arg(member)
             .stdin(Stdio::piped())
             .spawn()
             .expect("run embedded archive validator");
