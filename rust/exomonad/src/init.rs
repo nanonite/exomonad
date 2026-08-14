@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-const TL_LOOP_ARCHIVE: &[u8] = include_bytes!("../../../tl_loop.pyz");
+const TL_LOOP_ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tl_loop.pyz"));
 const TL_LOOP_PYPROJECT: &str = include_str!("../../../tl_loop/pyproject.toml");
 const TL_LOOP_INTERPRETER_POLICY: &str = include_str!("../../../tl_loop/interpreter_policy.toml");
 
@@ -2318,6 +2318,8 @@ mod tests {
     use exomonad_test_support::{
         assert_fixture_git_root, init_fixture_git_repository, run_fixture_git_command,
     };
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
     #[test]
     fn codex_protocol_delivery_is_prompt_independent() {
@@ -2866,5 +2868,27 @@ mod tests {
         assert!(catalog["opencode-go/deepseek-v4-pro"].contains("high"));
         assert!(catalog["opencode-go/deepseek-v4-pro"].contains("max"));
         assert!(!catalog["opencode-go/deepseek-v4-pro"].contains("medium"));
+    }
+
+    #[test]
+    fn embedded_archive_contains_expected_source() {
+        let marker = std::env::var("EXOMONAD_TL_LOOP_EXPECT_MARKER").unwrap_or_default();
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import io, sys, zipfile; source = zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())).read('tl_loop/__init__.py').decode(); assert not sys.argv[1] or sys.argv[1] in source",
+            )
+            .arg(marker)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("run embedded archive validator");
+        child
+            .stdin
+            .take()
+            .expect("open archive validator stdin")
+            .write_all(TL_LOOP_ARCHIVE)
+            .expect("write embedded archive");
+        let status = child.wait().expect("wait for embedded archive validator");
+        assert!(status.success(), "embedded archive validation failed: {status}");
     }
 }

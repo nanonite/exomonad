@@ -302,14 +302,9 @@ install-all-dev: (_install "dev")
 tl-loop-archive:
     #!/usr/bin/env bash
     set -euo pipefail
-    stage=$(mktemp -d)
-    trap 'rm -rf "$stage"' EXIT
     controller=$(python3 scripts/resolve_tl_loop_python.py)
     echo "TL controller archive interpreter: $controller"
-    cp -R tl_loop "$stage/tl_loop"
-    rm -rf "$stage/tl_loop/.venv" "$stage/tl_loop/tests" "$stage/tl_loop/__pycache__"
-    printf '%s\n' 'from tl_loop.__main__ import main' 'import sys' 'sys.exit(main())' > "$stage/__main__.py"
-    "$controller" -m zipapp "$stage" -o tl_loop.pyz -p "/usr/bin/env python3"
+    "$controller" scripts/build_tl_loop_archive.py --source tl_loop --output tl_loop.pyz
 
 tl-loop-python-check:
     #!/usr/bin/env bash
