@@ -22,6 +22,8 @@ fn main() {
 
     let resolver = Command::new("python3")
         .arg(&interpreter_resolver)
+        .arg("--policy")
+        .arg(&interpreter_policy)
         .current_dir(repository_root)
         .output()
         .expect("failed to resolve the tl_loop build interpreter");
@@ -39,6 +41,7 @@ fn main() {
         !controller.is_empty(),
         "tl_loop interpreter resolver returned empty output"
     );
+    println!("cargo:warning=TL controller build interpreter: {controller}");
 
     let build = Command::new(&controller)
         .arg(&archive_builder)

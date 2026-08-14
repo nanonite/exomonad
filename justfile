@@ -1,8 +1,8 @@
 # ExoMonad Development Justfile
 
-# Python interpreter for tl_loop tooling.
+# Development-only Python interpreter for tl_loop tooling (pytest and ruff).
 #
-# Defaults to the repo-local uv venv declared by tl_loop/pyproject.toml, which
+# This exception defaults to the repo-local uv venv declared by tl_loop/pyproject.toml, which
 # carries pytest and ruff. A bare `python3` is not sufficient — the system
 # interpreter has no pytest, which silently fails `just test` at tl-loop-test
 # and tl-loop-replay.
@@ -10,6 +10,7 @@
 # Override for a conda env or any other interpreter:
 #   EXOMONAD_PY=/home/you/anaconda3/envs/foo/bin/python just test
 py := env_var_or_default("EXOMONAD_PY", justfile_directory() / "tl_loop/.venv/bin/python")
+controller_policy := justfile_directory() / "tl_loop/interpreter_policy.toml"
 
 # Default recipe
 default:
@@ -302,14 +303,14 @@ install-all-dev: (_install "dev")
 tl-loop-archive:
     #!/usr/bin/env bash
     set -euo pipefail
-    controller=$(python3 scripts/resolve_tl_loop_python.py)
+    controller=$(python3 scripts/resolve_tl_loop_python.py --policy "{{controller_policy}}")
     echo "TL controller archive interpreter: $controller"
     "$controller" scripts/build_tl_loop_archive.py --source tl_loop --output tl_loop.pyz
 
 tl-loop-python-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    controller=$(python3 scripts/resolve_tl_loop_python.py)
+    controller=$(python3 scripts/resolve_tl_loop_python.py --policy "{{controller_policy}}")
     echo "TL controller build interpreter: $controller"
     "$controller" scripts/check_tl_loop_python.py
 

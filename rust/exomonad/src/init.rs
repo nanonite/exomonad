@@ -803,23 +803,29 @@ fn ensure_harness_capability(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-fn tl_loop_python(cwd: &Path) -> String {
+fn tl_loop_python_with<F>(env: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
     let environment = TL_LOOP_INTERPRETER_POLICY
         .lines()
         .find_map(|line| line.strip_prefix("environment = "))
         .map(|value| value.trim_matches('"'))
         .unwrap_or("EXOMONAD_TL_LOOP_PYTHON");
-    if let Ok(interpreter) = std::env::var(environment) {
+    if let Some(interpreter) = env(environment) {
         if !interpreter.trim().is_empty() {
             return interpreter;
         }
     }
-    let _ = cwd;
     TL_LOOP_INTERPRETER_POLICY
         .lines()
         .find_map(|line| line.strip_prefix("fallback = "))
         .map(|value| value.trim_matches('"').to_string())
         .unwrap_or_else(|| "python3".to_string())
+}
+
+fn tl_loop_python(_cwd: &Path) -> String {
+    tl_loop_python_with(|name| std::env::var(name).ok())
 }
 
 fn tl_loop_required_python() -> Result<(u32, u32)> {
@@ -2847,6 +2853,40 @@ mod tests {
     }
 
     #[test]
+    fn controller_build_and_runtime_resolvers_agree_for_same_environment() {
+        let environment = "EXOMONAD_TL_LOOP_PYTHON";
+        let policy =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tl_loop/interpreter_policy.toml");
+        let resolver =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/resolve_tl_loop_python.py");
+
+        for selected in [Some("python3"), None] {
+            let mut command = Command::new("python3");
+            command.arg(&resolver).arg("--policy").arg(&policy);
+            match selected {
+                Some(interpreter) => {
+                    command.env(environment, interpreter);
+                }
+                None => {
+                    command.env_remove(environment);
+                }
+            }
+            let output = command.output().expect("run build-side resolver");
+            assert!(output.status.success());
+            let build_side = String::from_utf8(output.stdout)
+                .expect("resolver output is UTF-8")
+                .trim()
+                .to_owned();
+            let runtime_side = tl_loop_python_with(|name| {
+                (name == environment)
+                    .then(|| selected.map(str::to_owned))
+                    .flatten()
+            });
+            assert_eq!(build_side, runtime_side);
+        }
+    }
+
+    #[test]
     fn structured_initial_prompt_writes_plan_and_rejects_legacy_text() {
         let tmp = tempfile::tempdir().unwrap();
         write_tl_loop_plan(tmp.path(), Some(r#"{"plan":{"leaves":[]}}"#)).unwrap();
@@ -2889,6 +2929,9 @@ mod tests {
             .write_all(TL_LOOP_ARCHIVE)
             .expect("write embedded archive");
         let status = child.wait().expect("wait for embedded archive validator");
-        assert!(status.success(), "embedded archive validation failed: {status}");
+        assert!(
+            status.success(),
+            "embedded archive validation failed: {status}"
+        );
     }
 }
