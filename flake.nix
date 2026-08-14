@@ -20,6 +20,7 @@
 
         # Common packages shared across shells
         commonPkgs = with pkgs; [
+          python3
           # Dev utilities
           jq
           just

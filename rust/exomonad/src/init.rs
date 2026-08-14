@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 const TL_LOOP_ARCHIVE: &[u8] = include_bytes!("../../../tl_loop.pyz");
+const TL_LOOP_PYPROJECT: &str = include_str!("../../../tl_loop/pyproject.toml");
 
 fn read_root_tl_protocol(cwd: &Path, wasm_name: &str) -> Option<String> {
     exomonad_core::services::agent_control::load_role_context(cwd, wasm_name, "root")
@@ -814,8 +815,84 @@ fn tl_loop_python(cwd: &Path) -> String {
     "python3".to_string()
 }
 
+fn tl_loop_required_python() -> Result<(u32, u32)> {
+    let requirement = TL_LOOP_PYPROJECT
+        .lines()
+        .find_map(|line| line.strip_prefix("requires-python = "))
+        .and_then(|value| value.trim_matches('"').strip_prefix(">="))
+        .context("tl_loop/pyproject.toml must declare requires-python >= a version")?;
+    let mut parts = requirement.split('.');
+    let major = parts
+        .next()
+        .context("requires-python is missing a major version")?
+        .parse()
+        .context("requires-python has an invalid major version")?;
+    let minor = parts
+        .next()
+        .context("requires-python is missing a minor version")?
+        .parse()
+        .context("requires-python has an invalid minor version")?;
+    Ok((major, minor))
+}
+
+fn validate_tl_loop_python_version(found: (u32, u32, u32), required: (u32, u32)) -> Result<()> {
+    if (found.0, found.1) < required {
+        anyhow::bail!(
+            "TL controller requires Python >= {}.{}; resolved interpreter is Python {}.{}.{}",
+            required.0,
+            required.1,
+            found.0,
+            found.1,
+            found.2
+        );
+    }
+    Ok(())
+}
+
+fn check_tl_loop_python(cwd: &Path) -> Result<String> {
+    let interpreter = tl_loop_python(cwd);
+    let output = std::process::Command::new(&interpreter)
+        .args([
+            "-c",
+            "import sys; print('.'.join(map(str, sys.version_info[:3])))",
+        ])
+        .output()
+        .with_context(|| format!("failed to resolve TL controller interpreter `{interpreter}`"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "resolved TL controller interpreter `{interpreter}` could not report its version"
+        );
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    let mut parts = version.trim().split('.');
+    let found = (
+        parts
+            .next()
+            .context("interpreter reported no major version")?
+            .parse()?,
+        parts
+            .next()
+            .context("interpreter reported no minor version")?
+            .parse()?,
+        parts
+            .next()
+            .context("interpreter reported no patch version")?
+            .parse()?,
+    );
+    let required = tl_loop_required_python()?;
+    validate_tl_loop_python_version(found, required)?;
+    info!(
+        interpreter = %interpreter,
+        version = %version.trim(),
+        required = %format!("{}.{}", required.0, required.1),
+        "Resolved TL controller interpreter"
+    );
+    Ok(interpreter)
+}
+
 fn run_tl_loop_preflight(cwd: &Path, package_root: &Path) -> Result<()> {
-    let status = std::process::Command::new(tl_loop_python(cwd))
+    let interpreter = check_tl_loop_python(cwd)?;
+    let status = std::process::Command::new(interpreter)
         .args([
             package_root
                 .to_str()
@@ -2742,6 +2819,14 @@ mod tests {
         assert!(!command.contains("PYTHONPATH="));
         assert!(command.contains("python3 /tmp/exo run"));
         assert!(command.contains("--wait-for-plan"));
+    }
+
+    #[test]
+    fn old_tl_loop_interpreter_error_names_found_and_required_versions() {
+        let error = validate_tl_loop_python_version((3, 10, 9), (3, 11)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Python 3.10.9"));
+        assert!(message.contains("Python >= 3.11"));
     }
 
     #[test]
