@@ -19,14 +19,14 @@ from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.loop.observability import emit_controller_event
-from tl_loop.preflight import PreflightError, run_preflight
-from tl_loop.select.capability import load_capability
-from tl_loop.select.policy import load_policy
 from tl_loop.plan_validation import (
     PlanValidationError,
     validate_plan_document,
     validate_plan_proposal,
 )
+from tl_loop.preflight import PreflightError, run_preflight
+from tl_loop.select.capability import load_capability
+from tl_loop.select.policy import load_policy
 from tl_loop.state.read_model import project_read_model
 from tl_loop.state.schema import GateStatus, RunState
 from tl_loop.state.store import RunStore

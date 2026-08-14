@@ -266,6 +266,9 @@ _install profile:
     # Atomic rename so install works even when the binary is in use (e.g. mcp-stdio running)
     cp "target/${TARGET_DIR}/exomonad" ~/.cargo/bin/exomonad.new
     mv ~/.cargo/bin/exomonad.new ~/.cargo/bin/exomonad
+    rm -rf ~/.exo/tl_loop
+    cp tl_loop.pyz ~/.exo/tl_loop.pyz.new
+    mv ~/.exo/tl_loop.pyz.new ~/.exo/tl_loop.pyz
     cp .exo/wasm/wasm-guest-devswarm.wasm ~/.exo/wasm/
     [ -f .exo/wasm/wasm-guest-e2e-test.wasm ] && cp .exo/wasm/wasm-guest-e2e-test.wasm ~/.exo/wasm/ || true
 
