@@ -20,6 +20,34 @@ The root cause is a chain of four things, none individually obviously wrong:
 4. **`status` is one-shot** (`__main__.py:298`). It prints JSON and exits.
    There is no live view anywhere, and no `--watch`.
 
+## Root cause, confirmed 2026-08-14
+
+The above explains a *missing plan*. Against a real migrated project
+(`/home/goya/beast-workspace/workspace`) whose four config files are all
+present and valid, the controller still never creates `run.json`. Reproduced:
+
+```
+PolicyMissing: .exo/harness_capability.toml: capability file is missing
+```
+
+`tl_run` calls `load_capability()` immediately after `load_policy()`, **before**
+`run_tl_loop` reaches `create()`. The controller dies at startup, no checkpoint
+is written, and `tl_loop status` reports a missing checkpoint — which hides the
+real cause.
+
+`.exo/harness_capability.toml` is a **fourth required file with no upgrade
+path**:
+
+- `new.rs:196-213` writes a default, but only `if !capability_path.exists()` —
+  fresh projects only.
+- `init.rs` has **zero** references to it. No check, no backfill.
+- It is **undocumented**: zero mentions in `README.md`, `CLAUDE.md`, or
+  `docs/guides/programming-the-tl.md`, which still says "the three files".
+
+Any project migrated rather than `new`-ed hits this, and the failure is silent.
+This is the defect that actually blocks a migrated project; preflight is what
+makes it visible.
+
 Two further defects sit behind that:
 
 - **`init` never validates `harness_policy.toml`** — zero references in
