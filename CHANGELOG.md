@@ -299,6 +299,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E18 :: E18.14 build.rs does not regenerate the archive on tl_loop source edits (#858)
+- E18 :: E18.11 Unify build-time and runtime Python interpreter resolution (#854)
 - E18 :: E18.12 Generated tl_loop.pyz is committed to git - stale-embed risk (#855)
 - E18 :: E18.13 zipapp archive ships __pycache__ - 5x bloat and interpreter-specific bytecode (#856)
 - E18 :: E18.9 Ship tl_loop as a zipapp - installed package is incomplete, init broken in consuming projects (#852)
