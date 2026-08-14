@@ -918,6 +918,7 @@ pub async fn run(
     reviewer_model: Option<String>,
     reviewer_max_rounds: Option<u32>,
     verbose: bool,
+    skip_preflight: bool,
     set_git_remote: Option<String>,
     reset_inbox: bool,
     import_legacy: Vec<PathBuf>,
@@ -948,8 +949,12 @@ pub async fn run(
     let mut config = Config::discover()?;
     ensure_harness_capability(&cwd)?;
     let tl_loop_root = tl_loop_package_root(&cwd)?;
-    run_tl_loop_preflight(&cwd, &tl_loop_root)?;
     write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
+    if skip_preflight {
+        warn!("Skipping TL controller preflight by explicit request");
+    } else {
+        run_tl_loop_preflight(&cwd, &tl_loop_root)?;
+    }
 
     if !import_legacy.is_empty() {
         crate::logs::run(
@@ -2695,6 +2700,21 @@ mod tests {
                 "--name",
                 "agent-1"
             ]))
+        );
+    }
+
+    #[test]
+    fn preflight_failure_precedes_tl_window_creation() {
+        let source = include_str!("init.rs");
+        let preflight = source
+            .find("run_tl_loop_preflight(&cwd")
+            .expect("init must run TL preflight");
+        let tl_window = source
+            .find("ipc.new_window(\"TL\"")
+            .expect("init must create the TL window");
+        assert!(
+            preflight < tl_window,
+            "preflight must fail before creating tmux windows"
         );
     }
 

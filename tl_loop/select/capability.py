@@ -19,10 +19,7 @@ from tl_loop.select.policy import (
 )
 
 DEFAULT_CAPABILITY_PATH = Path(".exo/harness_capability.toml")
-DEFAULT_CAPABILITY_CONTENT = """# Static capability ratings. Each entry records the operator's basis.
 
-[capabilities]
-"""
 _CAPABILITY_KEYS = frozenset({"capabilities"})
 _DIFFICULTY_RANK = {
     Difficulty.TRIVIAL: 0,
@@ -146,7 +143,6 @@ def _require_policy_coverage(
 
 __all__ = [
     "DEFAULT_CAPABILITY_PATH",
-    "DEFAULT_CAPABILITY_CONTENT",
     "CapabilityMap",
     "is_capable",
     "load_capabilities",

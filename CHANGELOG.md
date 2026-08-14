@@ -299,6 +299,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E18 :: E18.8 Preflight example is empty and duplicates the Rust template (#851)
+- E18 :: E18.4 Preflight tests (#838)
+- E18 :: E18.3 Add --skip-preflight (#837)
+- E18 :: E18.2 Call preflight from init before any window is created (#836)
+- E18 :: E18.1 Add a tl_loop preflight entry point (#835)
 - E20 :: E20.5 Persist and surface the controller exit reason (#850)
 - E18 :: E18.7 Document the fourth required file (#849)
 - E18 :: E18.6 init backfills harness_capability.toml or fails naming it (#848)

@@ -113,6 +113,9 @@ enum Commands {
         /// telemetry is emitted regardless of this flag.
         #[arg(long)]
         verbose: bool,
+        /// Skip TL controller preflight validation (for explicit recovery/debug use).
+        #[arg(long)]
+        skip_preflight: bool,
         /// Pin which git remote exomonad's PR/CI operations (file_pr, merge_pr,
         /// the Forgejo watcher, and push) use, for repos with more than one
         /// remote configured (e.g. a GitHub `origin` alongside a Forgejo
@@ -500,6 +503,7 @@ async fn main() -> Result<()> {
             reviewer_model,
             reviewer_max_rounds,
             verbose,
+            skip_preflight,
             set_git_remote,
             reset_inbox,
             import_legacy,
@@ -517,6 +521,7 @@ async fn main() -> Result<()> {
                 reviewer_model,
                 reviewer_max_rounds,
                 verbose,
+                skip_preflight,
                 set_git_remote,
                 reset_inbox,
                 import_legacy,
