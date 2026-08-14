@@ -52,7 +52,7 @@ First build downloads Nix dependencies and initializes the WASM toolchain — su
 
 ## Getting Started
 
-ExoMonad works on any git repository. Three files program the TL; the rest is defaults.
+ExoMonad works on any git repository. Four required files program the TL; the work plan is stored separately.
 
 ```bash
 cd your-project/
@@ -127,7 +127,7 @@ exomonad logs measure --output .exo/analysis/measurement
 
 That turns "how long do my gates sit unanswered" and "which park cause dominates" into numbers instead of impressions.
 
-> **Start here:** [**Programming the TL**](docs/guides/programming-the-tl.md) is the full guide — the three config files, the plan schema, worked examples, park causes, and the operator control plane.
+> **Start here:** [**Programming the TL**](docs/guides/programming-the-tl.md) is the full guide — the four required config files, the plan schema, worked examples, park causes, and the operator control plane.
 >
 > Coming from an older ExoMonad project? [Migrating an existing project](docs/guides/migrating-to-the-tl-loop.md).
 

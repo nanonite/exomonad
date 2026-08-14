@@ -225,12 +225,15 @@ answer it.
   and the schema distinguishes them.
 - **Do not** copy an old `config.toml` wholesale and assume the TL keys still
   apply. Check the table above.
-- **Do not** start the controller without `harness_policy.toml` and expect a
-  default. It fails closed, on purpose.
+- **Do not** start the controller without the four required files: `config.toml`,
+  `harness_policy.toml`, `review-policy.toml`, and `harness_capability.toml`.
+  Preflight fails closed, on purpose.
+
+Before starting a migrated project, add `.exo/harness_capability.toml` with a `[capabilities]` entry for every harness allowed by `.exo/harness_policy.toml`. `exomonad init` backfills the canonical map for the standard policy entries and otherwise fails naming the file rather than widening the allowlist.
 
 ## See also
 
-- [Programming the TL](programming-the-tl.md) — the three files and their schemas
+- [Programming the TL](programming-the-tl.md) — the four required controller files and their schemas
 - [`docs/decisions/tl-as-loop.md`](../decisions/tl-as-loop.md) — why the boundary moved
 - [`docs/observability/README.md`](../observability/README.md) — contracts and layers
 - [`docs/exomonad-failure-atlas-sync-plan.md`](../exomonad-failure-atlas-sync-plan.md) — the import/export design constraints

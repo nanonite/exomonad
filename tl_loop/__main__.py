@@ -19,6 +19,9 @@ from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.loop.observability import emit_controller_event
+from tl_loop.preflight import PreflightError, run_preflight
+from tl_loop.select.capability import load_capability
+from tl_loop.select.policy import load_policy
 from tl_loop.plan_validation import (
     PlanValidationError,
     validate_plan_document,
@@ -49,6 +52,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status",
         "gate",
         "plan-proposal",
+        "preflight",
         "-h",
         "--help",
     }:
@@ -63,9 +67,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_status(args)
         elif args.command == "plan-proposal":
             _print_plan_proposal(args)
+        elif args.command == "preflight":
+            run_preflight(args.project_root)
+            print("TL preflight passed: config.toml, harness_policy.toml, review-policy.toml, harness_capability.toml")
         else:
             _set_gate(args)
-    except (LauncherError, OSError, RuntimeError, ValueError, PlanValidationError) as error:
+    except (LauncherError, OSError, RuntimeError, ValueError, PlanValidationError, PreflightError) as error:
         LOGGER.error("[TL loop] %s", error)
         return 2
     return 0
@@ -91,6 +98,8 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument(
         "--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID)
     )
+    status.add_argument("--watch", action="store_true")
+    status.add_argument("--interval", type=_positive_float, default=1.0)
     status.set_defaults(command="status")
 
     gate = subcommands.add_parser("gate", help="answer a durable human gate")
@@ -116,6 +125,10 @@ def _parser() -> argparse.ArgumentParser:
         "--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID)
     )
     proposal.set_defaults(command="plan-proposal")
+
+    preflight = subcommands.add_parser("preflight", help="validate required TL controller files")
+    _add_project_options(preflight)
+    preflight.set_defaults(command="preflight")
 
     return parser
 
@@ -146,6 +159,15 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         role="tl",
         name="root",
     )
+    try:
+        policy = load_policy(project_root / ".exo" / "harness_policy.toml")
+        capabilities = load_capability(
+            project_root / ".exo" / "harness_capability.toml",
+            policy_path=project_root / ".exo" / "harness_policy.toml",
+        )
+    except Exception as error:
+        RunStore(run_id, state_root).record_exit_reason(str(error))
+        raise
     config = TLLoopConfig(
         active=True,
         max_events=args.max_events,
@@ -157,6 +179,8 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         run_id=run_id,
         role="worker",
         review_policy_path=project_root / ".exo" / "review-policy.toml",
+        policy=policy,
+        capabilities=capabilities,
     )
     budgets = plan_document.get("budgets", {"tokens": 0, "wall_seconds": 0})
     if not isinstance(budgets, Mapping):
@@ -172,6 +196,9 @@ def _run(args: argparse.Namespace) -> TLRunResult:
             config,
             cast(Mapping[str, object], budgets),
         )
+    except Exception as error:
+        RunStore(run_id, state_root).record_exit_reason(str(error))
+        raise
     finally:
         source.close(timeout=1.0)
 
@@ -298,21 +325,27 @@ def _print_result(result: TLRunResult) -> None:
 def _print_status(args: argparse.Namespace) -> None:
     project_root = args.project_root.expanduser().resolve()
     root = project_root / ".exo" / "tl-loop"
-    state = RunStore(args.run_id, root).load()
-    reader = LedgerReader(
-        project_root / ".exo" / "ledger" / "segments",
-        run_id=args.run_id,
-        state_root=root,
-        scope_run_id=args.run_id,
-    )
-    replay = reader.read_from(0)
-    print(
-        json.dumps(
-            _state_document(state, replay.events, replay.sequence_status),
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    while True:
+        store = RunStore(args.run_id, root)
+        if not store.path.exists():
+            reason = store.exit_reason()
+            if reason:
+                print(f"controller exited: {reason}")
+            else:
+                print(f"missing checkpoint: {store.path}")
+        else:
+            state = store.load()
+            reader = LedgerReader(
+                project_root / ".exo" / "ledger" / "segments",
+                run_id=args.run_id,
+                state_root=root,
+                scope_run_id=args.run_id,
+            )
+            replay = reader.read_from(0)
+            print(json.dumps(_state_document(state, replay.events, replay.sequence_status), indent=2, sort_keys=True))
+        if not args.watch:
+            return
+        time.sleep(args.interval)
 
 
 def _set_gate(args: argparse.Namespace) -> None:

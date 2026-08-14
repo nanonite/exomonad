@@ -299,6 +299,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E20 :: E20.5 Persist and surface the controller exit reason (#850)
+- E18 :: E18.7 Document the fourth required file (#849)
+- E18 :: E18.6 init backfills harness_capability.toml or fails naming it (#848)
+- E18 :: E18.5 Preflight must validate all FOUR required files (#847)
 - E17 :: E17.7 Add a declared-vs-emitted regression check (#831)
 - E17 :: E17.6 Resolve the three declared-without-producer signals (#830)
 - E17 :: E17.5 Re-audit tl-loop-event-coverage.md (#829)

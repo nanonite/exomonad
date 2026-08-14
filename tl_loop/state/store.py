@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -107,6 +108,28 @@ class RunStore:
     def load(self) -> RunState:
         """Load and verify this run's checkpoint."""
         return load(self.path)
+
+    @property
+    def exit_reason_path(self) -> Path:
+        """Return the diagnostic marker written when startup fails."""
+        return self.run_dir / "controller-exit.json"
+
+    def record_exit_reason(self, reason: str) -> None:
+        """Persist a diagnostic-only controller exit reason outside run state."""
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"reason": reason, "recorded_at": time.time()}
+        temporary = self.exit_reason_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temporary.replace(self.exit_reason_path)
+
+    def exit_reason(self) -> str | None:
+        """Read the diagnostic marker without treating it as a checkpoint."""
+        try:
+            payload = json.loads(self.exit_reason_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        return reason if isinstance(reason, str) and reason else None
 
     def resume(self) -> ResumeState:
         """Return local replay state without contacting the runtime."""

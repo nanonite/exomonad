@@ -1,7 +1,7 @@
 # Programming the TL for a new project
 
 The tech lead is no longer a prompt. It is `tl_loop`, a bounded Python
-controller that reads three human-authored files and drives every dispatch,
+controller that reads four required controller files and drives every dispatch,
 review, merge, and escalation decision from durable state.
 
 Programming the TL means authoring those files. This guide covers what each one
@@ -15,13 +15,16 @@ module-level contracts.
 
 ---
 
-## The three files
+## The four required controller files
 
 | File | Required | Owns |
 |------|----------|------|
+| `.exo/config.toml` | **yes** | Project and runtime configuration |
 | `.exo/harness_policy.toml` | **yes** | Which harness/model each role may use, and the token ceilings |
-| `.exo/review-policy.toml` | no (defaults apply) | Review rounds, timeouts, second-reviewer triggers |
-| `.exo/tl-loop/plan.json` | **yes** | The work itself: workers, leaves, recursive sub-TLs |
+| `.exo/review-policy.toml` | **yes** | Review rounds, timeouts, second-reviewer triggers |
+| `.exo/harness_capability.toml` | **yes** | Difficulty ratings for every harness/model allowed by the policy |
+
+The structured work plan lives separately at `.exo/tl-loop/plan.json`.
 
 A missing or invalid `harness_policy.toml` is a startup error. The controller
 never synthesizes a permissive default, and it never widens an allowlist or a
@@ -633,3 +636,17 @@ session is `unknown` and cannot classify the current one.
 - **Do not** widen `allow` or raise `token_budget` to clear a park without
   deciding that is the right call. The park is the design working.
 - **Do not** expect top-level `leaves` to run in order. They do not.
+
+
+### Required controller files
+
+A project must provide four files under `.exo/`: `config.toml`, `harness_policy.toml`, `review-policy.toml`, and `harness_capability.toml`. The policy is the authoritative allowlist and budget boundary; the capability map records a difficulty rating for every `harness/model` entry allowed by any policy role. It may not be used to widen that allowlist.
+
+`harness_capability.toml` has this shape:
+
+```toml
+[capabilities]
+"codex/gpt-luna" = "standard"
+```
+
+Run `python3 -m tl_loop preflight --project-root .` to validate all four files before starting the controller.

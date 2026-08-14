@@ -834,3 +834,6 @@ CLAUDE.md  ← YOU ARE HERE (project overview)
 - [haskell/wasm-guest/CLAUDE.md](haskell/wasm-guest/CLAUDE.md) — MCP tool definitions
 - [freer-simple](https://hackage.haskell.org/package/freer-simple) — Effect system
 - [Anthropic tool use](https://docs.anthropic.com/en/docs/tool-use)
+
+
+The TL-loop configuration also requires `.exo/harness_capability.toml`, whose capability entries must cover every harness allowed by `.exo/harness_policy.toml`.

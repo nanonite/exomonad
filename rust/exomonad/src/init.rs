@@ -771,6 +771,60 @@ fn agent_configuration_environment(config: &Config) -> String {
     format!(" {}", parts.join(" "))
 }
 
+fn ensure_harness_capability(cwd: &Path) -> Result<()> {
+    let exo = cwd.join(".exo");
+    let policy = exo.join("harness_policy.toml");
+    let capability = exo.join("harness_capability.toml");
+    if capability.exists() || !policy.exists() {
+        return Ok(());
+    }
+    let policy_text = std::fs::read_to_string(&policy)
+        .with_context(|| format!("failed to read {}", policy.display()))?;
+    for line in policy_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("allow") {
+            for entry in trimmed.split('"').skip(1).step_by(2) {
+                if !crate::new::HARNESS_CAPABILITY_CONTENT.contains(&format!("\"{entry}\"")) {
+                    anyhow::bail!(
+                        "cannot backfill {} without widening the policy allowlist; add it explicitly",
+                        capability.display()
+                    );
+                }
+            }
+        }
+    }
+    std::fs::write(&capability, crate::new::HARNESS_CAPABILITY_CONTENT)
+        .with_context(|| format!("failed to backfill {}", capability.display()))?;
+    info!(path = %capability.display(), "Backfilled harness capability map from the canonical default");
+    Ok(())
+}
+
+fn tl_loop_python(cwd: &Path) -> String {
+    if let Ok(interpreter) = std::env::var("EXOMONAD_TL_LOOP_PYTHON") {
+        if !interpreter.trim().is_empty() {
+            return interpreter;
+        }
+    }
+    let local = cwd.join("tl_loop/.venv/bin/python");
+    if local.is_file() {
+        return local.display().to_string();
+    }
+    "python3".to_string()
+}
+
+fn run_tl_loop_preflight(cwd: &Path, package_root: &Path) -> Result<()> {
+    let status = std::process::Command::new(tl_loop_python(cwd))
+        .args(["-m", "tl_loop", "preflight", "--project-root"])
+        .arg(cwd)
+        .env("PYTHONPATH", package_root)
+        .status()
+        .context("failed to run TL controller preflight")?;
+    if !status.success() {
+        anyhow::bail!("TL controller preflight failed with {status}");
+    }
+    Ok(())
+}
+
 fn tl_loop_package_root(cwd: &Path) -> Result<PathBuf> {
     let local = cwd.join("tl_loop");
     if local.join("__main__.py").is_file() {
@@ -844,7 +898,8 @@ fn tl_loop_command(cwd: &Path, package_root: &Path) -> String {
             .into(),
     );
     format!(
-        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl PYTHONPATH={package} python3 -m tl_loop run --project-root {project} --plan {plan} --run-id root --wait-for-plan"
+        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl PYTHONPATH={package} {} -m tl_loop run --project-root {project} --plan {plan} --run-id root --wait-for-plan",
+        shell_escape::escape(tl_loop_python(cwd).into()),
     )
 }
 
@@ -891,7 +946,9 @@ pub async fn run(
 
     // Resolve config
     let mut config = Config::discover()?;
+    ensure_harness_capability(&cwd)?;
     let tl_loop_root = tl_loop_package_root(&cwd)?;
+    run_tl_loop_preflight(&cwd, &tl_loop_root)?;
     write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
 
     if !import_legacy.is_empty() {

@@ -5,6 +5,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// Canonical capability-map template shared by project creation and init backfill.
+pub(crate) const HARNESS_CAPABILITY_CONTENT: &str = r#"# Static capability ratings. Each entry records the operator's basis.
+
+[capabilities]
+# Basis: operator judgment for the default low-cost worker model; standard tasks only.
+"codex/gpt-luna" = "standard"
+# Basis: vendor tier and the configured escalation target; hard tasks are supported.
+"claude/sonnet" = "hard"
+"#;
+
 /// Initialize a new exomonad project in the current directory.
 /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
 pub async fn run(_name: Option<String>, reviewer_max_rounds: Option<u32>) -> Result<()> {
@@ -197,17 +207,7 @@ escalate_after_attempts = 1
 
     let capability_path = project_dir.join(".exo/harness_capability.toml");
     if !capability_path.exists() {
-        std::fs::write(
-            &capability_path,
-            r#"# Static capability ratings. Each entry records the operator's basis.
-
-[capabilities]
-# Basis: operator judgment for the default low-cost worker model; standard tasks only.
-"codex/gpt-luna" = "standard"
-# Basis: vendor tier and the configured escalation target; hard tasks are supported.
-"claude/sonnet" = "hard"
-"#,
-        )?;
+        std::fs::write(&capability_path, HARNESS_CAPABILITY_CONTENT)?;
         info!("Created .exo/harness_capability.toml");
     }
     Ok(())
