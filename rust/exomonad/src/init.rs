@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
+const TL_LOOP_ARCHIVE: &[u8] = include_bytes!("../../../tl_loop.pyz");
+
 fn read_root_tl_protocol(cwd: &Path, wasm_name: &str) -> Option<String> {
     exomonad_core::services::agent_control::load_role_context(cwd, wasm_name, "root")
 }
@@ -814,9 +816,14 @@ fn tl_loop_python(cwd: &Path) -> String {
 
 fn run_tl_loop_preflight(cwd: &Path, package_root: &Path) -> Result<()> {
     let status = std::process::Command::new(tl_loop_python(cwd))
-        .args(["-m", "tl_loop", "preflight", "--project-root"])
+        .args([
+            package_root
+                .to_str()
+                .context("TL archive path is not UTF-8")?,
+            "preflight",
+            "--project-root",
+        ])
         .arg(cwd)
-        .env("PYTHONPATH", package_root)
         .status()
         .context("failed to run TL controller preflight")?;
     if !status.success() {
@@ -825,20 +832,30 @@ fn run_tl_loop_preflight(cwd: &Path, package_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn tl_loop_package_root(cwd: &Path) -> Result<PathBuf> {
-    let local = cwd.join("tl_loop");
-    if local.join("__main__.py").is_file() {
-        return Ok(cwd.to_path_buf());
+fn tl_loop_package_root() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME is required to install the TL controller")?;
+    let install_dir = PathBuf::from(home).join(".exo");
+    let archive = install_dir.join("tl_loop.pyz");
+    let legacy_package = install_dir.join("tl_loop");
+    if legacy_package.exists() {
+        std::fs::remove_dir_all(&legacy_package).with_context(|| {
+            format!(
+                "failed to remove legacy TL package {}",
+                legacy_package.display()
+            )
+        })?;
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let installed = PathBuf::from(home).join(".exo");
-        if installed.join("tl_loop/__main__.py").is_file() {
-            return Ok(installed);
-        }
+    std::fs::create_dir_all(&install_dir)?;
+    let current = std::fs::read(&archive).ok();
+    if current.as_deref() != Some(TL_LOOP_ARCHIVE) {
+        let temporary = install_dir.join("tl_loop.pyz.new");
+        std::fs::write(&temporary, TL_LOOP_ARCHIVE)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        std::fs::rename(&temporary, &archive)
+            .with_context(|| format!("failed to install {}", archive.display()))?;
+        info!(path = %archive.display(), "Installed embedded TL controller archive");
     }
-    anyhow::bail!(
-        "programmatic TL package not found; run `just install-all` in the exomonad repository"
-    )
+    Ok(archive)
 }
 
 fn write_tl_loop_plan(cwd: &Path, initial_prompt: Option<&str>) -> Result<()> {
@@ -898,7 +915,7 @@ fn tl_loop_command(cwd: &Path, package_root: &Path) -> String {
             .into(),
     );
     format!(
-        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl PYTHONPATH={package} {} -m tl_loop run --project-root {project} --plan {plan} --run-id root --wait-for-plan",
+        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan",
         shell_escape::escape(tl_loop_python(cwd).into()),
     )
 }
@@ -948,7 +965,7 @@ pub async fn run(
     // Resolve config
     let mut config = Config::discover()?;
     ensure_harness_capability(&cwd)?;
-    let tl_loop_root = tl_loop_package_root(&cwd)?;
+    let tl_loop_root = tl_loop_package_root()?;
     write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
     if skip_preflight {
         warn!("Skipping TL controller preflight by explicit request");
@@ -2722,8 +2739,8 @@ mod tests {
     fn tl_loop_command_uses_programmatic_controller() {
         let command = tl_loop_command(Path::new("/tmp/repo"), Path::new("/tmp/exo"));
         assert!(command.contains("EXOMONAD_ROLE=tl"));
-        assert!(command.contains("PYTHONPATH=/tmp/exo"));
-        assert!(command.contains("python3 -m tl_loop run"));
+        assert!(!command.contains("PYTHONPATH="));
+        assert!(command.contains("python3 /tmp/exo run"));
         assert!(command.contains("--wait-for-plan"));
     }
 

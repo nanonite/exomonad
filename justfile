@@ -251,10 +251,13 @@ _install profile:
     echo ">>> [1/3] Building Haskell WASM plugins (cabal cached if unchanged)..."
     just wasm-all
 
-    echo ">>> [2/3] Building Rust binary ()..."
+    echo ">>> [2/3] Building the embedded TL controller archive..."
+    just tl-loop-archive
+
+    echo ">>> [3/3] Building Rust binary ()..."
     nix develop --command cargo build ${CARGO_FLAGS} -p exomonad
 
-    echo ">>> [3/3] Installing binaries..."
+    echo ">>> [4/4] Installing binaries..."
     mkdir -p ~/.cargo/bin
     mkdir -p ~/.exo/wasm
     # Atomic rename so install works even when the binary is in use (e.g. mcp-stdio running)
@@ -262,11 +265,6 @@ _install profile:
     mv ~/.cargo/bin/exomonad.new ~/.cargo/bin/exomonad
     cp .exo/wasm/wasm-guest-devswarm.wasm ~/.exo/wasm/
     [ -f .exo/wasm/wasm-guest-e2e-test.wasm ] && cp .exo/wasm/wasm-guest-e2e-test.wasm ~/.exo/wasm/ || true
-
-    # Install the standard-library-only programmatic TL controller for consuming repos.
-    mkdir -p ~/.exo/tl_loop
-    cp tl_loop/__init__.py tl_loop/__main__.py ~/.exo/tl_loop/
-    cp -R tl_loop/client tl_loop/events tl_loop/fsm tl_loop/harness tl_loop/loop tl_loop/rlm tl_loop/select tl_loop/shadow tl_loop/state ~/.exo/tl_loop/
 
     # Install role context files for consuming repos
     mkdir -p ~/.exo/roles/devswarm/context
@@ -292,6 +290,31 @@ install-all: (_install "release")
 
 # Install everything (fast dev build)
 install-all-dev: (_install "dev")
+
+# Build the stdlib-only TL controller as a package-preserving zipapp.
+tl-loop-archive:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    stage=$(mktemp -d)
+    trap 'rm -rf "$stage"' EXIT
+    cp -R tl_loop "$stage/tl_loop"
+    rm -rf "$stage/tl_loop/.venv" "$stage/tl_loop/tests" "$stage/tl_loop/__pycache__"
+    printf '%s\n' 'from tl_loop.__main__ import main' 'import sys' 'sys.exit(main())' > "$stage/__main__.py"
+    python3 -m zipapp "$stage" -o tl_loop.pyz -p "/usr/bin/env python3"
+
+tl-loop-archive-test: tl-loop-archive
+    python3 - "$(pwd)/tl_loop.pyz" <<'PY'
+import importlib
+import pkgutil
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import tl_loop
+
+for module in pkgutil.walk_packages(tl_loop.__path__, tl_loop.__name__ + "."):
+    if ".tests" not in module.name and not module.name.rsplit(".", 1)[-1].startswith("test"):
+        importlib.import_module(module.name)
+PY
 
 # Compatibility entry point for profile-based install commands
 install profile:
