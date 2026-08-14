@@ -299,6 +299,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E18 :: E18.9 Ship tl_loop as a zipapp - installed package is incomplete, init broken in consuming projects (#852)
 - E18 :: E18.11 Unify build-time and runtime Python interpreter resolution (#854)
 - E18 :: E18.10 Verify and document the python3 interpreter floor (#853)
 - E18 :: E18.8 Preflight example is empty and duplicates the Rust template (#851)
