@@ -256,6 +256,7 @@ _install profile:
 
     echo ">>> [3/4] Building the embedded TL controller archive..."
     just tl-loop-archive
+    test -s tl_loop.pyz
 
     echo ">>> [4/4] Building Rust binary ()..."
     nix develop --command cargo build ${CARGO_FLAGS} -p exomonad
