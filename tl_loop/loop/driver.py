@@ -47,6 +47,7 @@ from tl_loop.loop.review import (
     load_freshness_window,
     verify_review,
     watcher_head,
+    watcher_patch_digest,
 )
 from tl_loop.loop.schedule import ScheduleDeadlock, ready
 from tl_loop.ordered import (
@@ -1753,6 +1754,8 @@ def _ensure_aggregate_candidate(
         aggregate_patch_digest=candidate.patch_digest,
         aggregate_original_base_sha=candidate.original_base_sha,
         integration_owner_id=owner_id,
+        head_sha=candidate.head_sha,
+        patch_digest=candidate.patch_digest,
     )
     child_store = RunStore(task.name, store.run_dir)
     child_store.set_ordered_state(
@@ -2106,10 +2109,12 @@ def _merge_completed_leaf(
                 else None
             )
             current_head = watcher_head(watcher_result)
+            current_patch_digest = watcher_patch_digest(watcher_result)
             verify_review(
                 current,
                 current_head,
                 freshness_window_secs=freshness_window_secs,
+                current_patch_digest=current_patch_digest,
             )
             head_sha = current_head
         except ReviewGateError as error:
@@ -2225,10 +2230,18 @@ def _record_review_event(
             raise TLLoopError(f"{event.event_type!r} findings have no head SHA")
         return store.checkpoint(phase, state.slices, state.budgets, event_seq)
     review_findings = _review_findings(current, event.head_sha, findings)
+    patch_digest = _event_patch_digest(event)
+    patch_digests = dict(current.review_patch_digests)
+    if patch_digest is not None:
+        patch_digests[event.head_sha] = patch_digest
     stall_classification = _event_stall_classification(event)
     if current.reviewed_head is not None and current.reviewed_head != event.head_sha:
         updated = dict(state.slices)
-        updated[slice_id] = replace(current, review_findings=review_findings)
+        updated[slice_id] = replace(
+            current,
+            review_findings=review_findings,
+            review_patch_digests=patch_digests,
+        )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     verdict = _review_verdict(event)
     if verdict is None:
@@ -2237,6 +2250,7 @@ def _record_review_event(
             current,
             pr_number=event.pr_number or current.pr_number,
             review_findings=review_findings,
+            review_patch_digests=patch_digests,
             stall_classification=stall_classification or current.stall_classification,
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
@@ -2248,6 +2262,7 @@ def _record_review_event(
         verdict=verdict,
         verdict_at=event.observed_at,
         review_findings=review_findings,
+        review_patch_digests=patch_digests,
         stall_classification=stall_classification or current.stall_classification,
     )
     return store.checkpoint(phase, updated, state.budgets, event_seq)
@@ -2291,6 +2306,17 @@ def _event_findings(event: EventEnvelope) -> list[dict[str, str]] | None:
     return findings
 
 
+def _event_patch_digest(event: EventEnvelope) -> str | None:
+    """Persist only a patch hash when the event carries patch material."""
+    explicit = event.data.get("patch_digest")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    patch = event.data.get("diff", event.data.get("patch"))
+    if patch is None:
+        return None
+    return hashlib.sha256(repr(patch).encode("utf-8")).hexdigest()
+
+
 def _review_findings(
     current: SliceState,
     head_sha: str,
@@ -2329,6 +2355,10 @@ def _route_review_event(
     if head_sha is None:
         raise TLLoopError(f"{event.event_type!r} findings have no head SHA")
     review_findings = _review_findings(current, head_sha, findings)
+    patch_digest = _event_patch_digest(event)
+    patch_digests = dict(current.review_patch_digests)
+    if patch_digest is not None:
+        patch_digests[head_sha] = patch_digest
     stall_classification = _event_stall_classification(event)
     if findings is None:
         LOGGER.warning(
@@ -2340,6 +2370,7 @@ def _route_review_event(
         updated[slice_id] = replace(
             current,
             review_findings=review_findings,
+            review_patch_digests=patch_digests,
             stall_classification=stall_classification or current.stall_classification,
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
@@ -2351,7 +2382,11 @@ def _route_review_event(
             head_sha,
         )
         updated = dict(state.slices)
-        updated[slice_id] = replace(current, review_findings=review_findings)
+        updated[slice_id] = replace(
+            current,
+            review_findings=review_findings,
+            review_patch_digests=patch_digests,
+        )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     leaf = next((candidate for candidate in plan.leaves if candidate.name == slice_id), None)
     if leaf is None:
@@ -2374,6 +2409,7 @@ def _route_review_event(
         verdict=result.verdict,
         verdict_at=event.observed_at,
         review_findings=review_findings,
+        review_patch_digests=patch_digests,
         stall_classification=stall_classification or current.stall_classification,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)

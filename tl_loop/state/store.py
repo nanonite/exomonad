@@ -477,6 +477,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             "attempts": value.attempts,
             "verdict": value.verdict.value if value.verdict else None,
         }
+        if value.review_patch_digests:
+            record["review_patch_digests"] = dict(value.review_patch_digests)
         if value.verdict_at is not None:
             record["verdict_at"] = value.verdict_at
         if value.park_cause is not None:
@@ -562,7 +564,7 @@ def _encode_ordered_stages(value: OrderedStagesInput) -> list[dict[str, object]]
 
 def _encode_integration(value: IntegrationInput) -> dict[str, object]:
     if isinstance(value, IntegrationRuntimeState):
-        return {
+        record: dict[str, object] = {
             "lifecycle": value.lifecycle.value,
             "sub_tl_states": {
                 name: lifecycle.value for name, lifecycle in value.sub_tl_states.items()
@@ -581,6 +583,9 @@ def _encode_integration(value: IntegrationInput) -> dict[str, object]:
             "base_revalidation_count": value.base_revalidation_count,
             "stage_verification": value.stage_verification,
         }
+        if value.integration_evidence_at is not None:
+            record["integration_evidence_at"] = value.integration_evidence_at
+        return record
     if not isinstance(value, Mapping):
         raise TypeError("integration must be an IntegrationRuntimeState or object")
     return copy.deepcopy(dict(value))
@@ -677,6 +682,7 @@ def _decode_integration(value: object) -> IntegrationRuntimeState:
         patch_digest=cast(str | None, value.get("patch_digest")),
         validated_base_sha=cast(str | None, value.get("validated_base_sha")),
         merge_tree_sha=cast(str | None, value.get("merge_tree_sha")),
+        integration_evidence_at=cast(str | None, value.get("integration_evidence_at")),
         ci_status=cast(str, value.get("ci_status", "unknown")),
         merge_attempts=cast(int, value.get("merge_attempts", 0)),
         base_revalidation_count=cast(int, value.get("base_revalidation_count", 0)),
@@ -786,6 +792,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         pr_number=cast(int | None, value["pr_number"]),
         reviewed_head=cast(str | None, value["reviewed_head"]),
         review_findings=_decode_review_findings(value.get("review_findings")),
+        review_patch_digests=_decode_string_map(value.get("review_patch_digests")),
         ci_state=_decode_string_map(value.get("ci_state")),
         reviewer_attempt=_decode_int_map(value.get("reviewer_attempt")),
         repair_attempts=cast(int, value.get("repair_attempts", 0)),

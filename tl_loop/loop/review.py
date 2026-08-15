@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 from tl_loop.client.effects import ToolResult
-from tl_loop.state.schema import SliceState, Verdict
+from tl_loop.ordered import IntegrationEvidence, IntegrationLifecycle
+from tl_loop.state.schema import IntegrationRuntimeState, SliceState, Verdict
 
 DEFAULT_REVIEW_POLICY = Path(".exo/review-policy.toml")
 
@@ -86,6 +87,14 @@ class ReviewHeadMismatch(ReviewGateError):
     """The PR head changed after the verdict was recorded."""
 
 
+class MissingPatchDigest(ReviewGateError):
+    """The reviewed head has no patch identity for exact verification."""
+
+
+class PatchDigestMismatch(ReviewGateError):
+    """The patch changed while the branch head identity was reused."""
+
+
 class StaleVerdict(ReviewGateError):
     """The verdict is older than the configured freshness window."""
 
@@ -102,6 +111,10 @@ class CIStatusNotApproved(ReviewGateError):
     """The reviewed head does not have a successful or neutral CI result."""
 
 
+class IntegrationEvidenceMismatch(ReviewGateError):
+    """Integration evidence no longer matches the live base or result."""
+
+
 class OptionalPolicyRejected(ReviewGateError):
     """An explicitly supplied project-specific merge predicate rejected."""
 
@@ -112,6 +125,7 @@ class ReviewEvidence:
 
     reviewed_head: str
     age_seconds: float
+    patch_digest: str | None = None
 
 
 def verify_review(
@@ -120,6 +134,7 @@ def verify_review(
     *,
     now: datetime | None = None,
     freshness_window_secs: int | None = None,
+    current_patch_digest: str | None = None,
     policy_path: str | Path = DEFAULT_REVIEW_POLICY,
     policy_predicate: Callable[[SliceState], bool] | None = None,
 ) -> ReviewEvidence:
@@ -142,6 +157,17 @@ def verify_review(
         raise ReviewHeadMismatch(
             f"slice {slice.id!r} reviewed {slice.reviewed_head}, current head is {current_head}"
         )
+    recorded_patch_digest = slice.review_patch_digests.get(slice.reviewed_head)
+    if recorded_patch_digest is not None:
+        if current_patch_digest is None:
+            raise MissingPatchDigest(
+                f"slice {slice.id!r} has no live patch digest for {current_head}"
+            )
+        if current_patch_digest != recorded_patch_digest:
+            raise PatchDigestMismatch(
+                f"slice {slice.id!r} reviewed patch {recorded_patch_digest}, "
+                f"current patch is {current_patch_digest}"
+            )
     ci_status = slice.ci_state.get(slice.reviewed_head)
     if ci_status is None:
         raise MissingCIStatus(
@@ -160,7 +186,99 @@ def verify_review(
         now=now,
         freshness_window_secs=freshness_window_secs,
     )
-    return ReviewEvidence(slice.reviewed_head, age_seconds)
+    return ReviewEvidence(slice.reviewed_head, age_seconds, recorded_patch_digest)
+
+
+def verify_integration(
+    state: IntegrationRuntimeState,
+    *,
+    base_sha: str,
+    head_sha: str,
+    merge_tree_sha: str,
+    ci_status: str,
+) -> IntegrationEvidence:
+    """Require exact persisted base, head, merge-tree, and CI evidence."""
+    expected = (
+        ("validated_base_sha", state.validated_base_sha, base_sha),
+        ("head_sha", state.head_sha, head_sha),
+        ("merge_tree_sha", state.merge_tree_sha, merge_tree_sha),
+        ("ci_status", state.ci_status, ci_status),
+    )
+    for name, recorded, current in expected:
+        if recorded != current:
+            raise IntegrationEvidenceMismatch(
+                f"integration {name} recorded {recorded!r}, current value is {current!r}"
+            )
+    if state.stage_verification != "passed":
+        raise IntegrationEvidenceMismatch(
+            f"integration stage verification is {state.stage_verification!r}"
+        )
+    if ci_status not in {"success", "neutral"}:
+        raise IntegrationEvidenceMismatch(f"integration CI status is {ci_status!r}")
+    if state.integration_evidence_at is None:
+        raise IntegrationEvidenceMismatch("integration evidence has no observed timestamp")
+    return IntegrationEvidence(
+        base_sha,
+        head_sha,
+        merge_tree_sha,
+        ci_status,
+        state.integration_evidence_at,
+    )
+
+
+def integration_needs_revalidation(
+    state: IntegrationRuntimeState,
+    *,
+    base_sha: str,
+    head_sha: str,
+    patch_digest: str,
+) -> str | None:
+    """Classify evidence invalidation without confusing base movement with head drift."""
+    if state.head_sha != head_sha or state.patch_digest != patch_digest:
+        return "head_invalidated"
+    if state.validated_base_sha != base_sha:
+        return "base_invalidated"
+    return None
+
+
+def invalidate_integration_evidence(
+    state: IntegrationRuntimeState,
+    *,
+    base_sha: str,
+    head_sha: str,
+    patch_digest: str,
+) -> IntegrationRuntimeState:
+    """Clear only the authority invalidated by base or head movement."""
+    reason = integration_needs_revalidation(
+        state,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        patch_digest=patch_digest,
+    )
+    if reason is None:
+        return state
+    common = {
+        "merge_tree_sha": None,
+        "ci_status": "unknown",
+        "stage_verification": "pending",
+        "integration_evidence_at": None,
+    }
+    if reason == "base_invalidated":
+        return replace(
+            state,
+            lifecycle=IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            validated_base_sha=None,
+            base_revalidation_count=state.base_revalidation_count + 1,
+            **common,
+        )
+    return replace(
+        state,
+        lifecycle=IntegrationLifecycle.REPAIRING_AGGREGATE,
+        head_sha=None,
+        patch_digest=None,
+        validated_base_sha=None,
+        **common,
+    )
 
 
 def _freshness_age(
@@ -197,6 +315,14 @@ def watcher_head(result: ToolResult) -> str:
     return head
 
 
+def watcher_patch_digest(result: ToolResult) -> str | None:
+    """Extract optional patch identity from the live watcher response."""
+    if result.success is not True or not isinstance(result.result, Mapping):
+        return None
+    value = result.result.get("patch_digest")
+    return value if isinstance(value, str) and value else None
+
+
 def load_freshness_window(path: str | Path = DEFAULT_REVIEW_POLICY) -> int:
     """Load the review freshness window from the canonical TOML policy."""
     try:
@@ -228,15 +354,21 @@ __all__ = [
     "CIStatusNotApproved",
     "MissingCIStatus",
     "MissingReviewedHead",
+    "MissingPatchDigest",
     "MissingVerdict",
     "OptionalPolicyRejected",
     "ReviewEvidence",
     "ReviewGateError",
     "ReviewHeadMismatch",
+    "PatchDigestMismatch",
     "StaleVerdict",
     "VerdictNotApproved",
     "compose_acceptance_criteria",
+    "integration_needs_revalidation",
+    "invalidate_integration_evidence",
     "load_freshness_window",
     "verify_review",
+    "verify_integration",
     "watcher_head",
+    "watcher_patch_digest",
 ]

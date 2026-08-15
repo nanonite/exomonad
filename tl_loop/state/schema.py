@@ -119,6 +119,7 @@ INTEGRATION_KEYS = frozenset(
         "patch_digest",
         "validated_base_sha",
         "merge_tree_sha",
+        "integration_evidence_at",
         "ci_status",
         "merge_attempts",
         "base_revalidation_count",
@@ -141,6 +142,7 @@ SLICE_KEYS = frozenset(
         "worktree",
         "pr_number",
         "review_findings",
+        "review_patch_digests",
         "ci_state",
         "reviewer_attempt",
         "repair_attempts",
@@ -231,6 +233,7 @@ class SliceState:
     attempts: int
     verdict: Verdict | None
     review_findings: Mapping[str, tuple[Mapping[str, str], ...]] = field(default_factory=dict)
+    review_patch_digests: Mapping[str, str] = field(default_factory=dict)
     ci_state: Mapping[str, str] = field(default_factory=dict)
     reviewer_attempt: Mapping[str, int] = field(default_factory=dict)
     repair_attempts: int = 0
@@ -336,6 +339,7 @@ class IntegrationRuntimeState:
     patch_digest: str | None = None
     validated_base_sha: str | None = None
     merge_tree_sha: str | None = None
+    integration_evidence_at: str | None = None
     ci_status: str = "unknown"
     merge_attempts: int = 0
     base_revalidation_count: int = 0
@@ -486,6 +490,7 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
         "patch_digest",
         "validated_base_sha",
         "merge_tree_sha",
+        "integration_evidence_at",
     ):
         _nullable_string(integration, key, "run.integration", errors)
     if "ci_status" in integration and integration["ci_status"] not in CI_STATUSES:
@@ -540,6 +545,7 @@ def _validate_slice(
     ):
         errors.append((f"{path}.reviewed_head", "is required when verdict is present"))
     _review_findings(value.get("review_findings"), path, errors)
+    _string_map(value.get("review_patch_digests"), f"{path}.review_patch_digests", errors)
     _ci_state(value.get("ci_state"), path, errors)
     _reviewer_attempt(value.get("reviewer_attempt"), path, errors)
     if "repair_attempts" in value:
@@ -597,6 +603,23 @@ def _review_findings(
                 continue
             for key in REVIEW_FINDING_KEYS:
                 _non_empty_string(finding, key, finding_path, errors)
+
+
+def _string_map(
+    value: object,
+    path: str,
+    errors: list[tuple[str, str]],
+) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        errors.append((path, "must be an object"))
+        return
+    for key, item in value.items():
+        if not isinstance(key, str) or not key:
+            errors.append((path, "keys must be non-empty strings"))
+        if not isinstance(item, str) or not item:
+            errors.append((f"{path}[{key!r}]", "must be a non-empty string"))
 
 
 def _ci_state(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -21,13 +21,21 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.review import (
     CIStatusNotApproved,
+    IntegrationEvidenceMismatch,
+    MissingPatchDigest,
     MissingCIStatus,
     OptionalPolicyRejected,
+    PatchDigestMismatch,
     ReviewHeadMismatch,
     StaleVerdict,
+    invalidate_integration_evidence,
+    integration_needs_revalidation,
+    verify_integration,
     verify_review,
 )
+from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
+    IntegrationRuntimeState,
     RunState,
     SchemaError,
     SliceState,
@@ -104,6 +112,134 @@ def test_changed_head_rejects_the_verdict() -> None:
             now=NOW,
             freshness_window_secs=600,
         )
+
+
+def test_changed_patch_digest_rejects_reused_head() -> None:
+    reviewed = replace(_slice(verdict_at=None), review_patch_digests={"abc123": "patch-a"})
+
+    with pytest.raises(PatchDigestMismatch, match="current patch"):
+        verify_review(reviewed, "abc123", current_patch_digest="patch-b")
+
+
+def test_missing_live_patch_digest_rejects_bound_review() -> None:
+    reviewed = replace(_slice(verdict_at=None), review_patch_digests={"abc123": "patch-a"})
+
+    with pytest.raises(MissingPatchDigest, match="no live patch digest"):
+        verify_review(reviewed, "abc123")
+
+
+def test_matching_patch_digest_accepts_bound_review() -> None:
+    reviewed = replace(_slice(verdict_at=None), review_patch_digests={"abc123": "patch-a"})
+
+    evidence = verify_review(reviewed, "abc123", current_patch_digest="patch-a")
+
+    assert evidence.patch_digest == "patch-a"
+
+
+def test_integration_evidence_requires_exact_base_head_tree_and_ci() -> None:
+    state = IntegrationRuntimeState(
+        lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
+        head_sha="head-a",
+        patch_digest="patch-a",
+        validated_base_sha="base-a",
+        merge_tree_sha="tree-a",
+        ci_status="success",
+        stage_verification="passed",
+        integration_evidence_at="2026-08-11T17:00:00Z",
+    )
+
+    evidence = verify_integration(
+        state,
+        base_sha="base-a",
+        head_sha="head-a",
+        merge_tree_sha="tree-a",
+        ci_status="success",
+    )
+
+    assert evidence.merge_tree_sha == "tree-a"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("base_sha", "base-b"), ("head_sha", "head-b"), ("merge_tree_sha", "tree-b"), ("ci_status", "failure")),
+)
+def test_integration_evidence_rejects_each_changed_dimension(field: str, value: str) -> None:
+    state = IntegrationRuntimeState(
+        lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
+        head_sha="head-a",
+        patch_digest="patch-a",
+        validated_base_sha="base-a",
+        merge_tree_sha="tree-a",
+        ci_status="success",
+        stage_verification="passed",
+        integration_evidence_at="2026-08-11T17:00:00Z",
+    )
+    live = {"base_sha": "base-a", "head_sha": "head-a", "merge_tree_sha": "tree-a", "ci_status": "success"}
+    live[field] = value
+
+    with pytest.raises(IntegrationEvidenceMismatch):
+        verify_integration(state, **live)
+
+
+def test_base_movement_only_requires_integration_revalidation() -> None:
+    state = IntegrationRuntimeState(head_sha="head-a", patch_digest="patch-a", validated_base_sha="base-a")
+
+    assert integration_needs_revalidation(
+        state, base_sha="base-b", head_sha="head-a", patch_digest="patch-a"
+    ) == "base_invalidated"
+    assert integration_needs_revalidation(
+        state, base_sha="base-a", head_sha="head-a", patch_digest="patch-b"
+    ) == "head_invalidated"
+
+
+def test_base_movement_clears_only_integration_authority() -> None:
+    state = IntegrationRuntimeState(
+        lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
+        head_sha="head-a",
+        patch_digest="patch-a",
+        validated_base_sha="base-a",
+        merge_tree_sha="tree-a",
+        ci_status="success",
+        stage_verification="passed",
+        integration_evidence_at="2026-08-11T17:00:00Z",
+    )
+
+    invalidated = invalidate_integration_evidence(
+        state,
+        base_sha="base-b",
+        head_sha="head-a",
+        patch_digest="patch-a",
+    )
+
+    assert invalidated.lifecycle is IntegrationLifecycle.NEEDS_BASE_REVALIDATION
+    assert invalidated.head_sha == "head-a"
+    assert invalidated.patch_digest == "patch-a"
+    assert invalidated.merge_tree_sha is None
+    assert invalidated.ci_status == "unknown"
+
+
+def test_head_or_patch_movement_clears_review_and_integration_authority() -> None:
+    state = IntegrationRuntimeState(
+        lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
+        head_sha="head-a",
+        patch_digest="patch-a",
+        validated_base_sha="base-a",
+        merge_tree_sha="tree-a",
+        ci_status="success",
+        stage_verification="passed",
+        integration_evidence_at="2026-08-11T17:00:00Z",
+    )
+
+    invalidated = invalidate_integration_evidence(
+        state,
+        base_sha="base-a",
+        head_sha="head-b",
+        patch_digest="patch-b",
+    )
+
+    assert invalidated.lifecycle is IntegrationLifecycle.REPAIRING_AGGREGATE
+    assert invalidated.head_sha is None
+    assert invalidated.patch_digest is None
 
 
 def test_expired_matching_verdict_requires_review() -> None:
