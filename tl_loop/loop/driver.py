@@ -48,7 +48,7 @@ from tl_loop.loop.review import (
     watcher_head,
 )
 from tl_loop.loop.schedule import ScheduleDeadlock, ready
-from tl_loop.ordered import IntegrationContract, OrderedStage, ReviewOwner
+from tl_loop.ordered import IntegrationContract, IntegrationLifecycle, OrderedStage, ReviewOwner
 from tl_loop.rlm.adjudicate import adjudicate_review
 from tl_loop.rlm.repair import RepairHandoff, compose_repair
 from tl_loop.select.agent_type import select_agent_type, selection_failure
@@ -62,6 +62,8 @@ from tl_loop.state.schema import (
     BudgetLedger,
     GateStatus,
     GoalState,
+    IntegrationRuntimeState,
+    OrderedStageState,
     ParkCause,
     RunState,
     SliceState,
@@ -414,6 +416,7 @@ def run_tl_loop(
             root_state["budgets"] = _budget_root(budgets)
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
+    state = _initialize_ordered_runtime(work_plan, state, store)
     effects_log: list[EffectIntent] = []
     state = _reconcile_dispatches(state, selected, effects, store, effects_log)
     state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
@@ -429,6 +432,21 @@ def run_tl_loop(
         effects_log,
         decoder or TLEventDecoder(),
     )
+
+
+def _initialize_ordered_runtime(plan: WorkPlan, state: RunState, store: RunStore) -> RunState:
+    """Create ordered restart metadata once, without resetting progress."""
+    if not plan.sub_tls:
+        return state
+    stages = tuple(OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages)
+    if state.ordered_stages:
+        if state.ordered_stages != stages:
+            raise TLLoopError("persisted ordered stages do not match the normalized plan")
+        return state
+    integration = IntegrationRuntimeState(
+        sub_tl_states={task.name: IntegrationLifecycle.RUNNING for task in plan.sub_tls}
+    )
+    return store.set_ordered_state(1, stages, integration)
 
 
 def _run_loop(
@@ -1434,6 +1452,7 @@ def _run_sub_tls(
             effects,
             effects_log,
         )
+        state = _persist_sub_tl_lifecycle(state, store, task.name, IntegrationLifecycle.RUNNING)
         child_config = _child_config(config, task, source, effects, store, branch, worktree)
         child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, state.budgets)
         status = (
@@ -1455,6 +1474,14 @@ def _run_sub_tls(
             config,
             effects,
             effects_log,
+        )
+        state = _persist_sub_tl_lifecycle(
+            state,
+            store,
+            task.name,
+            IntegrationLifecycle.CHILDREN_MERGED
+            if status is SliceStatus.MERGED
+            else IntegrationLifecycle.FAILED,
         )
         if status is SliceStatus.FAILED:
             before_phase = _phase_from_state(state)
@@ -1487,6 +1514,32 @@ def _run_sub_tls(
             effects_log,
         )
     return state
+
+
+def _persist_sub_tl_lifecycle(
+    state: RunState,
+    store: RunStore,
+    sub_tl_id: str,
+    lifecycle: IntegrationLifecycle,
+) -> RunState:
+    """Atomically retain one child lifecycle and the next restart order."""
+    states = dict(state.integration.sub_tl_states)
+    states[sub_tl_id] = lifecycle
+    pending_orders = [
+        stage.order
+        for stage in state.ordered_stages
+        if any(
+            states.get(child)
+            not in {IntegrationLifecycle.CHILDREN_MERGED, IntegrationLifecycle.FAILED}
+            for child in stage.sub_tls
+        )
+    ]
+    next_order = min(
+        pending_orders,
+        default=max((stage.order for stage in state.ordered_stages), default=state.current_order),
+    )
+    integration = replace(state.integration, sub_tl_states=states)
+    return store.set_ordered_state(next_order, state.ordered_stages, integration)
 
 
 def _child_config(

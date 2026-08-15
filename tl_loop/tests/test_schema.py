@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import cast
 
+from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import SchemaError, validate
 
 
@@ -138,6 +139,41 @@ def test_unknown_version_is_rejected_without_migration() -> None:
     document = _valid_document()
     document["version"] = 99
     _assert_rejected(document, "run.version")
+
+
+def test_ordered_runtime_state_is_closed_and_validated() -> None:
+    document = _valid_document()
+    document.update(
+        {
+            "current_order": 2,
+            "ordered_stages": [
+                {"order": 1, "sub_tls": ["auth"]},
+                {"order": 2, "sub_tls": ["docs"]},
+            ],
+            "integration": {
+                "lifecycle": IntegrationLifecycle.READY_FOR_INTEGRATION.value,
+                "sub_tl_states": {"auth": IntegrationLifecycle.MERGED.value},
+                "aggregate_pr_number": 42,
+                "aggregate_head_sha": "head-42",
+                "aggregate_patch_digest": "patch-42",
+                "aggregate_original_base_sha": "base-1",
+                "integration_owner_id": "tl/root",
+                "head_sha": "head-42",
+                "patch_digest": "patch-42",
+                "validated_base_sha": "base-1",
+                "merge_tree_sha": "tree-42",
+                "ci_status": "success",
+                "merge_attempts": 0,
+                "base_revalidation_count": 1,
+                "stage_verification": "passed",
+            },
+        }
+    )
+    validate(document)
+
+    invalid = deepcopy(document)
+    cast(dict[str, object], invalid["integration"])["ci_status"] = "green"
+    _assert_rejected(invalid, "run.integration.ci_status")
 
 
 def test_overlapping_non_terminal_paths_are_rejected() -> None:

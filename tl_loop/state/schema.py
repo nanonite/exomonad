@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Literal, TypeAlias, cast
 
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.ordered import CI_STATUSES, IntegrationLifecycle
 
 SCHEMA_VERSION = 1
 
@@ -42,6 +43,7 @@ class ParkCause(str, Enum):
     DISPATCH_TIMEOUT = "dispatch_timeout"
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
     DISPATCH_FAILED = "dispatch_failed"
+    CORRUPT_STATE = "corrupt_state"
 
 
 class Verdict(str, Enum):
@@ -98,8 +100,32 @@ RUN_KEYS = frozenset(
         "parent_agent_id",
         "depth",
         "goals",
+        "current_order",
+        "ordered_stages",
+        "integration",
     }
 )
+ORDERED_STAGE_KEYS = frozenset({"order", "sub_tls"})
+INTEGRATION_KEYS = frozenset(
+    {
+        "lifecycle",
+        "sub_tl_states",
+        "aggregate_pr_number",
+        "aggregate_head_sha",
+        "aggregate_patch_digest",
+        "aggregate_original_base_sha",
+        "integration_owner_id",
+        "head_sha",
+        "patch_digest",
+        "validated_base_sha",
+        "merge_tree_sha",
+        "ci_status",
+        "merge_attempts",
+        "base_revalidation_count",
+        "stage_verification",
+    }
+)
+INTEGRATION_VERIFICATION_VALUES = frozenset({"pending", "passed", "failed"})
 FSM_KEYS = frozenset({"phase", "waiting"})
 SLICE_KEYS = frozenset(
     {
@@ -287,6 +313,35 @@ class GoalState:
     last_progress_at: float | None = None
 
 
+@dataclass(frozen=True)
+class OrderedStageState:
+    """Persisted normalized stage order and its direct child IDs."""
+
+    order: int
+    sub_tls: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class IntegrationRuntimeState:
+    """Persisted evidence and lifecycle for one parent stage fold."""
+
+    lifecycle: IntegrationLifecycle = IntegrationLifecycle.RUNNING
+    sub_tl_states: Mapping[str, IntegrationLifecycle] = field(default_factory=dict)
+    aggregate_pr_number: int | None = None
+    aggregate_head_sha: str | None = None
+    aggregate_patch_digest: str | None = None
+    aggregate_original_base_sha: str | None = None
+    integration_owner_id: str | None = None
+    head_sha: str | None = None
+    patch_digest: str | None = None
+    validated_base_sha: str | None = None
+    merge_tree_sha: str | None = None
+    ci_status: str = "unknown"
+    merge_attempts: int = 0
+    base_revalidation_count: int = 0
+    stage_verification: str = "pending"
+
+
 SliceMap: TypeAlias = Mapping[str, SliceState]
 
 
@@ -309,6 +364,9 @@ class RunState:
     parent_agent_id: str | None = None
     depth: int = 0
     goals: GoalState = field(default_factory=GoalState)
+    current_order: int = 1
+    ordered_stages: tuple[OrderedStageState, ...] = ()
+    integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
 
 
 class SchemaError(ValueError):
@@ -349,6 +407,7 @@ def validate(doc: object) -> None:
 
     slices = _slice_map(root.get("slices"), errors)
     _goals(root.get("goals"), errors)
+    _ordered_state(root, errors)
     _budgets(root.get("budgets"), errors)
     _gates(root.get("gates"), errors)
     _events(root.get("events"), errors)
@@ -369,6 +428,74 @@ def _version(root: dict[str, object], errors: list[tuple[str, str]]) -> None:
         errors.append(("run.version", "must be an integer"))
     elif value not in {SCHEMA_VERSION}:
         errors.append(("run.version", f"unrecognised version {value}"))
+
+
+def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> None:
+    if "current_order" in root:
+        _positive_int(root, "current_order", "run", errors)
+    stages = root.get("ordered_stages")
+    if stages is not None:
+        if not isinstance(stages, list):
+            errors.append(("run.ordered_stages", "must be an array"))
+        else:
+            expected = 1
+            seen: set[str] = set()
+            for index, raw_stage in enumerate(stages):
+                path = f"run.ordered_stages[{index}]"
+                stage = _object(raw_stage, path, ORDERED_STAGE_KEYS, errors)
+                if stage is None:
+                    continue
+                _positive_int(stage, "order", path, errors)
+                if stage.get("order") != expected:
+                    errors.append((f"{path}.order", "must be contiguous and sorted from 1"))
+                expected += 1
+                _string_list(stage, "sub_tls", path, errors, allow_empty=False)
+                for name in stage.get("sub_tls", []):
+                    if isinstance(name, str):
+                        if name in seen:
+                            errors.append(
+                                (f"{path}.sub_tls", "sub-TL occurs in more than one stage")
+                            )
+                        seen.add(name)
+    if "integration" not in root:
+        return
+    integration = _object(root.get("integration"), "run.integration", INTEGRATION_KEYS, errors)
+    if integration is None:
+        return
+    _enum_value(integration, "lifecycle", "run.integration", IntegrationLifecycle, errors)
+    states = integration.get("sub_tl_states")
+    if not isinstance(states, dict):
+        errors.append(("run.integration.sub_tl_states", "must be an object"))
+    else:
+        for name, lifecycle in states.items():
+            if not isinstance(name, str) or not name:
+                errors.append(("run.integration.sub_tl_states", "keys must be non-empty strings"))
+            if not isinstance(lifecycle, str) or lifecycle not in {
+                item.value for item in IntegrationLifecycle
+            }:
+                errors.append(
+                    (f"run.integration.sub_tl_states[{name!r}]", "is not a lifecycle state")
+                )
+    _nullable_positive_int(integration, "aggregate_pr_number", "run.integration", errors)
+    for key in (
+        "aggregate_head_sha",
+        "aggregate_patch_digest",
+        "aggregate_original_base_sha",
+        "integration_owner_id",
+        "head_sha",
+        "patch_digest",
+        "validated_base_sha",
+        "merge_tree_sha",
+    ):
+        _nullable_string(integration, key, "run.integration", errors)
+    if "ci_status" in integration and integration["ci_status"] not in CI_STATUSES:
+        errors.append(("run.integration.ci_status", "is not a recognised CI status"))
+    _non_negative_int(integration, "merge_attempts", "run.integration", errors)
+    _non_negative_int(integration, "base_revalidation_count", "run.integration", errors)
+    if integration.get("stage_verification") not in INTEGRATION_VERIFICATION_VALUES:
+        errors.append(
+            ("run.integration.stage_verification", "is not a recognised verification result")
+        )
 
 
 def _slice_map(value: object, errors: list[tuple[str, str]]) -> dict[str, dict[str, object]] | None:
@@ -832,6 +959,14 @@ def _non_negative_int(
     value = holder.get(key)
     if type(value) is not int or value < 0:
         errors.append((f"{path}.{key}", "must be a non-negative integer"))
+
+
+def _positive_int(
+    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+) -> None:
+    value = holder.get(key)
+    if type(value) is not int or value <= 0:
+        errors.append((f"{path}.{key}", "must be a positive integer"))
 
 
 def _nullable_positive_int(

@@ -8,10 +8,13 @@ from pathlib import Path
 import pytest
 
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
     BudgetLedger,
     FSMState,
     GateStatus,
+    IntegrationRuntimeState,
+    OrderedStageState,
     SliceState,
     SliceStatus,
     Verdict,
@@ -71,6 +74,58 @@ def test_legacy_checkpoint_defaults_new_review_state(tmp_path: Path) -> None:
     assert restored.ci_state == {}
     assert restored.reviewer_attempt == {}
     assert restored.repair_attempts == 0
+
+
+def test_ordered_state_round_trips_and_resume_preserves_progress(tmp_path: Path) -> None:
+    store = RunStore("ordered-run", tmp_path)
+    create("ordered-run", {}, root_dir=tmp_path)
+    stages = (
+        OrderedStageState(1, ("auth", "sessions")),
+        OrderedStageState(2, ("docs",)),
+    )
+    integration = IntegrationRuntimeState(
+        lifecycle=IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+        sub_tl_states={
+            "auth": IntegrationLifecycle.MERGED,
+            "sessions": IntegrationLifecycle.MERGED,
+        },
+        aggregate_pr_number=42,
+        aggregate_head_sha="head-42",
+        aggregate_patch_digest="patch-42",
+        aggregate_original_base_sha="base-1",
+        integration_owner_id="tl/root",
+        head_sha="head-42",
+        patch_digest="patch-42",
+        validated_base_sha="base-0",
+        merge_tree_sha="tree-42",
+        ci_status="success",
+        merge_attempts=1,
+        base_revalidation_count=2,
+        stage_verification="passed",
+    )
+
+    state = store.set_ordered_state(2, stages, integration)
+    resumed = store.resume()
+
+    assert state.current_order == 2
+    assert state.ordered_stages == stages
+    assert state.integration == integration
+    assert resumed.current_order == 2
+    assert resumed.ordered_stages == stages
+    assert resumed.integration == integration
+
+
+def test_legacy_run_defaults_ordered_state_without_rewrite(tmp_path: Path) -> None:
+    store = RunStore("legacy-run", tmp_path)
+    create("legacy-run", {}, root_dir=tmp_path)
+    document = json.loads(store.path.read_text(encoding="utf-8"))
+
+    restored = store.load()
+
+    assert restored.current_order == 1
+    assert restored.ordered_stages == ()
+    assert restored.integration.lifecycle is IntegrationLifecycle.RUNNING
+    assert "ordered_stages" not in document
 
 
 def test_answer_gate_requires_an_existing_gate(tmp_path: Path) -> None:

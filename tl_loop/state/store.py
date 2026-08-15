@@ -24,6 +24,7 @@ from tl_loop.fsm.phase import (
     TLPRFiled,
     TLWaiting,
 )
+from tl_loop.ordered import IntegrationLifecycle
 
 from .schema import (
     ActualTokens,
@@ -34,6 +35,8 @@ from .schema import (
     GateState,
     GateStatus,
     GoalState,
+    IntegrationRuntimeState,
+    OrderedStageState,
     ParkCause,
     RunState,
     SchemaError,
@@ -50,10 +53,16 @@ RootSpec: TypeAlias = Mapping[str, object]
 SliceInput: TypeAlias = SliceState | Mapping[str, object]
 FSMInput: TypeAlias = FSMState | PhaseValue | TLPhase
 BudgetInput: TypeAlias = BudgetLedger | Mapping[str, object]
+OrderedStagesInput: TypeAlias = (
+    tuple[OrderedStageState, ...] | list[Mapping[str, object]] | Mapping[str, object]
+)
+IntegrationInput: TypeAlias = IntegrationRuntimeState | Mapping[str, object]
 
 
 class CorruptCheckpoint(ValueError):
     """A persisted run state is valid JSON but cannot be resumed safely."""
+
+    park_cause = ParkCause.CORRUPT_STATE
 
 
 class WorktreeClaimError(RuntimeError):
@@ -69,6 +78,9 @@ class ResumeState:
     budgets: BudgetLedger
     offset: int
     goals: GoalState = field(default_factory=GoalState)
+    current_order: int = 1
+    ordered_stages: tuple[OrderedStageState, ...] = ()
+    integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
 
     @property
     def phase(self) -> TLPhase:
@@ -101,9 +113,43 @@ class RunStore:
         slices: Mapping[str, SliceInput],
         budgets: BudgetInput,
         offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
     ) -> RunState:
         """Persist one checkpoint through the shared atomic mutation path."""
-        return checkpoint(fsm, slices, budgets, offset, path=self.run_dir)
+        return checkpoint(
+            fsm,
+            slices,
+            budgets,
+            offset,
+            path=self.run_dir,
+            current_order=current_order,
+            ordered_stages=ordered_stages,
+            integration=integration,
+        )
+
+    def set_ordered_state(
+        self,
+        current_order: int,
+        ordered_stages: OrderedStagesInput,
+        integration: IntegrationInput,
+    ) -> RunState:
+        """Atomically persist stage progress and integration evidence."""
+        encoded_stages = _encode_ordered_stages(ordered_stages)
+        encoded_integration = _encode_integration(integration)
+        if type(current_order) is not int or current_order <= 0:
+            raise ValueError("current_order must be a positive integer")
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            document["current_order"] = current_order
+            document["ordered_stages"] = copy.deepcopy(encoded_stages)
+            document["integration"] = copy.deepcopy(encoded_integration)
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
 
     def load(self) -> RunState:
         """Load and verify this run's checkpoint."""
@@ -242,6 +288,9 @@ def checkpoint(
     run_id: str | None = None,
     path: str | Path | None = None,
     root_dir: str | Path = DEFAULT_ROOT,
+    current_order: int | None = None,
+    ordered_stages: OrderedStagesInput | None = None,
+    integration: IntegrationInput | None = None,
 ) -> RunState:
     """Atomically update a run's FSM, slices, budget ledger, and event offset."""
     run_directory = _resolve_run_directory(run_id, path, root_dir)
@@ -250,6 +299,10 @@ def checkpoint(
     encoded_fsm = _encode_fsm(fsm)
     encoded_slices = _encode_slices(slices)
     encoded_budgets = _encode_budgets(budgets)
+    encoded_stages = _encode_ordered_stages(ordered_stages) if ordered_stages is not None else None
+    encoded_integration = _encode_integration(integration) if integration is not None else None
+    if current_order is not None and (type(current_order) is not int or current_order <= 0):
+        raise ValueError("current_order must be a positive integer")
     _assert_encoded_consistent(run_directory / "run.json", encoded_fsm, encoded_slices)
 
     def mutate(document: dict[str, object]) -> dict[str, object]:
@@ -257,6 +310,12 @@ def checkpoint(
         document["slices"] = copy.deepcopy(encoded_slices)
         document["budgets"] = copy.deepcopy(encoded_budgets)
         document["events"] = {"last_consumed_offset": offset}
+        if current_order is not None:
+            document["current_order"] = current_order
+        if encoded_stages is not None:
+            document["ordered_stages"] = copy.deepcopy(encoded_stages)
+        if encoded_integration is not None:
+            document["integration"] = copy.deepcopy(encoded_integration)
         return document
 
     apply(run_directory, mutate)
@@ -272,6 +331,9 @@ def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:
         budgets=state.budgets,
         offset=state.events.last_consumed_offset,
         goals=state.goals,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
     )
 
 
@@ -289,6 +351,9 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "parent_agent_id",
         "depth",
         "goals",
+        "current_order",
+        "ordered_stages",
+        "integration",
     }
     unknown = sorted(set(root_spec) - allowed)
     if unknown:
@@ -477,6 +542,50 @@ def _encode_budgets(budgets: BudgetInput) -> dict[str, object]:
     return {"ledger": copy.deepcopy(value)}
 
 
+def _encode_ordered_stages(value: OrderedStagesInput) -> list[dict[str, object]]:
+    if isinstance(value, Mapping):
+        raw = value.get("stages", value)
+        if isinstance(raw, list):
+            value = raw
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("ordered_stages must be an array")
+    result: list[dict[str, object]] = []
+    for stage in value:
+        if isinstance(stage, OrderedStageState):
+            result.append({"order": stage.order, "sub_tls": list(stage.sub_tls)})
+        elif isinstance(stage, Mapping):
+            result.append(copy.deepcopy(dict(stage)))
+        else:
+            raise TypeError("ordered stage must be an OrderedStageState or object")
+    return result
+
+
+def _encode_integration(value: IntegrationInput) -> dict[str, object]:
+    if isinstance(value, IntegrationRuntimeState):
+        return {
+            "lifecycle": value.lifecycle.value,
+            "sub_tl_states": {
+                name: lifecycle.value for name, lifecycle in value.sub_tl_states.items()
+            },
+            "aggregate_pr_number": value.aggregate_pr_number,
+            "aggregate_head_sha": value.aggregate_head_sha,
+            "aggregate_patch_digest": value.aggregate_patch_digest,
+            "aggregate_original_base_sha": value.aggregate_original_base_sha,
+            "integration_owner_id": value.integration_owner_id,
+            "head_sha": value.head_sha,
+            "patch_digest": value.patch_digest,
+            "validated_base_sha": value.validated_base_sha,
+            "merge_tree_sha": value.merge_tree_sha,
+            "ci_status": value.ci_status,
+            "merge_attempts": value.merge_attempts,
+            "base_revalidation_count": value.base_revalidation_count,
+            "stage_verification": value.stage_verification,
+        }
+    if not isinstance(value, Mapping):
+        raise TypeError("integration must be an IntegrationRuntimeState or object")
+    return copy.deepcopy(dict(value))
+
+
 def _read_bytes(target: Path) -> bytes:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(target, os.O_RDONLY | nofollow)
@@ -524,6 +633,54 @@ def _decode(document: dict[str, object]) -> RunState:
         parent_run_id=cast(str | None, document.get("parent_run_id")),
         parent_agent_id=cast(str | None, document.get("parent_agent_id")),
         depth=cast(int, document.get("depth", 0)),
+        current_order=cast(int, document.get("current_order", 1)),
+        ordered_stages=_decode_ordered_stages(document.get("ordered_stages")),
+        integration=_decode_integration(document.get("integration")),
+    )
+
+
+def _decode_ordered_stages(value: object) -> tuple[OrderedStageState, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        OrderedStageState(
+            order=cast(int, stage["order"]),
+            sub_tls=tuple(cast(list[str], stage["sub_tls"])),
+        )
+        for stage in value
+        if isinstance(stage, dict)
+    )
+
+
+def _decode_integration(value: object) -> IntegrationRuntimeState:
+    if not isinstance(value, dict):
+        return IntegrationRuntimeState()
+    raw_states = value.get("sub_tl_states")
+    states = (
+        {
+            name: IntegrationLifecycle(cast(str, lifecycle))
+            for name, lifecycle in raw_states.items()
+            if isinstance(name, str) and isinstance(lifecycle, str)
+        }
+        if isinstance(raw_states, dict)
+        else {}
+    )
+    return IntegrationRuntimeState(
+        lifecycle=IntegrationLifecycle(cast(str, value.get("lifecycle", "RUNNING"))),
+        sub_tl_states=MappingProxyType(states),
+        aggregate_pr_number=cast(int | None, value.get("aggregate_pr_number")),
+        aggregate_head_sha=cast(str | None, value.get("aggregate_head_sha")),
+        aggregate_patch_digest=cast(str | None, value.get("aggregate_patch_digest")),
+        aggregate_original_base_sha=cast(str | None, value.get("aggregate_original_base_sha")),
+        integration_owner_id=cast(str | None, value.get("integration_owner_id")),
+        head_sha=cast(str | None, value.get("head_sha")),
+        patch_digest=cast(str | None, value.get("patch_digest")),
+        validated_base_sha=cast(str | None, value.get("validated_base_sha")),
+        merge_tree_sha=cast(str | None, value.get("merge_tree_sha")),
+        ci_status=cast(str, value.get("ci_status", "unknown")),
+        merge_attempts=cast(int, value.get("merge_attempts", 0)),
+        base_revalidation_count=cast(int, value.get("base_revalidation_count", 0)),
+        stage_verification=cast(str, value.get("stage_verification", "pending")),
     )
 
 
