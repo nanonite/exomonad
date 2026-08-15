@@ -181,7 +181,11 @@ exomonad init --recreate
 `.exo/companions/` persist across it — only the session is torn down.
 
 The TL window now runs `python3 ~/.exo/tl_loop.pyz`, not a harness session. Do not type
-`claude` into it.
+`claude` into it. Init applies a bounded five-second startup liveness gate to
+the controller; this confirms that its process appears and survives startup,
+but is not a semantic ready signal or heartbeat protocol. Later hangs and
+failures remain visible through the Watcher, `status`, and the durable
+`controller-exit.json` record.
 
 ---
 
