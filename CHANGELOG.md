@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix TL dispatch timeout when leaf spawn produces no observable event (#876)
 - Fix TL controller startup race and surface launch failures (#862)
 - tmux_liveness dead-pane test depends on ambient tmux state and blocks just test (#857)
 - Fix installed controller missing newly added source files (#860)
