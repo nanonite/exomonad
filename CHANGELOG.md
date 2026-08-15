@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Validate and normalize ordered sub-TL plans (#865)
 - Define ordered sub-TL stage and integration contracts (#864)
 - E19: tl_loop status --watch (#833)
 - E18: Preflight config validation in exomonad init (#832)
