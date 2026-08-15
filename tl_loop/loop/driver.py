@@ -8,7 +8,7 @@ import logging
 import queue as queue_module
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, cast
@@ -47,6 +47,7 @@ from tl_loop.loop.review import (
     watcher_head,
 )
 from tl_loop.loop.schedule import ScheduleDeadlock, ready
+from tl_loop.ordered import IntegrationContract, OrderedStage, ReviewOwner
 from tl_loop.rlm.adjudicate import adjudicate_review
 from tl_loop.rlm.repair import RepairHandoff, compose_repair
 from tl_loop.select.agent_type import select_agent_type, selection_failure
@@ -188,6 +189,14 @@ class WorkPlan:
             sub_tls=_sub_tls(value.get("sub_tls", ())),
         )
 
+    @property
+    def ordered_stages(self) -> tuple[OrderedStage, ...]:
+        """Group direct sub-TLs by positive sibling order, lowest first."""
+        grouped: dict[int, list[str]] = {}
+        for task in self.sub_tls:
+            grouped.setdefault(task.order, []).append(task.name)
+        return tuple(OrderedStage(order, tuple(grouped[order])) for order in sorted(grouped))
+
 
 @dataclass(frozen=True)
 class SubTLTask:
@@ -200,6 +209,8 @@ class SubTLTask:
     agent_type: str | None = None
     worktree: str | Path | None = None
     agent_id: str | None = None
+    order: int = 1
+    integration: IntegrationContract = field(default_factory=IntegrationContract)
 
     def __post_init__(self) -> None:
         _require_text(self.name, "sub-TL name")
@@ -209,6 +220,10 @@ class SubTLTask:
         _optional_text(self.agent_id, "sub-TL agent_id")
         if self.worktree is not None:
             _require_text(str(self.worktree), "sub-TL worktree")
+        if type(self.order) is not int or self.order <= 0:
+            raise ValueError("sub-TL order must be a positive integer")
+        if not isinstance(self.integration, IntegrationContract):
+            raise TypeError("sub-TL integration must be an IntegrationContract")
 
 
 @dataclass(frozen=True)
@@ -2694,6 +2709,8 @@ def _sub_tl(value: object) -> SubTLTask:
         "agent_type",
         "worktree",
         "agent_id",
+        "order",
+        "integration",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -2706,6 +2723,7 @@ def _sub_tl(value: object) -> SubTLTask:
         if isinstance(plan_value, WorkPlan)
         else WorkPlan.from_mapping(cast(Mapping[str, object], plan_value))
     )
+    integration = _integration_contract(value.get("integration"))
     return SubTLTask(
         _required_text(value, "name", "sub-TL"),
         plan,
@@ -2714,6 +2732,51 @@ def _sub_tl(value: object) -> SubTLTask:
         _optional_string(value, "agent_type", "sub-TL"),
         cast(str | Path | None, value.get("worktree")),
         _optional_string(value, "agent_id", "sub-TL"),
+        _positive_order(value.get("order", 1), "sub-TL order"),
+        integration,
+    )
+
+
+def _positive_order(value: object, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _integration_contract(value: object) -> IntegrationContract:
+    if value is None:
+        return IntegrationContract()
+    if not isinstance(value, Mapping):
+        raise TypeError("sub-TL integration must be an object")
+    allowed = {
+        "aggregate_pr_required",
+        "base_revalidation_required",
+        "leaf_review_owner",
+        "aggregate_review_owner",
+        "aggregate_repair_owner",
+        "merge_strategy",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"sub-TL integration contains unknown keys: {', '.join(unknown)}")
+
+    def owner(name: str) -> ReviewOwner:
+        raw = value.get(
+            name,
+            ReviewOwner.LEAF.value if name == "leaf_review_owner" else ReviewOwner.AGGREGATE.value,
+        )
+        try:
+            return ReviewOwner(raw)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{name} must be 'leaf' or 'aggregate'") from error
+
+    return IntegrationContract(
+        aggregate_pr_required=value.get("aggregate_pr_required", True),
+        base_revalidation_required=value.get("base_revalidation_required", True),
+        leaf_review_owner=owner("leaf_review_owner"),
+        aggregate_review_owner=owner("aggregate_review_owner"),
+        aggregate_repair_owner=owner("aggregate_repair_owner"),
+        merge_strategy=value.get("merge_strategy", "merge"),
     )
 
 

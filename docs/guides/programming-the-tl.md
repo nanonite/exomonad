@@ -308,7 +308,31 @@ A sub-TL is a nested `tl_run` with its own checkpoint at
 ```
 
 Accepted keys: `name`, `plan` (or inline `workers`/`leaves`/`sub_tls`),
-`agent_type`, `worktree`, `agent_id`.
+`agent_type`, `worktree`, `agent_id`, positive `order`, and optional
+`integration`. Missing `order` is backward-compatible shorthand for order 1;
+zero and negative values are invalid.
+
+```json
+{
+  "name": "auth",
+  "order": 1,
+  "integration": {
+    "aggregate_pr_required": true,
+    "base_revalidation_required": true,
+    "merge_strategy": "merge"
+  },
+  "plan": { "leaves": [] }
+}
+```
+
+The integration contract binds each aggregate candidate to its child PR,
+head, patch digest, and original base. Code-review evidence must match the
+candidate head and patch; integration evidence must match the current base,
+integrated head, merge tree, and CI result. The lifecycle distinguishes
+`CHILDREN_MERGED`, `CODE_REVIEWED`, `READY_FOR_INTEGRATION`,
+`NEEDS_BASE_REVALIDATION`, `INTEGRATION_VALIDATED`, `MERGING`, `MERGED`, and
+explicit repair, conflict, failure, and parked states. A changed base and a
+changed head therefore take different recovery paths.
 
 Child branches use `{parent}.{name}`, the child PR targets the parent branch as
 its `base_ref`, and recursion depth is bounded by `max_depth` — exceeding it

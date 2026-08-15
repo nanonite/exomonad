@@ -192,10 +192,20 @@ name, or agent type.
 ## Recursive sub-TL ownership
 
 `WorkPlan.sub_tls` runs a child `tl_run` directly, without `fork_wave` or a
-Claude session. A child checkpoint lives at
+Claude session. Each direct child has a positive sibling-scoped `order`;
+children with the same order form one `OrderedStage`, and recursive children
+restart their order at `1`. A child checkpoint lives at
 `.exo/tl-loop/<parent_run_id>/<sub_tl_id>/run.json`; a grandchild nests below
 that child directory. Parent state contains only its direct sub-TL slice and
 the child terminal result.
+
+The ordered integration contract distinguishes the child result from the
+parent fold. `AggregateCandidate` binds a child PR to its head, patch digest,
+and original base. `CodeReviewEvidence` is head/patch-bound, while
+`IntegrationEvidence` is base/head/tree/CI-bound. The centralized integration
+transition table rejects illegal lifecycle edges; base invalidation enters
+`NEEDS_BASE_REVALIDATION`, while head invalidation enters aggregate repair.
+Legacy sub-TL plans without `order` remain one order-1 stage.
 
 Branches use the coordinate form `{parent}.{name}`. A child PR targets its
 parent branch, recorded as the child slice `base_ref`. Run state records the

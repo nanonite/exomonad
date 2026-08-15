@@ -25,7 +25,18 @@ _TASK_KEYS = {
         }
     ),
     "sub_tls": frozenset(
-        {"name", "plan", "workers", "leaves", "sub_tls", "agent_type", "worktree", "agent_id"}
+        {
+            "name",
+            "plan",
+            "workers",
+            "leaves",
+            "sub_tls",
+            "agent_type",
+            "worktree",
+            "agent_id",
+            "order",
+            "integration",
+        }
     ),
 }
 
