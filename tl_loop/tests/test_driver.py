@@ -6,7 +6,7 @@ import hashlib
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -1383,6 +1383,70 @@ def test_ordered_sub_tl_restart_adopts_terminal_child_checkpoint(
     )
 
     assert result.final_state.slices["adopt-child"].status is SliceStatus.MERGED
+
+
+def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) -> None:
+    transport = RecordingTransport()
+    child_plan = _plan()
+    parent_dir = tmp_path / "aggregate-run"
+    run_tl_loop(
+        "aggregate-child",
+        child_plan,
+        SyntheticQueue(_lifecycle_events("aggregate-child")),
+        EffectClient(transport),
+        config=_config(),
+        root_dir=parent_dir,
+    )
+    child_store = RunStore("aggregate-child", parent_dir)
+    child_state = child_store.load()
+    child_slices = dict(child_state.slices)
+    child_slices["leaf-a"] = replace(
+        child_slices["leaf-a"], pr_number=42, reviewed_head="head-a"
+    )
+    child_store.checkpoint(
+        child_state.fsm,
+        child_slices,
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    parent_plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),
+            SubTLTask("later-stage", WorkPlan(), source=SyntheticQueue([]), order=2),
+        )
+    )
+    config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
+
+    first = run_tl_loop(
+        "aggregate-run",
+        parent_plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    second = run_tl_loop(
+        "aggregate-run",
+        parent_plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    file_pr_calls = [arguments for name, arguments in transport.calls if name == "file_pr"]
+    assert len(file_pr_calls) == 1
+    assert file_pr_calls[0]["base_branch"] == "main"
+    assert first.final_state.fsm.phase is TLPhase.TLWaiting
+    assert second.final_state.fsm.phase is TLPhase.TLWaiting
+    parent_slice = second.final_state.slices["aggregate-child"]
+    assert parent_slice.status is SliceStatus.IN_REVIEW
+    assert parent_slice.pr_number == 43
+    assert parent_slice.dispatch_agent_id == "aggregate-run:aggregate-child:integration"
+    assert second.final_state.slices["later-stage"].status is SliceStatus.PENDING
+    child = load_state(parent_dir / "aggregate-child" / "run.json")
+    assert child.integration.aggregate_pr_number == parent_slice.pr_number
+    assert child.integration.integration_owner_id == parent_slice.dispatch_agent_id
 
 
 def test_same_order_event_consumers_require_isolated_sources(tmp_path: Path) -> None:

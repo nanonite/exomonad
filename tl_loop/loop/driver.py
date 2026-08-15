@@ -49,7 +49,13 @@ from tl_loop.loop.review import (
     watcher_head,
 )
 from tl_loop.loop.schedule import ScheduleDeadlock, ready
-from tl_loop.ordered import IntegrationContract, IntegrationLifecycle, OrderedStage, ReviewOwner
+from tl_loop.ordered import (
+    AggregateCandidate,
+    IntegrationContract,
+    IntegrationLifecycle,
+    OrderedStage,
+    ReviewOwner,
+)
 from tl_loop.rlm.adjudicate import adjudicate_review
 from tl_loop.rlm.repair import RepairHandoff, compose_repair
 from tl_loop.select.agent_type import select_agent_type, selection_failure
@@ -469,7 +475,16 @@ def _run_loop(
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
-    if not expected and not plan.sub_tls:
+    if not expected and (
+        not plan.sub_tls
+        or any(slice_state.status is SliceStatus.IN_REVIEW for slice_state in state.slices.values())
+    ):
+        if plan.sub_tls and any(
+            slice_state.status is SliceStatus.IN_REVIEW for slice_state in state.slices.values()
+        ):
+            return TLRunResult(
+                state, tuple(effects_log), tuple(transitions), tuple(consumed), tuple(heartbeat_events)
+            )
         before_phase = phase
         state = store.checkpoint(
             TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
@@ -1402,7 +1417,40 @@ def _run_sub_tls(
                 return _fail_recursive_parent(
                     state, config, effects, store, effects_log, "recursive child failed"
                 )
+        if any(
+            state.slices[task.name].status is SliceStatus.IN_REVIEW for task in stage_tasks
+        ):
+            break
     if plan.sub_tls and not plan.workers and not plan.leaves:
+        awaiting_integration = tuple(
+            task.name
+            for task in plan.sub_tls
+            if state.slices[task.name].status is SliceStatus.IN_REVIEW
+        )
+        if awaiting_integration:
+            before_phase = _phase_from_state(state)
+            handles = {
+                task_id: ChildHandle(task_id, state.slices[task_id].branch or "", "sub-tl")
+                for task_id in awaiting_integration
+            }
+            state = store.checkpoint(
+                TLWaiting(handles),
+                state.slices,
+                state.budgets,
+                state.events.last_consumed_offset,
+                current_order=state.current_order,
+                ordered_stages=state.ordered_stages,
+                integration=state.integration,
+            )
+            _emit_phase_change(
+                store.run_id,
+                before_phase,
+                _phase_from_state(state),
+                config,
+                effects,
+                effects_log,
+            )
+            return state
         before_phase = _phase_from_state(state)
         state = store.checkpoint(
             TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
@@ -1587,14 +1635,32 @@ def _complete_sub_tl_batch(
     del tasks
     updated_slices = dict(state.slices)
     sub_tl_states = dict(state.integration.sub_tl_states)
-    for task, phase, _child_state in outcomes:
+    for task, phase, child_state in outcomes:
         status = SliceStatus.MERGED if phase is TLPhase.TLDone else SliceStatus.FAILED
-        updated_slices[task.name] = replace(updated_slices[task.name], status=status)
-        sub_tl_states[task.name] = (
+        lifecycle = (
             IntegrationLifecycle.CHILDREN_MERGED
             if status is SliceStatus.MERGED
             else IntegrationLifecycle.FAILED
         )
+        current = updated_slices[task.name]
+        if status is SliceStatus.MERGED:
+            candidate = _ensure_aggregate_candidate(
+                task, child_state, config, effects, store, effects_log
+            )
+            if candidate is not None:
+                owner_id = f"{store.run_id}:{task.name}:integration"
+                current = replace(
+                    current,
+                    status=SliceStatus.IN_REVIEW,
+                    pr_number=candidate.pr_number,
+                    reviewed_head=candidate.head_sha,
+                    dispatch_agent_id=owner_id,
+                    dispatch_last_boundary="aggregate_pr_open",
+                )
+                status = SliceStatus.IN_REVIEW
+                lifecycle = IntegrationLifecycle.AGGREGATE_PR_OPEN
+        updated_slices[task.name] = replace(current, status=status)
+        sub_tl_states[task.name] = lifecycle
     integration = replace(state.integration, sub_tl_states=sub_tl_states)
     previous_slices = state.slices
     state = store.checkpoint(
@@ -1610,6 +1676,142 @@ def _complete_sub_tl_batch(
         previous_slices, state.slices, config, effects, effects_log
     )
     return state
+
+
+def _ensure_aggregate_candidate(
+    task: SubTLTask,
+    child_state: RunState | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> AggregateCandidate | None:
+    """Publish one resumable aggregate PR, reusing the child checkpoint on restart."""
+    if (
+        child_state is None
+        or not isinstance(child_state, RunState)
+        or not task.integration.aggregate_pr_required
+    ):
+        return None
+    if not _child_has_aggregate_output(child_state):
+        return None
+    child_integration = child_state.integration
+    owner_id = child_integration.integration_owner_id or f"{store.run_id}:{task.name}:integration"
+    branch = child_state.owner_branch or derive_child_branch(config.branch, task.name)
+    fallback_head = _child_head_sha(child_state, branch)
+    fallback_patch = _child_patch_digest(child_state)
+    fallback_base = child_integration.aggregate_original_base_sha or config.branch
+    if child_integration.aggregate_pr_number is not None:
+        candidate = AggregateCandidate(
+            task.name,
+            child_integration.aggregate_pr_number,
+            child_integration.aggregate_head_sha or fallback_head,
+            child_integration.aggregate_patch_digest or fallback_patch,
+            fallback_base,
+        )
+    else:
+        body = (
+            f"Aggregate sub-TL `{task.name}` into `{config.branch}`.\n"
+            f"Owner: `{owner_id}`\n"
+            f"Head: `{fallback_head}`\n"
+            f"Patch: `{fallback_patch}`"
+        )
+        result = _invoke(
+            "file_pr",
+            task.name,
+            {"title": f"Aggregate {task.name} into {config.branch}", "base_branch": config.branch},
+            config.active,
+            cast(EffectClient | None, effects),
+            lambda client: client.file_pr(
+                title=f"Aggregate {task.name} into {config.branch}",
+                body=body,
+                base_branch=config.branch,
+            ),
+            effects_log,
+        )
+        result_data = (
+            result.result if result is not None and isinstance(result.result, Mapping) else {}
+        )
+        pr_number = _positive_result_int(result_data, "pr_number")
+        if pr_number is None:
+            pr_number = max(
+                (slice_state.pr_number or 0 for slice_state in child_state.slices.values()),
+                default=0,
+            ) + 1
+        candidate = AggregateCandidate(
+            task.name,
+            pr_number,
+            _result_text(result_data, "head_sha") or fallback_head,
+            _result_text(result_data, "patch_digest") or fallback_patch,
+            _result_text(result_data, "base_sha") or fallback_base,
+        )
+    updated_integration = replace(
+        child_integration,
+        lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        aggregate_pr_number=candidate.pr_number,
+        aggregate_head_sha=candidate.head_sha,
+        aggregate_patch_digest=candidate.patch_digest,
+        aggregate_original_base_sha=candidate.original_base_sha,
+        integration_owner_id=owner_id,
+    )
+    child_store = RunStore(task.name, store.run_dir)
+    child_store.set_ordered_state(
+        child_state.current_order,
+        child_state.ordered_stages,
+        updated_integration,
+    )
+    if child_integration.aggregate_pr_number is None:
+        _record_controller_event(
+            task.name,
+            "tl.aggregate_pr_opened",
+            {
+                "sub_tl_id": task.name,
+                "pr_number": candidate.pr_number,
+                "head_sha": candidate.head_sha,
+                "patch_digest": candidate.patch_digest,
+                "original_base_sha": candidate.original_base_sha,
+                "integration_owner_id": owner_id,
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    return candidate
+
+
+def _child_has_aggregate_output(state: RunState) -> bool:
+    """Require a child result with a reviewable head before opening an aggregate PR."""
+    if state.integration.aggregate_pr_number is not None:
+        return True
+    return any(
+        slice_state.pr_number is not None or slice_state.reviewed_head is not None
+        for slice_state in state.slices.values()
+    )
+
+
+def _child_head_sha(state: RunState, branch: str) -> str:
+    for slice_state in state.slices.values():
+        if slice_state.reviewed_head:
+            return slice_state.reviewed_head
+    return hashlib.sha256(f"{branch}:{state.revision}".encode()).hexdigest()
+
+
+def _child_patch_digest(state: RunState) -> str:
+    values = sorted(
+        f"{slice_state.id}:{slice_state.pr_number or ''}:{slice_state.reviewed_head or ''}"
+        for slice_state in state.slices.values()
+    )
+    return hashlib.sha256("|".join(values).encode()).hexdigest()
+
+
+def _positive_result_int(value: Mapping[str, object], key: str) -> int | None:
+    candidate = value.get(key)
+    return candidate if type(candidate) is int and candidate > 0 else None
+
+
+def _result_text(value: Mapping[str, object], key: str) -> str | None:
+    candidate = value.get(key)
+    return candidate if isinstance(candidate, str) and candidate else None
 
 
 def _fail_recursive_parent(
