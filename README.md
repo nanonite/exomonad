@@ -27,12 +27,13 @@ See [try-exomonad/README.md](try-exomonad/README.md) for details.
 
 **Prerequisites:** [Nix](https://nixos.org/) (with flakes), Python 3.11 or newer, [tmux](https://github.com/tmux/tmux/wiki), and [just](https://github.com/casey/just).
 
-The TL controller is stdlib-only and requires the Python version declared in
-`tl_loop/pyproject.toml` (currently Python 3.11 or newer). Its build and
-runtime resolver is defined in `tl_loop/interpreter_policy.toml`: it uses
-`EXOMONAD_TL_LOOP_PYTHON` first and then `python3`. Development-only pytest
+Native installation packages the stdlib-only TL controller at
+`~/.exo/tl_loop.pyz` and `exomonad init` refreshes it when needed. Target
+repositories do not need a checkout of the `tl_loop` Python package: use
+`python3 ~/.exo/tl_loop.pyz` for direct status, gate, and preflight commands.
+The packaged controller requires Python 3.11 or newer. Development-only pytest
 and ruff may continue to use the repo-local `tl_loop/.venv` through
-`EXOMONAD_PY`; that environment is not used to build or run the controller.
+`EXOMONAD_PY`; that environment is not used to run the installed controller.
 
 Install Nix if you don't have it:
 
@@ -59,14 +60,20 @@ First build downloads Nix dependencies and initializes the WASM toolchain — su
 
 ## Getting Started
 
-ExoMonad works on any git repository. Four required files program the TL; the work plan is stored separately.
+ExoMonad works on any Git repository. The canonical PR, review, and CI loop is
+Forgejo-backed. Four controller files under `.exo/` are required:
+`config.toml`, `harness_policy.toml`, `review-policy.toml`, and
+`harness_capability.toml`. The structured work plan lives separately at
+`.exo/tl-loop/plan.json`.
 
 ```bash
 cd your-project/
-exomonad new        # One-time: .exo/config.toml, .gitignore, WASM, CI + rules templates
+exomonad new        # One-time: .exo/config.toml, .gitignore, CI + rules templates
 ```
 
-Then author the two required inputs:
+Complete the project-local controller setup before starting a run. Begin with
+one allowed harness/model entry per role and add capability entries for every
+allowed entry:
 
 ```toml
 # .exo/harness_policy.toml — the human-authored allowlist and budget ceiling.
@@ -79,8 +86,24 @@ escalate_after_attempts = 1
 # ... and the same for [roles.worker] and [roles.reviewer]
 ```
 
+Set the Forgejo connection values in `.exo/config.toml` using the credentials
+for the repository and webhook. Do not commit live credentials:
+
+```toml
+forgejo_url = "http://localhost:3000"
+forgejo_token = "<project-token>"
+forgejo_webhook_secret = "<shared-secret>"
+```
+
+The generated `.exo/review-policy.toml` is usable as-is for low-risk work, but
+review its `external_review_paths` and complexity thresholds for the project's
+risk surface. A merge requires reviewer approval and CI status `success` or
+`neutral` for the same PR head; missing, pending, or failed CI cannot pass the
+canonical merge rule.
+
+The plan must use disjoint `boundary` globs and real verification commands:
+
 ```json
-// .exo/tl-loop/plan.json — the work. Closed keys; unknown keys are rejected.
 {
   "run_id": "root",
   "budgets": { "tokens": 400000, "wall_seconds": 14400 },
@@ -97,18 +120,25 @@ escalate_after_attempts = 1
 }
 ```
 
+Validate all required controller files before starting the server:
+
+```bash
+python3 ~/.exo/tl_loop.pyz preflight --project-root .
+```
+
 ```bash
 exomonad init       # Creates tmux session with Server + TL windows
                     # Writes .mcp.json (auto-registers MCP tools)
                     # Starts background server on .exo/server.sock
-                    # TL window runs `python3 -m tl_loop` — the controller
+                    # TL window runs `python3 ~/.exo/tl_loop.pyz` — the controller
 ```
 
 The **TL window is the controller**, not a harness session — do not type `claude` into it. It is an observation and gate surface:
 
 ```bash
-python3 -m tl_loop status --project-root . --run-id root
-python3 -m tl_loop gate   --project-root . --run-id root --name <gate> --approve
+python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
+python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root --watch --interval 2
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --approve
 ```
 
 A run ends at `TLDone` or `TLFailed`. Bounded failures — retries exhausted, budget exhausted, review stuck, no capable harness, stall detected — park with an auditable cause and wait for an explicit human gate. The controller never retries past a ceiling or silently switches harness.
@@ -116,8 +146,9 @@ A run ends at `TLDone` or `TLFailed`. Bounded failures — retries exhausted, bu
 Once a run is live you can steer it three ways, in increasing richness:
 
 ```bash
-python3 -m tl_loop status --project-root . --run-id root          # phase, slices, gates
-python3 -m tl_loop gate   --project-root . --run-id root --name <gate> --approve
+python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root          # phase, slices, gates
+python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root --watch   # refresh continuously
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --approve
 export EXOMONAD_CONTROL_TOKEN=...                                  # unlocks /control
 curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Token: $EXOMONAD_CONTROL_TOKEN" \
      http://localhost/control/runs/root

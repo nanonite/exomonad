@@ -147,7 +147,7 @@ keeps model/provider calls outside the event log.
   under `.exo/tl-loop/<run_id>/`; the immutable ledger remains read-only to the
   loop.
 - Human intervention is explicit and resumable through
-  `python3 -m tl_loop gate --run-id <id> --name <gate> --approve|--reject`.
+  `python3 ~/.exo/tl_loop.pyz gate --run-id <id> --name <gate> --approve|--reject`.
 - `tl.md` remains because it is useful decompose-prompt vocabulary, but it is
   not an agent protocol. The old merge-reviewer teammate plan is subsumed:
   the controller is the merge queue.

@@ -470,9 +470,9 @@ Every bounded failure ends in one of these, with an auditable cause recorded in 
 ### Answering a gate
 
 ```bash
-python3 -m tl_loop status --project-root . --run-id root
-python3 -m tl_loop gate   --project-root . --run-id root --name <gate> --approve
-python3 -m tl_loop gate   --project-root . --run-id root --name <gate> --reject
+python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --approve
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --reject
 ```
 
 Gates are durable, uniquely named, and tri-state (`pending`, `approved`, `rejected`). The controller resumes from the checkpoint after an answer. It never coaxes a model into continuing and never asks a second interactive coordinator to decide.

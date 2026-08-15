@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix TL controller startup race and surface launch failures (#862)
 - tmux_liveness dead-pane test depends on ambient tmux state and blocks just test (#857)
 - Fix installed controller missing newly added source files (#860)
 - E9: Separate transport evidence from runtime consumption (#766)
@@ -303,6 +304,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Update README onboarding for the current TL workflow (#861)
 - E19 :: E19.4 Watch-mode tests (#842)
 - E19 :: E19.3 Degrade gracefully with no state (#841)
 - E19 :: E19.2 Render the live view (#840)

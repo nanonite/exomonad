@@ -15,8 +15,8 @@ M9 replaced that session with `tl_loop`. The architecture is better — durable,
 replayable, testable — but the operator surface regressed to two commands:
 
 ```bash
-python3 -m tl_loop status --run-id root
-python3 -m tl_loop gate   --run-id root --name <gate> --approve
+python3 ~/.exo/tl_loop.pyz status --run-id root
+python3 ~/.exo/tl_loop.pyz gate   --run-id root --name <gate> --approve
 ```
 
 `status` prints a fixed JSON view; `gate` answers a gate you already knew the

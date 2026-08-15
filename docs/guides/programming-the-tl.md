@@ -429,10 +429,10 @@ do.
 
 ```bash
 # The TL window runs this automatically; these are for direct/bounded use.
-python3 -m tl_loop run    --project-root . --plan .exo/tl-loop/plan.json --run-id root
-python3 -m tl_loop status --project-root . --run-id root
-python3 -m tl_loop gate   --project-root . --run-id root --name <gate> --approve
-python3 -m tl_loop gate   --project-root . --run-id root --name <gate> --reject
+python3 ~/.exo/tl_loop.pyz run    --project-root . --plan .exo/tl-loop/plan.json --run-id root
+python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --approve
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --reject
 ```
 
 `run` flags: `--max-events` (default 256), `--idle-timeout` (30s),
@@ -619,7 +619,7 @@ session is `unknown` and cannot classify the current one.
 5. Write `.exo/tl-loop/plan.json`. Disjoint `boundary` globs, real commands in
    `verify`.
 6. `exomonad init` — starts the server and the controller in the TL window.
-7. `python3 -m tl_loop status` to watch; `python3 -m tl_loop gate` to answer.
+7. `python3 ~/.exo/tl_loop.pyz status` to watch; `python3 ~/.exo/tl_loop.pyz gate` to answer.
 8. Optional: `export EXOMONAD_CONTROL_TOKEN=...` if you want the `/control`
    read model and gate/proposal routes rather than the CLI alone.
 9. After a run, `exomonad logs import --source .exo/ledger/segments` and
@@ -649,4 +649,4 @@ A project must provide four files under `.exo/`: `config.toml`, `harness_policy.
 "codex/gpt-luna" = "standard"
 ```
 
-Run `python3 -m tl_loop preflight --project-root .` to validate all four files before starting the controller.
+Run `python3 ~/.exo/tl_loop.pyz preflight --project-root .` to validate all four files before starting the controller.

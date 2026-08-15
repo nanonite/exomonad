@@ -73,9 +73,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             _set_gate(args)
     except (LauncherError, OSError, RuntimeError, ValueError, PlanValidationError, PreflightError) as error:
+        _record_run_failure(args, error)
         LOGGER.error("[TL loop] %s", error)
         return 2
     return 0
+
+
+def _record_run_failure(args: argparse.Namespace, error: Exception) -> None:
+    """Keep a failed run discoverable even when startup fails before _run."""
+    if getattr(args, "command", None) != "run":
+        return
+    try:
+        project_root = args.project_root.expanduser().resolve()
+        run_id = getattr(args, "run_id", DEFAULT_RUN_ID)
+        RunStore(run_id, project_root / ".exo" / "tl-loop").record_exit_reason(str(error))
+    except (OSError, ValueError, TypeError) as record_error:
+        LOGGER.error("[TL loop] failed to persist controller exit reason: %s", record_error)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -343,10 +356,10 @@ def _status_snapshot(
     run_id: str,
 ) -> str:
     """Render one race-tolerant, read-only status snapshot."""
+    reason = store.exit_reason()
+    if reason:
+        return f"controller exited: {reason}"
     if not store.path.exists():
-        reason = store.exit_reason()
-        if reason:
-            return f"controller exited: {reason}"
         return (
             "no run yet; controller is waiting for "
             f".exo/tl-loop/plan.json (path: {plan_path})"

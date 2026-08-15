@@ -180,7 +180,7 @@ exomonad init --recreate
 `--recreate` tears down and rebuilds the tmux session. Companion worktrees under
 `.exo/companions/` persist across it — only the session is torn down.
 
-The TL window now runs `python3 -m tl_loop`, not a harness session. Do not type
+The TL window now runs `python3 ~/.exo/tl_loop.pyz`, not a harness session. Do not type
 `claude` into it.
 
 ---
@@ -192,7 +192,7 @@ The TL window now runs `python3 -m tl_loop`, not a harness session. Do not type
 just validate-observability-contracts
 
 # Controller loaded the plan and reached a real phase
-python3 -m tl_loop status --project-root . --run-id root
+python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
 
 # Historical logs landed
 sqlite3 .exo/analysis/atlas.db "SELECT count(*), min(event_time), max(event_time) FROM events;"

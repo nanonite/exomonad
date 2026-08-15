@@ -892,6 +892,35 @@ impl TmuxIpc {
         }
     }
 
+    /// Wait for the process in a newly-created window to stay alive.
+    ///
+    /// A tmux window may remain after its command exits when `remain-on-exit`
+    /// is enabled, so checking only the window ID is not sufficient for
+    /// startup liveness.
+    pub async fn wait_for_window_process(
+        &self,
+        window_id: &WindowId,
+        max_wait: Duration,
+    ) -> Result<bool> {
+        let routing = RoutingInfo::window(window_id.clone());
+        let deadline = Instant::now() + max_wait;
+        let mut observed_alive = false;
+        loop {
+            if self.routing_target_process_alive(&routing).await? {
+                if observed_alive {
+                    return Ok(true);
+                }
+                observed_alive = true;
+            } else if observed_alive {
+                return Ok(false);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub async fn pane_exists(&self, pane_id: &PaneId) -> Result<bool> {
         let output = tmux_command()
             .args(["list-panes", "-a", "-F", "#{session_name}\t#{pane_id}"])

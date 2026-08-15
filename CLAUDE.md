@@ -129,7 +129,7 @@ if !status.success() {
 
 **`exomonad init` is the idempotent entry point for development sessions.** It creates a tmux session with:
 - **Server window**: Runs `exomonad serve` (the MCP server, binds to `.exo/server.sock`)
-- **TL window**: Runs the programmatic Python controller (`python3 -m tl_loop`), which owns planning, dispatch, event consumption, merge decisions, and durable run state.
+- **TL window**: Runs the programmatic Python controller (`python3 ~/.exo/tl_loop.pyz`), which owns planning, dispatch, event consumption, merge decisions, and durable run state.
 
 The server must be running before the controller or any worker can use MCP effects. Without it, effect calls fail explicitly. Init also writes `.mcp.json` with the `tl/root` identity, `.exo/agents/root/identity.json`, `.exo/tl-loop/plan.json` when supplied, and `.claude/settings.local.json` for worker hooks.
 
@@ -138,8 +138,8 @@ cd exomonad/                  # Run from the project root
 exomonad new                  # One-time setup: creates config, WASM, rules
 exomonad init                 # Creates tmux session, starts server
 # The TL window now runs the controller. Give it a JSON WorkPlan:
-python3 -m tl_loop status --project-root .
-python3 -m tl_loop gate --project-root . --run-id root --name <gate> --approve
+python3 ~/.exo/tl_loop.pyz status --project-root .
+python3 ~/.exo/tl_loop.pyz gate --project-root . --run-id root --name <gate> --approve
 ```
 
 The controller waits for `.exo/tl-loop/plan.json` when no structured
@@ -749,8 +749,8 @@ failure, and harness-switch requests become named durable gates or terminal
 parking causes. The operator answers a gate explicitly:
 
 ```bash
-python3 -m tl_loop gate --project-root . --run-id root --name <gate> --approve
-python3 -m tl_loop gate --project-root . --run-id root --name <gate> --reject
+python3 ~/.exo/tl_loop.pyz gate --project-root . --run-id root --name <gate> --approve
+python3 ~/.exo/tl_loop.pyz gate --project-root . --run-id root --name <gate> --reject
 ```
 
 The controller resumes from the checkpoint. It does not coax a model to keep

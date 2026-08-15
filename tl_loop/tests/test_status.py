@@ -13,6 +13,28 @@ def test_status_without_run_reports_waiting_plan(tmp_path: Path, capsys) -> None
     assert str(tmp_path / ".exo" / "tl-loop" / "plan.json") in output
 
 
+def test_startup_failure_is_recorded_and_status_reports_it(tmp_path: Path, capsys) -> None:
+    assert main(["run", "--project-root", str(tmp_path)]) == 2
+    marker = tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json"
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert "plan.json" in payload["reason"]
+
+    assert main(["status", "--project-root", str(tmp_path)]) == 0
+    assert "controller exited:" in capsys.readouterr().out
+
+
+def test_status_reports_durable_controller_failure(tmp_path: Path, capsys) -> None:
+    marker = tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(
+        json.dumps({"reason": "capability file is missing"}),
+        encoding="utf-8",
+    )
+
+    assert main(["status", "--project-root", str(tmp_path)]) == 0
+    assert capsys.readouterr().out.strip() == "controller exited: capability file is missing"
+
+
 def test_status_tolerates_partial_checkpoint(tmp_path: Path, capsys) -> None:
     checkpoint = tmp_path / ".exo" / "tl-loop" / "root" / "run.json"
     checkpoint.parent.mkdir(parents=True)
@@ -62,7 +84,7 @@ def test_status_renders_live_state_without_watch_controls(tmp_path: Path, capsys
     assert main(["status", "--project-root", str(tmp_path)]) == 0
     output = capsys.readouterr().out
     document = json.loads(output)
-    assert "[" not in output
+    assert "\x1b[" not in output
     assert document["phase"] == "tl_dispatching"
     assert document["slices"]["task-a"]["pr_number"] == 101
     assert document["gates"] == [{"name": "review", "status": "pending"}]
@@ -82,7 +104,7 @@ def test_status_watch_redraws_until_interrupted(tmp_path: Path, capsys, monkeypa
         main(["status", "--project-root", str(tmp_path), "--watch", "--interval", "0.01"])
 
     output = capsys.readouterr().out
-    assert "[2J[H" in output
+    assert "\x1b[2J\x1b[H" in output
     assert "no run yet; controller is waiting for .exo/tl-loop/plan.json" in output
 
 

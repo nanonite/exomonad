@@ -348,9 +348,9 @@ stateDiagram-v2
 </table>
 
 <h3>Answering a gate</h3>
-<pre>python3 -m tl_loop status --project-root . --run-id root
-python3 -m tl_loop gate   --project-root . --run-id root --name &lt;gate&gt; --approve
-python3 -m tl_loop gate   --project-root . --run-id root --name &lt;gate&gt; --reject</pre>
+<pre>python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name &lt;gate&gt; --approve
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name &lt;gate&gt; --reject</pre>
 <p class="note">Gates are durable, uniquely named, and tri-state (<code>pending</code>, <code>approved</code>, <code>rejected</code>). The controller resumes from the checkpoint after an answer. It never coaxes a model into continuing and never asks a second interactive coordinator to decide. See <a href="../guides/programming-the-tl.md">Programming the TL</a> for authoring the controller's inputs.</p>
 
 <hr/>

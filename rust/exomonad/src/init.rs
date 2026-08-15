@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 const TL_LOOP_ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tl_loop.pyz"));
 const TL_LOOP_PYPROJECT: &str = include_str!("../../../tl_loop/pyproject.toml");
 const TL_LOOP_INTERPRETER_POLICY: &str = include_str!("../../../tl_loop/interpreter_policy.toml");
+const TL_CONTROLLER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn read_root_tl_protocol(cwd: &Path, wasm_name: &str) -> Option<String> {
     exomonad_core::services::agent_control::load_role_context(cwd, wasm_name, "root")
@@ -1010,6 +1011,83 @@ fn tl_loop_command(cwd: &Path, package_root: &Path) -> String {
     )
 }
 
+fn controller_exit_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".exo/tl-loop/root/controller-exit.json")
+}
+
+fn controller_exit_reason(project_dir: &Path) -> Option<String> {
+    let payload = std::fs::read_to_string(controller_exit_path(project_dir)).ok()?;
+    let value = serde_json::from_str::<Value>(&payload).ok()?;
+    value
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .map(ToString::to_string)
+}
+
+fn clear_controller_exit_reason(project_dir: &Path) -> Result<()> {
+    let path = controller_exit_path(project_dir);
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("failed to clear {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn record_controller_exit_reason(project_dir: &Path, reason: &str) -> Result<()> {
+    let path = controller_exit_path(project_dir);
+    if path.exists() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .context("controller exit path has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let payload = serde_json::json!({
+        "reason": reason,
+        "recorded_at": current_time_millis() as f64 / 1000.0,
+        "source": "exomonad init",
+    });
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, serde_json::to_string(&payload)?)?;
+    std::fs::rename(&temporary, &path)?;
+    Ok(())
+}
+
+async fn wait_for_tl_controller_startup(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+    window_id: &exomonad_core::services::tmux_ipc::WindowId,
+) -> Result<()> {
+    let deadline = Instant::now() + TL_CONTROLLER_STARTUP_TIMEOUT;
+    loop {
+        if ipc
+            .wait_for_window_process(window_id, Duration::from_millis(100))
+            .await?
+        {
+            return Ok(());
+        }
+        if let Some(reason) = controller_exit_reason(project_dir) {
+            let _ = record_controller_exit_reason(project_dir, &reason);
+            anyhow::bail!(
+                "TL controller failed during startup in tmux window {window_id}: {reason}"
+            );
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let reason = controller_exit_reason(project_dir).unwrap_or_else(|| {
+        format!("tmux window {window_id} exited before the TL controller became ready")
+    });
+    if let Err(error) = record_controller_exit_reason(project_dir, &reason) {
+        warn!(%error, "Failed to persist TL controller startup failure");
+    }
+    anyhow::bail!("TL controller failed during startup in tmux window {window_id}: {reason}");
+}
+
 /// Run the init command: create or attach to tmux session.
 // The CLI exposes these independent initialization options as separate flags.
 #[allow(clippy::too_many_arguments)]
@@ -1441,6 +1519,7 @@ pub async fn run(
 
     // Create fresh session
     info!(session = %session, "Creating session");
+    clear_controller_exit_reason(&cwd)?;
 
     // 1. Write .mcp.json (for Claude Code discovery)
     let mut mcp_servers = serde_json::Map::new();
@@ -1679,6 +1758,11 @@ pub async fn run(
         );
     }
 
+    // 4. Wait for the server before launching the controller or Watcher.
+    wait_for_server_socket(&cwd).await?;
+    report_observability_health(&cwd);
+    ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await;
+
     // The human-facing TL window runs one coordinator: the Python controller.
     // Root harness settings and root_command are intentionally ignored.
     let tl_cwd = cwd.clone();
@@ -1689,13 +1773,8 @@ pub async fn run(
         None => base_command,
     };
 
-    let _ = ipc.new_window("TL", &tl_cwd, &shell, &tl_command).await?;
-
-    // 4. Poll for server socket
-    wait_for_server_socket(&cwd).await?;
-    report_observability_health(&cwd);
-
-    ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await;
+    let tl_window = ipc.new_window("TL", &tl_cwd, &shell, &tl_command).await?;
+    wait_for_tl_controller_startup(&ipc, &cwd, &tl_window).await?;
 
     // 5. Spawn companion agents
     let companions_to_spawn: Vec<&crate::config::CompanionConfig> =
@@ -2825,6 +2904,41 @@ mod tests {
             preflight < tl_window,
             "preflight must fail before creating tmux windows"
         );
+    }
+
+    #[test]
+    fn server_wait_precedes_tl_window_creation() {
+        let source = include_str!("init.rs");
+        let server_wait = source
+            .find("wait_for_server_socket(&cwd).await?")
+            .expect("init must wait for the server socket");
+        let tl_window = source
+            .find("ipc.new_window(\"TL\"")
+            .expect("init must create the TL window");
+        assert!(
+            server_wait < tl_window,
+            "the TL window must not launch before the server socket is ready"
+        );
+    }
+
+    #[test]
+    fn controller_exit_reason_is_durable_and_clearable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        record_controller_exit_reason(dir.path(), "plan.json is missing").unwrap();
+        assert_eq!(
+            controller_exit_reason(dir.path()).as_deref(),
+            Some("plan.json is missing")
+        );
+
+        record_controller_exit_reason(dir.path(), "replacement reason").unwrap();
+        assert_eq!(
+            controller_exit_reason(dir.path()).as_deref(),
+            Some("plan.json is missing")
+        );
+
+        clear_controller_exit_reason(dir.path()).unwrap();
+        assert!(controller_exit_reason(dir.path()).is_none());
     }
 
     #[test]

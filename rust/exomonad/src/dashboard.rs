@@ -100,9 +100,10 @@ impl DashboardState {
         repo_info: Option<&RepoInfo>,
     ) {
         self.updated_at = chrono::Local::now().format("%H:%M:%S").to_string();
-        self.agents = scan_agents(&config.project_dir);
+        let controller_failure = controller_exit_reason(&config.project_dir);
+        self.agents = scan_agents(&config.project_dir, controller_failure.is_some());
         self.events = read_events(&config.project_dir, EVENT_LIMIT);
-        self.error = None;
+        self.error = controller_failure.map(|reason| format!("TL controller failed: {reason}"));
 
         if let (Some(client), Some(repo_info)) = (client, repo_info) {
             self.refresh_forgejo(client, repo_info).await;
@@ -120,7 +121,9 @@ impl DashboardState {
         {
             Ok(prs) => prs,
             Err(error) => {
-                self.error = Some(error.to_string());
+                if self.error.is_none() {
+                    self.error = Some(error.to_string());
+                }
                 Vec::new()
             }
         };
@@ -521,20 +524,24 @@ fn runner_row(runner: ForgejoRunner) -> RunnerRow {
     }
 }
 
-fn scan_agents(project_dir: &Path) -> Vec<AgentRow> {
+fn scan_agents(project_dir: &Path, controller_failed: bool) -> Vec<AgentRow> {
     let mut agents = BTreeMap::new();
-    scan_agent_dir(&project_dir.join(".exo/agents"), &mut agents);
+    scan_agent_dir(
+        &project_dir.join(".exo/agents"),
+        &mut agents,
+        controller_failed,
+    );
     scan_worktree_dir(&project_dir.join(".exo/worktrees"), &mut agents);
     agents.into_values().collect()
 }
 
-fn scan_agent_dir(path: &Path, agents: &mut BTreeMap<String, AgentRow>) {
+fn scan_agent_dir(path: &Path, agents: &mut BTreeMap<String, AgentRow>, controller_failed: bool) {
     let Ok(entries) = std::fs::read_dir(path) else {
         return;
     };
     for entry in entries.flatten().filter(|entry| entry.path().is_dir()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        let row = agent_row_from_dir(&name, &entry.path());
+        let row = agent_row_from_dir(&name, &entry.path(), controller_failed);
         agents.insert(name, row);
     }
 }
@@ -554,14 +561,18 @@ fn scan_worktree_dir(path: &Path, agents: &mut BTreeMap<String, AgentRow>) {
     }
 }
 
-fn agent_row_from_dir(name: &str, dir: &Path) -> AgentRow {
+fn agent_row_from_dir(name: &str, dir: &Path, controller_failed: bool) -> AgentRow {
     let branch = read_identity_branch(dir).or_else(|| read_trimmed(dir.join(".birth_branch")));
     let role = infer_role(name, dir, branch.as_deref().unwrap_or_default());
     AgentRow {
         name: name.to_string(),
         role,
         branch: branch.unwrap_or_default(),
-        state: agent_state(dir),
+        state: if name == "root" && controller_failed {
+            "failure".to_string()
+        } else {
+            agent_state(dir)
+        },
     }
 }
 
@@ -630,6 +641,15 @@ fn read_identity_branch(dir: &Path) -> Option<String> {
     json.get("birth_branch")
         .or_else(|| json.get("branch"))
         .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn controller_exit_reason(project_dir: &Path) -> Option<String> {
+    let value = read_json(project_dir.join(".exo/tl-loop/root/controller-exit.json"))?;
+    value
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
         .map(ToString::to_string)
 }
 
@@ -778,5 +798,34 @@ mod tests {
 
         assert_eq!(row.pr, "-");
         assert_eq!(row.started_at, "12:34:56");
+    }
+
+    #[test]
+    fn scan_agents_marks_root_failed_when_controller_exit_is_recorded() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().join(".exo/agents/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(project.path().join(".exo/tl-loop/root")).unwrap();
+        std::fs::write(
+            project
+                .path()
+                .join(".exo/tl-loop/root/controller-exit.json"),
+            r#"{"reason":"controller exited during startup"}"#,
+        )
+        .unwrap();
+
+        let agents = scan_agents(
+            project.path(),
+            controller_exit_reason(project.path()).is_some(),
+        );
+        let root = agents
+            .iter()
+            .find(|agent| agent.name == "root")
+            .expect("root agent should be visible");
+        assert_eq!(root.state, "failure");
+        assert_eq!(
+            controller_exit_reason(project.path()).as_deref(),
+            Some("controller exited during startup")
+        );
     }
 }

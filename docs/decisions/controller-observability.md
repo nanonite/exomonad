@@ -37,7 +37,7 @@ FailureAtlas imports the ledger, not run state.
 | RLM judgments — `decompose`, `adjudicate_review`, `compose_repair`, `interpret_operator_intent` | `RlmCallStore`; not in the registry at all |
 | Plan proposal via `/control` | nowhere durable |
 
-`control_gate.rs:76` shells out to `python3 -m tl_loop gate` and emits nothing.
+`control_gate.rs:76` shells out to `python3 ~/.exo/tl_loop.pyz gate` and emits nothing.
 So a human approving a gate — the point where human authority enters a run —
 leaves no ledger trace. Gate latency, park-cause distribution, and judgment
 retry rates are exactly the orchestration-quality signals FailureAtlas exists
