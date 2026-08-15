@@ -79,6 +79,7 @@ agentInfoValue info =
       "has_unread" .= Agent.agentInfoHasUnread info,
       "last_check_inbox_at" .= Agent.agentInfoLastCheckInboxAt info,
       "last_activity_at" .= Agent.agentInfoLastActivityAt info,
+      "intent_id" .= strictText (Agent.agentInfoIntentId info),
       "is_alive" .= Agent.agentInfoIsAlive info
     ]
 

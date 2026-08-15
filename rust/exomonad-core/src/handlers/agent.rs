@@ -880,11 +880,25 @@ impl<
             ),
         };
 
-        let result = self
+        let result = match self
             .service
             .spawn_worker(&options, ctx)
             .await
-            .effect_err_preserve("agent")?;
+            .effect_err_preserve("agent")
+        {
+            Ok(result) => result,
+            Err(error) => {
+                append_spawn_failed(
+                    &self.ctx,
+                    ctx.agent_name.as_ref(),
+                    &req.name,
+                    &req.intent_id,
+                    &error.to_string(),
+                );
+                return Err(error);
+            }
+        };
+        persist_dispatch_intent(&self.ctx, &result.agent_name, &req.intent_id).await?;
 
         let agent_info = worker_result_to_proto(&req.name, &result);
         let provenance = self.ctx.agent_resolver().get(&result.agent_name).await;
@@ -913,19 +927,19 @@ impl<
             "[event] agent.spawned"
         );
         if let Some(log) = self.ctx.event_log() {
-            let _ = log.append(
-                "agent.spawned",
-                ctx.agent_name.as_ref(),
-                &serde_json::json!({
-                    "child_agent": agent_info.id,
-                    "agent_type": format!("{:?}", options.agent_type).to_lowercase(),
-                    "spawn_type": "worker",
-                    "branch": agent_info.branch_name,
-                    "model": model,
-                    "effort": effort,
-                    "topology": topology,
-                }),
-            );
+            let mut payload = serde_json::json!({
+                "child_agent": agent_info.id,
+                "agent_type": format!("{:?}", options.agent_type).to_lowercase(),
+                "spawn_type": "worker",
+                "branch": agent_info.branch_name,
+                "model": model,
+                "effort": effort,
+                "topology": topology,
+            });
+            if !req.intent_id.trim().is_empty() {
+                payload["intent_id"] = serde_json::json!(req.intent_id);
+            }
+            let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &payload);
         }
 
         if options.agent_type == ServiceAgentType::Claude {
@@ -1713,11 +1727,25 @@ impl<
             invocation_pr_number: None,
         };
 
-        let result = self
+        let result = match self
             .service
             .spawn_leaf_subtree(&options, &ctx.birth_branch)
             .await
-            .effect_err_preserve("agent")?;
+            .effect_err_preserve("agent")
+        {
+            Ok(result) => result,
+            Err(error) => {
+                append_spawn_failed(
+                    &self.ctx,
+                    ctx.agent_name.as_ref(),
+                    &req.branch_name,
+                    &req.intent_id,
+                    &error.to_string(),
+                );
+                return Err(error);
+            }
+        };
+        persist_dispatch_intent(&self.ctx, &result.agent_name, &req.intent_id).await?;
 
         let agent_info = leaf_subtree_result_to_proto(&req.branch_name, &result)?;
         let provenance = self.ctx.agent_resolver().get(&result.agent_name).await;
@@ -1746,13 +1774,17 @@ impl<
             "[event] agent.spawned"
         );
         if let Some(log) = self.ctx.event_log() {
-            let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &serde_json::json!({
+            let mut payload = serde_json::json!({
                 "child_agent": agent_info.id, "agent_type": format!("{:?}", options.agent_type), "spawn_type": "leaf_subtree",
                 "branch": agent_info.branch_name,
                 "model": model,
                 "effort": effort,
                 "topology": topology,
-            }));
+            });
+            if !req.intent_id.trim().is_empty() {
+                payload["intent_id"] = serde_json::json!(req.intent_id);
+            }
+            let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &payload);
         }
 
         if options.agent_type == ServiceAgentType::Claude {
@@ -3772,6 +3804,46 @@ fn spawn_result_branch_name(
     Ok(&result.branch_name)
 }
 
+async fn persist_dispatch_intent<C: HasProjectDir>(
+    ctx: &Arc<C>,
+    agent_name: &AgentName,
+    intent_id: &str,
+) -> EffectResult<()> {
+    if intent_id.trim().is_empty() {
+        return Ok(());
+    }
+    let path = ctx
+        .project_dir()
+        .join(".exo")
+        .join("agents")
+        .join(agent_name.as_str())
+        .join("dispatch_intent");
+    tokio::fs::write(path, intent_id.trim())
+        .await
+        .map_err(|error| EffectError::custom("dispatch_intent_persist_failed", error.to_string()))
+}
+
+fn append_spawn_failed<C: HasEventLog>(
+    ctx: &Arc<C>,
+    parent_agent: &str,
+    child_agent: &str,
+    intent_id: &str,
+    error: &str,
+) {
+    let Some(log) = ctx.event_log() else {
+        return;
+    };
+    let mut payload = serde_json::json!({
+        "child_agent": child_agent,
+        "error": error,
+        "source": "rust",
+    });
+    if !intent_id.trim().is_empty() {
+        payload["intent_id"] = serde_json::json!(intent_id);
+    }
+    let _ = log.append("agent.spawn_failed", parent_agent, &payload);
+}
+
 fn service_agent_type_to_proto(at: ServiceAgentType) -> i32 {
     match at {
         ServiceAgentType::Claude => AgentType::Claude as i32,
@@ -3857,6 +3929,13 @@ pub(crate) fn service_info_to_proto(
         Some(ServiceAgentType::Process) => AgentType::Unspecified as i32,
         None => AgentType::Unspecified as i32,
     };
+    let intent_id = info
+        .agent_dir
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path.join("dispatch_intent")).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
 
     exomonad_proto::effects::agent::AgentInfo {
         id: info.internal_name.to_string(),
@@ -3900,6 +3979,7 @@ pub(crate) fn service_info_to_proto(
         last_check_inbox_at: metadata.last_check_inbox_at,
         is_alive: metadata.is_alive,
         last_activity_at: metadata.last_activity_at as i64,
+        intent_id,
     }
 }
 

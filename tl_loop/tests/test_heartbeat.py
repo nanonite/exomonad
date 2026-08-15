@@ -166,6 +166,14 @@ def _state(
         "attempts": 1,
         "verdict": None,
     }
+    if status == "spawned":
+        record.update(
+            {
+                "dispatch_intent_id": "heartbeat-intent-1",
+                "dispatch_agent_id": "agent-slice-a",
+                "dispatch_authoritative_event_seq": 1,
+            }
+        )
     root_spec = {
         "fsm": {"phase": "tl_planning", "waiting": []},
         "slices": {"slice-a": record},

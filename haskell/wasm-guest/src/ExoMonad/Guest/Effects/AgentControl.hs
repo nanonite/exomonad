@@ -221,6 +221,7 @@ data ResumePrConfig = ResumePrConfig
 data SpawnWorkerConfig = SpawnWorkerConfig
   { swcName :: Text,
     swcPrompt :: Text,
+    swcIntentId :: Maybe Text,
     swcAgentType :: Maybe AgentType,
     swcPerms :: PermissionFlags
   }
@@ -294,7 +295,8 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestStandaloneRepo = slcStandaloneRepo cfg,
               PA.spawnLeafSubtreeRequestAllowedDirs = V.fromList (map fromText (slcAllowedDirs cfg)),
               PA.spawnLeafSubtreeRequestResumePrNumber = 0,
-              PA.spawnLeafSubtreeRequestExpectedHeadSha = fromText ""
+              PA.spawnLeafSubtreeRequestExpectedHeadSha = fromText "",
+              PA.spawnLeafSubtreeRequestIntentId = fromText (fromMaybe "" (slcIntentId cfg))
             }
     result <- suspendEffect @Agent.AgentSpawnLeafSubtree req
     pure $ case result of
@@ -315,7 +317,8 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestStandaloneRepo = False,
               PA.spawnLeafSubtreeRequestAllowedDirs = V.empty,
               PA.spawnLeafSubtreeRequestResumePrNumber = rpcPrNumber cfg,
-              PA.spawnLeafSubtreeRequestExpectedHeadSha = fromText (rpcExpectedHeadSha cfg)
+              PA.spawnLeafSubtreeRequestExpectedHeadSha = fromText (rpcExpectedHeadSha cfg),
+              PA.spawnLeafSubtreeRequestIntentId = fromText ""
             }
     result <- suspendEffect @Agent.AgentSpawnLeafSubtree req
     pure $ case result of
@@ -349,7 +352,8 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnWorkerRequestPermissionMode = fromText (fromMaybe "" (permMode (swcPerms cfg))),
               PA.spawnWorkerRequestAllowedTools = V.fromList (map fromText (allowedTools (swcPerms cfg))),
               PA.spawnWorkerRequestDisallowedTools = V.fromList (map fromText (disallowedTools (swcPerms cfg))),
-              PA.spawnWorkerRequestAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (swcAgentType cfg)))
+              PA.spawnWorkerRequestAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (swcAgentType cfg))),
+              PA.spawnWorkerRequestIntentId = fromText (fromMaybe "" (swcIntentId cfg))
             }
     result <- suspendEffect @Agent.AgentSpawnWorker req
     pure $ case result of

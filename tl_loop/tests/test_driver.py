@@ -25,10 +25,10 @@ from tl_loop.loop.driver import (
     TLRunResult,
     WorkerTask,
     WorkPlan,
+    _initial_slices,
     _record_review_event,
     _route_ci_event,
     _route_review_event,
-    _initial_slices,
     run_tl_loop,
     tl_run,
 )
@@ -72,6 +72,8 @@ class RecordingTransport:
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
     fail_observability: bool = False
     reject_spawns: bool = False
+    listed_agents: list[JsonObject] = field(default_factory=list)
+    next_controller_run_seq: int = 1000
 
     def call_tool(
         self,
@@ -86,6 +88,14 @@ class RecordingTransport:
             return {"success": False, "error": "ledger unavailable"}
         if self.reject_spawns and tool_name in {"spawn_worker", "spawn_leaf"}:
             return {"success": False, "error": "tmux launch rejected"}
+        if tool_name == "list_agents":
+            return {"success": True, "result": {"agents": self.listed_agents}}
+        if tool_name == "emit_controller_event":
+            self.next_controller_run_seq += 1
+            return {
+                "success": True,
+                "result": {"event_id": "controller-event", "run_seq": self.next_controller_run_seq},
+            }
         return {"success": True, "result": None}
 
 
@@ -380,6 +390,90 @@ def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> 
     assert result.final_state.gates == (
         GateState(name="tl-dispatch-timeout", status=GateStatus.PENDING),
     )
+
+
+def test_restart_adopts_owner_by_intent_without_duplicate_spawn(tmp_path: Path) -> None:
+    run_id = "dispatch-adopt-run"
+    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]})
+    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.01)
+    initial = _initial_slices(plan, config, tmp_path, run_id)
+    initial["leaf-a"].update(
+        {
+            "status": "dispatching",
+            "attempts": 1,
+            "dispatch_intent_id": "intent-adopt-1",
+            "dispatch_started_at": time.time(),
+            "dispatch_last_boundary": "dispatch_intended",
+        }
+    )
+    transport = RecordingTransport(
+        listed_agents=[
+            {"agent_id": "leaf-a-codex", "intent_id": "intent-adopt-1", "is_alive": True}
+        ]
+    )
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue(
+            [
+                _event(1, "child_completed", "leaf-a", run_id=run_id),
+                _event(2, "all_children_done", run_id=run_id),
+            ]
+        ),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+        initial_slices=initial,
+    )
+
+    adopted = result.final_state.slices["leaf-a"]
+    assert "spawn_leaf" not in _effect_names(transport)
+    assert adopted.dispatch_agent_id == "leaf-a-codex"
+    assert adopted.dispatch_authoritative_event_seq is not None
+    assert adopted.dispatch_last_boundary == "owner_adopted"
+
+
+def test_stale_spawn_intent_cannot_confirm_new_attempt(tmp_path: Path) -> None:
+    run_id = "dispatch-stale-intent-run"
+    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]})
+    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.01)
+    initial = _initial_slices(plan, config, tmp_path, run_id)
+    initial["leaf-a"].update(
+        {
+            "status": "dispatching",
+            "attempts": 2,
+            "dispatch_intent_id": "intent-new-2",
+            "dispatch_started_at": time.time(),
+            "dispatch_last_boundary": "dispatch_intended",
+        }
+    )
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue(
+            [
+                _canonical_event(
+                    1,
+                    "agent.spawned",
+                    "leaf-a",
+                    run_id,
+                    intent_id="intent-stale-1",
+                )
+            ]
+        ),
+        EffectClient(RecordingTransport()),
+        config=config,
+        root_dir=tmp_path,
+        initial_slices=initial,
+    )
+
+    stale = result.final_state.slices["leaf-a"]
+    assert stale.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert stale.dispatch_intent_id == "intent-new-2"
+    assert stale.dispatch_authoritative_event_seq is None
+    assert stale.park_cause.value == "dispatch_timeout"
 
 
 def test_pr_head_change_clears_per_head_gate_state() -> None:
@@ -1055,6 +1149,7 @@ def _canonical_event(
     run_id: str,
     *,
     pr_number: int | None = None,
+    intent_id: str | None = None,
 ) -> EventEnvelope:
     data: dict[str, object] = {}
     if event_type == "agent.spawned":
@@ -1063,6 +1158,7 @@ def _canonical_event(
                 "child_agent": slug,
                 "agent_type": "codex",
                 "branch": f"main.{slug}",
+                "intent_id": intent_id or _dispatch_intent(run_id, slug),
             }
         )
     else:
@@ -1101,6 +1197,7 @@ def _event(
     if kind == "child_spawned":
         shadow_event["branch"] = f"main.{slug}"
         shadow_event["agent_type"] = "codex"
+        shadow_event["intent_id"] = _dispatch_intent(run_id, slug or "")
     data: dict[str, object] = {"shadow_event": shadow_event}
     if pr_number is not None:
         data["pr_number"] = pr_number
@@ -1121,6 +1218,10 @@ def _event(
         "data": data,
     }
     return project(cast(dict[str, object], raw))
+
+
+def _dispatch_intent(run_id: str, slug: str) -> str:
+    return hashlib.sha256(f"{run_id}:{slug}:1".encode()).hexdigest()[:32]
 
 
 def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) -> None:

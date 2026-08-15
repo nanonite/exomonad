@@ -40,7 +40,8 @@
           "kind": "child_spawned",
           "slug": "worker-a",
           "branch": "main.worker-a",
-          "agent_type": "codex/gpt-luna"
+          "agent_type": "codex/gpt-luna",
+          "intent_id": "d6867fbe6a01815cb5381a063cd2d408"
         }
       }
     },
@@ -61,7 +62,8 @@
           "kind": "child_spawned",
           "slug": "leaf-a",
           "branch": "main.leaf-a",
-          "agent_type": "codex/gpt-luna"
+          "agent_type": "codex/gpt-luna",
+          "intent_id": "057b9fa9ed5e6b7bc43c5e52d6afbb7e"
         }
       }
     },

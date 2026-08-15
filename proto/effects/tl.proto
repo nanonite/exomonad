@@ -13,6 +13,8 @@ message EmitEventRequest {
 message EmitEventResponse {
   // Canonical ledger event identifier assigned by the host.
   string event_id = 1;
+  // Monotonic canonical ledger sequence for this event.
+  uint64 run_seq = 2;
 }
 
 service TlEffects {

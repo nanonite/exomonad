@@ -34,7 +34,9 @@ def test_ceiling_failure_happens_before_any_state_write(tmp_path: Path) -> None:
     assert (run_dir / "run.json").read_bytes() == before
 
 
-def test_spawn_and_charge_share_one_atomic_apply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_spawn_and_charge_share_one_atomic_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     run_dir = _make_run(tmp_path, budget=100)
     real_apply = ledger_module.apply
     calls = 0
@@ -64,8 +66,7 @@ def test_concurrent_spawns_cannot_consume_the_last_budget_twice(tmp_path: Path) 
     results: Any = context.Queue()
     process_type = cast(Any, context).Process
     processes = [
-        process_type(target=_spawn_process, args=(str(run_dir), results))
-        for _ in range(2)
+        process_type(target=_spawn_process, args=(str(run_dir), results)) for _ in range(2)
     ]
     for process in processes:
         process.start()
@@ -141,6 +142,9 @@ def _record_spawn(document: dict[str, object]) -> dict[str, object]:
     slices = cast(dict[str, object], document["slices"])
     slice_record = cast(dict[str, object], slices["slice-a"])
     slice_record["status"] = "spawned"
+    slice_record["dispatch_intent_id"] = "ledger-intent-1"
+    slice_record["dispatch_agent_id"] = "agent-slice-a"
+    slice_record["dispatch_authoritative_event_seq"] = 1
     return document
 
 

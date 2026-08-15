@@ -66,6 +66,8 @@ message AgentInfo {
   // Unix timestamp for lifecycle activity or PR-resume refresh.
   // This is distinct from last_check_inbox_at, which only records check_inbox.
   int64 last_activity_at = 18;
+  // Controller dispatch intent that created this agent, when correlated.
+  string intent_id = 19;
 }
 
 // ============================================================================
@@ -264,6 +266,8 @@ message SpawnWorkerRequest {
   repeated string disallowed_tools = 5;
   // Optional agent type override (default: Codex).
   AgentType agent_type = 6;
+  // Controller dispatch intent used to correlate the spawn confirmation.
+  string intent_id = 7;
 }
 
 message SpawnWorkerResponse {
@@ -419,6 +423,8 @@ message SpawnLeafSubtreeRequest {
   uint64 resume_pr_number = 12;
   // Head SHA observed by the caller; the host re-fetches and requires an exact match.
   string expected_head_sha = 13;
+  // Controller dispatch intent used to correlate the spawn confirmation.
+  string intent_id = 14;
 }
 
 message SpawnLeafSubtreeResponse {

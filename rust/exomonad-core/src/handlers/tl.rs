@@ -139,11 +139,11 @@ impl<C: HasEventLog + 'static> TlEffects for TlHandler<C> {
         let event_log = self.ctx.event_log().ok_or_else(|| {
             EffectError::custom("tl_event_log_unavailable", "event log unavailable")
         })?;
-        let event_id = event_log
-            .append(&req.event_type, ctx.agent_name.as_str(), &payload)
+        let (event_id, run_seq) = event_log
+            .append_with_seq(&req.event_type, ctx.agent_name.as_str(), &payload)
             .map_err(|error| EffectError::custom("tl_event_append_failed", error.to_string()))?;
 
-        Ok(EmitEventResponse { event_id })
+        Ok(EmitEventResponse { event_id, run_seq })
     }
 }
 

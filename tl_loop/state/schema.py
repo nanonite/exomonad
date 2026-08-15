@@ -427,6 +427,16 @@ def _validate_slice(
     _nullable_string(value, "dispatch_error", path, errors)
     _nullable_string(value, "dispatch_agent_id", path, errors)
     _nullable_non_negative_int(value, "dispatch_authoritative_event_seq", path, errors)
+    if value.get("status") == SliceStatus.SPAWNED.value:
+        _non_empty_string(value, "dispatch_intent_id", path, errors)
+        _non_empty_string(value, "dispatch_agent_id", path, errors)
+        if value.get("dispatch_authoritative_event_seq") is None:
+            errors.append(
+                (
+                    f"{path}.dispatch_authoritative_event_seq",
+                    "is required for spawned slices",
+                )
+            )
     classification = value.get("stall_classification")
     if classification is not None and classification not in STALL_CLASSIFICATION_VALUES:
         errors.append(

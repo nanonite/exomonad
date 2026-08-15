@@ -15,6 +15,7 @@ from typing import Protocol, cast
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
+from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, EventKind
 from tl_loop.fsm.event import (
     AllChildrenDone,
@@ -27,6 +28,7 @@ from tl_loop.fsm.event import (
     TLEvent,
 )
 from tl_loop.fsm.phase import (
+    ChildHandle,
     PhaseValue,
     TLDone,
     TLFailed,
@@ -37,7 +39,6 @@ from tl_loop.fsm.phase import (
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
-from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.review import (
     ReviewGateError,
     compose_acceptance_criteria,
@@ -536,6 +537,17 @@ def _run_loop(
             fsm_event = decoder.decode(event)
         except Exception as error:
             raise TLLoopError(str(error)) from error
+        if _is_spawn_confirmation_event(event) and not _dispatch_confirmation_matches(
+            state.slices, event
+        ):
+            LOGGER.warning(
+                "Ignoring uncorrelated agent.spawned event run_id=%s event_seq=%s",
+                run_id,
+                event_seq,
+            )
+            _checkpoint_and_ack(store, source, event, state, phase)
+            state = store.load()
+            continue
         if _duplicate_event(phase, fsm_event, state):
             _checkpoint_and_ack(store, source, event, state, phase)
             state = store.load()
@@ -561,8 +573,16 @@ def _run_loop(
         except IllegalTransition as error:
             raise TLLoopError(str(error)) from error
         event_slice_id = _event_slice_id(event, state)
-        next_slices = _update_slices(state.slices, fsm_event, slice_id=event_slice_id)
-        next_slices = _confirm_dispatch_event(next_slices, event, event_slice_id, event_seq)
+        next_slices = _update_slices(
+            state.slices,
+            fsm_event,
+            slice_id=event_slice_id,
+            allow_spawn_confirmation=_dispatch_confirmation_matches(state.slices, event),
+        )
+        if _is_spawn_confirmation_event(event):
+            next_slices = _confirm_dispatch_event(
+                state.slices, next_slices, event, event_slice_id, event_seq
+            )
         head_changed = _pr_head_changed(state.slices, fsm_event, event_slice_id)
         if head_changed and config.enable_reviewer_spawn:
             next_slices = _claim_reviewer_attempt(
@@ -919,6 +939,21 @@ def _reconcile_dispatches(
         for slice_state in state.slices.values()
         if slice_state.status in DISPATCHING_STATUSES
     ]
+    if not pending:
+        return state
+    agent_listing: ToolResult | None = None
+    if config.active:
+        live = cast(EffectClient, effects)
+        agent_listing = _invoke(
+            "list_agents",
+            "controller",
+            {},
+            True,
+            live,
+            lambda client: client.list_agents(),
+            effects_log,
+            raise_on_failure=False,
+        )
     for pending_slice in pending:
         current = state.slices.get(pending_slice.id, pending_slice)
         if current.dispatch_intent_id is None or current.dispatch_started_at is None:
@@ -936,6 +971,45 @@ def _reconcile_dispatches(
             effects,
             effects_log,
         )
+        owner_id = _agent_for_dispatch_intent(agent_listing, attempt.intent_id)
+        if owner_id is not None:
+            _record_controller_event(
+                current.id,
+                "tl.dispatch_reconciliation_completed",
+                _dispatch_payload(current.id, attempt, "owner_found"),
+                config,
+                effects,
+                effects_log,
+            )
+            confirmation = _record_controller_event(
+                current.id,
+                "tl.dispatch_confirmed",
+                _dispatch_payload(current.id, attempt, "owner_adopted"),
+                config,
+                effects,
+                effects_log,
+            )
+            authoritative_seq = _controller_event_run_seq(confirmation)
+            if authoritative_seq is not None:
+                adopted_slices = {
+                    **state.slices,
+                    current.id: replace(
+                        current,
+                        status=SliceStatus.SPAWNED,
+                        park_cause=None,
+                        dispatch_last_boundary="owner_adopted",
+                        dispatch_error=None,
+                        dispatch_agent_id=owner_id,
+                        dispatch_authoritative_event_seq=authoritative_seq,
+                    ),
+                }
+                state = store.checkpoint(
+                    _dispatch_waiting_phase(adopted_slices),
+                    adopted_slices,
+                    state.budgets,
+                    state.events.last_consumed_offset,
+                )
+                continue
         if current.status is SliceStatus.DISPATCHING:
             state = store.checkpoint(
                 state.fsm,
@@ -962,6 +1036,44 @@ def _reconcile_dispatches(
     return state
 
 
+def _dispatch_waiting_phase(slices: Mapping[str, SliceState]) -> TLWaiting:
+    handles = {
+        slice_id: ChildHandle(
+            slice_id,
+            slice_state.branch or "",
+            slice_state.agent_type or "unknown",
+        )
+        for slice_id, slice_state in slices.items()
+        if slice_state.status is SliceStatus.SPAWNED
+    }
+    return TLWaiting(handles)
+
+
+def _agent_for_dispatch_intent(result: ToolResult | None, intent_id: str) -> str | None:
+    if result is None or result.success is False or not isinstance(result.result, Mapping):
+        return None
+    agents = result.result.get("agents")
+    if not isinstance(agents, list):
+        return None
+    for raw_agent in agents:
+        if not isinstance(raw_agent, Mapping):
+            continue
+        if raw_agent.get("intent_id") != intent_id or raw_agent.get("is_alive") is not True:
+            continue
+        for key in ("agent_id", "id"):
+            agent_id = raw_agent.get(key)
+            if isinstance(agent_id, str) and agent_id:
+                return agent_id
+    return None
+
+
+def _controller_event_run_seq(result: ToolResult | None) -> int | None:
+    if result is None or result.success is False or not isinstance(result.result, Mapping):
+        return None
+    value = result.result.get("run_seq")
+    return value if type(value) is int and value > 0 else None
+
+
 def _dispatch_payload(
     slice_id: str,
     attempt: DispatchAttempt,
@@ -981,22 +1093,27 @@ def _dispatch_payload(
 
 
 def _confirm_dispatch_event(
-    slices: Mapping[str, SliceState],
+    previous_slices: Mapping[str, SliceState],
+    updated_slices: Mapping[str, SliceState],
     event: EventEnvelope,
     slice_id: str | None,
     event_seq: int,
 ) -> dict[str, SliceState]:
-    if not _is_spawn_confirmation_event(event) or slice_id is None:
-        return dict(slices)
-    current = slices.get(slice_id)
+    if (
+        not _is_spawn_confirmation_event(event)
+        or slice_id is None
+        or not _dispatch_confirmation_matches(previous_slices, event)
+    ):
+        return dict(updated_slices)
+    current = updated_slices.get(slice_id)
     if current is None or current.dispatch_intent_id is None:
-        return dict(slices)
+        return dict(updated_slices)
     data_agent = event.data.get("child_agent") or event.data.get("slug")
     agent_id = event.agent_id if isinstance(event.agent_id, str) else None
     if not agent_id and isinstance(data_agent, str):
         agent_id = data_agent
     return {
-        **slices,
+        **updated_slices,
         slice_id: replace(
             current,
             status=SliceStatus.SPAWNED,
@@ -1007,6 +1124,33 @@ def _confirm_dispatch_event(
             dispatch_authoritative_event_seq=event_seq,
         ),
     }
+
+
+def _event_dispatch_intent_id(event: EventEnvelope) -> str | None:
+    value = event.data.get("intent_id")
+    if isinstance(value, str) and value:
+        return value
+    shadow_event = event.data.get("shadow_event")
+    if isinstance(shadow_event, Mapping):
+        value = shadow_event.get("intent_id")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _dispatch_confirmation_matches(slices: Mapping[str, SliceState], event: EventEnvelope) -> bool:
+    if not _is_spawn_confirmation_event(event):
+        return True
+    intent_id = _event_dispatch_intent_id(event)
+    if intent_id is None:
+        return False
+    matches = [
+        slice_state
+        for slice_state in slices.values()
+        if slice_state.dispatch_intent_id == intent_id
+        and slice_state.status in DISPATCHING_STATUSES
+    ]
+    return len(matches) == 1
 
 
 def _emit_dispatch_confirmation(
@@ -1225,12 +1369,36 @@ def _run_sub_tls(
                 effects_log,
             )
             raise DepthLimitExceeded(f"depth ceiling {config.max_depth} reached for {task.name!r}")
+        internal_intent_id = hashlib.sha256(
+            f"{store.run_id}:{task.name}:{current.attempts + 1}".encode()
+        ).hexdigest()[:32]
+        internal_attempt = DispatchAttempt(
+            internal_intent_id,
+            time.time() if config.active else 0.0,
+            current.agent_type or "sub-tl",
+        )
+        confirmation = _record_controller_event(
+            task.name,
+            "tl.dispatch_confirmed",
+            _dispatch_payload(task.name, internal_attempt, "sub_tl_started"),
+            config,
+            effects,
+            effects_log,
+        )
+        authoritative_seq = _controller_event_run_seq(confirmation)
+        if authoritative_seq is None:
+            authoritative_seq = state.events.last_consumed_offset
         spawned = replace(
             current,
             status=SliceStatus.SPAWNED,
             base_ref=config.branch,
             branch=branch,
             worktree=worktree,
+            dispatch_intent_id=internal_intent_id,
+            dispatch_started_at=internal_attempt.started_at,
+            dispatch_last_boundary="sub_tl_started",
+            dispatch_agent_id=task.name,
+            dispatch_authoritative_event_seq=authoritative_seq,
         )
         previous_slices = state.slices
         state = store.checkpoint(
@@ -2080,7 +2248,7 @@ def _record_controller_event(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
-) -> None:
+) -> ToolResult | None:
     effects_log.append(EffectIntent("emit_controller_event", target, payload, config.active))
     LOGGER.info(
         "[TL loop] effect=emit_controller_event target=%s event_type=%s active=%s",
@@ -2089,9 +2257,23 @@ def _record_controller_event(
         config.active,
     )
     if not config.active:
-        return
+        return None
     live = cast(EffectClient, effects)
-    emit_controller_event(live, event_type, payload)
+    try:
+        result = live.emit_controller_event(
+            event_type=event_type,
+            payload=cast(JsonObject, dict(payload)),
+        )
+    except Exception as error:  # noqa: BLE001 - observability is fail-open
+        LOGGER.warning("controller event %s failed: %s", event_type, error)
+        return None
+    if result.success is False:
+        LOGGER.warning(
+            "controller event %s failed: %s",
+            event_type,
+            result.error or "effect returned failure",
+        )
+    return result
 
 
 def _invoke(
@@ -2180,7 +2362,7 @@ def _event_belongs_to_plan(
 
 
 def _event_slice_id(event: EventEnvelope, state: RunState) -> str | None:
-    intent_id = event.data.get("intent_id")
+    intent_id = _event_dispatch_intent_id(event)
     if isinstance(intent_id, str):
         for slice_id, slice_state in state.slices.items():
             if slice_state.dispatch_intent_id == intent_id:

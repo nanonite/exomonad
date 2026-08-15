@@ -101,6 +101,17 @@ impl EventLog {
         agent_id: &str,
         data: &serde_json::Value,
     ) -> io::Result<String> {
+        self.append_with_seq(event_type, agent_id, data)
+            .map(|(event_id, _)| event_id)
+    }
+
+    /// Append an event and return both its canonical ID and run sequence.
+    pub fn append_with_seq(
+        &self,
+        event_type: &str,
+        agent_id: &str,
+        data: &serde_json::Value,
+    ) -> io::Result<(String, u64)> {
         let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
         let event_id = Uuid::new_v4().to_string();
         let event_time = data
@@ -183,7 +194,7 @@ impl EventLog {
         {
             warn!(%error, "Event committed but sink-health fallback could not be updated");
         }
-        Ok(event_id)
+        Ok((event_id, run_seq))
     }
 
     /// Path to the log directory.

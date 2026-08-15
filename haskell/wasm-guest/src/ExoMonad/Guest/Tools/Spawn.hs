@@ -307,6 +307,7 @@ spawnWorkersCore args = do
           AC.SpawnWorkerConfig
             { AC.swcName = wsName spec,
               AC.swcPrompt = prompt,
+              AC.swcIntentId = wsIntentId spec,
               AC.swcAgentType = wsAgentType spec,
               AC.swcPerms = perms
             }

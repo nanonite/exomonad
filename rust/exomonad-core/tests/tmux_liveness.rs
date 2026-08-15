@@ -6,7 +6,9 @@
 //! skipped rather than failed.
 
 use exomonad_core::domain::RoutingInfo;
+use exomonad_core::services::event_log::EventLog;
 use exomonad_core::services::tmux_ipc::{routing_target_alive, PaneId, TmuxIpc, WindowId};
+use serde_json::json;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -363,4 +365,52 @@ async fn wait_for_window_process_accepts_a_live_tmux_command() {
         .wait_for_window_process(&window, Duration::from_millis(500))
         .await
         .expect("process probe succeeds"));
+}
+
+#[tokio::test]
+async fn live_tmux_dispatch_event_preserves_intent_and_sequence() {
+    if !tmux_available() {
+        return;
+    }
+    let session = TestSession::create("exo-liveness-correlated-dispatch");
+    let window = session.new_shell_window("correlated-dispatch");
+    let marker_dir = tempfile::tempdir().expect("marker directory");
+    let marker = marker_dir.path().join("spawned.json");
+    let command = format!(
+        "printf '%s' '{{\"child_agent\":\"worker-live\",\"intent_id\":\"intent-live\"}}' > {} ; sleep 300",
+        marker.display()
+    );
+    let target = format!("{}:{}", session.name, window);
+    let status = test_tmux_command()
+        .args(["respawn-window", "-k", "-t", &target, "sh", "-c", &command])
+        .status()
+        .expect("tmux respawn-window");
+    assert!(status.success(), "tmux respawn-window failed");
+
+    let ipc = session.ipc();
+    assert!(ipc
+        .wait_for_window_process(&window, Duration::from_millis(500))
+        .await
+        .expect("process probe succeeds"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "spawn marker was not written");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&marker).expect("read spawn marker"))
+            .expect("parse spawn marker");
+    let log = EventLog::open(marker_dir.path().join("events")).expect("open event log");
+    let (_, run_seq) = log
+        .append_with_seq("agent.spawned", "root", &payload)
+        .expect("append correlated spawn event");
+
+    assert_eq!(run_seq, 1);
+    let events = log.ledger().read_events().expect("read event ledger");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.event_type, "agent.spawned");
+    assert_eq!(events[0].event.run_seq, Some(run_seq));
+    assert_eq!(events[0].event.data["intent_id"], json!("intent-live"));
+    assert_eq!(events[0].event.data["child_agent"], json!("worker-live"));
 }

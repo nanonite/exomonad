@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
-from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
+from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.fsm.event import ChildSpawned
 from tl_loop.fsm.phase import ChildHandle
 from tl_loop.loop.shadow import ShadowLoop, TLEventDecoder
@@ -52,6 +53,7 @@ def test_shadow_decoder_accepts_canonical_spawn_payload() -> None:
             "child_agent": "child-a",
             "agent_type": "codex",
             "branch": "main.child-a",
+            "intent_id": _dispatch_intent("run-1", "child-a"),
         },
     }
 
@@ -67,7 +69,7 @@ def test_shadow_loop_reaches_terminal_phase_and_records_intended_sequence(tmp_pa
             "slices": {
                 "child-a": {
                     "id": "child-a",
-                    "status": "spawned",
+                    "status": "dispatch_unconfirmed",
                     "paths": ["src"],
                     "depends_on": [],
                     "base_ref": "main",
@@ -80,6 +82,9 @@ def test_shadow_loop_reaches_terminal_phase_and_records_intended_sequence(tmp_pa
                     "reviewed_head": None,
                     "attempts": 1,
                     "verdict": None,
+                    "dispatch_intent_id": _dispatch_intent("synthetic-shadow", "child-a"),
+                    "dispatch_started_at": 0.0,
+                    "dispatch_last_boundary": "dispatch_intended",
                 }
             }
         },
@@ -118,7 +123,34 @@ def test_shadow_loop_reaches_terminal_phase_and_records_intended_sequence(tmp_pa
 
 
 def test_shadow_loop_accepts_two_distinct_live_spawns(tmp_path: Path) -> None:
-    create("two-spawns", {}, root_dir=tmp_path / "shadow")
+    create(
+        "two-spawns",
+        {
+            "slices": {
+                slug: {
+                    "id": slug,
+                    "status": "dispatch_unconfirmed",
+                    "paths": [f"shadow:{slug}"],
+                    "depends_on": [],
+                    "base_ref": "main",
+                    "test_plan": ["just test"],
+                    "agent_type": "codex",
+                    "model": None,
+                    "branch": f"main.{slug}",
+                    "worktree": None,
+                    "pr_number": None,
+                    "reviewed_head": None,
+                    "attempts": 1,
+                    "verdict": None,
+                    "dispatch_intent_id": _dispatch_intent("synthetic-shadow", slug),
+                    "dispatch_started_at": 0.0,
+                    "dispatch_last_boundary": "dispatch_intended",
+                }
+                for slug in ("child-a", "child-b")
+            }
+        },
+        root_dir=tmp_path / "shadow",
+    )
     source = SyntheticQueue(
         [
             _event(1, "child_spawned", "child-a"),
@@ -176,8 +208,13 @@ def _event(run_seq: int, shadow_kind: str, slug: str = "child-a") -> EventEnvelo
                 "slug": slug,
                 "branch": "main.child-a",
                 "agent_type": "codex",
+                "intent_id": _dispatch_intent("synthetic-shadow", slug),
                 "reason": "synthetic reason",
             }
         },
     }
     return project(cast(dict[str, object], raw))
+
+
+def _dispatch_intent(run_id: str, slug: str) -> str:
+    return hashlib.sha256(f"{run_id}:{slug}:1".encode()).hexdigest()[:32]

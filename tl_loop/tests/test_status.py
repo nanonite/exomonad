@@ -69,6 +69,9 @@ def test_status_renders_live_state_without_watch_controls(tmp_path: Path, capsys
                         "reviewed_head": None,
                         "attempts": 1,
                         "verdict": None,
+                        "dispatch_intent_id": "status-intent-1",
+                        "dispatch_agent_id": "agent-task-a",
+                        "dispatch_authoritative_event_seq": 7,
                         "park_cause": "review_stuck",
                         "park_issue_id": 404,
                     }

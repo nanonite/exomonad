@@ -274,7 +274,9 @@ class ShadowLoop:
             recorder=recorder,
         )
 
-    def run(self, *, timeout: float | None = None, max_events: int | None = None) -> ShadowRunResult:
+    def run(
+        self, *, timeout: float | None = None, max_events: int | None = None
+    ) -> ShadowRunResult:
         """Run until the source is empty, terminal, or ``max_events`` is reached."""
         if max_events is not None and max_events < 0:
             raise ValueError("max_events must be non-negative")
@@ -287,6 +289,11 @@ class ShadowLoop:
             except queue_module.Empty:
                 break
             fsm_event = self.decoder.decode(event)
+            if isinstance(fsm_event, ChildSpawned) and not _shadow_spawn_matches(
+                state.slices, event, fsm_event
+            ):
+                self.source.acknowledge(event)
+                continue
             try:
                 next_phase = transition(phase, fsm_event)
             except IllegalTransition as error:
@@ -298,6 +305,17 @@ class ShadowLoop:
             slices = _update_slices(
                 state.slices, fsm_event, slice_id=event.slice_id or event.agent_id
             )
+            if isinstance(fsm_event, ChildSpawned):
+                current = slices.get(fsm_event.handle.slug)
+                if current is not None:
+                    slices[fsm_event.handle.slug] = replace(
+                        current,
+                        status=SliceStatus.SPAWNED,
+                        park_cause=None,
+                        dispatch_last_boundary="agent.spawned",
+                        dispatch_agent_id=event.agent_id or fsm_event.handle.slug,
+                        dispatch_authoritative_event_seq=event_seq,
+                    )
             action = IntendedAction(
                 judgment.kind,
                 _target(event, fsm_event),
@@ -336,7 +354,11 @@ def _judgment(
 
 
 def _update_slices(
-    slices: Mapping[str, SliceState], event: TLEvent, *, slice_id: str | None = None
+    slices: Mapping[str, SliceState],
+    event: TLEvent,
+    *,
+    slice_id: str | None = None,
+    allow_spawn_confirmation: bool = True,
 ) -> dict[str, SliceState]:
     updated = dict(slices)
     if isinstance(event, (PRFiled, PRUpdated)):
@@ -367,6 +389,8 @@ def _update_slices(
             stall_classification=None,
         )
     elif isinstance(event, ChildSpawned):
+        if not allow_spawn_confirmation:
+            return updated
         handle = event.handle
         current = updated.get(handle.slug)
         if current is None:
@@ -469,6 +493,23 @@ def _target(event: EventEnvelope, fsm_event: TLEvent) -> str:
     return "controller"
 
 
+def _shadow_spawn_matches(
+    slices: Mapping[str, SliceState], event: EventEnvelope, fsm_event: ChildSpawned
+) -> bool:
+    shadow_event = event.data.get("shadow_event")
+    if not isinstance(shadow_event, Mapping):
+        intent_id = event.data.get("intent_id")
+    else:
+        intent_id = shadow_event.get("intent_id")
+    current = slices.get(fsm_event.handle.slug)
+    return (
+        current is not None
+        and isinstance(intent_id, str)
+        and intent_id == current.dispatch_intent_id
+        and current.status in {SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED}
+    )
+
+
 def _agent(event: EventEnvelope) -> str:
     if not event.agent_id:
         raise ShadowLoopError(f"{event.event_type!r} requires agent_id")
@@ -489,9 +530,7 @@ def _string(value: Mapping[str, object], key: str, event_type: str) -> str:
     return candidate
 
 
-def _string_from_keys(
-    value: Mapping[str, object], keys: tuple[str, ...], event_type: str
-) -> str:
+def _string_from_keys(value: Mapping[str, object], keys: tuple[str, ...], event_type: str) -> str:
     for key in keys:
         candidate = value.get(key)
         if isinstance(candidate, str) and candidate:

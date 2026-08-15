@@ -132,6 +132,9 @@ def _slice(slice_id: str, status: SliceStatus, path: str) -> SliceState:
         repair_attempts=3,
         attempts=1,
         verdict=Verdict.GO if status is SliceStatus.MERGED else None,
+        dispatch_intent_id="store-intent-1" if status is SliceStatus.SPAWNED else None,
+        dispatch_agent_id="agent-spawned" if status is SliceStatus.SPAWNED else None,
+        dispatch_authoritative_event_seq=1 if status is SliceStatus.SPAWNED else None,
     )
 
 

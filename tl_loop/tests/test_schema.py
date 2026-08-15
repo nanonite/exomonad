@@ -33,9 +33,7 @@ def test_per_head_review_state_is_valid_and_closed() -> None:
     unknown_slice = _slice(unknown, "slice-a")
     unknown_slice["review_findings"] = {}
     findings = cast(dict[str, object], unknown_slice["review_findings"])
-    findings["head-a"] = [
-        {"severity": "info", "path": "src/a.py", "rationale": "covered"}
-    ]
+    findings["head-a"] = [{"severity": "info", "path": "src/a.py", "rationale": "covered"}]
     cast(list[dict[str, object]], findings["head-a"])[0]["extra"] = True
     _assert_rejected(unknown, "run.slices['slice-a'].review_findings['head-a'][0]")
 
@@ -114,6 +112,26 @@ def test_wrong_types_are_rejected_with_qualified_paths() -> None:
     errors = _rejection(document)
     assert "run.revision" in errors
     assert "run.events.last_consumed_offset" in errors
+
+
+def test_spawned_slice_requires_authoritative_dispatch_evidence() -> None:
+    document = _valid_document()
+    slice_state = _slice(document, "slice-a")
+    slice_state.update(
+        {
+            "status": "spawned",
+            "dispatch_intent_id": "intent-1",
+            "dispatch_agent_id": "agent-1",
+            "dispatch_authoritative_event_seq": 7,
+        }
+    )
+    validate(document)
+
+    missing_evidence = deepcopy(document)
+    missing_slice = _slice(missing_evidence, "slice-a")
+    missing_slice["dispatch_intent_id"] = None
+    missing_slice["dispatch_authoritative_event_seq"] = None
+    _assert_rejected(missing_evidence, "dispatch_intent_id")
 
 
 def test_unknown_version_is_rejected_without_migration() -> None:
