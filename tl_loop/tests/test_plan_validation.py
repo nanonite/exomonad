@@ -6,6 +6,7 @@ import pytest
 
 from tl_loop.plan_validation import (
     PlanValidationError,
+    normalize_plan_document,
     validate_plan_document,
     validate_plan_proposal,
 )
@@ -62,3 +63,24 @@ def test_validation_detaches_the_proposed_plan() -> None:
 
     plan["leaves"].append(_leaf("docs", ["docs/**"]))  # type: ignore[union-attr]
     assert len(cast_plan["leaves"]) == 1  # type: ignore[index]
+
+
+def test_validation_normalizes_explicit_order_without_reordering_legacy_plans() -> None:
+    ordered = normalize_plan_document(
+        {
+            "plan": {
+                "sub_tls": [
+                    {"name": "two", "order": 2, "plan": {}},
+                    {"name": "one", "order": 1, "plan": {}},
+                ]
+            }
+        },
+        proposal=True,
+    )
+    assert [entry["name"] for entry in ordered["plan"]["sub_tls"]] == ["one", "two"]  # type: ignore[index]
+
+    legacy = normalize_plan_document(
+        {"plan": {"sub_tls": [{"name": "second", "plan": {}}, {"name": "first", "plan": {}}]}},
+        proposal=True,
+    )
+    assert [entry["name"] for entry in legacy["plan"]["sub_tls"]] == ["second", "first"]  # type: ignore[index]

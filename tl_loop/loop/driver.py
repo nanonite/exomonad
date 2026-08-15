@@ -9,6 +9,7 @@ import queue as queue_module
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from fnmatch import fnmatchcase
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, cast
@@ -178,16 +179,17 @@ class WorkPlan:
             raise ValueError("worker and leaf names must be unique")
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> WorkPlan:
+    def from_mapping(cls, value: Mapping[str, object], *, path: str = "plan") -> WorkPlan:
         """Parse the small, closed plan shape used by the TL entry point."""
         unknown = sorted(set(value) - {"workers", "leaves", "sub_tls"})
         if unknown:
             raise ValueError(f"work plan contains unknown keys: {', '.join(unknown)}")
-        return cls(
+        parsed = cls(
             workers=_workers(value.get("workers", ())),
             leaves=_leaves(value.get("leaves", ())),
-            sub_tls=_sub_tls(value.get("sub_tls", ())),
+            sub_tls=_sub_tls(value.get("sub_tls", ()), path=f"{path}.sub_tls"),
         )
+        return normalize_work_plan(parsed, path=path)
 
     @property
     def ordered_stages(self) -> tuple[OrderedStage, ...]:
@@ -211,6 +213,7 @@ class SubTLTask:
     agent_id: str | None = None
     order: int = 1
     integration: IntegrationContract = field(default_factory=IntegrationContract)
+    order_explicit: bool = True
 
     def __post_init__(self) -> None:
         _require_text(self.name, "sub-TL name")
@@ -224,6 +227,8 @@ class SubTLTask:
             raise ValueError("sub-TL order must be a positive integer")
         if not isinstance(self.integration, IntegrationContract):
             raise TypeError("sub-TL integration must be an IntegrationContract")
+        if not isinstance(self.order_explicit, bool):
+            raise TypeError("sub-TL order_explicit must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -2687,13 +2692,13 @@ def _leaves(value: object) -> tuple[LeafTask, ...]:
     return tuple(_leaf(item) for item in value)
 
 
-def _sub_tls(value: object) -> tuple[SubTLTask, ...]:
+def _sub_tls(value: object, *, path: str = "plan.sub_tls") -> tuple[SubTLTask, ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise TypeError("work plan sub_tls must be an array")
-    return tuple(_sub_tl(item) for item in value)
+    return tuple(_sub_tl(item, path=f"{path}[{index}]") for index, item in enumerate(value))
 
 
-def _sub_tl(value: object) -> SubTLTask:
+def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
     if isinstance(value, SubTLTask):
         return value
     if not isinstance(value, Mapping):
@@ -2721,7 +2726,7 @@ def _sub_tl(value: object) -> SubTLTask:
     plan = (
         plan_value
         if isinstance(plan_value, WorkPlan)
-        else WorkPlan.from_mapping(cast(Mapping[str, object], plan_value))
+        else WorkPlan.from_mapping(cast(Mapping[str, object], plan_value), path=f"{path}.plan")
     )
     integration = _integration_contract(value.get("integration"))
     return SubTLTask(
@@ -2732,8 +2737,9 @@ def _sub_tl(value: object) -> SubTLTask:
         _optional_string(value, "agent_type", "sub-TL"),
         cast(str | Path | None, value.get("worktree")),
         _optional_string(value, "agent_id", "sub-TL"),
-        _positive_order(value.get("order", 1), "sub-TL order"),
+        _positive_order(value.get("order", 1), f"{path}.order"),
         integration,
+        "order" in value,
     )
 
 
@@ -2778,6 +2784,64 @@ def _integration_contract(value: object) -> IntegrationContract:
         aggregate_repair_owner=owner("aggregate_repair_owner"),
         merge_strategy=value.get("merge_strategy", "merge"),
     )
+
+
+def normalize_work_plan(plan: WorkPlan, *, path: str = "plan") -> WorkPlan:
+    """Normalize explicit sibling orders and validate stage ownership.
+
+    A plan with no explicit orders is intentionally returned in source order.
+    Once ordered mode is selected, all direct sub-TLs must declare an order,
+    values must be contiguous from one, and top-level leaves are forbidden.
+    The nested plans have already gone through this function with their own
+    path, so recursive order scopes remain independent.
+    """
+    tasks = plan.sub_tls
+    if not tasks or not any(task.order_explicit for task in tasks):
+        return plan
+    if not all(task.order_explicit for task in tasks):
+        missing = next(index for index, task in enumerate(tasks) if not task.order_explicit)
+        raise ValueError(f"{path}.sub_tls[{missing}].order is required when ordered mode is used")
+    if plan.leaves:
+        raise ValueError(f"{path}.leaves must be empty when ordered sub-TL stages are used")
+    orders = sorted({task.order for task in tasks})
+    expected = list(range(1, len(orders) + 1))
+    if orders != expected:
+        raise ValueError(f"{path}.sub_tls order values must be contiguous from 1; got {orders}")
+    for order in orders:
+        peers = [task for task in tasks if task.order == order]
+        _validate_concurrent_ownership(peers, path, order)
+    return WorkPlan(
+        workers=plan.workers,
+        leaves=plan.leaves,
+        sub_tls=tuple(sorted(tasks, key=lambda task: task.order)),
+    )
+
+
+def _validate_concurrent_ownership(tasks: Sequence[SubTLTask], path: str, order: int) -> None:
+    owned: list[tuple[str, str]] = []
+    for task in tasks:
+        for owned_path in _sub_tl_owned_paths(task):
+            for other_name, other_path in owned:
+                if _patterns_overlap(owned_path, other_path):
+                    raise ValueError(
+                        f"{path} order {order} ownership overlaps between "
+                        f"{task.name!r} path {owned_path!r} and "
+                        f"{other_name!r} path {other_path!r}"
+                    )
+            owned.append((task.name, owned_path))
+
+
+def _sub_tl_owned_paths(task: SubTLTask) -> tuple[str, ...]:
+    paths: list[str] = []
+    for leaf in task.plan.leaves if isinstance(task.plan, WorkPlan) else ():
+        paths.extend(leaf.boundary or (f"tl-loop/{task.name}/{leaf.name}",))
+    for child in task.plan.sub_tls if isinstance(task.plan, WorkPlan) else ():
+        paths.extend(_sub_tl_owned_paths(child))
+    return tuple(paths or (f"tl-loop/{task.name}",))
+
+
+def _patterns_overlap(left: str, right: str) -> bool:
+    return left == right or fnmatchcase(left, right) or fnmatchcase(right, left)
 
 
 def _worker(value: object) -> WorkerTask:

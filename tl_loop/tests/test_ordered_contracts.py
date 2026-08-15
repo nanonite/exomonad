@@ -54,6 +54,86 @@ def test_contract_rejects_invalid_order_and_integration_keys() -> None:
         )
 
 
+def test_ordered_plan_normalizes_numeric_stage_order() -> None:
+    plan = WorkPlan.from_mapping(
+        {
+            "sub_tls": [
+                {"name": "stage-two", "order": 2, "plan": {}},
+                {"name": "stage-one", "order": 1, "plan": {}},
+            ]
+        }
+    )
+
+    assert [task.name for task in plan.sub_tls] == ["stage-one", "stage-two"]
+
+
+@pytest.mark.parametrize(
+    ("sub_tls", "message"),
+    [
+        (
+            [{"name": "one", "order": 1, "plan": {}}, {"name": "missing", "plan": {}}],
+            "sub_tls[1].order",
+        ),
+        (
+            [{"name": "zero", "order": 0, "plan": {}}],
+            "sub_tls[0].order",
+        ),
+        (
+            [{"name": "one", "order": 1, "plan": {}}, {"name": "three", "order": 3, "plan": {}}],
+            "contiguous",
+        ),
+    ],
+)
+def test_ordered_plan_rejects_mixed_invalid_or_non_contiguous_orders(
+    sub_tls: list[dict[str, object]], message: str
+) -> None:
+    with pytest.raises(ValueError) as error:
+        WorkPlan.from_mapping({"sub_tls": sub_tls})
+    assert message in str(error.value)
+
+
+def test_ordered_plan_rejects_top_level_leaves_and_recursive_overlap() -> None:
+    with pytest.raises(ValueError, match="leaves must be empty"):
+        WorkPlan.from_mapping(
+            {
+                "leaves": [{"name": "top", "task": "not staged"}],
+                "sub_tls": [{"name": "stage", "order": 1, "plan": {}}],
+            }
+        )
+    with pytest.raises(ValueError, match="ownership overlaps"):
+        WorkPlan.from_mapping(
+            {
+                "sub_tls": [
+                    {
+                        "name": "one",
+                        "order": 1,
+                        "plan": {"leaves": [{"name": "a", "task": "a", "boundary": ["src/**"]}]},
+                    },
+                    {
+                        "name": "two",
+                        "order": 1,
+                        "plan": {
+                            "sub_tls": [
+                                {
+                                    "name": "nested",
+                                    "plan": {
+                                        "leaves": [
+                                            {
+                                                "name": "b",
+                                                "task": "b",
+                                                "boundary": ["src/api.py"],
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                ]
+            }
+        )
+
+
 def test_evidence_is_bound_to_the_required_dimensions() -> None:
     candidate = AggregateCandidate("stage-one", 7, "head-7", "patch-7", "base-1")
     review = CodeReviewEvidence("head-7", "patch-7", "GO", "2026-08-15T00:00:00Z")

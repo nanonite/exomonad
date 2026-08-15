@@ -18,6 +18,7 @@ from .driver import (
     WorkPlan,
     derive_child_branch,
     derive_child_worktree,
+    normalize_work_plan,
     run_tl_loop,
     tl_run,
 )
@@ -125,6 +126,7 @@ __all__ = [
     "compose_acceptance_criteria",
     "derive_child_branch",
     "derive_child_worktree",
+    "normalize_work_plan",
     "heartbeat_due",
     "heartbeat_once",
     "load_freshness_window",

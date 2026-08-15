@@ -75,7 +75,7 @@ def validate_plan_document(value: object, *, proposal: bool = False) -> dict[str
         raise PlanValidationError("plan must contain a WorkPlan object")
     _validate_work_plan(plan_value, "plan")
 
-    result: dict[str, object] = {"plan": deepcopy(dict(plan_value))}
+    result: dict[str, object] = {"plan": _normalize_work_plan_mapping(plan_value, "plan")}
     if not proposal:
         for key in ("run_id", "budgets"):
             if key in value:
@@ -88,11 +88,16 @@ def validate_plan_proposal(value: object) -> dict[str, object]:
     return validate_plan_document(value, proposal=True)
 
 
+def normalize_plan_document(value: object, *, proposal: bool = False) -> dict[str, object]:
+    """Validate a document and return its numerically ordered plan projection."""
+    return validate_plan_document(value, proposal=proposal)
+
+
 def _validate_work_plan(value: Mapping[str, object], path: str) -> None:
     from tl_loop.loop.driver import WorkPlan
 
     try:
-        WorkPlan.from_mapping(value)
+        WorkPlan.from_mapping(value, path=path)
     except (TypeError, ValueError) as error:
         raise PlanValidationError(f"{path}: {error}") from error
 
@@ -120,6 +125,43 @@ def _validate_work_plan(value: Mapping[str, object], path: str) -> None:
                 _validate_work_plan(nested, f"{path}.sub_tls[{index}].plan")
 
     _validate_sibling_ownership(value, path)
+
+
+def _normalize_work_plan_mapping(value: Mapping[str, object], path: str) -> dict[str, object]:
+    """Sort explicit sibling stages while preserving the input JSON shape."""
+    result = deepcopy(dict(value))
+    entries = result.get("sub_tls")
+    if isinstance(entries, list):
+        explicit = [entry for entry in entries if isinstance(entry, Mapping) and "order" in entry]
+        if explicit:
+            result["sub_tls"] = sorted(
+                entries,
+                key=lambda entry: entry.get("order", 1) if isinstance(entry, Mapping) else 1,
+            )
+        normalized_entries: list[object] = []
+        for index, entry in enumerate(result["sub_tls"]):
+            if not isinstance(entry, Mapping):
+                normalized_entries.append(entry)
+                continue
+            normalized = dict(entry)
+            nested = normalized.get("plan")
+            if isinstance(nested, Mapping):
+                normalized["plan"] = _normalize_work_plan_mapping(
+                    nested, f"{path}.sub_tls[{index}].plan"
+                )
+            else:
+                inline = {
+                    key: normalized[key]
+                    for key in ("workers", "leaves", "sub_tls")
+                    if key in normalized
+                }
+                if inline:
+                    normalized["plan"] = _normalize_work_plan_mapping(
+                        inline, f"{path}.sub_tls[{index}].plan"
+                    )
+            normalized_entries.append(normalized)
+        result["sub_tls"] = normalized_entries
+    return result
 
 
 def _validate_sibling_ownership(value: Mapping[str, object], path: str) -> None:
@@ -170,6 +212,7 @@ def _patterns_overlap(left: str, right: str) -> bool:
 
 __all__ = [
     "PlanValidationError",
+    "normalize_plan_document",
     "validate_plan_document",
     "validate_plan_proposal",
 ]
