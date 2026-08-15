@@ -69,10 +69,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_plan_proposal(args)
         elif args.command == "preflight":
             run_preflight(args.project_root)
-            print("TL preflight passed: config.toml, harness_policy.toml, review-policy.toml, harness_capability.toml")
+            print(
+                "TL preflight passed: config.toml, harness_policy.toml, review-policy.toml, harness_capability.toml"
+            )
         else:
             _set_gate(args)
-    except (LauncherError, OSError, RuntimeError, ValueError, PlanValidationError, PreflightError) as error:
+    except (
+        LauncherError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        PlanValidationError,
+        PreflightError,
+    ) as error:
         _record_run_failure(args, error)
         LOGGER.error("[TL loop] %s", error)
         return 2
@@ -318,6 +327,12 @@ def _print_result(result: TLRunResult) -> None:
         state.events.last_consumed_offset,
         len(result.effects),
     )
+    LOGGER.info(
+        "[TL loop] ordered current_order=%d integration=%s next_transition=%s",
+        state.current_order,
+        state.integration.lifecycle.value,
+        _next_state_transition(state),
+    )
     for gate in state.gates:
         LOGGER.info("[TL loop] gate name=%s status=%s", gate.name, gate.status.value)
         if gate.status is GateStatus.PENDING:
@@ -333,6 +348,23 @@ def _print_result(result: TLRunResult) -> None:
             slice_state.status.value,
             slice_state.pr_number,
         )
+
+
+def _next_state_transition(state: RunState) -> str:
+    """Describe the next legal operator transition for the terminal summary."""
+    pending_gate = next(
+        (gate.name for gate in state.gates if gate.status is GateStatus.PENDING),
+        None,
+    )
+    if pending_gate is not None:
+        return f"answer_gate:{pending_gate}"
+    if state.integration.lifecycle.value == "INTEGRATION_CONFLICT":
+        return f"resume_pr:{state.integration.integration_owner_id or 'aggregate'}"
+    if state.integration.lifecycle.value == "NEEDS_BASE_REVALIDATION":
+        return "revalidate_base_and_integration_ci"
+    if state.integration.lifecycle.value == "READY_FOR_INTEGRATION":
+        return "validate_integration_evidence"
+    return "await_controller"
 
 
 def _print_status(args: argparse.Namespace) -> None:
@@ -360,10 +392,7 @@ def _status_snapshot(
     if reason:
         return f"controller exited: {reason}"
     if not store.path.exists():
-        return (
-            "no run yet; controller is waiting for "
-            f".exo/tl-loop/plan.json (path: {plan_path})"
-        )
+        return f"no run yet; controller is waiting for .exo/tl-loop/plan.json (path: {plan_path})"
     try:
         state = store.load()
         reader = LedgerReader(

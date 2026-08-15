@@ -122,7 +122,11 @@ fn project_state(
         .ok_or_else(|| ReadModelError::InvalidState("root must be an object".to_string()))?;
     let fsm = object_at(root, "fsm")?;
     let slices = object_at(root, "slices")?;
+    let projected_slices = project_slices(slices, events)?;
+    let (ordered_stages, integration, next_transition) =
+        project_ordered_state(root, slices, &projected_slices);
     let mut model = Map::new();
+    model.insert("schema_version".to_string(), Value::from(2));
     model.insert("revision".to_string(), value_at(root, "revision")?.clone());
     model.insert("phase".to_string(), value_at(fsm, "phase")?.clone());
     model.insert("waiting".to_string(), value_at(fsm, "waiting")?.clone());
@@ -131,10 +135,7 @@ fn project_state(
         "ledger_sequence_status".to_string(),
         Value::String(sequence_status(events)),
     );
-    model.insert(
-        "slices".to_string(),
-        Value::Object(project_slices(slices, events)?),
-    );
+    model.insert("slices".to_string(), Value::Object(projected_slices));
     model.insert(
         "budgets".to_string(),
         project_budgets(object_at(root, "budgets")?)?,
@@ -153,7 +154,265 @@ fn project_state(
                 .collect(),
         ),
     );
+    model.insert(
+        "current_order".to_string(),
+        root.get("current_order")
+            .cloned()
+            .unwrap_or_else(|| Value::from(1)),
+    );
+    model.insert("ordered_stages".to_string(), ordered_stages);
+    model.insert("integration".to_string(), integration);
+    model.insert("next_transition".to_string(), next_transition);
     Ok(model)
+}
+
+fn project_ordered_state(
+    root: &Map<String, Value>,
+    slices: &Map<String, Value>,
+    projected_slices: &Map<String, Value>,
+) -> (Value, Value, Value) {
+    let integration = root.get("integration").and_then(Value::as_object);
+    let sub_states = integration
+        .and_then(|value| value.get("sub_tl_states"))
+        .and_then(Value::as_object);
+    let current_order = root
+        .get("current_order")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let stage_values = root
+        .get("ordered_stages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut lifecycle_values = Vec::new();
+    let stages = stage_values
+        .iter()
+        .enumerate()
+        .map(|(index, raw_stage)| {
+            let stage = raw_stage.as_object();
+            let order = stage
+                .and_then(|value| value.get("order"))
+                .and_then(Value::as_u64)
+                .unwrap_or(index as u64 + 1);
+            let children = stage
+                .and_then(|value| value.get("sub_tls"))
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let sub_tls = children
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|slice_id| {
+                    let slice = slices.get(slice_id).and_then(Value::as_object);
+                    let projected = projected_slices.get(slice_id).and_then(Value::as_object);
+                    let lifecycle = sub_states
+                        .and_then(|states| states.get(slice_id))
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| inferred_lifecycle(slice));
+                    lifecycle_values.push(lifecycle.to_string());
+                    let head_sha = slice
+                        .and_then(|value| value.get("reviewed_head"))
+                        .cloned()
+                        .filter(|value| !value.is_null())
+                        .or_else(|| optional_field(integration, "aggregate_head_sha"));
+                    let review_state = current_head_field(projected, "review_state");
+                    let integration_ci = current_head_field(projected, "ci_status")
+                        .or_else(|| optional_field(integration, "ci_status"))
+                        .unwrap_or_else(|| Value::String("unknown".to_string()));
+                    let status = optional_field(slice, "status").unwrap_or(Value::Null);
+                    let repair_count =
+                        optional_field(slice, "repair_attempts").unwrap_or_else(|| Value::from(0));
+                    let stage_verification = if order == current_order {
+                        optional_field(integration, "stage_verification")
+                            .unwrap_or_else(|| Value::String("pending".to_string()))
+                    } else {
+                        Value::String("pending".to_string())
+                    };
+                    let mut child = Map::new();
+                    child.insert("id".to_string(), Value::String(slice_id.to_string()));
+                    child.insert(
+                        "lifecycle".to_string(),
+                        Value::String(lifecycle.to_string()),
+                    );
+                    child.insert("status".to_string(), status);
+                    child.insert(
+                        "aggregate_pr_number".to_string(),
+                        optional_field(slice, "pr_number")
+                            .or_else(|| optional_field(integration, "aggregate_pr_number"))
+                            .unwrap_or(Value::Null),
+                    );
+                    child.insert("head_sha".to_string(), head_sha.unwrap_or(Value::Null));
+                    child.insert(
+                        "validated_base_sha".to_string(),
+                        optional_field(integration, "validated_base_sha").unwrap_or(Value::Null),
+                    );
+                    child.insert(
+                        "merge_tree_sha".to_string(),
+                        optional_field(integration, "merge_tree_sha").unwrap_or(Value::Null),
+                    );
+                    child.insert(
+                        "review_state".to_string(),
+                        review_state.unwrap_or(Value::Null),
+                    );
+                    child.insert("integration_ci".to_string(), integration_ci);
+                    child.insert(
+                        "revalidation_count".to_string(),
+                        optional_field(integration, "base_revalidation_count")
+                            .unwrap_or_else(|| Value::from(0)),
+                    );
+                    child.insert("repair_count".to_string(), repair_count);
+                    child.insert(
+                        "park_cause".to_string(),
+                        optional_field(slice, "park_cause").unwrap_or(Value::Null),
+                    );
+                    child.insert("stage_verification".to_string(), stage_verification);
+                    child.insert(
+                        "owner_id".to_string(),
+                        optional_field(integration, "integration_owner_id").unwrap_or(Value::Null),
+                    );
+                    Value::Object(child)
+                })
+                .collect::<Vec<_>>();
+            let mut projected_stage = Map::new();
+            projected_stage.insert("order".to_string(), Value::from(order));
+            projected_stage.insert("sub_tls".to_string(), Value::Array(sub_tls));
+            Value::Object(projected_stage)
+        })
+        .collect::<Vec<_>>();
+
+    let mut projected_integration = Map::new();
+    projected_integration.insert(
+        "lifecycle".to_string(),
+        optional_field(integration, "lifecycle")
+            .unwrap_or_else(|| Value::String("RUNNING".to_string())),
+    );
+    for (output, input) in [
+        ("aggregate_pr_number", "aggregate_pr_number"),
+        ("head_sha", "head_sha"),
+        ("validated_base_sha", "validated_base_sha"),
+        ("merge_tree_sha", "merge_tree_sha"),
+        ("ci_status", "ci_status"),
+        ("base_revalidation_count", "base_revalidation_count"),
+        ("merge_attempts", "merge_attempts"),
+        ("stage_verification", "stage_verification"),
+        ("owner_id", "integration_owner_id"),
+    ] {
+        let value = if output == "head_sha" {
+            optional_field(integration, "head_sha")
+                .or_else(|| optional_field(integration, "aggregate_head_sha"))
+        } else {
+            optional_field(integration, input)
+        };
+        projected_integration.insert(
+            output.to_string(),
+            value.unwrap_or_else(|| default_integration_value(output)),
+        );
+    }
+    let next_transition = next_transition(
+        root,
+        &lifecycle_values,
+        projected_integration
+            .get("lifecycle")
+            .and_then(Value::as_str)
+            .unwrap_or("RUNNING"),
+        projected_integration
+            .get("owner_id")
+            .and_then(Value::as_str),
+    );
+    (
+        Value::Array(stages),
+        Value::Object(projected_integration),
+        Value::String(next_transition),
+    )
+}
+
+fn optional_field(object: Option<&Map<String, Value>>, key: &str) -> Option<Value> {
+    object.and_then(|value| value.get(key)).cloned()
+}
+
+fn default_integration_value(key: &str) -> Value {
+    match key {
+        "ci_status" => Value::String("unknown".to_string()),
+        "base_revalidation_count" | "merge_attempts" => Value::from(0),
+        "stage_verification" => Value::String("pending".to_string()),
+        _ => Value::Null,
+    }
+}
+
+fn current_head_field(projected_slice: Option<&Map<String, Value>>, key: &str) -> Option<Value> {
+    let heads = projected_slice
+        .and_then(|slice| slice.get("heads"))
+        .and_then(Value::as_array)?;
+    heads.iter().find_map(|head| {
+        let object = head.as_object()?;
+        if object.get("is_current").and_then(Value::as_bool) == Some(true) {
+            object.get(key).cloned()
+        } else {
+            None
+        }
+    })
+}
+
+fn inferred_lifecycle(slice: Option<&Map<String, Value>>) -> &'static str {
+    match slice
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+    {
+        Some("merged") => "MERGED",
+        Some("parked") => "PARKED",
+        Some("failed") | Some("dispatch_failed") => "FAILED",
+        Some("repairing") => "REPAIRING_AGGREGATE",
+        Some("in_review") => "CODE_REVIEWED",
+        _ => "RUNNING",
+    }
+}
+
+fn next_transition(
+    root: &Map<String, Value>,
+    lifecycles: &[String],
+    integration_lifecycle: &str,
+    owner_id: Option<&str>,
+) -> String {
+    if let Some(gate) = root
+        .get("gates")
+        .and_then(Value::as_array)
+        .and_then(|gates| {
+            gates.iter().find_map(|gate| {
+                let object = gate.as_object()?;
+                (object.get("status").and_then(Value::as_str) == Some("pending")).then(|| {
+                    object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                })
+            })
+        })
+    {
+        return format!("answer_gate:{gate}");
+    }
+    if lifecycles
+        .iter()
+        .any(|state| state == "INTEGRATION_CONFLICT")
+        || integration_lifecycle == "INTEGRATION_CONFLICT"
+    {
+        return format!("resume_pr:{}", owner_id.unwrap_or("aggregate"));
+    }
+    if lifecycles
+        .iter()
+        .any(|state| state == "NEEDS_BASE_REVALIDATION")
+    {
+        return "revalidate_base_and_integration_ci".to_string();
+    }
+    if lifecycles
+        .iter()
+        .any(|state| state == "READY_FOR_INTEGRATION")
+    {
+        return "validate_integration_evidence".to_string();
+    }
+    if integration_lifecycle == "MERGED" {
+        return "complete_ordered_stage".to_string();
+    }
+    "await_controller".to_string()
 }
 
 fn validate_transition_limit(limit: Option<usize>) -> Result<(), ReadModelError> {
@@ -528,6 +787,11 @@ mod tests {
         .unwrap();
 
         let model = read_run_model(project.path(), "run-1", None).unwrap();
+        assert_eq!(model["schema_version"], 2);
+        assert_eq!(model["current_order"], 1);
+        assert_eq!(model["ordered_stages"].as_array().unwrap().len(), 0);
+        assert_eq!(model["integration"]["lifecycle"], "RUNNING");
+        assert_eq!(model["next_transition"], "await_controller");
         assert_eq!(model["ledger_cursor"], 2);
         assert_eq!(model["ledger_sequence_status"], "complete");
         assert_eq!(model["recent_transitions"].as_array().unwrap().len(), 2);
@@ -539,6 +803,62 @@ mod tests {
         assert!(!serialized.contains("private body"));
         assert!(!serialized.contains("rationale"));
         assert!(!serialized.contains("not consumed"));
+    }
+
+    #[test]
+    fn read_projection_exposes_partial_ordered_progress() {
+        let project = tempdir().unwrap();
+        let state_dir = project.path().join(".exo/tl-loop/run-ordered");
+        fs::create_dir_all(&state_dir).unwrap();
+        let state = serde_json::json!({
+            "revision": 4,
+            "run_id": "run-ordered",
+            "fsm": {"phase": "TLWaiting", "waiting": ["stage-a"]},
+            "slices": {
+                "stage-a": {
+                    "status": "in_review",
+                    "pr_number": 17,
+                    "reviewed_head": "head-a",
+                    "review_findings": {},
+                    "ci_state": {"head-a": "success"},
+                    "reviewer_attempt": {},
+                    "repair_attempts": 2
+                }
+            },
+            "budgets": {"ledger": {}},
+            "gates": [],
+            "events": {"last_consumed_offset": 0},
+            "current_order": 2,
+            "ordered_stages": [{"order": 2, "sub_tls": ["stage-a"]}],
+            "integration": {
+                "lifecycle": "READY_FOR_INTEGRATION",
+                "sub_tl_states": {"stage-a": "READY_FOR_INTEGRATION"},
+                "aggregate_pr_number": 17,
+                "aggregate_head_sha": "head-a",
+                "validated_base_sha": "base-a",
+                "merge_tree_sha": null,
+                "ci_status": "success",
+                "base_revalidation_count": 1,
+                "merge_attempts": 0,
+                "stage_verification": "passed",
+                "integration_owner_id": "aggregate-owner"
+            }
+        });
+        fs::write(
+            state_dir.join("run.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        let model = read_run_model(project.path(), "run-ordered", None).unwrap();
+        let stage = &model["ordered_stages"][0];
+        assert_eq!(stage["order"], 2);
+        assert_eq!(stage["sub_tls"][0]["id"], "stage-a");
+        assert_eq!(stage["sub_tls"][0]["lifecycle"], "READY_FOR_INTEGRATION");
+        assert_eq!(stage["sub_tls"][0]["integration_ci"], "success");
+        assert_eq!(stage["sub_tls"][0]["repair_count"], 2);
+        assert_eq!(model["integration"]["validated_base_sha"], "base-a");
+        assert_eq!(model["next_transition"], "validate_integration_evidence");
     }
 
     #[test]

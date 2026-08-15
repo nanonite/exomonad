@@ -1425,6 +1425,9 @@ def _run_sub_tls(
             return _fail_recursive_parent(
                 state, config, effects, store, effects_log, "recursive child is not recoverable"
             )
+        was_stage_complete = all(
+            current is not None and current.status is SliceStatus.MERGED for current in stage_states
+        )
         pending = tuple(
             task
             for task, current in zip(stage_tasks, stage_states)
@@ -1436,12 +1439,36 @@ def _run_sub_tls(
             state = _integrate_stage_candidates(
                 stage_tasks, state, config, effects, store, effects_log
             )
+            _emit_stage_completion(
+                stage,
+                state,
+                was_stage_complete,
+                config,
+                effects,
+                effects_log,
+            )
             if any(
                 state.slices[task.name].status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
                 for task in stage_tasks
             ):
                 break
             continue
+        if not any(
+            current is not None and current.status is not SliceStatus.PENDING
+            for current in stage_states
+        ):
+            _record_controller_event(
+                "controller",
+                "tl.stage_started",
+                {
+                    "order": stage.order,
+                    "sub_tl_ids": list(stage.sub_tls),
+                    "run_id": store.run_id,
+                },
+                config,
+                effects,
+                effects_log,
+            )
         _validate_stage_event_routes(pending)
         if config.max_parallel_slices == 0:
             raise LoopLimitExceeded("max_parallel_slices must permit one recursive child")
@@ -1460,6 +1487,14 @@ def _run_sub_tls(
                     state, config, effects, store, effects_log, "recursive child failed"
                 )
         state = _integrate_stage_candidates(stage_tasks, state, config, effects, store, effects_log)
+        _emit_stage_completion(
+            stage,
+            state,
+            was_stage_complete,
+            config,
+            effects,
+            effects_log,
+        )
         if any(
             state.slices[task.name].status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
             for task in stage_tasks
@@ -1508,6 +1543,34 @@ def _run_sub_tls(
             effects_log,
         )
     return state
+
+
+def _emit_stage_completion(
+    stage: OrderedStage,
+    state: RunState,
+    was_complete: bool,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    """Publish one durable completion observation for an ordered stage."""
+    if was_complete or any(
+        state.slices[slice_id].status is not SliceStatus.MERGED
+        for slice_id in stage.sub_tls
+        if slice_id in state.slices
+    ):
+        return
+    _record_controller_event(
+        "controller",
+        "tl.stage_completed",
+        {
+            "order": stage.order,
+            "sub_tl_ids": list(stage.sub_tls),
+        },
+        config,
+        effects,
+        effects_log,
+    )
 
 
 def _prepare_sub_tl_stage(
@@ -1975,6 +2038,19 @@ def _handle_external_base_change(
     patch_digest: str,
     reason: str,
 ) -> RunState:
+    _record_controller_event(
+        task.name,
+        "tl.integration_base_invalidated",
+        {
+            "slice_id": task.name,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "reason": reason[:500],
+        },
+        config,
+        effects,
+        effects_log,
+    )
     if state.integration.base_revalidation_count >= config.max_base_revalidations:
         return _open_integration_gate(
             task,
@@ -2078,6 +2154,20 @@ def _handle_integration_conflict(
         effects,
         effects_log,
     )
+    _record_controller_event(
+        task.name,
+        "tl.integration_repair_requested",
+        {
+            "slice_id": task.name,
+            "pr_number": current.pr_number,
+            "owner_id": current.dispatch_agent_id,
+            "reason": reason[:500],
+            "repair_attempt": current.repair_attempts + 1,
+        },
+        config,
+        effects,
+        effects_log,
+    )
     repairing = replace(
         conflict,
         lifecycle=IntegrationLifecycle.REPAIRING_AGGREGATE,
@@ -2163,6 +2253,21 @@ def _integrate_one_candidate(
         ordered_stages=state.ordered_stages,
         integration=integration,
     )
+    _record_controller_event(
+        task.name,
+        "tl.integration_validated",
+        {
+            "slice_id": task.name,
+            "pr_number": current.pr_number,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "merge_tree_sha": merge_tree_sha,
+            "ci_status": ci_status,
+        },
+        config,
+        effects,
+        effects_log,
+    )
     second = _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if second is None:
         return state
@@ -2205,6 +2310,15 @@ def _integrate_one_candidate(
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
         integration=replace(integration, lifecycle=IntegrationLifecycle.MERGING),
+    )
+    _emit_merge_decision(
+        task.name,
+        current.pr_number,
+        "merge",
+        head_sha,
+        config,
+        effects,
+        effects_log,
     )
     arguments = {
         "pr_number": current.pr_number,

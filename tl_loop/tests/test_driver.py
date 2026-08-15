@@ -1565,6 +1565,19 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) ->
 
     assert result.final_state.slices["aggregate-child"].status is SliceStatus.MERGED
     assert [name for name, _ in transport.calls if name == "merge_pr"] == ["merge_pr"]
+    event_types = {
+        arguments["event_type"]
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    }
+    assert {
+        "tl.stage_started",
+        "tl.stage_completed",
+        "tl.aggregate_pr_opened",
+        "tl.integration_validated",
+        "tl.integration_revalidated",
+        "tl.merge_decided",
+    } <= event_types
 
 
 def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path) -> None:

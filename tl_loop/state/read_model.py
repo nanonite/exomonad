@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import TypeAlias
 
 from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.reader import SequenceStatus
+from tl_loop.ordered import IntegrationLifecycle
 
 from .schema import BudgetCharge, BudgetLedger, RunState, SliceState, Verdict
 
@@ -102,6 +103,91 @@ class SliceReadModel:
             "dispatch_error": self.dispatch_error,
             "dispatch_agent_id": self.dispatch_agent_id,
             "dispatch_authoritative_event_seq": self.dispatch_authoritative_event_seq,
+        }
+
+
+@dataclass(frozen=True)
+class OrderedSubTLReadModel:
+    """Operator-safe progress for one ordered sub-TL."""
+
+    id: str
+    lifecycle: str
+    status: str
+    aggregate_pr_number: int | None
+    head_sha: str | None
+    validated_base_sha: str | None
+    merge_tree_sha: str | None
+    review_state: str | None
+    integration_ci: str
+    revalidation_count: int
+    repair_count: int
+    park_cause: str | None
+    stage_verification: str
+    owner_id: str | None
+
+    def to_document(self) -> dict[str, object]:
+        """Return the bounded progress representation."""
+        return {
+            "id": self.id,
+            "lifecycle": self.lifecycle,
+            "status": self.status,
+            "aggregate_pr_number": self.aggregate_pr_number,
+            "head_sha": self.head_sha,
+            "validated_base_sha": self.validated_base_sha,
+            "merge_tree_sha": self.merge_tree_sha,
+            "review_state": self.review_state,
+            "integration_ci": self.integration_ci,
+            "revalidation_count": self.revalidation_count,
+            "repair_count": self.repair_count,
+            "park_cause": self.park_cause,
+            "stage_verification": self.stage_verification,
+            "owner_id": self.owner_id,
+        }
+
+
+@dataclass(frozen=True)
+class OrderedStageReadModel:
+    """One order and the sub-TLs that execute in that order."""
+
+    order: int
+    sub_tls: tuple[OrderedSubTLReadModel, ...]
+
+    def to_document(self) -> dict[str, object]:
+        """Return the grouped stage representation."""
+        return {
+            "order": self.order,
+            "sub_tls": [sub_tl.to_document() for sub_tl in self.sub_tls],
+        }
+
+
+@dataclass(frozen=True)
+class IntegrationReadModel:
+    """Aggregate integration evidence visible to operators."""
+
+    lifecycle: str
+    aggregate_pr_number: int | None
+    head_sha: str | None
+    validated_base_sha: str | None
+    merge_tree_sha: str | None
+    ci_status: str
+    base_revalidation_count: int
+    merge_attempts: int
+    stage_verification: str
+    owner_id: str | None
+
+    def to_document(self) -> dict[str, object]:
+        """Return the body-free integration representation."""
+        return {
+            "lifecycle": self.lifecycle,
+            "aggregate_pr_number": self.aggregate_pr_number,
+            "head_sha": self.head_sha,
+            "validated_base_sha": self.validated_base_sha,
+            "merge_tree_sha": self.merge_tree_sha,
+            "ci_status": self.ci_status,
+            "base_revalidation_count": self.base_revalidation_count,
+            "merge_attempts": self.merge_attempts,
+            "stage_verification": self.stage_verification,
+            "owner_id": self.owner_id,
         }
 
 
@@ -225,10 +311,29 @@ class ReadModel:
     gates: tuple[GateReadModel, ...]
     park_causes: Mapping[str, str]
     recent_transitions: tuple[TransitionReadModel, ...]
+    schema_version: int = 2
+    current_order: int = 1
+    ordered_stages: tuple[OrderedStageReadModel, ...] = ()
+    integration: IntegrationReadModel = field(
+        default_factory=lambda: IntegrationReadModel(
+            lifecycle=IntegrationLifecycle.RUNNING.value,
+            aggregate_pr_number=None,
+            head_sha=None,
+            validated_base_sha=None,
+            merge_tree_sha=None,
+            ci_status="unknown",
+            base_revalidation_count=0,
+            merge_attempts=0,
+            stage_verification="pending",
+            owner_id=None,
+        )
+    )
+    next_transition: str = "await_controller"
 
     def to_document(self) -> dict[str, object]:
         """Return a stable JSON document without agent-authored bodies."""
         return {
+            "schema_version": self.schema_version,
             "run_id": self.run_id,
             "revision": self.revision,
             "phase": self.phase,
@@ -244,6 +349,10 @@ class ReadModel:
             "recent_transitions": [
                 transition.to_document() for transition in self.recent_transitions
             ],
+            "current_order": self.current_order,
+            "ordered_stages": [stage.to_document() for stage in self.ordered_stages],
+            "integration": self.integration.to_document(),
+            "next_transition": self.next_transition,
         }
 
 
@@ -283,6 +392,8 @@ def project_read_model(
         if recent_transition_limit
         else ()
     )
+    ordered_stages = _ordered_stage_models(state, slices)
+    integration = _integration_model(state)
     return ReadModel(
         run_id=state.run_id,
         revision=state.revision,
@@ -295,7 +406,135 @@ def project_read_model(
         gates=tuple(GateReadModel(gate.name, gate.status.value) for gate in state.gates),
         park_causes=MappingProxyType(park_causes),
         recent_transitions=recent,
+        current_order=state.current_order,
+        ordered_stages=ordered_stages,
+        integration=integration,
+        next_transition=_next_transition(state, ordered_stages, integration),
     )
+
+
+def _integration_model(state: RunState) -> IntegrationReadModel:
+    integration = state.integration
+    return IntegrationReadModel(
+        lifecycle=integration.lifecycle.value,
+        aggregate_pr_number=integration.aggregate_pr_number,
+        head_sha=integration.head_sha or integration.aggregate_head_sha,
+        validated_base_sha=integration.validated_base_sha,
+        merge_tree_sha=integration.merge_tree_sha,
+        ci_status=integration.ci_status,
+        base_revalidation_count=integration.base_revalidation_count,
+        merge_attempts=integration.merge_attempts,
+        stage_verification=integration.stage_verification,
+        owner_id=integration.integration_owner_id,
+    )
+
+
+def _ordered_stage_models(
+    state: RunState,
+    slices: Mapping[str, SliceReadModel],
+) -> tuple[OrderedStageReadModel, ...]:
+    integration = state.integration
+    models: list[OrderedStageReadModel] = []
+    for stage in state.ordered_stages:
+        children: list[OrderedSubTLReadModel] = []
+        for slice_id in stage.sub_tls:
+            slice_model = slices.get(slice_id)
+            if slice_model is None:
+                continue
+            lifecycle = integration.sub_tl_states.get(slice_id)
+            lifecycle_value = (
+                lifecycle.value if lifecycle is not None else _lifecycle_for_slice(slice_model)
+            )
+            head_sha = slice_model.reviewed_head or integration.aggregate_head_sha
+            review_state = _current_review_state(slice_model)
+            ci_status = _current_ci_status(slice_model) or integration.ci_status
+            stage_verification = (
+                integration.stage_verification if stage.order == state.current_order else "pending"
+            )
+            children.append(
+                OrderedSubTLReadModel(
+                    id=slice_id,
+                    lifecycle=lifecycle_value,
+                    status=slice_model.status,
+                    aggregate_pr_number=slice_model.pr_number or integration.aggregate_pr_number,
+                    head_sha=head_sha,
+                    validated_base_sha=integration.validated_base_sha,
+                    merge_tree_sha=integration.merge_tree_sha,
+                    review_state=review_state,
+                    integration_ci=ci_status,
+                    revalidation_count=integration.base_revalidation_count,
+                    repair_count=slice_model.repair_attempts,
+                    park_cause=slice_model.park_cause,
+                    stage_verification=stage_verification,
+                    owner_id=integration.integration_owner_id,
+                )
+            )
+        models.append(OrderedStageReadModel(stage.order, tuple(children)))
+    return tuple(models)
+
+
+def _lifecycle_for_slice(slice_model: SliceReadModel) -> str:
+    if slice_model.status == "merged":
+        return IntegrationLifecycle.MERGED.value
+    if slice_model.status == "parked":
+        return IntegrationLifecycle.PARKED.value
+    if slice_model.status in {"failed", "dispatch_failed"}:
+        return IntegrationLifecycle.FAILED.value
+    if slice_model.status == "repairing":
+        return IntegrationLifecycle.REPAIRING_AGGREGATE.value
+    if slice_model.status == "in_review":
+        if slice_model.verdict in {"GO", "GO-WITH-NITS"}:
+            return IntegrationLifecycle.READY_FOR_INTEGRATION.value
+        return IntegrationLifecycle.CODE_REVIEWED.value
+    return IntegrationLifecycle.RUNNING.value
+
+
+def _current_review_state(slice_model: SliceReadModel) -> str | None:
+    for head in slice_model.heads:
+        if head.is_current:
+            return head.review_state
+    return None
+
+
+def _current_ci_status(slice_model: SliceReadModel) -> str | None:
+    for head in slice_model.heads:
+        if head.is_current:
+            return head.ci_status
+    return None
+
+
+def _next_transition(
+    state: RunState,
+    stages: tuple[OrderedStageReadModel, ...],
+    integration: IntegrationReadModel,
+) -> str:
+    pending_gate = next(
+        (gate.name for gate in state.gates if gate.status.value == "pending"),
+        None,
+    )
+    if pending_gate is not None:
+        return f"answer_gate:{pending_gate}"
+    lifecycles = [sub_tl.lifecycle for stage in stages for sub_tl in stage.sub_tls]
+    if IntegrationLifecycle.INTEGRATION_CONFLICT.value in lifecycles:
+        return f"resume_pr:{integration.owner_id or 'aggregate'}"
+    if IntegrationLifecycle.NEEDS_BASE_REVALIDATION.value in lifecycles:
+        return "revalidate_base_and_integration_ci"
+    if IntegrationLifecycle.READY_FOR_INTEGRATION.value in lifecycles:
+        return "validate_integration_evidence"
+    if integration.lifecycle == IntegrationLifecycle.INTEGRATION_CONFLICT.value:
+        return f"resume_pr:{integration.owner_id or 'aggregate'}"
+    if any(
+        slice_model.status in {"pending", "ready", "spawned", "dispatching"}
+        for slice_model in state.slices.values()
+    ):
+        return "await_sub_tl_completion"
+    if any(
+        slice_model.status in {"in_review", "repairing"} for slice_model in state.slices.values()
+    ):
+        return "await_review_or_ci"
+    if integration.lifecycle == IntegrationLifecycle.MERGED.value and stages:
+        return "complete_ordered_stage"
+    return "await_controller"
 
 
 def _events_at_cursor(events: Iterable[EventEnvelope], cursor: int) -> tuple[EventEnvelope, ...]:
@@ -492,6 +731,9 @@ __all__ = [
     "BudgetReadModel",
     "GateReadModel",
     "HeadEvidence",
+    "IntegrationReadModel",
+    "OrderedStageReadModel",
+    "OrderedSubTLReadModel",
     "ReadModel",
     "RecentLimit",
     "SliceReadModel",

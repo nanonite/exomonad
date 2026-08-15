@@ -9,7 +9,8 @@ from typing import cast
 from tl_loop.events.envelope import project
 from tl_loop.events.reader import SequenceStatus
 from tl_loop.fsm.phase import TLPhase
-from tl_loop.state.read_model import project_read_model
+from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.state.read_model import GateReadModel, project_read_model
 from tl_loop.state.schema import (
     BudgetCharge,
     BudgetLedger,
@@ -17,13 +18,14 @@ from tl_loop.state.schema import (
     FSMState,
     GateState,
     GateStatus,
+    IntegrationRuntimeState,
+    OrderedStageState,
     ParkCause,
     RunState,
     SliceState,
     SliceStatus,
     Verdict,
 )
-from tl_loop.state.read_model import GateReadModel
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ledger_projection_events.json"
 
@@ -80,6 +82,47 @@ def test_projection_ignores_events_after_state_cursor() -> None:
 
     assert model.recent_transitions
     assert max(transition.run_seq for transition in model.recent_transitions) == 112
+
+
+def test_projection_exposes_ordered_progress_and_next_transition() -> None:
+    state = _state()
+    state = RunState(
+        **{
+            **state.__dict__,
+            "current_order": 1,
+            "ordered_stages": (OrderedStageState(1, ("task-a",)),),
+            "integration": IntegrationRuntimeState(
+                lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
+                sub_tl_states={"task-a": IntegrationLifecycle.READY_FOR_INTEGRATION},
+                aggregate_pr_number=101,
+                aggregate_head_sha="bbb222",
+                integration_owner_id="aggregate-owner",
+                head_sha="bbb222",
+                validated_base_sha="base-1",
+                merge_tree_sha="tree-1",
+                ci_status="success",
+                merge_attempts=3,
+                base_revalidation_count=2,
+                stage_verification="passed",
+            ),
+        }
+    )
+
+    document = project_read_model(state).to_document()
+
+    assert document["schema_version"] == 2
+    assert document["current_order"] == 1
+    stage = cast(list[dict[str, object]], document["ordered_stages"])[0]
+    sub_tl = cast(list[dict[str, object]], stage["sub_tls"])[0]
+    assert sub_tl["lifecycle"] == "READY_FOR_INTEGRATION"
+    assert sub_tl["aggregate_pr_number"] == 101
+    assert sub_tl["validated_base_sha"] == "base-1"
+    assert sub_tl["integration_ci"] == "success"
+    assert sub_tl["repair_count"] == 1
+    integration = cast(dict[str, object], document["integration"])
+    assert integration["merge_tree_sha"] == "tree-1"
+    assert integration["base_revalidation_count"] == 2
+    assert document["next_transition"] == "answer_gate:review"
 
 
 def _state() -> RunState:
