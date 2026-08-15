@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -21,6 +23,7 @@ from tl_loop.loop.driver import (
     DepthLimitExceeded,
     LoopLimitExceeded,
     SubTLTask,
+    TLLoopError,
     TLLoopConfig,
     TLRunResult,
     WorkerTask,
@@ -1274,6 +1277,132 @@ def test_recursive_depth_ceiling_parks_schedule_deadlock(tmp_path: Path) -> None
     state = load_state(tmp_path / "depth-run" / "run.json")
     assert state.fsm.phase is TLPhase.TLFailed
     assert state.slices["child"].status.value == "parked"
+
+
+def test_same_order_sub_tls_overlap_and_wait_for_prior_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    first_stage = threading.Barrier(2)
+    timeline: list[tuple[str, str]] = []
+
+    def fake_tl_run(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
+        del config, budgets
+        name = cast(dict[str, object], root_spec)["run_id"]
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            timeline.append(("start", cast(str, name)))
+        if name in {"stage-one-a", "stage-one-b"}:
+            first_stage.wait(timeout=2)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+            timeline.append(("end", cast(str, name)))
+        return SimpleNamespace(
+            final_state=SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLDone), slices={})
+        )
+
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", fake_tl_run)
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("stage-one-a", WorkPlan(), order=1),
+            SubTLTask("stage-one-b", WorkPlan(), order=1),
+            SubTLTask("stage-two", WorkPlan(), order=2),
+        )
+    )
+    result = run_tl_loop(
+        "ordered-concurrency-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=TLLoopConfig(max_parallel_slices=2, poll_interval=0.001, idle_timeout=0.1),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    assert maximum == 2
+    assert timeline.index(("start", "stage-two")) > timeline.index(("end", "stage-one-a"))
+    assert timeline.index(("start", "stage-two")) > timeline.index(("end", "stage-one-b"))
+
+
+def test_ordered_sub_tl_restart_does_not_rerun_merged_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def fake_tl_run(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
+        del config, budgets
+        calls.append(cast(str, cast(dict[str, object], root_spec)["run_id"]))
+        return SimpleNamespace(
+            final_state=SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLDone), slices={})
+        )
+
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", fake_tl_run)
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("restart-a", WorkPlan(), order=1),
+            SubTLTask("restart-b", WorkPlan(), order=1),
+        )
+    )
+    config = TLLoopConfig(max_parallel_slices=2, poll_interval=0.001, idle_timeout=0.1)
+    run_tl_loop("restart-run", plan, SyntheticQueue([]), EffectClient(RecordingTransport()), config=config, root_dir=tmp_path)
+    run_tl_loop("restart-run", plan, SyntheticQueue([]), EffectClient(RecordingTransport()), config=config, root_dir=tmp_path)
+
+    assert sorted(calls) == ["restart-a", "restart-b"]
+
+
+def test_ordered_sub_tl_restart_adopts_terminal_child_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_dir = tmp_path / "adopt-run"
+    run_tl_loop(
+        "adopt-child",
+        WorkPlan(),
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=_config(),
+        root_dir=parent_dir,
+    )
+
+    def unexpected_child_run(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
+        del root_spec, config, budgets
+        raise AssertionError("a terminal child checkpoint must be adopted")
+
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", unexpected_child_run)
+    result = run_tl_loop(
+        "adopt-run",
+        WorkPlan(sub_tls=(SubTLTask("adopt-child", WorkPlan(), order=1),)),
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=_config(),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.slices["adopt-child"].status is SliceStatus.MERGED
+
+
+def test_same_order_event_consumers_require_isolated_sources(tmp_path: Path) -> None:
+    eventful = WorkPlan(workers=(WorkerTask("worker", "consume"),))
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("event-a", eventful),
+            SubTLTask("event-b", eventful),
+        )
+    )
+
+    with pytest.raises(TLLoopError, match="isolated sources"):
+        run_tl_loop(
+            "routing-run",
+            plan,
+            SyntheticQueue([]),
+            EffectClient(RecordingTransport()),
+            config=TLLoopConfig(max_parallel_slices=2),
+            root_dir=tmp_path,
+        )
 
 
 __all__ = [

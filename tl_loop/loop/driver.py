@@ -7,6 +7,7 @@ import hashlib
 import logging
 import queue as queue_module
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
@@ -1354,13 +1355,85 @@ def _run_sub_tls(
     store: RunStore,
     effects_log: list[EffectIntent],
 ) -> RunState:
-    """Run direct recursive children and retain only terminal child state."""
-    for task in plan.sub_tls:
-        current = state.slices.get(task.name)
-        if current is None:
-            raise TLLoopError(f"recursive slice {task.name!r} is missing")
-        if current.status is not SliceStatus.PENDING:
+    """Run recursive children in deterministic, bounded order batches."""
+    if not plan.sub_tls:
+        return state
+    tasks_by_name = {task.name: task for task in plan.sub_tls}
+    for stage in plan.ordered_stages:
+        stage_tasks = tuple(tasks_by_name[name] for name in stage.sub_tls)
+        state = store.load()
+        stage_states = [state.slices.get(task.name) for task in stage_tasks]
+        if any(current is None for current in stage_states):
+            missing = next(
+                task.name for task, current in zip(stage_tasks, stage_states) if current is None
+            )
+            raise TLLoopError(f"recursive slice {missing!r} is missing")
+        if any(
+            current.status in {SliceStatus.FAILED, SliceStatus.PARKED}
+            for current in stage_states
+            if current is not None
+        ):
+            return _fail_recursive_parent(
+                state, config, effects, store, effects_log, "recursive child is not recoverable"
+            )
+        pending = tuple(
+            task
+            for task, current in zip(stage_tasks, stage_states)
+            if current is not None and current.status not in {SliceStatus.MERGED}
+        )
+        if not pending:
             continue
+        _validate_stage_event_routes(pending)
+        if config.max_parallel_slices == 0:
+            raise LoopLimitExceeded("max_parallel_slices must permit one recursive child")
+        state, spawned = _prepare_sub_tl_stage(
+            pending, state, config, source, effects, store, effects_log, stage.order
+        )
+        width = config.max_parallel_slices or len(spawned)
+        for batch_start in range(0, len(spawned), width):
+            batch = spawned[batch_start : batch_start + width]
+            outcomes = _run_sub_tl_batch(
+                batch, config, source, effects, store, state.budgets
+            )
+            state = _complete_sub_tl_batch(
+                batch, outcomes, state, config, effects, store, effects_log
+            )
+            if any(status is SliceStatus.FAILED for _, status, _ in outcomes):
+                return _fail_recursive_parent(
+                    state, config, effects, store, effects_log, "recursive child failed"
+                )
+    if plan.sub_tls and not plan.workers and not plan.leaves:
+        before_phase = _phase_from_state(state)
+        state = store.checkpoint(
+            TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
+        )
+        _emit_phase_change(
+            store.run_id,
+            before_phase,
+            _phase_from_state(state),
+            config,
+            effects,
+            effects_log,
+        )
+    return state
+
+
+def _prepare_sub_tl_stage(
+    tasks: Sequence[SubTLTask],
+    state: RunState,
+    config: TLLoopConfig,
+    source: EventQueue,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    order: int,
+) -> tuple[RunState, tuple[SubTLTask, ...]]:
+    """Persist every owner before launching a same-order batch."""
+    del source
+    updated_slices = dict(state.slices)
+    prepared: list[SubTLTask] = []
+    for task in tasks:
+        current = state.slices[task.name]
         branch = derive_child_branch(config.branch, task.name)
         worktree = str(
             task.worktree
@@ -1373,11 +1446,15 @@ def _run_sub_tls(
             parked = replace(
                 current, status=SliceStatus.PARKED, park_cause=ParkCause.SCHEDULE_DEADLOCK
             )
+            failed_slices = {**state.slices, task.name: parked}
             state = store.checkpoint(
                 TLFailed(f"depth ceiling reached for {task.name}"),
-                {**state.slices, task.name: parked},
+                failed_slices,
                 state.budgets,
                 state.events.last_consumed_offset,
+                current_order=order,
+                ordered_stages=state.ordered_stages,
+                integration=state.integration,
             )
             _emit_slice_status_changes(
                 {task.name: current},
@@ -1407,139 +1484,177 @@ def _run_sub_tls(
                 effects_log,
             )
             raise DepthLimitExceeded(f"depth ceiling {config.max_depth} reached for {task.name!r}")
-        internal_intent_id = hashlib.sha256(
-            f"{store.run_id}:{task.name}:{current.attempts + 1}".encode()
-        ).hexdigest()[:32]
-        internal_attempt = DispatchAttempt(
-            internal_intent_id,
-            time.time() if config.active else 0.0,
-            current.agent_type or "sub-tl",
-        )
-        confirmation = _record_controller_event(
-            task.name,
-            "tl.dispatch_confirmed",
-            _dispatch_payload(task.name, internal_attempt, "sub_tl_started"),
-            config,
-            effects,
-            effects_log,
-        )
-        authoritative_seq = _controller_event_run_seq(confirmation)
-        if authoritative_seq is None:
-            authoritative_seq = state.events.last_consumed_offset
-        spawned = replace(
-            current,
-            status=SliceStatus.SPAWNED,
-            base_ref=config.branch,
-            branch=branch,
-            worktree=worktree,
-            dispatch_intent_id=internal_intent_id,
-            dispatch_started_at=internal_attempt.started_at,
-            dispatch_last_boundary="sub_tl_started",
-            dispatch_agent_id=task.name,
-            dispatch_authoritative_event_seq=authoritative_seq,
-        )
-        previous_slices = state.slices
-        state = store.checkpoint(
-            _phase_from_state(state),
-            {**state.slices, task.name: spawned},
-            state.budgets,
-            state.events.last_consumed_offset,
-        )
-        _emit_slice_status_changes(
-            previous_slices,
-            state.slices,
-            config,
-            effects,
-            effects_log,
-        )
-        state = _persist_sub_tl_lifecycle(state, store, task.name, IntegrationLifecycle.RUNNING)
-        child_config = _child_config(config, task, source, effects, store, branch, worktree)
-        child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, state.budgets)
-        status = (
-            SliceStatus.MERGED
-            if child_result.final_state.fsm.phase is TLPhase.TLDone
-            else SliceStatus.FAILED
-        )
-        completed = replace(spawned, status=status)
-        previous_slices = state.slices
-        state = store.checkpoint(
-            _phase_from_state(state),
-            {**state.slices, task.name: completed},
-            state.budgets,
-            state.events.last_consumed_offset,
-        )
-        _emit_slice_status_changes(
-            previous_slices,
-            state.slices,
-            config,
-            effects,
-            effects_log,
-        )
-        state = _persist_sub_tl_lifecycle(
-            state,
-            store,
-            task.name,
-            IntegrationLifecycle.CHILDREN_MERGED
-            if status is SliceStatus.MERGED
-            else IntegrationLifecycle.FAILED,
-        )
-        if status is SliceStatus.FAILED:
-            before_phase = _phase_from_state(state)
-            state = store.checkpoint(
-                TLFailed(f"recursive child {task.name} failed"),
-                state.slices,
-                state.budgets,
-                state.events.last_consumed_offset,
+        if current.status is SliceStatus.PENDING:
+            internal_intent_id = hashlib.sha256(
+                f"{store.run_id}:{task.name}:{current.attempts + 1}".encode()
+            ).hexdigest()[:32]
+            internal_attempt = DispatchAttempt(
+                internal_intent_id,
+                time.time() if config.active else 0.0,
+                current.agent_type or "sub-tl",
             )
-            _emit_phase_change(
-                store.run_id,
-                before_phase,
-                _phase_from_state(state),
+            confirmation = _record_controller_event(
+                task.name,
+                "tl.dispatch_confirmed",
+                _dispatch_payload(task.name, internal_attempt, "sub_tl_started"),
                 config,
                 effects,
                 effects_log,
             )
-            return state
-    if plan.sub_tls and not plan.workers and not plan.leaves:
-        before_phase = _phase_from_state(state)
-        state = store.checkpoint(
-            TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
+            authoritative_seq = _controller_event_run_seq(confirmation)
+            if authoritative_seq is None:
+                authoritative_seq = state.events.last_consumed_offset
+            updated_slices[task.name] = replace(
+                current,
+                status=SliceStatus.SPAWNED,
+                base_ref=config.branch,
+                branch=branch,
+                worktree=worktree,
+                dispatch_intent_id=internal_intent_id,
+                dispatch_started_at=internal_attempt.started_at,
+                dispatch_last_boundary="sub_tl_started",
+                dispatch_agent_id=task.name,
+                dispatch_authoritative_event_seq=authoritative_seq,
+            )
+        prepared.append(task)
+    states = dict(state.integration.sub_tl_states)
+    for task in prepared:
+        states[task.name] = IntegrationLifecycle.RUNNING
+    integration = replace(state.integration, sub_tl_states=states)
+    previous_slices = state.slices
+    state = store.checkpoint(
+        _phase_from_state(state),
+        updated_slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=order,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+    )
+    _emit_slice_status_changes(
+        previous_slices, state.slices, config, effects, effects_log
+    )
+    return state, tuple(prepared)
+
+
+def _run_sub_tl_batch(
+    tasks: Sequence[SubTLTask],
+    config: TLLoopConfig,
+    source: EventQueue,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    budgets: BudgetLedger,
+) -> tuple[tuple[SubTLTask, TLPhase | None, RunState | None], ...]:
+    """Run one bounded batch and collect outcomes in plan order."""
+    def run_one(task: SubTLTask) -> tuple[SubTLTask, TLPhase | None, RunState | None]:
+        branch = derive_child_branch(config.branch, task.name)
+        worktree = str(
+            task.worktree
+            or derive_child_worktree(
+                _effective_worktree(config, store.root_dir, store.run_id), task.name
+            )
         )
-        _emit_phase_change(
-            store.run_id,
-            before_phase,
-            _phase_from_state(state),
-            config,
-            effects,
-            effects_log,
+        child_store = RunStore(task.name, store.run_dir)
+        if child_store.path.exists():
+            child_state = child_store.load()
+            child_phase = child_state.fsm.phase
+            if child_phase in {TLPhase.TLDone, TLPhase.TLFailed}:
+                return task, child_phase, child_state
+        child_config = _child_config(config, task, source, effects, store, branch, worktree)
+        try:
+            child_result = tl_run(
+                {"run_id": task.name, "plan": task.plan}, child_config, budgets
+            )
+        except Exception:  # noqa: BLE001 - batch completion persists a durable failure
+            return task, TLPhase.TLFailed, None
+        return task, child_result.final_state.fsm.phase, child_result.final_state
+
+    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = [executor.submit(run_one, task) for task in tasks]
+        return tuple(future.result() for future in futures)
+
+
+def _complete_sub_tl_batch(
+    tasks: Sequence[SubTLTask],
+    outcomes: Sequence[tuple[SubTLTask, TLPhase | None, RunState | None]],
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Apply a batch atomically after all same-order children finish."""
+    del tasks
+    updated_slices = dict(state.slices)
+    sub_tl_states = dict(state.integration.sub_tl_states)
+    for task, phase, _child_state in outcomes:
+        status = SliceStatus.MERGED if phase is TLPhase.TLDone else SliceStatus.FAILED
+        updated_slices[task.name] = replace(updated_slices[task.name], status=status)
+        sub_tl_states[task.name] = (
+            IntegrationLifecycle.CHILDREN_MERGED
+            if status is SliceStatus.MERGED
+            else IntegrationLifecycle.FAILED
         )
+    integration = replace(state.integration, sub_tl_states=sub_tl_states)
+    previous_slices = state.slices
+    state = store.checkpoint(
+        _phase_from_state(state),
+        updated_slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+    )
+    _emit_slice_status_changes(
+        previous_slices, state.slices, config, effects, effects_log
+    )
     return state
 
 
-def _persist_sub_tl_lifecycle(
+def _fail_recursive_parent(
     state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
-    sub_tl_id: str,
-    lifecycle: IntegrationLifecycle,
+    effects_log: list[EffectIntent],
+    reason: str,
 ) -> RunState:
-    """Atomically retain one child lifecycle and the next restart order."""
-    states = dict(state.integration.sub_tl_states)
-    states[sub_tl_id] = lifecycle
-    pending_orders = [
-        stage.order
-        for stage in state.ordered_stages
-        if any(
-            states.get(child)
-            not in {IntegrationLifecycle.CHILDREN_MERGED, IntegrationLifecycle.FAILED}
-            for child in stage.sub_tls
-        )
-    ]
-    next_order = min(
-        pending_orders,
-        default=max((stage.order for stage in state.ordered_stages), default=state.current_order),
+    """Stop stage advancement while retaining completed sibling results."""
+    before_phase = _phase_from_state(state)
+    state = store.checkpoint(
+        TLFailed(reason), state.slices, state.budgets, state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
     )
-    integration = replace(state.integration, sub_tl_states=states)
-    return store.set_ordered_state(next_order, state.ordered_stages, integration)
+    _emit_phase_change(
+        store.run_id,
+        before_phase,
+        _phase_from_state(state),
+        config,
+        effects,
+        effects_log,
+    )
+    return state
+
+
+def _validate_stage_event_routes(tasks: Sequence[SubTLTask]) -> None:
+    """Require independent cursors for concurrent children that consume events."""
+    consuming = [task for task in tasks if _plan_consumes_events(task.plan)]
+    if len(consuming) < 2:
+        return
+    if any(task.source is None for task in consuming):
+        raise TLLoopError("same-order sub-TLs that consume events require isolated sources")
+    if len({id(task.source) for task in consuming}) != len(consuming):
+        raise TLLoopError("same-order sub-TLs cannot share an event source")
+
+
+def _plan_consumes_events(plan: WorkPlan | Mapping[str, object]) -> bool:
+    """Return whether a child can consume a projected event stream."""
+    if isinstance(plan, WorkPlan):
+        return bool(plan.workers or plan.leaves or plan.sub_tls)
+    return bool(plan.get("workers") or plan.get("leaves") or plan.get("sub_tls"))
 
 
 def _child_config(
