@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix installed controller missing newly added source files (#860)
 - E9: Separate transport evidence from runtime consumption (#766)
 - Fix watcher purity and enforce complete merge observability gates (#757)
 - Improve Ruff compliance for production Python code (#715)
@@ -121,6 +122,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- E18: Preflight config validation in exomonad init (#832)
 - E17: Controller denominator rules and coverage refresh (#817)
 - E16: Declare and emit tl.* controller events (#816)
 - E15: Verb-first topic vocabulary as an addressing layer (#799)

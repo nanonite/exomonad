@@ -8,7 +8,12 @@ use std::process::Command;
 
 const EXCLUDED_DIRECTORIES: &[&str] = &[".venv", "tests", "__pycache__"];
 
-fn collect_tl_loop_files(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+fn collect_tl_loop_files(
+    directory: &Path,
+    directories: &mut Vec<PathBuf>,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    directories.push(directory.to_path_buf());
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
 
@@ -24,7 +29,7 @@ fn collect_tl_loop_files(directory: &Path, files: &mut Vec<PathBuf>) -> io::Resu
             {
                 continue;
             }
-            collect_tl_loop_files(&path, files)?;
+            collect_tl_loop_files(&path, directories, files)?;
         } else if file_type.is_file() && !file_name.to_string_lossy().ends_with(".pyc") {
             files.push(path);
         }
@@ -60,8 +65,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", interpreter_policy.display());
     println!("cargo:rerun-if-env-changed=EXOMONAD_TL_LOOP_PYTHON");
 
+    let mut source_directories = Vec::new();
     let mut source_files = Vec::new();
-    collect_tl_loop_files(&tl_loop_source, &mut source_files)?;
+    collect_tl_loop_files(&tl_loop_source, &mut source_directories, &mut source_files)?;
+    source_directories.sort();
+    for source_directory in source_directories {
+        println!("cargo:rerun-if-changed={}", source_directory.display());
+    }
     source_files.sort();
     for source_file in source_files {
         println!("cargo:rerun-if-changed={}", source_file.display());
