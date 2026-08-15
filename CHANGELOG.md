@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Add persistent aggregate PR ownership for sub-TLs (#868)
 - Run same-order sub-TLs concurrently with bounded orchestration (#867)
 - Persist ordered stage and integration state across restarts (#866)
 - Validate and normalize ordered sub-TL plans (#865)
