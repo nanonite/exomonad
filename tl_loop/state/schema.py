@@ -70,6 +70,7 @@ STALL_CLASSIFICATION_VALUES = frozenset(
         "reviewer_not_responding",
         "reviewer_never_started",
         "ci_failed",
+        "review_stuck",
     }
 )
 

@@ -7,8 +7,8 @@ import hashlib
 import logging
 import queue as queue_module
 import time
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -88,6 +88,8 @@ LOGGER = logging.getLogger(__name__)
 TIMEOUT_GATE_NAME = "tl-timeout"
 DISPATCH_TIMEOUT_GATE_NAME = "tl-dispatch-timeout"
 DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
+INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
+INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
 
 
@@ -255,6 +257,8 @@ class TLLoopConfig:
     poll_interval: float = 0.1
     idle_timeout: float = 30.0
     dispatch_timeout: float = 5.0
+    max_base_revalidations: int = 3
+    max_integration_repairs: int = 3
     heartbeat: HeartbeatConfig | None = None
     goals: GoalState | None = None
     chainlink_issue_id: int | None = None
@@ -283,7 +287,13 @@ class TLLoopConfig:
     max_depth: int = 3
 
     def __post_init__(self) -> None:
-        for name in ("max_workers", "max_leaves", "max_events"):
+        for name in (
+            "max_workers",
+            "max_leaves",
+            "max_events",
+            "max_base_revalidations",
+            "max_integration_repairs",
+        ):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
@@ -478,15 +488,26 @@ def _run_loop(
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
+    awaiting_sub_tl_review = any(
+        slice_state.status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+        for slice_state in state.slices.values()
+    )
     if not expected and (
         not plan.sub_tls
-        or any(slice_state.status is SliceStatus.IN_REVIEW for slice_state in state.slices.values())
+        or (
+            awaiting_sub_tl_review
+            and not any(
+                slice_state.status is SliceStatus.REPAIRING for slice_state in state.slices.values()
+            )
+        )
     ):
-        if plan.sub_tls and any(
-            slice_state.status is SliceStatus.IN_REVIEW for slice_state in state.slices.values()
-        ):
+        if plan.sub_tls and awaiting_sub_tl_review:
             return TLRunResult(
-                state, tuple(effects_log), tuple(transitions), tuple(consumed), tuple(heartbeat_events)
+                state,
+                tuple(effects_log),
+                tuple(transitions),
+                tuple(consumed),
+                tuple(heartbeat_events),
             )
         before_phase = phase
         state = store.checkpoint(
@@ -582,13 +603,23 @@ def _run_loop(
                 )
             else:
                 state = _record_review_event(store, state, phase, event, event_seq)
+            if plan.sub_tls:
+                state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
+                phase = _phase_from_state(state)
             source.acknowledge(event)
+            if isinstance(phase, (TLDone, TLFailed)):
+                break
             continue
         if event.kind is EventKind.CI_STATUS_CHANGED:
             state = _route_ci_event(
                 store, state, phase, event, event_seq, config, effects, effects_log
             )
+            if plan.sub_tls:
+                state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
+                phase = _phase_from_state(state)
             source.acknowledge(event)
+            if isinstance(phase, (TLDone, TLFailed)):
+                break
             continue
         try:
             fsm_event = decoder.decode(event)
@@ -1397,9 +1428,19 @@ def _run_sub_tls(
         pending = tuple(
             task
             for task, current in zip(stage_tasks, stage_states)
-            if current is not None and current.status not in {SliceStatus.MERGED}
+            if current is not None
+            and current.status
+            not in {SliceStatus.MERGED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
         )
         if not pending:
+            state = _integrate_stage_candidates(
+                stage_tasks, state, config, effects, store, effects_log
+            )
+            if any(
+                state.slices[task.name].status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+                for task in stage_tasks
+            ):
+                break
             continue
         _validate_stage_event_routes(pending)
         if config.max_parallel_slices == 0:
@@ -1410,9 +1451,7 @@ def _run_sub_tls(
         width = config.max_parallel_slices or len(spawned)
         for batch_start in range(0, len(spawned), width):
             batch = spawned[batch_start : batch_start + width]
-            outcomes = _run_sub_tl_batch(
-                batch, config, source, effects, store, state.budgets
-            )
+            outcomes = _run_sub_tl_batch(batch, config, source, effects, store, state.budgets)
             state = _complete_sub_tl_batch(
                 batch, outcomes, state, config, effects, store, effects_log
             )
@@ -1420,18 +1459,17 @@ def _run_sub_tls(
                 return _fail_recursive_parent(
                     state, config, effects, store, effects_log, "recursive child failed"
                 )
-        state = _integrate_stage_candidates(
-            stage_tasks, state, config, effects, store, effects_log
-        )
+        state = _integrate_stage_candidates(stage_tasks, state, config, effects, store, effects_log)
         if any(
-            state.slices[task.name].status is SliceStatus.IN_REVIEW for task in stage_tasks
+            state.slices[task.name].status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+            for task in stage_tasks
         ):
             break
     if plan.sub_tls and not plan.workers and not plan.leaves:
         awaiting_integration = tuple(
             task.name
             for task in plan.sub_tls
-            if state.slices[task.name].status is SliceStatus.IN_REVIEW
+            if state.slices[task.name].status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
         )
         if awaiting_integration:
             before_phase = _phase_from_state(state)
@@ -1585,9 +1623,7 @@ def _prepare_sub_tl_stage(
         ordered_stages=state.ordered_stages,
         integration=integration,
     )
-    _emit_slice_status_changes(
-        previous_slices, state.slices, config, effects, effects_log
-    )
+    _emit_slice_status_changes(previous_slices, state.slices, config, effects, effects_log)
     return state, tuple(prepared)
 
 
@@ -1600,6 +1636,7 @@ def _run_sub_tl_batch(
     budgets: BudgetLedger,
 ) -> tuple[tuple[SubTLTask, TLPhase | None, RunState | None], ...]:
     """Run one bounded batch and collect outcomes in plan order."""
+
     def run_one(task: SubTLTask) -> tuple[SubTLTask, TLPhase | None, RunState | None]:
         branch = derive_child_branch(config.branch, task.name)
         worktree = str(
@@ -1616,9 +1653,7 @@ def _run_sub_tl_batch(
                 return task, child_phase, child_state
         child_config = _child_config(config, task, source, effects, store, branch, worktree)
         try:
-            child_result = tl_run(
-                {"run_id": task.name, "plan": task.plan}, child_config, budgets
-            )
+            child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
         except Exception:  # noqa: BLE001 - batch completion persists a durable failure
             return task, TLPhase.TLFailed, None
         return task, child_result.final_state.fsm.phase, child_result.final_state
@@ -1678,9 +1713,7 @@ def _complete_sub_tl_batch(
         ordered_stages=state.ordered_stages,
         integration=integration,
     )
-    _emit_slice_status_changes(
-        previous_slices, state.slices, config, effects, effects_log
-    )
+    _emit_slice_status_changes(previous_slices, state.slices, config, effects, effects_log)
     return state
 
 
@@ -1740,10 +1773,13 @@ def _ensure_aggregate_candidate(
         )
         pr_number = _positive_result_int(result_data, "pr_number")
         if pr_number is None:
-            pr_number = max(
-                (slice_state.pr_number or 0 for slice_state in child_state.slices.values()),
-                default=0,
-            ) + 1
+            pr_number = (
+                max(
+                    (slice_state.pr_number or 0 for slice_state in child_state.slices.values()),
+                    default=0,
+                )
+                + 1
+            )
         candidate = AggregateCandidate(
             task.name,
             pr_number,
@@ -1796,7 +1832,7 @@ def _integrate_stage_candidates(
     effects_log: list[EffectIntent],
 ) -> RunState:
     """Serialize ready aggregate merges through the parent controller only."""
-    if not config.active:
+    if not config.active or _integration_gate_pending(state):
         return state
     for task in sorted(tasks, key=lambda item: item.name):
         current = state.slices[task.name]
@@ -1808,12 +1844,277 @@ def _integrate_stage_candidates(
             or current.ci_state.get(current.reviewed_head) not in {"success", "neutral"}
         ):
             continue
-        state = _integrate_one_candidate(
-            task, state, config, effects, store, effects_log
-        )
+        state = _integrate_one_candidate(task, state, config, effects, store, effects_log)
         if state.slices[task.name].status is not SliceStatus.MERGED:
             break
     return state
+
+
+def _merge_failure_classification(result: ToolResult | None) -> str | None:
+    if result is None or result.success is not False:
+        return None
+    values = [result.error or ""]
+    if isinstance(result.result, Mapping):
+        for key in ("classification", "reason", "message", "error"):
+            value = result.result.get(key)
+            if isinstance(value, str):
+                values.append(value)
+    text = " ".join(values).lower()
+    if "conflict" in text:
+        return "conflict"
+    if any(
+        marker in text
+        for marker in (
+            "stale",
+            "compare-and-swap",
+            "compare_and_swap",
+            "cas",
+            "base changed",
+            "head changed",
+        )
+    ):
+        return "base_changed"
+    return "failure"
+
+
+def _merge_failure_reason(result: ToolResult | None) -> str:
+    if result is None:
+        return "merge result was not returned"
+    if result.error:
+        return result.error[:500]
+    if isinstance(result.result, Mapping):
+        for key in ("reason", "message", "error"):
+            value = result.result.get(key)
+            if isinstance(value, str) and value:
+                return value[:500]
+    return "merge_pr returned failure"
+
+
+def _integration_gate_pending(state: RunState) -> bool:
+    return any(
+        gate.name in {INTEGRATION_REVALIDATION_GATE_NAME, INTEGRATION_CONFLICT_GATE_NAME}
+        and gate.status is GateStatus.PENDING
+        for gate in state.gates
+    )
+
+
+def _open_integration_gate(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    gate_name: str,
+    lifecycle: IntegrationLifecycle,
+    reason: str,
+) -> RunState:
+    current = state.slices[task.name]
+    sub_states = dict(state.integration.sub_tl_states)
+    sub_states[task.name] = lifecycle
+    updated = replace(
+        current,
+        status=SliceStatus.IN_REVIEW,
+        dispatch_last_boundary="integration_gate",
+        dispatch_error=reason[:500],
+    )
+    previous = next((gate for gate in state.gates if gate.name == gate_name), None)
+    integration = replace(
+        state.integration,
+        lifecycle=lifecycle,
+        sub_tl_states=sub_states,
+        validated_base_sha=None,
+        merge_tree_sha=None,
+        integration_evidence_at=None,
+        ci_status="unknown",
+        stage_verification="failed",
+        head_sha=(
+            None
+            if lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT
+            else state.integration.head_sha
+        ),
+        patch_digest=(
+            None
+            if lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT
+            else state.integration.patch_digest
+        ),
+    )
+    state = store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, task.name: updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+    )
+    state = store.set_gate(gate_name, GateStatus.PENDING)
+    if previous is None or previous.status is not GateStatus.PENDING:
+        _record_controller_event(
+            "controller",
+            "tl.gate_opened",
+            {"gate_name": gate_name, "run_id": store.run_id, "reason": reason[:500]},
+            config,
+            effects,
+            effects_log,
+        )
+    return state
+
+
+def _handle_external_base_change(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    base_sha: str,
+    head_sha: str,
+    patch_digest: str,
+    reason: str,
+) -> RunState:
+    if state.integration.base_revalidation_count >= config.max_base_revalidations:
+        return _open_integration_gate(
+            task,
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+            gate_name=INTEGRATION_REVALIDATION_GATE_NAME,
+            lifecycle=IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            reason=reason,
+        )
+    invalidated = invalidate_integration_evidence(
+        state.integration,
+        base_sha="",
+        head_sha=head_sha,
+        patch_digest=patch_digest,
+    )
+    current = state.slices[task.name]
+    return _checkpoint_integration_retry(
+        state,
+        task.name,
+        invalidated,
+        config,
+        store,
+        slice_update=replace(
+            current,
+            dispatch_last_boundary="base_revalidation",
+            dispatch_error=reason[:500],
+        ),
+    )
+
+
+def _handle_integration_conflict(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    base_sha: str,
+    head_sha: str,
+    reason: str,
+) -> RunState:
+    current = state.slices[task.name]
+    if (
+        current.repair_attempts >= config.max_integration_repairs
+        or config.review_model_choice is None
+    ):
+        return _open_integration_gate(
+            task,
+            state,
+            config,
+            store,
+            gate_name=INTEGRATION_CONFLICT_GATE_NAME,
+            lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
+            reason=reason,
+        )
+    conflict = replace(
+        state.integration,
+        lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
+        head_sha=head_sha,
+        patch_digest=current.review_patch_digests.get(head_sha),
+        validated_base_sha=base_sha,
+        merge_tree_sha=None,
+        ci_status="failure",
+        integration_evidence_at=None,
+        stage_verification="failed",
+        merge_attempts=state.integration.merge_attempts + 1,
+    )
+    conflicted = replace(
+        current,
+        status=SliceStatus.REPAIRING,
+        verdict=Verdict.NO_GO,
+        ci_state={},
+        dispatch_last_boundary="integration_conflict",
+        dispatch_error=reason[:500],
+    )
+    state = store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, task.name: conflicted},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=conflict,
+    )
+    _record_controller_event(
+        task.name,
+        "tl.integration_conflict",
+        {
+            "slice_id": task.name,
+            "pr_number": current.pr_number,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "reason": reason[:500],
+            "repair_attempt": current.repair_attempts + 1,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    repairing = replace(
+        conflict,
+        lifecycle=IntegrationLifecycle.REPAIRING_AGGREGATE,
+        head_sha=None,
+        patch_digest=None,
+        validated_base_sha=None,
+    )
+    state = store.checkpoint(
+        _phase_from_state(state),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=repairing,
+    )
+    return _route_repair(
+        store,
+        state,
+        _phase_from_state(state),
+        state.events.last_consumed_offset,
+        task.name,
+        {
+            "verdict": Verdict.NO_GO.value,
+            "reasons": [
+                {
+                    "severity": "blocking",
+                    "file": "integration",
+                    "line": 0,
+                    "claim": reason[:500],
+                }
+            ],
+        },
+        config,
+        effects,
+        effects_log,
+    )
 
 
 def _integrate_one_candidate(
@@ -1866,15 +2167,36 @@ def _integrate_one_candidate(
     if second is None:
         return state
     if _snapshot_text(second, "base_sha") != base_sha:
-        invalidated = invalidate_integration_evidence(
-            integration,
-            base_sha=_snapshot_text(second, "base_sha") or "",
+        return _handle_external_base_change(
+            task,
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+            base_sha=base_sha,
             head_sha=head_sha,
             patch_digest=patch_digest,
+            reason=(
+                f"aggregate base changed from {base_sha!r} to "
+                f"{_snapshot_text(second, 'base_sha')!r} before merge"
+            ),
         )
-        return _checkpoint_integration_retry(
-            state, task.name, invalidated, config, store
-        )
+    _record_controller_event(
+        task.name,
+        "tl.integration_revalidated",
+        {
+            "slice_id": task.name,
+            "pr_number": current.pr_number,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "merge_tree_sha": merge_tree_sha,
+            "ci_status": ci_status,
+        },
+        config,
+        effects,
+        effects_log,
+    )
     state = store.checkpoint(
         _phase_from_state(state),
         state.slices,
@@ -1890,7 +2212,7 @@ def _integrate_one_candidate(
         "working_dir": config.working_dir,
         "base_sha": base_sha,
     }
-    _invoke(
+    merge_result = _invoke(
         "merge_pr",
         task.name,
         arguments,
@@ -1902,7 +2224,36 @@ def _integrate_one_candidate(
             working_dir=config.working_dir,
         ),
         effects_log,
+        raise_on_failure=False,
     )
+    failure = _merge_failure_classification(merge_result)
+    if failure == "conflict":
+        return _handle_integration_conflict(
+            task,
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            reason=_merge_failure_reason(merge_result),
+        )
+    if failure == "base_changed":
+        return _handle_external_base_change(
+            task,
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            patch_digest=patch_digest,
+            reason=_merge_failure_reason(merge_result),
+        )
+    if failure is not None:
+        raise EffectFailed(f"merge_pr for {task.name!r}: {_merge_failure_reason(merge_result)}")
     updated_slices = dict(state.slices)
     updated_slices[task.name] = replace(
         current,
@@ -1915,7 +2266,10 @@ def _integrate_one_candidate(
         if task.name not in sibling.sub_tls:
             continue
         for sibling_id in sibling.sub_tls:
-            if sibling_id != task.name and updated_slices[sibling_id].status is SliceStatus.IN_REVIEW:
+            if (
+                sibling_id != task.name
+                and updated_slices[sibling_id].status is SliceStatus.IN_REVIEW
+            ):
                 sub_states[sibling_id] = IntegrationLifecycle.NEEDS_BASE_REVALIDATION
     merged_integration = replace(
         integration,
@@ -1926,7 +2280,7 @@ def _integrate_one_candidate(
     remaining = {
         sibling_id: ChildHandle(
             sibling_id,
-            updated_slices[sibling_id].branch or "",
+            sibling_slice.branch or "",
             "sub-tl",
         )
         for sibling_id, sibling_slice in updated_slices.items()
@@ -1950,13 +2304,19 @@ def _checkpoint_integration_retry(
     integration: IntegrationRuntimeState,
     config: TLLoopConfig,
     store: RunStore,
+    *,
+    slice_update: SliceState | None = None,
 ) -> RunState:
     """Persist a base retry without changing the candidate head or sibling slices."""
+    del config
     sub_states = dict(state.integration.sub_tl_states)
     sub_states[slice_id] = IntegrationLifecycle.NEEDS_BASE_REVALIDATION
+    slices = dict(state.slices)
+    if slice_update is not None:
+        slices[slice_id] = slice_update
     return store.checkpoint(
         _phase_from_state(state),
-        state.slices,
+        slices,
         state.budgets,
         state.events.last_consumed_offset,
         current_order=state.current_order,
@@ -2041,7 +2401,10 @@ def _fail_recursive_parent(
     """Stop stage advancement while retaining completed sibling results."""
     before_phase = _phase_from_state(state)
     state = store.checkpoint(
-        TLFailed(reason), state.slices, state.budgets, state.events.last_consumed_offset,
+        TLFailed(reason),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
         integration=state.integration,
@@ -2470,6 +2833,11 @@ def _record_review_event(
     updated = dict(state.slices)
     updated[slice_id] = replace(
         current,
+        status=(
+            SliceStatus.IN_REVIEW
+            if current.status is SliceStatus.REPAIRING and _is_aggregate_slice(current)
+            else current.status
+        ),
         pr_number=event.pr_number or current.pr_number,
         reviewed_head=event.head_sha,
         verdict=verdict,
@@ -2507,9 +2875,14 @@ def _review_slice_id(event: EventEnvelope, state: RunState) -> str | None:
 
 def _is_aggregate_slice(slice_state: SliceState) -> bool:
     """Identify a persisted sub-TL aggregate owner without trusting event text."""
-    return (
-        slice_state.dispatch_last_boundary == "aggregate_pr_open"
-        and slice_state.dispatch_agent_id is not None
+    return slice_state.dispatch_agent_id is not None and (
+        slice_state.dispatch_last_boundary
+        in {
+            "aggregate_pr_open",
+            "integration_conflict",
+            "integration_gate",
+        }
+        or slice_state.dispatch_agent_id.endswith(":integration")
     )
 
 
@@ -2601,7 +2974,11 @@ def _route_review_event(
             stall_classification=stall_classification or current.stall_classification,
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
-    if current.reviewed_head is not None and current.reviewed_head != head_sha and not _is_aggregate_slice(current):
+    if (
+        current.reviewed_head is not None
+        and current.reviewed_head != head_sha
+        and not _is_aggregate_slice(current)
+    ):
         LOGGER.warning(
             "[TL loop] ignoring stale review target=%s reviewed=%s event=%s",
             slice_id,
@@ -2815,8 +3192,20 @@ def _route_repair(
             dispatch_last_boundary="repair_exhausted",
             dispatch_error=str(error)[:500],
         )
+        remaining = {
+            waiting_id: ChildHandle(
+                waiting_id,
+                state.slices[waiting_id].branch or "",
+                state.slices[waiting_id].agent_type or "unknown",
+            )
+            for waiting_id in state.fsm.waiting
+            if waiting_id != slice_id
+            and state.slices[waiting_id].status
+            in {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+        }
+        repair_phase: PhaseValue = TLWaiting(remaining) if remaining else TLPlanning()
         state = store.checkpoint(
-            phase,
+            repair_phase,
             {**state.slices, slice_id: parked},
             state.budgets,
             event_seq,

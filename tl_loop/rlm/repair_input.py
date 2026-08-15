@@ -5,12 +5,13 @@ from __future__ import annotations
 import copy
 import re
 from collections.abc import Mapping, MutableMapping, Sequence
+from dataclasses import replace
 from fnmatch import fnmatchcase
 from typing import Protocol, cast
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.client.transport import JsonObject
-from tl_loop.state.schema import SliceState, SliceStatus, Verdict
+from tl_loop.state.schema import SliceStatus, Verdict
 from tl_loop.state.store import RunStore
 
 from .call import MAX_ATTEMPTS
@@ -41,11 +42,7 @@ def pr_identity(pr: Mapping[str, object] | object) -> tuple[int, tuple[str, ...]
         paths_value = member(nested, "paths") if nested is not None else None
     if not isinstance(paths_value, (list, tuple, set, frozenset)):
         raise RepairInputError("pr must provide a non-empty slice paths set")
-    paths = tuple(
-        path.strip()
-        for path in paths_value
-        if isinstance(path, str) and path.strip()
-    )
+    paths = tuple(path.strip() for path in paths_value if isinstance(path, str) and path.strip())
     if not paths or len(paths) != len(paths_value):
         raise RepairInputError("slice paths must contain non-empty strings")
     return number, paths
@@ -197,11 +194,7 @@ def _increment_store(
         nested = member(pr, "slice")
         target_id = member(nested, "id") if nested is not None else None
     if target_id is None:
-        matches = [
-            item.id
-            for item in state.slices.values()
-            if item.pr_number == number
-        ]
+        matches = [item.id for item in state.slices.values() if item.pr_number == number]
         if len(matches) == 1:
             target_id = matches[0]
     if not isinstance(target_id, str) or not target_id:
@@ -210,30 +203,11 @@ def _increment_store(
     if current is None:
         raise RepairInputError(f"repair attempts reference unknown slice {target_id!r}")
     updated = dict(state.slices)
-    updated[target_id] = SliceState(
-        id=current.id,
+    updated[target_id] = replace(
+        current,
         status=SliceStatus.REPAIRING,
-        paths=current.paths,
-        depends_on=current.depends_on,
-        base_ref=current.base_ref,
-        test_plan=current.test_plan,
-        agent_type=current.agent_type,
-        model=current.model,
-        branch=current.branch,
-        worktree=current.worktree,
-        pr_number=current.pr_number,
-        reviewed_head=current.reviewed_head,
-        review_findings=current.review_findings,
-        ci_state=current.ci_state,
-        reviewer_attempt=current.reviewer_attempt,
         repair_attempts=current.repair_attempts + 1,
         attempts=current.attempts + 1,
-        verdict=current.verdict,
-        verdict_at=current.verdict_at,
-        park_cause=current.park_cause,
-        park_issue_id=current.park_issue_id,
-        park_audit=current.park_audit,
-        blocked_by=current.blocked_by,
     )
     store.checkpoint(
         state.fsm,
@@ -268,9 +242,7 @@ def _watcher_payload(result: object) -> JsonObject:
         payload = result.result
     elif isinstance(result, Mapping):
         if result.get("success") is False:
-            raise RepairPRStateError(
-                cast(str, result.get("error") or "watcher_pr_state failed")
-            )
+            raise RepairPRStateError(cast(str, result.get("error") or "watcher_pr_state failed"))
         payload = result.get("result", result)
     else:
         raise RepairPRStateError("watcher_pr_state returned no object")

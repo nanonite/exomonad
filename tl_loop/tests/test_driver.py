@@ -23,8 +23,8 @@ from tl_loop.loop.driver import (
     DepthLimitExceeded,
     LoopLimitExceeded,
     SubTLTask,
-    TLLoopError,
     TLLoopConfig,
+    TLLoopError,
     TLRunResult,
     WorkerTask,
     WorkPlan,
@@ -106,6 +106,7 @@ class RecordingTransport:
 @dataclass
 class IntegrationTransport(RecordingTransport):
     snapshots: list[JsonObject] = field(default_factory=list)
+    merge_response: JsonObject | None = None
 
     def call_tool(
         self,
@@ -118,6 +119,9 @@ class IntegrationTransport(RecordingTransport):
             self.calls.append((tool_name, arguments))
             snapshot = self.snapshots.pop(0)
             return {"success": True, "result": snapshot}
+        if tool_name == "merge_pr" and self.merge_response is not None:
+            self.calls.append((tool_name, arguments))
+            return self.merge_response
         return super().call_tool(role, name, tool_name, arguments)
 
 
@@ -1368,8 +1372,22 @@ def test_ordered_sub_tl_restart_does_not_rerun_merged_children(
         )
     )
     config = TLLoopConfig(max_parallel_slices=2, poll_interval=0.001, idle_timeout=0.1)
-    run_tl_loop("restart-run", plan, SyntheticQueue([]), EffectClient(RecordingTransport()), config=config, root_dir=tmp_path)
-    run_tl_loop("restart-run", plan, SyntheticQueue([]), EffectClient(RecordingTransport()), config=config, root_dir=tmp_path)
+    run_tl_loop(
+        "restart-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=config,
+        root_dir=tmp_path,
+    )
+    run_tl_loop(
+        "restart-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=config,
+        root_dir=tmp_path,
+    )
 
     assert sorted(calls) == ["restart-a", "restart-b"]
 
@@ -1419,9 +1437,7 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     child_store = RunStore("aggregate-child", parent_dir)
     child_state = child_store.load()
     child_slices = dict(child_state.slices)
-    child_slices["leaf-a"] = replace(
-        child_slices["leaf-a"], pr_number=42, reviewed_head="head-a"
-    )
+    child_slices["leaf-a"] = replace(child_slices["leaf-a"], pr_number=42, reviewed_head="head-a")
     child_store.checkpoint(
         child_state.fsm,
         child_slices,
@@ -1482,9 +1498,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) ->
     child_store = RunStore("aggregate-child", parent_dir)
     child_state = child_store.load()
     child_slices = dict(child_state.slices)
-    child_slices["leaf-a"] = replace(
-        child_slices["leaf-a"], pr_number=42, reviewed_head="head-a"
-    )
+    child_slices["leaf-a"] = replace(child_slices["leaf-a"], pr_number=42, reviewed_head="head-a")
     child_store.checkpoint(
         child_state.fsm,
         child_slices,
@@ -1493,17 +1507,34 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) ->
     )
     transport = IntegrationTransport(
         snapshots=[
-            {"head_sha": "head-a", "base_sha": "base-a", "patch_digest": "patch-a", "merge_tree_sha": "tree-a", "ci_status": "success"},
-            {"head_sha": "head-a", "base_sha": "base-a", "patch_digest": "patch-a", "merge_tree_sha": "tree-a", "ci_status": "success"},
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
         ]
     )
     plan = WorkPlan(
-        sub_tls=(
-            SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),
-        )
+        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
     )
     config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
-    run_tl_loop("serialized-run", plan, SyntheticQueue([]), EffectClient(transport), config=config, root_dir=tmp_path)
+    run_tl_loop(
+        "serialized-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
     store = RunStore("serialized-run", tmp_path)
     state = store.load()
     current = state.slices["aggregate-child"]
@@ -1523,7 +1554,14 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) ->
         integration=state.integration,
     )
 
-    result = run_tl_loop("serialized-run", plan, SyntheticQueue([]), EffectClient(transport), config=config, root_dir=tmp_path)
+    result = run_tl_loop(
+        "serialized-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
 
     assert result.final_state.slices["aggregate-child"].status is SliceStatus.MERGED
     assert [name for name, _ in transport.calls if name == "merge_pr"] == ["merge_pr"]
@@ -1546,25 +1584,52 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
         child_state.fsm,
         {
             **child_state.slices,
-            "leaf-a": replace(
-                child_state.slices["leaf-a"], pr_number=42, reviewed_head="head-a"
-            ),
+            "leaf-a": replace(child_state.slices["leaf-a"], pr_number=42, reviewed_head="head-a"),
         },
         child_state.budgets,
         child_state.events.last_consumed_offset,
     )
     transport = IntegrationTransport(
         snapshots=[
-            {"head_sha": "head-a", "base_sha": "base-a", "patch_digest": "patch-a", "merge_tree_sha": "tree-a", "ci_status": "success"},
-            {"head_sha": "head-a", "base_sha": "base-b", "patch_digest": "patch-a", "merge_tree_sha": "tree-b", "ci_status": "success"},
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-b",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-b",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-b",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-b",
+                "ci_status": "success",
+            },
         ]
     )
     plan = WorkPlan(
-        sub_tls=(
-            SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),
-        )
+        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
     )
-    config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
+    config = TLLoopConfig(
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        idle_timeout=0.1,
+        max_base_revalidations=1,
+    )
     run_tl_loop(
         "serialized-run",
         plan,
@@ -1594,6 +1659,15 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
         integration=state.integration,
     )
 
+    first_revalidation = run_tl_loop(
+        "serialized-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert first_revalidation.final_state.integration.base_revalidation_count == 1
     result = run_tl_loop(
         "serialized-run",
         plan,
@@ -1611,6 +1685,128 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
     )
     assert result.final_state.integration.validated_base_sha is None
     assert result.final_state.integration.base_revalidation_count == 1
+    assert (
+        GateState(name="tl-integration-revalidation", status=GateStatus.PENDING)
+        in result.final_state.gates
+    )
+
+
+def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> None:
+    child_plan = _plan()
+    parent_dir = tmp_path / "conflict-run"
+    run_tl_loop(
+        "aggregate-child",
+        child_plan,
+        SyntheticQueue(_lifecycle_events("aggregate-child")),
+        EffectClient(RecordingTransport()),
+        config=_config(),
+        root_dir=parent_dir,
+    )
+    child_store = RunStore("aggregate-child", parent_dir)
+    child_state = child_store.load()
+    child_store.checkpoint(
+        child_state.fsm,
+        {
+            **child_state.slices,
+            "leaf-a": replace(child_state.slices["leaf-a"], pr_number=42, reviewed_head="head-a"),
+        },
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    backend = ReviewBackend(
+        [
+            RlmResponse(
+                {
+                    "root_cause": "The aggregate PR conflicts with the parent base",
+                    "proposed_solution": "Rebase the existing aggregate PR and resolve the conflict",
+                    "read_first": ["tl-loop/aggregate-child"],
+                    "steps": ["Resolve the aggregate conflict"],
+                    "verify": ["just tl-loop-test"],
+                    "boundary": ["Only edit tl-loop/aggregate-child"],
+                    "done_criteria": ["The aggregate PR applies cleanly"],
+                }
+            )
+        ]
+    )
+    transport = IntegrationTransport(
+        snapshots=[
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "open": True,
+                "merged": False,
+                "head_branch": "main.aggregate-child",
+                "head_sha": "head-a",
+            },
+        ],
+        merge_response={"success": False, "error": "merge conflict with parent base"},
+    )
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+    )
+    config = TLLoopConfig(
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        idle_timeout=0.01,
+        review_model_choice=_review_choice(backend),
+    )
+    run_tl_loop(
+        "conflict-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    store = RunStore("conflict-run", tmp_path)
+    state = store.load()
+    store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            "aggregate-child": replace(
+                state.slices["aggregate-child"],
+                verdict=Verdict.GO,
+                review_patch_digests={"head-a": "patch-a"},
+                ci_state={"head-a": "success"},
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    result = run_tl_loop(
+        "conflict-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    current = result.final_state.slices["aggregate-child"]
+    assert current.status is SliceStatus.REPAIRING
+    assert current.repair_attempts == 1
+    assert current.dispatch_agent_id == "conflict-run:aggregate-child:integration"
+    assert result.final_state.integration.lifecycle is IntegrationLifecycle.REPAIRING_AGGREGATE
+    assert result.final_state.integration.head_sha is None
+    assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
+    assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
 
 
 def test_same_order_event_consumers_require_isolated_sources(tmp_path: Path) -> None:
