@@ -72,6 +72,41 @@ start with `--wait-for-plan`). See
 `.exo/review-policy.toml` is optional and unchanged in format — if the old
 project had one, it carries forward as-is.
 
+### Ordered sub-TL plans
+
+Existing list-ordered plans do not need a rewrite. A direct sibling without an
+`order` field is normalized to numeric order 1, preserving the legacy behavior.
+When adopting ordered stages, add an explicit positive order to every direct
+sibling, use contiguous values starting at 1, and do not mix explicit and
+missing values. Preflight rejects a mixed or non-contiguous sibling set before
+the controller starts.
+
+Same-order children are dispatched concurrently within the configured bound;
+their aggregate PRs are then integrated one at a time in stable sub-TL ID
+order. The next numeric order waits for all children and integrations in the
+current order. A child failure blocks higher orders rather than silently
+skipping the failed stage. Nested plans apply the same rules independently at
+each recursive boundary.
+
+Review evidence remains bound to the child head and patch. Integration evidence
+is bound to the current base, integrated tree, head, and CI. If the base moves,
+the diagnosis is `NEEDS_BASE_REVALIDATION`: let the controller refresh the
+integration evidence. It is not a reason to spawn a worker or rebase a PR. A
+real merge conflict is `INTEGRATION_CONFLICT` and routes repair through
+same-owner `resume_pr`, preserving the existing branch, worktree, and PR.
+
+After migration, verify normalization and inspect recovery state with:
+
+~~~bash
+python3 ~/.exo/tl_loop.pyz preflight --project-root .
+python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
+~~~
+
+The status read model shows `current_order`, `ordered_stages`, integration
+evidence, and `next_transition`. During a restart, use that transition and the
+persisted checkpoint; do not manually mark a stage merged or create a duplicate
+aggregate PR.
+
 ---
 
 ## 2. Import the old logs for Failure Atlas visibility

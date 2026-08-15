@@ -338,14 +338,275 @@ Child branches use `{parent}.{name}`, the child PR targets the parent branch as
 its `base_ref`, and recursion depth is bounded by `max_depth` — exceeding it
 parks the slice with `schedule_deadlock`.
 
-**Sub-TLs run sequentially and each blocks until terminal.** The parent's
-execution order is:
+**Ordered sub-TLs execute in numbered stages.** The order value is scoped to
+one parent's direct sub-TL siblings:
 
-1. dispatch all top-level `workers` and `leaves` (in parallel),
-2. run each `sub_tls` entry to completion, one at a time, in list order,
-3. enter the event loop for the top-level children.
+- Missing order is legacy shorthand for order 1.
+- Explicit orders must be present on every sibling and be contiguous, starting
+  at 1; mixing explicit and missing orders is rejected.
+- Different orders are sequential. The next numeric order cannot start until
+  every sub-TL in the current order has completed and its aggregate result is
+  integrated.
+- Sub-TLs with the same order run concurrently, bounded by
+  max_parallel_slices. Each child may itself contain multiple parallel leaves.
+- The parent serializes aggregate integration in stable sub-TL ID order. A
+  plan does not author merge priority. After an earlier same-order aggregate
+  merge advances the base, each later candidate is revalidated against that
+  base without changing its reviewed head.
+- A child that ends in TLFailed blocks all higher numeric orders and leaves the
+  parent failed or parked; it is never silently skipped.
 
-A sub-TL that ends in `TLFailed` fails the parent immediately.
+The parent's top-level execution is therefore: dispatch any top-level
+workers/leaves, run order 1, integrate it, then advance through the remaining
+ordered stages. A sub-TL has its own checkpoint and branch coordinates, so a
+restart resumes the stage rather than spawning a duplicate child.
+
+### Ordered plan examples
+
+The following examples are complete plan.json documents. They use disjoint
+boundaries and real verification commands so they can be passed to preflight.
+
+One parallel group:
+
+~~~json
+{
+  "run_id": "root",
+  "budgets": { "tokens": 200000, "wall_seconds": 7200 },
+  "plan": {
+    "sub_tls": [
+      {
+        "name": "auth",
+        "order": 1,
+        "plan": {
+          "leaves": [
+            {
+              "name": "tokens",
+              "task": "Implement access-token rotation.",
+              "boundary": ["src/auth/tokens/**"],
+              "verify": ["cargo test -p auth tokens"]
+            }
+          ]
+        }
+      },
+      {
+        "name": "billing",
+        "order": 1,
+        "plan": {
+          "leaves": [
+            {
+              "name": "invoices",
+              "task": "Implement invoice persistence.",
+              "boundary": ["src/billing/invoices/**"],
+              "verify": ["cargo test -p billing invoices"]
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
+~~~
+
+Multiple same-order sub-TLs followed by an integration stage:
+
+~~~json
+{
+  "run_id": "root",
+  "budgets": { "tokens": 300000, "wall_seconds": 10800 },
+  "plan": {
+    "sub_tls": [
+      {
+        "name": "parser",
+        "order": 1,
+        "plan": {
+          "leaves": [
+            {
+              "name": "grammar",
+              "task": "Add the parser grammar.",
+              "boundary": ["src/parser/grammar/**"],
+              "verify": ["cargo test -p parser grammar"]
+            }
+          ]
+        }
+      },
+      {
+        "name": "schema",
+        "order": 1,
+        "plan": {
+          "leaves": [
+            {
+              "name": "types",
+              "task": "Add parsed AST types.",
+              "boundary": ["src/parser/types/**"],
+              "verify": ["cargo test -p parser types"]
+            }
+          ]
+        }
+      },
+      {
+        "name": "integration",
+        "order": 2,
+        "plan": {
+          "leaves": [
+            {
+              "name": "adapter",
+              "task": "Integrate the parser and schema changes.",
+              "boundary": ["src/integration/parser/**"],
+              "verify": ["cargo test -p integration parser"]
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
+~~~
+
+Nested orders reset at each recursive boundary:
+
+~~~json
+{
+  "run_id": "root",
+  "budgets": { "tokens": 250000, "wall_seconds": 9000 },
+  "plan": {
+    "sub_tls": [
+      {
+        "name": "release",
+        "order": 1,
+        "plan": {
+          "sub_tls": [
+            {
+              "name": "api",
+              "order": 1,
+              "plan": {
+                "leaves": [
+                  {
+                    "name": "endpoint",
+                    "task": "Add the release endpoint.",
+                    "boundary": ["src/release/api/**"],
+                    "verify": ["cargo test -p release endpoint"]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "cli",
+              "order": 2,
+              "plan": {
+                "leaves": [
+                  {
+                    "name": "command",
+                    "task": "Expose the release endpoint in the CLI.",
+                    "boundary": ["src/release/cli/**"],
+                    "verify": ["cargo test -p release command"]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
+~~~
+
+Sequential dependent stages:
+
+~~~json
+{
+  "run_id": "root",
+  "budgets": { "tokens": 180000, "wall_seconds": 6000 },
+  "plan": {
+    "sub_tls": [
+      {
+        "name": "build",
+        "order": 1,
+        "plan": {
+          "leaves": [
+            {
+              "name": "implementation",
+              "task": "Implement the feature.",
+              "boundary": ["src/feature/**"],
+              "verify": ["cargo test -p feature"]
+            }
+          ]
+        }
+      },
+      {
+        "name": "verify",
+        "order": 2,
+        "plan": {
+          "leaves": [
+            {
+              "name": "acceptance",
+              "task": "Verify the merged feature behavior.",
+              "boundary": ["tests/feature/**"],
+              "verify": ["cargo test -p feature --test acceptance"]
+            }
+          ]
+        }
+      },
+      {
+        "name": "publish",
+        "order": 3,
+        "plan": {
+          "leaves": [
+            {
+              "name": "documentation",
+              "task": "Document the verified feature.",
+              "boundary": ["docs/feature/**"],
+              "verify": ["just docs-lint"]
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
+~~~
+
+### Recursive integration and recovery
+
+Each completed child publishes one aggregate candidate owned by the direct
+parent. Review evidence is bound to the candidate's exact PR head and patch
+digest. Integration evidence is a separate check bound to the current parent
+base, integrated head, merge tree, and CI result:
+
+~~~text
+review_allowed =
+    reviewer_evidence.head_sha == candidate.head_sha
+ && reviewer_evidence.patch_digest == candidate.patch_digest
+
+integration_allowed =
+    review_allowed
+ && integration.base_sha == live_parent_base
+ && integration.head_sha == candidate.head_sha
+ && integration.merge_tree_sha == live_merge_tree
+ && integration.ci_status in {"success", "neutral"}
+~~~
+
+The parent adjudicates the child result and owns the aggregate PR. A review
+NO-GO uses compose_repair and resume_pr for that same aggregate owner, branch,
+worktree, and PR. It does not spawn a worker, create a replacement PR, or
+rebase a reviewed head solely because the parent base moved.
+
+The integration lifecycle shown in status and /control is:
+
+| State | Meaning | Next legal transition |
+|---|---|---|
+| RUNNING | Children are still executing | Wait for child completion |
+| READY_FOR_INTEGRATION | Head-bound review and CI are acceptable | Validate base/head/tree/CI evidence |
+| NEEDS_BASE_REVALIDATION | The parent base advanced; the reviewed head remains valid | Refresh integration evidence and CI |
+| INTEGRATION_CONFLICT | The candidate cannot merge cleanly | resume_pr the same aggregate owner |
+| MERGING | Merge was durably started | Reconcile live PR state; do not issue a duplicate merge |
+| MERGED | The aggregate result is recorded | Advance to the next numeric order |
+
+Repair and revalidation have separate ceilings. Exhausting either opens a
+named gate (tl-integration-conflict or tl-integration-revalidation).
+Restart reads the persisted stage, owner, PR, head, base, evidence, and
+attempt counters; it never treats a missing event as permission to duplicate a
+spawn, PR, review, repair, or merge.
 
 ---
 
@@ -358,9 +619,11 @@ actually shipped.
 
 Top-level leaves in one plan are dispatched **in parallel with no ordering**. A
 plan-level `depends_on` field does not exist — see the gap note below. Ordering
-comes from `sub_tls`, which run sequentially to terminal.
+comes from numeric `order` values on direct sibling `sub_tls` entries.
 
-So: put every stage in its own sub-TL, and put nothing at the top level.
+Use order 1 for implementation and order 2 for documentation. Same-order
+sub-TLs are concurrent; different orders wait for all child completion and
+serialized aggregate integration before advancing.
 
 ```json
 {
@@ -370,6 +633,7 @@ So: put every stage in its own sub-TL, and put nothing at the top level.
     "sub_tls": [
       {
         "name": "impl",
+        "order": 1,
         "plan": {
           "leaves": [
             {
@@ -389,6 +653,7 @@ So: put every stage in its own sub-TL, and put nothing at the top level.
       },
       {
         "name": "docs",
+        "order": 2,
         "plan": {
           "leaves": [
             {
@@ -464,13 +729,46 @@ python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> -
 `--verbose`. `EXOMONAD_TL_LOOP_PROJECT_ROOT` and `EXOMONAD_TL_LOOP_RUN_ID` set
 the defaults.
 
+The focused ordered integration checks are:
+
+~~~bash
+just tl-loop-ordered-e2e
+tl_loop/.venv/bin/python -m pytest -q tl_loop/tests/test_replay.py
+cargo test -p exomonad-core --test tmux_liveness
+~~~
+
+The first command exercises the hermetic recursive lifecycle. The second
+checks replay compatibility, and the third checks the real tmux liveness
+boundary. Run the Forgejo-backed end-to-end target when CI credentials and its
+server are available.
+
 `status` prints the phase, waiting slices, gates, per-slice status and PR
 number, and the consumed event offset.
+The output also includes the current numeric order, grouped same-order
+sub-TLs, integration evidence, and a next_transition describing the next
+legal operator action. The /control run read model exposes the same fields
+with schema_version: 2; older checkpoints are projected with empty ordered
+stages and unknown integration evidence.
 
 ### Slice statuses
 
 `pending` → `ready` → `spawned` → `in_review` → (`repairing` →) `merged`.
 Terminal alternatives: `failed`, `parked`, `blocked`.
+
+For an ordered run, inspect these fields first:
+
+| Status output | Diagnose |
+|---|---|
+| current_order and ordered_stages | Which numeric stage is active and which sibling sub-TLs are running together |
+| integration.lifecycle = READY_FOR_INTEGRATION | Review and CI are acceptable for the candidate head; the controller is checking base-bound evidence |
+| integration.lifecycle = NEEDS_BASE_REVALIDATION | The base moved; wait for refreshed integration CI, not a new review or rebase |
+| integration.lifecycle = INTEGRATION_CONFLICT | The aggregate PR needs same-owner resume_pr repair |
+| next_transition | The controller's next legal action, such as answer_gate:<name>, revalidate_base_and_integration_ci, or resume_pr:<owner> |
+
+tl-integration-revalidation means repeated base movement exceeded the
+configured revalidation ceiling. tl-integration-conflict means conflict
+repair exceeded its ceiling or requires human direction. Answering a gate is
+the only operator mutation; do not manually mark a stage merged.
 
 ### Park causes, and what each one asks of you
 
@@ -574,8 +872,8 @@ just agent and PR activity.
 
 ### Controller events
 
-Eight declared `tl.*` event types land in the ledger alongside agent events,
-all carrying identities and bounded dimensions only — never utterances, diffs,
+Declared `tl.*` event types land in the ledger alongside agent events, all
+carrying identities and bounded dimensions only — never utterances, diffs,
 repair prose, or plan documents:
 
 | Event | Fires when |
@@ -588,6 +886,13 @@ repair prose, or plan documents:
 | `tl.merge_decided` | The controller decides to merge or not |
 | `tl.judgment` | An RLM judgment completes, with attempt and outcome |
 | `tl.plan_proposed` | A `/control` plan proposal is accepted or rejected |
+| `tl.stage_started` / `tl.stage_completed` | An ordered numeric stage starts or finishes |
+| `tl.aggregate_pr_opened` | An aggregate PR is created for a child sub-TL |
+| `tl.integration_validated` / `tl.integration_revalidated` | Base-bound integration evidence is accepted or refreshed |
+| `tl.integration_base_invalidated` | The integration base changed and evidence must be refreshed |
+| `tl.integration_conflict` | Aggregate integration needs conflict repair |
+| `tl.integration_repair_requested` | Same-owner repair was requested |
+| `tl.merge_reconciled` | Restart observed that a persisted merge already completed |
 
 Emission is **fail-open**. If the ledger write fails it is logged and the run
 continues — observability can never stall a run or change a merge decision.

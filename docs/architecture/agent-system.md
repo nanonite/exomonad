@@ -39,6 +39,56 @@ The controller has an architectural no-edit boundary: implementation belongs to 
 
 ---
 
+## Ordered recursive integration
+
+Ordered sub-TLs are recursive controller stages, not extra interactive agent
+sessions. Order is scoped to direct siblings at one plan boundary. Missing order
+means legacy order 1; explicit orders must be present on every sibling and be
+contiguous from 1. Mixed explicit and missing values are rejected before
+dispatch.
+
+```mermaid
+flowchart LR
+  plan[ordered sub-TL plan] --> normalize[normalize contiguous orders]
+  normalize --> parallel[run same-order children concurrently]
+  parallel --> review[direct-parent review and head gate]
+  review --> evidence[base and head integration evidence]
+  evidence --> serialize[serialize aggregate merges by sub-TL ID]
+  serialize --> next[next numeric order]
+  evidence --> revalidate[NEEDS_BASE_REVALIDATION]
+  evidence --> conflict[INTEGRATION_CONFLICT]
+  revalidate --> evidence
+  conflict --> repair[same-owner resume_pr repair]
+  repair --> review
+```
+
+Different numeric orders are sequential. Same-order children run concurrently
+within `max_parallel_slices`; each child may also run parallel leaves. Once the
+children are ready, the parent owns aggregate PR integration and serializes it
+in stable sub-TL ID order. Merge priority is not plan-authored. A child failure
+blocks higher orders, and a restart resumes the stage and aggregate checkpoint
+without duplicating a child or merge.
+
+Review evidence is bound to the reviewed head and patch digest. Integration
+evidence is bound to the current base, integrated head, merge tree, and CI. A
+base movement is `NEEDS_BASE_REVALIDATION`, not a reason to spawn a worker or
+rebase solely for freshness. A real conflict is `INTEGRATION_CONFLICT` and
+routes through same-owner `resume_pr`, preserving branch, worktree, and PR.
+
+| Lifecycle | Authority | Recovery |
+|---|---|---|
+| `READY_FOR_INTEGRATION` | Direct parent has accepted review and CI for the candidate head | Validate base-bound evidence |
+| `NEEDS_BASE_REVALIDATION` | Watcher observed base movement | Refresh integration CI and evidence |
+| `INTEGRATION_CONFLICT` | Aggregate integration cannot apply cleanly | Same-owner `resume_pr` or a named human gate |
+| `MERGING` | Merge request was persisted | Reconcile watcher state after restart; never duplicate merge |
+| `MERGED` | Merge outcome is authoritative | Advance only after checkpoint |
+
+The read model exposes `schema_version: 2`, `current_order`, grouped
+`ordered_stages`, aggregate integration evidence, and `next_transition` so an
+operator can diagnose a stopped stage without reading raw ledger payloads.
+
+---
+
 ## 2. Tool Matrix — role × MCP tool
 
 `x` = registered for that role (callable). Blank = not registered, calls return `tool not found`.

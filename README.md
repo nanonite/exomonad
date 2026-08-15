@@ -160,6 +160,26 @@ window opens `tl-dispatch-timeout` with the intent and last boundary visible in
 `status`. Restart reconciliation uses the persisted intent and never issues a
 duplicate spawn for the same attempt.
 
+### Ordered recursive sub-TLs
+
+Direct sibling sub-TLs may declare a positive numeric `order`. Missing order is
+legacy shorthand for order 1; explicit orders must be present on every sibling
+and contiguous from 1, so a mixture of explicit and missing values is rejected.
+Different orders run sequentially. Same-order sub-TLs run concurrently within
+the configured bound, then their aggregate integration is serialized in stable
+sub-TL ID order before the next numeric order begins. The plan does not encode
+merge priority.
+
+Each aggregate candidate keeps review evidence bound to its reviewed head and
+integration evidence bound to the current base, integrated tree, and CI. A
+moving base requires base revalidation; a real conflict requires same-owner
+`resume_pr` repair. Do not spawn a worker or rebase solely because the base
+moved. A restart resumes the persisted stage and integration checkpoint rather
+than duplicating a child or merge.
+
+See [Programming the TL](docs/guides/programming-the-tl.md#ordered-plan-examples)
+for validated JSON examples covering parallel, nested, and sequential stages.
+
 Once a run is live you can steer it three ways, in increasing richness:
 
 ```bash
@@ -171,7 +191,12 @@ curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Token: $EXOMONAD_CONT
      http://localhost/control/runs/root
 ```
 
-The `/control` surface adds a read model over run state (slices, per-head review and CI evidence, budgets, transitions) plus the only two mutations an operator may make: answer an existing named gate, and propose a plan change that stays inert until confirmed. It can never merge, approve a review, set a verdict, or widen a policy — those stay with the controller.
+The `/control` surface adds a schema-versioned read model over run state
+(slices, ordered stages, per-head review evidence, base-bound integration
+evidence, budgets, transitions, and `next_transition`) plus the only two
+mutations an operator may make: answer an existing named gate, and propose a
+plan change that stays inert until confirmed. It can never merge, approve a
+review, set a verdict, or widen a policy — those stay with the controller.
 
 Afterwards, the run is measurable rather than merely reviewable. The controller's own decisions — gates opened and answered, slices parked and why, merge decisions, RLM judgment retries — land in the same append-only ledger as agent and PR activity:
 
@@ -240,7 +265,10 @@ A `NO-GO` composes a seven-section repair handoff and dispatches it through `res
 | `workers` / `spawn_worker` | Ephemeral agent in a tmux pane | Shared directory, no branch, no PR | Research or narrow in-place edits |
 | `sub_tls` | A nested `tl_run` with its own checkpoint | Own branch, PR targets the parent | Recursive decomposition and stage ordering |
 
-Sub-TLs run sequentially and each blocks until terminal — that is how you express "documentation after the code merges". Top-level leaves run in parallel with no ordering.
+Sub-TLs run in numbered stages: different orders are sequential, while
+same-order siblings run concurrently and integrate in deterministic sub-TL ID
+order. Top-level leaves still run in parallel with no ordering. Use an order-2
+sub-TL to express documentation after the order-1 code stage merges.
 
 **Communication:** Child agents call `notify_parent` when done; messages arrive as native teammate notifications via the Teams inbox. The inbox is a human and worker delivery surface — the controller coordinates on the durable ledger, and a free-form message can never approve a merge.
 

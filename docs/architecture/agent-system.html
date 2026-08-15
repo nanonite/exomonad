@@ -46,6 +46,34 @@
 </table>
 <p class="note">Harness and model are never chosen by a plan or a prompt. The selector reads the human-authored allowlist in <code>.exo/harness_policy.toml</code> and picks the cheapest allowed entry meeting the slice's capability and budget constraints. The controller has an architectural no-edit boundary: a failed or stuck run becomes a durable named gate, not a redispatch prompt.</p>
 
+<h2>Ordered recursive integration</h2>
+<p>Ordered sub-TLs are recursive controller stages, not extra interactive agent sessions. Order is scoped to direct siblings at one plan boundary. Missing order means legacy order 1; explicit orders must be present on every sibling and contiguous from 1. Mixed explicit and missing values are rejected before dispatch.</p>
+<div class="mermaid">
+flowchart LR
+  plan[ordered sub-TL plan] --> normalize[normalize contiguous orders]
+  normalize --> parallel[run same-order children concurrently]
+  parallel --> review[direct-parent review and head gate]
+  review --> evidence[base and head integration evidence]
+  evidence --> serialize[serialize aggregate merges by sub-TL ID]
+  serialize --> next[next numeric order]
+  evidence --> revalidate[NEEDS_BASE_REVALIDATION]
+  evidence --> conflict[INTEGRATION_CONFLICT]
+  revalidate --> evidence
+  conflict --> repair[same-owner resume_pr repair]
+  repair --> review
+</div>
+<p>Different numeric orders are sequential. Same-order children run concurrently within <code>max_parallel_slices</code>; each child may also run parallel leaves. The parent owns aggregate PR integration and serializes it in stable sub-TL ID order. A child failure blocks higher orders, and a restart resumes the stage and aggregate checkpoint without duplicating a child or merge.</p>
+<p>Review evidence is bound to the reviewed head and patch digest. Integration evidence is bound to the current base, integrated head, merge tree, and CI. Base movement is <code>NEEDS_BASE_REVALIDATION</code>, not a reason to spawn a worker or rebase solely for freshness. A real conflict is <code>INTEGRATION_CONFLICT</code> and routes through same-owner <code>resume_pr</code>.</p>
+<table>
+<tr><th>Lifecycle</th><th>Authority</th><th>Recovery</th></tr>
+<tr><td><code>READY_FOR_INTEGRATION</code></td><td>Direct parent accepted review and CI for the candidate head</td><td>Validate base-bound evidence</td></tr>
+<tr><td><code>NEEDS_BASE_REVALIDATION</code></td><td>Watcher observed base movement</td><td>Refresh integration CI and evidence</td></tr>
+<tr><td><code>INTEGRATION_CONFLICT</code></td><td>Aggregate integration cannot apply cleanly</td><td>Same-owner <code>resume_pr</code> or named human gate</td></tr>
+<tr><td><code>MERGING</code></td><td>Merge request was persisted</td><td>Reconcile watcher state after restart; never duplicate merge</td></tr>
+<tr><td><code>MERGED</code></td><td>Merge outcome is authoritative</td><td>Advance only after checkpoint</td></tr>
+</table>
+<p>The read model exposes <code>schema_version: 2</code>, <code>current_order</code>, grouped <code>ordered_stages</code>, aggregate integration evidence, and <code>next_transition</code>.</p>
+
 <h2>2. Tool Matrix</h2>
 
 <h3>ExoMonad orchestration</h3>
