@@ -8,6 +8,7 @@
 use exomonad_core::domain::RoutingInfo;
 use exomonad_core::services::tmux_ipc::{routing_target_alive, PaneId, TmuxIpc, WindowId};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// A tmux session created for one test, torn down on drop.
@@ -15,9 +16,25 @@ struct TestSession {
     name: String,
 }
 
+fn test_tmux_socket() -> &'static str {
+    static SOCKET: OnceLock<String> = OnceLock::new();
+    SOCKET.get_or_init(|| format!("exo-liveness-{}", std::process::id()))
+}
+
+fn test_tmux_command() -> Command {
+    let mut command = Command::new("tmux");
+    command.args(["-L", test_tmux_socket()]);
+    command
+}
+
+fn configure_test_tmux_socket() {
+    std::env::set_var("EXOMONAD_TMUX_SOCKET", test_tmux_socket());
+}
+
 impl TestSession {
     fn create(name: &str) -> Self {
-        let status = Command::new("tmux")
+        configure_test_tmux_socket();
+        let status = test_tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -50,7 +67,7 @@ impl TestSession {
     }
 
     fn query(&self, format: &str) -> String {
-        let output = Command::new("tmux")
+        let output = test_tmux_command()
             .args(["list-panes", "-t", &self.name, "-F", format])
             .output()
             .expect("tmux list-panes");
@@ -68,7 +85,7 @@ impl TestSession {
     }
 
     fn new_shell_window(&self, name: &str) -> WindowId {
-        let output = Command::new("tmux")
+        let output = test_tmux_command()
             .args([
                 "new-window",
                 "-d",
@@ -89,33 +106,33 @@ impl TestSession {
 
     fn set_remain_on_exit(&self, window_id: &WindowId) {
         let target = format!("{}:{}", self.name, window_id);
-        let status = Command::new("tmux")
+        let status = test_tmux_command()
             .args(["set-window-option", "-t", &target, "remain-on-exit", "on"])
             .status()
             .expect("tmux set-window-option");
         assert!(status.success(), "tmux set-window-option failed");
     }
 
-    fn exit_shell(&self, window_id: &WindowId) {
+    fn respawn_exiting_shell(&self, window_id: &WindowId) {
         let target = format!("{}:{}", self.name, window_id);
-        let status = Command::new("tmux")
-            .args(["send-keys", "-t", &target, "exit", "Enter"])
+        let status = test_tmux_command()
+            .args(["respawn-window", "-k", "-t", &target, "sh -c 'exit 0'"])
             .status()
-            .expect("tmux send-keys");
-        assert!(status.success(), "tmux send-keys failed");
+            .expect("tmux respawn-window");
+        assert!(status.success(), "tmux respawn-window failed");
     }
 }
 
 impl Drop for TestSession {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
+        let _ = test_tmux_command()
             .args(["kill-session", "-t", &self.name])
             .status();
     }
 }
 
 fn tmux_available() -> bool {
-    Command::new("tmux")
+    test_tmux_command()
         .arg("-V")
         .output()
         .map(|out| out.status.success())
@@ -161,7 +178,7 @@ async fn window_exists_reports_false_after_the_window_is_killed() {
         return;
     }
     let session = TestSession::create("exo-liveness-killed-window");
-    let extra = Command::new("tmux")
+    let extra = test_tmux_command()
         .args([
             "new-window",
             "-d",
@@ -186,7 +203,7 @@ async fn window_exists_reports_false_after_the_window_is_killed() {
         .await
         .expect("probe succeeds"));
 
-    let status = Command::new("tmux")
+    let status = test_tmux_command()
         .args(["kill-window", "-t", extra_id.as_str()])
         .status()
         .expect("tmux kill-window");
@@ -290,7 +307,7 @@ async fn routing_target_process_alive_rejects_dead_command_in_retained_window() 
         .expect("process probe succeeds"));
 
     session.set_remain_on_exit(&window);
-    session.exit_shell(&window);
+    session.respawn_exiting_shell(&window);
 
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {

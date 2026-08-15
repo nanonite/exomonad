@@ -29,7 +29,7 @@ from tl_loop.select.capability import load_capability
 from tl_loop.select.policy import load_policy
 from tl_loop.state.read_model import project_read_model
 from tl_loop.state.schema import GateStatus, RunState
-from tl_loop.state.store import RunStore
+from tl_loop.state.store import CorruptCheckpoint, RunStore
 
 LOGGER = logging.getLogger("tl_loop")
 DEFAULT_RUN_ID = "root"
@@ -99,7 +99,7 @@ def _parser() -> argparse.ArgumentParser:
         "--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID)
     )
     status.add_argument("--watch", action="store_true")
-    status.add_argument("--interval", type=_positive_float, default=1.0)
+    status.add_argument("--interval", type=_positive_float, default=2.0)
     status.set_defaults(command="status")
 
     gate = subcommands.add_parser("gate", help="answer a durable human gate")
@@ -325,27 +325,48 @@ def _print_result(result: TLRunResult) -> None:
 def _print_status(args: argparse.Namespace) -> None:
     project_root = args.project_root.expanduser().resolve()
     root = project_root / ".exo" / "tl-loop"
+    plan_path = project_root / ".exo" / "tl-loop" / "plan.json"
     while True:
+        if args.watch:
+            print("\033[2J\033[H", end="")
         store = RunStore(args.run_id, root)
-        if not store.path.exists():
-            reason = store.exit_reason()
-            if reason:
-                print(f"controller exited: {reason}")
-            else:
-                print(f"missing checkpoint: {store.path}")
-        else:
-            state = store.load()
-            reader = LedgerReader(
-                project_root / ".exo" / "ledger" / "segments",
-                run_id=args.run_id,
-                state_root=root,
-                scope_run_id=args.run_id,
-            )
-            replay = reader.read_from(0)
-            print(json.dumps(_state_document(state, replay.events, replay.sequence_status), indent=2, sort_keys=True))
+        print(_status_snapshot(store, project_root, plan_path, args.run_id))
         if not args.watch:
             return
         time.sleep(args.interval)
+
+
+def _status_snapshot(
+    store: RunStore,
+    project_root: Path,
+    plan_path: Path,
+    run_id: str,
+) -> str:
+    """Render one race-tolerant, read-only status snapshot."""
+    if not store.path.exists():
+        reason = store.exit_reason()
+        if reason:
+            return f"controller exited: {reason}"
+        return (
+            "no run yet; controller is waiting for "
+            f".exo/tl-loop/plan.json (path: {plan_path})"
+        )
+    try:
+        state = store.load()
+        reader = LedgerReader(
+            project_root / ".exo" / "ledger" / "segments",
+            run_id=run_id,
+            state_root=store.root_dir,
+            scope_run_id=run_id,
+        )
+        replay = reader.read_from(0)
+    except (CorruptCheckpoint, OSError, ValueError) as error:
+        return f"checkpoint is currently unavailable; retrying: {error}"
+    return json.dumps(
+        _state_document(state, replay.events, replay.sequence_status),
+        indent=2,
+        sort_keys=True,
+    )
 
 
 def _set_gate(args: argparse.Namespace) -> None:

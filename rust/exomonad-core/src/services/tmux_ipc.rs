@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::env;
 use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -167,6 +168,16 @@ fn session_missing(stderr: &str) -> bool {
     stderr.contains("can't find session") || stderr.contains("no server running")
 }
 
+fn tmux_command() -> Command {
+    let mut command = Command::new("tmux");
+    if let Ok(socket) = env::var("EXOMONAD_TMUX_SOCKET") {
+        if !socket.trim().is_empty() {
+            command.args(["-L", &socket]);
+        }
+    }
+    command
+}
+
 fn listing_contains_id(listing: &str, target: &str) -> bool {
     listing.lines().any(|line| line.trim() == target)
 }
@@ -223,7 +234,7 @@ impl TmuxIpc {
 
     /// Create a new tmux session. Returns the stable window ID (@N) of the initial window.
     pub async fn new_session(name: &str, cwd: &Path) -> Result<WindowId> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -252,7 +263,7 @@ impl TmuxIpc {
     }
 
     pub async fn has_session(name: &str) -> Result<bool> {
-        let status = Command::new("tmux")
+        let status = tmux_command()
             .args(["has-session", "-t", name])
             .status()
             .await
@@ -261,7 +272,7 @@ impl TmuxIpc {
     }
 
     pub async fn kill_session(name: &str) -> Result<()> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["kill-session", "-t", name])
             .output()
             .await
@@ -295,7 +306,7 @@ impl TmuxIpc {
         shell: &str,
         command: &str,
     ) -> Result<WindowId> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "new-window",
                 "-P",
@@ -329,7 +340,7 @@ impl TmuxIpc {
     }
 
     pub async fn list_windows(&self) -> Result<Vec<WindowInfo>> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "list-windows",
                 "-t",
@@ -382,7 +393,7 @@ impl TmuxIpc {
     }
 
     pub async fn kill_window(&self, window_id: &WindowId) -> Result<()> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["kill-window", "-t", window_id.as_str()])
             .output()
             .await
@@ -398,7 +409,7 @@ impl TmuxIpc {
     }
 
     pub async fn select_window(&self, window_id: &WindowId) -> Result<()> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["select-window", "-t", window_id.as_str()])
             .output()
             .await
@@ -422,7 +433,7 @@ impl TmuxIpc {
         shell: &str,
         command: &str,
     ) -> Result<PaneId> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "split-window",
                 "-P",
@@ -461,7 +472,7 @@ impl TmuxIpc {
     ) -> Result<()> {
         let qualified = format!("{}:{}", self.session_name, window_id.as_str());
         let layout_str = layout.as_str();
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["select-layout", "-t", &qualified, layout_str])
             .output()
             .await
@@ -477,7 +488,7 @@ impl TmuxIpc {
     }
 
     pub async fn kill_pane(&self, pane_id: &PaneId) -> Result<()> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["kill-pane", "-t", pane_id.as_str()])
             .output()
             .await
@@ -536,7 +547,7 @@ impl TmuxIpc {
 
         // Exit copy/scroll mode if active — copy mode intercepts input,
         // preventing paste-buffer from reaching the underlying process.
-        let mode_output = Command::new("tmux")
+        let mode_output = tmux_command()
             .args([
                 "display-message",
                 "-p",
@@ -548,7 +559,7 @@ impl TmuxIpc {
             .await;
         if let Ok(output) = mode_output {
             if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1" {
-                let _ = Command::new("tmux")
+                let _ = tmux_command()
                     .args(["send-keys", "-t", &qualified_target, "-X", "cancel"])
                     .output()
                     .await;
@@ -566,7 +577,7 @@ impl TmuxIpc {
             .await
             .context("Failed to write temp buffer file")?;
 
-        let load_result = Command::new("tmux")
+        let load_result = tmux_command()
             .args(["load-buffer", "-b", &buf_name, &tmp_path])
             .output()
             .await;
@@ -586,7 +597,7 @@ impl TmuxIpc {
         // Ink TUI and terminal readline implementations. Plain paste streams bytes
         // as standard keyboard input.
         let paste_started = Instant::now();
-        let paste_output = Command::new("tmux")
+        let paste_output = tmux_command()
             .args(["paste-buffer", "-b", &buf_name, "-t", &qualified_target])
             .output()
             .await
@@ -594,7 +605,7 @@ impl TmuxIpc {
         let paste_elapsed = paste_started.elapsed();
 
         // Delete the named buffer
-        match Command::new("tmux")
+        match tmux_command()
             .args(["delete-buffer", "-b", &buf_name])
             .output()
             .await
@@ -699,7 +710,7 @@ impl TmuxIpc {
     }
 
     async fn send_enter_key(qualified_target: &str) -> Result<()> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["send-keys", "-t", qualified_target, "Enter"])
             .output()
             .await
@@ -717,7 +728,7 @@ impl TmuxIpc {
     /// signal. The caller decides whether the observed change is meaningful.
     pub async fn capture_pane(&self, target: &str) -> Result<String> {
         let qualified_target = qualify_tmux_target(&self.session_name, target);
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["capture-pane", "-p", "-t", &qualified_target])
             .output()
             .await
@@ -736,7 +747,7 @@ impl TmuxIpc {
             return Ok(true);
         }
 
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["capture-pane", "-p", "-t", qualified_target])
             .output()
             .await
@@ -761,7 +772,7 @@ impl TmuxIpc {
         let qualified = qualify_tmux_target(&self.session_name, target);
 
         // Read current window dimensions
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "display-message",
                 "-t",
@@ -790,7 +801,7 @@ impl TmuxIpc {
         let height: u32 = parts[1].parse().context("Failed to parse window height")?;
 
         // Resize +1 column
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args([
                 "resize-window",
                 "-t",
@@ -806,7 +817,7 @@ impl TmuxIpc {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Restore original size
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args([
                 "resize-window",
                 "-t",
@@ -826,7 +837,7 @@ impl TmuxIpc {
     // -- Query --
 
     pub async fn window_exists(&self, window_id: &WindowId) -> Result<bool> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "list-windows",
                 "-t",
@@ -882,7 +893,7 @@ impl TmuxIpc {
     }
 
     pub async fn pane_exists(&self, pane_id: &PaneId) -> Result<bool> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args(["list-panes", "-a", "-F", "#{session_name}\t#{pane_id}"])
             .output()
             .await
@@ -921,7 +932,7 @@ impl TmuxIpc {
     /// command exits (`remain-on-exit`) as dead. The listing is session-scoped
     /// so a server-global pane/window ID from another session cannot qualify.
     pub async fn routing_target_process_alive(&self, routing: &RoutingInfo) -> Result<bool> {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "list-panes",
                 "-a",

@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- tmux_liveness dead-pane test depends on ambient tmux state and blocks just test (#857)
 - Fix installed controller missing newly added source files (#860)
 - E9: Separate transport evidence from runtime consumption (#766)
 - Fix watcher purity and enforce complete merge observability gates (#757)
@@ -122,6 +123,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- E19: tl_loop status --watch (#833)
 - E18: Preflight config validation in exomonad init (#832)
 - E17: Controller denominator rules and coverage refresh (#817)
 - E16: Declare and emit tl.* controller events (#816)
@@ -301,6 +303,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- E19 :: E19.4 Watch-mode tests (#842)
+- E19 :: E19.3 Degrade gracefully with no state (#841)
+- E19 :: E19.2 Render the live view (#840)
+- E19 :: E19.1 Add --watch and --interval to the status subcommand (#839)
 - E18 :: E18.14 build.rs does not regenerate the archive on tl_loop source edits (#858)
 - E18 :: E18.11 Unify build-time and runtime Python interpreter resolution (#854)
 - E18 :: E18.12 Generated tl_loop.pyz is committed to git - stale-embed risk (#855)
