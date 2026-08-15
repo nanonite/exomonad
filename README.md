@@ -133,6 +133,14 @@ exomonad init       # Creates tmux session with Server + TL windows
                     # TL window runs `python3 ~/.exo/tl_loop.pyz` — the controller
 ```
 
+`exomonad init` waits for the server socket and then applies a bounded
+five-second TL startup liveness gate. The controller must appear and remain
+alive through that startup interval; otherwise init exits non-zero and keeps a
+durable failure reason. This is intentionally not semantic controller
+readiness or heartbeat monitoring: later hangs and failures remain visible
+through the Watcher, `status`, and `controller-exit.json`. An authoritative
+ready/heartbeat protocol is separate future work.
+
 The **TL window is the controller**, not a harness session — do not type `claude` into it. It is an observation and gate surface:
 
 ```bash

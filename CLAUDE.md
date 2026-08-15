@@ -133,6 +133,12 @@ if !status.success() {
 
 The server must be running before the controller or any worker can use MCP effects. Without it, effect calls fail explicitly. Init also writes `.mcp.json` with the `tl/root` identity, `.exo/agents/root/identity.json`, `.exo/tl-loop/plan.json` when supplied, and `.claude/settings.local.json` for worker hooks.
 
+Init uses a bounded five-second startup liveness gate for the TL pane. This
+confirms that the controller process appears and survives startup; it is not a
+semantic ready signal or heartbeat protocol. Later hangs or failures remain
+observable through the Watcher, `status`, and the durable controller-exit
+record.
+
 ```bash
 cd exomonad/                  # Run from the project root
 exomonad new                  # One-time setup: creates config, WASM, rules
