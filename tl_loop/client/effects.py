@@ -24,7 +24,6 @@ class EffectTransport(Protocol):
         """Call a named server-side tool."""
 
 
-
 @dataclass(frozen=True)
 class CompletedTask:
     """A task and its verification command for ``notify_parent``."""
@@ -133,12 +132,12 @@ class EffectClient:
             {"event_type": event_type, "payload": payload},
         )
 
-
     def spawn_leaf(
         self,
         *,
         name: str,
         task: str,
+        intent_id: str | None = None,
         agent_type: str | None = None,
         boundary: StringList | None = None,
         context: str | None = None,
@@ -147,6 +146,7 @@ class EffectClient:
         verify: StringList | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {"name": name, "task": task}
+        _put(arguments, "intent_id", intent_id)
         _put(arguments, "agent_type", agent_type)
         _put_list(arguments, "boundary", boundary)
         _put(arguments, "context", context)
@@ -155,8 +155,16 @@ class EffectClient:
         _put_list(arguments, "verify", verify)
         return self._call("spawn_leaf", arguments)
 
-    def spawn_worker(self, *, name: str, task: str, agent_type: str | None = None) -> ToolResult:
+    def spawn_worker(
+        self,
+        *,
+        name: str,
+        task: str,
+        intent_id: str | None = None,
+        agent_type: str | None = None,
+    ) -> ToolResult:
         arguments: JsonObject = {"name": name, "task": task}
+        _put(arguments, "intent_id", intent_id)
         _put(arguments, "agent_type", agent_type)
         return self._call("spawn_worker", arguments)
 

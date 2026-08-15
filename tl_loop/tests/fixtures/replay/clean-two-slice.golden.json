@@ -43,7 +43,7 @@
     "waiting": []
   },
   "gates": [],
-  "revision": 7,
+  "revision": 9,
   "run_id": "<run-id>",
   "slices": {
     "leaf-a": {
@@ -53,6 +53,11 @@
       "branch": "main.leaf-a",
       "ci_state": {},
       "depends_on": [],
+      "dispatch_agent_id": "leaf-a",
+      "dispatch_authoritative_event_seq": 2,
+      "dispatch_intent_id": "<intent-id>",
+      "dispatch_last_boundary": "agent.spawned",
+      "dispatch_started_at": "<timestamp>",
       "id": "leaf-a",
       "model": null,
       "paths": [
@@ -77,6 +82,11 @@
       "branch": "main.worker-a",
       "ci_state": {},
       "depends_on": [],
+      "dispatch_agent_id": "worker-a",
+      "dispatch_authoritative_event_seq": 1,
+      "dispatch_intent_id": "<intent-id>",
+      "dispatch_last_boundary": "agent.spawned",
+      "dispatch_started_at": "<timestamp>",
       "id": "worker-a",
       "model": null,
       "paths": [

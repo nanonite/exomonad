@@ -424,6 +424,18 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["blocked_by"] = value.blocked_by
         if value.stall_classification is not None:
             record["stall_classification"] = value.stall_classification
+        if value.dispatch_intent_id is not None:
+            record["dispatch_intent_id"] = value.dispatch_intent_id
+        if value.dispatch_started_at is not None:
+            record["dispatch_started_at"] = value.dispatch_started_at
+        if value.dispatch_last_boundary is not None:
+            record["dispatch_last_boundary"] = value.dispatch_last_boundary
+        if value.dispatch_error is not None:
+            record["dispatch_error"] = value.dispatch_error
+        if value.dispatch_agent_id is not None:
+            record["dispatch_agent_id"] = value.dispatch_agent_id
+        if value.dispatch_authoritative_event_seq is not None:
+            record["dispatch_authoritative_event_seq"] = value.dispatch_authoritative_event_seq
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
@@ -636,6 +648,14 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         ),
         blocked_by=cast(str | None, value.get("blocked_by")),
         stall_classification=cast(str | None, value.get("stall_classification")),
+        dispatch_intent_id=cast(str | None, value.get("dispatch_intent_id")),
+        dispatch_started_at=cast(float | None, value.get("dispatch_started_at")),
+        dispatch_last_boundary=cast(str | None, value.get("dispatch_last_boundary")),
+        dispatch_error=cast(str | None, value.get("dispatch_error")),
+        dispatch_agent_id=cast(str | None, value.get("dispatch_agent_id")),
+        dispatch_authoritative_event_seq=cast(
+            int | None, value.get("dispatch_authoritative_event_seq")
+        ),
     )
 
 

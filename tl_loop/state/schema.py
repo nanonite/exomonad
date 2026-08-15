@@ -17,6 +17,9 @@ class SliceStatus(str, Enum):
 
     PENDING = "pending"
     READY = "ready"
+    DISPATCHING = "dispatching"
+    DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
+    DISPATCH_FAILED = "dispatch_failed"
     SPAWNED = "spawned"
     IN_REVIEW = "in_review"
     REPAIRING = "repairing"
@@ -36,6 +39,9 @@ class ParkCause(str, Enum):
     REVIEW_STUCK = "review_stuck"
     HARNESS_SWITCH_REQUESTED = "harness_switch_requested"
     STALL_DETECTED = "stall_detected"
+    DISPATCH_TIMEOUT = "dispatch_timeout"
+    DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
+    DISPATCH_FAILED = "dispatch_failed"
 
 
 class Verdict(str, Enum):
@@ -53,6 +59,7 @@ class GateStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
 
+
 REVIEW_FINDING_KEYS = frozenset({"severity", "path", "rationale"})
 CI_STATUS_VALUES = frozenset({"unknown", "pending", "success", "failure", "neutral"})
 STALL_CLASSIFICATION_VALUES = frozenset(
@@ -69,6 +76,7 @@ TERMINAL_SLICE_STATUSES = frozenset(
     {
         SliceStatus.MERGED.value,
         SliceStatus.FAILED.value,
+        SliceStatus.DISPATCH_FAILED.value,
         SliceStatus.PARKED.value,
         SliceStatus.BLOCKED.value,
     }
@@ -119,6 +127,12 @@ SLICE_KEYS = frozenset(
         "park_audit",
         "blocked_by",
         "stall_classification",
+        "dispatch_intent_id",
+        "dispatch_started_at",
+        "dispatch_last_boundary",
+        "dispatch_error",
+        "dispatch_agent_id",
+        "dispatch_authoritative_event_seq",
     }
 )
 PARK_AUDIT_KEYS = frozenset(
@@ -200,6 +214,12 @@ class SliceState:
     park_audit: Mapping[str, object] | None = None
     blocked_by: str | None = None
     stall_classification: str | None = None
+    dispatch_intent_id: str | None = None
+    dispatch_started_at: float | None = None
+    dispatch_last_boundary: str | None = None
+    dispatch_error: str | None = None
+    dispatch_agent_id: str | None = None
+    dispatch_authoritative_event_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -401,6 +421,12 @@ def _validate_slice(
     _nullable_positive_int(value, "park_issue_id", path, errors)
     _nullable_string(value, "blocked_by", path, errors)
     _nullable_string(value, "stall_classification", path, errors)
+    _nullable_string(value, "dispatch_intent_id", path, errors)
+    _nullable_number(value, "dispatch_started_at", path, errors)
+    _nullable_string(value, "dispatch_last_boundary", path, errors)
+    _nullable_string(value, "dispatch_error", path, errors)
+    _nullable_string(value, "dispatch_agent_id", path, errors)
+    _nullable_non_negative_int(value, "dispatch_authoritative_event_seq", path, errors)
     classification = value.get("stall_classification")
     if classification is not None and classification not in STALL_CLASSIFICATION_VALUES:
         errors.append(
@@ -452,9 +478,7 @@ def _ci_state(
             errors.append((f"{path}.ci_state", "keys must be non-empty head SHAs"))
             continue
         if not isinstance(status, str) or status not in CI_STATUS_VALUES:
-            errors.append(
-                (status_path, f"must be one of {sorted(CI_STATUS_VALUES)}")
-            )
+            errors.append((status_path, f"must be one of {sorted(CI_STATUS_VALUES)}"))
 
 
 def _reviewer_attempt(
@@ -470,9 +494,7 @@ def _reviewer_attempt(
     for head_sha, attempt in value.items():
         attempt_path = f"{path}.reviewer_attempt[{head_sha!r}]"
         if not isinstance(head_sha, str) or not head_sha:
-            errors.append(
-                (f"{path}.reviewer_attempt", "keys must be non-empty head SHAs")
-            )
+            errors.append((f"{path}.reviewer_attempt", "keys must be non-empty head SHAs"))
             continue
         if type(attempt) is not int or attempt < 0:
             errors.append((attempt_path, "must be a non-negative integer"))
@@ -808,3 +830,19 @@ def _nullable_positive_int(
     value = holder.get(key)
     if value is not None and (type(value) is not int or value < 1):
         errors.append((f"{path}.{key}", "must be null or a positive integer"))
+
+
+def _nullable_non_negative_int(
+    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+) -> None:
+    value = holder.get(key)
+    if value is not None and (type(value) is not int or value < 0):
+        errors.append((f"{path}.{key}", "must be null or a non-negative integer"))
+
+
+def _nullable_number(
+    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+) -> None:
+    value = holder.get(key)
+    if value is not None and (type(value) not in {int, float} or value < 0):
+        errors.append((f"{path}.{key}", "must be null or a non-negative number"))

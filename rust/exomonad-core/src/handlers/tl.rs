@@ -11,7 +11,7 @@ use exomonad_proto::effects::tl::*;
 use serde_json::Value;
 use std::sync::Arc;
 
-const CONTROLLER_EVENT_TYPES: [&str; 8] = [
+const CONTROLLER_EVENT_TYPES: [&str; 15] = [
     "tl.phase_changed",
     "tl.slice_status_changed",
     "tl.slice_parked",
@@ -20,6 +20,13 @@ const CONTROLLER_EVENT_TYPES: [&str; 8] = [
     "tl.merge_decided",
     "tl.judgment",
     "tl.plan_proposed",
+    "tl.dispatch_intended",
+    "tl.spawn_requested",
+    "tl.spawn_request_accepted",
+    "tl.spawn_request_failed",
+    "tl.dispatch_confirmed",
+    "tl.dispatch_reconciliation_started",
+    "tl.dispatch_reconciliation_completed",
 ];
 
 fn allowed_fields(event_type: &str) -> &'static [&'static str] {
@@ -41,6 +48,15 @@ fn allowed_fields(event_type: &str) -> &'static [&'static str] {
             "redacted_result",
         ],
         "tl.plan_proposed" => &["run_id", "accepted", "rejection_reason"],
+        "tl.dispatch_intended"
+        | "tl.spawn_requested"
+        | "tl.spawn_request_accepted"
+        | "tl.spawn_request_failed"
+        | "tl.dispatch_confirmed"
+        | "tl.dispatch_reconciliation_started"
+        | "tl.dispatch_reconciliation_completed" => {
+            &["slice_id", "intent_id", "boundary", "started_at", "error"]
+        }
         _ => &[],
     }
 }
@@ -160,8 +176,8 @@ mod tests {
         let response = handler
             .emit_event(
                 EmitEventRequest {
-                    event_type: "tl.phase_changed".to_string(),
-                    payload: br#"{"from_phase":"planning","to_phase":"running"}"#.to_vec(),
+                    event_type: "tl.dispatch_intended".to_string(),
+                    payload: br#"{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"dispatch_intended","started_at":1}"#.to_vec(),
                 },
                 &context(),
             )

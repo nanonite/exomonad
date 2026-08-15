@@ -109,6 +109,31 @@ Acknowledgement persists the global `run_seq` in the run-state cursor through
 the single state writer, so restart begins at `cursor + 1`. No queue or event
 log file is created.
 
+## Durable child-dispatch protocol
+
+Every worker or leaf spawn is a durable two-boundary operation. Before calling
+the external spawn effect, the controller assigns a unique `intent_id` and
+checkpoints the slice as `dispatching`, then emits `tl.dispatch_intended` and
+`tl.spawn_requested`. A successful tool response is only an accepted request;
+the slice remains `dispatch_unconfirmed` until the correlated `agent.spawned`
+ledger event carries the same `intent_id`. That event is the authoritative
+transition to `spawned` and records its `run_seq` as
+`dispatch_authoritative_event_seq`.
+
+An explicit tool rejection becomes `dispatch_failed` and opens the named
+`tl-dispatch-failed` gate. If an accepted request has no authoritative event
+within `dispatch_timeout` (five seconds by default), the controller persists
+`dispatch_timeout`, opens `tl-dispatch-timeout`, and reports the intent and
+last boundary in status. This is separate from the global idle timeout, so a
+missing spawn confirmation cannot be misreported as ordinary TL inactivity.
+
+On restart, `dispatching` and `dispatch_unconfirmed` slices are reconciled by
+their persisted intent IDs before new effects are considered. Reconciliation
+never issues a second spawn for an existing intent; it waits for the matching
+event or reaches the same named timeout gate. Controller boundary events are
+limited to scalar dimensions and are written by Rust through the `tl` event
+allowlist.
+
 ## Selector budget ledger
 
 The selector estimates a spawn before it is written to run state. The estimator

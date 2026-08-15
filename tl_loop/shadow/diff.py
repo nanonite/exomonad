@@ -57,7 +57,9 @@ class DiffReport:
 
     @property
     def counts(self) -> Mapping[ActionBucket, int]:
-        return {bucket: sum(entry.bucket is bucket for entry in self.entries) for bucket in ActionBucket}
+        return {
+            bucket: sum(entry.bucket is bucket for entry in self.entries) for bucket in ActionBucket
+        }
 
 
 def normalize_arguments(arguments: Mapping[str, object]) -> dict[str, object]:
@@ -150,16 +152,16 @@ def _find_target(shadow: IntendedAction, actual: Sequence[ActualAction]) -> int 
 
 
 def _comparison_key(action: Action) -> tuple[str, str, str]:
-    return action.kind, action.target, json.dumps(
-        normalize_arguments(action.arguments), sort_keys=True, separators=(",", ":")
+    return (
+        action.kind,
+        action.target,
+        json.dumps(normalize_arguments(action.arguments), sort_keys=True, separators=(",", ":")),
     )
 
 
 def _normalize_mapping(value: Mapping[str, object]) -> dict[str, object]:
     return {
-        key: _normalize_value(key, value[key])
-        for key in sorted(value)
-        if value[key] is not None
+        key: _normalize_value(key, value[key]) for key in sorted(value) if value[key] is not None
     }
 
 
@@ -168,6 +170,10 @@ def _normalize_value(key: str, value: object) -> object:
         return _normalize_mapping(value)
     if isinstance(value, list):
         return [_normalize_value(key, item) for item in value]
+    if key in {"intent_id", "dispatch_intent_id"} and isinstance(value, str):
+        return "<intent-id>"
+    if key == "started_at" and isinstance(value, (int, float)):
+        return "<timestamp>"
     if key.endswith(("_id", "_number")) and isinstance(value, str) and value.isdecimal():
         return int(value)
     return value
@@ -186,7 +192,15 @@ def _markdown(report: DiffReport) -> str:
         "|---|---:|",
     ]
     lines.extend(f"| {bucket.value} | {counts[bucket]} |" for bucket in ActionBucket)
-    lines.extend(["", "## Actions", "", "| bucket | event_seq | shadow | actual | rationale |", "|---|---:|---|---|---|"])
+    lines.extend(
+        [
+            "",
+            "## Actions",
+            "",
+            "| bucket | event_seq | shadow | actual | rationale |",
+            "|---|---:|---|---|---|",
+        ]
+    )
     for entry in report.entries:
         shadow = _action_cell(entry.shadow)
         actual = _action_cell(entry.actual)

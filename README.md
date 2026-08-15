@@ -151,6 +151,15 @@ python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> -
 
 A run ends at `TLDone` or `TLFailed`. Bounded failures — retries exhausted, budget exhausted, review stuck, no capable harness, stall detected — park with an auditable cause and wait for an explicit human gate. The controller never retries past a ceiling or silently switches harness.
 
+Child dispatch has its own durable boundary. Each worker or leaf records an
+intent before the spawn effect, remains `dispatch_unconfirmed` after an
+accepted request, and becomes `spawned` only when the correlated
+`agent.spawned` ledger event is consumed. A rejected request opens
+`tl-dispatch-failed`; a missing confirmation after the five-second dispatch
+window opens `tl-dispatch-timeout` with the intent and last boundary visible in
+`status`. Restart reconciliation uses the persisted intent and never issues a
+duplicate spawn for the same attempt.
+
 Once a run is live you can steer it three ways, in increasing richness:
 
 ```bash

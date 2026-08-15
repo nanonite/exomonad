@@ -104,6 +104,7 @@ data SpawnLeafSubtree
 data SpawnLeafSubtreeArgs = SpawnLeafSubtreeArgs
   { slsTask :: Text,
     slsBranchName :: Text,
+    slsIntentId :: Maybe Text,
     slsAgentType :: Maybe AC.AgentType,
     slsPermissionMode :: Maybe Text,
     slsAllowedTools :: Maybe [Text],
@@ -118,6 +119,7 @@ instance FromJSON SpawnLeafSubtreeArgs where
     SpawnLeafSubtreeArgs
       <$> v .: "task"
       <*> v .: "branch_name"
+      <*> v .:? "intent_id"
       <*> v .:? "agent_type"
       <*> v .:? "permission_mode"
       <*> v .:? "allowed_tools"
@@ -135,6 +137,7 @@ spawnLeafSubtreeSchema =
   genericToolSchemaWith @SpawnLeafSubtreeArgs
     [ ("task", "Description of the sub-problem to solve"),
       ("branch_name", "Branch name suffix (will be prefixed with current branch)"),
+      ("intent_id", "Controller dispatch intent identifier used to correlate agent.spawned confirmation."),
       ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
       ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
       ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
@@ -159,6 +162,7 @@ spawnLeafSubtreeCore args = do
         AC.SpawnLeafSubtreeConfig
           { AC.slcTask = renderedTask,
             AC.slcBranchName = slsBranchName args,
+            AC.slcIntentId = slsIntentId args,
             AC.slcRole = Nothing,
             AC.slcAgentType = slsAgentType args,
             AC.slcPerms = perms,
@@ -169,7 +173,7 @@ spawnLeafSubtreeCore args = do
   case result of
     Left err -> pure $ Left (spawnErrorMessage err)
     Right spawnResult -> do
-      emitSpawnEvent (slsBranchName args) "auto" (slsTask args)
+      emitSpawnEvent (slsIntentId args) (slsBranchName args) "auto" (slsTask args)
       pure $ Right (slsBranchName args, spawnResult)
 
 -- | Render a spawn leaf result to MCPCallOutput.
@@ -198,6 +202,7 @@ instance FromJSON WorkerType where
 data WorkerSpec = WorkerSpec
   { wsName :: Text,
     wsTask :: Text,
+    wsIntentId :: Maybe Text,
     wsReadFirst :: Maybe [Text],
     wsSteps :: Maybe [Text],
     wsVerify :: Maybe [Text],
@@ -222,6 +227,7 @@ instance JsonSchema WorkerSpec where
       genericToolSchemaWith @WorkerSpec
         [ ("name", "Human-readable name for the leaf agent"),
           ("task", "Short description of the task"),
+          ("intent_id", "Controller dispatch intent identifier used to correlate agent.spawned confirmation."),
           ("read_first", "Files the agent should read before starting"),
           ("steps", "Numbered implementation steps"),
           ("verify", "Commands to verify the work"),
@@ -244,6 +250,7 @@ instance FromJSON WorkerSpec where
     WorkerSpec
       <$> v .: "name"
       <*> v .: "task"
+      <*> v .:? "intent_id"
       <*> v .:? "read_first"
       <*> v .:? "steps"
       <*> v .:? "verify"
@@ -305,7 +312,7 @@ spawnWorkersCore args = do
             }
     r <- AC.spawnWorker cfg
     case r of
-      Right _ -> emitSpawnEvent (wsName spec) "worker" (wsTask spec)
+      Right _ -> emitSpawnEvent (wsIntentId spec) (wsName spec) "worker" (wsTask spec)
       Left _ -> pure ()
     pure r
   let (errs, successes) = partitionEithers results
@@ -325,6 +332,7 @@ data SpawnLeaf
 data SpawnLeafArgs = SpawnLeafArgs
   { slName :: Text,
     slTask :: Text,
+    slIntentId :: Maybe Text,
     slAgentType :: Maybe AC.AgentType,
     slReadFirst :: Maybe [Text],
     slSteps :: Maybe [Text],
@@ -339,6 +347,7 @@ instance FromJSON SpawnLeafArgs where
     SpawnLeafArgs
       <$> v .: "name"
       <*> v .: "task"
+      <*> v .:? "intent_id"
       <*> v .:? "agent_type"
       <*> v .:? "read_first"
       <*> v .:? "steps"
@@ -354,6 +363,7 @@ spawnLeafSchema =
   genericToolSchemaWith @SpawnLeafArgs
     [ ("name", "Branch name suffix (e.g., 'fix-clippy' \x2192 'main.fix-clippy')"),
       ("task", "What to build. Combined with steps/verify/boundary into structured spec"),
+      ("intent_id", "Controller dispatch intent identifier used to correlate agent.spawned confirmation."),
       ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
       ("steps", "Numbered implementation steps with code snippets and exact file paths"),
       ("verify", "Exact verification commands (e.g., 'cargo test --workspace')"),
@@ -368,6 +378,7 @@ spawnLeafCore args = do
         SpawnLeafSubtreeArgs
           { slsTask = buildLeafTask args,
             slsBranchName = slName args,
+            slsIntentId = slIntentId args,
             slsAgentType = slAgentType args,
             slsPermissionMode = Nothing,
             slsAllowedTools = Nothing,
@@ -383,6 +394,7 @@ buildLeafTask args =
         WorkerSpec
           { wsName = slName args,
             wsTask = slTask args,
+            wsIntentId = Nothing,
             wsReadFirst = slReadFirst args,
             wsSteps = slSteps args,
             wsVerify = slVerify args,
@@ -410,6 +422,7 @@ data SpawnWorkerTool
 data SpawnWorkerToolArgs = SpawnWorkerToolArgs
   { swtName :: Text,
     swtTask :: Text,
+    swtIntentId :: Maybe Text,
     swtAgentType :: Maybe AC.AgentType
   }
   deriving (Show, Eq, Generic)
@@ -419,6 +432,7 @@ instance FromJSON SpawnWorkerToolArgs where
     SpawnWorkerToolArgs
       <$> v .: "name"
       <*> v .: "task"
+      <*> v .:? "intent_id"
       <*> v .:? "agent_type"
 
 spawnWorkerToolDescription :: Text
@@ -429,6 +443,7 @@ spawnWorkerToolSchema =
   genericToolSchemaWith @SpawnWorkerToolArgs
     [ ("name", "Worker name (pane title, messaging identity)"),
       ("task", "The full prompt. Everything the worker needs in one string"),
+      ("intent_id", "Controller dispatch intent identifier used to correlate agent.spawned confirmation."),
       ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default.")
     ]
 
@@ -438,6 +453,7 @@ spawnWorkerToolCore args = do
         WorkerSpec
           { wsName = swtName args,
             wsTask = swtTask args,
+            wsIntentId = swtIntentId args,
             wsReadFirst = Nothing,
             wsSteps = Nothing,
             wsVerify = Nothing,
@@ -483,16 +499,18 @@ closeWorkerPaneCore args = do
     Right resp -> successResult (Aeson.toJSON resp)
 
 -- | Helper to emit 'agent.spawned' event to the host.
-emitSpawnEvent :: Text -> Text -> Text -> Eff Effects ()
-emitSpawnEvent slug agentType taskSummary = do
+emitSpawnEvent :: Maybe Text -> Text -> Text -> Text -> Eff Effects ()
+emitSpawnEvent intentId slug agentType taskSummary = do
   let eventPayload =
         BSL.toStrict $
           Aeson.encode $
             object
-              [ "slug" .= slug,
-                "agent_type" .= agentType,
-                "task_summary" .= taskSummary
-              ]
+              ( [ "slug" .= slug,
+                  "agent_type" .= agentType,
+                  "task_summary" .= taskSummary
+                ]
+                  <> maybe [] (\value -> ["intent_id" .= value]) intentId
+              )
   void $
     suspendEffect_ @LogEmitEvent
       ( Log.EmitEventRequest

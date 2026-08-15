@@ -196,6 +196,10 @@ def _normalize_value(key: str, value: object) -> object:
         return {name: _normalize_value(name, item) for name, item in sorted(value.items())}
     if isinstance(value, list):
         return [_normalize_value(key, item) for item in value]
+    if key in {"dispatch_intent_id", "intent_id"}:
+        return "<intent-id>"
+    if key == "dispatch_started_at":
+        return "<timestamp>"
     if key == "run_id":
         return "<run-id>"
     if key.endswith("_at") and isinstance(value, str):

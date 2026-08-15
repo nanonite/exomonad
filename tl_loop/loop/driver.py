@@ -71,6 +71,9 @@ from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slice
 
 LOGGER = logging.getLogger(__name__)
 TIMEOUT_GATE_NAME = "tl-timeout"
+DISPATCH_TIMEOUT_GATE_NAME = "tl-dispatch-timeout"
+DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
+DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
 
 
 class TLLoopError(RuntimeError):
@@ -91,6 +94,15 @@ class DepthLimitExceeded(TLLoopError):
 
 class EffectFailed(TLLoopError):
     """An active effect returned an explicit failure."""
+
+
+@dataclass(frozen=True)
+class DispatchAttempt:
+    """Durable identity assigned to one external child-spawn attempt."""
+
+    intent_id: str
+    started_at: float
+    harness: str
 
 
 class EventQueue(Protocol):
@@ -209,6 +221,7 @@ class TLLoopConfig:
     max_events: int = 256
     poll_interval: float = 0.1
     idle_timeout: float = 30.0
+    dispatch_timeout: float = 5.0
     heartbeat: HeartbeatConfig | None = None
     goals: GoalState | None = None
     chainlink_issue_id: int | None = None
@@ -251,6 +264,8 @@ class TLLoopConfig:
             raise ValueError("poll_interval must be non-negative")
         if self.idle_timeout <= 0:
             raise ValueError("idle_timeout must be positive")
+        if self.dispatch_timeout <= 0:
+            raise ValueError("dispatch_timeout must be positive")
         if type(self.enable_reviewer_spawn) is not bool:
             raise ValueError("enable_reviewer_spawn must be a boolean")
         if self.chainlink_issue_id is not None and self.chainlink_issue_id <= 0:
@@ -379,6 +394,7 @@ def run_tl_loop(
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
     effects_log: list[EffectIntent] = []
+    state = _reconcile_dispatches(state, selected, effects, store, effects_log)
     state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
     state = _run_sub_tls(work_plan, state, selected, source, effects, store, effects_log)
     return _run_loop(
@@ -428,7 +444,7 @@ def _run_loop(
         )
         return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
 
-    deadline = time.monotonic() + config.idle_timeout
+    deadline = _next_loop_deadline(state, config)
 
     while len(consumed) < config.max_events:
         if isinstance(phase, (TLDone, TLFailed)):
@@ -436,6 +452,18 @@ def _run_loop(
         try:
             event = _next_event(source, config, deadline)
         except LoopTimeout as error:
+            if _has_pending_dispatch(state):
+                return _park_dispatch_timeout(
+                    run_id,
+                    store,
+                    state,
+                    effects,
+                    config,
+                    effects_log,
+                    transitions,
+                    consumed,
+                    str(error),
+                )
             return _park_timeout(
                 run_id,
                 store,
@@ -478,12 +506,12 @@ def _run_loop(
         if event_seq is None:
             raise TLLoopError(f"{event.event_type!r} has no run_seq")
         consumed.append(event_seq)
-        deadline = time.monotonic() + config.idle_timeout
+        deadline = _next_loop_deadline(state, config)
         if event.run_id not in {None, run_id}:
             _checkpoint_and_ack(store, source, event, state, phase)
             state = store.load()
             continue
-        if not _event_belongs_to_plan(event, expected):
+        if not _event_belongs_to_plan(event, expected, state):
             _checkpoint_and_ack(store, source, event, state, phase)
             state = store.load()
             continue
@@ -532,19 +560,29 @@ def _run_loop(
             next_phase = transition(phase, fsm_event)
         except IllegalTransition as error:
             raise TLLoopError(str(error)) from error
-        next_slices = _update_slices(
-            state.slices, fsm_event, slice_id=_event_slice_id(event, state)
-        )
-        head_changed = _pr_head_changed(state.slices, fsm_event, _event_slice_id(event, state))
+        event_slice_id = _event_slice_id(event, state)
+        next_slices = _update_slices(state.slices, fsm_event, slice_id=event_slice_id)
+        next_slices = _confirm_dispatch_event(next_slices, event, event_slice_id, event_seq)
+        head_changed = _pr_head_changed(state.slices, fsm_event, event_slice_id)
         if head_changed and config.enable_reviewer_spawn:
             next_slices = _claim_reviewer_attempt(
                 next_slices, fsm_event, _event_slice_id(event, state)
             )
         previous_state = state
         state = store.checkpoint(next_phase, next_slices, state.budgets, event_seq)
+        deadline = _next_loop_deadline(state, config)
         _emit_slice_status_changes(
             previous_state.slices,
             next_slices,
+            config,
+            effects,
+            effects_log,
+        )
+        _emit_dispatch_confirmation(
+            previous_state.slices,
+            next_slices,
+            event,
+            event_slice_id,
             config,
             effects,
             effects_log,
@@ -625,6 +663,405 @@ def _park_timeout(
     return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
 
 
+def _has_pending_dispatch(state: RunState) -> bool:
+    return any(slice_state.status in DISPATCHING_STATUSES for slice_state in state.slices.values())
+
+
+def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> float:
+    deadline = time.monotonic() + config.idle_timeout
+    remaining = []
+    if config.active:
+        remaining = [
+            config.dispatch_timeout - max(0.0, time.time() - slice_state.dispatch_started_at)
+            for slice_state in state.slices.values()
+            if slice_state.status in DISPATCHING_STATUSES
+            and slice_state.dispatch_started_at is not None
+        ]
+    if remaining:
+        deadline = min(deadline, time.monotonic() + min(remaining))
+    return deadline
+
+
+def _park_dispatch_timeout(
+    run_id: str,
+    store: RunStore,
+    state: RunState,
+    effects: EffectClient | ReadOnlyEffectClient,
+    config: TLLoopConfig,
+    effects_log: list[EffectIntent],
+    transitions: list[LoopTransition],
+    consumed: list[int],
+    reason: str,
+) -> TLRunResult:
+    """Persist a distinct dispatch timeout when spawn proof never arrives."""
+    before_phase = _phase_from_state(state)
+    bounded_reason = (
+        f"no authoritative agent.spawned event within {config.dispatch_timeout:g}s; {reason}"
+    )[:500]
+    pending = [
+        current for current in state.slices.values() if current.status in DISPATCHING_STATUSES
+    ]
+    updated_slices = {
+        current.id: replace(
+            current,
+            status=SliceStatus.DISPATCH_UNCONFIRMED,
+            park_cause=ParkCause.DISPATCH_TIMEOUT,
+            dispatch_last_boundary="dispatch_timeout",
+            dispatch_error=bounded_reason,
+        )
+        for current in pending
+    }
+    state = store.checkpoint(
+        TLFailed(f"dispatch timeout: {bounded_reason}"),
+        {**state.slices, **updated_slices},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    previous_gate = next(
+        (gate for gate in state.gates if gate.name == DISPATCH_TIMEOUT_GATE_NAME),
+        None,
+    )
+    state = store.set_gate(DISPATCH_TIMEOUT_GATE_NAME, GateStatus.PENDING)
+    if previous_gate is None or previous_gate.status is not GateStatus.PENDING:
+        _record_controller_event(
+            "controller",
+            "tl.gate_opened",
+            {"gate_name": DISPATCH_TIMEOUT_GATE_NAME, "run_id": run_id},
+            config,
+            effects,
+            effects_log,
+        )
+    for current in pending:
+        if current.dispatch_intent_id is None or current.dispatch_started_at is None:
+            continue
+        attempt = DispatchAttempt(
+            current.dispatch_intent_id,
+            current.dispatch_started_at,
+            current.agent_type or "",
+        )
+        _record_controller_event(
+            current.id,
+            "tl.dispatch_reconciliation_completed",
+            _dispatch_payload(
+                current.id,
+                attempt,
+                "dispatch_timeout",
+                error=bounded_reason,
+            ),
+            config,
+            effects,
+            effects_log,
+        )
+    _emit_phase_change(
+        run_id,
+        before_phase,
+        _phase_from_state(state),
+        config,
+        effects,
+        effects_log,
+    )
+    LOGGER.warning("[TL loop] dispatch timeout: %s", bounded_reason)
+    return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
+
+
+def _record_dispatch_intent(
+    slice_id: str,
+    attempt: DispatchAttempt,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    _record_controller_event(
+        slice_id,
+        "tl.dispatch_intended",
+        _dispatch_payload(slice_id, attempt, "dispatch_intended"),
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _record_spawn_request(
+    slice_id: str,
+    attempt: DispatchAttempt,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    _record_controller_event(
+        slice_id,
+        "tl.spawn_requested",
+        _dispatch_payload(slice_id, attempt, "spawn_requested"),
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _record_dispatch_result(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    attempt: DispatchAttempt,
+    result: ToolResult | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    if result is not None and result.success is False:
+        return _record_dispatch_failure(
+            store,
+            state,
+            slice_id,
+            attempt,
+            result.error or "spawn request rejected",
+            config,
+            effects,
+            effects_log,
+        )
+    boundary = "spawn_request_accepted" if result is not None else "spawn_not_executed"
+    current = state.slices[slice_id]
+    updated = replace(
+        current,
+        status=SliceStatus.DISPATCH_UNCONFIRMED,
+        park_cause=ParkCause.DISPATCH_UNCONFIRMED,
+        dispatch_last_boundary=boundary,
+        dispatch_agent_id=_spawn_agent_id(result),
+        dispatch_error=None,
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, slice_id: updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    if result is not None:
+        _record_controller_event(
+            slice_id,
+            "tl.spawn_request_accepted",
+            _dispatch_payload(slice_id, attempt, boundary),
+            config,
+            effects,
+            effects_log,
+        )
+    return state
+
+
+def _record_dispatch_failure(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    attempt: DispatchAttempt,
+    reason: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    bounded_reason = reason[:500]
+    current = state.slices[slice_id]
+    updated = replace(
+        current,
+        status=SliceStatus.DISPATCH_FAILED,
+        park_cause=ParkCause.DISPATCH_FAILED,
+        dispatch_last_boundary="spawn_request_failed",
+        dispatch_error=bounded_reason,
+    )
+    before_phase = _phase_from_state(state)
+    state = store.checkpoint(
+        TLFailed(f"dispatch failed for {slice_id!r}: {bounded_reason}"),
+        {**state.slices, slice_id: updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    previous_gate = next(
+        (gate for gate in state.gates if gate.name == DISPATCH_FAILURE_GATE_NAME),
+        None,
+    )
+    state = store.set_gate(DISPATCH_FAILURE_GATE_NAME)
+    if previous_gate is None or previous_gate.status is not GateStatus.PENDING:
+        _record_controller_event(
+            "controller",
+            "tl.gate_opened",
+            {"gate_name": DISPATCH_FAILURE_GATE_NAME, "run_id": state.run_id},
+            config,
+            effects,
+            effects_log,
+        )
+    _record_controller_event(
+        slice_id,
+        "tl.spawn_request_failed",
+        _dispatch_payload(slice_id, attempt, "spawn_request_failed", error=bounded_reason),
+        config,
+        effects,
+        effects_log,
+    )
+    _emit_phase_change(
+        state.run_id,
+        before_phase,
+        _phase_from_state(state),
+        config,
+        effects,
+        effects_log,
+    )
+    return state
+
+
+def _reconcile_dispatches(
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Adopt persisted dispatches before any restart can issue a duplicate."""
+    pending = [
+        slice_state
+        for slice_state in state.slices.values()
+        if slice_state.status in DISPATCHING_STATUSES
+    ]
+    for pending_slice in pending:
+        current = state.slices.get(pending_slice.id, pending_slice)
+        if current.dispatch_intent_id is None or current.dispatch_started_at is None:
+            continue
+        attempt = DispatchAttempt(
+            current.dispatch_intent_id,
+            current.dispatch_started_at,
+            current.agent_type or "",
+        )
+        _record_controller_event(
+            current.id,
+            "tl.dispatch_reconciliation_started",
+            _dispatch_payload(current.id, attempt, "reconciliation_started"),
+            config,
+            effects,
+            effects_log,
+        )
+        if current.status is SliceStatus.DISPATCHING:
+            state = store.checkpoint(
+                state.fsm,
+                {
+                    **state.slices,
+                    current.id: replace(
+                        current,
+                        status=SliceStatus.DISPATCH_UNCONFIRMED,
+                        park_cause=ParkCause.DISPATCH_UNCONFIRMED,
+                        dispatch_last_boundary="reconciliation_started",
+                    ),
+                },
+                state.budgets,
+                state.events.last_consumed_offset,
+            )
+        _record_controller_event(
+            current.id,
+            "tl.dispatch_reconciliation_completed",
+            _dispatch_payload(current.id, attempt, "awaiting_authoritative_event"),
+            config,
+            effects,
+            effects_log,
+        )
+    return state
+
+
+def _dispatch_payload(
+    slice_id: str,
+    attempt: DispatchAttempt,
+    boundary: str,
+    *,
+    error: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "slice_id": slice_id,
+        "intent_id": attempt.intent_id,
+        "boundary": boundary,
+        "started_at": attempt.started_at,
+    }
+    if error is not None:
+        payload["error"] = error
+    return payload
+
+
+def _confirm_dispatch_event(
+    slices: Mapping[str, SliceState],
+    event: EventEnvelope,
+    slice_id: str | None,
+    event_seq: int,
+) -> dict[str, SliceState]:
+    if not _is_spawn_confirmation_event(event) or slice_id is None:
+        return dict(slices)
+    current = slices.get(slice_id)
+    if current is None or current.dispatch_intent_id is None:
+        return dict(slices)
+    data_agent = event.data.get("child_agent") or event.data.get("slug")
+    agent_id = event.agent_id if isinstance(event.agent_id, str) else None
+    if not agent_id and isinstance(data_agent, str):
+        agent_id = data_agent
+    return {
+        **slices,
+        slice_id: replace(
+            current,
+            status=SliceStatus.SPAWNED,
+            park_cause=None,
+            dispatch_last_boundary="agent.spawned",
+            dispatch_error=None,
+            dispatch_agent_id=agent_id,
+            dispatch_authoritative_event_seq=event_seq,
+        ),
+    }
+
+
+def _emit_dispatch_confirmation(
+    before: Mapping[str, SliceState],
+    after: Mapping[str, SliceState],
+    event: EventEnvelope,
+    slice_id: str | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    if not _is_spawn_confirmation_event(event) or slice_id is None:
+        return
+    previous = before.get(slice_id)
+    current = after.get(slice_id)
+    if (
+        previous is None
+        or current is None
+        or previous.dispatch_intent_id is None
+        or current.dispatch_authoritative_event_seq is None
+        or previous.dispatch_authoritative_event_seq == current.dispatch_authoritative_event_seq
+    ):
+        return
+    attempt = DispatchAttempt(
+        previous.dispatch_intent_id,
+        previous.dispatch_started_at or time.time(),
+        previous.agent_type or "",
+    )
+    _record_controller_event(
+        slice_id,
+        "tl.dispatch_confirmed",
+        _dispatch_payload(slice_id, attempt, "agent.spawned"),
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _is_spawn_confirmation_event(event: EventEnvelope) -> bool:
+    if event.kind is EventKind.AGENT_SPAWNED:
+        return True
+    shadow_event = event.data.get("shadow_event")
+    return isinstance(shadow_event, Mapping) and shadow_event.get("kind") == "child_spawned"
+
+
+def _spawn_agent_id(result: ToolResult | None) -> str | None:
+    if result is None or not isinstance(result.result, Mapping):
+        return None
+    for key in ("agent_id", "id", "child_agent"):
+        value = result.result.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _dispatch_children(
     plan: WorkPlan,
     state: RunState,
@@ -645,20 +1082,31 @@ def _dispatch_children(
             continue
         if _already_dispatched(worker.name, state):
             continue
-        selected_harness = _prepare_spawn(worker.name, state, config, live, store)
-        if selected_harness is not None:
-            state = store.load()
+        attempt = _prepare_spawn(worker.name, state, config, effects, store, effects_log)
+        state = store.load()
+        _record_spawn_request(worker.name, attempt, config, effects, effects_log)
         worker_args: dict[str, object] = {"name": worker.name, "task": worker.task}
-        _optional_argument(worker_args, "agent_type", selected_harness or worker.agent_type)
-        _invoke(
-            "spawn_worker",
-            worker.name,
-            worker_args,
-            config.active,
-            live,
-            _worker_call(worker, selected_harness),
-            effects_log,
+        _optional_argument(worker_args, "agent_type", attempt.harness or worker.agent_type)
+        try:
+            result = _invoke(
+                "spawn_worker",
+                worker.name,
+                worker_args,
+                config.active,
+                live,
+                _worker_call(worker, attempt.harness or None, attempt.intent_id),
+                effects_log,
+                raise_on_failure=False,
+            )
+        except Exception as error:  # noqa: BLE001 - persist the boundary failure
+            return _record_dispatch_failure(
+                store, state, worker.name, attempt, str(error), config, effects, effects_log
+            )
+        state = _record_dispatch_result(
+            store, state, worker.name, attempt, result, config, effects, effects_log
         )
+        if state.fsm.phase is TLPhase.TLFailed:
+            return state
     for leaf in plan.leaves:
         try:
             dispatchable = _can_dispatch(leaf.name, state, config)
@@ -669,11 +1117,12 @@ def _dispatch_children(
             continue
         if _already_dispatched(leaf.name, state):
             continue
-        selected_harness = _prepare_spawn(leaf.name, state, config, live, store)
-        if selected_harness is not None:
-            state = store.load()
+        attempt = _prepare_spawn(leaf.name, state, config, effects, store, effects_log)
+        state = store.load()
+        _record_spawn_request(leaf.name, attempt, config, effects, effects_log)
         leaf_args: dict[str, object] = {"name": leaf.name, "task": leaf.task}
-        _optional_argument(leaf_args, "agent_type", selected_harness or leaf.agent_type)
+        _optional_argument(leaf_args, "intent_id", attempt.intent_id)
+        _optional_argument(leaf_args, "agent_type", attempt.harness or leaf.agent_type)
         for name, value in (
             ("boundary", leaf.boundary),
             ("read_first", leaf.read_first),
@@ -683,15 +1132,26 @@ def _dispatch_children(
             if value:
                 leaf_args[name] = list(value)
         _optional_argument(leaf_args, "context", leaf.context)
-        _invoke(
-            "spawn_leaf",
-            leaf.name,
-            leaf_args,
-            config.active,
-            live,
-            _leaf_call(leaf, selected_harness),
-            effects_log,
+        try:
+            result = _invoke(
+                "spawn_leaf",
+                leaf.name,
+                leaf_args,
+                config.active,
+                live,
+                _leaf_call(leaf, attempt.harness or None, attempt.intent_id),
+                effects_log,
+                raise_on_failure=False,
+            )
+        except Exception as error:  # noqa: BLE001 - persist the boundary failure
+            return _record_dispatch_failure(
+                store, state, leaf.name, attempt, str(error), config, effects, effects_log
+            )
+        state = _record_dispatch_result(
+            store, state, leaf.name, attempt, result, config, effects, effects_log
         )
+        if state.fsm.phase is TLPhase.TLFailed:
+            return state
     updated = store.load() if config.policy is not None else state
     _emit_slice_status_changes(
         before_slices,
@@ -907,11 +1367,35 @@ def _prepare_spawn(
     name: str,
     state: RunState,
     config: TLLoopConfig,
-    live: EffectClient | None,
+    effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
-) -> str | None:
+    effects_log: list[EffectIntent],
+) -> DispatchAttempt:
+    intent = _new_dispatch_attempt(state, name, config)
     if config.policy is None:
-        return None
+        current = state.slices.get(name)
+        if current is None:
+            raise TLLoopError(f"dispatch slice {name!r} is missing from run state")
+        updated = replace(
+            current,
+            status=SliceStatus.DISPATCHING,
+            attempts=current.attempts + 1,
+            dispatch_intent_id=intent.intent_id,
+            dispatch_started_at=intent.started_at,
+            dispatch_last_boundary="dispatch_intended",
+            dispatch_error=None,
+            dispatch_agent_id=None,
+            dispatch_authoritative_event_seq=None,
+            park_cause=None,
+        )
+        state = store.checkpoint(
+            state.fsm,
+            {**state.slices, name: updated},
+            state.budgets,
+            state.events.last_consumed_offset,
+        )
+        _record_dispatch_intent(name, intent, config, effects, effects_log)
+        return intent
     slice_state = state.slices.get(name)
     if slice_state is None:
         raise TLLoopError(f"selector slice {name!r} is missing from run state")
@@ -935,8 +1419,7 @@ def _prepare_spawn(
         if cause is None:
             raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}")
         if config.active:
-            if live is None:
-                raise TLLoopError("active loop has no effect client for escalation")
+            live = cast(EffectClient, effects)
             park(
                 slice_state,
                 cause,
@@ -949,6 +1432,8 @@ def _prepare_spawn(
     if config.catalog is not None:
         model_id = select_model(choice.harness, config.catalog, config.requested_model).model_id
 
+    intent = DispatchAttempt(intent.intent_id, intent.started_at, choice.harness)
+
     def record_spawn(document: dict[str, object]) -> dict[str, object]:
         slices = document.get("slices")
         if not isinstance(slices, dict):
@@ -956,10 +1441,17 @@ def _prepare_spawn(
         raw_slice = slices.get(name)
         if not isinstance(raw_slice, dict):
             raise TLLoopError(f"selector slice {name!r} is not an object")
-        raw_slice["status"] = SliceStatus.SPAWNED.value
+        raw_slice["status"] = SliceStatus.DISPATCHING.value
         raw_slice["agent_type"] = choice.harness
         raw_slice["model"] = model_id
         raw_slice["attempts"] = slice_state.attempts + 1
+        raw_slice["dispatch_intent_id"] = intent.intent_id
+        raw_slice["dispatch_started_at"] = intent.started_at
+        raw_slice["dispatch_last_boundary"] = "dispatch_intended"
+        raw_slice["dispatch_error"] = None
+        raw_slice["dispatch_agent_id"] = None
+        raw_slice["dispatch_authoritative_event_seq"] = None
+        raw_slice["park_cause"] = None
         return document
 
     apply_spawn_and_charge(store.run_dir, choice, slice_state, record_spawn)
@@ -970,16 +1462,27 @@ def _prepare_spawn(
         model_id or "unresolved",
         choice.estimated_cost,
     )
-    return choice.harness
+    _record_dispatch_intent(name, intent, config, effects, effects_log)
+    return intent
+
+
+def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> DispatchAttempt:
+    current = state.slices.get(name)
+    attempt = (current.attempts if current is not None else 0) + 1
+    identity = f"{state.run_id}:{name}:{attempt}"
+    intent_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    started_at = time.time() if config.active else 0.0
+    return DispatchAttempt(intent_id, started_at, "")
 
 
 def _worker_call(
-    task: WorkerTask, selected_harness: str | None
+    task: WorkerTask, selected_harness: str | None, intent_id: str | None
 ) -> Callable[[EffectClient], ToolResult]:
     def invoke(client: EffectClient) -> ToolResult:
         return client.spawn_worker(
             name=task.name,
             task=task.task,
+            intent_id=intent_id,
             agent_type=selected_harness or task.agent_type,
         )
 
@@ -987,12 +1490,13 @@ def _worker_call(
 
 
 def _leaf_call(
-    task: LeafTask, selected_harness: str | None
+    task: LeafTask, selected_harness: str | None, intent_id: str | None
 ) -> Callable[[EffectClient], ToolResult]:
     def invoke(client: EffectClient) -> ToolResult:
         return client.spawn_leaf(
             name=task.name,
             task=task.task,
+            intent_id=intent_id,
             agent_type=selected_harness or task.agent_type,
             boundary=task.boundary,
             context=task.context,
@@ -1598,17 +2102,20 @@ def _invoke(
     client: EffectClient | None,
     call: Callable[[EffectClient], ToolResult],
     effects_log: list[EffectIntent],
-) -> None:
+    *,
+    raise_on_failure: bool = True,
+) -> ToolResult | None:
     effects_log.append(EffectIntent(operation, target, arguments, active))
     LOGGER.info("[TL loop] effect=%s target=%s active=%s", operation, target, active)
     if not active:
-        return
+        return None
     if client is None:
         raise TLLoopError("active loop has no effect client")
     result = call(client)
-    if result.success is False:
+    if result.success is False and raise_on_failure:
         detail = result.error or f"{operation} returned failure"
         raise EffectFailed(f"{operation} for {target!r}: {detail}")
+    return result
 
 
 def _next_event(
@@ -1642,7 +2149,9 @@ def _checkpoint_and_ack(
     source.acknowledge(event)
 
 
-def _event_belongs_to_plan(event: EventEnvelope, expected: set[str]) -> bool:
+def _event_belongs_to_plan(
+    event: EventEnvelope, expected: set[str], state: RunState | None = None
+) -> bool:
     if "shadow_event" in event.data:
         value = event.data["shadow_event"]
         if isinstance(value, Mapping):
@@ -1654,6 +2163,15 @@ def _event_belongs_to_plan(event: EventEnvelope, expected: set[str]) -> bool:
         return True
     if event.agent_id in expected:
         return True
+    intent_id = event.data.get("intent_id")
+    if (
+        isinstance(intent_id, str)
+        and state is not None
+        and any(
+            slice_state.dispatch_intent_id == intent_id for slice_state in state.slices.values()
+        )
+    ):
+        return True
     for key in ("slug", "child_agent", "slice_id"):
         value = event.data.get(key)
         if isinstance(value, str) and value in expected:
@@ -1662,8 +2180,22 @@ def _event_belongs_to_plan(event: EventEnvelope, expected: set[str]) -> bool:
 
 
 def _event_slice_id(event: EventEnvelope, state: RunState) -> str | None:
+    intent_id = event.data.get("intent_id")
+    if isinstance(intent_id, str):
+        for slice_id, slice_state in state.slices.items():
+            if slice_state.dispatch_intent_id == intent_id:
+                return slice_id
     if event.slice_id is not None:
         return event.slice_id
+    shadow_event = event.data.get("shadow_event")
+    if isinstance(shadow_event, Mapping):
+        shadow_slug = shadow_event.get("slug")
+        if isinstance(shadow_slug, str) and shadow_slug in state.slices:
+            return shadow_slug
+    for key in ("slug", "child_agent", "slice_id"):
+        value = event.data.get(key)
+        if isinstance(value, str) and value in state.slices:
+            return value
     if event.kind in {EventKind.PR_FILED, EventKind.PR_UPDATED} and event.agent_id in state.slices:
         return event.agent_id
     return None

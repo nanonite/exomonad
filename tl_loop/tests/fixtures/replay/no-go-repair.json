@@ -181,11 +181,87 @@
   ],
   "expected_actions": [
     {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.dispatch_intended",
+        "payload": {
+          "boundary": "dispatch_intended",
+          "intent_id": "<intent-id>",
+          "slice_id": "worker-a",
+          "started_at": "<timestamp>"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.spawn_requested",
+        "payload": {
+          "boundary": "spawn_requested",
+          "intent_id": "<intent-id>",
+          "slice_id": "worker-a",
+          "started_at": "<timestamp>"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
       "operation": "spawn_worker",
       "arguments": {
         "agent_type": "codex/gpt-luna",
+        "intent_id": "<intent-id>",
         "name": "worker-a",
         "task": "inspect the repository",
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.spawn_request_accepted",
+        "payload": {
+          "boundary": "spawn_request_accepted",
+          "intent_id": "<intent-id>",
+          "slice_id": "worker-a",
+          "started_at": "<timestamp>"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.dispatch_intended",
+        "payload": {
+          "boundary": "dispatch_intended",
+          "intent_id": "<intent-id>",
+          "slice_id": "leaf-a",
+          "started_at": "<timestamp>"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.spawn_requested",
+        "payload": {
+          "boundary": "spawn_requested",
+          "intent_id": "<intent-id>",
+          "slice_id": "leaf-a",
+          "started_at": "<timestamp>"
+        },
         "force": false,
         "include_dead": false,
         "sweep": false
@@ -198,6 +274,7 @@
         "boundary": [
           "src/leaf.py"
         ],
+        "intent_id": "<intent-id>",
         "name": "leaf-a",
         "read_first": [],
         "steps": [],
@@ -213,11 +290,26 @@
     {
       "operation": "emit_controller_event",
       "arguments": {
+        "event_type": "tl.spawn_request_accepted",
+        "payload": {
+          "boundary": "spawn_request_accepted",
+          "intent_id": "<intent-id>",
+          "slice_id": "leaf-a",
+          "started_at": "<timestamp>"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
         "event_type": "tl.slice_status_changed",
         "payload": {
           "from_status": "pending",
           "slice_id": "leaf-a",
-          "to_status": "spawned"
+          "to_status": "dispatch_unconfirmed"
         },
         "force": false,
         "include_dead": false,
@@ -231,7 +323,36 @@
         "payload": {
           "from_status": "pending",
           "slice_id": "worker-a",
+          "to_status": "dispatch_unconfirmed"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.slice_status_changed",
+        "payload": {
+          "from_status": "dispatch_unconfirmed",
+          "slice_id": "worker-a",
           "to_status": "spawned"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.dispatch_confirmed",
+        "payload": {
+          "boundary": "agent.spawned",
+          "intent_id": "<intent-id>",
+          "slice_id": "worker-a",
+          "started_at": "<timestamp>"
         },
         "force": false,
         "include_dead": false,
@@ -246,6 +367,35 @@
           "from_phase": "tl_planning",
           "run_id": "replay-repair",
           "to_phase": "tl_waiting"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.slice_status_changed",
+        "payload": {
+          "from_status": "dispatch_unconfirmed",
+          "slice_id": "leaf-a",
+          "to_status": "spawned"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.dispatch_confirmed",
+        "payload": {
+          "boundary": "agent.spawned",
+          "intent_id": "<intent-id>",
+          "slice_id": "leaf-a",
+          "started_at": "<timestamp>"
         },
         "force": false,
         "include_dead": false,

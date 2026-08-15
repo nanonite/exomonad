@@ -199,6 +199,7 @@ data SpawnSubtreeConfig = SpawnSubtreeConfig
 data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
   { slcTask :: Text,
     slcBranchName :: Text,
+    slcIntentId :: Maybe Text,
     slcRole :: Maybe Text,
     slcAgentType :: Maybe AgentType,
     slcPerms :: PermissionFlags,

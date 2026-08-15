@@ -25,6 +25,10 @@
             "description": "Freeform context: code snippets, examples, patterns to follow",
             "type": "string"
           },
+          "intent_id": {
+            "description": "Controller dispatch intent identifier used to correlate agent.spawned confirmation.",
+            "type": "string"
+          },
           "name": {
             "description": "Branch name suffix (e.g., 'fix-clippy' → 'main.fix-clippy')",
             "type": "string"
@@ -79,6 +83,10 @@
           },
           "name": {
             "description": "Worker name (pane title, messaging identity)",
+            "type": "string"
+          },
+          "intent_id": {
+            "description": "Controller dispatch intent identifier used to correlate agent.spawned confirmation.",
             "type": "string"
           },
           "task": {

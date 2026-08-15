@@ -68,6 +68,12 @@ class SliceReadModel:
     park_issue_id: int | None
     blocked_by: str | None
     stall_classification: str | None
+    dispatch_intent_id: str | None
+    dispatch_started_at: float | None
+    dispatch_last_boundary: str | None
+    dispatch_error: str | None
+    dispatch_agent_id: str | None
+    dispatch_authoritative_event_seq: int | None
 
     def to_document(self) -> dict[str, object]:
         """Return the body-free JSON representation."""
@@ -90,6 +96,12 @@ class SliceReadModel:
             "park_issue_id": self.park_issue_id,
             "blocked_by": self.blocked_by,
             "stall_classification": self.stall_classification,
+            "dispatch_intent_id": self.dispatch_intent_id,
+            "dispatch_started_at": self.dispatch_started_at,
+            "dispatch_last_boundary": self.dispatch_last_boundary,
+            "dispatch_error": self.dispatch_error,
+            "dispatch_agent_id": self.dispatch_agent_id,
+            "dispatch_authoritative_event_seq": self.dispatch_authoritative_event_seq,
         }
 
 
@@ -378,6 +390,12 @@ def _slice_model(state: SliceState, events: Mapping[str, EventEnvelope]) -> Slic
         park_issue_id=state.park_issue_id,
         blocked_by=state.blocked_by,
         stall_classification=state.stall_classification,
+        dispatch_intent_id=state.dispatch_intent_id,
+        dispatch_started_at=state.dispatch_started_at,
+        dispatch_last_boundary=state.dispatch_last_boundary,
+        dispatch_error=state.dispatch_error,
+        dispatch_agent_id=state.dispatch_agent_id,
+        dispatch_authoritative_event_seq=state.dispatch_authoritative_event_seq,
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import queue
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -27,6 +28,7 @@ from tl_loop.loop.driver import (
     _record_review_event,
     _route_ci_event,
     _route_review_event,
+    _initial_slices,
     run_tl_loop,
     tl_run,
 )
@@ -69,6 +71,7 @@ class SyntheticQueue:
 class RecordingTransport:
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
     fail_observability: bool = False
+    reject_spawns: bool = False
 
     def call_tool(
         self,
@@ -81,6 +84,8 @@ class RecordingTransport:
         self.calls.append((tool_name, arguments))
         if self.fail_observability and tool_name == "emit_controller_event":
             return {"success": False, "error": "ledger unavailable"}
+        if self.reject_spawns and tool_name in {"spawn_worker", "spawn_leaf"}:
+            return {"success": False, "error": "tmux launch rejected"}
         return {"success": True, "result": None}
 
 
@@ -98,8 +103,7 @@ def _merge_decisions(transport: RecordingTransport) -> list[JsonObject]:
     return [
         cast(JsonObject, arguments["payload"])
         for name, arguments in transport.calls
-        if name == "emit_controller_event"
-        and arguments["event_type"] == "tl.merge_decided"
+        if name == "emit_controller_event" and arguments["event_type"] == "tl.merge_decided"
     ]
 
 
@@ -168,19 +172,44 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert result.final_state.events.last_consumed_offset == 5
     assert result.final_state.slices["worker-a"].status.value == "merged"
     assert result.final_state.slices["leaf-a"].status.value == "merged"
+    assert result.final_state.slices["worker-a"].dispatch_authoritative_event_seq == 1
+    assert result.final_state.slices["leaf-a"].dispatch_authoritative_event_seq == 2
+    assert result.final_state.slices["worker-a"].dispatch_last_boundary == "agent.spawned"
+    assert result.final_state.slices["leaf-a"].dispatch_last_boundary == "agent.spawned"
     assert source.acknowledged == [1, 2, 3, 4, 5]
-    assert [
+    lifecycle_payloads = [
         arguments["payload"]
         for name, arguments in transport.calls
         if name == "emit_controller_event"
-    ] == [
-        {"slice_id": "worker-a", "from_status": "pending", "to_status": "spawned"},
+        and arguments["event_type"]
+        in {"tl.slice_status_changed", "tl.phase_changed", "tl.merge_decided"}
+    ]
+    assert lifecycle_payloads == [
+        {
+            "slice_id": "leaf-a",
+            "from_status": "pending",
+            "to_status": "dispatch_unconfirmed",
+        },
+        {
+            "slice_id": "worker-a",
+            "from_status": "pending",
+            "to_status": "dispatch_unconfirmed",
+        },
+        {
+            "slice_id": "worker-a",
+            "from_status": "dispatch_unconfirmed",
+            "to_status": "spawned",
+        },
         {
             "from_phase": "tl_planning",
             "to_phase": "tl_waiting",
             "run_id": "active-run",
         },
-        {"slice_id": "leaf-a", "from_status": "pending", "to_status": "spawned"},
+        {
+            "slice_id": "leaf-a",
+            "from_status": "dispatch_unconfirmed",
+            "to_status": "spawned",
+        },
         {"slice_id": "worker-a", "from_status": "spawned", "to_status": "merged"},
         {
             "slice_id": "leaf-a",
@@ -191,6 +220,22 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
         {"slice_id": "leaf-a", "from_status": "spawned", "to_status": "merged"},
         {"from_phase": "tl_waiting", "to_phase": "tl_all_merged", "run_id": "active-run"},
         {"from_phase": "tl_all_merged", "to_phase": "tl_done", "run_id": "active-run"},
+    ]
+    dispatch_events = [
+        arguments["event_type"]
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments["event_type"].startswith(("tl.dispatch_", "tl.spawn_"))
+    ]
+    assert dispatch_events == [
+        "tl.dispatch_intended",
+        "tl.spawn_requested",
+        "tl.spawn_request_accepted",
+        "tl.dispatch_intended",
+        "tl.spawn_requested",
+        "tl.spawn_request_accepted",
+        "tl.dispatch_confirmed",
+        "tl.dispatch_confirmed",
     ]
 
 
@@ -219,7 +264,9 @@ def test_observability_failure_does_not_change_terminal_state(
         )
 
     assert result.final_state.fsm.phase is baseline.final_state.fsm.phase is TLPhase.TLDone
-    assert result.final_state.slices["leaf-a"].status is baseline.final_state.slices["leaf-a"].status
+    assert (
+        result.final_state.slices["leaf-a"].status is baseline.final_state.slices["leaf-a"].status
+    )
     assert result.final_state.slices["leaf-a"].status is SliceStatus.MERGED
     assert "merge_pr" in _effect_names(failed_transport)
     assert _merge_decisions(failed_transport) == _merge_decisions(baseline_transport)
@@ -245,15 +292,94 @@ def test_idle_timeout_parks_with_named_gate_and_never_merges(tmp_path: Path) -> 
     )
 
     assert result.final_state.fsm.phase is TLPhase.TLFailed
-    assert result.final_state.gates == (GateState(name="tl-timeout", status=GateStatus.PENDING),)
+    assert result.final_state.gates == (
+        GateState(name="tl-dispatch-timeout", status=GateStatus.PENDING),
+    )
     assert _effect_names(transport) == ["spawn_worker", "spawn_leaf"]
+    worker_state = result.final_state.slices["worker-a"]
+    assert worker_state.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert worker_state.park_cause.value == "dispatch_timeout"
+    assert worker_state.dispatch_intent_id
+    assert "authoritative agent.spawned" in (worker_state.dispatch_error or "")
     assert [
         arguments["payload"]
         for tool_name, arguments in transport.calls
-        if tool_name == "emit_controller_event"
-        and arguments["event_type"] == "tl.gate_opened"
-    ] == [{"gate_name": "tl-timeout", "run_id": "timeout-run"}]
+        if tool_name == "emit_controller_event" and arguments["event_type"] == "tl.gate_opened"
+    ] == [{"gate_name": "tl-dispatch-timeout", "run_id": "timeout-run"}]
     assert "merge_pr" not in _effect_names(transport)
+
+
+def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None:
+    transport = RecordingTransport(reject_spawns=True)
+    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement the change"}]})
+    result = run_tl_loop(
+        "dispatch-failure-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=TLLoopConfig(poll_interval=0.001, idle_timeout=0.1),
+        root_dir=tmp_path,
+    )
+
+    slice_state = result.final_state.slices["leaf-a"]
+    assert result.final_state.fsm.phase is TLPhase.TLFailed
+    assert slice_state.status is SliceStatus.DISPATCH_FAILED
+    assert slice_state.park_cause.value == "dispatch_failed"
+    assert slice_state.dispatch_last_boundary == "spawn_request_failed"
+    assert "tmux launch rejected" in (slice_state.dispatch_error or "")
+    assert any(
+        arguments["event_type"] == "tl.spawn_request_failed"
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    )
+    assert not any(
+        arguments["event_type"] == "tl.gate_opened"
+        and arguments["payload"].get("gate_name") == "tl-timeout"
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    )
+
+
+def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> None:
+    run_id = "dispatch-restart-run"
+    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement the change"}]})
+    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.01)
+    initial = _initial_slices(plan, config, tmp_path, run_id)
+    initial["leaf-a"].update(
+        {
+            "status": "dispatching",
+            "attempts": 1,
+            "dispatch_intent_id": "intent-restart-1",
+            "dispatch_started_at": time.time(),
+            "dispatch_last_boundary": "dispatch_intended",
+        }
+    )
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+        initial_slices=initial,
+    )
+
+    slice_state = result.final_state.slices["leaf-a"]
+    event_types = [
+        arguments["event_type"]
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    ]
+    assert "spawn_leaf" not in _effect_names(transport)
+    assert slice_state.dispatch_intent_id == "intent-restart-1"
+    assert slice_state.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert "tl.dispatch_reconciliation_started" in event_types
+    assert "tl.dispatch_reconciliation_completed" in event_types
+    assert result.final_state.gates == (
+        GateState(name="tl-dispatch-timeout", status=GateStatus.PENDING),
+    )
 
 
 def test_pr_head_change_clears_per_head_gate_state() -> None:
@@ -723,7 +849,10 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
         "spawn_leaf",
         "merge_pr",
     ]
-    assert transport.calls[0][1]["agent_type"] == "codex/gpt-luna"
+    spawn_worker_call = next(
+        arguments for name, arguments in transport.calls if name == "spawn_worker"
+    )
+    assert spawn_worker_call["agent_type"] == "codex/gpt-luna"
     assert result.final_state.budgets.role_reserved == {"worker": 500}
     assert result.final_state.budgets.harness_reserved == {"codex/gpt-luna": 500}
     assert result.final_state.slices["worker-a"].model == "gpt-5.5"
@@ -890,8 +1019,8 @@ def _config(*, active: bool = True) -> TLLoopConfig:
 
 def _lifecycle_events(run_id: str) -> list[EventEnvelope]:
     return [
-        _event(1, "child_spawned", "worker-a", run_id=run_id),
-        _event(2, "child_spawned", "leaf-a", run_id=run_id),
+        _canonical_event(1, "agent.spawned", "worker-a", run_id),
+        _canonical_event(2, "agent.spawned", "leaf-a", run_id),
         _event(3, "child_completed", "worker-a", run_id=run_id),
         _event(4, "child_completed", "leaf-a", pr_number=42, head_sha="head-a", run_id=run_id),
         _event(5, "all_children_done", run_id=run_id),
