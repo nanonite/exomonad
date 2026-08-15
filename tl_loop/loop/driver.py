@@ -36,6 +36,7 @@ from tl_loop.fsm.phase import (
     TLFailed,
     TLMerging,
     TLPhase,
+    TLPlanning,
     TLWaiting,
 )
 from tl_loop.fsm.transition import IllegalTransition, transition
@@ -44,6 +45,7 @@ from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, hea
 from tl_loop.loop.review import (
     ReviewGateError,
     compose_acceptance_criteria,
+    invalidate_integration_evidence,
     load_freshness_window,
     verify_review,
     watcher_head,
@@ -1418,6 +1420,9 @@ def _run_sub_tls(
                 return _fail_recursive_parent(
                     state, config, effects, store, effects_log, "recursive child failed"
                 )
+        state = _integrate_stage_candidates(
+            stage_tasks, state, config, effects, store, effects_log
+        )
         if any(
             state.slices[task.name].status is SliceStatus.IN_REVIEW for task in stage_tasks
         ):
@@ -1780,6 +1785,214 @@ def _ensure_aggregate_candidate(
             effects_log,
         )
     return candidate
+
+
+def _integrate_stage_candidates(
+    tasks: Sequence[SubTLTask],
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Serialize ready aggregate merges through the parent controller only."""
+    if not config.active:
+        return state
+    for task in sorted(tasks, key=lambda item: item.name):
+        current = state.slices[task.name]
+        if (
+            current.status is not SliceStatus.IN_REVIEW
+            or current.pr_number is None
+            or current.reviewed_head is None
+            or current.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}
+            or current.ci_state.get(current.reviewed_head) not in {"success", "neutral"}
+        ):
+            continue
+        state = _integrate_one_candidate(
+            task, state, config, effects, store, effects_log
+        )
+        if state.slices[task.name].status is not SliceStatus.MERGED:
+            break
+    return state
+
+
+def _integrate_one_candidate(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Validate one aggregate candidate, recheck its base, then merge it."""
+    current = state.slices[task.name]
+    first = _watcher_snapshot(current.pr_number, config, effects, effects_log)
+    if first is None:
+        return state
+    head_sha = _snapshot_text(first, "head_sha")
+    base_sha = _snapshot_text(first, "base_sha")
+    patch_digest = _snapshot_text(first, "patch_digest") or current.review_patch_digests.get(
+        current.reviewed_head or ""
+    )
+    merge_tree_sha = _snapshot_text(first, "merge_tree_sha")
+    ci_status = _snapshot_text(first, "ci_status")
+    if not all((head_sha, base_sha, patch_digest, merge_tree_sha, ci_status)):
+        return state
+    try:
+        verify_review(current, head_sha, current_patch_digest=patch_digest)
+    except ReviewGateError:
+        return state
+    integration = replace(
+        state.integration,
+        lifecycle=IntegrationLifecycle.INTEGRATION_VALIDATED,
+        head_sha=head_sha,
+        patch_digest=patch_digest,
+        validated_base_sha=base_sha,
+        merge_tree_sha=merge_tree_sha,
+        ci_status=ci_status,
+        stage_verification="passed",
+        integration_evidence_at=_now_timestamp(),
+    )
+    state = store.checkpoint(
+        _phase_from_state(state),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+    )
+    second = _watcher_snapshot(current.pr_number, config, effects, effects_log)
+    if second is None:
+        return state
+    if _snapshot_text(second, "base_sha") != base_sha:
+        invalidated = invalidate_integration_evidence(
+            integration,
+            base_sha=_snapshot_text(second, "base_sha") or "",
+            head_sha=head_sha,
+            patch_digest=patch_digest,
+        )
+        return _checkpoint_integration_retry(
+            state, task.name, invalidated, config, store
+        )
+    state = store.checkpoint(
+        _phase_from_state(state),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=replace(integration, lifecycle=IntegrationLifecycle.MERGING),
+    )
+    arguments = {
+        "pr_number": current.pr_number,
+        "strategy": config.merge_strategy or task.integration.merge_strategy,
+        "working_dir": config.working_dir,
+        "base_sha": base_sha,
+    }
+    _invoke(
+        "merge_pr",
+        task.name,
+        arguments,
+        config.active,
+        cast(EffectClient, effects),
+        lambda client: client.merge_pr(
+            pr_number=current.pr_number or 0,
+            strategy=config.merge_strategy or task.integration.merge_strategy,
+            working_dir=config.working_dir,
+        ),
+        effects_log,
+    )
+    updated_slices = dict(state.slices)
+    updated_slices[task.name] = replace(
+        current,
+        status=SliceStatus.MERGED,
+        dispatch_last_boundary="aggregate_merged",
+    )
+    sub_states = dict(state.integration.sub_tl_states)
+    sub_states[task.name] = IntegrationLifecycle.MERGED
+    for sibling in state.ordered_stages:
+        if task.name not in sibling.sub_tls:
+            continue
+        for sibling_id in sibling.sub_tls:
+            if sibling_id != task.name and updated_slices[sibling_id].status is SliceStatus.IN_REVIEW:
+                sub_states[sibling_id] = IntegrationLifecycle.NEEDS_BASE_REVALIDATION
+    merged_integration = replace(
+        integration,
+        lifecycle=IntegrationLifecycle.MERGED,
+        merge_attempts=integration.merge_attempts + 1,
+        stage_verification="passed",
+    )
+    remaining = {
+        sibling_id: ChildHandle(
+            sibling_id,
+            updated_slices[sibling_id].branch or "",
+            "sub-tl",
+        )
+        for sibling_id, sibling_slice in updated_slices.items()
+        if sibling_slice.status is SliceStatus.IN_REVIEW
+    }
+    checkpoint_phase: PhaseValue = TLWaiting(remaining) if remaining else TLPlanning()
+    return store.checkpoint(
+        checkpoint_phase,
+        updated_slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=replace(merged_integration, sub_tl_states=sub_states),
+    )
+
+
+def _checkpoint_integration_retry(
+    state: RunState,
+    slice_id: str,
+    integration: IntegrationRuntimeState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> RunState:
+    """Persist a base retry without changing the candidate head or sibling slices."""
+    sub_states = dict(state.integration.sub_tl_states)
+    sub_states[slice_id] = IntegrationLifecycle.NEEDS_BASE_REVALIDATION
+    return store.checkpoint(
+        _phase_from_state(state),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=replace(integration, sub_tl_states=sub_states),
+    )
+
+
+def _watcher_snapshot(
+    pr_number: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> Mapping[str, object] | None:
+    """Read one live PR/base snapshot through the parent-owned watcher."""
+    result = _invoke(
+        "watcher_pr_state",
+        str(pr_number),
+        {"pr_number": pr_number},
+        config.active,
+        cast(EffectClient, effects),
+        lambda client: client.watcher_pr_state(pr_number=pr_number),
+        effects_log,
+    )
+    if result is None or result.success is not True or not isinstance(result.result, Mapping):
+        return None
+    return result.result
+
+
+def _snapshot_text(snapshot: Mapping[str, object], key: str) -> str | None:
+    value = snapshot.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _now_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _child_has_aggregate_output(state: RunState) -> bool:

@@ -36,6 +36,7 @@ from tl_loop.loop.driver import (
     tl_run,
 )
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
+from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
@@ -100,6 +101,24 @@ class RecordingTransport:
                 "result": {"event_id": "controller-event", "run_seq": self.next_controller_run_seq},
             }
         return {"success": True, "result": None}
+
+
+@dataclass
+class IntegrationTransport(RecordingTransport):
+    snapshots: list[JsonObject] = field(default_factory=list)
+
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        if tool_name == "watcher_pr_state":
+            self.calls.append((tool_name, arguments))
+            snapshot = self.snapshots.pop(0)
+            return {"success": True, "result": snapshot}
+        return super().call_tool(role, name, tool_name, arguments)
 
 
 def _effect_names(transport: RecordingTransport) -> list[str]:
@@ -1447,6 +1466,151 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     child = load_state(parent_dir / "aggregate-child" / "run.json")
     assert child.integration.aggregate_pr_number == parent_slice.pr_number
     assert child.integration.integration_owner_id == parent_slice.dispatch_agent_id
+
+
+def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) -> None:
+    child_plan = _plan()
+    parent_dir = tmp_path / "serialized-run"
+    run_tl_loop(
+        "aggregate-child",
+        child_plan,
+        SyntheticQueue(_lifecycle_events("aggregate-child")),
+        EffectClient(RecordingTransport()),
+        config=_config(),
+        root_dir=parent_dir,
+    )
+    child_store = RunStore("aggregate-child", parent_dir)
+    child_state = child_store.load()
+    child_slices = dict(child_state.slices)
+    child_slices["leaf-a"] = replace(
+        child_slices["leaf-a"], pr_number=42, reviewed_head="head-a"
+    )
+    child_store.checkpoint(
+        child_state.fsm,
+        child_slices,
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    transport = IntegrationTransport(
+        snapshots=[
+            {"head_sha": "head-a", "base_sha": "base-a", "patch_digest": "patch-a", "merge_tree_sha": "tree-a", "ci_status": "success"},
+            {"head_sha": "head-a", "base_sha": "base-a", "patch_digest": "patch-a", "merge_tree_sha": "tree-a", "ci_status": "success"},
+        ]
+    )
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),
+        )
+    )
+    config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
+    run_tl_loop("serialized-run", plan, SyntheticQueue([]), EffectClient(transport), config=config, root_dir=tmp_path)
+    store = RunStore("serialized-run", tmp_path)
+    state = store.load()
+    current = state.slices["aggregate-child"]
+    updated = replace(
+        current,
+        verdict=Verdict.GO,
+        review_patch_digests={"head-a": "patch-a"},
+        ci_state={"head-a": "success"},
+    )
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, "aggregate-child": updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    result = run_tl_loop("serialized-run", plan, SyntheticQueue([]), EffectClient(transport), config=config, root_dir=tmp_path)
+
+    assert result.final_state.slices["aggregate-child"].status is SliceStatus.MERGED
+    assert [name for name, _ in transport.calls if name == "merge_pr"] == ["merge_pr"]
+
+
+def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path) -> None:
+    child_plan = _plan()
+    parent_dir = tmp_path / "serialized-run"
+    run_tl_loop(
+        "aggregate-child",
+        child_plan,
+        SyntheticQueue(_lifecycle_events("aggregate-child")),
+        EffectClient(RecordingTransport()),
+        config=_config(),
+        root_dir=parent_dir,
+    )
+    child_store = RunStore("aggregate-child", parent_dir)
+    child_state = child_store.load()
+    child_store.checkpoint(
+        child_state.fsm,
+        {
+            **child_state.slices,
+            "leaf-a": replace(
+                child_state.slices["leaf-a"], pr_number=42, reviewed_head="head-a"
+            ),
+        },
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    transport = IntegrationTransport(
+        snapshots=[
+            {"head_sha": "head-a", "base_sha": "base-a", "patch_digest": "patch-a", "merge_tree_sha": "tree-a", "ci_status": "success"},
+            {"head_sha": "head-a", "base_sha": "base-b", "patch_digest": "patch-a", "merge_tree_sha": "tree-b", "ci_status": "success"},
+        ]
+    )
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),
+        )
+    )
+    config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
+    run_tl_loop(
+        "serialized-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    store = RunStore("serialized-run", tmp_path)
+    state = store.load()
+    current = state.slices["aggregate-child"]
+    store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            "aggregate-child": replace(
+                current,
+                verdict=Verdict.GO,
+                review_patch_digests={"head-a": "patch-a"},
+                ci_state={"head-a": "success"},
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    result = run_tl_loop(
+        "serialized-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
+    assert [name for name, _ in transport.calls if name == "merge_pr"] == []
+    assert (
+        result.final_state.integration.sub_tl_states["aggregate-child"]
+        is IntegrationLifecycle.NEEDS_BASE_REVALIDATION
+    )
+    assert result.final_state.integration.validated_base_sha is None
+    assert result.final_state.integration.base_revalidation_count == 1
 
 
 def test_same_order_event_consumers_require_isolated_sources(tmp_path: Path) -> None:
