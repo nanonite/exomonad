@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Route hierarchical review adjudication and repairs (#870)
 - Bind review evidence to heads and integration evidence to bases (#869)
 - Add persistent aggregate PR ownership for sub-TLs (#868)
 - Run same-order sub-TLs concurrently with bounded orchestration (#867)
