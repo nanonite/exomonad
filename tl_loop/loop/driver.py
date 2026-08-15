@@ -1482,7 +1482,7 @@ def _run_sub_tls(
             state = _complete_sub_tl_batch(
                 batch, outcomes, state, config, effects, store, effects_log
             )
-            if any(status is SliceStatus.FAILED for _, status, _ in outcomes):
+            if any(phase is TLPhase.TLFailed for _, phase, _ in outcomes):
                 return _fail_recursive_parent(
                     state, config, effects, store, effects_log, "recursive child failed"
                 )
@@ -2217,7 +2217,26 @@ def _integrate_one_candidate(
 ) -> RunState:
     """Validate one aggregate candidate, recheck its base, then merge it."""
     current = state.slices[task.name]
-    first = _watcher_snapshot(current.pr_number, config, effects, effects_log)
+    first: Mapping[str, object] | None = None
+    if state.integration.lifecycle is IntegrationLifecycle.MERGING:
+        first = _watcher_snapshot(current.pr_number, config, effects, effects_log)
+        if first is None:
+            return state
+        if _snapshot_bool(first, "merged"):
+            _record_controller_event(
+                task.name,
+                "tl.merge_reconciled",
+                {
+                    "slice_id": task.name,
+                    "pr_number": current.pr_number,
+                    "head_sha": state.integration.head_sha,
+                },
+                config,
+                effects,
+                effects_log,
+            )
+            return _checkpoint_aggregate_merged(task, state, store, state.integration)
+    first = first or _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if first is None:
         return state
     head_sha = _snapshot_text(first, "head_sha")
@@ -2368,6 +2387,17 @@ def _integrate_one_candidate(
         )
     if failure is not None:
         raise EffectFailed(f"merge_pr for {task.name!r}: {_merge_failure_reason(merge_result)}")
+    return _checkpoint_aggregate_merged(task, state, store, integration)
+
+
+def _checkpoint_aggregate_merged(
+    task: SubTLTask,
+    state: RunState,
+    store: RunStore,
+    integration: IntegrationRuntimeState,
+) -> RunState:
+    """Persist one merge result, including a restart reconciliation result."""
+    current = state.slices[task.name]
     updated_slices = dict(state.slices)
     updated_slices[task.name] = replace(
         current,
@@ -2463,6 +2493,11 @@ def _watcher_snapshot(
 def _snapshot_text(snapshot: Mapping[str, object], key: str) -> str | None:
     value = snapshot.get(key)
     return value if isinstance(value, str) and value else None
+
+
+def _snapshot_bool(snapshot: Mapping[str, object], key: str) -> bool:
+    value = snapshot.get(key)
+    return value is True or value == "true"
 
 
 def _now_timestamp() -> str:

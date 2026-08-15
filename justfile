@@ -81,6 +81,10 @@ tl-loop-test:
 tl-loop-replay:
     {{py}} -m pytest -q tl_loop/tests/test_replay.py
 
+# Run the hermetic ordered recursive integration acceptance suite
+tl-loop-ordered-e2e:
+    {{py}} -m pytest -q tl_loop/tests/test_driver.py -k 'ordered or aggregate or merging'
+
 # Lint the programmatic TL controller
 tl-loop-lint:
     {{py}} -m ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py

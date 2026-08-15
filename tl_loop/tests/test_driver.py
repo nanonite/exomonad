@@ -46,6 +46,7 @@ from tl_loop.state.schema import (
     BudgetLedger,
     GateState,
     GateStatus,
+    OrderedStageState,
     SliceState,
     SliceStatus,
     Verdict,
@@ -122,6 +123,37 @@ class IntegrationTransport(RecordingTransport):
         if tool_name == "merge_pr" and self.merge_response is not None:
             self.calls.append((tool_name, arguments))
             return self.merge_response
+        return super().call_tool(role, name, tool_name, arguments)
+
+
+@dataclass
+class OrderedIntegrationTransport(IntegrationTransport):
+    """Deterministic Forgejo-shaped transport for recursive acceptance tests."""
+
+    snapshot_history: list[JsonObject] = field(default_factory=list)
+
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        if tool_name == "file_pr":
+            self.calls.append((tool_name, arguments))
+            title = str(arguments.get("title", ""))
+            sub_tl_id = "alpha" if "alpha" in title else "beta"
+            return {
+                "success": True,
+                "result": {
+                    "pr_number": 101 if sub_tl_id == "alpha" else 102,
+                    "head_sha": f"head-{sub_tl_id}",
+                    "patch_digest": f"patch-{sub_tl_id}",
+                    "base_sha": "base-main",
+                },
+            }
+        if tool_name == "watcher_pr_state" and self.snapshots:
+            self.snapshot_history.append(dict(self.snapshots[0]))
         return super().call_tool(role, name, tool_name, arguments)
 
 
@@ -1147,6 +1179,16 @@ def _lifecycle_events(run_id: str) -> list[EventEnvelope]:
     ]
 
 
+def _multi_leaf_events(run_id: str) -> list[EventEnvelope]:
+    return [
+        _canonical_event(1, "agent.spawned", "leaf-a", run_id),
+        _canonical_event(2, "agent.spawned", "leaf-b", run_id),
+        _event(3, "child_completed", "leaf-a", pr_number=10, head_sha="leaf-a-head", run_id=run_id),
+        _event(4, "child_completed", "leaf-b", pr_number=11, head_sha="leaf-b-head", run_id=run_id),
+        _event(5, "all_children_done", run_id=run_id),
+    ]
+
+
 def _canonical_lifecycle(run_id: str) -> list[EventEnvelope]:
     return [
         _canonical_event(1, "agent.spawned", "worker-a", run_id),
@@ -1350,6 +1392,228 @@ def test_same_order_sub_tls_overlap_and_wait_for_prior_stage(
     assert maximum == 2
     assert timeline.index(("start", "stage-two")) > timeline.index(("end", "stage-one-a"))
     assert timeline.index(("start", "stage-two")) > timeline.index(("end", "stage-one-b"))
+
+
+def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
+    tmp_path: Path,
+) -> None:
+    child_plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {"name": "leaf-a", "task": "implement alpha part one"},
+                {"name": "leaf-b", "task": "implement alpha part two"},
+            ]
+        }
+    )
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "beta",
+                child_plan,
+                source=SyntheticQueue(_multi_leaf_events("beta")),
+                order=1,
+            ),
+            SubTLTask(
+                "alpha",
+                child_plan,
+                source=SyntheticQueue(_multi_leaf_events("alpha")),
+                order=1,
+            ),
+        )
+    )
+    transport = OrderedIntegrationTransport(
+        snapshots=[
+            {
+                "head_sha": "head-alpha",
+                "base_sha": "base-alpha",
+                "patch_digest": "patch-alpha",
+                "merge_tree_sha": "tree-alpha",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": "head-alpha",
+                "base_sha": "base-alpha",
+                "patch_digest": "patch-alpha",
+                "merge_tree_sha": "tree-alpha",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": "head-beta",
+                "base_sha": "base-after-alpha",
+                "patch_digest": "patch-beta",
+                "merge_tree_sha": "tree-beta",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": "head-beta",
+                "base_sha": "base-after-alpha",
+                "patch_digest": "patch-beta",
+                "merge_tree_sha": "tree-beta",
+                "ci_status": "success",
+            },
+        ]
+    )
+    config = TLLoopConfig(
+        max_parallel_slices=2,
+        max_leaves=2,
+        max_workers=0,
+        max_events=5,
+        poll_interval=0.001,
+        idle_timeout=0.1,
+    )
+    parent_root = tmp_path / "ordered-e2e-run"
+    for sub_tl_id, pr_number in (("alpha", 101), ("beta", 102)):
+        run_tl_loop(
+            sub_tl_id,
+            child_plan,
+            SyntheticQueue(_multi_leaf_events(sub_tl_id)),
+            EffectClient(transport),
+            config=config,
+            root_dir=parent_root,
+        )
+        child_store = RunStore(sub_tl_id, parent_root)
+        child_state = child_store.load()
+        child_slice = child_state.slices["leaf-a"]
+        child_store.checkpoint(
+            child_state.fsm,
+            {
+                **child_state.slices,
+                "leaf-a": replace(
+                    child_slice,
+                    pr_number=pr_number,
+                    reviewed_head=f"child-{sub_tl_id}-head",
+                ),
+            },
+            child_state.budgets,
+            child_state.events.last_consumed_offset,
+        )
+
+    first = run_tl_loop(
+        "ordered-e2e-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert first.final_state.fsm.phase is TLPhase.TLWaiting
+    parent_store = RunStore("ordered-e2e-run", tmp_path)
+    parent_state = parent_store.load()
+    ready_slices = {
+        slice_id: replace(
+            slice_state,
+            verdict=Verdict.GO,
+            review_patch_digests={slice_state.reviewed_head or "": f"patch-{slice_id}"},
+            ci_state={slice_state.reviewed_head or "": "success"},
+        )
+        for slice_id, slice_state in parent_state.slices.items()
+    }
+    parent_store.checkpoint(
+        parent_state.fsm,
+        ready_slices,
+        parent_state.budgets,
+        parent_state.events.last_consumed_offset,
+        current_order=parent_state.current_order,
+        ordered_stages=parent_state.ordered_stages,
+        integration=parent_state.integration,
+    )
+
+    result = run_tl_loop(
+        "ordered-e2e-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    merge_pr_numbers = [
+        arguments["pr_number"] for name, arguments in transport.calls if name == "merge_pr"
+    ]
+    assert merge_pr_numbers[-2:] == [101, 102]
+    assert len(merge_pr_numbers) == 6
+    assert [
+        arguments["pr_number"] for name, arguments in transport.calls if name == "watcher_pr_state"
+    ] == [
+        101,
+        101,
+        102,
+        102,
+    ]
+    assert [snapshot["head_sha"] for snapshot in transport.snapshot_history] == [
+        "head-alpha",
+        "head-alpha",
+        "head-beta",
+        "head-beta",
+    ]
+    assert len([name for name, _ in transport.calls if name == "file_pr"]) == 2
+    assert len([name for name, _ in transport.calls if name == "spawn_leaf"]) == 4
+
+
+def test_failed_ordered_sub_tl_blocks_higher_order_work(tmp_path: Path) -> None:
+    failing_child = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-fails", "task": "fail without a completion event"}]}
+    )
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("failed-stage", failing_child, source=SyntheticQueue([]), order=1),
+            SubTLTask("later-stage", WorkPlan(), source=SyntheticQueue([]), order=2),
+        )
+    )
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        "ordered-failure-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=TLLoopConfig(
+            max_parallel_slices=1,
+            max_workers=0,
+            max_events=5,
+            poll_interval=0.001,
+            idle_timeout=0.01,
+        ),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLFailed
+    assert result.final_state.slices["failed-stage"].status is SliceStatus.FAILED
+    assert result.final_state.slices["later-stage"].status is SliceStatus.PENDING
+    assert not any(
+        arguments.get("name") == "later-stage"
+        for name, arguments in transport.calls
+        if name in {"spawn_leaf", "spawn_worker"}
+    )
+
+
+def test_nested_ordered_stages_round_trip_the_recursive_checkpoint(tmp_path: Path) -> None:
+    nested = WorkPlan(
+        sub_tls=(
+            SubTLTask("inner-one", WorkPlan(), source=SyntheticQueue([]), order=1),
+            SubTLTask("inner-two", WorkPlan(), source=SyntheticQueue([]), order=2),
+        )
+    )
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        "nested-ordered-run",
+        WorkPlan(sub_tls=(SubTLTask("outer", nested, source=SyntheticQueue([]), order=1),)),
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=TLLoopConfig(max_parallel_slices=2, poll_interval=0.001, idle_timeout=0.1),
+        root_dir=tmp_path,
+    )
+
+    child = load_state(tmp_path / "nested-ordered-run" / "outer" / "run.json")
+    assert result.final_state.slices["outer"].status is SliceStatus.MERGED
+    assert child.ordered_stages == (
+        OrderedStageState(1, ("inner-one",)),
+        OrderedStageState(2, ("inner-two",)),
+    )
+    assert child.slices["inner-one"].status is SliceStatus.MERGED
+    assert child.slices["inner-two"].status is SliceStatus.MERGED
 
 
 def test_ordered_sub_tl_restart_does_not_rerun_merged_children(
@@ -1578,6 +1842,79 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) ->
         "tl.integration_revalidated",
         "tl.merge_decided",
     } <= event_types
+
+
+def test_restart_during_merging_reconciles_without_duplicate_merge(tmp_path: Path) -> None:
+    run_id = "merging-restart-run"
+    plan = WorkPlan(sub_tls=(SubTLTask("aggregate-child", WorkPlan(), order=1),))
+    config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
+    initial = _initial_slices(plan, config, tmp_path, run_id)
+    initial["aggregate-child"].update(
+        {
+            "status": "in_review",
+            "pr_number": 42,
+            "reviewed_head": "head-a",
+            "verdict": "GO",
+            "review_patch_digests": {"head-a": "patch-a"},
+            "ci_state": {"head-a": "success"},
+        }
+    )
+    transport = IntegrationTransport(snapshots=[{}])
+    first = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+        initial_slices=initial,
+    )
+    store = RunStore(run_id, tmp_path)
+    state = store.load()
+    store.checkpoint(
+        state.fsm,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=replace(
+            state.integration,
+            lifecycle=IntegrationLifecycle.MERGING,
+            head_sha="head-a",
+            patch_digest="patch-a",
+            validated_base_sha="base-a",
+            merge_tree_sha="tree-a",
+            ci_status="success",
+            stage_verification="passed",
+        ),
+    )
+    transport.snapshots.append(
+        {
+            "merged": True,
+            "head_sha": "head-a",
+            "base_sha": "base-a",
+        }
+    )
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert first.final_state.fsm.phase is TLPhase.TLWaiting
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    assert result.final_state.slices["aggregate-child"].status is SliceStatus.MERGED
+    assert [name for name, _ in transport.calls if name == "merge_pr"] == []
+    assert any(
+        arguments["event_type"] == "tl.merge_reconciled"
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    )
 
 
 def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path) -> None:
