@@ -58,7 +58,7 @@ from tl_loop.ordered import (
     ReviewOwner,
 )
 from tl_loop.rlm.adjudicate import adjudicate_review
-from tl_loop.rlm.repair import RepairHandoff, compose_repair
+from tl_loop.rlm.repair import RepairError, RepairHandoff, compose_repair
 from tl_loop.select.agent_type import select_agent_type, selection_failure
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.learned_policy import LearnedPolicy
@@ -2283,7 +2283,21 @@ def _review_slice_id(event: EventEnvelope, state: RunState) -> str | None:
         for slice_id, current in state.slices.items()
         if current.pr_number == event.pr_number
     ]
-    return matches[0] if len(matches) == 1 else direct
+    if len(matches) > 1:
+        raise TLLoopError(
+            f"review event PR {event.pr_number} matches multiple slices: {', '.join(matches)}"
+        )
+    if len(matches) == 1:
+        return matches[0]
+    return direct if direct in state.slices else None
+
+
+def _is_aggregate_slice(slice_state: SliceState) -> bool:
+    """Identify a persisted sub-TL aggregate owner without trusting event text."""
+    return (
+        slice_state.dispatch_last_boundary == "aggregate_pr_open"
+        and slice_state.dispatch_agent_id is not None
+    )
 
 
 def _event_findings(event: EventEnvelope) -> list[dict[str, str]] | None:
@@ -2374,7 +2388,7 @@ def _route_review_event(
             stall_classification=stall_classification or current.stall_classification,
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
-    if current.reviewed_head is not None and current.reviewed_head != head_sha:
+    if current.reviewed_head is not None and current.reviewed_head != head_sha and not _is_aggregate_slice(current):
         LOGGER.warning(
             "[TL loop] ignoring stale review target=%s reviewed=%s event=%s",
             slice_id,
@@ -2389,9 +2403,9 @@ def _route_review_event(
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     leaf = next((candidate for candidate in plan.leaves if candidate.name == slice_id), None)
-    if leaf is None:
+    if leaf is None and not _is_aggregate_slice(current):
         raise TLLoopError(f"review event references non-leaf slice {slice_id!r}")
-    criteria = compose_acceptance_criteria(current, leaf)
+    criteria = compose_acceptance_criteria(current, leaf or {})
     result = adjudicate_review(
         _review_diff(event),
         findings,
@@ -2410,6 +2424,7 @@ def _route_review_event(
         verdict_at=event.observed_at,
         review_findings=review_findings,
         review_patch_digests=patch_digests,
+        ci_state={} if current.reviewed_head != result.reviewed_head else current.ci_state,
         stall_classification=stall_classification or current.stall_classification,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
@@ -2568,15 +2583,44 @@ def _route_repair(
             True,
         )
     )
-    handoff = compose_repair(
-        pr,
-        Verdict.NO_GO,
-        review,
-        client=live,
-        model_choice=config.review_model_choice,
-        store=store,
-        slice_id=slice_id,
-    )
+    try:
+        handoff = compose_repair(
+            pr,
+            Verdict.NO_GO,
+            review,
+            client=live,
+            model_choice=config.review_model_choice,
+            store=store,
+            slice_id=slice_id,
+        )
+    except (RepairError, ValueError) as error:
+        parked = replace(
+            current,
+            status=SliceStatus.PARKED,
+            park_cause=ParkCause.REVIEW_STUCK,
+            stall_classification="review_stuck",
+            dispatch_last_boundary="repair_exhausted",
+            dispatch_error=str(error)[:500],
+        )
+        state = store.checkpoint(
+            phase,
+            {**state.slices, slice_id: parked},
+            state.budgets,
+            event_seq,
+        )
+        _record_controller_event(
+            slice_id,
+            "tl.slice_parked",
+            {
+                "slice_id": slice_id,
+                "park_cause": ParkCause.REVIEW_STUCK.value,
+                "reason": str(error)[:500],
+            },
+            config,
+            effects,
+            effects_log,
+        )
+        return state
     effects_log.append(
         EffectIntent(
             "resume_pr",
