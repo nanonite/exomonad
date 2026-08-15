@@ -1060,28 +1060,44 @@ async fn wait_for_tl_controller_startup(
     window_id: &exomonad_core::services::tmux_ipc::WindowId,
 ) -> Result<()> {
     let deadline = Instant::now() + TL_CONTROLLER_STARTUP_TIMEOUT;
+    let routing = exomonad_core::domain::RoutingInfo::window(window_id.clone());
+    let mut observed_alive = false;
+
     loop {
-        if ipc
-            .wait_for_window_process(window_id, Duration::from_millis(100))
-            .await?
-        {
-            return Ok(());
-        }
         if let Some(reason) = controller_exit_reason(project_dir) {
-            let _ = record_controller_exit_reason(project_dir, &reason);
-            anyhow::bail!(
-                "TL controller failed during startup in tmux window {window_id}: {reason}"
+            return tl_controller_startup_failure(project_dir, window_id, reason);
+        }
+
+        if ipc.routing_target_process_alive(&routing).await? {
+            observed_alive = true;
+        } else if observed_alive {
+            return tl_controller_startup_failure(
+                project_dir,
+                window_id,
+                format!("tmux window {window_id} exited before TL startup completed"),
             );
         }
+
         if Instant::now() >= deadline {
-            break;
+            if observed_alive {
+                return Ok(());
+            }
+            return tl_controller_startup_failure(
+                project_dir,
+                window_id,
+                format!("tmux window {window_id} never became live during TL startup"),
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
 
-    let reason = controller_exit_reason(project_dir).unwrap_or_else(|| {
-        format!("tmux window {window_id} exited before the TL controller became ready")
-    });
+fn tl_controller_startup_failure(
+    project_dir: &Path,
+    window_id: &exomonad_core::services::tmux_ipc::WindowId,
+    fallback_reason: String,
+) -> Result<()> {
+    let reason = controller_exit_reason(project_dir).unwrap_or(fallback_reason);
     if let Err(error) = record_controller_exit_reason(project_dir, &reason) {
         warn!(%error, "Failed to persist TL controller startup failure");
     }
@@ -2308,24 +2324,25 @@ pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn wait_for_server_socket(project_dir: &Path) -> Result<()> {
-    let socket_path = project_dir.join(".exo/server.sock");
-    let start = Instant::now();
-    let timeout_dur = Duration::from_secs(30);
-
-    while start.elapsed() < timeout_dur {
+async fn wait_for_socket_path(socket_path: &Path, timeout_dur: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout_dur;
+    while Instant::now() < deadline {
         if socket_path.exists() {
-            break;
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    if !socket_path.exists() {
-        anyhow::bail!(
-            "Server socket not found at {} after 30s.",
-            socket_path.display()
-        );
-    }
+    anyhow::bail!(
+        "Server socket not found at {} after {}s.",
+        socket_path.display(),
+        timeout_dur.as_secs()
+    );
+}
+
+pub async fn wait_for_server_socket(project_dir: &Path) -> Result<()> {
+    let socket_path = project_dir.join(".exo/server.sock");
+    wait_for_socket_path(&socket_path, Duration::from_secs(30)).await?;
 
     let client = uds_client::ServerClient::new(socket_path.to_path_buf());
     for _ in 0..5 {
@@ -2919,6 +2936,23 @@ mod tests {
             server_wait < tl_window,
             "the TL window must not launch before the server socket is ready"
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_server_socket_creation_is_detected_before_timeout() {
+        let project = tempfile::tempdir().unwrap();
+        let socket_path = project.path().join("server.sock");
+        let delayed_path = socket_path.clone();
+        let creator = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            let _listener = tokio::net::UnixListener::bind(delayed_path).unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        wait_for_socket_path(&socket_path, Duration::from_secs(2))
+            .await
+            .unwrap();
+        creator.abort();
     }
 
     #[test]

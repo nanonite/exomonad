@@ -84,13 +84,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .current_dir(repository_root)
         .output()?;
     if !resolver.status.success() {
-        return Err(Error::new(
-            ErrorKind::Other,
-            format!(
-                "tl_loop interpreter resolver failed: {}",
-                String::from_utf8_lossy(&resolver.stderr)
-            ),
-        )
+        return Err(Error::other(format!(
+            "tl_loop interpreter resolver failed: {}",
+            String::from_utf8_lossy(&resolver.stderr)
+        ))
         .into());
     }
     let controller = String::from_utf8(resolver.stdout)?.trim().to_owned();
@@ -112,13 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .current_dir(repository_root)
         .output()?;
     if !build.status.success() {
-        return Err(Error::new(
-            ErrorKind::Other,
-            format!(
-                "tl_loop archive build failed: {}",
-                String::from_utf8_lossy(&build.stderr)
-            ),
-        )
+        return Err(Error::other(format!(
+            "tl_loop archive build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        ))
         .into());
     }
 

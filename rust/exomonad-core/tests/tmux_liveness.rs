@@ -329,3 +329,38 @@ async fn routing_target_process_alive_rejects_dead_command_in_retained_window() 
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+#[tokio::test]
+async fn wait_for_window_process_rejects_a_failed_tmux_command() {
+    if !tmux_available() {
+        return;
+    }
+    let session = TestSession::create("exo-liveness-startup-failure");
+    let window = session.new_shell_window("failed-command");
+    let ipc = session.ipc();
+
+    session.set_remain_on_exit(&window);
+    session.respawn_exiting_shell(&window);
+
+    assert!(
+        !ipc.wait_for_window_process(&window, Duration::from_millis(500))
+            .await
+            .expect("process probe succeeds"),
+        "a retained pane whose command exited must not be reported as live"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_window_process_accepts_a_live_tmux_command() {
+    if !tmux_available() {
+        return;
+    }
+    let session = TestSession::create("exo-liveness-startup-live");
+    let window = session.new_shell_window("live-command");
+
+    assert!(session
+        .ipc()
+        .wait_for_window_process(&window, Duration::from_millis(500))
+        .await
+        .expect("process probe succeeds"));
+}
