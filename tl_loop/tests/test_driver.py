@@ -34,6 +34,7 @@ from tl_loop.loop.driver import (
     _route_ci_event,
     _route_review_event,
     _run_sub_tl_batch,
+    _supervise_live_sub_tl,
     run_tl_loop,
     tl_run,
 )
@@ -136,6 +137,43 @@ def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path)
     assert all(child_state is not None for _, _, child_state in outcomes)
     assert RunStore("alpha", root).load().parent_run_id == "parent"
     assert RunStore("beta", root).load().parent_run_id == "parent"
+
+
+def test_live_waiting_child_is_not_terminated_after_supervision_window() -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.alive = True
+            self.joins: list[float | None] = []
+            self.terminated = False
+
+        def join(self, timeout: float | None = None) -> None:
+            self.joins.append(timeout)
+            if timeout is None:
+                self.alive = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.alive = False
+
+    process = FakeProcess()
+    child_store = SimpleNamespace(
+        load=lambda: SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting)),
+        record_exit_reason=lambda reason: pytest.fail(reason),
+    )
+
+    state = _supervise_live_sub_tl(
+        process,
+        child_store,
+        TLLoopConfig(keep_alive_on_waiting=True, idle_timeout=0.1),
+        0.01,
+    )
+
+    assert state is not None
+    assert process.joins == [0.01, None]
+    assert not process.terminated
 
 
 @dataclass

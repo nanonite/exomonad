@@ -1893,19 +1893,38 @@ def _run_live_sub_tl_batch(
     timeout = max(config.idle_timeout, config.dispatch_timeout)
     outcomes: list[tuple[SubTLTask, TLPhase | None, RunState | None]] = []
     for task, process in processes:
-        process.join(timeout=timeout)
         child_store = RunStore(task.name, store.run_dir)
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            child_store.record_exit_reason(f"sub-TL controller exceeded {timeout:.3f}s")
+        child_state = _supervise_live_sub_tl(process, child_store, config, timeout)
+        phase = child_state.fsm.phase if child_state is not None else TLPhase.TLFailed
+        outcomes.append((task, phase, child_state))
+    return tuple(outcomes)
+
+
+def _supervise_live_sub_tl(
+    process: multiprocessing.Process,
+    child_store: RunStore,
+    config: TLLoopConfig,
+    timeout: float,
+) -> RunState | None:
+    """Keep a checkpointed waiting child alive until its own event stream advances."""
+    process.join(timeout=timeout)
+    if process.is_alive():
         try:
             child_state = child_store.load()
         except (OSError, ValueError):
             child_state = None
-        phase = child_state.fsm.phase if child_state is not None else TLPhase.TLFailed
-        outcomes.append((task, phase, child_state))
-    return tuple(outcomes)
+        if child_state is not None and child_state.fsm.phase is TLPhase.TLWaiting and (
+            config.keep_alive_on_waiting
+        ):
+            process.join()
+        else:
+            process.terminate()
+            process.join()
+            child_store.record_exit_reason(f"sub-TL controller exceeded {timeout:.3f}s")
+    try:
+        return child_store.load()
+    except (OSError, ValueError):
+        return None
 
 
 def _run_live_sub_tl(
