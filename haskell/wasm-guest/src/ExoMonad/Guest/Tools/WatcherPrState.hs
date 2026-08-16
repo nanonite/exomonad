@@ -71,6 +71,9 @@ watcherPrStateCore args
                     "head_sha" .= lazyText (PA.watcherPrStateResponseHeadSha resp),
                     "head_branch" .= lazyText (PA.watcherPrStateResponseHeadBranch resp),
                     "base_branch" .= lazyText (PA.watcherPrStateResponseBaseBranch resp),
+                    "base_sha" .= lazyText (PA.watcherPrStateResponseBaseSha resp),
+                    "patch_digest" .= lazyText (PA.watcherPrStateResponsePatchDigest resp),
+                    "merge_tree_sha" .= lazyText (PA.watcherPrStateResponseMergeTreeSha resp),
                     "pr_state" .= lazyText (PA.watcherPrStateResponsePrState resp),
                     "merged" .= PA.watcherPrStateResponseMerged resp,
                     "review_count" .= PA.watcherPrStateResponseReviewCount resp
