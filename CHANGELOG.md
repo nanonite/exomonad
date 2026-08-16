@@ -126,6 +126,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - Bind review evidence to heads and integration evidence to bases (#869)
+- Bind review evidence to heads and integration evidence to bases (#869)
 - Serialize same-order sub-TL integration with base revalidation (#871)
 - Bind review evidence to heads and integration evidence to bases (#869)
 - Run same-order sub-TLs concurrently with bounded orchestration (#867)
