@@ -6,7 +6,6 @@ Post-process proto3-suite generated Haskell files:
 """
 
 import re
-import sys
 from pathlib import Path
 
 
@@ -38,9 +37,10 @@ def strip_toschema_instances(content: str) -> str:
         # Stop skipping at next top-level declaration
         if skip:
             # Check for top-level declarations that end a ToSchema block
-            if (line.startswith('data ') or
-                line.startswith('newtype ') or
-                (line.startswith('instance ') and 'ToSchema' not in line)):
+            if (
+                line.startswith(('data ', 'newtype '))
+                or (line.startswith('instance ') and 'ToSchema' not in line)
+            ):
                 skip = False
                 result.append(line)
             # Otherwise skip this line

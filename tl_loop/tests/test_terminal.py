@@ -7,16 +7,15 @@ from tl_loop.fsm import (
     PhaseValue,
     TLAllMerged,
     TLDispatching,
-    TLFailed,
-    TLPRFiled,
-    TLPlanning,
     TLDone,
+    TLFailed,
     TLMerging,
+    TLPlanning,
+    TLPRFiled,
     TLWaiting,
     is_terminal,
     is_waiting,
 )
-
 
 CHILDREN = {"child": ChildHandle("child", "main.child", "codex")}
 

@@ -8,7 +8,6 @@ import tempfile
 import zipapp
 from pathlib import Path
 
-
 EXCLUDED_NAMES = {".venv", "tests", "__pycache__"}
 
 

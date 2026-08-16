@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
-from typing import Sequence
-
+from collections.abc import Sequence
+from pathlib import Path
 
 GIT_REPOSITORY_SELECTION_VARIABLES = (
     "GIT_DIR",

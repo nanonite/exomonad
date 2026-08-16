@@ -1,7 +1,8 @@
 import json
-import jsonschema
 import sys
-import os
+
+import jsonschema
+
 
 def validate_json(json_file, schema_file):
     try:
@@ -25,7 +26,7 @@ def validate_json(json_file, schema_file):
     except FileNotFoundError as e:
         print(f"❌ File not found: {e.filename}")
         return 1
-    except Exception as e:
+    except (OSError, TypeError, jsonschema.exceptions.SchemaError) as e:
         print(f"❌ An error occurred: {e}")
         return 1
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from shadow_companion import _is_concrete_spawn
+
 from tl_loop.events.envelope import project
 
 

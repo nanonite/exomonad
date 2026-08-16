@@ -9,7 +9,6 @@ import uuid
 import zipfile
 from pathlib import Path
 
-
 REPOSITORY_ROOT = Path(__file__).parents[2]
 SOURCE_MODULE = REPOSITORY_ROOT / "tl_loop/preflight.py"
 ARCHIVE_BUILDER = REPOSITORY_ROOT / "scripts/build_tl_loop_archive.py"

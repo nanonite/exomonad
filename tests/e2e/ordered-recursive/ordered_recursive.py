@@ -390,7 +390,7 @@ class ControllerScenario:
                     None,
                     {"shadow_event": {"kind": "all_children_done"}},
                 )
-        except Exception as error:  # pragma: no cover - surfaced by the controller
+        except (OSError, RuntimeError, ValueError) as error:
             self._put(
                 record.owner,
                 "agent.stuck",

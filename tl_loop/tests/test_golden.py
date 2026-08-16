@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping, cast
+from typing import cast
 
+from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.fsm import (
     AllChildrenDone,
     ChildCompleted,
@@ -15,20 +17,19 @@ from tl_loop.fsm import (
     ChildSpawned,
     IllegalTransition,
     OwnPRFiled,
-    PRMerged,
     PhaseValue,
-    TLEvent,
+    PRMerged,
     TLAllMerged,
-    TLFailed,
-    TLPRFiled,
-    TLPlanning,
-    TLDone,
     TLDispatching,
+    TLDone,
+    TLEvent,
+    TLFailed,
     TLMerging,
+    TLPlanning,
+    TLPRFiled,
     TLWaiting,
     transition,
 )
-from tl_loop.client.transport import JsonObject, JsonValue
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = Path(__file__).parent / "fixtures" / "tl_phase_golden.json"

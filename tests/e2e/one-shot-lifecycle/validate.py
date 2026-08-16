@@ -9,8 +9,9 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 def mcp_call(socket: str, role: str, agent: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:

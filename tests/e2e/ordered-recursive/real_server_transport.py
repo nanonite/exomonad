@@ -32,7 +32,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import JsonObject, TransportClient, TransportError
 from tl_loop.events.envelope import EventEnvelope, project
-from tl_loop.fsm.phase import ChildHandle, TLPhase, TLWaiting
+from tl_loop.fsm.phase import ChildHandle, TLDispatching, TLPhase, TLWaiting
 from tl_loop.loop.driver import (
     SubTLTask,
     TLLoopConfig,
@@ -47,8 +47,10 @@ from tl_loop.state.schema import (
     IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
+    ParkCause,
     SliceState,
     SliceStatus,
+    Verdict,
 )
 from tl_loop.state.store import RunStore, create
 
@@ -82,6 +84,7 @@ class DelayedAggregateEventSource:
         self.initial_delay = initial_delay
         self.started_at: float | None = None
         self.emitted: list[str] = []
+        self.emitted_sequences: list[int] = []
         self.acknowledged: list[int] = []
 
     def get(self, timeout: float | None = None) -> EventEnvelope:
@@ -140,6 +143,7 @@ class DelayedAggregateEventSource:
                     },
                 )
                 self.emitted.append("review:" + slice_id)
+                self.emitted_sequences.append(event.run_seq or -1)
                 return event
             if current.ci_state.get(head_sha) not in {"success", "neutral"}:
                 event = self._event(
@@ -149,6 +153,7 @@ class DelayedAggregateEventSource:
                     {"status": "success"},
                 )
                 self.emitted.append("ci:" + slice_id)
+                self.emitted_sequences.append(event.run_seq or -1)
                 return event
         return None
 
@@ -532,9 +537,13 @@ def seed_delayed_restart_run(
     root: Path,
     repo: Path,
     forgejo_url: str,
+    *,
+    boundary: str,
 ) -> tuple[str, WorkPlan, int, int]:
     """Seed two real aggregate PRs, then resume them through the controller."""
-    run_id = "ordered-server-delayed-restart"
+    if boundary not in {"aggregate_review", "base_revalidation", "merging"}:
+        raise HarnessError(f"unsupported aggregate restart boundary: {boundary}")
+    run_id = f"ordered-server-{boundary}-restart"
     state_root = root / "controller-state"
     parent_worktree = repo / ".exo/worktrees/parent"
     plan = WorkPlan(
@@ -572,8 +581,14 @@ def seed_delayed_restart_run(
     parent_effects = EffectClient(client, role="tl", name="parent")
     candidates: dict[str, IntegrationCandidateState] = {}
     updated_slices = dict(state.slices)
+    lifecycle = {
+        "aggregate_review": IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        "base_revalidation": IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+        "merging": IntegrationLifecycle.MERGING,
+    }[boundary]
+    verdict = None if boundary == "aggregate_review" else Verdict.GO
     for name in ("sub-a", "sub-b"):
-        branch = f"aggregate/{name}"
+        branch = f"aggregate/{boundary}/{name}"
         git(repo, "branch", branch, "main")
         git(repo, "push", "-q", "origin", branch)
         filed = json_request(
@@ -614,12 +629,13 @@ def seed_delayed_restart_run(
             review_patch_digests={head_sha: patch_digest},
             dispatch_intent_id=f"seeded-{name}",
             dispatch_started_at=time.time(),
-            dispatch_last_boundary="aggregate_pr_open",
+            dispatch_last_boundary=boundary,
             dispatch_agent_id=owner_id,
             dispatch_authoritative_event_seq=1,
+            verdict=verdict,
         )
         candidates[name] = IntegrationCandidateState(
-            lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+            lifecycle=lifecycle,
             aggregate_pr_number=pr_number,
             aggregate_head_sha=head_sha,
             aggregate_patch_digest=patch_digest,
@@ -630,6 +646,19 @@ def seed_delayed_restart_run(
             integration_owner_worktree=str(parent_worktree / name),
             head_sha=head_sha,
             patch_digest=patch_digest,
+            validated_base_sha=(
+                str(evidence["base_sha"]) if boundary == "merging" else None
+            ),
+            merge_tree_sha=(
+                str(evidence["merge_tree_sha"]) if boundary == "merging" else None
+            ),
+            integration_evidence_at=(
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                if boundary == "merging"
+                else None
+            ),
+            ci_status="success" if boundary == "merging" else "unknown",
+            stage_verification="passed" if boundary == "merging" else "pending",
         )
     stages = tuple(
         OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
@@ -660,15 +689,101 @@ def seed_delayed_restart_run(
     )
 
 
-def run_delayed_restart_probe(
+def seed_dispatch_restart_run(
+    root: Path, repo: Path
+) -> tuple[str, WorkPlan, int, int]:
+    """Leave both live sub-TL owners at the dispatch boundary before restart."""
+    run_id = "ordered-server-dispatch-restart"
+    state_root = root / "controller-state"
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("sub-a", WorkPlan(), order=1),
+            SubTLTask("sub-b", WorkPlan(), order=1),
+        )
+    )
+    config = TLLoopConfig(
+        active=True,
+        keep_alive_on_waiting=True,
+        max_parallel_slices=2,
+        max_events=16,
+        idle_timeout=0.2,
+        dispatch_timeout=0.2,
+        controller_stall_timeout=5.0,
+        root_dir=state_root,
+        branch="main",
+        worktree=repo,
+        working_dir=str(repo / ".exo/worktrees/parent"),
+    )
+    initial = _initial_slices(plan, config, state_root, run_id)
+    store = RunStore(run_id, state_root)
+    create(
+        run_id,
+        {
+            "owner_branch": "main",
+            "owner_worktree": str(repo),
+            "slices": initial,
+            "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
+        },
+        root_dir=state_root,
+    )
+    state = store.load()
+    dispatching = {
+        name: replace(
+            current,
+            status=SliceStatus.DISPATCH_UNCONFIRMED,
+            branch=f"main.{name}",
+            worktree=str(repo / ".exo/agents" / name),
+            agent_type="sub-tl",
+            dispatch_intent_id=f"restart-{name}",
+            dispatch_started_at=time.time(),
+            dispatch_last_boundary="dispatch_requested",
+            park_cause=ParkCause.DISPATCH_UNCONFIRMED,
+            dispatch_agent_id=None,
+            dispatch_authoritative_event_seq=None,
+        )
+        for name, current in state.slices.items()
+    }
+    stages = tuple(
+        OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
+    )
+    integration = IntegrationRuntimeState(
+        sub_tl_states={
+            name: IntegrationLifecycle.RUNNING for name in dispatching
+        }
+    )
+    store.checkpoint(
+        TLDispatching(),
+        dispatching,
+        BudgetLedger(tokens=0, wall_seconds=0),
+        0,
+        current_order=1,
+        ordered_stages=stages,
+        integration=integration,
+    )
+    return (
+        run_id,
+        plan,
+        mock_request_count(root / "mock.log", method="POST", suffix="/pulls"),
+        mock_merge_count(root / "mock.log"),
+    )
+
+
+def _run_restart_case(
     client: TransportClient,
     root: Path,
     repo: Path,
     forgejo_url: str,
+    *,
+    boundary: str,
 ) -> None:
-    run_id, plan, pr_count_before, merge_count_before = seed_delayed_restart_run(
-        client, root, repo, forgejo_url
-    )
+    if boundary == "dispatch":
+        run_id, plan, pr_count_before, merge_count_before = seed_dispatch_restart_run(
+            root, repo
+        )
+    else:
+        run_id, plan, pr_count_before, merge_count_before = seed_delayed_restart_run(
+            client, root, repo, forgejo_url, boundary=boundary
+        )
     state_root = root / "controller-state"
     context = multiprocessing.get_context("fork")
 
@@ -699,13 +814,20 @@ def run_delayed_restart_probe(
     time.sleep(0.5)
     waiting_state = RunStore(run_id, state_root).load()
     if not first.is_alive() or any(
-        current.status is not SliceStatus.IN_REVIEW
+        current.status
+        not in {
+            SliceStatus.DISPATCHING,
+            SliceStatus.DISPATCH_UNCONFIRMED,
+            SliceStatus.SPAWNED,
+            SliceStatus.IN_REVIEW,
+        }
         for current in waiting_state.slices.values()
     ):
         first.terminate()
         first.join(timeout=5)
         raise HarnessError(
-            f"controller did not remain alive during delayed review: {waiting_state!r}"
+            f"{boundary} restart did not remain at a recoverable boundary: "
+            f"{waiting_state!r}"
         )
     first.terminate()
     first.join(timeout=5)
@@ -740,22 +862,58 @@ def run_delayed_restart_probe(
             f"delayed restart did not converge: emitted={source.emitted!r} "
             f"acknowledged={source.acknowledged!r}"
         )
-    required_events = {"review:sub-a", "review:sub-b", "ci:sub-a", "ci:sub-b"}
-    if not required_events <= set(source.emitted) or any(
-        source.emitted.count(name) != 1 for name in ("review:sub-a", "review:sub-b")
+    required_events: set[str] = set()
+    if boundary == "aggregate_review":
+        required_events |= {"review:sub-a", "review:sub-b"}
+        required_events |= {"ci:sub-a", "ci:sub-b"}
+    elif boundary in {"base_revalidation", "merging"}:
+        required_events |= {"ci:sub-a", "ci:sub-b"}
+    if (
+        not required_events <= set(source.emitted)
+        or any(source.emitted.count(name) != 1 for name in required_events)
+        or len(set(source.emitted)) != len(source.emitted)
+        or sorted(source.emitted_sequences) != sorted(source.acknowledged)
+        or len(set(source.acknowledged)) != len(source.acknowledged)
     ):
         raise HarnessError(
-            f"delayed events were not consumed exactly once: {source.emitted!r}"
+            f"{boundary} events were not delivered and acknowledged exactly once: "
+            f"emitted={source.emitted!r} sequences={source.emitted_sequences!r} "
+            f"acknowledged={source.acknowledged!r}"
         )
+    expected_pr_count = pr_count_before
     if (
         mock_request_count(root / "mock.log", method="POST", suffix="/pulls")
-        != pr_count_before
+        != expected_pr_count
     ):
-        raise HarnessError("restart created a duplicate aggregate PR")
-    if mock_merge_count(root / "mock.log") != merge_count_before + 2:
+        actual_pr_count = mock_request_count(
+            root / "mock.log", method="POST", suffix="/pulls"
+        )
         raise HarnessError(
-            "restart did not perform exactly one merge per candidate: "
+            f"{boundary} restart created a duplicate aggregate PR: "
+            f"before={pr_count_before} after={actual_pr_count} expected={expected_pr_count}"
+        )
+    expected_merge_count = merge_count_before + (0 if boundary == "dispatch" else 2)
+    if mock_merge_count(root / "mock.log") != expected_merge_count:
+        raise HarnessError(
+            f"{boundary} restart did not perform exactly one merge per candidate: "
             f"before={merge_count_before} after={mock_merge_count(root / 'mock.log')}"
+        )
+
+
+def run_delayed_restart_probe(
+    client: TransportClient,
+    root: Path,
+    repo: Path,
+    forgejo_url: str,
+) -> None:
+    """Exercise restart recovery at every ordered-controller boundary."""
+    for boundary in ("dispatch", "aggregate_review", "base_revalidation", "merging"):
+        _run_restart_case(
+            client,
+            root,
+            repo,
+            forgejo_url,
+            boundary=boundary,
         )
 
 

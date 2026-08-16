@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
-
+from typing import Any
 
 EVENT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 REQUIRED_RULE_FIELDS = {

@@ -27,11 +27,12 @@ import argparse
 import datetime
 import json
 import os
-from pathlib import Path
 import re
 import signal
+import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from git_fixture import run_fixture_git
@@ -85,8 +86,8 @@ def resolve_sha(branch):
             result = run_fixture_git(["rev-parse", branch], fixture_root=remote_dir)
             if result.returncode == 0:
                 return result.stdout.strip()
-        except Exception:
-            pass
+        except (OSError, subprocess.SubprocessError):
+            return None
     return None
 
 
@@ -99,8 +100,8 @@ def git_output(*args):
         result = run_fixture_git(args, fixture_root=remote_dir)
         if result.returncode == 0:
             return result.stdout
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError):
+        return None
     return None
 
 
@@ -226,7 +227,7 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         try:
             with open(log_path, "a") as f:
                 f.write(json.dumps(log_entry) + "\n")
-        except Exception as e:
+        except OSError as e:
             sys.stderr.write(f"Failed to write log: {e}\n")
 
     def _send_json(self, data, status_code=200):

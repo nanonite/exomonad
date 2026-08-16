@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import signal
 import sys
@@ -12,7 +11,7 @@ from http.server import HTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from mock_github import GitHubMockHandler, state  # noqa: E402
+from mock_github import GitHubMockHandler, state
 
 RACE: dict[str, object] = {}
 
