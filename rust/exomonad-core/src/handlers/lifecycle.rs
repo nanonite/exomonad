@@ -632,6 +632,7 @@ exit 64
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn has_pending_work_reports_live_tmux_agent_with_real_metadata() {
         let temp_dir = tempfile::tempdir().expect("temp project dir");
         let services = test_services(temp_dir.path(), &["root", "leaf-a"]).await;

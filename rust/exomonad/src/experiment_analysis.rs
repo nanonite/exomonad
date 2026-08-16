@@ -1,5 +1,3 @@
-#![cfg(debug_assertions)]
-
 //! Report generation for the opt-in TL autonomy benchmark.
 
 use anyhow::{bail, Context, Result};

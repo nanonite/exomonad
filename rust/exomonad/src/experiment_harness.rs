@@ -1,5 +1,3 @@
-#![cfg(debug_assertions)]
-
 //! Deterministic, opt-in TL autonomy benchmark.
 //!
 //! This module is intentionally debug-only. It exercises the real watcher

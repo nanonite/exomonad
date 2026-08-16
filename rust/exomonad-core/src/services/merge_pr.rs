@@ -17,15 +17,19 @@ pub struct MergePROutput {
     pub head_sha: Option<String>,
 }
 
+pub struct MergeExpectedEvidence<'a> {
+    pub base_sha: Option<&'a str>,
+    pub head_sha: Option<&'a str>,
+    pub patch_digest: Option<&'a str>,
+    pub merge_tree_sha: Option<&'a str>,
+}
+
 /// Merge a PR using the Forgejo API.
 pub async fn merge_pr_async(
     pr_number: PRNumber,
     strategy: &MergeStrategy,
     working_dir: &str,
-    expected_base_sha: Option<&str>,
-    expected_head_sha: Option<&str>,
-    _expected_patch_digest: Option<&str>,
-    _expected_merge_tree_sha: Option<&str>,
+    expected: MergeExpectedEvidence<'_>,
     git_wt: Arc<GitWorktreeService>,
     forgejo: Option<&ForgejoClient>,
 ) -> Result<MergePROutput> {
@@ -51,7 +55,7 @@ pub async fn merge_pr_async(
         .await?;
     let branch_name = pr.head_ref.clone();
     let head_sha = pr.head_sha.clone();
-    if let Some(expected) = expected_head_sha.filter(|value| !value.is_empty()) {
+    if let Some(expected) = expected.head_sha.filter(|value| !value.is_empty()) {
         if pr.head_sha.as_deref() != Some(expected) {
             return Ok(MergePROutput {
                 success: false,
@@ -65,7 +69,7 @@ pub async fn merge_pr_async(
             });
         }
     }
-    if let Some(expected) = expected_base_sha.filter(|value| !value.is_empty()) {
+    if let Some(expected) = expected.base_sha.filter(|value| !value.is_empty()) {
         let output = tokio::process::Command::new("git")
             .args(["rev-parse", pr.base_ref.as_str()])
             .current_dir(dir)

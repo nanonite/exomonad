@@ -85,6 +85,12 @@ tl-loop-replay:
 tl-loop-ordered-e2e:
     {{py}} -m pytest -q tl_loop/tests/test_driver.py -k 'ordered or aggregate or merging'
 
+# Run the real-git/tmux recursive ordered integration harness. Set
+# EXOMONAD_FORGEJO_E2E_MOCK=1 for the local API fixture; otherwise provide a
+# dedicated Forgejo repository through EXOMONAD_FORGEJO_E2E_* variables.
+tl-loop-ordered-forgejo:
+    ./tests/e2e/ordered-recursive/run.sh
+
 # Lint the programmatic TL controller
 tl-loop-lint:
     {{py}} -m ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py

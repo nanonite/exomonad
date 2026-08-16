@@ -89,10 +89,14 @@ impl<
                 pr_number,
                 &strategy,
                 &req.working_dir,
-                crate::handlers::non_empty(req.expected_base_sha.clone()).as_deref(),
-                crate::handlers::non_empty(req.expected_head_sha.clone()).as_deref(),
-                crate::handlers::non_empty(req.expected_patch_digest.clone()).as_deref(),
-                crate::handlers::non_empty(req.expected_merge_tree_sha.clone()).as_deref(),
+                merge_pr::MergeExpectedEvidence {
+                    base_sha: crate::handlers::non_empty(req.expected_base_sha.clone()).as_deref(),
+                    head_sha: crate::handlers::non_empty(req.expected_head_sha.clone()).as_deref(),
+                    patch_digest: crate::handlers::non_empty(req.expected_patch_digest.clone())
+                        .as_deref(),
+                    merge_tree_sha: crate::handlers::non_empty(req.expected_merge_tree_sha.clone())
+                        .as_deref(),
+                },
                 self.ctx.git_worktree_service().clone(),
                 self.ctx.forgejo_client().map(|arc| arc.as_ref()),
             )
