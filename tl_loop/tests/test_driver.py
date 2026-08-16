@@ -2332,6 +2332,105 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
     assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
 
 
+def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None:
+    child_plan = _plan()
+    parent_dir = tmp_path / "gate-run"
+    run_tl_loop(
+        "aggregate-child",
+        child_plan,
+        SyntheticQueue(_lifecycle_events("aggregate-child")),
+        EffectClient(RecordingTransport()),
+        config=_config(),
+        root_dir=parent_dir,
+    )
+    child_store = RunStore("aggregate-child", parent_dir)
+    child_state = child_store.load()
+    child_store.checkpoint(
+        child_state.fsm,
+        {
+            **child_state.slices,
+            "leaf-a": replace(child_state.slices["leaf-a"], pr_number=42, reviewed_head="head-a"),
+        },
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    transport = IntegrationTransport(
+        snapshots=[
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "open": True,
+                "merged": False,
+                "head_branch": "main.aggregate-child",
+                "head_sha": "head-a",
+            },
+        ],
+        merge_response={"success": False, "error": "merge conflict with parent base"},
+    )
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+    )
+    config = TLLoopConfig(
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        idle_timeout=0.01,
+        max_integration_repairs=0,
+    )
+    run_tl_loop(
+        "gate-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    store = RunStore("gate-run", tmp_path)
+    state = store.load()
+    store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            "aggregate-child": replace(
+                state.slices["aggregate-child"],
+                verdict=Verdict.GO,
+                review_patch_digests={"head-a": "patch-a"},
+                ci_state={"head-a": "success"},
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    result = run_tl_loop(
+        "gate-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert GateState(name="tl-integration-conflict", status=GateStatus.PENDING) in result.final_state.gates
+    assert result.final_state.integration.lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT
+    assert result.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
+    assert not any(name == "resume_pr" for name, _ in transport.calls)
+
+
 def test_same_order_event_consumers_require_isolated_sources(tmp_path: Path) -> None:
     eventful = WorkPlan(workers=(WorkerTask("worker", "consume"),))
     plan = WorkPlan(
