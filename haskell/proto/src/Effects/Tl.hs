@@ -153,8 +153,11 @@ instance (HsJSONPB.ToJSON EmitEventRequest) where
 instance (HsJSONPB.FromJSON EmitEventRequest) where
   parseJSON = HsJSONPB.parseJSONPB
 
-newtype EmitEventResponse
-  = EmitEventResponse {emitEventResponseEventId :: Hs.Text}
+data EmitEventResponse
+  = EmitEventResponse
+  { emitEventResponseEventId :: Hs.Text,
+    emitEventResponseRunSeq :: Hs.Word64
+  }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
 instance (Hs.NFData EmitEventResponse)
@@ -165,13 +168,23 @@ instance (HsProtobuf.Named EmitEventResponse) where
 instance (HsProtobuf.HasDefault EmitEventResponse)
 
 instance (HsProtobuf.Message EmitEventResponse) where
-  encodeMessage _ EmitEventResponse {emitEventResponseEventId} =
-    ( HsProtobuf.encodeMessageField
-        (HsProtobuf.FieldNumber 1)
-        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-            emitEventResponseEventId
+  encodeMessage
+    _
+    EmitEventResponse
+      { emitEventResponseEventId,
+        emitEventResponseRunSeq
+      } =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                emitEventResponseEventId
+            )
         )
-    )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            emitEventResponseRunSeq
+        )
   decodeMessage _ =
     Hs.pure EmitEventResponse
       <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
@@ -180,25 +193,36 @@ instance (HsProtobuf.Message EmitEventResponse) where
                   (HsProtobuf.FieldNumber 1)
               )
           )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 2)
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "event_id")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "run_seq")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB EmitEventResponse) where
-  toJSONPB (EmitEventResponse f1) =
+  toJSONPB (EmitEventResponse f1 f2) =
     HsJSONPB.object
       [ "event_id"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "run_seq" .= f2
       ]
-  toEncodingPB (EmitEventResponse f1) =
+  toEncodingPB (EmitEventResponse f1 f2) =
     HsJSONPB.pairs
       [ "event_id"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "run_seq" .= f2
       ]
 
 instance (HsJSONPB.FromJSONPB EmitEventResponse) where
@@ -210,6 +234,7 @@ instance (HsJSONPB.FromJSONPB EmitEventResponse) where
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "event_id")
                 )
+            <*> obj .: "run_seq"
       )
 
 instance (HsJSONPB.ToJSON EmitEventResponse) where

@@ -68,6 +68,30 @@ def test_effect_result_decodes_the_server_envelope() -> None:
     assert result.error is None
 
 
+def test_merge_pr_emits_compare_and_swap_evidence() -> None:
+    transport = RecordingTransport()
+    EffectClient(transport).merge_pr(
+        pr_number=7,
+        expected_base_sha="base-sha",
+        expected_head_sha="head-sha",
+        expected_patch_digest="patch-digest",
+        expected_merge_tree_sha="tree-sha",
+    )
+
+    assert transport.calls == [
+        (
+            "merge_pr",
+            {
+                "pr_number": 7,
+                "expected_base_sha": "base-sha",
+                "expected_head_sha": "head-sha",
+                "expected_patch_digest": "patch-digest",
+                "expected_merge_tree_sha": "tree-sha",
+            },
+        )
+    ]
+
+
 def _load_schemas() -> dict[str, JsonObject]:
     raw = cast(JsonObject, json.loads(FIXTURE.read_text(encoding="utf-8")))
     tools = raw.get("tools")

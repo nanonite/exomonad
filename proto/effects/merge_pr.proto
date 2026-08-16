@@ -7,6 +7,11 @@ message MergePrRequest {
   string strategy = 2;
   // Working directory for git operations. Required for agents in worktrees.
   string working_dir = 3;
+  // Expected source/base evidence captured immediately before merge.
+  string expected_base_sha = 4;
+  string expected_head_sha = 5;
+  string expected_patch_digest = 6;
+  string expected_merge_tree_sha = 7;
 }
 
 message MergePrResponse {

@@ -22,14 +22,14 @@ from tl_loop.loop.driver import (
 from tl_loop.loop.review import (
     CIStatusNotApproved,
     IntegrationEvidenceMismatch,
-    MissingPatchDigest,
     MissingCIStatus,
+    MissingPatchDigest,
     OptionalPolicyRejected,
     PatchDigestMismatch,
     ReviewHeadMismatch,
     StaleVerdict,
-    invalidate_integration_evidence,
     integration_needs_revalidation,
+    invalidate_integration_evidence,
     verify_integration,
     verify_review,
 )
@@ -152,6 +152,7 @@ def test_integration_evidence_requires_exact_base_head_tree_and_ci() -> None:
         state,
         base_sha="base-a",
         head_sha="head-a",
+        patch_digest="patch-a",
         merge_tree_sha="tree-a",
         ci_status="success",
     )
@@ -161,7 +162,13 @@ def test_integration_evidence_requires_exact_base_head_tree_and_ci() -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    (("base_sha", "base-b"), ("head_sha", "head-b"), ("merge_tree_sha", "tree-b"), ("ci_status", "failure")),
+    (
+        ("base_sha", "base-b"),
+        ("head_sha", "head-b"),
+        ("patch_digest", "patch-b"),
+        ("merge_tree_sha", "tree-b"),
+        ("ci_status", "failure"),
+    ),
 )
 def test_integration_evidence_rejects_each_changed_dimension(field: str, value: str) -> None:
     state = IntegrationRuntimeState(
@@ -174,7 +181,13 @@ def test_integration_evidence_rejects_each_changed_dimension(field: str, value: 
         stage_verification="passed",
         integration_evidence_at="2026-08-11T17:00:00Z",
     )
-    live = {"base_sha": "base-a", "head_sha": "head-a", "merge_tree_sha": "tree-a", "ci_status": "success"}
+    live = {
+        "base_sha": "base-a",
+        "head_sha": "head-a",
+        "patch_digest": "patch-a",
+        "merge_tree_sha": "tree-a",
+        "ci_status": "success",
+    }
     live[field] = value
 
     with pytest.raises(IntegrationEvidenceMismatch):

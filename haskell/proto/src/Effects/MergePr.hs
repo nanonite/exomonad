@@ -51,7 +51,11 @@ data MergePrRequest
   = MergePrRequest
   { mergePrRequestPrNumber :: Hs.Int64,
     mergePrRequestStrategy :: Hs.Text,
-    mergePrRequestWorkingDir :: Hs.Text
+    mergePrRequestWorkingDir :: Hs.Text,
+    mergePrRequestExpectedBaseSha :: Hs.Text,
+    mergePrRequestExpectedHeadSha :: Hs.Text,
+    mergePrRequestExpectedPatchDigest :: Hs.Text,
+    mergePrRequestExpectedMergeTreeSha :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -68,25 +72,61 @@ instance (HsProtobuf.Message MergePrRequest) where
     MergePrRequest
       { mergePrRequestPrNumber,
         mergePrRequestStrategy,
-        mergePrRequestWorkingDir
+        mergePrRequestWorkingDir,
+        mergePrRequestExpectedBaseSha,
+        mergePrRequestExpectedHeadSha,
+        mergePrRequestExpectedPatchDigest,
+        mergePrRequestExpectedMergeTreeSha
       } =
       Hs.mappend
         ( Hs.mappend
-            ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 1)
-                mergePrRequestPrNumber
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 1)
+                                mergePrRequestPrNumber
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 2)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    mergePrRequestStrategy
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 3)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                mergePrRequestWorkingDir
+                            )
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 4)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            mergePrRequestExpectedBaseSha
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 5)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        mergePrRequestExpectedHeadSha
+                    )
+                )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 2)
+                (HsProtobuf.FieldNumber 6)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    mergePrRequestStrategy
+                    mergePrRequestExpectedPatchDigest
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 3)
+            (HsProtobuf.FieldNumber 7)
             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                mergePrRequestWorkingDir
+                mergePrRequestExpectedMergeTreeSha
             )
         )
   decodeMessage _ =
@@ -104,6 +144,30 @@ instance (HsProtobuf.Message MergePrRequest) where
               ( HsProtobuf.at
                   HsProtobuf.decodeMessageField
                   (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 6)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
               )
           )
   dotProto _ =
@@ -124,25 +188,65 @@ instance (HsProtobuf.Message MergePrRequest) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "working_dir")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_base_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_head_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_patch_digest")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_merge_tree_sha")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB MergePrRequest) where
-  toJSONPB (MergePrRequest f1 f2 f3) =
+  toJSONPB (MergePrRequest f1 f2 f3 f4 f5 f6 f7) =
     HsJSONPB.object
       [ "pr_number" .= f1,
         "strategy"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
         "working_dir"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "expected_base_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "expected_head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "expected_patch_digest"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "expected_merge_tree_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
       ]
-  toEncodingPB (MergePrRequest f1 f2 f3) =
+  toEncodingPB (MergePrRequest f1 f2 f3 f4 f5 f6 f7) =
     HsJSONPB.pairs
       [ "pr_number" .= f1,
         "strategy"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
         "working_dir"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "expected_base_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "expected_head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "expected_patch_digest"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "expected_merge_tree_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
       ]
 
 instance (HsJSONPB.FromJSONPB MergePrRequest) where
@@ -157,6 +261,18 @@ instance (HsJSONPB.FromJSONPB MergePrRequest) where
                 )
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "working_dir")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_base_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_head_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_patch_digest")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_merge_tree_sha")
                 )
       )
 

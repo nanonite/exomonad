@@ -22,6 +22,10 @@ pub async fn merge_pr_async(
     pr_number: PRNumber,
     strategy: &MergeStrategy,
     working_dir: &str,
+    expected_base_sha: Option<&str>,
+    expected_head_sha: Option<&str>,
+    _expected_patch_digest: Option<&str>,
+    _expected_merge_tree_sha: Option<&str>,
     git_wt: Arc<GitWorktreeService>,
     forgejo: Option<&ForgejoClient>,
 ) -> Result<MergePROutput> {
@@ -47,6 +51,37 @@ pub async fn merge_pr_async(
         .await?;
     let branch_name = pr.head_ref.clone();
     let head_sha = pr.head_sha.clone();
+    if let Some(expected) = expected_head_sha.filter(|value| !value.is_empty()) {
+        if pr.head_sha.as_deref() != Some(expected) {
+            return Ok(MergePROutput {
+                success: false,
+                message: format!(
+                    "compare_and_swap: expected head {expected}, found {:?}",
+                    pr.head_sha
+                ),
+                git_fetched: false,
+                branch_name,
+                head_sha,
+            });
+        }
+    }
+    if let Some(expected) = expected_base_sha.filter(|value| !value.is_empty()) {
+        let output = tokio::process::Command::new("git")
+            .args(["rev-parse", pr.base_ref.as_str()])
+            .current_dir(dir)
+            .output()
+            .await?;
+        let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || actual != expected {
+            return Ok(MergePROutput {
+                success: false,
+                message: format!("compare_and_swap: expected base {expected}, found {actual:?}"),
+                git_fetched: false,
+                branch_name,
+                head_sha,
+            });
+        }
+    }
 
     let method = match strategy {
         MergeStrategy::Squash => "squash",

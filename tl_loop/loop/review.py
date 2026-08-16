@@ -194,13 +194,15 @@ def verify_integration(
     *,
     base_sha: str,
     head_sha: str,
+    patch_digest: str,
     merge_tree_sha: str,
     ci_status: str,
 ) -> IntegrationEvidence:
-    """Require exact persisted base, head, merge-tree, and CI evidence."""
+    """Require exact persisted base, head, patch, merge-tree, and CI evidence."""
     expected = (
         ("validated_base_sha", state.validated_base_sha, base_sha),
         ("head_sha", state.head_sha, head_sha),
+        ("patch_digest", state.patch_digest, patch_digest),
         ("merge_tree_sha", state.merge_tree_sha, merge_tree_sha),
         ("ci_status", state.ci_status, ci_status),
     )
@@ -353,22 +355,22 @@ __all__ = [
     "AcceptanceCriteriaError",
     "CIStatusNotApproved",
     "MissingCIStatus",
-    "MissingReviewedHead",
     "MissingPatchDigest",
+    "MissingReviewedHead",
     "MissingVerdict",
     "OptionalPolicyRejected",
+    "PatchDigestMismatch",
     "ReviewEvidence",
     "ReviewGateError",
     "ReviewHeadMismatch",
-    "PatchDigestMismatch",
     "StaleVerdict",
     "VerdictNotApproved",
     "compose_acceptance_criteria",
     "integration_needs_revalidation",
     "invalidate_integration_evidence",
     "load_freshness_window",
-    "verify_review",
     "verify_integration",
+    "verify_review",
     "watcher_head",
     "watcher_patch_digest",
 ]

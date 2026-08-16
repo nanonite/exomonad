@@ -192,7 +192,8 @@ data AgentInfo
     agentInfoHasUnread :: Hs.Bool,
     agentInfoLastCheckInboxAt :: Hs.Int64,
     agentInfoIsAlive :: Hs.Bool,
-    agentInfoLastActivityAt :: Hs.Int64
+    agentInfoLastActivityAt :: Hs.Int64,
+    agentInfoIntentId :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -224,7 +225,8 @@ instance (HsProtobuf.Message AgentInfo) where
         agentInfoHasUnread,
         agentInfoLastCheckInboxAt,
         agentInfoIsAlive,
-        agentInfoLastActivityAt
+        agentInfoLastActivityAt,
+        agentInfoIntentId
       } =
       Hs.mappend
         ( Hs.mappend
@@ -243,123 +245,131 @@ instance (HsProtobuf.Message AgentInfo) where
                                                             ( Hs.mappend
                                                                 ( Hs.mappend
                                                                     ( Hs.mappend
-                                                                        ( HsProtobuf.encodeMessageField
-                                                                            (HsProtobuf.FieldNumber 1)
-                                                                            ( ( Hs.coerce
-                                                                                  @Hs.Text
-                                                                                  @(HsProtobuf.String Hs.Text)
-                                                                              )
-                                                                                agentInfoId
+                                                                        ( Hs.mappend
+                                                                            ( HsProtobuf.encodeMessageField
+                                                                                (HsProtobuf.FieldNumber 1)
+                                                                                ( ( Hs.coerce
+                                                                                      @Hs.Text
+                                                                                      @(HsProtobuf.String Hs.Text)
+                                                                                  )
+                                                                                    agentInfoId
+                                                                                )
+                                                                            )
+                                                                            ( HsProtobuf.encodeMessageField
+                                                                                (HsProtobuf.FieldNumber 2)
+                                                                                ( ( Hs.coerce
+                                                                                      @Hs.Text
+                                                                                      @(HsProtobuf.String Hs.Text)
+                                                                                  )
+                                                                                    agentInfoIssue
+                                                                                )
                                                                             )
                                                                         )
                                                                         ( HsProtobuf.encodeMessageField
-                                                                            (HsProtobuf.FieldNumber 2)
+                                                                            (HsProtobuf.FieldNumber 3)
                                                                             ( ( Hs.coerce
                                                                                   @Hs.Text
                                                                                   @(HsProtobuf.String Hs.Text)
                                                                               )
-                                                                                agentInfoIssue
+                                                                                agentInfoWorktreePath
                                                                             )
                                                                         )
                                                                     )
                                                                     ( HsProtobuf.encodeMessageField
-                                                                        (HsProtobuf.FieldNumber 3)
+                                                                        (HsProtobuf.FieldNumber 4)
                                                                         ( ( Hs.coerce
                                                                               @Hs.Text
                                                                               @(HsProtobuf.String Hs.Text)
                                                                           )
-                                                                            agentInfoWorktreePath
+                                                                            agentInfoBranchName
                                                                         )
                                                                     )
                                                                 )
                                                                 ( HsProtobuf.encodeMessageField
-                                                                    (HsProtobuf.FieldNumber 4)
-                                                                    ( ( Hs.coerce
-                                                                          @Hs.Text
-                                                                          @(HsProtobuf.String Hs.Text)
-                                                                      )
-                                                                        agentInfoBranchName
-                                                                    )
+                                                                    (HsProtobuf.FieldNumber 5)
+                                                                    agentInfoAgentType
                                                                 )
                                                             )
                                                             ( HsProtobuf.encodeMessageField
-                                                                (HsProtobuf.FieldNumber 5)
-                                                                agentInfoAgentType
+                                                                (HsProtobuf.FieldNumber 6)
+                                                                agentInfoRole
                                                             )
                                                         )
                                                         ( HsProtobuf.encodeMessageField
-                                                            (HsProtobuf.FieldNumber 6)
-                                                            agentInfoRole
+                                                            (HsProtobuf.FieldNumber 7)
+                                                            agentInfoAlive
                                                         )
                                                     )
                                                     ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 7)
-                                                        agentInfoAlive
+                                                        (HsProtobuf.FieldNumber 8)
+                                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                            agentInfoMuxWindow
+                                                        )
                                                     )
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 8)
+                                                    (HsProtobuf.FieldNumber 9)
                                                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                        agentInfoMuxWindow
+                                                        agentInfoError
                                                     )
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 9)
-                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                    agentInfoError
-                                                )
+                                                (HsProtobuf.FieldNumber 10)
+                                                agentInfoPrNumber
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 10)
-                                            agentInfoPrNumber
+                                            (HsProtobuf.FieldNumber 11)
+                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                agentInfoPrUrl
+                                            )
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 11)
-                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                            agentInfoPrUrl
-                                        )
+                                        (HsProtobuf.FieldNumber 12)
+                                        agentInfoTopology
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 12)
-                                    agentInfoTopology
+                                    (HsProtobuf.FieldNumber 13)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        agentInfoPaneId
+                                    )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 13)
+                                (HsProtobuf.FieldNumber 14)
                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                    agentInfoPaneId
+                                    agentInfoBirthBranch
                                 )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 14)
-                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                agentInfoBirthBranch
-                            )
+                            (HsProtobuf.FieldNumber 15)
+                            agentInfoHasUnread
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 15)
-                        agentInfoHasUnread
+                        (HsProtobuf.FieldNumber 16)
+                        agentInfoLastCheckInboxAt
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 16)
-                    agentInfoLastCheckInboxAt
+                    (HsProtobuf.FieldNumber 17)
+                    agentInfoIsAlive
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 17)
-                agentInfoIsAlive
+                (HsProtobuf.FieldNumber 18)
+                agentInfoLastActivityAt
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 18)
-            agentInfoLastActivityAt
+            (HsProtobuf.FieldNumber 19)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                agentInfoIntentId
+            )
         )
   decodeMessage _ =
     Hs.pure AgentInfo
@@ -444,6 +454,12 @@ instance (HsProtobuf.Message AgentInfo) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 18)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 19)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -562,6 +578,12 @@ instance (HsProtobuf.Message AgentInfo) where
         (HsProtobufAST.Prim HsProtobufAST.Int64)
         (HsProtobufAST.Single "last_activity_at")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 19)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "intent_id")
+        []
         ""
     ]
 
@@ -586,6 +608,7 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
         f16
         f17
         f18
+        f19
       ) =
       HsJSONPB.object
         [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -611,7 +634,9 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
           "has_unread" .= f15,
           "last_check_inbox_at" .= f16,
           "is_alive" .= f17,
-          "last_activity_at" .= f18
+          "last_activity_at" .= f18,
+          "intent_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f19)
         ]
   toEncodingPB
     ( AgentInfo
@@ -633,6 +658,7 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
         f16
         f17
         f18
+        f19
       ) =
       HsJSONPB.pairs
         [ "id" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -658,7 +684,9 @@ instance (HsJSONPB.ToJSONPB AgentInfo) where
           "has_unread" .= f15,
           "last_check_inbox_at" .= f16,
           "is_alive" .= f17,
-          "last_activity_at" .= f18
+          "last_activity_at" .= f18,
+          "intent_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f19)
         ]
 
 instance (HsJSONPB.FromJSONPB AgentInfo) where
@@ -703,6 +731,9 @@ instance (HsJSONPB.FromJSONPB AgentInfo) where
             <*> obj .: "last_check_inbox_at"
             <*> obj .: "is_alive"
             <*> obj .: "last_activity_at"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "intent_id")
+                )
       )
 
 instance (HsJSONPB.ToJSON AgentInfo) where
@@ -3069,7 +3100,8 @@ data SpawnWorkerRequest
     spawnWorkerRequestPermissionMode :: Hs.Text,
     spawnWorkerRequestAllowedTools :: (Hs.Vector Hs.Text),
     spawnWorkerRequestDisallowedTools :: (Hs.Vector Hs.Text),
-    spawnWorkerRequestAgentType :: (HsProtobuf.Enumerated Effects.Agent.AgentType)
+    spawnWorkerRequestAgentType :: (HsProtobuf.Enumerated Effects.Agent.AgentType),
+    spawnWorkerRequestIntentId :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -3089,56 +3121,65 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
         spawnWorkerRequestPermissionMode,
         spawnWorkerRequestAllowedTools,
         spawnWorkerRequestDisallowedTools,
-        spawnWorkerRequestAgentType
+        spawnWorkerRequestAgentType,
+        spawnWorkerRequestIntentId
       } =
       Hs.mappend
         ( Hs.mappend
             ( Hs.mappend
                 ( Hs.mappend
                     ( Hs.mappend
-                        ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 1)
-                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                spawnWorkerRequestName
+                        ( Hs.mappend
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 1)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    spawnWorkerRequestName
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 2)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    spawnWorkerRequestPrompt
+                                )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 2)
+                            (HsProtobuf.FieldNumber 3)
                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                spawnWorkerRequestPrompt
+                                spawnWorkerRequestPermissionMode
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 3)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            spawnWorkerRequestPermissionMode
+                        (HsProtobuf.FieldNumber 4)
+                        ( ( Hs.coerce
+                              @(Hs.Vector Hs.Text)
+                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                          )
+                            spawnWorkerRequestAllowedTools
                         )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 4)
+                    (HsProtobuf.FieldNumber 5)
                     ( ( Hs.coerce
                           @(Hs.Vector Hs.Text)
                           @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                       )
-                        spawnWorkerRequestAllowedTools
+                        spawnWorkerRequestDisallowedTools
                     )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 5)
-                ( ( Hs.coerce
-                      @(Hs.Vector Hs.Text)
-                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                  )
-                    spawnWorkerRequestDisallowedTools
-                )
+                (HsProtobuf.FieldNumber 6)
+                spawnWorkerRequestAgentType
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 6)
-            spawnWorkerRequestAgentType
+            (HsProtobuf.FieldNumber 7)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                spawnWorkerRequestIntentId
+            )
         )
   decodeMessage _ =
     Hs.pure SpawnWorkerRequest
@@ -3181,6 +3222,12 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 6)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -3219,11 +3266,17 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
         )
         (HsProtobufAST.Single "agent_type")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "intent_id")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB SpawnWorkerRequest) where
-  toJSONPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6) =
+  toJSONPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6 f7) =
     HsJSONPB.object
       [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "prompt" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -3243,9 +3296,11 @@ instance (HsJSONPB.ToJSONPB SpawnWorkerRequest) where
                )
                  f5
              ),
-        "agent_type" .= f6
+        "agent_type" .= f6,
+        "intent_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
       ]
-  toEncodingPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6) =
+  toEncodingPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6 f7) =
     HsJSONPB.pairs
       [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "prompt" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -3265,7 +3320,9 @@ instance (HsJSONPB.ToJSONPB SpawnWorkerRequest) where
                )
                  f5
              ),
-        "agent_type" .= f6
+        "agent_type" .= f6,
+        "intent_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
       ]
 
 instance (HsJSONPB.FromJSONPB SpawnWorkerRequest) where
@@ -3296,6 +3353,9 @@ instance (HsJSONPB.FromJSONPB SpawnWorkerRequest) where
                     (obj .: "disallowed_tools")
                 )
             <*> obj .: "agent_type"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "intent_id")
+                )
       )
 
 instance (HsJSONPB.ToJSON SpawnWorkerRequest) where
@@ -5269,7 +5329,8 @@ data SpawnLeafSubtreeRequest
     spawnLeafSubtreeRequestStandaloneRepo :: Hs.Bool,
     spawnLeafSubtreeRequestAllowedDirs :: (Hs.Vector Hs.Text),
     spawnLeafSubtreeRequestResumePrNumber :: Hs.Word64,
-    spawnLeafSubtreeRequestExpectedHeadSha :: Hs.Text
+    spawnLeafSubtreeRequestExpectedHeadSha :: Hs.Text,
+    spawnLeafSubtreeRequestIntentId :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -5294,7 +5355,8 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
         spawnLeafSubtreeRequestStandaloneRepo,
         spawnLeafSubtreeRequestAllowedDirs,
         spawnLeafSubtreeRequestResumePrNumber,
-        spawnLeafSubtreeRequestExpectedHeadSha
+        spawnLeafSubtreeRequestExpectedHeadSha,
+        spawnLeafSubtreeRequestIntentId
       } =
       Hs.mappend
         ( Hs.mappend
@@ -5306,82 +5368,90 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
                                 ( Hs.mappend
                                     ( Hs.mappend
                                         ( Hs.mappend
-                                            ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 1)
-                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                    spawnLeafSubtreeRequestTask
+                                            ( Hs.mappend
+                                                ( HsProtobuf.encodeMessageField
+                                                    (HsProtobuf.FieldNumber 1)
+                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                        spawnLeafSubtreeRequestTask
+                                                    )
+                                                )
+                                                ( HsProtobuf.encodeMessageField
+                                                    (HsProtobuf.FieldNumber 2)
+                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                        spawnLeafSubtreeRequestBranchName
+                                                    )
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 2)
+                                                (HsProtobuf.FieldNumber 3)
                                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                    spawnLeafSubtreeRequestBranchName
+                                                    spawnLeafSubtreeRequestRole
                                                 )
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 3)
-                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                spawnLeafSubtreeRequestRole
-                                            )
+                                            (HsProtobuf.FieldNumber 4)
+                                            spawnLeafSubtreeRequestAgentType
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 4)
-                                        spawnLeafSubtreeRequestAgentType
+                                        (HsProtobuf.FieldNumber 5)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            spawnLeafSubtreeRequestPermissionMode
+                                        )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 5)
-                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        spawnLeafSubtreeRequestPermissionMode
+                                    (HsProtobuf.FieldNumber 6)
+                                    ( ( Hs.coerce
+                                          @(Hs.Vector Hs.Text)
+                                          @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                      )
+                                        spawnLeafSubtreeRequestAllowedTools
                                     )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 6)
+                                (HsProtobuf.FieldNumber 7)
                                 ( ( Hs.coerce
                                       @(Hs.Vector Hs.Text)
                                       @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                                   )
-                                    spawnLeafSubtreeRequestAllowedTools
+                                    spawnLeafSubtreeRequestDisallowedTools
                                 )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 7)
-                            ( ( Hs.coerce
-                                  @(Hs.Vector Hs.Text)
-                                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                              )
-                                spawnLeafSubtreeRequestDisallowedTools
-                            )
+                            (HsProtobuf.FieldNumber 10)
+                            spawnLeafSubtreeRequestStandaloneRepo
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 10)
-                        spawnLeafSubtreeRequestStandaloneRepo
+                        (HsProtobuf.FieldNumber 11)
+                        ( ( Hs.coerce
+                              @(Hs.Vector Hs.Text)
+                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                          )
+                            spawnLeafSubtreeRequestAllowedDirs
+                        )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 11)
-                    ( ( Hs.coerce
-                          @(Hs.Vector Hs.Text)
-                          @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                      )
-                        spawnLeafSubtreeRequestAllowedDirs
-                    )
+                    (HsProtobuf.FieldNumber 12)
+                    spawnLeafSubtreeRequestResumePrNumber
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 12)
-                spawnLeafSubtreeRequestResumePrNumber
+                (HsProtobuf.FieldNumber 13)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    spawnLeafSubtreeRequestExpectedHeadSha
+                )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 13)
+            (HsProtobuf.FieldNumber 14)
             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                spawnLeafSubtreeRequestExpectedHeadSha
+                spawnLeafSubtreeRequestIntentId
             )
         )
   decodeMessage _ =
@@ -5452,6 +5522,12 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
                   (HsProtobuf.FieldNumber 13)
               )
           )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 14)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -5520,12 +5596,18 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "expected_head_sha")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 14)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "intent_id")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
   toJSONPB
-    (SpawnLeafSubtreeRequest f1 f2 f3 f4 f5 f6 f7 f10 f11 f12 f13) =
+    (SpawnLeafSubtreeRequest f1 f2 f3 f4 f5 f6 f7 f10 f11 f12 f13 f14) =
       HsJSONPB.object
         [ "task" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
           "branch_name"
@@ -5558,10 +5640,12 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
                ),
           "resume_pr_number" .= f12,
           "expected_head_sha"
-            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13)
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
+          "intent_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14)
         ]
   toEncodingPB
-    (SpawnLeafSubtreeRequest f1 f2 f3 f4 f5 f6 f7 f10 f11 f12 f13) =
+    (SpawnLeafSubtreeRequest f1 f2 f3 f4 f5 f6 f7 f10 f11 f12 f13 f14) =
       HsJSONPB.pairs
         [ "task" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
           "branch_name"
@@ -5594,7 +5678,9 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
                ),
           "resume_pr_number" .= f12,
           "expected_head_sha"
-            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13)
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
+          "intent_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14)
         ]
 
 instance (HsJSONPB.FromJSONPB SpawnLeafSubtreeRequest) where
@@ -5638,6 +5724,9 @@ instance (HsJSONPB.FromJSONPB SpawnLeafSubtreeRequest) where
             <*> obj .: "resume_pr_number"
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "expected_head_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "intent_id")
                 )
       )
 

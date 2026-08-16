@@ -471,7 +471,11 @@ runMerge args = do
         MP.MergePrRequest
           { MP.mergePrRequestPrNumber = fromIntegral (mprPrNumber args),
             MP.mergePrRequestStrategy = maybe "" TL.fromStrict (mprStrategy args),
-            MP.mergePrRequestWorkingDir = maybe "" TL.fromStrict (mprWorkingDir args)
+            MP.mergePrRequestWorkingDir = maybe "" TL.fromStrict (mprWorkingDir args),
+            MP.mergePrRequestExpectedBaseSha = "",
+            MP.mergePrRequestExpectedHeadSha = "",
+            MP.mergePrRequestExpectedPatchDigest = "",
+            MP.mergePrRequestExpectedMergeTreeSha = ""
           }
   result <- suspendEffect @MergePRMergePr req
   case result of

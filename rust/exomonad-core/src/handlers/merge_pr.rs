@@ -89,6 +89,10 @@ impl<
                 pr_number,
                 &strategy,
                 &req.working_dir,
+                crate::handlers::non_empty(req.expected_base_sha.clone()).as_deref(),
+                crate::handlers::non_empty(req.expected_head_sha.clone()).as_deref(),
+                crate::handlers::non_empty(req.expected_patch_digest.clone()).as_deref(),
+                crate::handlers::non_empty(req.expected_merge_tree_sha.clone()).as_deref(),
                 self.ctx.git_worktree_service().clone(),
                 self.ctx.forgejo_client().map(|arc| arc.as_ref()),
             )
@@ -303,6 +307,10 @@ mod tests {
             pr_number: 42,
             strategy: "".to_string(),
             working_dir: ".".to_string(),
+            expected_base_sha: String::new(),
+            expected_head_sha: String::new(),
+            expected_patch_digest: String::new(),
+            expected_merge_tree_sha: String::new(),
         };
 
         // Empty strategy should be handled by the service layer (defaults to "squash")

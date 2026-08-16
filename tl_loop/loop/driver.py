@@ -2581,6 +2581,7 @@ def _integrate_one_candidate(
             integration,
             base_sha=base_sha,
             head_sha=live_head_sha,
+            patch_digest=live_patch_digest,
             merge_tree_sha=live_merge_tree_sha,
             ci_status=live_ci_status,
         )
@@ -2650,6 +2651,10 @@ def _integrate_one_candidate(
             pr_number=current.pr_number or 0,
             strategy=config.merge_strategy or task.integration.merge_strategy,
             working_dir=config.working_dir,
+            expected_base_sha=base_sha,
+            expected_head_sha=head_sha,
+            expected_patch_digest=patch_digest,
+            expected_merge_tree_sha=merge_tree_sha,
         ),
         effects_log,
         raise_on_failure=False,
