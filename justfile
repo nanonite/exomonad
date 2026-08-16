@@ -96,6 +96,12 @@ tl-loop-ordered-e2e:
 tl-loop-ordered-forgejo:
     ./tests/e2e/ordered-recursive/run.sh
 
+# Run the real Rust server + WASM + TransportClient ordered recursion check
+# against disposable Git and Forgejo-shaped fixtures.
+tl-loop-ordered-server-e2e:
+    nix develop --command cargo build -p exomonad
+    {{py}} tests/e2e/ordered-recursive/real_server_transport.py
+
 # Lint the programmatic TL controller
 tl-loop-lint:
     {{py}} -m ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py
