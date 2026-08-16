@@ -11,7 +11,7 @@ use exomonad_proto::effects::tl::*;
 use serde_json::Value;
 use std::sync::Arc;
 
-const CONTROLLER_EVENT_TYPES: [&str; 17] = [
+const CONTROLLER_EVENT_TYPES: [&str; 25] = [
     "tl.phase_changed",
     "tl.slice_status_changed",
     "tl.slice_parked",
@@ -29,6 +29,14 @@ const CONTROLLER_EVENT_TYPES: [&str; 17] = [
     "tl.dispatch_reconciliation_completed",
     "tl.stage_started",
     "tl.stage_completed",
+    "tl.aggregate_pr_opened",
+    "tl.integration_base_invalidated",
+    "tl.integration_conflict",
+    "tl.integration_evidence_invalidated",
+    "tl.integration_repair_requested",
+    "tl.integration_revalidated",
+    "tl.integration_validated",
+    "tl.merge_reconciled",
 ];
 
 fn allowed_fields(event_type: &str) -> &'static [&'static str] {
@@ -36,7 +44,7 @@ fn allowed_fields(event_type: &str) -> &'static [&'static str] {
         "tl.phase_changed" => &["from_phase", "to_phase", "run_id"],
         "tl.slice_status_changed" => &["slice_id", "from_status", "to_status"],
         "tl.slice_parked" => &["slice_id", "park_cause", "attempts"],
-        "tl.gate_opened" => &["gate_name", "run_id"],
+        "tl.gate_opened" => &["gate_name", "run_id", "reason"],
         "tl.gate_answered" => &["gate_name", "decision", "source"],
         "tl.merge_decided" => &["slice_id", "pr_number", "decision", "head_sha_hash"],
         "tl.judgment" => &[
@@ -60,6 +68,41 @@ fn allowed_fields(event_type: &str) -> &'static [&'static str] {
             &["slice_id", "intent_id", "boundary", "started_at", "error"]
         }
         "tl.stage_started" | "tl.stage_completed" => &["order", "sub_tl_ids", "run_id"],
+        "tl.aggregate_pr_opened" => &[
+            "sub_tl_id",
+            "pr_number",
+            "head_sha",
+            "patch_digest",
+            "original_base_sha",
+            "integration_owner_id",
+        ],
+        "tl.integration_base_invalidated" | "tl.integration_evidence_invalidated" => {
+            &["slice_id", "base_sha", "head_sha", "reason"]
+        }
+        "tl.integration_conflict" => &[
+            "slice_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+            "reason",
+            "repair_attempt",
+        ],
+        "tl.integration_repair_requested" => &[
+            "slice_id",
+            "pr_number",
+            "owner_id",
+            "reason",
+            "repair_attempt",
+        ],
+        "tl.integration_revalidated" | "tl.integration_validated" => &[
+            "slice_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+            "merge_tree_sha",
+            "ci_status",
+        ],
+        "tl.merge_reconciled" => &["slice_id", "pr_number", "head_sha"],
         _ => &[],
     }
 }
