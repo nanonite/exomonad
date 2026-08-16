@@ -1530,6 +1530,77 @@ def test_same_order_sub_tls_overlap_and_wait_for_prior_stage(
     assert timeline.index(("start", "stage-two")) > timeline.index(("end", "stage-one-b"))
 
 
+def test_recursive_tl_waiting_child_is_not_marked_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def waiting_child(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
+        del root_spec, config, budgets
+        return SimpleNamespace(
+            final_state=SimpleNamespace(
+                fsm=SimpleNamespace(phase=TLPhase.TLWaiting), slices={}
+            )
+        )
+
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", waiting_child)
+    result = run_tl_loop(
+        "waiting-child-parent",
+        WorkPlan(sub_tls=(SubTLTask("waiting-child", WorkPlan(), order=1),)),
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=TLLoopConfig(
+            active=True,
+            max_parallel_slices=1,
+            poll_interval=0.001,
+            idle_timeout=0.01,
+        ),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLWaiting
+    assert result.final_state.slices["waiting-child"].status is SliceStatus.SPAWNED
+
+
+def test_active_parent_stays_alive_for_later_recursive_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release_at = time.monotonic() + 0.02
+
+    class DelayedQueue(SyntheticQueue):
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            if not self.events and time.monotonic() < release_at:
+                raise queue.Empty
+            return super().get(timeout)
+
+    def waiting_child(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
+        del root_spec, config, budgets
+        return SimpleNamespace(
+            final_state=SimpleNamespace(
+                fsm=SimpleNamespace(phase=TLPhase.TLWaiting), slices={}
+            )
+        )
+
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", waiting_child)
+    run_id = "waiting-parent"
+    result = run_tl_loop(
+        run_id,
+        WorkPlan(sub_tls=(SubTLTask("waiting-child", WorkPlan(), order=1),)),
+        DelayedQueue([_event(1, "all_children_done", run_id=run_id)]),
+        EffectClient(RecordingTransport()),
+        config=TLLoopConfig(
+            active=True,
+            keep_alive_on_waiting=True,
+            max_parallel_slices=1,
+            max_events=1,
+            poll_interval=0.001,
+            idle_timeout=0.01,
+        ),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    assert result.consumed_events == (1,)
+
+
 def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
     tmp_path: Path,
 ) -> None:

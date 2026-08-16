@@ -194,6 +194,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         active=True,
         max_events=args.max_events,
         idle_timeout=args.idle_timeout,
+        keep_alive_on_waiting=True,
         poll_interval=args.poll_interval,
         source=source,
         effects=effects,

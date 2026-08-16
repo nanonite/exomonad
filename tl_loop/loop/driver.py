@@ -199,7 +199,7 @@ def _persist_candidate_runtime(
 
 
 def _sub_tls_waiting_for_integration(plan: WorkPlan, state: RunState) -> bool:
-    """Stop an idle poll only after the aggregate event queue was consulted."""
+    """Report recursive work that must remain alive until a later event."""
     stage_ids = {
         task_id
         for stage in plan.ordered_stages
@@ -211,11 +211,9 @@ def _sub_tls_waiting_for_integration(plan: WorkPlan, state: RunState) -> bool:
         for task_id in stage_ids
         if task_id in state.slices
     ]
-    return bool(statuses) and any(
-        status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING} for status in statuses
-    ) and all(
-        status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING, SliceStatus.MERGED}
-        for status in statuses
+    pending = {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+    return bool(statuses) and any(status in pending for status in statuses) and all(
+        status in pending | {SliceStatus.MERGED} for status in statuses
     )
 
 
@@ -382,6 +380,7 @@ class TLLoopConfig:
     max_events: int = 256
     poll_interval: float = 0.1
     idle_timeout: float = 30.0
+    keep_alive_on_waiting: bool = False
     dispatch_timeout: float = 5.0
     max_base_revalidations: int = 3
     max_integration_repairs: int = 3
@@ -433,6 +432,8 @@ class TLLoopConfig:
             raise ValueError("poll_interval must be non-negative")
         if self.idle_timeout <= 0:
             raise ValueError("idle_timeout must be positive")
+        if type(self.keep_alive_on_waiting) is not bool:
+            raise ValueError("keep_alive_on_waiting must be a boolean")
         if self.dispatch_timeout <= 0:
             raise ValueError("dispatch_timeout must be positive")
         if type(self.enable_reviewer_spawn) is not bool:
@@ -691,13 +692,15 @@ def _run_loop(
                             run_id, before_phase, phase, config, effects, effects_log
                         )
             if _sub_tls_waiting_for_integration(plan, state):
-                return TLRunResult(
-                    state,
-                    tuple(effects_log),
-                    tuple(transitions),
-                    tuple(consumed),
-                    tuple(heartbeat_events),
-                )
+                if not config.keep_alive_on_waiting:
+                    return TLRunResult(
+                        state,
+                        tuple(effects_log),
+                        tuple(transitions),
+                        tuple(consumed),
+                        tuple(heartbeat_events),
+                    )
+                deadline = _next_loop_deadline(state, config)
             continue
         event_seq = event.run_seq
         if event_seq is None:
@@ -1622,7 +1625,8 @@ def _run_sub_tls(
         awaiting_integration = tuple(
             task.name
             for task in plan.sub_tls
-            if state.slices[task.name].status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+            if state.slices[task.name].status
+            in {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
         )
         if awaiting_integration:
             before_phase = _phase_from_state(state)
@@ -1927,6 +1931,10 @@ def _complete_sub_tl_batch(
     sub_tl_states = dict(state.integration.sub_tl_states)
     candidate_records = dict(state.integration.candidates)
     for task, phase, child_state in outcomes:
+        if phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
+            current = updated_slices[task.name]
+            updated_slices[task.name] = replace(current, status=SliceStatus.SPAWNED)
+            continue
         status = SliceStatus.MERGED if phase is TLPhase.TLDone else SliceStatus.FAILED
         previous_lifecycle = sub_tl_states.get(task.name, IntegrationLifecycle.RUNNING)
         lifecycle = _transition_sub_tl_lifecycle(
