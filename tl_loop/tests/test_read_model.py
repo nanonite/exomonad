@@ -18,6 +18,7 @@ from tl_loop.state.schema import (
     FSMState,
     GateState,
     GateStatus,
+    IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
     ParkCause,
@@ -104,6 +105,27 @@ def test_projection_exposes_ordered_progress_and_next_transition() -> None:
                 merge_attempts=3,
                 base_revalidation_count=2,
                 stage_verification="passed",
+                candidates={
+                    "task-a": IntegrationCandidateState(
+                        lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
+                        aggregate_pr_number=202,
+                        aggregate_head_sha="candidate-head",
+                        aggregate_patch_digest="candidate-patch",
+                        head_sha="candidate-head",
+                        patch_digest="candidate-patch",
+                        validated_base_sha="candidate-base",
+                        merge_tree_sha="candidate-tree",
+                        integration_evidence_at="2026-08-15T12:00:00Z",
+                        ci_status="failure",
+                        merge_attempts=4,
+                        base_revalidation_count=7,
+                        stage_verification="failed",
+                        integration_owner_id="candidate-owner",
+                        integration_owner_run_id="candidate-run",
+                        integration_owner_branch="main.candidate",
+                        integration_owner_worktree=".exo/worktrees/candidate",
+                    )
+                },
             ),
         }
     )
@@ -114,11 +136,17 @@ def test_projection_exposes_ordered_progress_and_next_transition() -> None:
     assert document["current_order"] == 1
     stage = cast(list[dict[str, object]], document["ordered_stages"])[0]
     sub_tl = cast(list[dict[str, object]], stage["sub_tls"])[0]
-    assert sub_tl["lifecycle"] == "READY_FOR_INTEGRATION"
-    assert sub_tl["aggregate_pr_number"] == 101
-    assert sub_tl["validated_base_sha"] == "base-1"
-    assert sub_tl["integration_ci"] == "success"
+    assert sub_tl["lifecycle"] == "INTEGRATION_CONFLICT"
+    assert sub_tl["aggregate_pr_number"] == 202
+    assert sub_tl["head_sha"] == "candidate-head"
+    assert sub_tl["patch_digest"] == "candidate-patch"
+    assert sub_tl["validated_base_sha"] == "candidate-base"
+    assert sub_tl["merge_tree_sha"] == "candidate-tree"
+    assert sub_tl["integration_ci"] == "failure"
+    assert sub_tl["revalidation_count"] == 7
     assert sub_tl["repair_count"] == 1
+    assert sub_tl["stage_verification"] == "failed"
+    assert sub_tl["owner_id"] == "candidate-owner"
     integration = cast(dict[str, object], document["integration"])
     assert integration["merge_tree_sha"] == "tree-1"
     assert integration["base_revalidation_count"] == 2

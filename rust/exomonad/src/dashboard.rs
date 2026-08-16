@@ -84,6 +84,7 @@ impl Drop for TerminalGuard {
 #[derive(Default)]
 struct DashboardState {
     agents: Vec<AgentRow>,
+    ordered: Vec<OrderedStageRow>,
     ci_runs: Vec<CiRunRow>,
     runners: Vec<RunnerRow>,
     prs: Vec<PrRow>,
@@ -102,6 +103,7 @@ impl DashboardState {
         self.updated_at = chrono::Local::now().format("%H:%M:%S").to_string();
         let controller_failure = controller_exit_reason(&config.project_dir);
         self.agents = scan_agents(&config.project_dir, controller_failure.is_some());
+        self.ordered = read_ordered_stages(&config.project_dir);
         self.events = read_events(&config.project_dir, EVENT_LIMIT);
         self.error = controller_failure.map(|reason| format!("TL controller failed: {reason}"));
 
@@ -139,6 +141,16 @@ struct AgentRow {
     role: String,
     branch: String,
     state: String,
+}
+
+#[derive(Clone, Default)]
+struct OrderedStageRow {
+    order: String,
+    sub_tl: String,
+    lifecycle: String,
+    head: String,
+    base: String,
+    ci: String,
 }
 
 #[derive(Clone, Default)]
@@ -216,7 +228,11 @@ fn draw(frame: &mut Frame, state: &DashboardState, config: &Config, repo_info: O
         .split(outer[1]);
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Percentage(35),
+            Constraint::Percentage(20),
+        ])
         .split(middle[0]);
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -224,7 +240,8 @@ fn draw(frame: &mut Frame, state: &DashboardState, config: &Config, repo_info: O
         .split(middle[1]);
 
     draw_agents(frame, left[0], &state.agents);
-    draw_runners(frame, left[1], &state.runners);
+    draw_ordered(frame, left[1], &state.ordered);
+    draw_runners(frame, left[2], &state.runners);
     draw_ci(frame, right[0], &state.ci_runs);
     draw_prs(frame, right[1], &state.prs);
     draw_events(frame, outer[2], state);
@@ -284,6 +301,37 @@ fn draw_agents(frame: &mut Frame, area: Rect, agents: &[AgentRow]) {
     )
     .header(header(["agent", "role", "branch", "state"]))
     .block(Block::default().title("Agent Tree").borders(Borders::ALL));
+    frame.render_widget(table, area);
+}
+
+fn draw_ordered(frame: &mut Frame, area: Rect, stages: &[OrderedStageRow]) {
+    let rows = stages.iter().map(|stage| {
+        Row::new([
+            Cell::from(stage.order.clone()),
+            Cell::from(stage.sub_tl.clone()),
+            Cell::from(stage.lifecycle.clone()).style(state_style(&stage.lifecycle)),
+            Cell::from(stage.head.clone()),
+            Cell::from(stage.base.clone()),
+            Cell::from(stage.ci.clone()).style(state_style(&stage.ci)),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(8),
+            Constraint::Percentage(22),
+            Constraint::Percentage(22),
+            Constraint::Percentage(18),
+            Constraint::Percentage(18),
+            Constraint::Percentage(12),
+        ],
+    )
+    .header(header(["#", "sub-TL", "lifecycle", "head", "base", "CI"]))
+    .block(
+        Block::default()
+            .title("Ordered Sub-TLs")
+            .borders(Borders::ALL),
+    );
     frame.render_widget(table, area);
 }
 
@@ -576,6 +624,78 @@ fn agent_row_from_dir(name: &str, dir: &Path, controller_failed: bool) -> AgentR
     }
 }
 
+fn read_ordered_stages(project_dir: &Path) -> Vec<OrderedStageRow> {
+    let Some(document) = read_json(project_dir.join(".exo/tl-loop/root/run.json")) else {
+        return Vec::new();
+    };
+    let Some(stages) = document.get("ordered_stages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let integration = document.get("integration");
+    let candidates = integration.and_then(|value| value.get("candidates"));
+    let sub_tl_states = integration.and_then(|value| value.get("sub_tl_states"));
+    let mut rows = Vec::new();
+    for stage in stages {
+        let order = stage
+            .get("order")
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let Some(sub_tls) = stage.get("sub_tls").and_then(Value::as_array) else {
+            continue;
+        };
+        for sub_tl in sub_tls.iter().filter_map(Value::as_str) {
+            let candidate = candidates.and_then(|value| value.get(sub_tl));
+            let lifecycle = candidate
+                .and_then(|value| value.get("lifecycle"))
+                .or_else(|| sub_tl_states.and_then(|value| value.get(sub_tl)))
+                .or_else(|| integration.and_then(|value| value.get("lifecycle")));
+            rows.push(OrderedStageRow {
+                order: order.clone(),
+                sub_tl: sub_tl.to_string(),
+                lifecycle: value_text(lifecycle),
+                head: candidate_or_integration_text(
+                    candidate,
+                    integration,
+                    &["head_sha", "aggregate_head_sha"],
+                ),
+                base: candidate_or_integration_text(
+                    candidate,
+                    integration,
+                    &["validated_base_sha"],
+                ),
+                ci: candidate_or_integration_text(candidate, integration, &["ci_status"]),
+            });
+        }
+    }
+    rows
+}
+
+fn candidate_or_integration_text(
+    candidate: Option<&Value>,
+    integration: Option<&Value>,
+    keys: &[&str],
+) -> String {
+    keys.iter()
+        .find_map(|key| {
+            candidate
+                .and_then(|value| value.get(*key))
+                .or_else(|| integration.and_then(|value| value.get(*key)))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn value_text(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
 fn agent_state(dir: &Path) -> String {
     let marker = read_trimmed(dir.join("state")).unwrap_or_default();
     if marker.to_lowercase().contains("stuck") {
@@ -827,5 +947,41 @@ mod tests {
             controller_exit_reason(project.path()).as_deref(),
             Some("controller exited during startup")
         );
+    }
+
+    #[test]
+    fn ordered_stage_rows_use_candidate_evidence() {
+        let project = tempfile::tempdir().unwrap();
+        let run_dir = project.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.json"),
+            r#"{
+                "ordered_stages":[{"order":1,"sub_tls":["alpha","beta"]}],
+                "integration":{
+                    "lifecycle":"RUNNING",
+                    "sub_tl_states":{"alpha":"RUNNING","beta":"RUNNING"},
+                    "candidates":{
+                        "alpha":{"lifecycle":"MERGED","head_sha":"alpha-head","validated_base_sha":"base-a","ci_status":"success"},
+                        "beta":{"lifecycle":"INTEGRATION_CONFLICT","head_sha":"beta-head","validated_base_sha":"base-b","ci_status":"failure"}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let rows = read_ordered_stages(project.path());
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].sub_tl, "alpha");
+        assert_eq!(rows[0].lifecycle, "MERGED");
+        assert_eq!(rows[0].head, "alpha-head");
+        assert_eq!(rows[0].base, "base-a");
+        assert_eq!(rows[0].ci, "success");
+        assert_eq!(rows[1].sub_tl, "beta");
+        assert_eq!(rows[1].lifecycle, "INTEGRATION_CONFLICT");
+        assert_eq!(rows[1].head, "beta-head");
+        assert_eq!(rows[1].base, "base-b");
+        assert_eq!(rows[1].ci, "failure");
     }
 }

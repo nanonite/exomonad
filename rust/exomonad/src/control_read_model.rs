@@ -175,6 +175,9 @@ fn project_ordered_state(
     let sub_states = integration
         .and_then(|value| value.get("sub_tl_states"))
         .and_then(Value::as_object);
+    let candidates = integration
+        .and_then(|value| value.get("candidates"))
+        .and_then(Value::as_object);
     let current_order = root
         .get("current_order")
         .and_then(Value::as_u64)
@@ -205,25 +208,35 @@ fn project_ordered_state(
                 .map(|slice_id| {
                     let slice = slices.get(slice_id).and_then(Value::as_object);
                     let projected = projected_slices.get(slice_id).and_then(Value::as_object);
-                    let lifecycle = sub_states
-                        .and_then(|states| states.get(slice_id))
+                    let candidate = candidates
+                        .and_then(|values| values.get(slice_id))
+                        .and_then(Value::as_object);
+                    let lifecycle = candidate
+                        .and_then(|value| value.get("lifecycle"))
+                        .or_else(|| sub_states.and_then(|states| states.get(slice_id)))
                         .and_then(Value::as_str)
                         .unwrap_or_else(|| inferred_lifecycle(slice));
                     lifecycle_values.push(lifecycle.to_string());
-                    let head_sha = slice
-                        .and_then(|value| value.get("reviewed_head"))
-                        .cloned()
-                        .filter(|value| !value.is_null())
-                        .or_else(|| optional_field(integration, "aggregate_head_sha"));
+                    let head_sha =
+                        candidate_or_integration_field(candidate, integration, "head_sha")
+                            .or_else(|| {
+                                candidate_or_integration_field(
+                                    candidate,
+                                    integration,
+                                    "aggregate_head_sha",
+                                )
+                            })
+                            .or_else(|| optional_field(slice, "reviewed_head"));
                     let review_state = current_head_field(projected, "review_state");
-                    let integration_ci = current_head_field(projected, "ci_status")
-                        .or_else(|| optional_field(integration, "ci_status"))
-                        .unwrap_or_else(|| Value::String("unknown".to_string()));
+                    let integration_ci =
+                        candidate_or_integration_field(candidate, integration, "ci_status")
+                            .or_else(|| current_head_field(projected, "ci_status"))
+                            .unwrap_or_else(|| Value::String("unknown".to_string()));
                     let status = optional_field(slice, "status").unwrap_or(Value::Null);
                     let repair_count =
                         optional_field(slice, "repair_attempts").unwrap_or_else(|| Value::from(0));
                     let stage_verification = if order == current_order {
-                        optional_field(integration, "stage_verification")
+                        candidate_or_integration_field(candidate, integration, "stage_verification")
                             .unwrap_or_else(|| Value::String("pending".to_string()))
                     } else {
                         Value::String("pending".to_string())
@@ -237,18 +250,49 @@ fn project_ordered_state(
                     child.insert("status".to_string(), status);
                     child.insert(
                         "aggregate_pr_number".to_string(),
-                        optional_field(slice, "pr_number")
-                            .or_else(|| optional_field(integration, "aggregate_pr_number"))
-                            .unwrap_or(Value::Null),
+                        candidate_or_integration_field(
+                            candidate,
+                            integration,
+                            "aggregate_pr_number",
+                        )
+                        .or_else(|| optional_field(slice, "pr_number"))
+                        .unwrap_or(Value::Null),
                     );
                     child.insert("head_sha".to_string(), head_sha.unwrap_or(Value::Null));
                     child.insert(
+                        "patch_digest".to_string(),
+                        candidate_or_integration_field(candidate, integration, "patch_digest")
+                            .or_else(|| {
+                                candidate_or_integration_field(
+                                    candidate,
+                                    integration,
+                                    "aggregate_patch_digest",
+                                )
+                            })
+                            .unwrap_or(Value::Null),
+                    );
+                    child.insert(
                         "validated_base_sha".to_string(),
-                        optional_field(integration, "validated_base_sha").unwrap_or(Value::Null),
+                        candidate_or_integration_field(
+                            candidate,
+                            integration,
+                            "validated_base_sha",
+                        )
+                        .unwrap_or(Value::Null),
                     );
                     child.insert(
                         "merge_tree_sha".to_string(),
-                        optional_field(integration, "merge_tree_sha").unwrap_or(Value::Null),
+                        candidate_or_integration_field(candidate, integration, "merge_tree_sha")
+                            .unwrap_or(Value::Null),
+                    );
+                    child.insert(
+                        "integration_evidence_at".to_string(),
+                        candidate_or_integration_field(
+                            candidate,
+                            integration,
+                            "integration_evidence_at",
+                        )
+                        .unwrap_or(Value::Null),
                     );
                     child.insert(
                         "review_state".to_string(),
@@ -257,8 +301,12 @@ fn project_ordered_state(
                     child.insert("integration_ci".to_string(), integration_ci);
                     child.insert(
                         "revalidation_count".to_string(),
-                        optional_field(integration, "base_revalidation_count")
-                            .unwrap_or_else(|| Value::from(0)),
+                        candidate_or_integration_field(
+                            candidate,
+                            integration,
+                            "base_revalidation_count",
+                        )
+                        .unwrap_or_else(|| Value::from(0)),
                     );
                     child.insert("repair_count".to_string(), repair_count);
                     child.insert(
@@ -268,8 +316,24 @@ fn project_ordered_state(
                     child.insert("stage_verification".to_string(), stage_verification);
                     child.insert(
                         "owner_id".to_string(),
-                        optional_field(integration, "integration_owner_id").unwrap_or(Value::Null),
+                        candidate_or_integration_field(
+                            candidate,
+                            integration,
+                            "integration_owner_id",
+                        )
+                        .unwrap_or(Value::Null),
                     );
+                    for key in [
+                        "integration_owner_run_id",
+                        "integration_owner_branch",
+                        "integration_owner_worktree",
+                    ] {
+                        child.insert(
+                            key.trim_start_matches("integration_").to_string(),
+                            candidate_or_integration_field(candidate, integration, key)
+                                .unwrap_or(Value::Null),
+                        );
+                    }
                     Value::Object(child)
                 })
                 .collect::<Vec<_>>();
@@ -308,6 +372,14 @@ fn project_ordered_state(
             value.unwrap_or_else(|| default_integration_value(output)),
         );
     }
+    let ordered_owner = candidates.and_then(|values| {
+        values.values().find_map(|candidate| {
+            let object = candidate.as_object()?;
+            (object.get("lifecycle").and_then(Value::as_str) == Some("INTEGRATION_CONFLICT"))
+                .then(|| object.get("integration_owner_id").and_then(Value::as_str))
+                .flatten()
+        })
+    });
     let next_transition = next_transition(
         root,
         &lifecycle_values,
@@ -315,9 +387,11 @@ fn project_ordered_state(
             .get("lifecycle")
             .and_then(Value::as_str)
             .unwrap_or("RUNNING"),
-        projected_integration
-            .get("owner_id")
-            .and_then(Value::as_str),
+        ordered_owner.or_else(|| {
+            projected_integration
+                .get("owner_id")
+                .and_then(Value::as_str)
+        }),
     );
     (
         Value::Array(stages),
@@ -328,6 +402,16 @@ fn project_ordered_state(
 
 fn optional_field(object: Option<&Map<String, Value>>, key: &str) -> Option<Value> {
     object.and_then(|value| value.get(key)).cloned()
+}
+
+fn candidate_or_integration_field(
+    candidate: Option<&Map<String, Value>>,
+    integration: Option<&Map<String, Value>>,
+    key: &str,
+) -> Option<Value> {
+    optional_field(candidate, key)
+        .filter(|value| !value.is_null())
+        .or_else(|| optional_field(integration, key).filter(|value| !value.is_null()))
 }
 
 fn default_integration_value(key: &str) -> Value {
@@ -841,7 +925,25 @@ mod tests {
                 "base_revalidation_count": 1,
                 "merge_attempts": 0,
                 "stage_verification": "passed",
-                "integration_owner_id": "aggregate-owner"
+                "integration_owner_id": "aggregate-owner",
+                "candidates": {
+                    "stage-a": {
+                        "lifecycle": "INTEGRATION_CONFLICT",
+                        "aggregate_pr_number": 18,
+                        "head_sha": "candidate-head",
+                        "patch_digest": "candidate-patch",
+                        "validated_base_sha": "candidate-base",
+                        "merge_tree_sha": "candidate-tree",
+                        "integration_evidence_at": "2026-08-15T12:00:00Z",
+                        "ci_status": "failure",
+                        "base_revalidation_count": 4,
+                        "stage_verification": "failed",
+                        "integration_owner_id": "candidate-owner",
+                        "integration_owner_run_id": "candidate-run",
+                        "integration_owner_branch": "main.candidate",
+                        "integration_owner_worktree": ".exo/worktrees/candidate"
+                    }
+                }
             }
         });
         fs::write(
@@ -854,11 +956,17 @@ mod tests {
         let stage = &model["ordered_stages"][0];
         assert_eq!(stage["order"], 2);
         assert_eq!(stage["sub_tls"][0]["id"], "stage-a");
-        assert_eq!(stage["sub_tls"][0]["lifecycle"], "READY_FOR_INTEGRATION");
-        assert_eq!(stage["sub_tls"][0]["integration_ci"], "success");
+        assert_eq!(stage["sub_tls"][0]["lifecycle"], "INTEGRATION_CONFLICT");
+        assert_eq!(stage["sub_tls"][0]["aggregate_pr_number"], 18);
+        assert_eq!(stage["sub_tls"][0]["head_sha"], "candidate-head");
+        assert_eq!(stage["sub_tls"][0]["patch_digest"], "candidate-patch");
+        assert_eq!(stage["sub_tls"][0]["validated_base_sha"], "candidate-base");
+        assert_eq!(stage["sub_tls"][0]["merge_tree_sha"], "candidate-tree");
+        assert_eq!(stage["sub_tls"][0]["integration_ci"], "failure");
+        assert_eq!(stage["sub_tls"][0]["owner_id"], "candidate-owner");
         assert_eq!(stage["sub_tls"][0]["repair_count"], 2);
         assert_eq!(model["integration"]["validated_base_sha"], "base-a");
-        assert_eq!(model["next_transition"], "validate_integration_evidence");
+        assert_eq!(model["next_transition"], "resume_pr:candidate-owner");
     }
 
     #[test]

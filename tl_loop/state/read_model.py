@@ -115,8 +115,10 @@ class OrderedSubTLReadModel:
     status: str
     aggregate_pr_number: int | None
     head_sha: str | None
+    patch_digest: str | None
     validated_base_sha: str | None
     merge_tree_sha: str | None
+    integration_evidence_at: str | None
     review_state: str | None
     integration_ci: str
     revalidation_count: int
@@ -124,6 +126,9 @@ class OrderedSubTLReadModel:
     park_cause: str | None
     stage_verification: str
     owner_id: str | None
+    owner_run_id: str | None
+    owner_branch: str | None
+    owner_worktree: str | None
 
     def to_document(self) -> dict[str, object]:
         """Return the bounded progress representation."""
@@ -133,8 +138,10 @@ class OrderedSubTLReadModel:
             "status": self.status,
             "aggregate_pr_number": self.aggregate_pr_number,
             "head_sha": self.head_sha,
+            "patch_digest": self.patch_digest,
             "validated_base_sha": self.validated_base_sha,
             "merge_tree_sha": self.merge_tree_sha,
+            "integration_evidence_at": self.integration_evidence_at,
             "review_state": self.review_state,
             "integration_ci": self.integration_ci,
             "revalidation_count": self.revalidation_count,
@@ -142,6 +149,9 @@ class OrderedSubTLReadModel:
             "park_cause": self.park_cause,
             "stage_verification": self.stage_verification,
             "owner_id": self.owner_id,
+            "owner_run_id": self.owner_run_id,
+            "owner_branch": self.owner_branch,
+            "owner_worktree": self.owner_worktree,
         }
 
 
@@ -441,32 +451,95 @@ def _ordered_stage_models(
             slice_model = slices.get(slice_id)
             if slice_model is None:
                 continue
-            lifecycle = integration.sub_tl_states.get(slice_id)
+            candidate = integration.candidates.get(slice_id)
+            lifecycle = candidate.lifecycle if candidate is not None else integration.sub_tl_states.get(slice_id)
             lifecycle_value = (
                 lifecycle.value if lifecycle is not None else _lifecycle_for_slice(slice_model)
             )
-            head_sha = slice_model.reviewed_head or integration.aggregate_head_sha
+            aggregate_pr_number = (
+                candidate.aggregate_pr_number
+                if candidate is not None
+                else integration.aggregate_pr_number
+            )
+            head_sha = (
+                (candidate.head_sha or candidate.aggregate_head_sha)
+                if candidate is not None
+                else integration.head_sha or integration.aggregate_head_sha
+            ) or slice_model.reviewed_head
+            patch_digest = (
+                candidate.patch_digest or candidate.aggregate_patch_digest
+                if candidate is not None
+                else integration.patch_digest or integration.aggregate_patch_digest
+            )
+            validated_base_sha = (
+                candidate.validated_base_sha
+                if candidate is not None
+                else integration.validated_base_sha
+            )
+            merge_tree_sha = (
+                candidate.merge_tree_sha if candidate is not None else integration.merge_tree_sha
+            )
+            integration_evidence_at = (
+                candidate.integration_evidence_at
+                if candidate is not None
+                else integration.integration_evidence_at
+            )
             review_state = _current_review_state(slice_model)
-            ci_status = _current_ci_status(slice_model) or integration.ci_status
+            ci_status = (
+                candidate.ci_status
+                if candidate is not None
+                else _current_ci_status(slice_model) or integration.ci_status
+            )
             stage_verification = (
-                integration.stage_verification if stage.order == state.current_order else "pending"
+                (
+                    candidate.stage_verification
+                    if candidate is not None
+                    else integration.stage_verification
+                )
+                if stage.order == state.current_order
+                else "pending"
             )
             children.append(
                 OrderedSubTLReadModel(
                     id=slice_id,
                     lifecycle=lifecycle_value,
                     status=slice_model.status,
-                    aggregate_pr_number=slice_model.pr_number or integration.aggregate_pr_number,
+                    aggregate_pr_number=aggregate_pr_number or slice_model.pr_number,
                     head_sha=head_sha,
-                    validated_base_sha=integration.validated_base_sha,
-                    merge_tree_sha=integration.merge_tree_sha,
+                    patch_digest=patch_digest,
+                    validated_base_sha=validated_base_sha,
+                    merge_tree_sha=merge_tree_sha,
+                    integration_evidence_at=integration_evidence_at,
                     review_state=review_state,
                     integration_ci=ci_status,
-                    revalidation_count=integration.base_revalidation_count,
+                    revalidation_count=(
+                        candidate.base_revalidation_count
+                        if candidate is not None
+                        else integration.base_revalidation_count
+                    ),
                     repair_count=slice_model.repair_attempts,
                     park_cause=slice_model.park_cause,
                     stage_verification=stage_verification,
-                    owner_id=integration.integration_owner_id,
+                    owner_id=(
+                        candidate.integration_owner_id
+                        if candidate is not None
+                        else integration.integration_owner_id
+                    ),
+                    owner_run_id=(
+                        candidate.integration_owner_run_id
+                        if candidate is not None
+                        else integration.integration_owner_run_id
+                    ),
+                    owner_branch=(
+                        candidate.integration_owner_branch
+                        if candidate is not None
+                        else integration.integration_owner_branch
+                    ),
+                    owner_worktree=(
+                        candidate.integration_owner_worktree
+                        if candidate is not None
+                        else integration.integration_owner_worktree
+                    ),
                 )
             )
         models.append(OrderedStageReadModel(stage.order, tuple(children)))
@@ -514,9 +587,18 @@ def _next_transition(
     )
     if pending_gate is not None:
         return f"answer_gate:{pending_gate}"
-    lifecycles = [sub_tl.lifecycle for stage in stages for sub_tl in stage.sub_tls]
-    if IntegrationLifecycle.INTEGRATION_CONFLICT.value in lifecycles:
-        return f"resume_pr:{integration.owner_id or 'aggregate'}"
+    sub_tls = [sub_tl for stage in stages for sub_tl in stage.sub_tls]
+    conflict = next(
+        (
+            sub_tl
+            for sub_tl in sub_tls
+            if sub_tl.lifecycle == IntegrationLifecycle.INTEGRATION_CONFLICT.value
+        ),
+        None,
+    )
+    if conflict is not None:
+        return f"resume_pr:{conflict.owner_id or 'aggregate'}"
+    lifecycles = [sub_tl.lifecycle for sub_tl in sub_tls]
     if IntegrationLifecycle.NEEDS_BASE_REVALIDATION.value in lifecycles:
         return "revalidate_base_and_integration_ci"
     if IntegrationLifecycle.READY_FOR_INTEGRATION.value in lifecycles:
