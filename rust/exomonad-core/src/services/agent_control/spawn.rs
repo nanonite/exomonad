@@ -5,6 +5,22 @@ fn resume_spawn_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+async fn persist_dispatch_intent(
+    project_dir: &Path,
+    agent_name: &AgentName,
+    intent_id: Option<&str>,
+) -> Result<()> {
+    let Some(intent_id) = intent_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let agent_dir = project_dir.join(".exo/agents").join(agent_name.as_str());
+    fs::create_dir_all(&agent_dir).await?;
+    let temporary_path = agent_dir.join("dispatch_intent.tmp");
+    fs::write(&temporary_path, intent_id).await?;
+    fs::rename(temporary_path, agent_dir.join("dispatch_intent")).await?;
+    Ok(())
+}
+
 fn parse_git_status_paths(stdout: &str) -> Vec<String> {
     stdout
         .lines()
@@ -970,6 +986,15 @@ impl<
         options: &SpawnWorkerOptions,
         ctx: &crate::effects::EffectContext,
     ) -> Result<SpawnResult> {
+        self.spawn_worker_with_intent(options, ctx, None).await
+    }
+
+    pub async fn spawn_worker_with_intent(
+        &self,
+        options: &SpawnWorkerOptions,
+        ctx: &crate::effects::EffectContext,
+        intent_id: Option<&str>,
+    ) -> Result<SpawnResult> {
         let agent_type = options.agent_type;
         info!(name = %options.name, agent_type = agent_type.suffix(), timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_worker");
 
@@ -1026,6 +1051,8 @@ impl<
                     warn!(name = %options.name, error = %e, "Failed to clean up stale worker config dir");
                 }
             }
+
+            persist_dispatch_intent(self.project_dir(), &agent_name, intent_id).await?;
 
             let role = crate::domain::Role::worker();
             let model = self.effective_model_for(agent_type, role.as_str(), None);
@@ -1503,6 +1530,16 @@ impl<
         options: &SpawnLeafOptions,
         caller_bb: &BirthBranch,
     ) -> Result<SpawnResult> {
+        self.spawn_leaf_subtree_with_intent(options, caller_bb, None)
+            .await
+    }
+
+    pub async fn spawn_leaf_subtree_with_intent(
+        &self,
+        options: &SpawnLeafOptions,
+        caller_bb: &BirthBranch,
+        intent_id: Option<&str>,
+    ) -> Result<SpawnResult> {
         info!(branch_name = %options.branch_name, timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_leaf_subtree");
         let _resume_spawn_guard = if options.expected_agent_name.is_some() {
             Some(resume_spawn_lock().lock().await)
@@ -1639,6 +1676,8 @@ impl<
                     pane_id: None,
                 });
             }
+
+            persist_dispatch_intent(self.project_dir(), &agent_name, intent_id).await?;
 
             // Ensure a remote exists for local-only workflows
             ensure_remote_exists(effective_project_dir).await;
@@ -2606,6 +2645,25 @@ mod tests {
             .unwrap();
         assert!(!agent_wt.join(".exo/context/absolute").exists());
         assert!(!agent_wt.join(".exo/context/outside").exists());
+    }
+
+    #[tokio::test]
+    async fn dispatch_intent_is_atomic_and_precedes_spawn_resources() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let agent = AgentIdentity::new("leaf-a".to_string(), AgentType::Codex).internal_name();
+
+        persist_dispatch_intent(temp_dir.path(), &agent, Some("intent-a"))
+            .await
+            .unwrap();
+
+        let agent_dir = temp_dir.path().join(".exo/agents").join(agent.as_str());
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("dispatch_intent"))
+                .await
+                .unwrap(),
+            "intent-a"
+        );
+        assert!(!agent_dir.join("dispatch_intent.tmp").exists());
     }
 
     #[test]

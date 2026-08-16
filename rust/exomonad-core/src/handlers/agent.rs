@@ -882,7 +882,7 @@ impl<
 
         let result = match self
             .service
-            .spawn_worker(&options, ctx)
+            .spawn_worker_with_intent(&options, ctx, Some(req.intent_id.as_str()))
             .await
             .effect_err_preserve("agent")
         {
@@ -898,8 +898,6 @@ impl<
                 return Err(error);
             }
         };
-        persist_dispatch_intent(&self.ctx, &result.agent_name, &req.intent_id).await?;
-
         let agent_info = worker_result_to_proto(&req.name, &result);
         let provenance = self.ctx.agent_resolver().get(&result.agent_name).await;
         let model = provenance
@@ -1729,7 +1727,11 @@ impl<
 
         let result = match self
             .service
-            .spawn_leaf_subtree(&options, &ctx.birth_branch)
+            .spawn_leaf_subtree_with_intent(
+                &options,
+                &ctx.birth_branch,
+                Some(req.intent_id.as_str()),
+            )
             .await
             .effect_err_preserve("agent")
         {
@@ -1745,8 +1747,6 @@ impl<
                 return Err(error);
             }
         };
-        persist_dispatch_intent(&self.ctx, &result.agent_name, &req.intent_id).await?;
-
         let agent_info = leaf_subtree_result_to_proto(&req.branch_name, &result)?;
         let provenance = self.ctx.agent_resolver().get(&result.agent_name).await;
         let model = provenance
@@ -3804,25 +3804,6 @@ fn spawn_result_branch_name(
     Ok(&result.branch_name)
 }
 
-async fn persist_dispatch_intent<C: HasProjectDir>(
-    ctx: &Arc<C>,
-    agent_name: &AgentName,
-    intent_id: &str,
-) -> EffectResult<()> {
-    if intent_id.trim().is_empty() {
-        return Ok(());
-    }
-    let path = ctx
-        .project_dir()
-        .join(".exo")
-        .join("agents")
-        .join(agent_name.as_str())
-        .join("dispatch_intent");
-    tokio::fs::write(path, intent_id.trim())
-        .await
-        .map_err(|error| EffectError::custom("dispatch_intent_persist_failed", error.to_string()))
-}
-
 fn append_spawn_failed<C: HasEventLog>(
     ctx: &Arc<C>,
     parent_agent: &str,
@@ -4005,6 +3986,10 @@ fn agent_is_alive(info: &AgentInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exomonad_test_support::init_fixture_git_repository;
+    use prost::Message;
+    use serial_test::serial;
+    use std::os::unix::fs::PermissionsExt;
 
     fn restart_test_pr() -> ForgejoPullRequest {
         ForgejoPullRequest {
@@ -4025,6 +4010,204 @@ mod tests {
         let services = Arc::new(crate::services::Services::test());
         let service = Arc::new(AgentControlService::new(services.clone()));
         AgentHandler::new(service, services)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn spawn_worker_effect_persists_intent_before_tmux_and_emits_ledger_event() {
+        let tmux_available = Command::new("tmux")
+            .arg("-V")
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !tmux_available {
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().expect("temporary project directory");
+        let project_dir = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("create fixture project directory");
+        init_fixture_git_repository(&project_dir).expect("initialize fixture repository");
+        std::fs::write(project_dir.join(".gitignore"), ".exo/\n").expect("write fixture gitignore");
+        let git_status = Command::new("git")
+            .args(["-C", project_dir.to_str().unwrap(), "add", ".gitignore"])
+            .output()
+            .await
+            .expect("stage fixture gitignore");
+        assert!(git_status.status.success());
+        let git_commit = Command::new("git")
+            .args([
+                "-C",
+                project_dir.to_str().unwrap(),
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=ExoMonad Test",
+                "commit",
+                "-m",
+                "fixture",
+            ])
+            .output()
+            .await
+            .expect("commit fixture gitignore");
+        assert!(git_commit.status.success());
+
+        let fake_bin = temp_dir.path().join("fake-bin");
+        std::fs::create_dir_all(&fake_bin).expect("create fake runtime directory");
+        let marker = project_dir.join("dispatch-marker");
+        let fake_codex = fake_bin.join("codex");
+        std::fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\nproject_dir=$(dirname \"$CHAINLINK_DB\")\nintent=\"$project_dir/.exo/agents/worker-codex/dispatch_intent\"\nif [ -f \"$intent\" ]; then printf '%s' \"$intent\" > \"{}\"; else printf '%s' missing > \"{}\"; fi\nsleep 30\n",
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .expect("write fake runtime");
+        std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake runtime executable");
+        let fake_shell = temp_dir.path().join("fake-shell");
+        std::fs::write(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-l\" ]; then shift; fi\nif [ \"$1\" = \"-c\" ]; then exec /bin/sh -c \"$2\"; fi\nexec /bin/sh \"$@\"\n",
+        )
+        .expect("write fake shell");
+        std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake shell executable");
+
+        let old_path = std::env::var_os("PATH");
+        let old_shell = std::env::var_os("SHELL");
+        let old_tmux_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
+        std::env::set_var("SHELL", &fake_shell);
+        let mut path = std::ffi::OsString::from(&fake_bin);
+        path.push(":");
+        path.push(old_path.as_deref().unwrap_or_default());
+        std::env::set_var("PATH", path);
+
+        let tmux_socket = format!("exo-dispatch-handler-{}", std::process::id());
+        let session = format!("exo-dispatch-handler-{}", std::process::id());
+        std::env::set_var("EXOMONAD_TMUX_SOCKET", &tmux_socket);
+        let session_status = Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_socket,
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-n",
+                "TL",
+                "sh",
+                "-c",
+                "sleep 300",
+            ])
+            .status()
+            .await
+            .expect("create test tmux session");
+        assert!(session_status.success());
+        let path_for_tmux = std::env::var("PATH").expect("test PATH");
+        let tmux_path_status = Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_socket,
+                "set-environment",
+                "-g",
+                "PATH",
+                &path_for_tmux,
+            ])
+            .status()
+            .await
+            .expect("set test tmux PATH");
+        assert!(tmux_path_status.success());
+
+        let event_log = Arc::new(
+            crate::services::event_log::EventLog::open(project_dir.join(".exo/logs"))
+                .expect("open event log"),
+        );
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.to_path_buf();
+        services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.to_path_buf(),
+        ));
+        services.event_log = Some(event_log.clone());
+        let services = Arc::new(services);
+        let service = Arc::new(
+            AgentControlService::new(services.clone())
+                .with_tmux_session(session.clone())
+                .with_birth_branch(BirthBranch::try_from_str("main").expect("main branch"))
+                .with_spawn_agent_type(ServiceAgentType::Codex),
+        );
+        let handler = AgentHandler::new(service, services);
+        let ctx = crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root").expect("root identity"),
+            birth_branch: BirthBranch::try_from_str("main").expect("main branch"),
+            working_dir: project_dir.to_path_buf(),
+        };
+        let request = SpawnWorkerRequest {
+            name: "worker".to_string(),
+            prompt: "exercise correlated dispatch".to_string(),
+            permission_mode: String::new(),
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            agent_type: AgentType::Codex as i32,
+            intent_id: "intent-live-handler".to_string(),
+        };
+
+        let response = handler
+            .handle("agent.spawn_worker", &request.encode_to_vec(), &ctx)
+            .await
+            .expect("spawn effect succeeds");
+        let response = SpawnWorkerResponse::decode(response.as_slice()).expect("decode response");
+        assert_eq!(
+            response.agent.as_ref().map(|agent| agent.id.as_str()),
+            Some("worker-codex")
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake runtime did not start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read dispatch marker"),
+            project_dir
+                .join(".exo/agents/worker-codex/dispatch_intent")
+                .display()
+                .to_string()
+        );
+
+        let events = event_log.ledger().read_events().expect("read event ledger");
+        let spawned = events
+            .iter()
+            .find(|entry| entry.event.event_type == "agent.spawned")
+            .expect("handler emits authoritative spawn event");
+        assert_eq!(spawned.event.data["child_agent"], "worker-codex");
+        assert_eq!(spawned.event.data["intent_id"], "intent-live-handler");
+
+        let _ = Command::new("tmux")
+            .args(["-L", &tmux_socket, "kill-session", "-t", &session])
+            .status()
+            .await;
+        if let Some(old_path) = old_path {
+            std::env::set_var("PATH", old_path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(old_shell) = old_shell {
+            std::env::set_var("SHELL", old_shell);
+        } else {
+            std::env::remove_var("SHELL");
+        }
+        if let Some(old_tmux_socket) = old_tmux_socket {
+            std::env::set_var("EXOMONAD_TMUX_SOCKET", old_tmux_socket);
+        } else {
+            std::env::remove_var("EXOMONAD_TMUX_SOCKET");
+        }
     }
 
     #[test]
