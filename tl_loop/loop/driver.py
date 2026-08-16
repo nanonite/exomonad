@@ -206,14 +206,12 @@ def _sub_tls_waiting_for_integration(plan: WorkPlan, state: RunState) -> bool:
         if state.current_order is None or stage.order == state.current_order
         for task_id in stage.sub_tls
     }
-    statuses = [
-        state.slices[task_id].status
-        for task_id in stage_ids
-        if task_id in state.slices
-    ]
+    statuses = [state.slices[task_id].status for task_id in stage_ids if task_id in state.slices]
     pending = {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
-    return bool(statuses) and any(status in pending for status in statuses) and all(
-        status in pending | {SliceStatus.MERGED} for status in statuses
+    return (
+        bool(statuses)
+        and any(status in pending for status in statuses)
+        and all(status in pending | {SliceStatus.MERGED} for status in statuses)
     )
 
 
@@ -703,7 +701,7 @@ def _run_loop(
                         tuple(consumed),
                         tuple(heartbeat_events),
                     )
-                deadline = _next_loop_deadline(state, config)
+                deadline = _next_waiting_deadline(config)
             continue
         event_seq = event.run_seq
         if event_seq is None:
@@ -730,6 +728,11 @@ def _run_loop(
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
+                deadline = (
+                    _next_waiting_deadline(config)
+                    if _sub_tls_waiting_for_integration(plan, state)
+                    else _next_loop_deadline(state, config)
+                )
             source.acknowledge(event)
             if isinstance(phase, (TLDone, TLFailed)):
                 break
@@ -741,6 +744,11 @@ def _run_loop(
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
+                deadline = (
+                    _next_waiting_deadline(config)
+                    if _sub_tls_waiting_for_integration(plan, state)
+                    else _next_loop_deadline(state, config)
+                )
             source.acknowledge(event)
             if isinstance(phase, (TLDone, TLFailed)):
                 break
@@ -924,6 +932,16 @@ def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> float:
     if remaining:
         deadline = min(deadline, time.monotonic() + min(remaining))
     return deadline
+
+
+def _next_waiting_deadline(config: TLLoopConfig) -> float:
+    """Use the liveness budget while review or CI is legally outstanding."""
+    timeout = (
+        config.heartbeat.stall_threshold_seconds
+        if config.heartbeat is not None
+        else config.controller_stall_timeout
+    )
+    return time.monotonic() + timeout
 
 
 def _park_dispatch_timeout(
@@ -1836,8 +1854,10 @@ def _run_sub_tl_batch(
     budgets: BudgetLedger,
 ) -> tuple[tuple[SubTLTask, TLPhase | None, RunState | None], ...]:
     """Run one bounded batch and collect outcomes in plan order."""
-    if config.active and isinstance(effects, EffectClient) and isinstance(
-        effects.transport, TransportClient
+    if (
+        config.active
+        and isinstance(effects, EffectClient)
+        and isinstance(effects.transport, TransportClient)
     ):
         return _run_live_sub_tl_batch(tasks, config, source, effects, store, budgets)
 
@@ -1916,8 +1936,10 @@ def _supervise_live_sub_tl(
             child_state = child_store.load()
         except (OSError, ValueError):
             child_state = None
-        if child_state is not None and child_state.fsm.phase is TLPhase.TLWaiting and (
-            config.keep_alive_on_waiting
+        if (
+            child_state is not None
+            and child_state.fsm.phase is TLPhase.TLWaiting
+            and (config.keep_alive_on_waiting)
         ):
             _join_waiting_child(process, child_store, config)
         else:
@@ -1997,7 +2019,9 @@ def _run_live_sub_tl(
     branch = derive_child_branch(config.branch, task.name)
     worktree = str(
         task.worktree
-        or derive_child_worktree(_effective_worktree(config, store.root_dir, store.run_id), task.name)
+        or derive_child_worktree(
+            _effective_worktree(config, store.root_dir, store.run_id), task.name
+        )
     )
     child_config = _child_config(config, task, source, effects, store, branch, worktree)
     try:
@@ -2145,21 +2169,17 @@ def _ensure_aggregate_candidate(
     child_integration = child_state.integration
     own_candidate = child_integration.candidates.get(task.name)
     owner_id = (
-        (own_candidate.integration_owner_id if own_candidate is not None else None)
-        or f"{store.run_id}:{task.name}:integration"
-    )
+        own_candidate.integration_owner_id if own_candidate is not None else None
+    ) or f"{store.run_id}:{task.name}:integration"
     branch = child_state.owner_branch or derive_child_branch(config.branch, task.name)
     owner_worktree = child_state.owner_worktree or str(
-        derive_child_worktree(
-            _effective_worktree(config, store.root_dir, store.run_id), task.name
-        )
+        derive_child_worktree(_effective_worktree(config, store.root_dir, store.run_id), task.name)
     )
     fallback_head = _child_head_sha(child_state, branch)
     fallback_patch = _child_patch_digest(child_state)
     fallback_base = (
-        (own_candidate.aggregate_original_base_sha if own_candidate is not None else None)
-        or config.branch
-    )
+        own_candidate.aggregate_original_base_sha if own_candidate is not None else None
+    ) or config.branch
     if own_candidate is not None and own_candidate.aggregate_pr_number is not None:
         candidate = AggregateCandidate(
             task.name,
@@ -2557,9 +2577,7 @@ def _handle_integration_conflict(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=_persist_candidate_runtime(
-            state.integration, task.name, conflict
-        ),
+        integration=_persist_candidate_runtime(state.integration, task.name, conflict),
     )
     _record_controller_event(
         task.name,
@@ -2912,7 +2930,9 @@ def _checkpoint_aggregate_merged(
         integration,
         lifecycle=IntegrationLifecycle.MERGED,
         aggregate_pr_number=integration.aggregate_pr_number or current.pr_number,
-        aggregate_head_sha=integration.aggregate_head_sha or integration.head_sha or current.reviewed_head,
+        aggregate_head_sha=integration.aggregate_head_sha
+        or integration.head_sha
+        or current.reviewed_head,
         aggregate_patch_digest=(
             integration.aggregate_patch_digest
             or integration.patch_digest
@@ -2938,9 +2958,7 @@ def _checkpoint_aggregate_merged(
         integration_evidence_at=integration.integration_evidence_at or _now_timestamp(),
         stage_verification="passed",
     )
-    persisted_merged = _persist_candidate_runtime(
-        state.integration, task.name, merged_integration
-    )
+    persisted_merged = _persist_candidate_runtime(state.integration, task.name, merged_integration)
     remaining = {
         sibling_id: ChildHandle(
             sibling_id,

@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -30,16 +31,26 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import JsonObject, TransportClient, TransportError
+from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.fsm.phase import ChildHandle, TLPhase, TLWaiting
 from tl_loop.loop.driver import (
     SubTLTask,
     TLLoopConfig,
     WorkPlan,
+    _initial_slices,
     _supervise_live_sub_tl,
     run_tl_loop,
 )
-from tl_loop.state.schema import SliceState, SliceStatus
-from tl_loop.state.store import BudgetLedger, RunStore, create
+from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.state.schema import (
+    BudgetLedger,
+    IntegrationCandidateState,
+    IntegrationRuntimeState,
+    OrderedStageState,
+    SliceState,
+    SliceStatus,
+)
+from tl_loop.state.store import RunStore, create
 
 
 class HarnessError(RuntimeError):
@@ -55,6 +66,120 @@ class EmptyEventSource:
 
     def acknowledge(self, event: Any) -> int:
         return event.run_seq
+
+
+class DelayedAggregateEventSource:
+    """Deliver review and CI only after a durable controller restart point."""
+
+    def __init__(
+        self,
+        run_id: str,
+        root_dir: Path,
+        *,
+        initial_delay: float,
+    ) -> None:
+        self.store = RunStore(run_id, root_dir)
+        self.initial_delay = initial_delay
+        self.started_at: float | None = None
+        self.emitted: list[str] = []
+        self.acknowledged: list[int] = []
+
+    def get(self, timeout: float | None = None) -> EventEnvelope:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        if self.started_at is None:
+            self.started_at = time.monotonic()
+        while True:
+            event = self._next_event()
+            if event is not None:
+                return event
+            if deadline is not None and time.monotonic() >= deadline:
+                raise queue.Empty
+            time.sleep(0.01)
+
+    def acknowledge(self, event: EventEnvelope) -> int:
+        if event.run_seq is None:
+            raise HarnessError("delayed event has no run_seq")
+        self.acknowledged.append(event.run_seq)
+        state = self.store.load()
+        self.store.checkpoint(
+            state.fsm,
+            state.slices,
+            state.budgets,
+            max(state.events.last_consumed_offset, event.run_seq),
+            current_order=state.current_order,
+            ordered_stages=state.ordered_stages,
+            integration=state.integration,
+        )
+        return event.run_seq
+
+    def _next_event(self) -> EventEnvelope | None:
+        if (
+            self.started_at is None
+            or time.monotonic() - self.started_at < self.initial_delay
+        ):
+            return None
+        state = self.store.load()
+        for slice_id in sorted(state.slices):
+            current = state.slices[slice_id]
+            if current.status is not SliceStatus.IN_REVIEW or current.pr_number is None:
+                continue
+            head_sha = current.reviewed_head
+            if not head_sha:
+                continue
+            if current.verdict is None:
+                event = self._event(
+                    state,
+                    current,
+                    "pr.review",
+                    {
+                        "review_state": "approved",
+                        "kind": "approved",
+                        "patch_digest": current.review_patch_digests.get(
+                            head_sha, "seed"
+                        ),
+                    },
+                )
+                self.emitted.append("review:" + slice_id)
+                return event
+            if current.ci_state.get(head_sha) not in {"success", "neutral"}:
+                event = self._event(
+                    state,
+                    current,
+                    "ci.status_changed",
+                    {"status": "success"},
+                )
+                self.emitted.append("ci:" + slice_id)
+                return event
+        return None
+
+    def _event(
+        self,
+        state: Any,
+        current: SliceState,
+        event_type: str,
+        extra: Mapping[str, object],
+    ) -> EventEnvelope:
+        data = {
+            "slice_id": current.id,
+            "pr_number": current.pr_number,
+            "head_sha": current.reviewed_head,
+            **extra,
+        }
+        raw = {
+            "schema_version": 1,
+            "event_id": f"delayed-{state.events.last_consumed_offset + 1}",
+            "id": f"delayed-{state.events.last_consumed_offset + 1}",
+            "event_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_seq": state.events.last_consumed_offset + 1,
+            "type": event_type,
+            "agent_id": current.id,
+            "run_id": state.run_id,
+            "session_id": "delayed-e2e",
+            "lifecycle_state": "observed",
+            "data": data,
+        }
+        return project(raw)
 
 
 def run_command(command: list[str], cwd: Path | None = None) -> str:
@@ -206,7 +331,21 @@ def start_server(
     (repo / ".exo/wasm").mkdir(parents=True, exist_ok=True)
     for child_name in ("sub-a", "sub-b"):
         agent_dir = repo / ".exo/agents" / child_name
-        agent_dir.mkdir(parents=True, exist_ok=True)
+        agent_dir.parent.mkdir(parents=True, exist_ok=True)
+        run_command(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                f"main.{child_name}",
+                str(agent_dir),
+                "main",
+            ]
+        )
         (agent_dir / ".birth_branch").write_text("main\n", encoding="utf-8")
     parent_worktree = repo / ".exo/worktrees/parent"
     parent_worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -365,6 +504,286 @@ def run_live_ordered_probe(client: TransportClient, root: Path, repo: Path) -> N
             )
 
 
+def mock_request_count(log_path: Path, *, method: str, suffix: str) -> int:
+    if not log_path.exists():
+        return 0
+    count = 0
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if request.get("method") == method and str(request.get("path", "")).endswith(
+            suffix
+        ):
+            count += 1
+    return count
+
+
+def mock_merge_count(log_path: Path) -> int:
+    return sum(
+        mock_request_count(log_path, method=method, suffix="/merge")
+        for method in ("POST", "PUT")
+    )
+
+
+def seed_delayed_restart_run(
+    client: TransportClient,
+    root: Path,
+    repo: Path,
+    forgejo_url: str,
+) -> tuple[str, WorkPlan, int, int]:
+    """Seed two real aggregate PRs, then resume them through the controller."""
+    run_id = "ordered-server-delayed-restart"
+    state_root = root / "controller-state"
+    parent_worktree = repo / ".exo/worktrees/parent"
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("sub-a", WorkPlan(), order=1),
+            SubTLTask("sub-b", WorkPlan(), order=1),
+        )
+    )
+    config = TLLoopConfig(
+        active=True,
+        keep_alive_on_waiting=True,
+        max_parallel_slices=2,
+        max_events=16,
+        idle_timeout=0.2,
+        dispatch_timeout=0.2,
+        controller_stall_timeout=5.0,
+        root_dir=state_root,
+        branch="main",
+        worktree=repo,
+        working_dir=str(parent_worktree),
+    )
+    initial = _initial_slices(plan, config, state_root, run_id)
+    seeded_slices = RunStore(run_id, state_root)
+    create(
+        run_id,
+        {
+            "owner_branch": "main",
+            "owner_worktree": str(repo),
+            "slices": initial,
+            "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
+        },
+        root_dir=state_root,
+    )
+    state = seeded_slices.load()
+    parent_effects = EffectClient(client, role="tl", name="parent")
+    candidates: dict[str, IntegrationCandidateState] = {}
+    updated_slices = dict(state.slices)
+    for name in ("sub-a", "sub-b"):
+        branch = f"aggregate/{name}"
+        git(repo, "branch", branch, "main")
+        git(repo, "push", "-q", "origin", branch)
+        filed = json_request(
+            "POST",
+            f"{forgejo_url}/api/v1/repos/owner/repo/pulls",
+            {
+                "title": f"Delayed aggregate {name}",
+                "body": "Controller restart acceptance fixture",
+                "head": branch,
+                "base": "main",
+            },
+        )
+        if not isinstance(filed, Mapping) or type(filed.get("number")) is not int:
+            raise HarnessError(f"mock Forgejo did not create delayed PR: {filed!r}")
+        pr_number = int(filed["number"])
+        snapshot = parent_effects.watcher_pr_state(pr_number=pr_number)
+        evidence = find_object(
+            snapshot,
+            {"head_sha", "base_sha", "patch_digest", "merge_tree_sha"},
+        )
+        head_sha = str(evidence["head_sha"])
+        patch_digest = str(evidence["patch_digest"])
+        json_request(
+            "POST",
+            f"{forgejo_url}/api/v1/repos/owner/repo/pulls/{pr_number}/reviews",
+            {"event": "APPROVED", "commit_id": head_sha},
+        )
+        current = state.slices[name]
+        owner_id = f"{run_id}:{name}:integration"
+        updated_slices[name] = replace(
+            current,
+            status=SliceStatus.IN_REVIEW,
+            base_ref="main",
+            branch=branch,
+            worktree=str(parent_worktree / name),
+            pr_number=pr_number,
+            reviewed_head=head_sha,
+            review_patch_digests={head_sha: patch_digest},
+            dispatch_intent_id=f"seeded-{name}",
+            dispatch_started_at=time.time(),
+            dispatch_last_boundary="aggregate_pr_open",
+            dispatch_agent_id=owner_id,
+            dispatch_authoritative_event_seq=1,
+        )
+        candidates[name] = IntegrationCandidateState(
+            lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+            aggregate_pr_number=pr_number,
+            aggregate_head_sha=head_sha,
+            aggregate_patch_digest=patch_digest,
+            aggregate_original_base_sha=str(evidence["base_sha"]),
+            integration_owner_id=owner_id,
+            integration_owner_run_id=name,
+            integration_owner_branch=branch,
+            integration_owner_worktree=str(parent_worktree / name),
+            head_sha=head_sha,
+            patch_digest=patch_digest,
+        )
+    stages = tuple(
+        OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
+    )
+    integration = IntegrationRuntimeState(
+        sub_tl_states={
+            name: IntegrationLifecycle.AGGREGATE_PR_OPEN for name in ("sub-a", "sub-b")
+        },
+        candidates=candidates,
+    )
+    waiting = {
+        name: ChildHandle(name, f"main.{name}", "sub-tl") for name in ("sub-a", "sub-b")
+    }
+    seeded_slices.checkpoint(
+        TLWaiting(waiting),
+        updated_slices,
+        BudgetLedger(tokens=0, wall_seconds=0),
+        0,
+        current_order=1,
+        ordered_stages=stages,
+        integration=integration,
+    )
+    return (
+        run_id,
+        plan,
+        mock_request_count(root / "mock.log", method="POST", suffix="/pulls"),
+        mock_merge_count(root / "mock.log"),
+    )
+
+
+def run_delayed_restart_probe(
+    client: TransportClient,
+    root: Path,
+    repo: Path,
+    forgejo_url: str,
+) -> None:
+    run_id, plan, pr_count_before, merge_count_before = seed_delayed_restart_run(
+        client, root, repo, forgejo_url
+    )
+    state_root = root / "controller-state"
+    context = multiprocessing.get_context("fork")
+
+    def controller(delay: float) -> None:
+        source = DelayedAggregateEventSource(run_id, state_root, initial_delay=delay)
+        effects = EffectClient(
+            TransportClient(project_root=repo, timeout=5),
+            role="tl",
+            name="parent",
+        )
+        config = TLLoopConfig(
+            active=True,
+            keep_alive_on_waiting=True,
+            max_parallel_slices=2,
+            max_events=16,
+            idle_timeout=0.2,
+            dispatch_timeout=0.2,
+            controller_stall_timeout=5.0,
+            root_dir=state_root,
+            branch="main",
+            worktree=repo,
+            working_dir=str(repo / ".exo/worktrees/parent"),
+        )
+        run_tl_loop(run_id, plan, source, effects, config=config, root_dir=state_root)
+
+    first = context.Process(target=controller, args=(5.0,))
+    first.start()
+    time.sleep(0.5)
+    waiting_state = RunStore(run_id, state_root).load()
+    if not first.is_alive() or any(
+        current.status is not SliceStatus.IN_REVIEW
+        for current in waiting_state.slices.values()
+    ):
+        first.terminate()
+        first.join(timeout=5)
+        raise HarnessError(
+            f"controller did not remain alive during delayed review: {waiting_state!r}"
+        )
+    first.terminate()
+    first.join(timeout=5)
+    if first.exitcode == 0:
+        raise HarnessError("restart probe controller exited before the forced restart")
+
+    source = DelayedAggregateEventSource(run_id, state_root, initial_delay=0.05)
+    effects = EffectClient(client, role="tl", name="parent")
+    config = TLLoopConfig(
+        active=True,
+        keep_alive_on_waiting=True,
+        max_parallel_slices=2,
+        max_events=16,
+        idle_timeout=0.2,
+        dispatch_timeout=0.2,
+        controller_stall_timeout=5.0,
+        root_dir=state_root,
+        branch="main",
+        worktree=repo,
+        working_dir=str(repo / ".exo/worktrees/parent"),
+    )
+    result = run_tl_loop(
+        run_id,
+        plan,
+        source,
+        effects,
+        config=config,
+        root_dir=state_root,
+    )
+    if result.final_state.fsm.phase is not TLPhase.TLDone:
+        raise HarnessError(
+            f"delayed restart did not converge: emitted={source.emitted!r} "
+            f"acknowledged={source.acknowledged!r}"
+        )
+    required_events = {"review:sub-a", "review:sub-b", "ci:sub-a", "ci:sub-b"}
+    if not required_events <= set(source.emitted) or any(
+        source.emitted.count(name) != 1 for name in ("review:sub-a", "review:sub-b")
+    ):
+        raise HarnessError(
+            f"delayed events were not consumed exactly once: {source.emitted!r}"
+        )
+    if (
+        mock_request_count(root / "mock.log", method="POST", suffix="/pulls")
+        != pr_count_before
+    ):
+        raise HarnessError("restart created a duplicate aggregate PR")
+    if mock_merge_count(root / "mock.log") != merge_count_before + 2:
+        raise HarnessError(
+            "restart did not perform exactly one merge per candidate: "
+            f"before={merge_count_before} after={mock_merge_count(root / 'mock.log')}"
+        )
+
+
+def assert_stage_events(repo: Path) -> None:
+    observed: list[str] = []
+    for path in (repo / ".exo").rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            continue
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, Mapping):
+                event_type = value.get("type", value.get("event_type"))
+                if isinstance(event_type, str):
+                    observed.append(event_type)
+    required = {"tl.stage_started", "tl.stage_completed"}
+    if not required <= set(observed):
+        raise HarnessError(
+            f"server ledger did not contain ordered stage events: {sorted(set(observed))!r}"
+        )
+
+
 def waiting_child(run_root: str) -> None:
     create("waiting-child", {}, root_dir=Path(run_root))
     waiting_slice = SliceState(
@@ -428,6 +847,8 @@ def main() -> None:
             server, client = start_server(root, repo, forgejo_url, project_root)
             check_pr_evidence(client, branch, repo, forgejo_url)
             run_live_ordered_probe(client, root, repo)
+            run_delayed_restart_probe(client, root, repo, forgejo_url)
+            assert_stage_events(repo)
             run_waiting_supervision_probe(root / "waiting-state")
             print("real server TransportClient ordered recursion: passed")
         finally:
