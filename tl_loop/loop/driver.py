@@ -788,6 +788,18 @@ def _run_loop(
             slice_id=event_slice_id,
             allow_spawn_confirmation=_dispatch_confirmation_matches(state.slices, event),
         )
+        if (
+            isinstance(fsm_event, ChildCompleted)
+            and event_slice_id is not None
+            and event.pr_number is not None
+            and event.head_sha is not None
+            and event_slice_id in next_slices
+        ):
+            next_slices[event_slice_id] = replace(
+                next_slices[event_slice_id],
+                pr_number=event.pr_number,
+                reviewed_head=event.head_sha,
+            )
         if _is_spawn_confirmation_event(event):
             next_slices = _confirm_dispatch_event(
                 state.slices, next_slices, event, event_slice_id, event_seq
@@ -1843,7 +1855,8 @@ def _run_sub_tl_batch(
         child_config = _child_config(config, task, source, effects, store, branch, worktree)
         try:
             child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
-        except Exception:  # noqa: BLE001 - batch completion persists a durable failure
+        except Exception as error:  # noqa: BLE001 - batch completion persists a durable failure
+            child_store.record_exit_reason(str(error))
             return task, TLPhase.TLFailed, None
         return task, child_result.final_state.fsm.phase, child_result.final_state
 
@@ -2053,7 +2066,11 @@ def _ensure_aggregate_candidate(
     if not _child_has_aggregate_output(child_state):
         return None
     child_integration = child_state.integration
-    owner_id = child_integration.integration_owner_id or f"{store.run_id}:{task.name}:integration"
+    own_candidate = child_integration.candidates.get(task.name)
+    owner_id = (
+        (own_candidate.integration_owner_id if own_candidate is not None else None)
+        or f"{store.run_id}:{task.name}:integration"
+    )
     branch = child_state.owner_branch or derive_child_branch(config.branch, task.name)
     owner_worktree = child_state.owner_worktree or str(
         derive_child_worktree(
@@ -2062,13 +2079,16 @@ def _ensure_aggregate_candidate(
     )
     fallback_head = _child_head_sha(child_state, branch)
     fallback_patch = _child_patch_digest(child_state)
-    fallback_base = child_integration.aggregate_original_base_sha or config.branch
-    if child_integration.aggregate_pr_number is not None:
+    fallback_base = (
+        (own_candidate.aggregate_original_base_sha if own_candidate is not None else None)
+        or config.branch
+    )
+    if own_candidate is not None and own_candidate.aggregate_pr_number is not None:
         candidate = AggregateCandidate(
             task.name,
-            child_integration.aggregate_pr_number,
-            child_integration.aggregate_head_sha or fallback_head,
-            child_integration.aggregate_patch_digest or fallback_patch,
+            own_candidate.aggregate_pr_number,
+            own_candidate.aggregate_head_sha or fallback_head,
+            own_candidate.aggregate_patch_digest or fallback_patch,
             fallback_base,
         )
     else:

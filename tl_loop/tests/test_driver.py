@@ -273,6 +273,8 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert result.final_state.fsm.phase is TLPhase.TLDone
     assert result.final_state.events.last_consumed_offset == 5
     assert result.final_state.slices["worker-a"].status.value == "merged"
+    assert result.final_state.slices["leaf-a"].pr_number == 42
+    assert result.final_state.slices["leaf-a"].reviewed_head == "head-a"
     assert result.final_state.slices["leaf-a"].status.value == "merged"
     assert result.final_state.slices["worker-a"].dispatch_authoritative_event_seq == 1
     assert result.final_state.slices["leaf-a"].dispatch_authoritative_event_seq == 2
