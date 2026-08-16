@@ -2285,6 +2285,114 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("head_sha", "head-b"), ("patch_digest", "patch-b")),
+)
+def test_head_or_patch_mismatch_opens_conflict_gate(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    parent_dir = tmp_path / "mismatch-run"
+    child_plan = _plan()
+    run_tl_loop(
+        "aggregate-child",
+        child_plan,
+        SyntheticQueue(_lifecycle_events("aggregate-child")),
+        EffectClient(RecordingTransport()),
+        config=_config(),
+        root_dir=parent_dir,
+    )
+    child_store = RunStore("aggregate-child", parent_dir)
+    child_state = child_store.load()
+    child_store.checkpoint(
+        child_state.fsm,
+        {
+            **child_state.slices,
+            "leaf-a": replace(child_state.slices["leaf-a"], pr_number=42, reviewed_head="head-a"),
+        },
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    second_snapshot = {
+        "head_sha": "head-a",
+        "base_sha": "base-a",
+        "patch_digest": "patch-a",
+        "merge_tree_sha": "tree-a",
+        "ci_status": "success",
+    }
+    second_snapshot[field] = value
+    transport = IntegrationTransport(
+        snapshots=[
+            {
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            second_snapshot,
+        ]
+    )
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+    )
+    config = TLLoopConfig(
+        max_parallel_slices=1,
+        max_integration_repairs=0,
+        poll_interval=0.001,
+        idle_timeout=0.1,
+    )
+    run_tl_loop(
+        "mismatch-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    store = RunStore("mismatch-run", tmp_path)
+    state = store.load()
+    store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            "aggregate-child": replace(
+                state.slices["aggregate-child"],
+                verdict=Verdict.GO,
+                review_patch_digests={"head-a": "patch-a"},
+                ci_state={"head-a": "success"},
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    result = run_tl_loop(
+        "mismatch-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert GateState(name="tl-integration-conflict", status=GateStatus.PENDING) in result.final_state.gates
+    assert result.final_state.integration.lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT
+    assert result.final_state.slices["aggregate-child"].dispatch_agent_id == (
+        "mismatch-run:aggregate-child:integration"
+    )
+    event_types = [
+        arguments["event_type"]
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    ]
+    assert "tl.integration_base_invalidated" not in event_types
+    assert "tl.gate_opened" in event_types
+
+
 def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> None:
     child_plan = _plan()
     parent_dir = tmp_path / "conflict-run"

@@ -190,8 +190,10 @@ def test_integration_evidence_rejects_each_changed_dimension(field: str, value: 
     }
     live[field] = value
 
-    with pytest.raises(IntegrationEvidenceMismatch):
+    with pytest.raises(IntegrationEvidenceMismatch) as error_info:
         verify_integration(state, **live)
+    expected_field = "validated_base_sha" if field == "base_sha" else field
+    assert error_info.value.field == expected_field
 
 
 def test_base_movement_only_requires_integration_revalidation() -> None:

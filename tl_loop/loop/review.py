@@ -114,6 +114,10 @@ class CIStatusNotApproved(ReviewGateError):
 class IntegrationEvidenceMismatch(ReviewGateError):
     """Integration evidence no longer matches the live base or result."""
 
+    def __init__(self, message: str, *, field: str | None = None) -> None:
+        self.field = field
+        super().__init__(message)
+
 
 class OptionalPolicyRejected(ReviewGateError):
     """An explicitly supplied project-specific merge predicate rejected."""
@@ -209,16 +213,23 @@ def verify_integration(
     for name, recorded, current in expected:
         if recorded != current:
             raise IntegrationEvidenceMismatch(
-                f"integration {name} recorded {recorded!r}, current value is {current!r}"
+                f"integration {name} recorded {recorded!r}, current value is {current!r}",
+                field=name,
             )
     if state.stage_verification != "passed":
         raise IntegrationEvidenceMismatch(
-            f"integration stage verification is {state.stage_verification!r}"
+            f"integration stage verification is {state.stage_verification!r}",
+            field="stage_verification",
         )
     if ci_status not in {"success", "neutral"}:
-        raise IntegrationEvidenceMismatch(f"integration CI status is {ci_status!r}")
+        raise IntegrationEvidenceMismatch(
+            f"integration CI status is {ci_status!r}", field="ci_status"
+        )
     if state.integration_evidence_at is None:
-        raise IntegrationEvidenceMismatch("integration evidence has no observed timestamp")
+        raise IntegrationEvidenceMismatch(
+            "integration evidence has no observed timestamp",
+            field="integration_evidence_at",
+        )
     return IntegrationEvidence(
         base_sha,
         head_sha,

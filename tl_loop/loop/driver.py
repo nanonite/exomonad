@@ -2352,6 +2352,58 @@ def _handle_external_base_change(
     )
 
 
+def _handle_integration_revalidation(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    base_sha: str,
+    head_sha: str,
+    patch_digest: str,
+    reason: str,
+) -> RunState:
+    """Clear non-review integration evidence without misclassifying a base change."""
+    _record_controller_event(
+        task.name,
+        "tl.integration_evidence_invalidated",
+        {
+            "slice_id": task.name,
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "reason": reason[:500],
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    candidate_runtime = _candidate_runtime(state.integration, task.name)
+    invalidated = replace(
+        candidate_runtime,
+        lifecycle=IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+        validated_base_sha=None,
+        merge_tree_sha=None,
+        ci_status="unknown",
+        stage_verification="pending",
+        integration_evidence_at=None,
+    )
+    current = state.slices[task.name]
+    return _checkpoint_integration_retry(
+        state,
+        task.name,
+        invalidated,
+        config,
+        store,
+        slice_update=replace(
+            current,
+            dispatch_last_boundary="integration_revalidation",
+            dispatch_error=reason[:500],
+        ),
+    )
+
+
 def _handle_integration_conflict(
     task: SubTLTask,
     state: RunState,
@@ -2596,7 +2648,19 @@ def _integrate_one_candidate(
             ci_status=live_ci_status,
         )
     except IntegrationEvidenceMismatch as error:
-        return _handle_external_base_change(
+        if error.field in {"head_sha", "patch_digest"}:
+            return _handle_integration_conflict(
+                task,
+                state,
+                config,
+                effects,
+                store,
+                effects_log,
+                base_sha=base_sha,
+                head_sha=live_head_sha,
+                reason=str(error),
+            )
+        return _handle_integration_revalidation(
             task,
             state,
             config,
