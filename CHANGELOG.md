@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Handle recursive integration conflicts without stale-head loops (#872)
 - Serialize same-order sub-TL integration with base revalidation (#871)
 - Route hierarchical review adjudication and repairs (#870)
 - Bind review evidence to heads and integration evidence to bases (#869)
