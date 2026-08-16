@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Run same-order sub-TLs concurrently with bounded orchestration (#867)
 - Document ordered sub-TL plans and recursive integration (#875)
 - Verify ordered recursive integration end to end (#874)
 - Expose ordered sub-TL progress and recovery state (#873)
