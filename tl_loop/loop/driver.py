@@ -44,10 +44,12 @@ from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
 from tl_loop.loop.review import (
+    IntegrationEvidenceMismatch,
     ReviewGateError,
     compose_acceptance_criteria,
     invalidate_integration_evidence,
     load_freshness_window,
+    verify_integration,
     verify_review,
     watcher_head,
     watcher_patch_digest,
@@ -2566,6 +2568,33 @@ def _integrate_one_candidate(
                 f"aggregate base changed from {base_sha!r} to "
                 f"{_snapshot_text(second, 'base_sha')!r} before merge"
             ),
+        )
+    live_head_sha = _snapshot_text(second, "head_sha")
+    live_patch_digest = _snapshot_text(second, "patch_digest")
+    live_merge_tree_sha = _snapshot_text(second, "merge_tree_sha")
+    live_ci_status = _snapshot_text(second, "ci_status")
+    if not all((live_head_sha, live_patch_digest, live_merge_tree_sha, live_ci_status)):
+        return state
+    try:
+        verify_integration(
+            integration,
+            base_sha=base_sha,
+            head_sha=live_head_sha,
+            merge_tree_sha=live_merge_tree_sha,
+            ci_status=live_ci_status,
+        )
+    except IntegrationEvidenceMismatch as error:
+        return _handle_external_base_change(
+            task,
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+            base_sha=base_sha,
+            head_sha=live_head_sha,
+            patch_digest=live_patch_digest,
+            reason=str(error),
         )
     _record_controller_event(
         task.name,

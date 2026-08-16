@@ -1819,7 +1819,9 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     assert candidate.integration_owner_worktree == child.integration.integration_owner_worktree
 
 
-def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) -> None:
+def test_parent_serializes_aggregate_merge_after_base_recheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     child_plan = _plan()
     parent_dir = tmp_path / "serialized-run"
     run_tl_loop(
@@ -1862,6 +1864,23 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) ->
         sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
     )
     config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
+    verified: list[tuple[str, str, str, str]] = []
+    from tl_loop.loop import driver
+
+    original_verify = driver.verify_integration
+
+    def record_verify(state: object, **live: str) -> object:
+        verified.append(
+            (
+                live["base_sha"],
+                live["head_sha"],
+                live["merge_tree_sha"],
+                live["ci_status"],
+            )
+        )
+        return original_verify(state, **live)
+
+    monkeypatch.setattr(driver, "verify_integration", record_verify)
     run_tl_loop(
         "serialized-run",
         plan,
@@ -1899,6 +1918,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) ->
     )
 
     assert result.final_state.slices["aggregate-child"].status is SliceStatus.MERGED
+    assert verified == [("base-a", "head-a", "tree-a", "success")]
     assert [name for name, _ in transport.calls if name == "merge_pr"] == ["merge_pr"]
     event_types = {
         arguments["event_type"]
