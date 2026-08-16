@@ -61,6 +61,7 @@ from tl_loop.ordered import (
     IntegrationLifecycle,
     IntegrationState,
     IntegrationTransition,
+    IntegrationTransitionError,
     OrderedStage,
     ReviewOwner,
     transition_integration,
@@ -3525,6 +3526,10 @@ def _route_review_event(
         stall_classification=stall_classification or current.stall_classification,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
+    if _is_aggregate_slice(updated[slice_id]):
+        state = _record_aggregate_review_lifecycle(
+            store, state, phase, event_seq, slice_id, result.verdict
+        )
     if result.verdict is Verdict.NO_GO:
         return _route_repair(
             store,
@@ -3538,6 +3543,57 @@ def _route_review_event(
             effects_log,
         )
     return state
+
+
+def _record_aggregate_review_lifecycle(
+    store: RunStore,
+    state: RunState,
+    phase: PhaseValue,
+    event_seq: int,
+    slice_id: str,
+    verdict: Verdict,
+) -> RunState:
+    """Apply hierarchical review outcomes through the ordered transition table."""
+    candidate = _candidate_runtime(state.integration, slice_id)
+    lifecycle = candidate.lifecycle
+    if verdict is Verdict.NO_GO:
+        if lifecycle is not IntegrationLifecycle.REPAIRING_AGGREGATE:
+            lifecycle = transition_integration(
+                IntegrationState(lifecycle=lifecycle),
+                IntegrationTransition.REPAIR_STARTED,
+            ).lifecycle
+    elif verdict in {Verdict.GO, Verdict.GO_WITH_NITS}:
+        if lifecycle is IntegrationLifecycle.REPAIRING_AGGREGATE:
+            lifecycle = transition_integration(
+                IntegrationState(lifecycle=lifecycle),
+                IntegrationTransition.REPAIR_COMPLETED,
+            ).lifecycle
+        if lifecycle is IntegrationLifecycle.AGGREGATE_PR_OPEN:
+            lifecycle = transition_integration(
+                IntegrationState(lifecycle=lifecycle),
+                IntegrationTransition.CODE_REVIEW_ACCEPTED,
+            ).lifecycle
+        if lifecycle is IntegrationLifecycle.CODE_REVIEWED:
+            lifecycle = transition_integration(
+                IntegrationState(lifecycle=lifecycle),
+                IntegrationTransition.CODE_REVIEW_ACCEPTED,
+            ).lifecycle
+    else:
+        raise IntegrationTransitionError(f"unsupported aggregate review verdict {verdict!r}")
+    updated = _persist_candidate_runtime(
+        state.integration,
+        slice_id,
+        replace(candidate, lifecycle=lifecycle),
+    )
+    return store.checkpoint(
+        phase,
+        state.slices,
+        state.budgets,
+        event_seq,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=updated,
+    )
 
 
 def _persist_adjudication_nits(

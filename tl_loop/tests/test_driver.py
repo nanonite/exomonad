@@ -48,6 +48,8 @@ from tl_loop.state.schema import (
     BudgetLedger,
     GateState,
     GateStatus,
+    IntegrationCandidateState,
+    IntegrationRuntimeState,
     OrderedStageState,
     SliceState,
     SliceStatus,
@@ -780,6 +782,76 @@ def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -
     assert restored.repair_attempts == 1
     assert restored.review_findings["head-a"][0]["path"] == "src/leaf.py"
     assert all(name != "spawn_leaf" for name, _ in transport.calls)
+
+
+def test_aggregate_review_advances_hierarchical_lifecycle(tmp_path: Path) -> None:
+    backend = ReviewBackend(
+        [
+            RlmResponse(
+                {
+                    "verdict": "GO",
+                    "reviewed_head": "head-a",
+                    "reasons": [],
+                    "blocking_count": 0,
+                }
+            )
+        ]
+    )
+    transport = ReviewRepairTransport()
+    store = _review_store(tmp_path)
+    current = store.load().slices["leaf-a"]
+    current = replace(
+        current,
+        dispatch_agent_id="review-run:leaf-a:integration",
+        dispatch_last_boundary="aggregate_pr_open",
+    )
+    candidate = IntegrationCandidateState(
+        lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        aggregate_pr_number=42,
+        aggregate_head_sha="head-a",
+        aggregate_patch_digest="patch-a",
+        aggregate_original_base_sha="main",
+        integration_owner_id="review-run:leaf-a:integration",
+        integration_owner_run_id="leaf-a",
+        integration_owner_branch="main.leaf-a",
+        integration_owner_worktree=".worktrees/leaf-a",
+        head_sha="head-a",
+        patch_digest="patch-a",
+    )
+    state = store.checkpoint(
+        TLPlanning(),
+        {"leaf-a": current},
+        BudgetLedger(0, 0),
+        offset=0,
+        integration=IntegrationRuntimeState(
+            lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+            sub_tl_states={"leaf-a": IntegrationLifecycle.AGGREGATE_PR_OPEN},
+            candidates={"leaf-a": candidate},
+        ),
+    )
+    _route_review_event(
+        WorkPlan(sub_tls=(SubTLTask("leaf-a", WorkPlan(), source=SyntheticQueue([])),)),
+        store,
+        state,
+        TLPlanning(),
+        _review_event(),
+        1,
+        TLLoopConfig(
+            active=True,
+            review_model_choice=_review_choice(backend),
+            review_policy_path=Path(".exo/review-policy.toml"),
+        ),
+        EffectClient(transport),
+        [],
+    )
+
+    restored = store.load()
+    assert (
+        restored.integration.candidates["leaf-a"].lifecycle
+        is IntegrationLifecycle.READY_FOR_INTEGRATION
+    )
+    assert restored.slices["leaf-a"].verdict is Verdict.GO
+    assert _effect_names(transport) == []
 
 
 def test_go_with_nits_persists_follow_up_in_per_head_state(tmp_path: Path) -> None:

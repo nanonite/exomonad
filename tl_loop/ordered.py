@@ -205,6 +205,7 @@ _TRANSITIONS: Final[
     IntegrationLifecycle.READY_FOR_INTEGRATION: {
         IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
         IntegrationTransition.HEAD_INVALIDATED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+        IntegrationTransition.REPAIR_STARTED: IntegrationLifecycle.REPAIRING_AGGREGATE,
         IntegrationTransition.INTEGRATION_VALIDATED: IntegrationLifecycle.INTEGRATION_VALIDATED,
         IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
         IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
