@@ -1810,6 +1810,13 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     child = load_state(parent_dir / "aggregate-child" / "run.json")
     assert child.integration.aggregate_pr_number == parent_slice.pr_number
     assert child.integration.integration_owner_id == parent_slice.dispatch_agent_id
+    assert child.integration.integration_owner_run_id == "aggregate-child"
+    assert child.integration.integration_owner_branch == "main.aggregate-child"
+    assert child.integration.integration_owner_worktree
+    candidate = second.final_state.integration.candidates["aggregate-child"]
+    assert candidate.integration_owner_run_id == "aggregate-child"
+    assert candidate.integration_owner_branch == "main.aggregate-child"
+    assert candidate.integration_owner_worktree == child.integration.integration_owner_worktree
 
 
 def test_parent_serializes_aggregate_merge_after_base_recheck(tmp_path: Path) -> None:

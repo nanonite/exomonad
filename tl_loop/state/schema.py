@@ -117,6 +117,9 @@ INTEGRATION_KEYS = frozenset(
         "aggregate_patch_digest",
         "aggregate_original_base_sha",
         "integration_owner_id",
+        "integration_owner_run_id",
+        "integration_owner_branch",
+        "integration_owner_worktree",
         "head_sha",
         "patch_digest",
         "validated_base_sha",
@@ -136,6 +139,9 @@ INTEGRATION_CANDIDATE_KEYS = frozenset(
         "aggregate_patch_digest",
         "aggregate_original_base_sha",
         "integration_owner_id",
+        "integration_owner_run_id",
+        "integration_owner_branch",
+        "integration_owner_worktree",
         "head_sha",
         "patch_digest",
         "validated_base_sha",
@@ -355,6 +361,9 @@ class IntegrationCandidateState:
     aggregate_patch_digest: str | None = None
     aggregate_original_base_sha: str | None = None
     integration_owner_id: str | None = None
+    integration_owner_run_id: str | None = None
+    integration_owner_branch: str | None = None
+    integration_owner_worktree: str | None = None
     head_sha: str | None = None
     patch_digest: str | None = None
     validated_base_sha: str | None = None
@@ -377,6 +386,9 @@ class IntegrationRuntimeState:
     aggregate_patch_digest: str | None = None
     aggregate_original_base_sha: str | None = None
     integration_owner_id: str | None = None
+    integration_owner_run_id: str | None = None
+    integration_owner_branch: str | None = None
+    integration_owner_worktree: str | None = None
     head_sha: str | None = None
     patch_digest: str | None = None
     validated_base_sha: str | None = None
@@ -529,6 +541,9 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
         "aggregate_patch_digest",
         "aggregate_original_base_sha",
         "integration_owner_id",
+        "integration_owner_run_id",
+        "integration_owner_branch",
+        "integration_owner_worktree",
         "head_sha",
         "patch_digest",
         "validated_base_sha",
@@ -565,6 +580,9 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
                     "aggregate_patch_digest",
                     "aggregate_original_base_sha",
                     "integration_owner_id",
+                    "integration_owner_run_id",
+                    "integration_owner_branch",
+                    "integration_owner_worktree",
                     "head_sha",
                     "patch_digest",
                     "validated_base_sha",
@@ -590,6 +608,9 @@ def _validate_integration_evidence_contract(
         required = (
             "aggregate_pr_number",
             "integration_owner_id",
+            "integration_owner_run_id",
+            "integration_owner_branch",
+            "integration_owner_worktree",
             "head_sha",
             "patch_digest",
             "validated_base_sha",

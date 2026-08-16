@@ -126,6 +126,9 @@ def _candidate_runtime(
         aggregate_patch_digest=candidate.aggregate_patch_digest,
         aggregate_original_base_sha=candidate.aggregate_original_base_sha,
         integration_owner_id=candidate.integration_owner_id,
+        integration_owner_run_id=candidate.integration_owner_run_id,
+        integration_owner_branch=candidate.integration_owner_branch,
+        integration_owner_worktree=candidate.integration_owner_worktree,
         head_sha=candidate.head_sha,
         patch_digest=candidate.patch_digest,
         validated_base_sha=candidate.validated_base_sha,
@@ -153,6 +156,9 @@ def _persist_candidate_runtime(
         aggregate_patch_digest=candidate.aggregate_patch_digest,
         aggregate_original_base_sha=candidate.aggregate_original_base_sha,
         integration_owner_id=candidate.integration_owner_id,
+        integration_owner_run_id=candidate.integration_owner_run_id,
+        integration_owner_branch=candidate.integration_owner_branch,
+        integration_owner_worktree=candidate.integration_owner_worktree,
         head_sha=candidate.head_sha,
         patch_digest=candidate.patch_digest,
         validated_base_sha=candidate.validated_base_sha,
@@ -173,6 +179,9 @@ def _persist_candidate_runtime(
         aggregate_patch_digest=candidate.aggregate_patch_digest,
         aggregate_original_base_sha=candidate.aggregate_original_base_sha,
         integration_owner_id=candidate.integration_owner_id,
+        integration_owner_run_id=candidate.integration_owner_run_id,
+        integration_owner_branch=candidate.integration_owner_branch,
+        integration_owner_worktree=candidate.integration_owner_worktree,
         head_sha=candidate.head_sha,
         patch_digest=candidate.patch_digest,
         validated_base_sha=candidate.validated_base_sha,
@@ -1933,6 +1942,21 @@ def _complete_sub_tl_batch(
             )
             if candidate is not None:
                 owner_id = f"{store.run_id}:{task.name}:integration"
+                owner_branch = (
+                    child_state.owner_branch
+                    if child_state is not None and child_state.owner_branch
+                    else derive_child_branch(config.branch, task.name)
+                )
+                owner_worktree = (
+                    child_state.owner_worktree
+                    if child_state is not None and child_state.owner_worktree
+                    else str(
+                        derive_child_worktree(
+                            _effective_worktree(config, store.root_dir, store.run_id),
+                            task.name,
+                        )
+                    )
+                )
                 current = replace(
                     current,
                     status=SliceStatus.IN_REVIEW,
@@ -1953,6 +1977,9 @@ def _complete_sub_tl_batch(
                     aggregate_patch_digest=candidate.patch_digest,
                     aggregate_original_base_sha=candidate.original_base_sha,
                     integration_owner_id=owner_id,
+                    integration_owner_run_id=task.name,
+                    integration_owner_branch=owner_branch,
+                    integration_owner_worktree=owner_worktree,
                     head_sha=candidate.head_sha,
                     patch_digest=candidate.patch_digest,
                 )
@@ -1965,6 +1992,9 @@ def _complete_sub_tl_batch(
             aggregate_patch_digest=candidate_runtime.aggregate_patch_digest,
             aggregate_original_base_sha=candidate_runtime.aggregate_original_base_sha,
             integration_owner_id=candidate_runtime.integration_owner_id,
+            integration_owner_run_id=candidate_runtime.integration_owner_run_id,
+            integration_owner_branch=candidate_runtime.integration_owner_branch,
+            integration_owner_worktree=candidate_runtime.integration_owner_worktree,
             head_sha=candidate_runtime.head_sha,
             patch_digest=candidate_runtime.patch_digest,
             validated_base_sha=candidate_runtime.validated_base_sha,
@@ -2014,6 +2044,11 @@ def _ensure_aggregate_candidate(
     child_integration = child_state.integration
     owner_id = child_integration.integration_owner_id or f"{store.run_id}:{task.name}:integration"
     branch = child_state.owner_branch or derive_child_branch(config.branch, task.name)
+    owner_worktree = child_state.owner_worktree or str(
+        derive_child_worktree(
+            _effective_worktree(config, store.root_dir, store.run_id), task.name
+        )
+    )
     fallback_head = _child_head_sha(child_state, branch)
     fallback_patch = _child_patch_digest(child_state)
     fallback_base = child_integration.aggregate_original_base_sha or config.branch
@@ -2032,12 +2067,13 @@ def _ensure_aggregate_candidate(
             f"Head: `{fallback_head}`\n"
             f"Patch: `{fallback_patch}`"
         )
+        owner_effects = _owner_effect_client(effects, task.name)
         result = _invoke(
             "file_pr",
             task.name,
             {"title": f"Aggregate {task.name} into {config.branch}", "base_branch": config.branch},
             config.active,
-            cast(EffectClient | None, effects),
+            cast(EffectClient | None, owner_effects),
             lambda client: client.file_pr(
                 title=f"Aggregate {task.name} into {config.branch}",
                 body=body,
@@ -2072,6 +2108,9 @@ def _ensure_aggregate_candidate(
         aggregate_patch_digest=candidate.patch_digest,
         aggregate_original_base_sha=candidate.original_base_sha,
         integration_owner_id=owner_id,
+        integration_owner_run_id=task.name,
+        integration_owner_branch=branch,
+        integration_owner_worktree=owner_worktree,
         head_sha=candidate.head_sha,
         patch_digest=candidate.patch_digest,
     )
@@ -2650,6 +2689,9 @@ def _checkpoint_aggregate_merged(
                     aggregate_patch_digest=sibling_runtime.aggregate_patch_digest,
                     aggregate_original_base_sha=sibling_runtime.aggregate_original_base_sha,
                     integration_owner_id=sibling_runtime.integration_owner_id,
+                    integration_owner_run_id=sibling_runtime.integration_owner_run_id,
+                    integration_owner_branch=sibling_runtime.integration_owner_branch,
+                    integration_owner_worktree=sibling_runtime.integration_owner_worktree,
                     head_sha=sibling_runtime.head_sha,
                     patch_digest=sibling_runtime.patch_digest,
                     validated_base_sha=None,
@@ -2674,6 +2716,17 @@ def _checkpoint_aggregate_merged(
             integration.integration_owner_id
             or current.dispatch_agent_id
             or f"{store.run_id}:{task.name}:integration"
+        ),
+        integration_owner_run_id=integration.integration_owner_run_id or task.name,
+        integration_owner_branch=(
+            integration.integration_owner_branch
+            or current.branch
+            or derive_child_branch(current.base_ref or "main", task.name)
+        ),
+        integration_owner_worktree=(
+            integration.integration_owner_worktree
+            or current.worktree
+            or str(store.root_dir / task.name)
         ),
         merge_attempts=integration.merge_attempts + 1,
         integration_evidence_at=integration.integration_evidence_at or _now_timestamp(),
@@ -2862,10 +2915,11 @@ def _child_config(
     branch: str,
     worktree: str,
 ) -> TLLoopConfig:
+    child_effects = _owner_effect_client(effects, task.agent_id or task.name)
     return replace(
         config,
         source=task.source or source,
-        effects=task.effects or effects,
+        effects=task.effects or child_effects,
         root_dir=store.run_dir,
         run_id=task.name,
         branch=branch,
@@ -2876,6 +2930,15 @@ def _child_config(
         agent_id=task.agent_id or task.name,
         depth=config.depth + 1,
     )
+
+
+def _owner_effect_client(
+    effects: EffectClient | ReadOnlyEffectClient, owner_name: str
+) -> EffectClient | ReadOnlyEffectClient:
+    """Bind live effect calls to the persistent child controller identity."""
+    if not isinstance(effects, EffectClient):
+        return effects
+    return EffectClient(effects.transport, role=effects.role, name=owner_name)
 
 
 def _park_schedule_deadlock(
