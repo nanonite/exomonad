@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import multiprocessing
 import queue as queue_module
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -17,7 +18,7 @@ from typing import Protocol, cast
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
-from tl_loop.client.transport import JsonObject
+from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.envelope import EventEnvelope, EventKind
 from tl_loop.fsm.event import (
     AllChildrenDone,
@@ -1804,6 +1805,10 @@ def _run_sub_tl_batch(
     budgets: BudgetLedger,
 ) -> tuple[tuple[SubTLTask, TLPhase | None, RunState | None], ...]:
     """Run one bounded batch and collect outcomes in plan order."""
+    if config.active and isinstance(effects, EffectClient) and isinstance(
+        effects.transport, TransportClient
+    ):
+        return _run_live_sub_tl_batch(tasks, config, source, effects, store, budgets)
 
     def run_one(task: SubTLTask) -> tuple[SubTLTask, TLPhase | None, RunState | None]:
         branch = derive_child_branch(config.branch, task.name)
@@ -1829,6 +1834,70 @@ def _run_sub_tl_batch(
     with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
         futures = [executor.submit(run_one, task) for task in tasks]
         return tuple(future.result() for future in futures)
+
+
+def _run_live_sub_tl_batch(
+    tasks: Sequence[SubTLTask],
+    config: TLLoopConfig,
+    source: EventQueue,
+    effects: EffectClient,
+    store: RunStore,
+    budgets: BudgetLedger,
+) -> tuple[tuple[SubTLTask, TLPhase | None, RunState | None], ...]:
+    """Run live children as bounded, independently owned controller processes."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        raise TLLoopError("live ordered sub-TLs require fork-capable controller isolation")
+    context = multiprocessing.get_context("fork")
+    processes = [
+        (
+            task,
+            context.Process(
+                target=_run_live_sub_tl,
+                args=(task, config, source, effects, store, budgets),
+                name=f"tl-sub-{task.name}",
+            ),
+        )
+        for task in tasks
+    ]
+    for _, process in processes:
+        process.start()
+    timeout = max(config.idle_timeout, config.dispatch_timeout)
+    outcomes: list[tuple[SubTLTask, TLPhase | None, RunState | None]] = []
+    for task, process in processes:
+        process.join(timeout=timeout)
+        child_store = RunStore(task.name, store.run_dir)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            child_store.record_exit_reason(f"sub-TL controller exceeded {timeout:.3f}s")
+        try:
+            child_state = child_store.load()
+        except (OSError, ValueError):
+            child_state = None
+        phase = child_state.fsm.phase if child_state is not None else TLPhase.TLFailed
+        outcomes.append((task, phase, child_state))
+    return tuple(outcomes)
+
+
+def _run_live_sub_tl(
+    task: SubTLTask,
+    config: TLLoopConfig,
+    source: EventQueue,
+    effects: EffectClient,
+    store: RunStore,
+    budgets: BudgetLedger,
+) -> None:
+    """Own one live child controller process and leave its checkpoint durable."""
+    branch = derive_child_branch(config.branch, task.name)
+    worktree = str(
+        task.worktree
+        or derive_child_worktree(_effective_worktree(config, store.root_dir, store.run_id), task.name)
+    )
+    child_config = _child_config(config, task, source, effects, store, branch, worktree)
+    try:
+        tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
+    except Exception as error:  # noqa: BLE001 - parent reconciles the durable marker
+        RunStore(task.name, store.run_dir).record_exit_reason(str(error))
 
 
 def _complete_sub_tl_batch(

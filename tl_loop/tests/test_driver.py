@@ -15,7 +15,7 @@ import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
-from tl_loop.client.transport import JsonObject
+from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.fsm.event import PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning
@@ -28,11 +28,12 @@ from tl_loop.loop.driver import (
     TLRunResult,
     WorkerTask,
     WorkPlan,
-    _initial_slices,
     _event_belongs_to_plan,
+    _initial_slices,
     _record_review_event,
     _route_ci_event,
     _route_review_event,
+    _run_sub_tl_batch,
     run_tl_loop,
     tl_run,
 )
@@ -103,6 +104,36 @@ class RecordingTransport:
                 "result": {"event_id": "controller-event", "run_seq": self.next_controller_run_seq},
             }
         return {"success": True, "result": None}
+
+
+def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path) -> None:
+    root = tmp_path / "parent"
+    source = SyntheticQueue([])
+    tasks = (
+        SubTLTask("alpha", WorkPlan(), source=source, order=1),
+        SubTLTask("beta", WorkPlan(), source=SyntheticQueue([]), order=1),
+    )
+    config = TLLoopConfig(
+        active=True,
+        idle_timeout=0.5,
+        dispatch_timeout=0.5,
+        root_dir=root,
+        run_id="parent",
+    )
+    effects = EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
+    outcomes = _run_sub_tl_batch(
+        tasks,
+        config,
+        source,
+        effects,
+        RunStore("parent", tmp_path),
+        BudgetLedger(tokens=0, wall_seconds=0),
+    )
+
+    assert [phase for _, phase, _ in outcomes] == [TLPhase.TLDone, TLPhase.TLDone]
+    assert all(child_state is not None for _, _, child_state in outcomes)
+    assert RunStore("alpha", root).load().parent_run_id == "parent"
+    assert RunStore("beta", root).load().parent_run_id == "parent"
 
 
 @dataclass
