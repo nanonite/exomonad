@@ -382,6 +382,7 @@ class TLLoopConfig:
     idle_timeout: float = 30.0
     keep_alive_on_waiting: bool = False
     dispatch_timeout: float = 5.0
+    controller_stall_timeout: float = 300.0
     max_base_revalidations: int = 3
     max_integration_repairs: int = 3
     heartbeat: HeartbeatConfig | None = None
@@ -436,6 +437,8 @@ class TLLoopConfig:
             raise ValueError("keep_alive_on_waiting must be a boolean")
         if self.dispatch_timeout <= 0:
             raise ValueError("dispatch_timeout must be positive")
+        if self.controller_stall_timeout <= 0:
+            raise ValueError("controller_stall_timeout must be positive")
         if type(self.enable_reviewer_spawn) is not bool:
             raise ValueError("enable_reviewer_spawn must be a boolean")
         if self.chainlink_issue_id is not None and self.chainlink_issue_id <= 0:
@@ -1906,7 +1909,7 @@ def _supervise_live_sub_tl(
     config: TLLoopConfig,
     timeout: float,
 ) -> RunState | None:
-    """Keep a checkpointed waiting child alive until its own event stream advances."""
+    """Keep a waiting child alive while its checkpoint or heartbeat advances."""
     process.join(timeout=timeout)
     if process.is_alive():
         try:
@@ -1916,7 +1919,7 @@ def _supervise_live_sub_tl(
         if child_state is not None and child_state.fsm.phase is TLPhase.TLWaiting and (
             config.keep_alive_on_waiting
         ):
-            process.join()
+            _join_waiting_child(process, child_store, config)
         else:
             process.terminate()
             process.join()
@@ -1925,6 +1928,61 @@ def _supervise_live_sub_tl(
         return child_store.load()
     except (OSError, ValueError):
         return None
+
+
+def _join_waiting_child(
+    process: multiprocessing.Process,
+    child_store: RunStore,
+    config: TLLoopConfig,
+) -> None:
+    """Join a legal wait in bounded slices, resetting on durable activity."""
+    stall_timeout = (
+        config.heartbeat.stall_threshold_seconds
+        if config.heartbeat is not None
+        else config.controller_stall_timeout
+    )
+    poll_interval = max(config.poll_interval, 0.05)
+    activity = _waiting_child_activity(child_store)
+    deadline = time.monotonic() + stall_timeout
+    while process.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            process.terminate()
+            process.join()
+            child_store.record_exit_reason(
+                f"sub-TL controller stalled for {stall_timeout:.3f}s while waiting"
+            )
+            return
+        process.join(timeout=min(poll_interval, remaining))
+        if not process.is_alive():
+            return
+        updated_activity = _waiting_child_activity(child_store)
+        if updated_activity != activity:
+            activity = updated_activity
+            deadline = time.monotonic() + stall_timeout
+
+
+def _waiting_child_activity(child_store: RunStore) -> tuple[object, ...]:
+    """Return durable liveness markers without making the checkpoint authoritative."""
+    state = None
+    try:
+        state = child_store.load()
+    except (OSError, ValueError):
+        pass
+    checkpoint_mtime: int | None = None
+    path = getattr(child_store, "path", None)
+    if path is not None:
+        try:
+            checkpoint_mtime = path.stat().st_mtime_ns
+        except OSError:
+            pass
+    goals = getattr(state, "goals", None)
+    return (
+        checkpoint_mtime,
+        getattr(goals, "last_heartbeat_at", None),
+        getattr(goals, "last_progress_at", None),
+        getattr(getattr(state, "fsm", None), "phase", None),
+    )
 
 
 def _run_live_sub_tl(

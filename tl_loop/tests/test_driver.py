@@ -148,7 +148,7 @@ def test_live_waiting_child_is_not_terminated_after_supervision_window() -> None
 
         def join(self, timeout: float | None = None) -> None:
             self.joins.append(timeout)
-            if timeout is None:
+            if len(self.joins) >= 2:
                 self.alive = False
 
         def is_alive(self) -> bool:
@@ -167,13 +167,57 @@ def test_live_waiting_child_is_not_terminated_after_supervision_window() -> None
     state = _supervise_live_sub_tl(
         process,
         child_store,
-        TLLoopConfig(keep_alive_on_waiting=True, idle_timeout=0.1),
+        TLLoopConfig(
+            keep_alive_on_waiting=True,
+            idle_timeout=0.1,
+            controller_stall_timeout=0.05,
+        ),
         0.01,
     )
 
     assert state is not None
-    assert process.joins == [0.01, None]
+    assert process.joins[0] == 0.01
+    assert process.joins[1] == pytest.approx(0.05, abs=0.001)
     assert not process.terminated
+
+
+def test_live_waiting_child_is_terminated_after_stall_deadline() -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.alive = True
+            self.terminated = False
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.alive = False
+
+    process = FakeProcess()
+    reasons: list[str] = []
+    child_store = SimpleNamespace(
+        load=lambda: SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting)),
+        record_exit_reason=reasons.append,
+    )
+
+    state = _supervise_live_sub_tl(
+        process,
+        child_store,
+        TLLoopConfig(
+            keep_alive_on_waiting=True,
+            poll_interval=0.001,
+            controller_stall_timeout=0.01,
+        ),
+        0.001,
+    )
+
+    assert state is not None
+    assert process.terminated
+    assert reasons == ["sub-TL controller stalled for 0.010s while waiting"]
 
 
 @dataclass

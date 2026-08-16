@@ -18,6 +18,7 @@ from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
+from tl_loop.loop.heartbeat import HeartbeatConfig
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.plan_validation import (
     PlanValidationError,
@@ -195,6 +196,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         max_events=args.max_events,
         idle_timeout=args.idle_timeout,
         keep_alive_on_waiting=True,
+        heartbeat=HeartbeatConfig(),
         poll_interval=args.poll_interval,
         source=source,
         effects=effects,
