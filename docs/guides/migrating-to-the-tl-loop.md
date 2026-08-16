@@ -81,6 +81,26 @@ sibling, use contiguous values starting at 1, and do not mix explicit and
 missing values. Preflight rejects a mixed or non-contiguous sibling set before
 the controller starts.
 
+For example, this is rejected because `legacy` omits `order` while `new`
+declares one:
+
+```json
+{
+  "plan": {
+    "sub_tls": [
+      {"name": "legacy", "plan": {}},
+      {"name": "new", "order": 1, "plan": {}}
+    ]
+  }
+}
+```
+
+Either omit `order` from every direct sibling to retain one legacy order-1
+stage, or write `order: 1` on every sibling in that stage. Do not use an
+explicit order to express a dependency between leaves; put the dependent work
+in a later direct sub-TL stage. The order namespace resets inside each nested
+sub-TL plan.
+
 Same-order children are dispatched concurrently within the configured bound;
 their aggregate PRs are then integrated one at a time in stable sub-TL ID
 order. The next numeric order waits for all children and integrations in the
@@ -233,6 +253,9 @@ just validate-observability-contracts
 # Controller loaded the plan and reached a real phase
 python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
 
+# Documentation examples and relative links remain valid
+just docs-check
+
 # Historical logs landed
 sqlite3 .exo/analysis/atlas.db "SELECT count(*), min(event_time), max(event_time) FROM events;"
 ```
@@ -240,6 +263,13 @@ sqlite3 .exo/analysis/atlas.db "SELECT count(*), min(event_time), max(event_time
 A healthy `status` prints a phase, the slice map with statuses, and
 `last_consumed_offset`. Any `pending` gate is printed with the exact command to
 answer it.
+
+For ordered runs, also inspect `current_order`, each `ordered_stages[*].sub_tls`
+row, the per-candidate owner/head/base evidence under the ordered-stage rows,
+and `next_transition`. `NEEDS_BASE_REVALIDATION` means the reviewed head is
+still the same and only the parent base moved. `INTEGRATION_CONFLICT` means the
+aggregate PR needs same-owner `resume_pr`; neither state calls for a worker or
+an unnecessary rebase.
 
 ---
 

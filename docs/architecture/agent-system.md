@@ -28,7 +28,7 @@ The coordinator is not one of them. `tl_loop` is a Python controller process —
 | Actor | Model | Spawns | Files PR | Merges PR | Lifecycle |
 |-------|-------|--------|----------|-----------|-----------|
 | `tl_loop` controller | n/a — Python; calls a model only for `decompose`, `adjudicate_review`, `compose_repair` | yes | via children | yes | one per run; resumable from `.exo/tl-loop/<run_id>/run.json` |
-| `root` / `tl` roles | policy-selected from `[roles.tl]` | yes | yes | yes | RPC surface + branch coordinates; a sub-TL is a nested `tl_run`, not a session |
+| `root` / `tl` roles | policy-selected from `[roles.tl]` | yes | yes | yes | RPC surface + branch coordinates; an active sub-TL is an isolated controller process, not an interactive session |
 | `dev` | policy-selected from `[roles.worker]` | no | yes | no | one assignment per invocation, exits after handoff |
 | `reviewer` | policy-selected from `[roles.reviewer]` | no | no | no | ephemeral per review round |
 | `worker` | policy-selected from `[roles.worker]` | no | no | no | ephemeral, same-worktree edits |
@@ -77,15 +77,25 @@ routes through same-owner `resume_pr`, preserving branch, worktree, and PR.
 
 | Lifecycle | Authority | Recovery |
 |---|---|---|
-| `READY_FOR_INTEGRATION` | Direct parent has accepted review and CI for the candidate head | Validate base-bound evidence |
+| `RUNNING` | Direct children are executing | Wait for child checkpoints |
+| `CHILDREN_MERGED` | Child work folded into the aggregate branch | Open or reuse the aggregate PR |
+| `AGGREGATE_PR_OPEN` | Aggregate PR and owner coordinates are persisted | Collect aggregate review evidence |
+| `CODE_REVIEWED` | Review is bound to the candidate head and patch | Wait for CI/readiness |
+| `READY_FOR_INTEGRATION` | Direct parent accepted review and CI for the candidate head | Validate base-bound evidence |
 | `NEEDS_BASE_REVALIDATION` | Watcher observed base movement | Refresh integration CI and evidence |
+| `INTEGRATION_VALIDATED` | Base, head, tree, patch, and CI match the snapshot | Persist `MERGING` and call `merge_pr` |
 | `INTEGRATION_CONFLICT` | Aggregate integration cannot apply cleanly | Same-owner `resume_pr` or a named human gate |
+| `REPAIRING_AGGREGATE` | Same owner is repairing the aggregate head | Re-review the repaired head |
 | `MERGING` | Merge request was persisted | Reconcile watcher state after restart; never duplicate merge |
 | `MERGED` | Merge outcome is authoritative | Advance only after checkpoint |
+| `FAILED` | Child or integration failed terminally | Inspect failure and gate state |
+| `PARKED` | Ceiling or human decision stopped progress | Answer the named gate or revise the plan |
 
 The read model exposes `schema_version: 2`, `current_order`, grouped
-`ordered_stages`, aggregate integration evidence, and `next_transition` so an
-operator can diagnose a stopped stage without reading raw ledger payloads.
+`ordered_stages`, per-candidate aggregate evidence and owner coordinates, and
+`next_transition` so an operator can diagnose a stopped stage without reading
+raw ledger payloads. `NEEDS_BASE_REVALIDATION` refreshes base-bound evidence;
+`INTEGRATION_CONFLICT` routes the existing owner through `resume_pr`.
 
 ---
 

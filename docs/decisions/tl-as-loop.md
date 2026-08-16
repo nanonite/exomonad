@@ -47,6 +47,25 @@ the fold boundary. The controller makes those transitions executable and
 testable; the model supplies only bounded structured judgments
 (`decompose`, `adjudicate_review`, and `compose_repair`).
 
+### Ordered recursive stages
+
+Direct sibling sub-TLs may be grouped into positive numeric orders. The order
+scope resets at each recursive plan boundary. Missing order is the legacy
+order-1 shorthand; explicit orders must be complete and contiguous, so mixed
+explicit/missing siblings fail validation. Same-order children run concurrently
+within `max_parallel_slices`, while the parent serializes aggregate integration
+in stable sub-TL ID order. The plan therefore expresses stage dependencies, not
+merge priority.
+
+Each active sub-TL has an isolated controller process and durable checkpoint,
+owner branch, and worktree coordinates. The direct parent owns the aggregate
+PR. Review evidence is bound to the aggregate head and patch; integration
+evidence is independently bound to the current base, merge tree, and CI. Base
+movement enters `NEEDS_BASE_REVALIDATION`; a real conflict enters
+`INTEGRATION_CONFLICT` and uses same-owner `resume_pr`. Both transitions are
+durable and restart-safe, and higher orders cannot start before the current
+stage is integrated.
+
 ## Boundary choice: A — Haskell as the RPC surface
 
 The controller calls the existing Rust UDS/MCP runtime. Haskell WASM remains

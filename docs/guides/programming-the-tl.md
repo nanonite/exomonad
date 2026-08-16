@@ -293,7 +293,11 @@ commit to the caller's worktree is acceptable.
 ### `sub_tls` — recursion, and the only way to order work
 
 A sub-TL is a nested `tl_run` with its own checkpoint at
-`.exo/tl-loop/<parent>/<sub_tl>/run.json`. It is not another agent session.
+`.exo/tl-loop/<parent>/<sub_tl>/run.json`. In an active run it executes in an
+isolated controller process with its own owner branch and worktree coordinates;
+it is not an interactive model session and it does not own the parent merge.
+The direct parent remains the aggregate PR owner and the only process that
+serializes integration.
 
 ```json
 {
@@ -591,22 +595,77 @@ NO-GO uses compose_repair and resume_pr for that same aggregate owner, branch,
 worktree, and PR. It does not spawn a worker, create a replacement PR, or
 rebase a reviewed head solely because the parent base moved.
 
-The integration lifecycle shown in status and /control is:
+The integration lifecycle shown in `status` and `/control` is:
 
 | State | Meaning | Next legal transition |
 |---|---|---|
 | RUNNING | Children are still executing | Wait for child completion |
+| CHILDREN_MERGED | The child fold completed | Open or reuse the aggregate PR |
+| AGGREGATE_PR_OPEN | The aggregate PR and owner are persisted | Collect aggregate review evidence |
+| CODE_REVIEWED | The aggregate head has binding review evidence | Wait for CI and enter integration readiness |
 | READY_FOR_INTEGRATION | Head-bound review and CI are acceptable | Validate base/head/tree/CI evidence |
 | NEEDS_BASE_REVALIDATION | The parent base advanced; the reviewed head remains valid | Refresh integration evidence and CI |
-| INTEGRATION_CONFLICT | The candidate cannot merge cleanly | resume_pr the same aggregate owner |
-| MERGING | Merge was durably started | Reconcile live PR state; do not issue a duplicate merge |
+| INTEGRATION_VALIDATED | Base, head, tree, patch, and CI all match the snapshot | Persist `MERGING` and call `merge_pr` |
+| MERGING | Merge request was durably started | Reconcile live PR state after restart |
 | MERGED | The aggregate result is recorded | Advance to the next numeric order |
+| REPAIRING_AGGREGATE | Same owner is repairing the aggregate head | Re-review the repaired head |
+| INTEGRATION_CONFLICT | The candidate cannot merge cleanly | `resume_pr` the same aggregate owner or open the gate |
+| FAILED | The child or integration failed terminally | Inspect the failure and answer any named gate |
+| PARKED | A ceiling or human decision stopped progress | Answer the named gate or revise the plan |
 
 Repair and revalidation have separate ceilings. Exhausting either opens a
 named gate (tl-integration-conflict or tl-integration-revalidation).
 Restart reads the persisted stage, owner, PR, head, base, evidence, and
 attempt counters; it never treats a missing event as permission to duplicate a
 spawn, PR, review, repair, or merge.
+
+### Troubleshooting `status`
+
+The status projection is intentionally body-free but contains enough evidence
+to diagnose a stopped stage. Inspect these fields first:
+
+```bash
+python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
+```
+
+```json
+{
+  "current_order": 2,
+  "ordered_stages": [
+    {"order": 1, "sub_tls": [{"id": "auth", "lifecycle": "MERGED"}]},
+    {"order": 2, "sub_tls": [{
+      "id": "docs",
+      "lifecycle": "NEEDS_BASE_REVALIDATION",
+      "aggregate_pr_number": 42,
+      "head_sha": "head-docs",
+      "validated_base_sha": null,
+      "integration_ci": "unknown",
+      "owner_run_id": "docs",
+      "owner_branch": "main.docs"
+    }]}
+  ],
+  "integration": {"lifecycle": "NEEDS_BASE_REVALIDATION"},
+  "next_transition": "revalidate_base_and_integration_ci"
+}
+```
+
+`next_transition` is the operator diagnosis: `await_sub_tl_completion` means
+the child checkpoint is still running, `await_review_or_ci` means the
+aggregate PR is waiting for head-bound evidence, `validate_integration_evidence`
+means the parent has a ready candidate, and `resume_pr:<owner>` means a
+conflict repair belongs to the persisted aggregate owner. A pending
+`tl-integration-revalidation` or `tl-integration-conflict` gate must be
+answered explicitly; a restart or a new worker is not an answer.
+
+For a real-git/tmux and Forgejo-backed acceptance run, use the project recipe
+with a dedicated repository. The mock mode is hermetic and does not replace a
+real Forgejo run:
+
+```bash
+EXOMONAD_FORGEJO_E2E_MOCK=1 just tl-loop-ordered-forgejo
+# real run: set EXOMONAD_FORGEJO_E2E_URL/TOKEN/OWNER/REPO/GIT_REMOTE first
+just tl-loop-ordered-forgejo
+```
 
 ---
 

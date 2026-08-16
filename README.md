@@ -179,6 +179,11 @@ than duplicating a child or merge.
 
 See [Programming the TL](docs/guides/programming-the-tl.md#ordered-plan-examples)
 for validated JSON examples covering parallel, nested, and sequential stages.
+The same guide documents every persisted integration lifecycle and the
+`next_transition` troubleshooting field. To exercise the real-git/tmux
+acceptance harness against a dedicated Forgejo repository, run
+`just tl-loop-ordered-forgejo` after setting its `EXOMONAD_FORGEJO_E2E_*`
+variables; `EXOMONAD_FORGEJO_E2E_MOCK=1` runs the local API fixture.
 
 Once a run is live you can steer it three ways, in increasing richness:
 

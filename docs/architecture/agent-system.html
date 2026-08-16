@@ -39,7 +39,7 @@
 <table>
 <tr><th>Actor</th><th>Model</th><th>Spawns</th><th>Files PR</th><th>Merges PR</th><th>Lifecycle</th></tr>
 <tr><td><code>tl_loop</code> controller</td><td>Python; calls a model only for <code>decompose</code>, <code>adjudicate_review</code>, <code>compose_repair</code></td><td>yes</td><td>via children</td><td>yes</td><td>one per run; resumable from <code>.exo/tl-loop/&lt;run_id&gt;/run.json</code></td></tr>
-<tr><td><code>root</code> / <code>tl</code> roles</td><td>from <code>[roles.tl]</code></td><td>yes</td><td>yes</td><td>yes</td><td>RPC surface + branch coordinates; a sub-TL is a nested <code>tl_run</code></td></tr>
+<tr><td><code>root</code> / <code>tl</code> roles</td><td>from <code>[roles.tl]</code></td><td>yes</td><td>yes</td><td>yes</td><td>RPC surface + branch coordinates; an active sub-TL is an isolated controller process, not an interactive session</td></tr>
 <tr><td><code>dev</code></td><td>from <code>[roles.worker]</code></td><td>no</td><td>yes</td><td>no</td><td>one assignment per invocation, exits after handoff</td></tr>
 <tr><td><code>reviewer</code></td><td>from <code>[roles.reviewer]</code></td><td>no</td><td>no</td><td>no</td><td>ephemeral per review round</td></tr>
 <tr><td><code>worker</code></td><td>from <code>[roles.worker]</code></td><td>no</td><td>no</td><td>no</td><td>ephemeral, same-worktree edits</td></tr>
@@ -66,13 +66,21 @@ flowchart LR
 <p>Review evidence is bound to the reviewed head and patch digest. Integration evidence is bound to the current base, integrated head, merge tree, and CI. Base movement is <code>NEEDS_BASE_REVALIDATION</code>, not a reason to spawn a worker or rebase solely for freshness. A real conflict is <code>INTEGRATION_CONFLICT</code> and routes through same-owner <code>resume_pr</code>.</p>
 <table>
 <tr><th>Lifecycle</th><th>Authority</th><th>Recovery</th></tr>
+<tr><td><code>RUNNING</code></td><td>Direct children are executing</td><td>Wait for child checkpoints</td></tr>
+<tr><td><code>CHILDREN_MERGED</code></td><td>Child work folded into the aggregate branch</td><td>Open or reuse the aggregate PR</td></tr>
+<tr><td><code>AGGREGATE_PR_OPEN</code></td><td>Aggregate PR and owner coordinates are persisted</td><td>Collect aggregate review evidence</td></tr>
+<tr><td><code>CODE_REVIEWED</code></td><td>Review is bound to the candidate head and patch</td><td>Wait for CI/readiness</td></tr>
 <tr><td><code>READY_FOR_INTEGRATION</code></td><td>Direct parent accepted review and CI for the candidate head</td><td>Validate base-bound evidence</td></tr>
 <tr><td><code>NEEDS_BASE_REVALIDATION</code></td><td>Watcher observed base movement</td><td>Refresh integration CI and evidence</td></tr>
-<tr><td><code>INTEGRATION_CONFLICT</code></td><td>Aggregate integration cannot apply cleanly</td><td>Same-owner <code>resume_pr</code> or named human gate</td></tr>
+<tr><td><code>INTEGRATION_VALIDATED</code></td><td>Base, head, tree, patch, and CI match the snapshot</td><td>Persist <code>MERGING</code> and call <code>merge_pr</code></td></tr>
+<tr><td><code>INTEGRATION_CONFLICT</code></td><td>Aggregate integration cannot apply cleanly</td><td>Same-owner <code>resume_pr</code> or a named human gate</td></tr>
+<tr><td><code>REPAIRING_AGGREGATE</code></td><td>Same owner is repairing the aggregate head</td><td>Re-review the repaired head</td></tr>
 <tr><td><code>MERGING</code></td><td>Merge request was persisted</td><td>Reconcile watcher state after restart; never duplicate merge</td></tr>
 <tr><td><code>MERGED</code></td><td>Merge outcome is authoritative</td><td>Advance only after checkpoint</td></tr>
+<tr><td><code>FAILED</code></td><td>Child or integration failed terminally</td><td>Inspect failure and gate state</td></tr>
+<tr><td><code>PARKED</code></td><td>Ceiling or human decision stopped progress</td><td>Answer the named gate or revise the plan</td></tr>
 </table>
-<p>The read model exposes <code>schema_version: 2</code>, <code>current_order</code>, grouped <code>ordered_stages</code>, aggregate integration evidence, and <code>next_transition</code>.</p>
+<p>The read model exposes <code>schema_version: 2</code>, <code>current_order</code>, grouped <code>ordered_stages</code>, per-candidate aggregate evidence and owner coordinates, and <code>next_transition</code>. <code>NEEDS_BASE_REVALIDATION</code> refreshes base-bound evidence; <code>INTEGRATION_CONFLICT</code> routes the existing owner through <code>resume_pr</code>.</p>
 
 <h2>2. Tool Matrix</h2>
 

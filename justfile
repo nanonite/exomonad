@@ -77,6 +77,11 @@ haskell-test:
 tl-loop-test:
     {{py}} -m pytest -q tl_loop/tests
 
+# Validate relative documentation links and executable ordered-plan examples.
+docs-check:
+    python3 scripts/check-doc-links.py
+    {{py}} -m pytest -q tl_loop/tests/test_documented_ordered_plans.py
+
 # Replay committed TL event streams against the real loop
 tl-loop-replay:
     {{py}} -m pytest -q tl_loop/tests/test_replay.py
