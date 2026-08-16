@@ -29,6 +29,7 @@ from tl_loop.loop.driver import (
     WorkerTask,
     WorkPlan,
     _initial_slices,
+    _event_belongs_to_plan,
     _record_review_event,
     _route_ci_event,
     _route_review_event,
@@ -1290,6 +1291,38 @@ def _event(
 
 def _dispatch_intent(run_id: str, slug: str) -> str:
     return hashlib.sha256(f"{run_id}:{slug}:1".encode()).hexdigest()[:32]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        ("pr.review", {"findings": [], "head_sha": "aggregate-head"}),
+        ("ci.status_changed", {"ci_status": "success", "head_sha": "aggregate-head"}),
+    ],
+)
+def test_aggregate_review_and_ci_events_route_by_persisted_pr(
+    event_type: str, payload: dict[str, object]
+) -> None:
+    payload = {**payload, "pr_number": 77}
+    event = project(
+        {
+            "schema_version": 1,
+            "event_id": "aggregate-event",
+            "id": "aggregate-event",
+            "event_time": "2026-08-11T00:00:00Z",
+            "observed_at": "2026-08-11T00:00:00Z",
+            "run_seq": 1,
+            "type": event_type,
+            "agent_id": "aggregate-run:alpha:integration",
+            "run_id": "aggregate-run",
+            "session_id": "session-1",
+            "lifecycle_state": "observed",
+            "data": payload,
+        }
+    )
+    state = SimpleNamespace(slices={"alpha": SimpleNamespace(pr_number=77)})
+
+    assert _event_belongs_to_plan(event, set(), state)
 
 
 def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) -> None:

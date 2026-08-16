@@ -56,8 +56,11 @@ from tl_loop.ordered import (
     AggregateCandidate,
     IntegrationContract,
     IntegrationLifecycle,
+    IntegrationState,
+    IntegrationTransition,
     OrderedStage,
     ReviewOwner,
+    transition_integration,
 )
 from tl_loop.rlm.adjudicate import adjudicate_review
 from tl_loop.rlm.repair import RepairError, RepairHandoff, compose_repair
@@ -91,6 +94,34 @@ DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
+
+
+def _transition_sub_tl_lifecycle(
+    current: IntegrationLifecycle, event: IntegrationTransition
+) -> IntegrationLifecycle:
+    """Apply the centralized ordered-integration contract to one candidate."""
+    return transition_integration(IntegrationState(lifecycle=current), event).lifecycle
+
+
+def _sub_tls_waiting_for_integration(plan: WorkPlan, state: RunState) -> bool:
+    """Stop an idle poll only after the aggregate event queue was consulted."""
+    stage_ids = {
+        task_id
+        for stage in plan.ordered_stages
+        if state.current_order is None or stage.order == state.current_order
+        for task_id in stage.sub_tls
+    }
+    statuses = [
+        state.slices[task_id].status
+        for task_id in stage_ids
+        if task_id in state.slices
+    ]
+    return bool(statuses) and any(
+        status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING} for status in statuses
+    ) and all(
+        status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING, SliceStatus.MERGED}
+        for status in statuses
+    )
 
 
 class TLLoopError(RuntimeError):
@@ -482,33 +513,17 @@ def _run_loop(
 ) -> TLRunResult:
     """Shared loop body; active mode changes only effect execution."""
     phase = _phase_from_state(state)
-    expected = {task.name for task in plan.workers} | {task.name for task in plan.leaves}
+    expected = (
+        {task.name for task in plan.workers}
+        | {task.name for task in plan.leaves}
+        | {task.name for task in plan.sub_tls}
+    )
     leaf_names = {task.name for task in plan.leaves}
     merged: set[str] = set()
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
-    awaiting_sub_tl_review = any(
-        slice_state.status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
-        for slice_state in state.slices.values()
-    )
-    if not expected and (
-        not plan.sub_tls
-        or (
-            awaiting_sub_tl_review
-            and not any(
-                slice_state.status is SliceStatus.REPAIRING for slice_state in state.slices.values()
-            )
-        )
-    ):
-        if plan.sub_tls and awaiting_sub_tl_review:
-            return TLRunResult(
-                state,
-                tuple(effects_log),
-                tuple(transitions),
-                tuple(consumed),
-                tuple(heartbeat_events),
-            )
+    if not expected and not plan.sub_tls:
         before_phase = phase
         state = store.checkpoint(
             TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
@@ -580,6 +595,14 @@ def _run_loop(
                         _emit_phase_change(
                             run_id, before_phase, phase, config, effects, effects_log
                         )
+            if _sub_tls_waiting_for_integration(plan, state):
+                return TLRunResult(
+                    state,
+                    tuple(effects_log),
+                    tuple(transitions),
+                    tuple(consumed),
+                    tuple(heartbeat_events),
+                )
             continue
         event_seq = event.run_seq
         if event_seq is None:
@@ -1741,10 +1764,14 @@ def _complete_sub_tl_batch(
     sub_tl_states = dict(state.integration.sub_tl_states)
     for task, phase, child_state in outcomes:
         status = SliceStatus.MERGED if phase is TLPhase.TLDone else SliceStatus.FAILED
-        lifecycle = (
-            IntegrationLifecycle.CHILDREN_MERGED
-            if status is SliceStatus.MERGED
-            else IntegrationLifecycle.FAILED
+        previous_lifecycle = sub_tl_states.get(task.name, IntegrationLifecycle.RUNNING)
+        lifecycle = _transition_sub_tl_lifecycle(
+            previous_lifecycle,
+            (
+                IntegrationTransition.CHILDREN_MERGED
+                if status is SliceStatus.MERGED
+                else IntegrationTransition.FAILED
+            ),
         )
         current = updated_slices[task.name]
         if status is SliceStatus.MERGED:
@@ -1762,7 +1789,9 @@ def _complete_sub_tl_batch(
                     dispatch_last_boundary="aggregate_pr_open",
                 )
                 status = SliceStatus.IN_REVIEW
-                lifecycle = IntegrationLifecycle.AGGREGATE_PR_OPEN
+                lifecycle = _transition_sub_tl_lifecycle(
+                    lifecycle, IntegrationTransition.AGGREGATE_PR_OPENED
+                )
         updated_slices[task.name] = replace(current, status=status)
         sub_tl_states[task.name] = lifecycle
     integration = replace(state.integration, sub_tl_states=sub_tl_states)
@@ -3564,6 +3593,10 @@ def _event_belongs_to_plan(
         return True
     if event.kind is EventKind.PR_UPDATED:
         return True
+    if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW, EventKind.CI_STATUS_CHANGED}:
+        if state is None:
+            return False
+        return _review_slice_id(event, state) is not None
     if event.agent_id in expected:
         return True
     intent_id = event.data.get("intent_id")
