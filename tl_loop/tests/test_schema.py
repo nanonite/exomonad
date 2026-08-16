@@ -171,6 +171,51 @@ def test_ordered_runtime_state_is_closed_and_validated() -> None:
     )
     validate(document)
 
+    candidates = {
+        "auth": {
+            "lifecycle": IntegrationLifecycle.READY_FOR_INTEGRATION.value,
+            "aggregate_pr_number": 42,
+            "aggregate_head_sha": "head-auth",
+            "aggregate_patch_digest": "patch-auth",
+            "aggregate_original_base_sha": "base-1",
+            "integration_owner_id": "tl/auth",
+            "head_sha": "head-auth",
+            "patch_digest": "patch-auth",
+            "validated_base_sha": "base-1",
+            "merge_tree_sha": "tree-auth",
+            "integration_evidence_at": "2026-01-01T00:00:00Z",
+            "ci_status": "success",
+            "merge_attempts": 1,
+            "base_revalidation_count": 0,
+            "stage_verification": "passed",
+        },
+        "docs": {
+            "lifecycle": IntegrationLifecycle.READY_FOR_INTEGRATION.value,
+            "aggregate_pr_number": 43,
+            "aggregate_head_sha": "head-docs",
+            "aggregate_patch_digest": "patch-docs",
+            "aggregate_original_base_sha": "base-1",
+            "integration_owner_id": "tl/docs",
+            "head_sha": "head-docs",
+            "patch_digest": "patch-docs",
+            "validated_base_sha": "base-1",
+            "merge_tree_sha": "tree-docs",
+            "integration_evidence_at": "2026-01-01T00:00:00Z",
+            "ci_status": "success",
+            "merge_attempts": 1,
+            "base_revalidation_count": 0,
+            "stage_verification": "passed",
+        },
+    }
+    cast(dict[str, object], document["integration"])["candidates"] = candidates
+    validate(document)
+
+    invalid_candidate = deepcopy(document)
+    candidate_map = cast(dict[str, object], cast(dict[str, object], invalid_candidate["integration"])["candidates"])
+    cast(dict[str, object], candidate_map["auth"])["lifecycle"] = IntegrationLifecycle.MERGED.value
+    cast(dict[str, object], candidate_map["auth"]).pop("integration_owner_id")
+    _assert_rejected(invalid_candidate, "run.integration.candidates['auth'].integration_owner_id")
+
     invalid = deepcopy(document)
     cast(dict[str, object], invalid["integration"])["ci_status"] = "green"
     _assert_rejected(invalid, "run.integration.ci_status")

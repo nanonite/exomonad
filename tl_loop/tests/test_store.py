@@ -13,6 +13,7 @@ from tl_loop.state.schema import (
     BudgetLedger,
     FSMState,
     GateStatus,
+    IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
     SliceState,
@@ -102,6 +103,40 @@ def test_ordered_state_round_trips_and_resume_preserves_progress(tmp_path: Path)
         merge_attempts=1,
         base_revalidation_count=2,
         stage_verification="passed",
+        candidates={
+            "auth": IntegrationCandidateState(
+                lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
+                aggregate_pr_number=42,
+                aggregate_head_sha="head-auth",
+                aggregate_patch_digest="patch-auth",
+                aggregate_original_base_sha="base-1",
+                integration_owner_id="tl/auth",
+                head_sha="head-auth",
+                patch_digest="patch-auth",
+                validated_base_sha="base-1",
+                merge_tree_sha="tree-auth",
+                integration_evidence_at="2026-01-01T00:00:00Z",
+                ci_status="success",
+                merge_attempts=1,
+                stage_verification="passed",
+            ),
+            "sessions": IntegrationCandidateState(
+                lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
+                aggregate_pr_number=43,
+                aggregate_head_sha="head-sessions",
+                aggregate_patch_digest="patch-sessions",
+                aggregate_original_base_sha="base-1",
+                integration_owner_id="tl/sessions",
+                head_sha="head-sessions",
+                patch_digest="patch-sessions",
+                validated_base_sha="base-1",
+                merge_tree_sha="tree-sessions",
+                integration_evidence_at="2026-01-01T00:00:00Z",
+                ci_status="success",
+                merge_attempts=1,
+                stage_verification="passed",
+            ),
+        },
     )
 
     state = store.set_ordered_state(2, stages, integration)
@@ -113,6 +148,8 @@ def test_ordered_state_round_trips_and_resume_preserves_progress(tmp_path: Path)
     assert resumed.current_order == 2
     assert resumed.ordered_stages == stages
     assert resumed.integration == integration
+    assert resumed.integration.candidates["auth"].head_sha == "head-auth"
+    assert resumed.integration.candidates["sessions"].head_sha == "head-sessions"
 
 
 def test_legacy_run_defaults_ordered_state_without_rewrite(tmp_path: Path) -> None:

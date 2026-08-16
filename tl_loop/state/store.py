@@ -35,6 +35,7 @@ from .schema import (
     GateState,
     GateStatus,
     GoalState,
+    IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
     ParkCause,
@@ -582,6 +583,10 @@ def _encode_integration(value: IntegrationInput) -> dict[str, object]:
             "merge_attempts": value.merge_attempts,
             "base_revalidation_count": value.base_revalidation_count,
             "stage_verification": value.stage_verification,
+            "candidates": {
+                name: _encode_integration_candidate(candidate)
+                for name, candidate in value.candidates.items()
+            },
         }
         if value.integration_evidence_at is not None:
             record["integration_evidence_at"] = value.integration_evidence_at
@@ -589,6 +594,26 @@ def _encode_integration(value: IntegrationInput) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError("integration must be an IntegrationRuntimeState or object")
     return copy.deepcopy(dict(value))
+
+
+def _encode_integration_candidate(value: IntegrationCandidateState) -> dict[str, object]:
+    return {
+        "lifecycle": value.lifecycle.value,
+        "aggregate_pr_number": value.aggregate_pr_number,
+        "aggregate_head_sha": value.aggregate_head_sha,
+        "aggregate_patch_digest": value.aggregate_patch_digest,
+        "aggregate_original_base_sha": value.aggregate_original_base_sha,
+        "integration_owner_id": value.integration_owner_id,
+        "head_sha": value.head_sha,
+        "patch_digest": value.patch_digest,
+        "validated_base_sha": value.validated_base_sha,
+        "merge_tree_sha": value.merge_tree_sha,
+        "integration_evidence_at": value.integration_evidence_at,
+        "ci_status": value.ci_status,
+        "merge_attempts": value.merge_attempts,
+        "base_revalidation_count": value.base_revalidation_count,
+        "stage_verification": value.stage_verification,
+    }
 
 
 def _read_bytes(target: Path) -> bytes:
@@ -673,6 +698,33 @@ def _decode_integration(value: object) -> IntegrationRuntimeState:
     return IntegrationRuntimeState(
         lifecycle=IntegrationLifecycle(cast(str, value.get("lifecycle", "RUNNING"))),
         sub_tl_states=MappingProxyType(states),
+        aggregate_pr_number=cast(int | None, value.get("aggregate_pr_number")),
+        aggregate_head_sha=cast(str | None, value.get("aggregate_head_sha")),
+        aggregate_patch_digest=cast(str | None, value.get("aggregate_patch_digest")),
+        aggregate_original_base_sha=cast(str | None, value.get("aggregate_original_base_sha")),
+        integration_owner_id=cast(str | None, value.get("integration_owner_id")),
+        head_sha=cast(str | None, value.get("head_sha")),
+        patch_digest=cast(str | None, value.get("patch_digest")),
+        validated_base_sha=cast(str | None, value.get("validated_base_sha")),
+        merge_tree_sha=cast(str | None, value.get("merge_tree_sha")),
+        integration_evidence_at=cast(str | None, value.get("integration_evidence_at")),
+        ci_status=cast(str, value.get("ci_status", "unknown")),
+        merge_attempts=cast(int, value.get("merge_attempts", 0)),
+        base_revalidation_count=cast(int, value.get("base_revalidation_count", 0)),
+        stage_verification=cast(str, value.get("stage_verification", "pending")),
+        candidates=MappingProxyType(
+            {
+                name: _decode_integration_candidate(cast(dict[str, object], candidate))
+                for name, candidate in cast(dict[str, object], value.get("candidates", {})).items()
+                if isinstance(name, str) and isinstance(candidate, dict)
+            }
+        ),
+    )
+
+
+def _decode_integration_candidate(value: dict[str, object]) -> IntegrationCandidateState:
+    return IntegrationCandidateState(
+        lifecycle=IntegrationLifecycle(cast(str, value.get("lifecycle", "RUNNING"))),
         aggregate_pr_number=cast(int | None, value.get("aggregate_pr_number")),
         aggregate_head_sha=cast(str | None, value.get("aggregate_head_sha")),
         aggregate_patch_digest=cast(str | None, value.get("aggregate_patch_digest")),

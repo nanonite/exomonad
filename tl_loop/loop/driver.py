@@ -75,6 +75,7 @@ from tl_loop.state.schema import (
     BudgetLedger,
     GateStatus,
     GoalState,
+    IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
     ParkCause,
@@ -101,6 +102,87 @@ def _transition_sub_tl_lifecycle(
 ) -> IntegrationLifecycle:
     """Apply the centralized ordered-integration contract to one candidate."""
     return transition_integration(IntegrationState(lifecycle=current), event).lifecycle
+
+
+def _candidate_runtime(
+    integration: IntegrationRuntimeState, candidate_id: str
+) -> IntegrationRuntimeState:
+    """Read one candidate record, falling back to legacy single-candidate state."""
+    candidate = integration.candidates.get(candidate_id)
+    if candidate is None:
+        return integration
+    if (
+        len(integration.candidates) == 1
+        and candidate == IntegrationCandidateState()
+        and integration.lifecycle is not IntegrationLifecycle.RUNNING
+    ):
+        return replace(integration, candidates={})
+    return replace(
+        integration,
+        lifecycle=candidate.lifecycle,
+        aggregate_pr_number=candidate.aggregate_pr_number,
+        aggregate_head_sha=candidate.aggregate_head_sha,
+        aggregate_patch_digest=candidate.aggregate_patch_digest,
+        aggregate_original_base_sha=candidate.aggregate_original_base_sha,
+        integration_owner_id=candidate.integration_owner_id,
+        head_sha=candidate.head_sha,
+        patch_digest=candidate.patch_digest,
+        validated_base_sha=candidate.validated_base_sha,
+        merge_tree_sha=candidate.merge_tree_sha,
+        integration_evidence_at=candidate.integration_evidence_at,
+        ci_status=candidate.ci_status,
+        merge_attempts=candidate.merge_attempts,
+        base_revalidation_count=candidate.base_revalidation_count,
+        stage_verification=candidate.stage_verification,
+        candidates={},
+    )
+
+
+def _persist_candidate_runtime(
+    integration: IntegrationRuntimeState,
+    candidate_id: str,
+    candidate: IntegrationRuntimeState,
+) -> IntegrationRuntimeState:
+    """Write one candidate without discarding sibling candidate records."""
+    candidates = dict(integration.candidates)
+    candidates[candidate_id] = IntegrationCandidateState(
+        lifecycle=candidate.lifecycle,
+        aggregate_pr_number=candidate.aggregate_pr_number,
+        aggregate_head_sha=candidate.aggregate_head_sha,
+        aggregate_patch_digest=candidate.aggregate_patch_digest,
+        aggregate_original_base_sha=candidate.aggregate_original_base_sha,
+        integration_owner_id=candidate.integration_owner_id,
+        head_sha=candidate.head_sha,
+        patch_digest=candidate.patch_digest,
+        validated_base_sha=candidate.validated_base_sha,
+        merge_tree_sha=candidate.merge_tree_sha,
+        integration_evidence_at=candidate.integration_evidence_at,
+        ci_status=candidate.ci_status,
+        merge_attempts=candidate.merge_attempts,
+        base_revalidation_count=candidate.base_revalidation_count,
+        stage_verification=candidate.stage_verification,
+    )
+    # Keep legacy fields as a compatibility view; all ordered production reads
+    # use _candidate_runtime and therefore cannot mix sibling evidence.
+    return replace(
+        integration,
+        lifecycle=candidate.lifecycle,
+        aggregate_pr_number=candidate.aggregate_pr_number,
+        aggregate_head_sha=candidate.aggregate_head_sha,
+        aggregate_patch_digest=candidate.aggregate_patch_digest,
+        aggregate_original_base_sha=candidate.aggregate_original_base_sha,
+        integration_owner_id=candidate.integration_owner_id,
+        head_sha=candidate.head_sha,
+        patch_digest=candidate.patch_digest,
+        validated_base_sha=candidate.validated_base_sha,
+        merge_tree_sha=candidate.merge_tree_sha,
+        integration_evidence_at=candidate.integration_evidence_at,
+        ci_status=candidate.ci_status,
+        merge_attempts=candidate.merge_attempts,
+        base_revalidation_count=candidate.base_revalidation_count,
+        stage_verification=candidate.stage_verification,
+        candidates=candidates,
+    )
 
 
 def _sub_tls_waiting_for_integration(plan: WorkPlan, state: RunState) -> bool:
@@ -1762,6 +1844,7 @@ def _complete_sub_tl_batch(
     del tasks
     updated_slices = dict(state.slices)
     sub_tl_states = dict(state.integration.sub_tl_states)
+    candidate_records = dict(state.integration.candidates)
     for task, phase, child_state in outcomes:
         status = SliceStatus.MERGED if phase is TLPhase.TLDone else SliceStatus.FAILED
         previous_lifecycle = sub_tl_states.get(task.name, IntegrationLifecycle.RUNNING)
@@ -1774,6 +1857,7 @@ def _complete_sub_tl_batch(
             ),
         )
         current = updated_slices[task.name]
+        candidate_runtime = _candidate_runtime(state.integration, task.name)
         if status is SliceStatus.MERGED:
             candidate = _ensure_aggregate_candidate(
                 task, child_state, config, effects, store, effects_log
@@ -1792,9 +1876,41 @@ def _complete_sub_tl_batch(
                 lifecycle = _transition_sub_tl_lifecycle(
                     lifecycle, IntegrationTransition.AGGREGATE_PR_OPENED
                 )
+                candidate_runtime = replace(
+                    candidate_runtime,
+                    lifecycle=lifecycle,
+                    aggregate_pr_number=candidate.pr_number,
+                    aggregate_head_sha=candidate.head_sha,
+                    aggregate_patch_digest=candidate.patch_digest,
+                    aggregate_original_base_sha=candidate.original_base_sha,
+                    integration_owner_id=owner_id,
+                    head_sha=candidate.head_sha,
+                    patch_digest=candidate.patch_digest,
+                )
         updated_slices[task.name] = replace(current, status=status)
         sub_tl_states[task.name] = lifecycle
-    integration = replace(state.integration, sub_tl_states=sub_tl_states)
+        candidate_records[task.name] = IntegrationCandidateState(
+            lifecycle=candidate_runtime.lifecycle,
+            aggregate_pr_number=candidate_runtime.aggregate_pr_number,
+            aggregate_head_sha=candidate_runtime.aggregate_head_sha,
+            aggregate_patch_digest=candidate_runtime.aggregate_patch_digest,
+            aggregate_original_base_sha=candidate_runtime.aggregate_original_base_sha,
+            integration_owner_id=candidate_runtime.integration_owner_id,
+            head_sha=candidate_runtime.head_sha,
+            patch_digest=candidate_runtime.patch_digest,
+            validated_base_sha=candidate_runtime.validated_base_sha,
+            merge_tree_sha=candidate_runtime.merge_tree_sha,
+            integration_evidence_at=candidate_runtime.integration_evidence_at,
+            ci_status=candidate_runtime.ci_status,
+            merge_attempts=candidate_runtime.merge_attempts,
+            base_revalidation_count=candidate_runtime.base_revalidation_count,
+            stage_verification=candidate_runtime.stage_verification,
+        )
+    integration = replace(
+        state.integration,
+        sub_tl_states=sub_tl_states,
+        candidates=candidate_records,
+    )
     previous_slices = state.slices
     state = store.checkpoint(
         _phase_from_state(state),
@@ -2005,6 +2121,7 @@ def _open_integration_gate(
     current = state.slices[task.name]
     sub_states = dict(state.integration.sub_tl_states)
     sub_states[task.name] = lifecycle
+    candidate_runtime = _candidate_runtime(state.integration, task.name)
     updated = replace(
         current,
         status=SliceStatus.IN_REVIEW,
@@ -2012,10 +2129,9 @@ def _open_integration_gate(
         dispatch_error=reason[:500],
     )
     previous = next((gate for gate in state.gates if gate.name == gate_name), None)
-    integration = replace(
-        state.integration,
+    candidate_runtime = replace(
+        candidate_runtime,
         lifecycle=lifecycle,
-        sub_tl_states=sub_states,
         validated_base_sha=None,
         merge_tree_sha=None,
         integration_evidence_at=None,
@@ -2024,13 +2140,16 @@ def _open_integration_gate(
         head_sha=(
             None
             if lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT
-            else state.integration.head_sha
+            else candidate_runtime.head_sha
         ),
         patch_digest=(
             None
             if lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT
-            else state.integration.patch_digest
+            else candidate_runtime.patch_digest
         ),
+    )
+    integration = _persist_candidate_runtime(
+        replace(state.integration, sub_tl_states=sub_states), task.name, candidate_runtime
     )
     state = store.checkpoint(
         _phase_from_state(state),
@@ -2080,7 +2199,8 @@ def _handle_external_base_change(
         effects,
         effects_log,
     )
-    if state.integration.base_revalidation_count >= config.max_base_revalidations:
+    candidate_runtime = _candidate_runtime(state.integration, task.name)
+    if candidate_runtime.base_revalidation_count >= config.max_base_revalidations:
         return _open_integration_gate(
             task,
             state,
@@ -2093,7 +2213,7 @@ def _handle_external_base_change(
             reason=reason,
         )
     invalidated = invalidate_integration_evidence(
-        state.integration,
+        candidate_runtime,
         base_sha="",
         head_sha=head_sha,
         patch_digest=patch_digest,
@@ -2139,8 +2259,9 @@ def _handle_integration_conflict(
             lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
             reason=reason,
         )
+    candidate_runtime = _candidate_runtime(state.integration, task.name)
     conflict = replace(
-        state.integration,
+        candidate_runtime,
         lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
         head_sha=head_sha,
         patch_digest=current.review_patch_digests.get(head_sha),
@@ -2149,7 +2270,7 @@ def _handle_integration_conflict(
         ci_status="failure",
         integration_evidence_at=None,
         stage_verification="failed",
-        merge_attempts=state.integration.merge_attempts + 1,
+        merge_attempts=candidate_runtime.merge_attempts + 1,
     )
     conflicted = replace(
         current,
@@ -2166,7 +2287,9 @@ def _handle_integration_conflict(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=conflict,
+        integration=_persist_candidate_runtime(
+            state.integration, task.name, conflict
+        ),
     )
     _record_controller_event(
         task.name,
@@ -2246,8 +2369,9 @@ def _integrate_one_candidate(
 ) -> RunState:
     """Validate one aggregate candidate, recheck its base, then merge it."""
     current = state.slices[task.name]
+    candidate_runtime = _candidate_runtime(state.integration, task.name)
     first: Mapping[str, object] | None = None
-    if state.integration.lifecycle is IntegrationLifecycle.MERGING:
+    if candidate_runtime.lifecycle is IntegrationLifecycle.MERGING:
         first = _watcher_snapshot(current.pr_number, config, effects, effects_log)
         if first is None:
             return state
@@ -2258,13 +2382,13 @@ def _integrate_one_candidate(
                 {
                     "slice_id": task.name,
                     "pr_number": current.pr_number,
-                    "head_sha": state.integration.head_sha,
+                    "head_sha": candidate_runtime.head_sha,
                 },
                 config,
                 effects,
                 effects_log,
             )
-            return _checkpoint_aggregate_merged(task, state, store, state.integration)
+            return _checkpoint_aggregate_merged(task, state, store, candidate_runtime)
     first = first or _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if first is None:
         return state
@@ -2282,7 +2406,7 @@ def _integrate_one_candidate(
     except ReviewGateError:
         return state
     integration = replace(
-        state.integration,
+        candidate_runtime,
         lifecycle=IntegrationLifecycle.INTEGRATION_VALIDATED,
         head_sha=head_sha,
         patch_digest=patch_digest,
@@ -2299,7 +2423,7 @@ def _integrate_one_candidate(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=integration,
+        integration=_persist_candidate_runtime(state.integration, task.name, integration),
     )
     _record_controller_event(
         task.name,
@@ -2357,7 +2481,11 @@ def _integrate_one_candidate(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=replace(integration, lifecycle=IntegrationLifecycle.MERGING),
+        integration=_persist_candidate_runtime(
+            state.integration,
+            task.name,
+            replace(integration, lifecycle=IntegrationLifecycle.MERGING),
+        ),
     )
     _emit_merge_decision(
         task.name,
@@ -2435,6 +2563,7 @@ def _checkpoint_aggregate_merged(
     )
     sub_states = dict(state.integration.sub_tl_states)
     sub_states[task.name] = IntegrationLifecycle.MERGED
+    candidate_records = dict(state.integration.candidates)
     for sibling in state.ordered_stages:
         if task.name not in sibling.sub_tls:
             continue
@@ -2444,11 +2573,45 @@ def _checkpoint_aggregate_merged(
                 and updated_slices[sibling_id].status is SliceStatus.IN_REVIEW
             ):
                 sub_states[sibling_id] = IntegrationLifecycle.NEEDS_BASE_REVALIDATION
+                sibling_runtime = _candidate_runtime(state.integration, sibling_id)
+                candidate_records[sibling_id] = IntegrationCandidateState(
+                    lifecycle=IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+                    aggregate_pr_number=sibling_runtime.aggregate_pr_number,
+                    aggregate_head_sha=sibling_runtime.aggregate_head_sha,
+                    aggregate_patch_digest=sibling_runtime.aggregate_patch_digest,
+                    aggregate_original_base_sha=sibling_runtime.aggregate_original_base_sha,
+                    integration_owner_id=sibling_runtime.integration_owner_id,
+                    head_sha=sibling_runtime.head_sha,
+                    patch_digest=sibling_runtime.patch_digest,
+                    validated_base_sha=None,
+                    merge_tree_sha=None,
+                    integration_evidence_at=None,
+                    ci_status="unknown",
+                    merge_attempts=sibling_runtime.merge_attempts,
+                    base_revalidation_count=sibling_runtime.base_revalidation_count,
+                    stage_verification="pending",
+                )
     merged_integration = replace(
         integration,
         lifecycle=IntegrationLifecycle.MERGED,
+        aggregate_pr_number=integration.aggregate_pr_number or current.pr_number,
+        aggregate_head_sha=integration.aggregate_head_sha or integration.head_sha or current.reviewed_head,
+        aggregate_patch_digest=(
+            integration.aggregate_patch_digest
+            or integration.patch_digest
+            or current.review_patch_digests.get(current.reviewed_head or "")
+        ),
+        integration_owner_id=(
+            integration.integration_owner_id
+            or current.dispatch_agent_id
+            or f"{store.run_id}:{task.name}:integration"
+        ),
         merge_attempts=integration.merge_attempts + 1,
+        integration_evidence_at=integration.integration_evidence_at or _now_timestamp(),
         stage_verification="passed",
+    )
+    persisted_merged = _persist_candidate_runtime(
+        state.integration, task.name, merged_integration
     )
     remaining = {
         sibling_id: ChildHandle(
@@ -2467,7 +2630,11 @@ def _checkpoint_aggregate_merged(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=replace(merged_integration, sub_tl_states=sub_states),
+        integration=replace(
+            persisted_merged,
+            sub_tl_states=sub_states,
+            candidates=candidate_records,
+        ),
     )
 
 
@@ -2484,6 +2651,7 @@ def _checkpoint_integration_retry(
     del config
     sub_states = dict(state.integration.sub_tl_states)
     sub_states[slice_id] = IntegrationLifecycle.NEEDS_BASE_REVALIDATION
+    persisted = _persist_candidate_runtime(state.integration, slice_id, integration)
     slices = dict(state.slices)
     if slice_update is not None:
         slices[slice_id] = slice_update
@@ -2494,7 +2662,7 @@ def _checkpoint_integration_retry(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=replace(integration, sub_tl_states=sub_states),
+        integration=replace(persisted, sub_tl_states=sub_states),
     )
 
 

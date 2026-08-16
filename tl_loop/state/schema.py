@@ -111,6 +111,26 @@ INTEGRATION_KEYS = frozenset(
     {
         "lifecycle",
         "sub_tl_states",
+        "candidates",
+        "aggregate_pr_number",
+        "aggregate_head_sha",
+        "aggregate_patch_digest",
+        "aggregate_original_base_sha",
+        "integration_owner_id",
+        "head_sha",
+        "patch_digest",
+        "validated_base_sha",
+        "merge_tree_sha",
+        "integration_evidence_at",
+        "ci_status",
+        "merge_attempts",
+        "base_revalidation_count",
+        "stage_verification",
+    }
+)
+INTEGRATION_CANDIDATE_KEYS = frozenset(
+    {
+        "lifecycle",
         "aggregate_pr_number",
         "aggregate_head_sha",
         "aggregate_patch_digest",
@@ -326,6 +346,27 @@ class OrderedStageState:
 
 
 @dataclass(frozen=True)
+class IntegrationCandidateState:
+    """Persisted lifecycle and evidence for one aggregate candidate."""
+
+    lifecycle: IntegrationLifecycle = IntegrationLifecycle.RUNNING
+    aggregate_pr_number: int | None = None
+    aggregate_head_sha: str | None = None
+    aggregate_patch_digest: str | None = None
+    aggregate_original_base_sha: str | None = None
+    integration_owner_id: str | None = None
+    head_sha: str | None = None
+    patch_digest: str | None = None
+    validated_base_sha: str | None = None
+    merge_tree_sha: str | None = None
+    integration_evidence_at: str | None = None
+    ci_status: str = "unknown"
+    merge_attempts: int = 0
+    base_revalidation_count: int = 0
+    stage_verification: str = "pending"
+
+
+@dataclass(frozen=True)
 class IntegrationRuntimeState:
     """Persisted evidence and lifecycle for one parent stage fold."""
 
@@ -345,6 +386,7 @@ class IntegrationRuntimeState:
     merge_attempts: int = 0
     base_revalidation_count: int = 0
     stage_verification: str = "pending"
+    candidates: Mapping[str, IntegrationCandidateState] = field(default_factory=dict)
 
 
 SliceMap: TypeAlias = Mapping[str, SliceState]
@@ -502,6 +544,73 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
         errors.append(
             ("run.integration.stage_verification", "is not a recognised verification result")
         )
+    _validate_integration_evidence_contract(integration, "run.integration", errors)
+    candidates = integration.get("candidates")
+    if candidates is not None:
+        if not isinstance(candidates, dict):
+            errors.append(("run.integration.candidates", "must be an object"))
+        else:
+            for candidate_id, raw_candidate in candidates.items():
+                path = f"run.integration.candidates[{candidate_id!r}]"
+                if not isinstance(candidate_id, str) or not candidate_id:
+                    errors.append(("run.integration.candidates", "keys must be non-empty strings"))
+                    continue
+                candidate = _object(raw_candidate, path, INTEGRATION_CANDIDATE_KEYS, errors)
+                if candidate is None:
+                    continue
+                _enum_value(candidate, "lifecycle", path, IntegrationLifecycle, errors)
+                _nullable_positive_int(candidate, "aggregate_pr_number", path, errors)
+                for key in (
+                    "aggregate_head_sha",
+                    "aggregate_patch_digest",
+                    "aggregate_original_base_sha",
+                    "integration_owner_id",
+                    "head_sha",
+                    "patch_digest",
+                    "validated_base_sha",
+                    "merge_tree_sha",
+                    "integration_evidence_at",
+                ):
+                    _nullable_string(candidate, key, path, errors)
+                if "ci_status" in candidate and candidate["ci_status"] not in CI_STATUSES:
+                    errors.append((f"{path}.ci_status", "is not a recognised CI status"))
+                _non_negative_int(candidate, "merge_attempts", path, errors)
+                _non_negative_int(candidate, "base_revalidation_count", path, errors)
+                if candidate.get("stage_verification") not in INTEGRATION_VERIFICATION_VALUES:
+                    errors.append((f"{path}.stage_verification", "is not a recognised verification result"))
+                _validate_integration_evidence_contract(candidate, path, errors)
+
+
+def _validate_integration_evidence_contract(
+    value: Mapping[str, object], path: str, errors: list[tuple[str, str]]
+) -> None:
+    """Reject terminal integration states without the evidence that proves them."""
+    lifecycle = value.get("lifecycle")
+    if lifecycle == IntegrationLifecycle.MERGED.value:
+        required = (
+            "aggregate_pr_number",
+            "integration_owner_id",
+            "head_sha",
+            "patch_digest",
+            "validated_base_sha",
+            "merge_tree_sha",
+            "integration_evidence_at",
+        )
+        for key in required:
+            item = value.get(key)
+            if item is None or item == "":
+                errors.append((f"{path}.{key}", "is required when lifecycle is MERGED"))
+        if value.get("ci_status") not in {"success", "neutral"}:
+            errors.append((f"{path}.ci_status", "must be successful when lifecycle is MERGED"))
+        if value.get("stage_verification") != "passed":
+            errors.append((f"{path}.stage_verification", "must be passed when lifecycle is MERGED"))
+    if lifecycle in {
+        IntegrationLifecycle.INTEGRATION_VALIDATED.value,
+        IntegrationLifecycle.MERGING.value,
+    }:
+        for key in ("head_sha", "patch_digest", "validated_base_sha", "merge_tree_sha"):
+            if not value.get(key):
+                errors.append((f"{path}.{key}", "is required before merge"))
 
 
 def _slice_map(value: object, errors: list[tuple[str, str]]) -> dict[str, dict[str, object]] | None:
