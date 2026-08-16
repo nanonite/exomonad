@@ -29,10 +29,11 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# ruff: noqa: E402 - imports intentionally follow the project-root path setup.
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import JsonObject, TransportClient, TransportError
 from tl_loop.events.envelope import EventEnvelope, project
-from tl_loop.fsm.phase import ChildHandle, TLDispatching, TLPhase, TLWaiting
+from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
 from tl_loop.loop.driver import (
     SubTLTask,
     TLLoopConfig,
@@ -47,7 +48,6 @@ from tl_loop.state.schema import (
     IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
-    ParkCause,
     SliceState,
     SliceStatus,
     Verdict,
@@ -68,6 +68,61 @@ class EmptyEventSource:
 
     def acknowledge(self, event: Any) -> int:
         return event.run_seq
+
+
+class DispatchBoundaryTransportClient(TransportClient):
+    """Pause after durable dispatch state is visible through the real server."""
+
+    def __init__(self, project_root: Path, marker: Path, release: Path) -> None:
+        super().__init__(project_root=project_root, timeout=5)
+        self.marker = marker
+        self.release = release
+
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        response = super().call_tool(role, name, tool_name, arguments)
+        if (
+            tool_name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.slice_status_changed"
+            and not self.marker.exists()
+        ):
+            self.marker.write_text("dispatch-state-visible\n", encoding="utf-8")
+            while not self.release.exists():
+                time.sleep(0.01)
+        return response
+
+
+class BaseAdvancingTransportClient(TransportClient):
+    """Advance the remote base after the first real watcher snapshot."""
+
+    def __init__(self, project_root: Path, repo: Path) -> None:
+        super().__init__(project_root=project_root, timeout=5)
+        self.repo = repo
+        self.watcher_calls = 0
+        self.advanced_pr_numbers: set[int] = set()
+        self.base_advanced = False
+
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        response = super().call_tool(role, name, tool_name, arguments)
+        if tool_name == "watcher_pr_state":
+            self.watcher_calls += 1
+            pr_number = arguments.get("pr_number")
+            if self.watcher_calls == 1 and isinstance(pr_number, int):
+                self.advanced_pr_numbers.add(pr_number)
+                advance_remote_base(self.repo, len(self.advanced_pr_numbers))
+                self.base_advanced = True
+        return response
 
 
 class DelayedAggregateEventSource:
@@ -201,6 +256,43 @@ def run_command(command: list[str], cwd: Path | None = None) -> str:
 
 def git(repo: Path, *args: str) -> str:
     return run_command(["git", "-C", str(repo), *args])
+
+
+def advance_remote_base(repo: Path, sequence: int) -> None:
+    """Publish one new main commit while a candidate is being revalidated."""
+    worktree = repo.parent / f".base-revalidation-{sequence}"
+    git(repo, "fetch", "-q", "origin", "main")
+    run_command(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            str(worktree),
+            "origin/main",
+        ]
+    )
+    try:
+        marker = worktree / "base-revalidation.txt"
+        marker.write_text(f"advanced base {sequence}\n", encoding="utf-8")
+        git(worktree, "add", marker.name)
+        git(worktree, "commit", "-q", "-m", "Advance base for revalidation")
+        git(worktree, "push", "-q", "origin", "HEAD:main")
+    finally:
+        run_command(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+            ]
+        )
 
 
 def free_port() -> int:
@@ -647,14 +739,18 @@ def seed_delayed_restart_run(
             head_sha=head_sha,
             patch_digest=patch_digest,
             validated_base_sha=(
-                str(evidence["base_sha"]) if boundary == "merging" else None
+                str(evidence["base_sha"])
+                if boundary in {"base_revalidation", "merging"}
+                else None
             ),
             merge_tree_sha=(
-                str(evidence["merge_tree_sha"]) if boundary == "merging" else None
+                str(evidence["merge_tree_sha"])
+                if boundary in {"base_revalidation", "merging"}
+                else None
             ),
             integration_evidence_at=(
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                if boundary == "merging"
+                if boundary in {"base_revalidation", "merging"}
                 else None
             ),
             ci_status="success" if boundary == "merging" else "unknown",
@@ -727,33 +823,19 @@ def seed_dispatch_restart_run(
         root_dir=state_root,
     )
     state = store.load()
-    dispatching = {
-        name: replace(
-            current,
-            status=SliceStatus.DISPATCH_UNCONFIRMED,
-            branch=f"main.{name}",
-            worktree=str(repo / ".exo/agents" / name),
-            agent_type="sub-tl",
-            dispatch_intent_id=f"restart-{name}",
-            dispatch_started_at=time.time(),
-            dispatch_last_boundary="dispatch_requested",
-            park_cause=ParkCause.DISPATCH_UNCONFIRMED,
-            dispatch_agent_id=None,
-            dispatch_authoritative_event_seq=None,
-        )
-        for name, current in state.slices.items()
-    }
     stages = tuple(
         OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
     )
     integration = IntegrationRuntimeState(
-        sub_tl_states={
-            name: IntegrationLifecycle.RUNNING for name in dispatching
-        }
+        sub_tl_states={name: IntegrationLifecycle.RUNNING for name in state.slices},
+        candidates={
+            name: IntegrationCandidateState()
+            for name in state.slices
+        },
     )
     store.checkpoint(
-        TLDispatching(),
-        dispatching,
+        TLPlanning(),
+        state.slices,
         BudgetLedger(tokens=0, wall_seconds=0),
         0,
         current_order=1,
@@ -786,11 +868,23 @@ def _run_restart_case(
         )
     state_root = root / "controller-state"
     context = multiprocessing.get_context("fork")
+    dispatch_marker = root / "dispatch-state-visible"
+    dispatch_release = root / "dispatch-release"
+    dispatch_events_before = (
+        server_event_count(repo, "tl.dispatch_confirmed")
+        if boundary == "dispatch"
+        else None
+    )
 
     def controller(delay: float) -> None:
         source = DelayedAggregateEventSource(run_id, state_root, initial_delay=delay)
+        transport: TransportClient = TransportClient(project_root=repo, timeout=5)
+        if boundary == "dispatch" and delay > 1:
+            transport = DispatchBoundaryTransportClient(
+                repo, dispatch_marker, dispatch_release
+            )
         effects = EffectClient(
-            TransportClient(project_root=repo, timeout=5),
+            transport,
             role="tl",
             name="parent",
         )
@@ -811,11 +905,49 @@ def _run_restart_case(
 
     first = context.Process(target=controller, args=(5.0,))
     first.start()
-    time.sleep(0.5)
+    if boundary == "dispatch":
+        deadline = time.monotonic() + 10
+        while (
+            not dispatch_marker.exists()
+            and first.is_alive()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        if not dispatch_marker.exists():
+            first.terminate()
+            first.join(timeout=5)
+            raise HarnessError("dispatch controller did not reach its durable boundary")
+    else:
+        time.sleep(0.5)
     waiting_state = RunStore(run_id, state_root).load()
+    expected_lifecycle = {
+        "dispatch": IntegrationLifecycle.RUNNING,
+        "aggregate_review": IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        "base_revalidation": IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+        "merging": IntegrationLifecycle.MERGING,
+    }[boundary]
+    expected_heads = {
+        name: waiting_state.integration.candidates[name].head_sha
+        for name in waiting_state.integration.candidates
+    }
+    expected_bases = {
+        name: waiting_state.integration.candidates[name].validated_base_sha
+        for name in waiting_state.integration.candidates
+    }
+    if any(
+        candidate.lifecycle is not expected_lifecycle
+        for candidate in waiting_state.integration.candidates.values()
+    ):
+        first.terminate()
+        first.join(timeout=5)
+        raise HarnessError(
+            f"{boundary} restart was not captured at its requested lifecycle: "
+            f"{waiting_state.integration.candidates!r}"
+        )
     if not first.is_alive() or any(
         current.status
         not in {
+            SliceStatus.PENDING,
             SliceStatus.DISPATCHING,
             SliceStatus.DISPATCH_UNCONFIRMED,
             SliceStatus.SPAWNED,
@@ -835,7 +967,10 @@ def _run_restart_case(
         raise HarnessError("restart probe controller exited before the forced restart")
 
     source = DelayedAggregateEventSource(run_id, state_root, initial_delay=0.05)
-    effects = EffectClient(client, role="tl", name="parent")
+    resumed_transport: TransportClient = client
+    if boundary == "base_revalidation":
+        resumed_transport = BaseAdvancingTransportClient(repo, repo)
+    effects = EffectClient(resumed_transport, role="tl", name="parent")
     config = TLLoopConfig(
         active=True,
         keep_alive_on_waiting=True,
@@ -898,6 +1033,94 @@ def _run_restart_case(
             f"{boundary} restart did not perform exactly one merge per candidate: "
             f"before={merge_count_before} after={mock_merge_count(root / 'mock.log')}"
         )
+    final_candidates = result.final_state.integration.candidates
+    if boundary == "base_revalidation":
+        if not isinstance(resumed_transport, BaseAdvancingTransportClient):
+            raise HarnessError("base revalidation did not use the advancing watcher client")
+        if (
+            not resumed_transport.base_advanced
+            or resumed_transport.watcher_calls < 2
+            or not resumed_transport.advanced_pr_numbers
+        ):
+            raise HarnessError(
+                "base revalidation did not observe an advanced remote base through "
+                "watcher_pr_state"
+            )
+        revalidated = {
+            name: candidate
+            for name, candidate in final_candidates.items()
+            if candidate.base_revalidation_count >= 1
+        }
+        if not revalidated:
+            raise HarnessError(
+                f"base revalidation did not persist an attempt: {final_candidates!r}"
+            )
+        for name, candidate in revalidated.items():
+            if candidate.head_sha != expected_heads[name]:
+                raise HarnessError(
+                    f"{name} changed head during base revalidation: "
+                    f"before={expected_heads[name]!r} after={candidate.head_sha!r}"
+                )
+            if candidate.validated_base_sha == expected_bases[name]:
+                raise HarnessError(
+                    f"{name} revalidated against the original base: {candidate!r}"
+                )
+    if boundary == "dispatch":
+        if dispatch_events_before is None:
+            raise HarnessError("dispatch event baseline was not captured")
+        dispatch_delta = server_event_count(repo, "tl.dispatch_confirmed") - dispatch_events_before
+        if dispatch_delta != len(plan.sub_tls):
+            raise HarnessError(
+                f"dispatch restart produced {dispatch_delta} authoritative confirmations; "
+                f"expected {len(plan.sub_tls)}"
+            )
+        intents = [current.dispatch_intent_id for current in result.final_state.slices.values()]
+        owners = [current.dispatch_agent_id for current in result.final_state.slices.values()]
+        branches = [current.branch for current in result.final_state.slices.values()]
+        sequences = [
+            current.dispatch_authoritative_event_seq
+            for current in result.final_state.slices.values()
+        ]
+        if (
+            any(value is None for value in (*intents, *owners, *branches, *sequences))
+            or len(set(intents)) != len(intents)
+            or len(set(owners)) != len(owners)
+            or len(set(branches)) != len(branches)
+        ):
+            raise HarnessError(
+                f"dispatch restart did not preserve unique owners and branches: "
+                f"slices={result.final_state.slices!r}"
+            )
+
+
+def server_event_count(repo: Path, event_type: str) -> int:
+    """Count one event type in the server's durable JSONL ledger."""
+    count = 0
+    seen: set[tuple[str, str]] = set()
+    for path in (repo / ".exo").rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            continue
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, Mapping) or value.get(
+                "type", value.get("event_type")
+            ) != event_type:
+                continue
+            identity = value.get("event_id", value.get("id", value.get("run_seq")))
+            if isinstance(identity, (str, int)):
+                key = (event_type, str(identity))
+                if key in seen:
+                    continue
+                seen.add(key)
+            count += 1
+    return count
 
 
 def run_delayed_restart_probe(
