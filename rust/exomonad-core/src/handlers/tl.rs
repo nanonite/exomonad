@@ -11,7 +11,7 @@ use exomonad_proto::effects::tl::*;
 use serde_json::Value;
 use std::sync::Arc;
 
-const CONTROLLER_EVENT_TYPES: [&str; 15] = [
+const CONTROLLER_EVENT_TYPES: [&str; 17] = [
     "tl.phase_changed",
     "tl.slice_status_changed",
     "tl.slice_parked",
@@ -27,6 +27,8 @@ const CONTROLLER_EVENT_TYPES: [&str; 15] = [
     "tl.dispatch_confirmed",
     "tl.dispatch_reconciliation_started",
     "tl.dispatch_reconciliation_completed",
+    "tl.stage_started",
+    "tl.stage_completed",
 ];
 
 fn allowed_fields(event_type: &str) -> &'static [&'static str] {
@@ -57,8 +59,18 @@ fn allowed_fields(event_type: &str) -> &'static [&'static str] {
         | "tl.dispatch_reconciliation_completed" => {
             &["slice_id", "intent_id", "boundary", "started_at", "error"]
         }
+        "tl.stage_started" | "tl.stage_completed" => &["order", "sub_tl_ids", "run_id"],
         _ => &[],
     }
+}
+
+fn valid_field_value(event_type: &str, key: &str, value: &Value) -> bool {
+    if matches!(event_type, "tl.stage_started" | "tl.stage_completed") && key == "sub_tl_ids" {
+        return value
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string));
+    }
+    value.is_string() || value.is_boolean() || value.is_number()
 }
 
 /// Handles controller-owned aggregate observability events.
@@ -129,7 +141,7 @@ impl<C: HasEventLog + 'static> TlEffects for TlHandler<C> {
                     req.event_type
                 )));
             }
-            if !value.is_string() && !value.is_boolean() && !value.is_number() {
+            if !valid_field_value(req.event_type.as_str(), key, value) {
                 return Err(EffectError::invalid_input(format!(
                     "field '{key}' must be a scalar aggregate dimension"
                 )));
@@ -219,5 +231,30 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, EffectError::InvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn appends_ordered_stage_observability_events() {
+        let directory = tempdir().unwrap();
+        let mut services = Services::test();
+        services.event_log = Some(Arc::new(
+            EventLog::open(directory.path().join("logs")).unwrap(),
+        ));
+        let handler = TlHandler::new(Arc::new(services));
+
+        for event_type in ["tl.stage_started", "tl.stage_completed"] {
+            let response = handler
+                .emit_event(
+                    EmitEventRequest {
+                        event_type: event_type.to_string(),
+                        payload: br#"{"order":1,"sub_tl_ids":["sub-a","sub-b"],"run_id":"root"}"#
+                            .to_vec(),
+                    },
+                    &context(),
+                )
+                .await
+                .unwrap();
+            assert!(!response.event_id.is_empty());
+        }
     }
 }
