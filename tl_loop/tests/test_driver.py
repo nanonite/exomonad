@@ -2102,6 +2102,12 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
 
     assert result.final_state.slices["aggregate-child"].status is SliceStatus.MERGED
     assert verified == [("base-a", "head-a", "tree-a", "success")]
+    candidate = result.final_state.integration.candidates["aggregate-child"]
+    assert candidate.validated_base_sha == "base-a"
+    assert candidate.head_sha == "head-a"
+    assert candidate.patch_digest == "patch-a"
+    assert candidate.merge_tree_sha == "tree-a"
+    assert candidate.ci_status == "success"
     assert [name for name, _ in transport.calls if name == "merge_pr"] == ["merge_pr"]
     assert next(
         arguments for name, arguments in transport.calls if name == "merge_pr"
