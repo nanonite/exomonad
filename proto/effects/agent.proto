@@ -394,6 +394,10 @@ message WatcherPrStateResponse {
   string pr_state = 12;
   bool merged = 13;
   uint32 review_count = 14;
+  // Authoritative Git evidence observed for this exact PR head.
+  string base_sha = 15;
+  string patch_digest = 16;
+  string merge_tree_sha = 17;
 }
 
 // ============================================================================

@@ -687,6 +687,9 @@ fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPr
         head_sha: String::new(),
         head_branch: String::new(),
         base_branch: String::new(),
+        base_sha: String::new(),
+        patch_digest: String::new(),
+        merge_tree_sha: String::new(),
         pr_state: String::new(),
         merged: false,
         review_count: 0,
@@ -1634,6 +1637,17 @@ impl<
             Err(error) => return Ok(watcher_pr_state_error(req.pr_number, error.to_string())),
         };
         let head_sha = pr.head_sha.clone().unwrap_or_default();
+        let project_dir = self.ctx.project_dir().to_string_lossy().into_owned();
+        let evidence = match crate::services::merge_pr::observe_pr_evidence(
+            &project_dir,
+            pr.base_ref.as_str(),
+            &head_sha,
+        )
+        .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => return Ok(watcher_pr_state_error(req.pr_number, error.to_string())),
+        };
 
         let reviews = forgejo
             .list_pull_request_reviews(
@@ -1662,6 +1676,9 @@ impl<
             head_sha,
             head_branch: pr.head_ref.to_string(),
             base_branch: pr.base_ref.to_string(),
+            base_sha: evidence.base_sha,
+            patch_digest: evidence.patch_digest,
+            merge_tree_sha: evidence.merge_tree_sha,
             pr_state: pr.state,
             merged: pr.merged,
             review_count,

@@ -26,11 +26,11 @@ pub struct MergeExpectedEvidence<'a> {
     pub merge_tree_sha: Option<&'a str>,
 }
 
-struct MergeObservedEvidence {
-    base_sha: String,
-    head_sha: String,
-    patch_digest: String,
-    merge_tree_sha: String,
+pub struct MergeObservedEvidence {
+    pub base_sha: String,
+    pub head_sha: String,
+    pub patch_digest: String,
+    pub merge_tree_sha: String,
 }
 
 /// Merge a PR using the Forgejo API.
@@ -78,47 +78,10 @@ pub async fn merge_pr_async(
             });
         }
     }
-    let authoritative_base = if expected.base_sha.is_some()
+    if expected.base_sha.is_some()
         || expected.patch_digest.is_some()
         || expected.merge_tree_sha.is_some()
     {
-        match authoritative_base_sha(dir, pr.base_ref.as_str()).await {
-            Ok(actual) => actual,
-            Err(error) => {
-                return Ok(cas_failure(
-                    format!("compare_and_swap: authoritative base lookup failed: {error}"),
-                    branch_name,
-                    head_sha,
-                ));
-            }
-        }
-        .into()
-    } else {
-        None
-    };
-    if let (Some(expected), Some(actual)) = (
-        expected.base_sha.filter(|value| !value.is_empty()),
-        authoritative_base.as_deref(),
-    ) {
-        if actual != expected {
-            return Ok(MergePROutput {
-                success: false,
-                message: format!("compare_and_swap: expected base {expected}, found {actual:?}"),
-                git_fetched: false,
-                branch_name,
-                head_sha,
-            });
-        }
-    }
-
-    if expected.patch_digest.is_some() || expected.merge_tree_sha.is_some() {
-        let Some(actual_base) = authoritative_base.as_deref() else {
-            return Ok(cas_failure(
-                "compare_and_swap: authoritative base was not observed".to_string(),
-                branch_name,
-                head_sha,
-            ));
-        };
         let Some(actual_head) = pr.head_sha.as_deref() else {
             return Ok(cas_failure(
                 "compare_and_swap: PR has no authoritative head SHA".to_string(),
@@ -126,7 +89,7 @@ pub async fn merge_pr_async(
                 head_sha,
             ));
         };
-        let observed = match observe_merge_evidence(dir, actual_base, actual_head).await {
+        let observed = match observe_pr_evidence(dir, pr.base_ref.as_str(), actual_head).await {
             Ok(observed) => observed,
             Err(error) => {
                 return Ok(cas_failure(
@@ -218,6 +181,16 @@ async fn authoritative_base_sha(dir: &str, base_ref: &str) -> Result<String> {
     run_git(dir, &["fetch", "--prune", &remote]).await?;
     let remote_ref = format!("refs/remotes/{remote}/{base_ref}");
     run_git(dir, &["rev-parse", "--verify", &remote_ref]).await
+}
+
+/// Observe the same authoritative evidence used by merge compare-and-swap.
+pub async fn observe_pr_evidence(
+    dir: &str,
+    base_ref: &str,
+    head_sha: &str,
+) -> Result<MergeObservedEvidence> {
+    let base_sha = authoritative_base_sha(dir, base_ref).await?;
+    observe_merge_evidence(dir, &base_sha, head_sha).await
 }
 
 async fn configured_remote(dir: &str) -> Result<String> {
