@@ -59,7 +59,11 @@ data MergePRArgs = MergePRArgs
   { mprPrNumber :: Int,
     mprStrategy :: Maybe Text,
     mprWorkingDir :: Maybe Text,
-    mprChainlinkIssueId :: Maybe Int
+    mprChainlinkIssueId :: Maybe Int,
+    mprExpectedBaseSha :: Maybe Text,
+    mprExpectedHeadSha :: Maybe Text,
+    mprExpectedPatchDigest :: Maybe Text,
+    mprExpectedMergeTreeSha :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -70,6 +74,10 @@ instance FromJSON MergePRArgs where
       <*> v .:? "strategy"
       <*> v .:? "working_dir"
       <*> v .:? "chainlink_issue_id"
+      <*> v .:? "expected_base_sha"
+      <*> v .:? "expected_head_sha"
+      <*> v .:? "expected_patch_digest"
+      <*> v .:? "expected_merge_tree_sha"
 
 data MergePROutput = MergePROutput
   { mpoSuccess :: Bool,
@@ -472,10 +480,10 @@ runMerge args = do
           { MP.mergePrRequestPrNumber = fromIntegral (mprPrNumber args),
             MP.mergePrRequestStrategy = maybe "" TL.fromStrict (mprStrategy args),
             MP.mergePrRequestWorkingDir = maybe "" TL.fromStrict (mprWorkingDir args),
-            MP.mergePrRequestExpectedBaseSha = "",
-            MP.mergePrRequestExpectedHeadSha = "",
-            MP.mergePrRequestExpectedPatchDigest = "",
-            MP.mergePrRequestExpectedMergeTreeSha = ""
+            MP.mergePrRequestExpectedBaseSha = maybe "" TL.fromStrict (mprExpectedBaseSha args),
+            MP.mergePrRequestExpectedHeadSha = maybe "" TL.fromStrict (mprExpectedHeadSha args),
+            MP.mergePrRequestExpectedPatchDigest = maybe "" TL.fromStrict (mprExpectedPatchDigest args),
+            MP.mergePrRequestExpectedMergeTreeSha = maybe "" TL.fromStrict (mprExpectedMergeTreeSha args)
           }
   result <- suspendEffect @MergePRMergePr req
   case result of
