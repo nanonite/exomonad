@@ -64,9 +64,16 @@ fn allowed_fields(event_type: &str) -> &'static [&'static str] {
         | "tl.spawn_request_failed"
         | "tl.dispatch_confirmed"
         | "tl.dispatch_reconciliation_started"
-        | "tl.dispatch_reconciliation_completed" => {
-            &["slice_id", "intent_id", "boundary", "started_at", "error"]
-        }
+        | "tl.dispatch_reconciliation_completed" => &[
+            "slice_id",
+            "intent_id",
+            "boundary",
+            "started_at",
+            "error",
+            "harness",
+            "agent_type",
+            "model",
+        ],
         "tl.stage_started" | "tl.stage_completed" => &["order", "sub_tl_ids", "run_id"],
         "tl.aggregate_pr_opened" => &[
             "sub_tl_id",
@@ -233,6 +240,29 @@ mod tests {
                 EmitEventRequest {
                     event_type: "tl.dispatch_intended".to_string(),
                     payload: br#"{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"dispatch_intended","started_at":1}"#.to_vec(),
+                },
+                &context(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!response.event_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accepts_dispatch_telemetry_agent_type_and_model() {
+        let directory = tempdir().unwrap();
+        let mut services = Services::test();
+        services.event_log = Some(Arc::new(
+            EventLog::open(directory.path().join("logs")).unwrap(),
+        ));
+        let handler = TlHandler::new(Arc::new(services));
+
+        let response = handler
+            .emit_event(
+                EmitEventRequest {
+                    event_type: "tl.spawn_requested".to_string(),
+                    payload: br#"{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"spawn_requested","started_at":1,"harness":"opencode","agent_type":"opencode","model":"opencode-go/deepseek-v4-pro"}"#.to_vec(),
                 },
                 &context(),
             )

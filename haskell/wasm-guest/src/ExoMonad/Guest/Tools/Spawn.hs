@@ -391,6 +391,7 @@ spawnLeafCore args = do
             slsBranchName = slName args,
             slsIntentId = slIntentId args,
             slsAgentType = slAgentType args,
+            slsModel = slModel args,
             slsPermissionMode = Nothing,
             slsAllowedTools = Nothing,
             slsDisallowedTools = Nothing,

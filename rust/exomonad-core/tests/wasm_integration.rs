@@ -19,9 +19,15 @@ use serde_json::{json, Value};
 use serial_test::serial;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 static MOCK_AGENT_CLOSE_SELF_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MOCK_EVENTS_NOTIFY_PARENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MOCK_LAST_SPAWN_LEAF_MODEL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn mock_last_spawn_leaf_model() -> &'static Mutex<Option<String>> {
+    MOCK_LAST_SPAWN_LEAF_MODEL.get_or_init(|| Mutex::new(None))
+}
 
 // ============================================================================
 // Test Infrastructure
@@ -435,6 +441,8 @@ impl EffectHandler for MockAgentHandler {
             "agent.spawn_leaf_subtree" => {
                 let req = SpawnLeafSubtreeRequest::decode(payload)
                     .expect("mock agent handler should decode spawn_leaf_subtree request");
+                *mock_last_spawn_leaf_model().lock().unwrap() =
+                    (!req.model.is_empty()).then_some(req.model.clone());
                 let agent = AgentInfo {
                     id: "test-leaf-codex".into(),
                     issue: String::new(),
@@ -1409,6 +1417,33 @@ async fn wasm_spawn_leaf_passes_agent_type() {
 
     assert_tool_success(&output, "spawn_leaf");
     assert_eq!(output["result"]["agent_type"], "opencode");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_spawn_leaf_preserves_explicit_model_separately_from_agent_type() {
+    *mock_last_spawn_leaf_model().lock().unwrap() = None;
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_leaf",
+        json!({
+            "name": "model-routing",
+            "task": "Exercise model propagation",
+            "agent_type": "opencode",
+            "model": "opencode-go/deepseek-v4-pro"
+        }),
+    )
+    .await;
+
+    assert_tool_success(&output, "spawn_leaf");
+    assert_eq!(output["result"]["agent_type"], "opencode");
+    assert_eq!(
+        *mock_last_spawn_leaf_model().lock().unwrap(),
+        Some("opencode-go/deepseek-v4-pro".to_owned())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

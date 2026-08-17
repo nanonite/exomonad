@@ -9,6 +9,7 @@ build-type:         Simple
 
 common shared
     default-language: GHC2021
+    ghc-options: -Wmissing-fields -Werror=missing-fields
     default-extensions:
         AllowAmbiguousTypes
         DataKinds

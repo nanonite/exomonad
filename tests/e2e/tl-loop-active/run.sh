@@ -55,6 +55,10 @@ PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/active_run.py" \
 
 printf '>>> [Phase 2] Exercising the default TL-window controller command without starting a session...\n'
 mkdir -p "$REPO_DIR/.exo/tl-loop"
+printf '%s\n' 'spawn_agent_type = "codex"' > "$REPO_DIR/.exo/config.toml"
+cp "$PROJECT_ROOT/.exo/harness_policy.toml" "$REPO_DIR/.exo/harness_policy.toml"
+cp "$PROJECT_ROOT/.exo/review-policy.toml" "$REPO_DIR/.exo/review-policy.toml"
+cp "$PROJECT_ROOT/.exo/harness_capability.toml" "$REPO_DIR/.exo/harness_capability.toml"
 printf '%s\n' '{"run_id":"root","plan":{"leaves":[]}}' > "$REPO_DIR/.exo/tl-loop/plan.json"
 PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop run \
     --project-root "$REPO_DIR" \

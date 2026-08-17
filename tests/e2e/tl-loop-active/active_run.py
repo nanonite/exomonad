@@ -52,9 +52,11 @@ class ActiveEffectTransport:
 
     repo: Path
     remote: Path
+    ledger_segments: Path
     calls: list[dict[str, object]] = field(default_factory=list)
     prs: dict[int, PullRequest] = field(default_factory=dict)
     adjudications: int = 0
+    controller_events: list[dict[str, object]] = field(default_factory=list)
 
     def call_tool(
         self,
@@ -66,6 +68,8 @@ class ActiveEffectTransport:
         """Record and execute one active effect without an interactive agent."""
         del role, name
         self.calls.append({"tool": tool_name, "arguments": json.loads(json.dumps(arguments))})
+        if tool_name == "emit_controller_event":
+            return self._emit_controller_event(arguments)
         if tool_name == "spawn_leaf":
             return self._spawn_leaf(arguments)
         if tool_name == "watcher_pr_state":
@@ -73,6 +77,33 @@ class ActiveEffectTransport:
         if tool_name == "merge_pr":
             return self._merge_pr(arguments)
         raise AssertionError(f"unexpected active-loop effect: {tool_name}")
+
+    def _emit_controller_event(self, arguments: JsonObject) -> JsonObject:
+        event_type = _string(arguments, "event_type")
+        payload = arguments.get("payload")
+        if not isinstance(payload, dict):
+            raise TypeError("controller event payload must be an object")
+        event = {"event_type": event_type, "payload": json.loads(json.dumps(payload))}
+        self.controller_events.append(event)
+        if event_type in {
+            "tl.dispatch_intended",
+            "tl.spawn_requested",
+            "tl.spawn_request_accepted",
+        }:
+            if payload.get("harness") != "codex/gpt-luna":
+                raise AssertionError(f"dispatch telemetry lost harness identity: {event}")
+            if payload.get("agent_type") != "codex":
+                raise AssertionError(f"dispatch telemetry lost agent type: {event}")
+            if payload.get("model") != "gpt-luna":
+                raise AssertionError(f"dispatch telemetry lost model identity: {event}")
+        elif event_type == "tl.dispatch_confirmed":
+            for key, expected in (("agent_type", "codex"), ("model", "gpt-luna")):
+                if key in payload and payload[key] != expected:
+                    raise AssertionError(f"dispatch telemetry changed {key}: {event}")
+        return {
+            "success": True,
+            "result": {"event_id": f"active-controller-event-{len(self.controller_events)}"},
+        }
 
     def file_upward_pr(self) -> dict[str, object]:
         """File a real summary branch representing the TL's upward PR."""
@@ -104,6 +135,7 @@ class ActiveEffectTransport:
 
     def _spawn_leaf(self, arguments: JsonObject) -> JsonObject:
         name = _string(arguments, "name")
+        intent_id = _string(arguments, "intent_id")
         if name not in LEAVES:
             raise AssertionError(f"unexpected leaf {name!r}")
         if name in {pr.branch.rsplit(".", 1)[-1] for pr in self.prs.values()}:
@@ -128,6 +160,7 @@ class ActiveEffectTransport:
         _git(worktree, "commit", "-m", f"Implement {name}")
         _git(worktree, "push", "-u", "origin", branch)
         commit_sha = _git(worktree, "rev-parse", "HEAD")
+        self._correlate_spawn_event(name, intent_id)
         pr_number = PR_NUMBERS[name]
         self.prs[pr_number] = PullRequest(
             number=pr_number,
@@ -137,6 +170,23 @@ class ActiveEffectTransport:
             commit_sha=commit_sha,
         )
         return {"success": True, "result": {"branch": branch, "pr_number": pr_number}}
+
+    def _correlate_spawn_event(self, name: str, intent_id: str) -> None:
+        segment = self.ledger_segments / "segment-0001.jsonl"
+        rows = [json.loads(line) for line in segment.read_text(encoding="utf-8").splitlines()]
+        for row in rows:
+            if row.get("type") != "agent.spawned" or row.get("agent_id") != name:
+                continue
+            data = row.get("data")
+            if not isinstance(data, dict):
+                raise TypeError(f"spawn event data is not an object: {row}")
+            data["intent_id"] = intent_id
+            segment.write_text(
+                "".join(json.dumps(item, sort_keys=True) + "\n" for item in rows),
+                encoding="utf-8",
+            )
+            return
+        raise AssertionError(f"no authoritative spawn event exists for {name!r}")
 
     def _watcher_pr_state(self, arguments: JsonObject) -> JsonObject:
         pr_number = _positive_int(arguments, "pr_number")
@@ -177,7 +227,7 @@ def run_active_wave(repo: Path, remote: Path, artifacts: Path) -> None:
     segments = repo / ".exo" / "ledger" / "segments"
     state_root = repo / ".exo" / "tl-loop"
     _write_ledger(segments)
-    transport = ActiveEffectTransport(repo, remote)
+    transport = ActiveEffectTransport(repo, remote, segments)
     reader = LedgerReader(segments, run_id=RUN_ID, state_root=state_root)
     source = LazyLedgerQueue(reader)
     plan = WorkPlan.from_mapping(
@@ -295,7 +345,12 @@ def _assert_result(
     state = RunStore(RUN_ID, state_root).load()
     if result.final_state.fsm.phase is not TLPhase.TLDone or state.fsm.phase is not TLPhase.TLDone:
         raise AssertionError(f"active loop did not finish at TLDone: {state.fsm.phase}")
-    if [call["tool"] for call in transport.calls] != [
+    effect_tools = [
+        cast(str, call["tool"])
+        for call in transport.calls
+        if call["tool"] != "emit_controller_event"
+    ]
+    if effect_tools != [
         "spawn_leaf",
         "spawn_leaf",
         "watcher_pr_state",
@@ -304,6 +359,18 @@ def _assert_result(
         "merge_pr",
     ]:
         raise AssertionError(f"unexpected active effect order: {transport.calls}")
+    dispatch_events = {
+        event["event_type"]
+        for event in transport.controller_events
+        if cast(str, event["event_type"]).startswith(("tl.dispatch_", "tl.spawn_"))
+    }
+    if not {
+        "tl.dispatch_intended",
+        "tl.spawn_requested",
+        "tl.spawn_request_accepted",
+        "tl.dispatch_confirmed",
+    }.issubset(dispatch_events):
+        raise AssertionError(f"dispatch telemetry was incomplete: {transport.controller_events}")
     if transport.adjudications != 2 or len(transport.prs) != 2:
         raise AssertionError("both PRs must receive one deterministic approval")
     if not all(pr.merged for pr in transport.prs.values()):
