@@ -116,6 +116,7 @@ class LedgerReader:
         run_dir: str | Path | None = None,
         run_id: str | None = None,
         state_root: str | Path = DEFAULT_ROOT,
+        ledger_run_id: str | None = None,
         scope_run_id: str | None = None,
         scope_agent_id: str | None = None,
     ) -> None:
@@ -129,9 +130,13 @@ class LedgerReader:
             self.run_dir = Path(state_root) / run_id
         else:
             self.run_dir = None
-        _optional_scope_text(scope_run_id, "scope_run_id")
+        if ledger_run_id is not None and scope_run_id is not None and ledger_run_id != scope_run_id:
+            raise ValueError("reader ledger_run_id and scope_run_id must match when both are set")
+        effective_scope = ledger_run_id or scope_run_id
+        _optional_scope_text(effective_scope, "ledger_run_id")
         _optional_scope_text(scope_agent_id, "scope_agent_id")
-        self.scope_run_id = scope_run_id
+        self.ledger_run_id = effective_scope
+        self.scope_run_id = effective_scope
         self.scope_agent_id = scope_agent_id
 
     def cursor(self) -> int:
@@ -180,7 +185,7 @@ class LedgerReader:
 
     def _in_scope(self, event: EventEnvelope) -> bool:
         """Keep one run and its directly owned child events in scope."""
-        if self.scope_run_id is not None and event.run_id != self.scope_run_id:
+        if self.ledger_run_id is not None and event.run_id != self.ledger_run_id:
             return False
         return not (self.scope_agent_id is not None and event.agent_id not in {self.scope_agent_id} and event.parent_agent_id != self.scope_agent_id)
 

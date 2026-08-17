@@ -89,6 +89,7 @@ RUN_KEYS = frozenset(
         "version",
         "revision",
         "run_id",
+        "ledger_run_id",
         "fsm",
         "slices",
         "budgets",
@@ -416,6 +417,7 @@ class RunState:
     budgets: BudgetLedger
     gates: tuple[GateState, ...]
     events: EventCursor
+    ledger_run_id: str | None = None
     owner_branch: str | None = None
     owner_worktree: str | None = None
     parent_branch: str | None = None
@@ -448,6 +450,7 @@ def validate(doc: object) -> None:
     _non_negative_int(root, "revision", "run", errors)
     _non_empty_string(root, "run_id", "run", errors)
     for key in (
+        "ledger_run_id",
         "owner_branch",
         "owner_worktree",
         "parent_branch",

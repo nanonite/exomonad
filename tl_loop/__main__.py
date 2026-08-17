@@ -172,11 +172,13 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     plan_document = _load_plan(plan_path, args.wait_for_plan)
     plan = _plan_from_document(plan_document)
     run_id = _run_id(plan_document, args.run_id)
+    ledger_run_id = _authoritative_ledger_run_id(project_root)
     state_root = project_root / ".exo" / "tl-loop"
     reader = LedgerReader(
         project_root / ".exo" / "ledger" / "segments",
         run_id=run_id,
         state_root=state_root,
+        ledger_run_id=ledger_run_id,
     )
     source = LedgerQueue(reader, poll_interval=args.poll_interval).start()
     effects = EffectClient(
@@ -204,6 +206,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         effects=effects,
         root_dir=state_root,
         run_id=run_id,
+        ledger_run_id=ledger_run_id,
         role="worker",
         review_policy_path=project_root / ".exo" / "review-policy.toml",
         policy=policy,
@@ -324,6 +327,16 @@ def _run_id(document: Mapping[str, object], configured: str) -> str:
     return value
 
 
+def _authoritative_ledger_run_id(project_root: Path) -> str | None:
+    """Read the server-owned swarm ID without changing the local checkpoint key."""
+    path = project_root / ".exo" / "run_id"
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
+
+
 def _print_result(result: TLRunResult) -> None:
     state = result.final_state
     LOGGER.info(
@@ -404,7 +417,7 @@ def _status_snapshot(
             project_root / ".exo" / "ledger" / "segments",
             run_id=run_id,
             state_root=store.root_dir,
-            scope_run_id=run_id,
+            ledger_run_id=_authoritative_ledger_run_id(project_root),
         )
         replay = reader.read_from(0)
     except (CorruptCheckpoint, OSError, ValueError) as error:

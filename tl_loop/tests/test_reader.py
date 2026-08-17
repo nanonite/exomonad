@@ -55,6 +55,26 @@ def test_cursor_persists_and_resume_spans_segment_boundary(tmp_path: Path) -> No
     assert [event.run_seq for event in resumed.read_from().events] == [102]
 
 
+def test_reader_scopes_authoritative_id_separately_from_local_checkpoint(tmp_path: Path) -> None:
+    events = deepcopy(_fixture_events()[:2])
+    events[0]["run_id"] = "swarm-uuid"
+    events[1]["run_id"] = "stale-swarm-uuid"
+    segments = tmp_path / "segments"
+    _write_segment(segments, 1, events)
+    state_root = tmp_path / "state"
+    create("root", {}, root_dir=state_root)
+
+    reader = LedgerReader(
+        segments,
+        run_id="root",
+        state_root=state_root,
+        ledger_run_id="swarm-uuid",
+    )
+
+    assert [event.run_seq for event in reader.read_from().events] == [101]
+    assert reader.cursor() == 0
+
+
 def test_retired_segment_during_tail_does_not_corrupt_global_cursor(tmp_path: Path) -> None:
     events = _fixture_events()
     segments = tmp_path / "segments"

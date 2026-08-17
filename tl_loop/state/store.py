@@ -388,6 +388,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "budgets",
         "gates",
         "events",
+        "ledger_run_id",
         "owner_branch",
         "owner_worktree",
         "parent_branch",
@@ -686,6 +687,7 @@ def _decode(document: dict[str, object]) -> RunState:
         version=cast(int, document["version"]),
         revision=cast(int, document["revision"]),
         run_id=cast(str, document["run_id"]),
+        ledger_run_id=cast(str | None, document.get("ledger_run_id")),
         fsm=FSMState(
             phase=TLPhase(cast(str, fsm["phase"])),
             waiting=tuple(cast(list[str], fsm["waiting"])),

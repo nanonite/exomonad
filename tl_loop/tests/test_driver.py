@@ -122,6 +122,7 @@ def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path)
         dispatch_timeout=0.5,
         root_dir=root,
         run_id="parent",
+        ledger_run_id="swarm-uuid",
     )
     effects = EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
     outcomes = _run_sub_tl_batch(
@@ -137,6 +138,8 @@ def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path)
     assert all(child_state is not None for _, _, child_state in outcomes)
     assert RunStore("alpha", root).load().parent_run_id == "parent"
     assert RunStore("beta", root).load().parent_run_id == "parent"
+    assert RunStore("alpha", root).load().ledger_run_id == "swarm-uuid"
+    assert RunStore("beta", root).load().ledger_run_id == "swarm-uuid"
 
 
 def test_live_waiting_child_is_not_terminated_after_supervision_window() -> None:

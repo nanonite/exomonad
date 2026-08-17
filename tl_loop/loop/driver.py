@@ -394,6 +394,7 @@ class TLLoopConfig:
     effects: EffectClient | ReadOnlyEffectClient | None = None
     root_dir: str | Path = DEFAULT_ROOT
     run_id: str = "tl-run"
+    ledger_run_id: str | None = None
     policy: HarnessPolicy | None = None
     learned_policy: LearnedPolicy | None = None
     capabilities: CapabilityMap | None = None
@@ -446,6 +447,7 @@ class TLLoopConfig:
         _optional_text(self.merge_strategy, "merge_strategy")
         _optional_text(self.working_dir, "working_dir")
         _require_text(self.run_id, "run_id")
+        _optional_text(self.ledger_run_id, "ledger_run_id")
         _require_text(self.role, "role")
         for name in ("depth", "max_depth"):
             value = getattr(self, name)
@@ -564,8 +566,20 @@ def run_tl_loop(
             root_state["slices"] = copy.deepcopy(dict(initial_slices))
         if budgets is not None:
             root_state["budgets"] = _budget_root(budgets)
+        if selected.ledger_run_id is not None:
+            root_state["ledger_run_id"] = selected.ledger_run_id
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
+    if state.ledger_run_id and selected.ledger_run_id and (
+        state.ledger_run_id != selected.ledger_run_id
+    ):
+        raise TLLoopError(
+            f"checkpoint ledger_run_id {state.ledger_run_id!r} does not match "
+            f"active swarm {selected.ledger_run_id!r}"
+        )
+    effective_ledger_run_id = selected.ledger_run_id or state.ledger_run_id
+    if effective_ledger_run_id is not None:
+        selected = replace(selected, ledger_run_id=effective_ledger_run_id)
     state = _initialize_ordered_runtime(work_plan, state, store)
     effects_log: list[EffectIntent] = []
     state = _reconcile_dispatches(state, selected, effects, store, effects_log)
@@ -710,9 +724,17 @@ def _run_loop(
             raise TLLoopError(f"{event.event_type!r} has no run_seq")
         consumed.append(event_seq)
         deadline = _next_loop_deadline(state, config)
-        if event.run_id not in {None, run_id}:
+        ledger_run_id = config.ledger_run_id or run_id
+        if event.run_id not in {None, ledger_run_id}:
             _checkpoint_and_ack(store, source, event, state, phase)
             state = store.load()
+            LOGGER.warning(
+                "Ignoring event from stale swarm run_id=%s expected=%s local_checkpoint=%s event_seq=%s",
+                event.run_id,
+                ledger_run_id,
+                run_id,
+                event_seq,
+            )
             continue
         if not _event_belongs_to_plan(event, expected, state):
             _checkpoint_and_ack(store, source, event, state, phase)
