@@ -233,7 +233,7 @@ install-hooks:
 
 # Build WASM role and install to .exo/wasm/
 wasm role="tl":
-    @nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; if [ ! -d ~/.cabal/packages/hackage.haskell.org ]; then echo ">>> First-time WASM setup (populating cabal package index)..."; wasm32-wasi-cabal update --project-file=cabal.project.wasm; fi'
+    @nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; cache_dir="$(wasm32-wasi-cabal path --project-file=cabal.project.wasm | sed -n "s/^remote-repo-cache: //p")"; test -n "$cache_dir"; if [ ! -d "$cache_dir/hackage.haskell.org" ] || [ ! -d "$cache_dir/head.hackage" ]; then echo ">>> First-time WASM setup (populating cabal package index in $cache_dir)..."; wasm32-wasi-cabal update --project-file=cabal.project.wasm; fi'
     @echo ">>> Building wasm-guest-{{role}}..."
     nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; wasm32-wasi-cabal build --project-file=cabal.project.wasm wasm-guest-{{role}}'
     @echo ">>> Installing to .exo/wasm/..."
