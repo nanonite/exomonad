@@ -68,7 +68,7 @@ from tl_loop.ordered import (
 )
 from tl_loop.rlm.adjudicate import adjudicate_review
 from tl_loop.rlm.repair import RepairError, RepairHandoff, compose_repair
-from tl_loop.select.agent_type import select_agent_type, selection_failure
+from tl_loop.select.agent_type import parse_harness_identifier, select_agent_type, selection_failure
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
@@ -242,6 +242,8 @@ class DispatchAttempt:
     intent_id: str
     started_at: float
     harness: str
+    agent_type: str = ""
+    model: str | None = None
 
 
 class EventQueue(Protocol):
@@ -1331,7 +1333,25 @@ def _dispatch_payload(
     }
     if error is not None:
         payload["error"] = error
+    if attempt.harness:
+        payload["harness"] = attempt.harness
+    if attempt.agent_type:
+        payload["agent_type"] = attempt.agent_type
+    if attempt.model:
+        payload["model"] = attempt.model
     return payload
+
+
+def _spawn_route(
+    attempt: DispatchAttempt, fallback_harness: str | None
+) -> tuple[str | None, str | None]:
+    """Return protocol fields while preserving the qualified audit identity."""
+    if attempt.agent_type:
+        return attempt.agent_type, attempt.model
+    if not fallback_harness:
+        return None, None
+    route = parse_harness_identifier(fallback_harness)
+    return route.agent_type, route.model
 
 
 def _confirm_dispatch_event(
@@ -1472,7 +1492,9 @@ def _dispatch_children(
         state = store.load()
         _record_spawn_request(worker.name, attempt, config, effects, effects_log)
         worker_args: dict[str, object] = {"name": worker.name, "task": worker.task}
-        _optional_argument(worker_args, "agent_type", attempt.harness or worker.agent_type)
+        agent_type, model = _spawn_route(attempt, worker.agent_type)
+        _optional_argument(worker_args, "agent_type", agent_type)
+        _optional_argument(worker_args, "model", model)
         try:
             result = _invoke(
                 "spawn_worker",
@@ -1480,7 +1502,7 @@ def _dispatch_children(
                 worker_args,
                 config.active,
                 live,
-                _worker_call(worker, attempt.harness or None, attempt.intent_id),
+                _worker_call(worker, agent_type, model, attempt.intent_id),
                 effects_log,
                 raise_on_failure=False,
             )
@@ -1508,7 +1530,9 @@ def _dispatch_children(
         _record_spawn_request(leaf.name, attempt, config, effects, effects_log)
         leaf_args: dict[str, object] = {"name": leaf.name, "task": leaf.task}
         _optional_argument(leaf_args, "intent_id", attempt.intent_id)
-        _optional_argument(leaf_args, "agent_type", attempt.harness or leaf.agent_type)
+        agent_type, model = _spawn_route(attempt, leaf.agent_type)
+        _optional_argument(leaf_args, "agent_type", agent_type)
+        _optional_argument(leaf_args, "model", model)
         for name, value in (
             ("boundary", leaf.boundary),
             ("read_first", leaf.read_first),
@@ -1525,7 +1549,7 @@ def _dispatch_children(
                 leaf_args,
                 config.active,
                 live,
-                _leaf_call(leaf, attempt.harness or None, attempt.intent_id),
+                _leaf_call(leaf, agent_type, model, attempt.intent_id),
                 effects_log,
                 raise_on_failure=False,
             )
@@ -3267,11 +3291,19 @@ def _prepare_spawn(
                 ledger=state.budgets,
             )
         raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}; slice parked")
-    model_id: str | None = None
+    route = parse_harness_identifier(choice.harness)
     if config.catalog is not None:
         model_id = select_model(choice.harness, config.catalog, config.requested_model).model_id
+    else:
+        model_id = route.model
 
-    intent = DispatchAttempt(intent.intent_id, intent.started_at, choice.harness)
+    intent = DispatchAttempt(
+        intent.intent_id,
+        intent.started_at,
+        choice.harness,
+        route.agent_type,
+        model_id,
+    )
 
     def record_spawn(document: dict[str, object]) -> dict[str, object]:
         slices = document.get("slices")
@@ -3281,7 +3313,7 @@ def _prepare_spawn(
         if not isinstance(raw_slice, dict):
             raise TLLoopError(f"selector slice {name!r} is not an object")
         raw_slice["status"] = SliceStatus.DISPATCHING.value
-        raw_slice["agent_type"] = choice.harness
+        raw_slice["agent_type"] = route.agent_type
         raw_slice["model"] = model_id
         raw_slice["attempts"] = slice_state.attempts + 1
         raw_slice["dispatch_intent_id"] = intent.intent_id
@@ -3315,28 +3347,36 @@ def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> D
 
 
 def _worker_call(
-    task: WorkerTask, selected_harness: str | None, intent_id: str | None
+    task: WorkerTask,
+    selected_agent_type: str | None,
+    selected_model: str | None,
+    intent_id: str | None,
 ) -> Callable[[EffectClient], ToolResult]:
     def invoke(client: EffectClient) -> ToolResult:
         return client.spawn_worker(
             name=task.name,
             task=task.task,
             intent_id=intent_id,
-            agent_type=selected_harness or task.agent_type,
+            agent_type=selected_agent_type or task.agent_type,
+            model=selected_model,
         )
 
     return invoke
 
 
 def _leaf_call(
-    task: LeafTask, selected_harness: str | None, intent_id: str | None
+    task: LeafTask,
+    selected_agent_type: str | None,
+    selected_model: str | None,
+    intent_id: str | None,
 ) -> Callable[[EffectClient], ToolResult]:
     def invoke(client: EffectClient) -> ToolResult:
         return client.spawn_leaf(
             name=task.name,
             task=task.task,
             intent_id=intent_id,
-            agent_type=selected_harness or task.agent_type,
+            agent_type=selected_agent_type or task.agent_type,
+            model=selected_model,
             boundary=task.boundary,
             context=task.context,
             read_first=task.read_first,

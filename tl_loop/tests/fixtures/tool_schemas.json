@@ -14,6 +14,10 @@
             ],
             "type": "string"
           },
+          "model": {
+            "description": "Optional model override, separate from agent_type.",
+            "type": "string"
+          },
           "boundary": {
             "description": "DO NOT rules for known failure modes",
             "items": {
@@ -79,6 +83,10 @@
               "opencode",
               "codex"
             ],
+            "type": "string"
+          },
+          "model": {
+            "description": "Optional model override, separate from agent_type.",
             "type": "string"
           },
           "name": {

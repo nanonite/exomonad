@@ -925,6 +925,7 @@ impl<
         env_vars: HashMap<String, String>,
         parent_window_name: Option<&str>,
         claude_flags: Option<&ClaudeSpawnFlags>,
+        model_override: Option<&str>,
     ) -> Result<super::tmux_ipc::PaneId> {
         info!(name, cwd = %cwd.display(), agent_type = ?agent_type, parent = ?parent_window_name, "Creating tmux pane");
 
@@ -934,10 +935,10 @@ impl<
             None => None,
         };
 
-        let model = match agent_type {
+        let model = model_override.or_else(|| match agent_type {
             AgentType::OpenCode | AgentType::Codex => self.spawn_agent_model(),
             _ => None,
-        };
+        });
         let full_command = Self::build_agent_command_with_effort(
             agent_type,
             prompt_file.as_deref(),

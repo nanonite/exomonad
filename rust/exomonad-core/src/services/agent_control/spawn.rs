@@ -1055,7 +1055,7 @@ impl<
             persist_dispatch_intent(self.project_dir(), &agent_name, intent_id).await?;
 
             let role = crate::domain::Role::worker();
-            let model = self.effective_model_for(agent_type, role.as_str(), None);
+            let model = self.effective_model_for(agent_type, role.as_str(), options.model.as_deref());
             let effort = self.effective_effort_for(role.as_str(), None);
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             let session_branch = BranchName::try_from_str(parent_bb.as_str()).expect("validated string input is non-empty");
@@ -1128,7 +1128,8 @@ impl<
                 env_vars,
                 Some(&caller_tab),
                 Some(&options.claude_flags),
-              )
+                model.as_deref(),
+            )
               .await?;
               let pane_id_string = pane_id.as_str().to_string();
 

@@ -10,6 +10,7 @@ from typing import cast
 
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.classify import Classification, Difficulty, classify_task
+from tl_loop.select.harness import HarnessRoute, parse_harness_identifier
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.policy import HarnessPolicy, RolePolicy
 from tl_loop.state.schema import BudgetLedger, SliceState, Verdict
@@ -276,10 +277,12 @@ def _non_negative(value: object, path: str) -> int:
 
 
 __all__ = [
+    "HarnessRoute",
     "HarnessChoice",
     "SelectionFailure",
     "SelectionLedger",
     "estimate_cost",
+    "parse_harness_identifier",
     "select_agent_type",
     "selection_failure",
 ]

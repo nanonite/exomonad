@@ -106,6 +106,7 @@ data SpawnLeafSubtreeArgs = SpawnLeafSubtreeArgs
     slsBranchName :: Text,
     slsIntentId :: Maybe Text,
     slsAgentType :: Maybe AC.AgentType,
+    slsModel :: Maybe Text,
     slsPermissionMode :: Maybe Text,
     slsAllowedTools :: Maybe [Text],
     slsDisallowedTools :: Maybe [Text],
@@ -121,6 +122,7 @@ instance FromJSON SpawnLeafSubtreeArgs where
       <*> v .: "branch_name"
       <*> v .:? "intent_id"
       <*> v .:? "agent_type"
+      <*> v .:? "model"
       <*> v .:? "permission_mode"
       <*> v .:? "allowed_tools"
       <*> v .:? "disallowed_tools"
@@ -139,6 +141,7 @@ spawnLeafSubtreeSchema =
       ("branch_name", "Branch name suffix (will be prefixed with current branch)"),
       ("intent_id", "Controller dispatch intent identifier used to correlate agent.spawned confirmation."),
       ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
+      ("model", "Optional model override, separate from agent_type."),
       ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
       ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
       ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction."),
@@ -165,6 +168,7 @@ spawnLeafSubtreeCore args = do
             AC.slcIntentId = slsIntentId args,
             AC.slcRole = Nothing,
             AC.slcAgentType = slsAgentType args,
+            AC.slcModel = slsModel args,
             AC.slcPerms = perms,
             AC.slcStandaloneRepo = standaloneRepo,
             AC.slcAllowedDirs = fromMaybe [] (slsAllowedDirs args)
@@ -215,6 +219,7 @@ data WorkerSpec = WorkerSpec
     wsVerifyTemplates :: Maybe [Text],
     wsType :: Maybe WorkerType,
     wsAgentType :: Maybe AC.AgentType,
+    wsModel :: Maybe Text,
     wsPermissionMode :: Maybe Text,
     wsAllowedTools :: Maybe [Text],
     wsDisallowedTools :: Maybe [Text]
@@ -240,6 +245,7 @@ instance JsonSchema WorkerSpec where
           ("verify_templates", "Verification script templates"),
           ("type", "Worker type: 'implementation' (default) or 'research'. Research workers are read-only — they explore, search, and report findings via notify_parent."),
           ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
+          ("model", "Optional model override, separate from agent_type."),
           ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
           ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
           ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction.")
@@ -263,6 +269,7 @@ instance FromJSON WorkerSpec where
       <*> v .:? "verify_templates"
       <*> v .:? "type"
       <*> v .:? "agent_type"
+      <*> v .:? "model"
       <*> v .:? "permission_mode"
       <*> v .:? "allowed_tools"
       <*> v .:? "disallowed_tools"
@@ -309,6 +316,7 @@ spawnWorkersCore args = do
               AC.swcPrompt = prompt,
               AC.swcIntentId = wsIntentId spec,
               AC.swcAgentType = wsAgentType spec,
+              AC.swcModel = wsModel spec,
               AC.swcPerms = perms
             }
     r <- AC.spawnWorker cfg
@@ -335,6 +343,7 @@ data SpawnLeafArgs = SpawnLeafArgs
     slTask :: Text,
     slIntentId :: Maybe Text,
     slAgentType :: Maybe AC.AgentType,
+    slModel :: Maybe Text,
     slReadFirst :: Maybe [Text],
     slSteps :: Maybe [Text],
     slVerify :: Maybe [Text],
@@ -350,6 +359,7 @@ instance FromJSON SpawnLeafArgs where
       <*> v .: "task"
       <*> v .:? "intent_id"
       <*> v .:? "agent_type"
+      <*> v .:? "model"
       <*> v .:? "read_first"
       <*> v .:? "steps"
       <*> v .:? "verify"
@@ -408,6 +418,7 @@ buildLeafTask args =
             wsVerifyTemplates = Nothing,
             wsType = Nothing,
             wsAgentType = Nothing,
+            wsModel = slModel args,
             wsPermissionMode = Nothing,
             wsAllowedTools = Nothing,
             wsDisallowedTools = Nothing
@@ -424,7 +435,8 @@ data SpawnWorkerToolArgs = SpawnWorkerToolArgs
   { swtName :: Text,
     swtTask :: Text,
     swtIntentId :: Maybe Text,
-    swtAgentType :: Maybe AC.AgentType
+    swtAgentType :: Maybe AC.AgentType,
+    swtModel :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -435,6 +447,7 @@ instance FromJSON SpawnWorkerToolArgs where
       <*> v .: "task"
       <*> v .:? "intent_id"
       <*> v .:? "agent_type"
+      <*> v .:? "model"
 
 spawnWorkerToolDescription :: Text
 spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR, so the TL worktree must be clean before spawning. Commit the scaffold or discard throwaway output before retrying. Workers are sequential per TL tab; wait for the active worker handoff before spawning another worker, or use spawn_leaf for parallel PR work. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately."
@@ -445,7 +458,8 @@ spawnWorkerToolSchema =
     [ ("name", "Worker name (pane title, messaging identity)"),
       ("task", "The full prompt. Everything the worker needs in one string"),
       ("intent_id", "Controller dispatch intent identifier used to correlate agent.spawned confirmation."),
-      ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default.")
+      ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
+      ("model", "Optional model override, separate from agent_type.")
     ]
 
 spawnWorkerToolCore :: SpawnWorkerToolArgs -> Eff Effects MCPCallOutput
@@ -467,6 +481,7 @@ spawnWorkerToolCore args = do
             wsVerifyTemplates = Nothing,
             wsType = Nothing,
             wsAgentType = swtAgentType args,
+            wsModel = swtModel args,
             wsPermissionMode = Nothing,
             wsAllowedTools = Nothing,
             wsDisallowedTools = Nothing

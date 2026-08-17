@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tl_loop.select.agent_type import (
+    parse_harness_identifier,
     SelectionFailure,
     SelectionLedger,
     estimate_cost,
@@ -17,6 +20,27 @@ from tl_loop.state.schema import SliceState, SliceStatus, Verdict
 CAPABILITIES = CapabilityMap(
     {"codex/gpt-luna": Difficulty.STANDARD, "claude/sonnet": Difficulty.HARD}
 )
+
+
+def test_parse_model_qualified_harness_separates_protocol_fields() -> None:
+    route = parse_harness_identifier("opencode/deepseek-v4-pro")
+
+    assert route.harness == "opencode/deepseek-v4-pro"
+    assert route.agent_type == "opencode"
+    assert route.model == "deepseek-v4-pro"
+
+
+def test_parse_bare_harness_leaves_model_for_catalog_resolution() -> None:
+    route = parse_harness_identifier("codex")
+
+    assert route.agent_type == "codex"
+    assert route.model is None
+
+
+@pytest.mark.parametrize("value", ["", "unknown/model", "opencode/"])
+def test_parse_harness_identifier_rejects_invalid_routes(value: str) -> None:
+    with pytest.raises(ValueError):
+        parse_harness_identifier(value)
 
 
 def test_trivial_task_uses_cheapest_allowed_harness() -> None:

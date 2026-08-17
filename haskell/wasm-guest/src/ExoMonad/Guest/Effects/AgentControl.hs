@@ -202,6 +202,7 @@ data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
     slcIntentId :: Maybe Text,
     slcRole :: Maybe Text,
     slcAgentType :: Maybe AgentType,
+    slcModel :: Maybe Text,
     slcPerms :: PermissionFlags,
     slcStandaloneRepo :: Bool,
     slcAllowedDirs :: [Text]
@@ -223,6 +224,7 @@ data SpawnWorkerConfig = SpawnWorkerConfig
     swcPrompt :: Text,
     swcIntentId :: Maybe Text,
     swcAgentType :: Maybe AgentType,
+    swcModel :: Maybe Text,
     swcPerms :: PermissionFlags
   }
   deriving (Show, Eq, Generic)
@@ -289,6 +291,7 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestBranchName = fromText (slcBranchName cfg),
               PA.spawnLeafSubtreeRequestRole = fromText (fromMaybe "" (slcRole cfg)),
               PA.spawnLeafSubtreeRequestAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (slcAgentType cfg))),
+              PA.spawnLeafSubtreeRequestModel = fromText (fromMaybe "" (slcModel cfg)),
               PA.spawnLeafSubtreeRequestPermissionMode = fromText (fromMaybe "" (permMode (slcPerms cfg))),
               PA.spawnLeafSubtreeRequestAllowedTools = V.fromList (map fromText (allowedTools (slcPerms cfg))),
               PA.spawnLeafSubtreeRequestDisallowedTools = V.fromList (map fromText (disallowedTools (slcPerms cfg))),
@@ -311,6 +314,7 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestBranchName = fromText "",
               PA.spawnLeafSubtreeRequestRole = fromText "",
               PA.spawnLeafSubtreeRequestAgentType = Enumerated (Right PA.AgentTypeAGENT_TYPE_UNSPECIFIED),
+              PA.spawnLeafSubtreeRequestModel = fromText "",
               PA.spawnLeafSubtreeRequestPermissionMode = fromText "",
               PA.spawnLeafSubtreeRequestAllowedTools = V.empty,
               PA.spawnLeafSubtreeRequestDisallowedTools = V.empty,
@@ -353,7 +357,8 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnWorkerRequestAllowedTools = V.fromList (map fromText (allowedTools (swcPerms cfg))),
               PA.spawnWorkerRequestDisallowedTools = V.fromList (map fromText (disallowedTools (swcPerms cfg))),
               PA.spawnWorkerRequestAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (swcAgentType cfg))),
-              PA.spawnWorkerRequestIntentId = fromText (fromMaybe "" (swcIntentId cfg))
+              PA.spawnWorkerRequestIntentId = fromText (fromMaybe "" (swcIntentId cfg)),
+              PA.spawnWorkerRequestModel = fromText (fromMaybe "" (swcModel cfg))
             }
     result <- suspendEffect @Agent.AgentSpawnWorker req
     pure $ case result of

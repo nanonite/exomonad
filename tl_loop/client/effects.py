@@ -139,6 +139,7 @@ class EffectClient:
         task: str,
         intent_id: str | None = None,
         agent_type: str | None = None,
+        model: str | None = None,
         boundary: StringList | None = None,
         context: str | None = None,
         read_first: StringList | None = None,
@@ -148,6 +149,7 @@ class EffectClient:
         arguments: JsonObject = {"name": name, "task": task}
         _put(arguments, "intent_id", intent_id)
         _put(arguments, "agent_type", agent_type)
+        _put(arguments, "model", model)
         _put_list(arguments, "boundary", boundary)
         _put(arguments, "context", context)
         _put_list(arguments, "read_first", read_first)
@@ -162,10 +164,12 @@ class EffectClient:
         task: str,
         intent_id: str | None = None,
         agent_type: str | None = None,
+        model: str | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {"name": name, "task": task}
         _put(arguments, "intent_id", intent_id)
         _put(arguments, "agent_type", agent_type)
+        _put(arguments, "model", model)
         return self._call("spawn_worker", arguments)
 
     def spawn_reviewer(

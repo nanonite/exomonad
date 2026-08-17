@@ -483,6 +483,9 @@ pub struct SpawnWorkerOptions {
     /// Agent type (default: configured spawn harness).
     #[serde(default)]
     pub agent_type: AgentType,
+    /// Optional model override, separate from the agent type.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Claude-specific permission flags (ignored for non-Claude agents).
     #[serde(default)]
     pub claude_flags: ClaudeSpawnFlags,
@@ -537,6 +540,9 @@ pub struct SpawnLeafOptions {
     pub role: Option<crate::domain::Role>,
     /// Agent type. Required — no default.
     pub agent_type: AgentType,
+    /// Optional model override, separate from the agent type.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Claude-specific permission flags (ignored for other harnesses).
     #[serde(default)]
     pub claude_flags: ClaudeSpawnFlags,

@@ -1192,7 +1192,8 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
     spawn_worker_call = next(
         arguments for name, arguments in transport.calls if name == "spawn_worker"
     )
-    assert spawn_worker_call["agent_type"] == "codex/gpt-luna"
+    assert spawn_worker_call["agent_type"] == "codex"
+    assert spawn_worker_call["model"] == "gpt-5.5"
     assert result.final_state.budgets.role_reserved == {"worker": 500}
     assert result.final_state.budgets.harness_reserved == {"codex/gpt-luna": 500}
     assert result.final_state.slices["worker-a"].model == "gpt-5.5"

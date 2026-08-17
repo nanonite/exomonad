@@ -851,9 +851,12 @@ impl<
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
             convert_agent_type_or_default(requested_agent_type, default_type)?;
-        let model = self
-            .service
-            .effective_model_for(effective_agent_type, "worker", None);
+        let requested_model = non_empty(req.model.clone());
+        let model = self.service.effective_model_for(
+            effective_agent_type,
+            "worker",
+            requested_model.as_deref(),
+        );
         let effort = self.service.effective_effort_for("worker", None);
         self.enforce_harness_switch_policy(
             ctx,
@@ -876,6 +879,7 @@ impl<
                 .expect("validated string input is non-empty"),
             prompt: req.prompt.clone(),
             agent_type: effective_agent_type,
+            model: requested_model,
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -1523,6 +1527,7 @@ impl<
             base_branch: Some(original_base_branch.clone()),
             expected_agent_name: None,
             invocation_pr_number: None,
+            model: None,
         };
         info!(
             chainlink_issue_id = issue_id,
@@ -1704,9 +1709,11 @@ impl<
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
             convert_agent_type_or_default(requested_agent_type, default_type)?;
-        let model = self
-            .service
-            .effective_model_for(effective_agent_type, "dev", None);
+        let model = self.service.effective_model_for(
+            effective_agent_type,
+            "dev",
+            non_empty(req.model.clone()).as_deref(),
+        );
         let effort = self.service.effective_effort_for("dev", None);
         self.enforce_harness_switch_policy(
             ctx,
@@ -1729,6 +1736,7 @@ impl<
             branch_name: req.branch_name.clone(),
             role: non_empty(req.role.clone()).map(crate::domain::Role::new),
             agent_type: effective_agent_type,
+            model: non_empty(req.model.clone()),
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -2753,6 +2761,7 @@ impl<
             base_branch: Some(pr.base_ref.to_string()),
             expected_agent_name: Some(owner.agent_name.clone()),
             invocation_pr_number: Some(req.resume_pr_number),
+            model: None,
         };
         let options = with_resume_task(options, continuation_prefix.as_deref());
         let owner_dir = self
@@ -2938,6 +2947,7 @@ fn validate_resume_request(req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
         || !req.permission_mode.trim().is_empty()
         || !req.allowed_tools.is_empty()
         || !req.disallowed_tools.is_empty()
+        || !req.model.trim().is_empty()
         || req.standalone_repo
         || !req.allowed_dirs.is_empty()
     {
@@ -4170,6 +4180,7 @@ mod tests {
             disallowed_tools: Vec::new(),
             agent_type: AgentType::Codex as i32,
             intent_id: "intent-live-handler".to_string(),
+            model: String::new(),
         };
 
         let response = handler
@@ -4512,6 +4523,7 @@ mod tests {
                 AgentName::try_from_str("owner-slug-codex").expect("literal is a valid agent name"),
             ),
             invocation_pr_number: Some(104),
+            model: None,
         };
         let composed = with_resume_task(options.clone(), Some("continuation"));
 

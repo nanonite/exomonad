@@ -9,6 +9,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TypeAlias, cast
 
+from tl_loop.select.harness import parse_harness_identifier
+
 DEFAULT_POLICY_PATH = Path(".exo/harness_policy.toml")
 ROLE_NAMES = ("tl", "worker", "reviewer")
 _POLICY_KEYS = frozenset({"roles"})
@@ -89,6 +91,11 @@ def _parse_role(role: str, roles: Mapping[str, object]) -> RolePolicy:
     table = _mapping(_required(roles, role, "policy.roles"), path)
     _reject_unknown(table, _ROLE_KEYS, path)
     allow = _strings(_required(table, "allow", path), f"{path}.allow")
+    for index, harness in enumerate(allow):
+        try:
+            parse_harness_identifier(harness)
+        except ValueError as error:
+            raise PolicyInvalid(f"{path}.allow[{index}]: {error}") from error
     cost_rank = _positive_int_map(_required(table, "cost_rank", path), f"{path}.cost_rank")
     _require_exact_keys(cost_rank, allow, f"{path}.cost_rank")
     token_budget = _positive_int(_required(table, "token_budget", path), f"{path}.token_budget")

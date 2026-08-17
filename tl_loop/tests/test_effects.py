@@ -113,13 +113,14 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         name="leaf",
         task="sample",
         agent_type="codex",
+        model="gpt-test",
         boundary=["avoid"],
         context="context",
         read_first=["README.md"],
         steps=["step"],
         verify=["just test"],
     )
-    client.spawn_worker(name="worker", task="sample", agent_type="codex")
+    client.spawn_worker(name="worker", task="sample", agent_type="codex", model="gpt-test")
     client.spawn_reviewer(pr_number=1, head_sha="abc123", acceptance_criteria=["criterion"], force=False)
     client.cleanup_reviewer_leaf(pr_number=1)
     client.close_reviewer_window(pr_number=1)
