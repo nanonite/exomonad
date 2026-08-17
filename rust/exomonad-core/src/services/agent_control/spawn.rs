@@ -21,23 +21,33 @@ async fn persist_dispatch_intent(
     Ok(())
 }
 
-fn parse_git_status_paths(stdout: &str) -> Vec<String> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let path = line.get(3..)?.trim();
-            if path.is_empty() {
-                return None;
+fn parse_git_status_paths(stdout: &[u8]) -> Vec<String> {
+    let records: Vec<&[u8]> = stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect();
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        if record.len() >= 4 {
+            let status = &record[..2];
+            paths.push(String::from_utf8_lossy(&record[3..]).into_owned());
+            if status.iter().any(|byte| matches!(byte, b'R' | b'C')) {
+                if let Some(previous_path) = records.get(index + 1) {
+                    paths.push(String::from_utf8_lossy(previous_path).into_owned());
+                    index += 1;
+                }
             }
-            Some(
-                path.rsplit_once(" -> ")
-                    .map(|(_, target)| target)
-                    .unwrap_or(path)
-                    .trim_matches('"')
-                    .to_string(),
-            )
-        })
-        .collect()
+        }
+        index += 1;
+    }
+    paths
+}
+
+fn is_tl_runtime_checkpoint(path: &str) -> bool {
+    let normalized = path.strip_prefix("./").unwrap_or(path);
+    normalized == ".exo/tl-loop" || normalized.starts_with(".exo/tl-loop/")
 }
 
 fn resolve_identity_working_dir(project_dir: &Path, working_dir: &Path) -> PathBuf {
@@ -182,7 +192,7 @@ async fn filter_gitignored_paths(worktree: &Path, files: Vec<String>) -> Result<
 
 async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
     let output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(worktree)
         .output()
         .await
@@ -196,7 +206,10 @@ async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
         );
     }
 
-    let files = parse_git_status_paths(&String::from_utf8_lossy(&output.stdout));
+    let files = parse_git_status_paths(&output.stdout)
+        .into_iter()
+        .filter(|path| !is_tl_runtime_checkpoint(path))
+        .collect();
     let files = filter_gitignored_paths(worktree, files).await?;
     if files.is_empty() {
         Ok(())
@@ -2329,7 +2342,7 @@ mod tests {
     #[test]
     fn test_parse_git_status_paths_lists_status_entries() {
         let paths = parse_git_status_paths(
-            " M src/lib.rs\nA  docs/new.md\nR  old.rs -> new.rs\n?? scratch.txt\n",
+            b" M src/lib.rs\0A  docs/new.md\0R  new.rs\0old.rs\0?? scratch.txt\0",
         );
         assert_eq!(
             paths,
@@ -2337,9 +2350,25 @@ mod tests {
                 "src/lib.rs".to_string(),
                 "docs/new.md".to_string(),
                 "new.rs".to_string(),
+                "old.rs".to_string(),
                 "scratch.txt".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_git_status_paths_preserves_spaces_and_quotes() {
+        let paths = parse_git_status_paths(b"?? user file.txt\0?? \"quoted file.txt\"\0");
+
+        assert_eq!(paths, vec!["user file.txt", "\"quoted file.txt\""]);
+    }
+
+    #[test]
+    fn test_tl_runtime_checkpoint_is_the_only_exempt_subtree() {
+        assert!(is_tl_runtime_checkpoint(".exo/tl-loop/root/run.json"));
+        assert!(is_tl_runtime_checkpoint("./.exo/tl-loop"));
+        assert!(!is_tl_runtime_checkpoint(".exo/config.toml"));
+        assert!(!is_tl_runtime_checkpoint("src/.exo/tl-loop/file"));
     }
 
     async fn run_git_test_command(worktree: &Path, args: &[&str]) {
@@ -2413,6 +2442,33 @@ mod tests {
             .to_string();
         assert!(message.contains("src/lib.rs"));
         assert!(message.contains("dirty TL worktree"));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_clean_spawn_worktree_ignores_runtime_checkpoints_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let worktree = temp_dir.path();
+        init_test_repo(worktree).await;
+
+        fs::create_dir_all(worktree.join(".exo/tl-loop/root"))
+            .await
+            .unwrap();
+        fs::write(worktree.join(".exo/tl-loop/root/run.json"), "checkpoint")
+            .await
+            .unwrap();
+        ensure_clean_spawn_worktree(worktree).await.unwrap();
+
+        fs::write(
+            worktree.join(".exo/config.toml"),
+            "spawn_agent_type = \"codex\"\n",
+        )
+        .await
+        .unwrap();
+        let message = ensure_clean_spawn_worktree(worktree)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(".exo/config.toml"));
     }
 
     #[test]

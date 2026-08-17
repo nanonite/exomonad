@@ -319,7 +319,7 @@ impl<
     ) -> EffectResult<()> {
         let mut failures = Vec::new();
 
-        match dirty_worktree_entries(&ctx.working_dir).await {
+        match spawn_dirty_worktree_entries(&ctx.working_dir).await {
             Ok(entries) if entries.is_empty() => {}
             Ok(entries) => failures.push(dirty_worktree_message(&entries)),
             Err(message) => failures.push(format!("worktree check failed: {message}")),
@@ -464,18 +464,50 @@ async fn dirty_worktree_entries(project_dir: &Path) -> Result<Vec<String>, Strin
     let output = Command::new("git")
         .arg("-C")
         .arg(project_dir)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()
         .await
-        .map_err(|error| format!("failed to run git status --porcelain: {error}"))?;
+        .map_err(|error| format!("failed to run git status --porcelain=v1 -z: {error}"))?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::to_string)
+    Ok(parse_git_status_paths(&output.stdout))
+}
+
+fn parse_git_status_paths(stdout: &[u8]) -> Vec<String> {
+    let records: Vec<&[u8]> = stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect();
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        if record.len() >= 4 {
+            let status = &record[..2];
+            paths.push(String::from_utf8_lossy(&record[3..]).into_owned());
+            if status.iter().any(|byte| matches!(byte, b'R' | b'C')) {
+                if let Some(previous_path) = records.get(index + 1) {
+                    paths.push(String::from_utf8_lossy(previous_path).into_owned());
+                    index += 1;
+                }
+            }
+        }
+        index += 1;
+    }
+    paths
+}
+
+async fn spawn_dirty_worktree_entries(project_dir: &Path) -> Result<Vec<String>, String> {
+    let entries = dirty_worktree_entries(project_dir).await?;
+    Ok(entries
+        .into_iter()
+        .filter(|path| {
+            let normalized = path.strip_prefix("./").unwrap_or(path);
+            normalized != ".exo/tl-loop" && !normalized.starts_with(".exo/tl-loop/")
+        })
         .collect())
 }
 
