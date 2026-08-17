@@ -29,7 +29,6 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# ruff: noqa: E402 - imports intentionally follow the project-root path setup.
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import JsonObject, TransportClient, TransportError
 from tl_loop.events.envelope import EventEnvelope, project
