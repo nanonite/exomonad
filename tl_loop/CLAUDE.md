@@ -85,11 +85,14 @@ watcher_pr_state effects, then persists reconciled slice state through the
 shared writer. Synthetic heartbeat events are deterministic observations; they
 do not consume ledger sequence numbers or charge budgets.
 
-Dead panes and no-progress stalls use the existing M5.3 park path with
-stall_detected, including needs-human issue creation and dependent blocking.
-Read-only shadow effects fail closed when parking would be required. Repeated
-heartbeats must be safe to run because terminal slices are no longer polled and
-unchanged PR observations produce no new synthetic event.
+Dead panes remain authoritative process failures and use the existing M5.3 park
+path with stall_detected, including needs-human issue creation and dependent
+blocking. A live pane with no progress only emits a wave.stalled observation;
+elapsed time does not park or fail the slice. The controller remains active
+until an authoritative event, explicit cancellation, or an unrecoverable
+integrity error resolves it. Repeated heartbeats must be safe to run because
+terminal slices are no longer polled and unchanged PR observations produce no
+new synthetic event.
 
 ## Ledger-backed event projection
 

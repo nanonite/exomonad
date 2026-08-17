@@ -24,6 +24,7 @@ from tl_loop.fsm.event import PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning
 from tl_loop.loop.driver import (
     DepthLimitExceeded,
+    LoopCancelled,
     LoopLimitExceeded,
     SubTLTask,
     TLLoopConfig,
@@ -1400,11 +1401,66 @@ def test_loop_rejects_an_event_stream_over_its_event_ceiling(tmp_path: Path) -> 
             EffectClient(RecordingTransport()),
             config=TLLoopConfig(
                 max_events=1,
+                test_harness=True,
                 poll_interval=0.001,
                 idle_timeout=0.1,
             ),
             root_dir=tmp_path,
         )
+
+
+def test_idle_silence_preserves_spawned_state_until_explicit_cancellation(
+    tmp_path: Path,
+) -> None:
+    run_id = "long-running-run"
+    cancel_event = threading.Event()
+    source = SyntheticQueue(
+        [
+            _canonical_event(
+                1,
+                "agent.spawned",
+                "leaf-a",
+                run_id,
+                intent_id=_dispatch_intent(run_id, "leaf-a"),
+            )
+        ]
+    )
+    outcome: dict[str, BaseException] = {}
+
+    def run() -> None:
+        try:
+            run_tl_loop(
+                run_id,
+                WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "long work"}]}),
+                source,
+                EffectClient(RecordingTransport()),
+                config=TLLoopConfig(
+                    max_workers=0,
+                    max_leaves=1,
+                    poll_interval=0.001,
+                    idle_timeout=0.001,
+                    dispatch_timeout=5.0,
+                    cancel_event=cancel_event,
+                ),
+                root_dir=tmp_path,
+            )
+        except BaseException as error:  # noqa: BLE001 - assert explicit cancellation
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while not source.acknowledged and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert source.acknowledged == [1]
+    cancel_event.set()
+    thread.join(timeout=2)
+
+    assert isinstance(outcome.get("error"), LoopCancelled)
+    state = RunStore(run_id, tmp_path).load()
+    assert state.fsm.phase is TLPhase.TLWaiting
+    assert state.slices["leaf-a"].status is SliceStatus.SPAWNED
+    assert not state.gates
 
 
 def _selector_policy() -> dict[str, object]:

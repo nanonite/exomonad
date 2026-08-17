@@ -86,17 +86,32 @@ def heartbeat_once(
     current_time = time.time() if now is None else now
     if not heartbeat_due(state.goals, current_time, config.interval_seconds):
         return HeartbeatResult(False, False, state, (), ())
-    if state.goals.deadline and current_time >= state.goals.deadline:
-        raise HeartbeatDeadlineExceeded(
-            f"goal deadline {state.goals.deadline:g} elapsed at {current_time:g}"
+    deadline_elapsed = state.goals.deadline and current_time >= state.goals.deadline
+    deadline_event = (
+        _event(
+            "goal.deadline_elapsed",
+            "heartbeat",
+            "controller",
+            {"deadline": state.goals.deadline, "observed_at": current_time},
         )
+        if deadline_elapsed
+        else None
+    )
 
     active = _active_slices(state)
     if not active:
-        return HeartbeatResult(False, False, state, (), ())
+        return HeartbeatResult(
+            False,
+            False,
+            state,
+            (deadline_event,) if deadline_event is not None else (),
+            (),
+        )
 
     worker_rows = _poll_workers(effects, tuple(active))
     events: list[SyntheticHeartbeatEvent] = []
+    if deadline_event is not None:
+        events.append(deadline_event)
     parked: list[str] = []
     progress = False
 
@@ -158,27 +173,18 @@ def heartbeat_once(
         and prior_progress is not None
         and current_time - prior_progress >= config.stall_threshold_seconds
     ):
-        if isinstance(effects, ReadOnlyEffectClient):
-            raise HeartbeatError("stall detected but shadow effects cannot park slices")
         for slice_state in _active_slices(current):
-            park(
-                slice_state,
-                ParkCause.STALL_DETECTED,
-                store=store,
-                issue_creator=effects,
-                ledger=current.budgets,
-            )
-            parked.append(slice_state.id)
             events.append(
                 _event(
                     "wave.stalled",
                     "heartbeat",
                     slice_state.id,
-                    {"stall_threshold_seconds": config.stall_threshold_seconds},
+                    {
+                        "stall_threshold_seconds": config.stall_threshold_seconds,
+                        "action": "observe",
+                    },
                 )
             )
-        progress = bool(parked)
-        current = store.load()
 
     updated_goals = replace(
         current.goals,
@@ -269,9 +275,7 @@ def _reconcile_pr(slice_state: SliceState, payload: JsonMapping) -> tuple[SliceS
 
 def _pr_payload(payload: JsonMapping) -> dict[str, object]:
     return {
-        key: payload[key]
-        for key in ("head_sha", "review_state", "ci_status")
-        if key in payload
+        key: payload[key] for key in ("head_sha", "review_state", "ci_status") if key in payload
     }
 
 

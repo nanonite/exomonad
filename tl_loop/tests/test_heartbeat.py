@@ -112,6 +112,43 @@ def test_silently_dead_worker_is_parked(tmp_path: Path) -> None:
     ]
 
 
+def test_silent_live_worker_stall_is_observational(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    transport = HeartbeatTransport(pane_alive=True)
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=1.0),
+        now=10.0,
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.status is SliceStatus.SPAWNED
+    assert observed.park_cause is None
+    assert result.parked_slice_ids == ()
+    assert [event.kind for event in result.events] == ["wave.stalled"]
+    assert result.events[0].payload["action"] == "observe"
+
+
+def test_goal_deadline_is_observational_for_live_work(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    transport = HeartbeatTransport(pane_alive=True)
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=2000.0,
+    )
+
+    assert result.state.slices["slice-a"].status is SliceStatus.SPAWNED
+    assert result.parked_slice_ids == ()
+    assert result.events[0].kind == "goal.deadline_elapsed"
+
+
 def test_repeated_heartbeat_reconciliation_is_idempotent(tmp_path: Path) -> None:
     store, state = _state(
         tmp_path,

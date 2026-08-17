@@ -7,6 +7,7 @@ import hashlib
 import logging
 import multiprocessing
 import queue as queue_module
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -233,6 +234,10 @@ class LoopTimeout(TLLoopError):
         self.timeout_seconds = timeout_seconds
 
 
+class LoopCancelled(TLLoopError):
+    """The caller explicitly cancelled the controller without changing state."""
+
+
 class DepthLimitExceeded(TLLoopError):
     """A recursive child reached the configured depth ceiling."""
 
@@ -434,6 +439,8 @@ class TLLoopConfig:
     max_leaves: int = 8
     max_parallel_slices: int | None = None
     max_events: int = 256
+    test_harness: bool = False
+    cancel_event: threading.Event | None = None
     poll_interval: float = 0.1
     idle_timeout: float = 30.0
     keep_alive_on_waiting: bool = False
@@ -486,6 +493,8 @@ class TLLoopConfig:
             raise ValueError("max_parallel_slices must be null or non-negative")
         if self.max_events == 0:
             raise ValueError("max_events must be positive")
+        if type(self.test_harness) is not bool:
+            raise ValueError("test_harness must be a boolean")
         if self.poll_interval < 0:
             raise ValueError("poll_interval must be non-negative")
         if self.idle_timeout <= 0:
@@ -719,9 +728,11 @@ def _run_loop(
 
     deadline = _next_loop_deadline(state, config)
 
-    while len(consumed) < config.max_events:
+    while not config.test_harness or len(consumed) < config.max_events:
         if isinstance(phase, (TLDone, TLFailed)):
             break
+        if config.cancel_event is not None and config.cancel_event.is_set():
+            raise LoopCancelled(f"TL controller {run_id!r} was cancelled")
         _record_reader_findings(source, diagnostics)
         try:
             event = _next_event(source, config, deadline)
@@ -740,18 +751,8 @@ def _run_loop(
                     error,
                     diagnostics,
                 )
-            return _park_timeout(
-                run_id,
-                store,
-                state,
-                effects,
-                config,
-                effects_log,
-                transitions,
-                consumed,
-                error,
-                diagnostics,
-            )
+            deadline = _next_loop_deadline(state, config)
+            continue
         _record_reader_findings(source, diagnostics)
         if event is None:
             if config.heartbeat is not None:
@@ -789,7 +790,7 @@ def _run_loop(
                         tuple(heartbeat_events),
                         diagnostics.snapshot(),
                     )
-                deadline = _next_waiting_deadline(config)
+                deadline = _next_loop_deadline(state, config)
             continue
         event_seq = event.run_seq
         if event_seq is None:
@@ -831,11 +832,7 @@ def _run_loop(
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
-                deadline = (
-                    _next_waiting_deadline(config)
-                    if _sub_tls_waiting_for_integration(plan, state)
-                    else _next_loop_deadline(state, config)
-                )
+                deadline = _next_loop_deadline(state, config)
             source.acknowledge(event)
             diagnostics.acknowledged += 1
             if isinstance(phase, (TLDone, TLFailed)):
@@ -849,11 +846,7 @@ def _run_loop(
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
-                deadline = (
-                    _next_waiting_deadline(config)
-                    if _sub_tls_waiting_for_integration(plan, state)
-                    else _next_loop_deadline(state, config)
-                )
+                deadline = _next_loop_deadline(state, config)
             source.acknowledge(event)
             diagnostics.acknowledged += 1
             if isinstance(phase, (TLDone, TLFailed)):
@@ -1031,9 +1024,10 @@ def _run_loop(
         if isinstance(phase, (TLDone, TLFailed)):
             break
     else:
-        raise LoopLimitExceeded(
-            f"event limit {config.max_events} reached before TL reached a terminal phase"
-        )
+        if config.test_harness:
+            raise LoopLimitExceeded(
+                f"event limit {config.max_events} reached before TL reached a terminal phase"
+            )
     if not isinstance(phase, (TLDone, TLFailed)):
         raise LoopTimeout(f"TL did not reach a terminal phase within {config.idle_timeout:g}s")
     if phase is TLFailed:
@@ -1141,9 +1135,8 @@ def _record_reader_findings(source: EventQueue, diagnostics: EventDiagnostics) -
         diagnostics.record_reader_findings(tuple(findings))
 
 
-def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> LoopDeadline:
-    now = time.monotonic()
-    deadline = LoopDeadline(now + config.idle_timeout, "idle", config.idle_timeout)
+def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> LoopDeadline | None:
+    """Return only evidence-bound deadlines; ordinary silence is not terminal."""
     remaining: list[float] = []
     if config.active:
         remaining = [
@@ -1154,13 +1147,12 @@ def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> LoopDeadline:
         ]
     if remaining:
         dispatch_remaining = min(remaining)
-        if dispatch_remaining < config.idle_timeout:
-            deadline = LoopDeadline(
-                now + dispatch_remaining,
-                "dispatch",
-                config.dispatch_timeout,
-            )
-    return deadline
+        return LoopDeadline(
+            time.monotonic() + dispatch_remaining,
+            "dispatch",
+            config.dispatch_timeout,
+        )
+    return None
 
 
 def _next_waiting_deadline(config: TLLoopConfig) -> LoopDeadline:
@@ -4423,10 +4415,15 @@ def _invoke(
 def _next_event(
     source: EventQueue,
     config: TLLoopConfig,
-    deadline: LoopDeadline,
+    deadline: LoopDeadline | None,
 ) -> EventEnvelope | None:
-    remaining = deadline.at - time.monotonic()
-    if remaining <= 0:
+    if config.cancel_event is not None and config.cancel_event.is_set():
+        raise LoopCancelled("TL controller cancellation requested")
+    if deadline is None:
+        remaining = config.poll_interval or 0.01
+    else:
+        remaining = deadline.at - time.monotonic()
+    if remaining <= 0 and deadline is not None:
         raise LoopTimeout(
             f"TL did not receive an event within {deadline.timeout_seconds:g}s "
             f"(deadline={deadline.reason})",
@@ -5033,6 +5030,7 @@ __all__ = [
     "EffectIntent",
     "EventQueue",
     "LeafTask",
+    "LoopCancelled",
     "LoopLimitExceeded",
     "LoopTimeout",
     "SubTLTask",
