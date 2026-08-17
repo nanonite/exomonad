@@ -5,6 +5,14 @@ This harness deliberately keeps the Forgejo-shaped API local, but does not
 replace the product boundary: the Rust server, generated WASM tool, Git
 remote, TransportClient, and merge handler are all exercised.  The existing
 ``ordered_recursive.py`` remains the hermetic ControllerScenario coverage.
+
+Run from the repository root after building the server and development WASM:
+
+    python3 tests/e2e/ordered-recursive/real_server_transport.py
+
+The first probe uses the real spawn_worker effect and ledger tailer with a
+local root checkpoint. Later probes cover nested local checkpoint IDs,
+restart boundaries, and tmux cleanup in the same temporary server session.
 """
 
 from __future__ import annotations
@@ -31,11 +39,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import JsonObject, TransportClient, TransportError
-from tl_loop.events.envelope import EventEnvelope, project
+from tl_loop.events.envelope import EventEnvelope, EventKind, project
+from tl_loop.events.queue import LedgerQueue
+from tl_loop.events.reader import LedgerReader
 from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
 from tl_loop.loop.driver import (
     SubTLTask,
     TLLoopConfig,
+    WorkerTask,
     WorkPlan,
     _initial_slices,
     _supervise_live_sub_tl,
@@ -67,6 +78,28 @@ class EmptyEventSource:
 
     def acknowledge(self, event: Any) -> int:
         return event.run_seq
+
+
+class StopAfterSpawnQueue:
+    """Expose the real ledger until one authoritative spawn is consumed."""
+
+    def __init__(self, queue: LedgerQueue) -> None:
+        self.queue = queue
+        self.stopped = False
+
+    def get(self, timeout: float | None = None) -> EventEnvelope:
+        if self.stopped:
+            raise queue.Empty
+        event = self.queue.get(timeout=timeout)
+        if event.kind is EventKind.AGENT_SPAWNED:
+            self.stopped = True
+        return event
+
+    def acknowledge(self, event: EventEnvelope) -> int:
+        return self.queue.acknowledge(event)
+
+    def close(self) -> None:
+        self.queue.close(timeout=5)
 
 
 class DispatchBoundaryTransportClient(TransportClient):
@@ -475,6 +508,7 @@ def start_server(
                 f'tmux_session = "{session}"',
                 f"port = {port}",
                 "yolo = true",
+                'spawn_agent_type = "codex"',
                 f'forgejo_url = "{forgejo_url}"',
                 'forgejo_token = "test-token"',
                 'forgejo_reviewer_token = "test-token"',
@@ -490,6 +524,210 @@ def start_server(
     client = TransportClient(project_root=repo, timeout=5)
     wait_for_server(client, process, Path(log.name))
     return process, client
+
+
+def server_run_id(repo: Path) -> str:
+    """Return the immutable swarm UUID written by the running server."""
+    path = repo / ".exo" / "run_id"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if path.is_file():
+            value = path.read_text(encoding="utf-8").strip()
+            if value and value != "root":
+                return value
+        time.sleep(0.05)
+    raise HarnessError(f"server did not write a swarm UUID to {path}")
+
+
+def server_ledger_events(repo: Path) -> list[dict[str, Any]]:
+    """Read committed server events without projecting local checkpoint IDs."""
+    events: list[dict[str, Any]] = []
+    segments = repo / ".exo" / "ledger" / "segments"
+    for path in sorted(segments.glob("*")):
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                events.append(value)
+    return events
+
+
+def stop_spawned_worker(repo: Path, worker_name: str) -> None:
+    """Stop only the temporary worker window created by this probe."""
+    config = (repo / ".exo" / "config.toml").read_text(encoding="utf-8")
+    session = next(
+        line.split("=", 1)[1].strip().strip('"')
+        for line in config.splitlines()
+        if line.startswith("tmux_session =")
+    )
+    windows = run_command(
+        [
+            "tmux",
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_id}\t#{window_name}",
+        ]
+    )
+    matches = [
+        line.split("\t", 1)[0] for line in windows.splitlines() if worker_name in line
+    ]
+    for window_id in matches:
+        run_command(["tmux", "kill-window", "-t", window_id])
+    remaining = run_command(
+        [
+            "tmux",
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_name}",
+        ]
+    )
+    if worker_name in remaining.splitlines():
+        raise HarnessError(f"temporary worker window survived cleanup: {worker_name}")
+
+
+def run_root_recursive_lifecycle_probe(
+    client: TransportClient, root: Path, repo: Path
+) -> str:
+    """Consume a real UUID-stamped spawn while keeping the checkpoint ID root."""
+    swarm_id = server_run_id(repo)
+    state_root = root / "lifecycle-state"
+    worker_name = "lifecycle-root-child"
+    reader = LedgerReader(
+        repo / ".exo" / "ledger" / "segments",
+        run_id="root",
+        state_root=state_root,
+        ledger_run_id=swarm_id,
+    )
+    source = StopAfterSpawnQueue(
+        LedgerQueue(reader, poll_interval=0.01, active_tail_timeout=5).start()
+    )
+    try:
+        result = run_tl_loop(
+            "root",
+            WorkPlan(workers=(WorkerTask(worker_name, "lifecycle correlation probe"),)),
+            source,
+            EffectClient(client, role="tl", name="root"),
+            config=TLLoopConfig(
+                active=True,
+                max_events=256,
+                poll_interval=0.01,
+                idle_timeout=0.1,
+                dispatch_timeout=5,
+                root_dir=state_root,
+                run_id="root",
+                ledger_run_id=swarm_id,
+                branch="main",
+                worktree=repo,
+                working_dir=str(repo),
+            ),
+            root_dir=state_root,
+        )
+        state = RunStore("root", state_root).load()
+        child = state.slices[worker_name]
+        if child.status is not SliceStatus.SPAWNED:
+            raise HarnessError(f"root spawn was not confirmed: {child!r}")
+        if (
+            state.ledger_run_id != swarm_id
+            or child.dispatch_authoritative_event_seq is None
+            or state.events.last_consumed_offset
+            < child.dispatch_authoritative_event_seq
+        ):
+            raise HarnessError(
+                f"root checkpoint lost authoritative identity: state={state!r}"
+            )
+        if result.diagnostics.get("correlated") != 1:
+            raise HarnessError(
+                f"root spawn was not correlated exactly once: {result.diagnostics}"
+            )
+        spawn_events = [
+            event
+            for event in server_ledger_events(repo)
+            if event.get("type") == "agent.spawned"
+            and event.get("run_id") == swarm_id
+            and isinstance(event.get("data"), dict)
+            and event["data"].get("intent_id") == child.dispatch_intent_id
+        ]
+        if len(spawn_events) != 1:
+            raise HarnessError(
+                f"expected one UUID-scoped spawn event for {worker_name}: {spawn_events!r}"
+            )
+        checkpoint = state_root / "root" / "run.json"
+        if not checkpoint.is_file() or checkpoint.parent.name == swarm_id:
+            raise HarnessError(
+                f"root checkpoint path was not local and stable: {checkpoint}"
+            )
+        return swarm_id
+    finally:
+        source.close()
+        stop_spawned_worker(repo, worker_name)
+
+
+def run_recursive_checkpoint_probe(
+    client: TransportClient, root: Path, repo: Path, swarm_id: str
+) -> None:
+    """Run nested live controllers with local IDs and one shared ledger UUID."""
+    state_root = root / "lifecycle-state"
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "sub-a",
+                WorkPlan(sub_tls=(SubTLTask("nested", WorkPlan(), order=1),)),
+                order=1,
+            ),
+            SubTLTask("sub-b", WorkPlan(), order=1),
+        )
+    )
+    result = run_tl_loop(
+        "recursive-root",
+        plan,
+        EmptyEventSource(),
+        EffectClient(client, role="tl", name="recursive-root"),
+        config=TLLoopConfig(
+            active=True,
+            keep_alive_on_waiting=True,
+            max_parallel_slices=2,
+            max_events=16,
+            idle_timeout=0.2,
+            dispatch_timeout=1,
+            root_dir=state_root,
+            run_id="recursive-root",
+            ledger_run_id=swarm_id,
+            branch="main",
+            worktree=repo,
+            working_dir=str(repo),
+        ),
+        root_dir=state_root,
+    )
+    if result.final_state.fsm.phase is not TLPhase.TLDone:
+        raise HarnessError(
+            f"recursive lifecycle probe did not finish: {result.final_state!r}"
+        )
+    local_runs = (
+        ("recursive-root", state_root),
+        ("sub-a", state_root / "recursive-root"),
+        ("nested", state_root / "recursive-root" / "sub-a"),
+        ("sub-b", state_root / "recursive-root"),
+    )
+    for local_id, parent_root in local_runs:
+        path = parent_root / local_id / "run.json"
+        state = RunStore(local_id, parent_root).load()
+        if (
+            not path.is_file()
+            or state.ledger_run_id != swarm_id
+            or local_id == swarm_id
+        ):
+            raise HarnessError(
+                f"recursive checkpoint identity was not isolated for {local_id}: {path}"
+            )
+    assert_stage_events(repo, swarm_id)
 
 
 def check_pr_evidence(
@@ -784,9 +1022,7 @@ def seed_delayed_restart_run(
     )
 
 
-def seed_dispatch_restart_run(
-    root: Path, repo: Path
-) -> tuple[str, WorkPlan, int, int]:
+def seed_dispatch_restart_run(root: Path, repo: Path) -> tuple[str, WorkPlan, int, int]:
     """Leave both live sub-TL owners at the dispatch boundary before restart."""
     run_id = "ordered-server-dispatch-restart"
     state_root = root / "controller-state"
@@ -827,10 +1063,7 @@ def seed_dispatch_restart_run(
     )
     integration = IntegrationRuntimeState(
         sub_tl_states={name: IntegrationLifecycle.RUNNING for name in state.slices},
-        candidates={
-            name: IntegrationCandidateState()
-            for name in state.slices
-        },
+        candidates={name: IntegrationCandidateState() for name in state.slices},
     )
     store.checkpoint(
         TLPlanning(),
@@ -1035,7 +1268,9 @@ def _run_restart_case(
     final_candidates = result.final_state.integration.candidates
     if boundary == "base_revalidation":
         if not isinstance(resumed_transport, BaseAdvancingTransportClient):
-            raise HarnessError("base revalidation did not use the advancing watcher client")
+            raise HarnessError(
+                "base revalidation did not use the advancing watcher client"
+            )
         if (
             not resumed_transport.base_advanced
             or resumed_transport.watcher_calls < 2
@@ -1067,14 +1302,20 @@ def _run_restart_case(
     if boundary == "dispatch":
         if dispatch_events_before is None:
             raise HarnessError("dispatch event baseline was not captured")
-        dispatch_delta = server_event_count(repo, "tl.dispatch_confirmed") - dispatch_events_before
+        dispatch_delta = (
+            server_event_count(repo, "tl.dispatch_confirmed") - dispatch_events_before
+        )
         if dispatch_delta != len(plan.sub_tls):
             raise HarnessError(
                 f"dispatch restart produced {dispatch_delta} authoritative confirmations; "
                 f"expected {len(plan.sub_tls)}"
             )
-        intents = [current.dispatch_intent_id for current in result.final_state.slices.values()]
-        owners = [current.dispatch_agent_id for current in result.final_state.slices.values()]
+        intents = [
+            current.dispatch_intent_id for current in result.final_state.slices.values()
+        ]
+        owners = [
+            current.dispatch_agent_id for current in result.final_state.slices.values()
+        ]
         branches = [current.branch for current in result.final_state.slices.values()]
         sequences = [
             current.dispatch_authoritative_event_seq
@@ -1108,9 +1349,10 @@ def server_event_count(repo: Path, event_type: str) -> int:
                 value = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(value, Mapping) or value.get(
-                "type", value.get("event_type")
-            ) != event_type:
+            if (
+                not isinstance(value, Mapping)
+                or value.get("type", value.get("event_type")) != event_type
+            ):
                 continue
             identity = value.get("event_id", value.get("id", value.get("run_seq")))
             if isinstance(identity, (str, int)):
@@ -1139,24 +1381,20 @@ def run_delayed_restart_probe(
         )
 
 
-def assert_stage_events(repo: Path) -> None:
+def assert_stage_events(repo: Path, expected_run_id: str | None = None) -> None:
     observed: list[str] = []
-    for path in (repo / ".exo").rglob("*"):
-        if not path.is_file():
-            continue
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError):
-            continue
-        for line in lines:
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, Mapping):
-                event_type = value.get("type", value.get("event_type"))
-                if isinstance(event_type, str):
-                    observed.append(event_type)
+    for value in server_ledger_events(repo):
+        event_type = value.get("type", value.get("event_type"))
+        if isinstance(event_type, str):
+            observed.append(event_type)
+            if (
+                expected_run_id is not None
+                and event_type in {"tl.stage_started", "tl.stage_completed"}
+                and value.get("run_id") != expected_run_id
+            ):
+                raise HarnessError(
+                    f"stage event used a local run ID instead of the swarm UUID: {value!r}"
+                )
     required = {"tl.stage_started", "tl.stage_completed"}
     if not required <= set(observed):
         raise HarnessError(
@@ -1226,9 +1464,11 @@ def main() -> None:
         try:
             server, client = start_server(root, repo, forgejo_url, project_root)
             check_pr_evidence(client, branch, repo, forgejo_url)
+            swarm_id = run_root_recursive_lifecycle_probe(client, root, repo)
+            run_recursive_checkpoint_probe(client, root, repo, swarm_id)
             run_live_ordered_probe(client, root, repo)
             run_delayed_restart_probe(client, root, repo, forgejo_url)
-            assert_stage_events(repo)
+            assert_stage_events(repo, swarm_id)
             run_waiting_supervision_probe(root / "waiting-state")
             print("real server TransportClient ordered recursion: passed")
         finally:
