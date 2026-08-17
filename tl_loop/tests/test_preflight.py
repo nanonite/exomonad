@@ -127,6 +127,37 @@ def test_exit_reason_preserves_chained_error_diagnostics(tmp_path: Path) -> None
     }
 
 
+def test_exit_reason_preserves_recent_controller_output(tmp_path: Path) -> None:
+    store = RunStore("root", tmp_path / ".exo" / "tl-loop")
+    store.controller_output_path.parent.mkdir(parents=True, exist_ok=True)
+    store.controller_output_path.write_text("first\nlast failure\n", encoding="utf-8")
+
+    store.record_exit_reason("controller failed")
+
+    payload = json.loads(store.exit_reason_path.read_text(encoding="utf-8"))
+    assert payload["recent_output"] == "first\nlast failure"
+
+
+def test_terminal_summary_is_durable_after_controller_exit(tmp_path: Path) -> None:
+    store = RunStore("root", tmp_path / ".exo" / "tl-loop")
+    store.controller_output_path.parent.mkdir(parents=True, exist_ok=True)
+    store.controller_output_path.write_text("terminal failure output\n", encoding="utf-8")
+    store.record_terminal_summary(
+        {
+            "reason": "dispatch timeout",
+            "deadline_reason": "dispatch",
+            "timeout_seconds": 5.0,
+            "diagnostics": {"received": 2, "filtered": 2},
+        }
+    )
+
+    summary = store.terminal_summary()
+    assert summary is not None
+    assert summary["reason"] == "dispatch timeout"
+    assert summary["diagnostics"] == {"received": 2, "filtered": 2}
+    assert summary["recent_output"] == "terminal failure output"
+
+
 def test_cli_persists_actual_ledger_queue_failure_diagnostics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -419,6 +419,27 @@ impl TmuxIpc {
         Ok(())
     }
 
+    pub async fn set_window_remain_on_exit(
+        &self,
+        window_id: &WindowId,
+        enabled: bool,
+    ) -> Result<()> {
+        let target = format!("{}:{}", self.session_name, window_id.as_str());
+        let value = if enabled { "on" } else { "off" };
+        let output = tmux_command()
+            .args(["set-window-option", "-t", &target, "remain-on-exit", value])
+            .output()
+            .await
+            .context("Failed to set tmux remain-on-exit")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux set-window-option remain-on-exit failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
     fn ownership_target(&self, routing: &RoutingInfo) -> Option<(&'static str, String)> {
         if let Some(window_id) = &routing.window_id {
             return Some((

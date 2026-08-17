@@ -194,6 +194,38 @@ class RunStore:
         """Return the diagnostic marker written when startup fails."""
         return self.run_dir / "controller-exit.json"
 
+    @property
+    def terminal_summary_path(self) -> Path:
+        """Return the durable summary path for a terminal controller result."""
+        return self.run_dir / "terminal-summary.json"
+
+    @property
+    def controller_output_path(self) -> Path:
+        """Return the bounded-on-disk controller output capture path."""
+        return self.run_dir / "controller-output.log"
+
+    def record_terminal_summary(self, summary: Mapping[str, object]) -> None:
+        """Persist terminal diagnostics independently of the tmux process."""
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"recorded_at": time.time(), **dict(summary)}
+        try:
+            output = self.controller_output_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            output = ""
+        if output:
+            payload["recent_output"] = "\n".join(output.splitlines()[-20:])
+        temporary = self.terminal_summary_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temporary.replace(self.terminal_summary_path)
+
+    def terminal_summary(self) -> Mapping[str, object] | None:
+        """Read the terminal summary without making it part of run state."""
+        try:
+            payload = json.loads(self.terminal_summary_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def record_exit_reason(
         self,
         reason: str,
@@ -208,18 +240,31 @@ class RunStore:
             context = _exception_context(error)
             if context:
                 payload["context"] = context
+        try:
+            output = self.controller_output_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            output = ""
+        if output:
+            payload["recent_output"] = "\n".join(output.splitlines()[-20:])
         temporary = self.exit_reason_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
         temporary.replace(self.exit_reason_path)
 
     def exit_reason(self) -> str | None:
         """Read the diagnostic marker without treating it as a checkpoint."""
+        payload = self.exit_diagnostics()
+        if payload is None:
+            return None
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        return reason if isinstance(reason, str) and reason else None
+
+    def exit_diagnostics(self) -> Mapping[str, object] | None:
+        """Read the complete durable controller-exit diagnostic."""
         try:
             payload = json.loads(self.exit_reason_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None
-        reason = payload.get("reason") if isinstance(payload, dict) else None
-        return reason if isinstance(reason, str) and reason else None
+        return payload if isinstance(payload, dict) else None
 
     def resume(self) -> ResumeState:
         """Return local replay state without contacting the runtime."""

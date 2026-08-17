@@ -1018,11 +1018,19 @@ fn controller_exit_path(project_dir: &Path) -> PathBuf {
 fn controller_exit_reason(project_dir: &Path) -> Option<String> {
     let payload = std::fs::read_to_string(controller_exit_path(project_dir)).ok()?;
     let value = serde_json::from_str::<Value>(&payload).ok()?;
-    value
+    let reason = value
         .get("reason")
         .and_then(Value::as_str)
         .filter(|reason| !reason.is_empty())
-        .map(ToString::to_string)
+        .map(ToString::to_string)?;
+    let output = value
+        .get("recent_output")
+        .and_then(Value::as_str)
+        .filter(|output| !output.is_empty());
+    Some(match output {
+        Some(output) => format!("{reason}; recent controller output: {output}"),
+        None => reason,
+    })
 }
 
 fn clear_controller_exit_reason(project_dir: &Path) -> Result<()> {
@@ -1891,7 +1899,12 @@ pub async fn run(
     };
 
     let tl_window = ipc.new_window("TL", &tl_cwd, &shell, &tl_command).await?;
-    wait_for_tl_controller_startup(&ipc, &cwd, &tl_window).await?;
+    ipc.set_window_remain_on_exit(&tl_window, true).await?;
+    let startup = wait_for_tl_controller_startup(&ipc, &cwd, &tl_window).await;
+    if startup.is_ok() {
+        ipc.set_window_remain_on_exit(&tl_window, false).await?;
+    }
+    startup?;
 
     // 5. Spawn companion agents
     let companions_to_spawn: Vec<&crate::config::CompanionConfig> =
@@ -3070,6 +3083,17 @@ mod tests {
         assert_eq!(
             controller_exit_reason(dir.path()).as_deref(),
             Some("plan.json is missing")
+        );
+
+        let payload_path = controller_exit_path(dir.path());
+        std::fs::write(
+            &payload_path,
+            r#"{"reason":"ledger tailer stopped","recent_output":"last output line"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            controller_exit_reason(dir.path()).as_deref(),
+            Some("ledger tailer stopped; recent controller output: last output line")
         );
 
         clear_controller_exit_reason(dir.path()).unwrap();

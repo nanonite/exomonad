@@ -226,6 +226,11 @@ class LoopLimitExceeded(TLLoopError):
 class LoopTimeout(TLLoopError):
     """The loop received no event for its configured idle window."""
 
+    def __init__(self, message: str, *, reason: str = "idle", timeout_seconds: float | None = None):
+        super().__init__(message)
+        self.deadline_reason = reason
+        self.timeout_seconds = timeout_seconds
+
 
 class DepthLimitExceeded(TLLoopError):
     """A recursive child reached the configured depth ceiling."""
@@ -244,6 +249,37 @@ class DispatchAttempt:
     harness: str
     agent_type: str = ""
     model: str | None = None
+
+
+@dataclass(frozen=True)
+class LoopDeadline:
+    """Effective deadline and the budget that selected it."""
+
+    at: float
+    reason: str
+    timeout_seconds: float
+
+
+@dataclass
+class EventDiagnostics:
+    """Counters explaining what the controller did with projected events."""
+
+    received: int = 0
+    acknowledged: int = 0
+    filtered: int = 0
+    correlated: int = 0
+    rejected: int = 0
+    last_event_seq: int | None = None
+
+    def snapshot(self) -> Mapping[str, object]:
+        return {
+            "received": self.received,
+            "acknowledged": self.acknowledged,
+            "filtered": self.filtered,
+            "correlated": self.correlated,
+            "rejected": self.rejected,
+            "last_event_seq": self.last_event_seq,
+        }
 
 
 class EventQueue(Protocol):
@@ -495,6 +531,7 @@ class TLRunResult:
     transitions: tuple[LoopTransition, ...]
     consumed_events: tuple[int, ...]
     heartbeat_events: tuple[SyntheticHeartbeatEvent, ...] = ()
+    diagnostics: Mapping[str, object] = field(default_factory=dict)
 
 
 def tl_run(
@@ -636,6 +673,7 @@ def _run_loop(
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
+    diagnostics = EventDiagnostics()
     if not expected and not plan.sub_tls:
         before_phase = phase
         state = store.checkpoint(
@@ -649,7 +687,13 @@ def _run_loop(
             effects,
             effects_log,
         )
-        return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
+        return TLRunResult(
+            state,
+            tuple(effects_log),
+            tuple(transitions),
+            tuple(consumed),
+            diagnostics=diagnostics.snapshot(),
+        )
 
     deadline = _next_loop_deadline(state, config)
 
@@ -669,7 +713,8 @@ def _run_loop(
                     effects_log,
                     transitions,
                     consumed,
-                    str(error),
+                    error,
+                    diagnostics,
                 )
             return _park_timeout(
                 run_id,
@@ -680,7 +725,8 @@ def _run_loop(
                 effects_log,
                 transitions,
                 consumed,
-                str(error),
+                error,
+                diagnostics,
             )
         if event is None:
             if config.heartbeat is not None:
@@ -716,6 +762,7 @@ def _run_loop(
                         tuple(transitions),
                         tuple(consumed),
                         tuple(heartbeat_events),
+                        diagnostics.snapshot(),
                     )
                 deadline = _next_waiting_deadline(config)
             continue
@@ -723,10 +770,14 @@ def _run_loop(
         if event_seq is None:
             raise TLLoopError(f"{event.event_type!r} has no run_seq")
         consumed.append(event_seq)
+        diagnostics.received += 1
+        diagnostics.last_event_seq = event_seq
         deadline = _next_loop_deadline(state, config)
         ledger_run_id = config.ledger_run_id or run_id
         if event.run_id not in {None, ledger_run_id}:
+            diagnostics.filtered += 1
             _checkpoint_and_ack(store, source, event, state, phase)
+            diagnostics.acknowledged += 1
             state = store.load()
             LOGGER.warning(
                 "Ignoring event from stale swarm run_id=%s expected=%s local_checkpoint=%s event_seq=%s",
@@ -737,12 +788,15 @@ def _run_loop(
             )
             continue
         if not _event_belongs_to_plan(event, expected, state):
+            diagnostics.filtered += 1
             _checkpoint_and_ack(store, source, event, state, phase)
+            diagnostics.acknowledged += 1
             state = store.load()
             continue
         if config.heartbeat is not None:
             state = _note_heartbeat_progress(store, state)
         if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW}:
+            diagnostics.correlated += 1
             if _review_workflow_enabled(config):
                 state = _route_review_event(
                     plan, store, state, phase, event, event_seq, config, effects, effects_log
@@ -758,10 +812,12 @@ def _run_loop(
                     else _next_loop_deadline(state, config)
                 )
             source.acknowledge(event)
+            diagnostics.acknowledged += 1
             if isinstance(phase, (TLDone, TLFailed)):
                 break
             continue
         if event.kind is EventKind.CI_STATUS_CHANGED:
+            diagnostics.correlated += 1
             state = _route_ci_event(
                 store, state, phase, event, event_seq, config, effects, effects_log
             )
@@ -774,6 +830,7 @@ def _run_loop(
                     else _next_loop_deadline(state, config)
                 )
             source.acknowledge(event)
+            diagnostics.acknowledged += 1
             if isinstance(phase, (TLDone, TLFailed)):
                 break
             continue
@@ -784,16 +841,21 @@ def _run_loop(
         if _is_spawn_confirmation_event(event) and not _dispatch_confirmation_matches(
             state.slices, event
         ):
+            diagnostics.filtered += 1
+            diagnostics.rejected += 1
             LOGGER.warning(
                 "Ignoring uncorrelated agent.spawned event run_id=%s event_seq=%s",
                 run_id,
                 event_seq,
             )
             _checkpoint_and_ack(store, source, event, state, phase)
+            diagnostics.acknowledged += 1
             state = store.load()
             continue
         if _duplicate_event(phase, fsm_event, state):
+            diagnostics.filtered += 1
             _checkpoint_and_ack(store, source, event, state, phase)
+            diagnostics.acknowledged += 1
             state = store.load()
             continue
         if isinstance(fsm_event, ChildCompleted):
@@ -866,6 +928,8 @@ def _run_loop(
         if head_changed and config.enable_reviewer_spawn:
             _spawn_reviewer_for_head(plan, state, fsm_event, event, config, effects, effects_log)
         source.acknowledge(event)
+        diagnostics.acknowledged += 1
+        diagnostics.correlated += 1
         before_tag = _phase_tag(phase)
         after_tag = _phase_tag(next_phase)
         transitions.append(LoopTransition(event_seq, event.event_type, before_tag, after_tag))
@@ -888,8 +952,30 @@ def _run_loop(
         )
     if not isinstance(phase, (TLDone, TLFailed)):
         raise LoopTimeout(f"TL did not reach a terminal phase within {config.idle_timeout:g}s")
+    if phase is TLFailed:
+        reason = next(
+            (
+                current.dispatch_error
+                for current in state.slices.values()
+                if current.dispatch_error
+            ),
+            "TL reached the failed terminal phase",
+        )
+        store.record_terminal_summary(
+            {
+                "reason": reason,
+                "deadline_reason": None,
+                "timeout_seconds": None,
+                "diagnostics": diagnostics.snapshot(),
+            }
+        )
     return TLRunResult(
-        state, tuple(effects_log), tuple(transitions), tuple(consumed), tuple(heartbeat_events)
+        state,
+        tuple(effects_log),
+        tuple(transitions),
+        tuple(consumed),
+        tuple(heartbeat_events),
+        diagnostics.snapshot(),
     )
 
 
@@ -902,7 +988,8 @@ def _park_timeout(
     effects_log: list[EffectIntent],
     transitions: list[LoopTransition],
     consumed: list[int],
-    reason: str,
+    reason: str | LoopTimeout,
+    diagnostics: EventDiagnostics,
 ) -> TLRunResult:
     """Persist a named timeout gate before returning a terminal failed run."""
     before_phase = _phase_from_state(state)
@@ -920,7 +1007,8 @@ def _park_timeout(
             effects,
             effects_log,
         )
-    message = f"timeout parked at gate {TIMEOUT_GATE_NAME!r}: {reason}"
+    timeout_reason = _diagnostic_timeout_reason(reason, diagnostics)
+    message = f"timeout parked at gate {TIMEOUT_GATE_NAME!r}: {timeout_reason}"
     state = store.checkpoint(
         TLFailed(message),
         state.slices,
@@ -936,16 +1024,40 @@ def _park_timeout(
         effects_log,
     )
     LOGGER.warning("[TL loop] %s", message)
-    return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
+    store.record_terminal_summary(
+        {
+            "reason": message,
+            "deadline_reason": getattr(reason, "deadline_reason", "idle"),
+            "timeout_seconds": getattr(reason, "timeout_seconds", None),
+            "diagnostics": diagnostics.snapshot(),
+        }
+    )
+    return TLRunResult(
+        state,
+        tuple(effects_log),
+        tuple(transitions),
+        tuple(consumed),
+        diagnostics=diagnostics.snapshot(),
+    )
 
 
 def _has_pending_dispatch(state: RunState) -> bool:
     return any(slice_state.status in DISPATCHING_STATUSES for slice_state in state.slices.values())
 
 
-def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> float:
-    deadline = time.monotonic() + config.idle_timeout
-    remaining = []
+def _diagnostic_timeout_reason(reason: str | LoopTimeout, diagnostics: EventDiagnostics) -> str:
+    if diagnostics.received == 0:
+        return str(reason)
+    return (
+        f"{reason}; consumed {diagnostics.received} event(s), filtered "
+        f"{diagnostics.filtered}, rejected {diagnostics.rejected} without a correlated event"
+    )
+
+
+def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> LoopDeadline:
+    now = time.monotonic()
+    deadline = LoopDeadline(now + config.idle_timeout, "idle", config.idle_timeout)
+    remaining: list[float] = []
     if config.active:
         remaining = [
             config.dispatch_timeout - max(0.0, time.time() - slice_state.dispatch_started_at)
@@ -954,18 +1066,25 @@ def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> float:
             and slice_state.dispatch_started_at is not None
         ]
     if remaining:
-        deadline = min(deadline, time.monotonic() + min(remaining))
+        dispatch_remaining = min(remaining)
+        if dispatch_remaining < config.idle_timeout:
+            deadline = LoopDeadline(
+                now + dispatch_remaining,
+                "dispatch",
+                config.dispatch_timeout,
+            )
     return deadline
 
 
-def _next_waiting_deadline(config: TLLoopConfig) -> float:
+def _next_waiting_deadline(config: TLLoopConfig) -> LoopDeadline:
     """Use the liveness budget while review or CI is legally outstanding."""
     timeout = (
         config.heartbeat.stall_threshold_seconds
         if config.heartbeat is not None
         else config.controller_stall_timeout
     )
-    return time.monotonic() + timeout
+    reason = "stall" if config.heartbeat is not None else "waiting"
+    return LoopDeadline(time.monotonic() + timeout, reason, timeout)
 
 
 def _park_dispatch_timeout(
@@ -977,12 +1096,21 @@ def _park_dispatch_timeout(
     effects_log: list[EffectIntent],
     transitions: list[LoopTransition],
     consumed: list[int],
-    reason: str,
+    reason: str | LoopTimeout,
+    diagnostics: EventDiagnostics,
 ) -> TLRunResult:
     """Persist a distinct dispatch timeout when spawn proof never arrives."""
     before_phase = _phase_from_state(state)
+    if diagnostics.received:
+        observed = (
+            f"consumed {diagnostics.received} event(s), filtered {diagnostics.filtered}, "
+            f"rejected {diagnostics.rejected} without an authoritative match"
+        )
+    else:
+        observed = "no event was received"
     bounded_reason = (
-        f"no authoritative agent.spawned event within {config.dispatch_timeout:g}s; {reason}"
+        f"no authoritative agent.spawned event within {config.dispatch_timeout:g}s; "
+        f"{observed}; {reason}"
     )[:500]
     pending = [
         current for current in state.slices.values() if current.status in DISPATCHING_STATUSES
@@ -1047,7 +1175,21 @@ def _park_dispatch_timeout(
         effects_log,
     )
     LOGGER.warning("[TL loop] dispatch timeout: %s", bounded_reason)
-    return TLRunResult(state, tuple(effects_log), tuple(transitions), tuple(consumed))
+    store.record_terminal_summary(
+        {
+            "reason": f"dispatch timeout: {bounded_reason}",
+            "deadline_reason": "dispatch",
+            "timeout_seconds": config.dispatch_timeout,
+            "diagnostics": diagnostics.snapshot(),
+        }
+    )
+    return TLRunResult(
+        state,
+        tuple(effects_log),
+        tuple(transitions),
+        tuple(consumed),
+        diagnostics=diagnostics.snapshot(),
+    )
 
 
 def _record_dispatch_intent(
@@ -4194,11 +4336,16 @@ def _invoke(
 def _next_event(
     source: EventQueue,
     config: TLLoopConfig,
-    deadline: float,
+    deadline: LoopDeadline,
 ) -> EventEnvelope | None:
-    remaining = deadline - time.monotonic()
+    remaining = deadline.at - time.monotonic()
     if remaining <= 0:
-        raise LoopTimeout(f"TL did not receive an event within {config.idle_timeout:g}s")
+        raise LoopTimeout(
+            f"TL did not receive an event within {deadline.timeout_seconds:g}s "
+            f"(deadline={deadline.reason})",
+            reason=deadline.reason,
+            timeout_seconds=deadline.timeout_seconds,
+        )
     timeout = min(config.poll_interval or 0.01, remaining)
     try:
         return source.get(timeout=timeout)

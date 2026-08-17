@@ -490,6 +490,18 @@ def test_idle_timeout_parks_with_named_gate_and_never_merges(tmp_path: Path) -> 
     assert worker_state.park_cause.value == "dispatch_timeout"
     assert worker_state.dispatch_intent_id
     assert "authoritative agent.spawned" in (worker_state.dispatch_error or "")
+    summary = RunStore("timeout-run", tmp_path).terminal_summary()
+    assert summary is not None
+    assert summary["deadline_reason"] == "dispatch"
+    assert summary["timeout_seconds"] == 5.0
+    assert summary["diagnostics"] == {
+        "received": 0,
+        "acknowledged": 0,
+        "filtered": 0,
+        "correlated": 0,
+        "rejected": 0,
+        "last_event_seq": None,
+    }
     assert [
         arguments["payload"]
         for tool_name, arguments in transport.calls
@@ -532,7 +544,7 @@ def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None
 def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> None:
     run_id = "dispatch-restart-run"
     plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement the change"}]})
-    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.01)
+    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.1)
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["leaf-a"].update(
         {
@@ -616,7 +628,7 @@ def test_restart_adopts_owner_by_intent_without_duplicate_spawn(tmp_path: Path) 
 def test_stale_spawn_intent_cannot_confirm_new_attempt(tmp_path: Path) -> None:
     run_id = "dispatch-stale-intent-run"
     plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]})
-    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.01)
+    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.1)
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["leaf-a"].update(
         {
@@ -653,6 +665,10 @@ def test_stale_spawn_intent_cannot_confirm_new_attempt(tmp_path: Path) -> None:
     assert stale.dispatch_intent_id == "intent-new-2"
     assert stale.dispatch_authoritative_event_seq is None
     assert stale.park_cause.value == "dispatch_timeout"
+    assert result.diagnostics["received"] == 1
+    assert result.diagnostics["filtered"] == 1
+    assert result.diagnostics["rejected"] == 1
+    assert result.diagnostics["acknowledged"] == 1
 
 
 def test_pr_head_change_clears_per_head_gate_state() -> None:

@@ -59,7 +59,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     }:
         parsed_argv.insert(0, "run")
     args = parser.parse_args(parsed_argv)
-    _configure_logging(args.verbose if hasattr(args, "verbose") else False)
+    _configure_logging(
+        args.verbose if hasattr(args, "verbose") else False,
+        project_root=getattr(args, "project_root", None),
+        run_id=getattr(args, "run_id", None),
+    )
     try:
         if args.command == "run":
             result = _run(args)
@@ -83,8 +87,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         PlanValidationError,
         PreflightError,
     ) as error:
-        _record_run_failure(args, error)
         LOGGER.error("[TL loop] %s", error)
+        _record_run_failure(args, error)
         return 2
     return 0
 
@@ -345,6 +349,8 @@ def _print_result(result: TLRunResult) -> None:
         state.events.last_consumed_offset,
         len(result.effects),
     )
+    if result.diagnostics:
+        LOGGER.info("[TL loop] event diagnostics=%s", dict(result.diagnostics))
     LOGGER.info(
         "[TL loop] ordered current_order=%d integration=%s next_transition=%s",
         state.current_order,
@@ -422,11 +428,11 @@ def _status_snapshot(
         replay = reader.read_from(0)
     except (CorruptCheckpoint, OSError, ValueError) as error:
         return f"checkpoint is currently unavailable; retrying: {error}"
-    return json.dumps(
-        _state_document(state, replay.events, replay.sequence_status),
-        indent=2,
-        sort_keys=True,
-    )
+    document = _state_document(state, replay.events, replay.sequence_status)
+    summary = store.terminal_summary()
+    if summary is not None:
+        document["terminal_summary"] = dict(summary)
+    return json.dumps(document, indent=2, sort_keys=True)
 
 
 def _set_gate(args: argparse.Namespace) -> None:
@@ -489,11 +495,28 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
-def _configure_logging(verbose: bool) -> None:
+def _configure_logging(
+    verbose: bool,
+    *,
+    project_root: Path | None = None,
+    run_id: str | None = None,
+) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    for handler in list(LOGGER.handlers):
+        if getattr(handler, "_tl_controller_output", False):
+            LOGGER.removeHandler(handler)
+            handler.close()
+    if project_root is not None and run_id:
+        output_path = project_root.expanduser().resolve() / ".exo" / "tl-loop" / run_id
+        output_path.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(output_path / "controller-output.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+        handler._tl_controller_output = True  # type: ignore[attr-defined]
+        LOGGER.addHandler(handler)
 
 
 if __name__ == "__main__":
