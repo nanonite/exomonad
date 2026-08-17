@@ -8,9 +8,17 @@ import threading
 from typing import TypeAlias
 
 from .envelope import EventEnvelope
-from .reader import LedgerFinding, LedgerReader, ReadResult, SequenceStatus
+from .reader import (
+    ActiveTail,
+    LedgerFinding,
+    LedgerReader,
+    LedgerReadError,
+    ReadResult,
+    SequenceStatus,
+)
 
 FindingKey: TypeAlias = tuple[str, str, str, int]
+DEFAULT_ACTIVE_TAIL_RETRY_LIMIT = 120
 LOGGER = logging.getLogger(__name__)
 
 
@@ -54,11 +62,14 @@ class LedgerQueue:
         *,
         maxsize: int = 128,
         poll_interval: float = 0.25,
+        active_tail_retry_limit: int = DEFAULT_ACTIVE_TAIL_RETRY_LIMIT,
     ) -> None:
         if maxsize <= 0:
             raise ValueError("queue maxsize must be positive")
         if poll_interval <= 0:
             raise ValueError("queue poll interval must be positive")
+        if active_tail_retry_limit <= 0:
+            raise ValueError("active tail retry limit must be positive")
         self.reader = reader
         self.poll_interval = poll_interval
         self._events: queue_module.Queue[EventEnvelope] = queue_module.Queue(maxsize=maxsize)
@@ -70,6 +81,9 @@ class LedgerQueue:
         self._lock = threading.Lock()
         self._sequence_status = SequenceStatus.UNKNOWN
         self._cursor = 0
+        self._active_tail_retry_limit = active_tail_retry_limit
+        self._active_tail_signature: tuple[object, ...] | None = None
+        self._active_tail_retries = 0
 
     def start(self) -> LedgerQueue:
         """Start the single tailer thread."""
@@ -126,6 +140,7 @@ class LedgerQueue:
             while not self._stop.is_set():
                 result = self.reader.read_from(cursor)
                 self._record_result(result)
+                self._check_active_tail(result.active_tail)
                 for event in result.events:
                     if self._stop.is_set():
                         return
@@ -142,6 +157,25 @@ class LedgerQueue:
                     self._cursor,
                     self.sequence_status.value,
                 )
+
+    def _check_active_tail(self, active_tail: ActiveTail | None) -> None:
+        if active_tail is None:
+            self._active_tail_signature = None
+            self._active_tail_retries = 0
+            return
+        signature = (active_tail.segment, active_tail.line_number, active_tail.byte_length)
+        if signature == self._active_tail_signature:
+            self._active_tail_retries += 1
+        else:
+            self._active_tail_signature = signature
+            self._active_tail_retries = 1
+        if self._active_tail_retries > self._active_tail_retry_limit:
+            raise LedgerReadError(
+                f"active ledger tail {active_tail.segment} line {active_tail.line_number} "
+                f"remained incomplete for {self._active_tail_retries} stable polls",
+                segment=active_tail.segment,
+                line_number=active_tail.line_number,
+            )
 
     def _put_until_stopped(self, event: EventEnvelope) -> None:
         while not self._stop.is_set():

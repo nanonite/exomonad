@@ -70,12 +70,28 @@ class LedgerRow:
 
 
 @dataclass(frozen=True)
+class ActiveTail:
+    """An unterminated final record observed in the active segment."""
+
+    segment: Path
+    line_number: int
+    byte_length: int
+
+
+@dataclass(frozen=True)
+class _RowsRead:
+    rows: tuple[LedgerRow, ...]
+    active_tail: ActiveTail | None
+
+
+@dataclass(frozen=True)
 class ReadResult:
     """Projected replay rows plus sequence status and read-time findings."""
 
     events: tuple[EventEnvelope, ...]
     sequence_status: SequenceStatus
     findings: tuple[LedgerFinding, ...]
+    active_tail: ActiveTail | None = None
 
     def __iter__(self) -> Iterator[EventEnvelope]:
         return iter(self.events)
@@ -114,7 +130,7 @@ class LedgerReader:
 
     def cursor(self) -> int:
         """Return the persisted global cursor, or zero for a new local reader."""
-        if self.run_dir is None:
+        if self.run_dir is None or not (self.run_dir / "run.json").is_file():
             return 0
         from tl_loop.state.store import load
 
@@ -125,7 +141,8 @@ class LedgerReader:
         effective_cursor = self.cursor() if cursor is None else cursor
         if type(effective_cursor) is not int or effective_cursor < 0:
             raise ValueError("replay cursor must be a non-negative integer")
-        rows = _resolve_superseded(self._read_rows())
+        read_rows = self._read_rows()
+        rows = _resolve_superseded(list(read_rows.rows))
         status = sequence_status(_run_sequences(row.document for row in rows))
         findings: list[LedgerFinding] = []
         projected: list[EventEnvelope] = []
@@ -153,7 +170,7 @@ class LedgerReader:
             if envelope.run_seq > effective_cursor:
                 projected.append(envelope)
         projected.sort(key=lambda event: cast(int, event.run_seq))
-        return ReadResult(tuple(projected), status, tuple(findings))
+        return ReadResult(tuple(projected), status, tuple(findings), read_rows.active_tail)
 
     def _in_scope(self, event: EventEnvelope) -> bool:
         """Keep one run and its directly owned child events in scope."""
@@ -181,8 +198,9 @@ class LedgerReader:
         events = cast(dict[str, object], document["events"])
         return cast(int, events["last_consumed_offset"])
 
-    def _read_rows(self) -> list[LedgerRow]:
+    def _read_rows(self) -> _RowsRead:
         rows: list[LedgerRow] = []
+        active_tail: ActiveTail | None = None
         segments = self._segment_paths()
         active_segment = segments[-1] if segments else None
         for segment in segments:
@@ -197,10 +215,11 @@ class LedgerReader:
                         # final line of the newest segment is retryable; a
                         # newline makes malformed data committed evidence.
                         if segment == active_segment and not line.endswith(b"\n"):
+                            active_tail = ActiveTail(segment, line_number, len(line))
                             break
                         try:
                             value = json.loads(line)
-                        except json.JSONDecodeError as error:
+                        except (json.JSONDecodeError, UnicodeDecodeError) as error:
                             raise LedgerReadError(
                                 f"could not parse {segment} line {line_number}: {error}",
                                 segment=segment,
@@ -217,7 +236,7 @@ class LedgerReader:
                 continue
             except OSError as error:
                 raise LedgerReadError(f"could not read ledger segment {segment}: {error}") from error
-        return rows
+        return _RowsRead(tuple(rows), active_tail)
 
     def _segment_paths(self) -> list[Path]:
         try:
@@ -302,6 +321,7 @@ def _optional_scope_text(value: str | None, name: str) -> None:
 
 __all__ = [
     "DEFAULT_LEDGER_ROOT",
+    "ActiveTail",
     "FindingKind",
     "LedgerFinding",
     "LedgerReadError",

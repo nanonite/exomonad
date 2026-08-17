@@ -17,6 +17,7 @@ from .envelope import (
 from .queue import EventQueue, LedgerQueue, QueueError
 from .reader import (
     DEFAULT_LEDGER_ROOT,
+    ActiveTail,
     FindingKind,
     LedgerFinding,
     LedgerReader,
@@ -34,6 +35,7 @@ __all__ = [
     "KIND_BY_EVENT_TYPE",
     "MAPPED_EVENT_TYPES",
     "SERVER_EMIT_HEAD_SHA_GAPS",
+    "ActiveTail",
     "BridgeError",
     "EnvelopeError",
     "EventBridge",

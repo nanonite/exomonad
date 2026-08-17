@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import queue
+import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import cast
@@ -146,6 +147,79 @@ def test_finalized_malformed_record_remains_a_hard_failure(tmp_path: Path) -> No
         LedgerReader(segments).read_from()
 
 
+def test_finalized_invalid_utf8_preserves_segment_and_line(tmp_path: Path) -> None:
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    path = segments / "segment-000000000001.jsonl"
+    path.write_bytes(b"\xff\n")
+
+    with pytest.raises(LedgerReadError, match=r"line 1") as raised:
+        LedgerReader(segments).read_from()
+
+    assert raised.value.segment == path
+    assert raised.value.line_number == 1
+
+
+def test_concurrent_writer_partial_tail_is_retried_without_queue_failure(tmp_path: Path) -> None:
+    event = _fixture_events()[0]
+    encoded = json.dumps(
+        {**event, "data": {"slice_id": "leaf-é", "large": "x" * 32_768}},
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    path = segments / "segment-000000000001.jsonl"
+    split = len(encoded) // 2
+    ready = threading.Event()
+    release = threading.Event()
+
+    def writer() -> None:
+        with path.open("wb") as stream:
+            stream.write(encoded[:split])
+            stream.flush()
+            ready.set()
+            assert release.wait(timeout=2)
+            stream.write(encoded[split:] + b"\n")
+            stream.flush()
+
+    writer_thread = threading.Thread(target=writer)
+    writer_thread.start()
+    assert ready.wait(timeout=2)
+    event_queue = LedgerQueue(LedgerReader(segments), poll_interval=0.005).start()
+    try:
+        with pytest.raises(queue.Empty):
+            event_queue.get(timeout=0.05)
+        release.set()
+        assert event_queue.get(timeout=2).run_seq == 101
+    finally:
+        release.set()
+        event_queue.close(timeout=2)
+        writer_thread.join(timeout=2)
+    assert not writer_thread.is_alive()
+
+
+def test_abandoned_active_tail_eventually_fails_with_context(tmp_path: Path) -> None:
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    path = segments / "segment-000000000001.jsonl"
+    path.write_bytes(b"{\"abandoned\":")
+    event_queue = LedgerQueue(
+        LedgerReader(segments),
+        poll_interval=0.001,
+        active_tail_retry_limit=3,
+    ).start()
+    try:
+        with pytest.raises(QueueError, match=r"remained incomplete") as raised:
+            event_queue.get(timeout=2)
+        cause = raised.value.__cause__
+        assert isinstance(cause, LedgerReadError)
+        assert cause.segment == path
+        assert cause.line_number == 1
+    finally:
+        event_queue.close(timeout=2)
+
+
 def test_queue_retries_partial_tail_and_reports_hard_failures(tmp_path: Path) -> None:
     event = _fixture_events()[0]
     encoded = json.dumps(event, sort_keys=True).encode("utf-8")
@@ -225,7 +299,7 @@ def _write_segment(directory: Path, index: int, events: list[dict[str, object]])
     path.write_text("\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n", encoding="utf-8")
 
 
-def _write_raw_segment(directory: Path, index: int, lines: list[str]) -> None:
+def _write_raw_segment(directory: Path, index: int, lines: list[str | bytes]) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"segment-{index:012}.jsonl"
-    path.write_text("".join(lines), encoding="utf-8")
+    path.write_bytes(b"".join(line if isinstance(line, bytes) else line.encode() for line in lines))

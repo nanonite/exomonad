@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from tl_loop import __main__ as tl_main
 from tl_loop.preflight import PreflightError, capability_example, run_preflight
 from tl_loop.select.policy import load_policy
 from tl_loop.state.store import RunStore
@@ -118,3 +119,68 @@ def test_exit_reason_preserves_chained_error_diagnostics(tmp_path: Path) -> None
         "segment": "segment-000000000001.jsonl",
         "sequence_status": "partial",
     }
+
+
+def test_cli_persists_actual_ledger_queue_failure_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path, capability="standard")
+    policy_path = project / ".exo" / "harness_policy.toml"
+    policy_path.write_text(
+        policy_path.read_text(encoding="utf-8").replace("token_budget = 1", "token_budget = 10000"),
+        encoding="utf-8",
+    )
+    (project / ".exo" / "tl-loop" / "plan.json").write_text(
+        '{\"plan\":{\"workers\":[{\"name\":\"worker-a\",\"task\":\"work\"}],\"leaves\":[],\"sub_tls\":[]},\"budgets\":{\"tokens\":100,\"wall_seconds\":100}}',
+        encoding="utf-8",
+    )
+    segments = project / ".exo" / "ledger" / "segments"
+    segments.mkdir(parents=True)
+    segment = segments / "segment-000000000001.jsonl"
+    segment.write_bytes(b"\xff\n")
+
+    class FakeTransport:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: dict[str, object],
+        ) -> dict[str, object]:
+            del role, name
+            if tool_name == "spawn_worker":
+                return {
+                    "success": True,
+                    "result": {"agent_id": arguments.get("name", "worker-a")},
+                }
+            return {"success": True, "result": {"run_seq": 1}}
+
+    monkeypatch.setattr(tl_main, "TransportClient", FakeTransport)
+
+    assert (
+        tl_main.main(
+            [
+                "run",
+                "--project-root",
+                str(project),
+                "--poll-interval",
+                "0.001",
+                "--idle-timeout",
+                "1",
+            ]
+        )
+        == 2
+    )
+
+    payload = json.loads(
+        (project / ".exo" / "tl-loop" / "root" / "controller-exit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["context"]["line_number"] == 1
+    assert payload["context"]["segment"] == str(segment)
+    assert any("UnicodeDecodeError" in item for item in payload["error_chain"])
+    assert "ledger tailer stopped" in payload["reason"]
