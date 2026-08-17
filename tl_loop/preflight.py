@@ -10,11 +10,16 @@ from pathlib import Path
 
 from tl_loop.plan_validation import PlanValidationError, validate_plan_document
 from tl_loop.rlm.review_input import load_review_policy
-from tl_loop.select.capability import load_capability
 from tl_loop.select.agent_type import parse_harness_identifier
+from tl_loop.select.capability import load_capability
 from tl_loop.select.policy import HarnessPolicy, load_policy
 
-REQUIRED_FILES = ("config.toml", "harness_policy.toml", "review-policy.toml", "harness_capability.toml")
+REQUIRED_FILES = (
+    "config.toml",
+    "harness_policy.toml",
+    "review-policy.toml",
+    "harness_capability.toml",
+)
 PLAN_PATH = Path(".exo/tl-loop/plan.json")
 
 
@@ -51,19 +56,24 @@ def run_preflight(project_root: str | Path) -> PreflightReport:
         if not capability_path.is_file():
             raise PreflightError(
                 f"missing required TL file: {capability_path}\n\n"
-                "Example harness_capability.toml for this policy:\n"
-                + capability_example(policy)
+                "Example harness_capability.toml for this policy:\n" + capability_example(policy)
             )
         load_capability(capability_path, policy_path=policy_path)
     except (OSError, ValueError, tomllib.TOMLDecodeError, PlanValidationError) as error:
         raise PreflightError(str(error)) from error
-    return PreflightReport(root, (config_path, policy_path, review_path, capability_path, plan_path))
+    return PreflightReport(
+        root, (config_path, policy_path, review_path, capability_path, plan_path)
+    )
 
 
 def capability_example(policy: HarnessPolicy) -> str:
     """Render a copy-ready map covering exactly the policy's allowed harnesses."""
     allowed = sorted({harness for role in policy.roles.values() for harness in role.allow})
-    lines = ["# Static capability ratings. Each entry records the operator's basis.", "", "[capabilities]"]
+    lines = [
+        "# Static capability ratings. Each entry records the operator's basis.",
+        "",
+        "[capabilities]",
+    ]
     lines.extend(f'{json.dumps(harness)} = "standard"' for harness in allowed)
     return "\n".join(lines) + "\n"
 

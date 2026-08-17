@@ -1621,9 +1621,7 @@ def test_recursive_tl_waiting_child_is_not_marked_failed(
     def waiting_child(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
         del root_spec, config, budgets
         return SimpleNamespace(
-            final_state=SimpleNamespace(
-                fsm=SimpleNamespace(phase=TLPhase.TLWaiting), slices={}
-            )
+            final_state=SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting), slices={})
         )
 
     monkeypatch.setattr("tl_loop.loop.driver.tl_run", waiting_child)
@@ -1659,9 +1657,7 @@ def test_active_parent_stays_alive_for_later_recursive_event(
     def waiting_child(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
         del root_spec, config, budgets
         return SimpleNamespace(
-            final_state=SimpleNamespace(
-                fsm=SimpleNamespace(phase=TLPhase.TLWaiting), slices={}
-            )
+            final_state=SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting), slices={})
         )
 
     monkeypatch.setattr("tl_loop.loop.driver.tl_run", waiting_child)
@@ -2154,9 +2150,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
     assert candidate.merge_tree_sha == "tree-a"
     assert candidate.ci_status == "success"
     assert [name for name, _ in transport.calls if name == "merge_pr"] == ["merge_pr"]
-    assert next(
-        arguments for name, arguments in transport.calls if name == "merge_pr"
-    ) == {
+    assert next(arguments for name, arguments in transport.calls if name == "merge_pr") == {
         "pr_number": 43,
         "strategy": "merge",
         "expected_base_sha": "base-a",
@@ -2380,9 +2374,7 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
     ("field", "value"),
     (("head_sha", "head-b"), ("patch_digest", "patch-b")),
 )
-def test_head_or_patch_mismatch_opens_conflict_gate(
-    tmp_path: Path, field: str, value: str
-) -> None:
+def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, value: str) -> None:
     parent_dir = tmp_path / "mismatch-run"
     child_plan = _plan()
     run_tl_loop(
@@ -2470,7 +2462,10 @@ def test_head_or_patch_mismatch_opens_conflict_gate(
         root_dir=tmp_path,
     )
 
-    assert GateState(name="tl-integration-conflict", status=GateStatus.PENDING) in result.final_state.gates
+    assert (
+        GateState(name="tl-integration-conflict", status=GateStatus.PENDING)
+        in result.final_state.gates
+    )
     assert result.final_state.integration.lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT
     assert result.final_state.slices["aggregate-child"].dispatch_agent_id == (
         "mismatch-run:aggregate-child:integration"
@@ -2695,7 +2690,10 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
         root_dir=tmp_path,
     )
 
-    assert GateState(name="tl-integration-conflict", status=GateStatus.PENDING) in result.final_state.gates
+    assert (
+        GateState(name="tl-integration-conflict", status=GateStatus.PENDING)
+        in result.final_state.gates
+    )
     assert result.final_state.integration.lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT
     assert result.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
     assert not any(name == "resume_pr" for name, _ in transport.calls)

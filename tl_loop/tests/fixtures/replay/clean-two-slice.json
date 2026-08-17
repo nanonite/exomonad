@@ -131,8 +131,11 @@
       "arguments": {
         "event_type": "tl.dispatch_intended",
         "payload": {
+          "agent_type": "codex",
           "boundary": "dispatch_intended",
+          "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
+          "model": "gpt-luna",
           "slice_id": "worker-a",
           "started_at": "<timestamp>"
         },
@@ -146,8 +149,11 @@
       "arguments": {
         "event_type": "tl.spawn_requested",
         "payload": {
+          "agent_type": "codex",
           "boundary": "spawn_requested",
+          "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
+          "model": "gpt-luna",
           "slice_id": "worker-a",
           "started_at": "<timestamp>"
         },
@@ -159,8 +165,9 @@
     {
       "operation": "spawn_worker",
       "arguments": {
-        "agent_type": "codex/gpt-luna",
+        "agent_type": "codex",
         "intent_id": "<intent-id>",
+        "model": "gpt-luna",
         "name": "worker-a",
         "task": "inspect the repository",
         "force": false,
@@ -173,8 +180,11 @@
       "arguments": {
         "event_type": "tl.spawn_request_accepted",
         "payload": {
+          "agent_type": "codex",
           "boundary": "spawn_request_accepted",
+          "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
+          "model": "gpt-luna",
           "slice_id": "worker-a",
           "started_at": "<timestamp>"
         },
@@ -188,8 +198,11 @@
       "arguments": {
         "event_type": "tl.dispatch_intended",
         "payload": {
+          "agent_type": "codex",
           "boundary": "dispatch_intended",
+          "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
+          "model": "gpt-luna",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"
         },
@@ -203,8 +216,11 @@
       "arguments": {
         "event_type": "tl.spawn_requested",
         "payload": {
+          "agent_type": "codex",
           "boundary": "spawn_requested",
+          "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
+          "model": "gpt-luna",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"
         },
@@ -216,11 +232,12 @@
     {
       "operation": "spawn_leaf",
       "arguments": {
-        "agent_type": "codex/gpt-luna",
+        "agent_type": "codex",
         "boundary": [
           "src/leaf.py"
         ],
         "intent_id": "<intent-id>",
+        "model": "gpt-luna",
         "name": "leaf-a",
         "read_first": [],
         "steps": [],
@@ -238,8 +255,11 @@
       "arguments": {
         "event_type": "tl.spawn_request_accepted",
         "payload": {
+          "agent_type": "codex",
           "boundary": "spawn_request_accepted",
+          "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
+          "model": "gpt-luna",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"
         },
@@ -296,6 +316,7 @@
         "event_type": "tl.dispatch_confirmed",
         "payload": {
           "boundary": "agent.spawned",
+          "harness": "codex",
           "intent_id": "<intent-id>",
           "slice_id": "worker-a",
           "started_at": "<timestamp>"
@@ -339,6 +360,7 @@
         "event_type": "tl.dispatch_confirmed",
         "payload": {
           "boundary": "agent.spawned",
+          "harness": "codex",
           "intent_id": "<intent-id>",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"

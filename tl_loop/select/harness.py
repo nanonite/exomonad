@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 SUPPORTED_AGENT_TYPES = frozenset({"claude", "codex", "opencode", "shoal"})
 
 

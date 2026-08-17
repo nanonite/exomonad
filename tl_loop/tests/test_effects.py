@@ -121,7 +121,9 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         verify=["just test"],
     )
     client.spawn_worker(name="worker", task="sample", agent_type="codex", model="gpt-test")
-    client.spawn_reviewer(pr_number=1, head_sha="abc123", acceptance_criteria=["criterion"], force=False)
+    client.spawn_reviewer(
+        pr_number=1, head_sha="abc123", acceptance_criteria=["criterion"], force=False
+    )
     client.cleanup_reviewer_leaf(pr_number=1)
     client.close_reviewer_window(pr_number=1)
     client.restart_review(pr_number=1)

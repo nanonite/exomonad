@@ -65,9 +65,7 @@ def select_agent_type(
     role_policy = _role_policy(policy, role)
     capability_map = capabilities or load_capability()
     classification = classify_task(slice)
-    candidates = _candidates(
-        slice, role, role_policy, ledger, capability_map, classification
-    )
+    candidates = _candidates(slice, role, role_policy, ledger, capability_map, classification)
     if not candidates:
         return None
     selected = min(
@@ -106,9 +104,7 @@ def selection_failure(
     return SelectionFailure.OVER_BUDGET
 
 
-def estimate_cost(
-    slice: SliceState, difficulty: Difficulty, harness_rate: float = 1.0
-) -> int:
+def estimate_cost(slice: SliceState, difficulty: Difficulty, harness_rate: float = 1.0) -> int:
     """Estimate tokens using the documented task shape and harness rate."""
     if harness_rate <= 0:
         raise ValueError("harness_rate must be positive")
@@ -117,7 +113,9 @@ def estimate_cost(
         Difficulty.STANDARD: 500,
         Difficulty.HARD: 1000,
     }[difficulty]
-    unscaled = base + 50 * len(slice.test_plan) + 100 * len(slice.paths) + 50 * len(slice.depends_on)
+    unscaled = (
+        base + 50 * len(slice.test_plan) + 100 * len(slice.paths) + 50 * len(slice.depends_on)
+    )
     return ceil(unscaled * harness_rate)
 
 
@@ -141,11 +139,7 @@ def _selection_key(
         if learned_policy is not None
         else ()
     )
-    learned_rank = (
-        learned_order.index(harness)
-        if harness in learned_order
-        else len(learned_order)
-    )
+    learned_rank = learned_order.index(harness) if harness in learned_order else len(learned_order)
     return (
         role_policy.cost_rank[harness],
         learned_rank,
@@ -164,9 +158,7 @@ def _candidates(
     capable = _capable_harnesses(slice, role_policy, capabilities, classification)
     result: list[tuple[str, int]] = []
     for harness in capable:
-        cost = estimate_cost(
-            slice, classification.difficulty, role_policy.cost_rank[harness]
-        )
+        cost = estimate_cost(slice, classification.difficulty, role_policy.cost_rank[harness])
         if _within_budget(ledger, role, role_policy, harness, cost):
             result.append((harness, cost))
     return result
@@ -224,15 +216,13 @@ def _spent(ledger: object, kind: str, role: str, harness: str) -> int:
     if isinstance(ledger, BudgetLedger):
         if kind == "role":
             if ledger.role_spent or ledger.role_reserved:
-                return (
-                    _non_negative(ledger.role_spent.get(role, 0), "ledger.role_spent")
-                    + _non_negative(ledger.role_reserved.get(role, 0), "ledger.role_reserved")
-                )
+                return _non_negative(
+                    ledger.role_spent.get(role, 0), "ledger.role_spent"
+                ) + _non_negative(ledger.role_reserved.get(role, 0), "ledger.role_reserved")
             return _non_negative(ledger.tokens, "ledger.tokens")
-        return (
-            _non_negative(ledger.harness_spent.get(harness, 0), "ledger.harness_spent")
-            + _non_negative(ledger.harness_reserved.get(harness, 0), "ledger.harness_reserved")
-        )
+        return _non_negative(
+            ledger.harness_spent.get(harness, 0), "ledger.harness_spent"
+        ) + _non_negative(ledger.harness_reserved.get(harness, 0), "ledger.harness_reserved")
     if isinstance(ledger, Mapping):
         direct_spent = ledger.get(f"{kind}_spent")
         direct_reserved = ledger.get(f"{kind}_reserved")
@@ -259,9 +249,7 @@ def _mapping_value(
     return _non_negative(value, f"ledger.{key}") if kind == "role" else 0
 
 
-def _counter_value(
-    value: object, role: str, harness: str, kind: str, label: str
-) -> int:
+def _counter_value(value: object, role: str, harness: str, kind: str, label: str) -> int:
     if value is None:
         return 0
     if not isinstance(value, Mapping):
@@ -277,8 +265,8 @@ def _non_negative(value: object, path: str) -> int:
 
 
 __all__ = [
-    "HarnessRoute",
     "HarnessChoice",
+    "HarnessRoute",
     "SelectionFailure",
     "SelectionLedger",
     "estimate_cost",

@@ -39,11 +39,11 @@ def test_is_capable_respects_the_maximum_rating() -> None:
 
 def test_missing_policy_coverage_fails_closed(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.toml"
-    policy_path.write_text(_policy_toml("missing/model"), encoding="utf-8")
+    policy_path.write_text(_policy_toml("codex/missing"), encoding="utf-8")
     capability_path = tmp_path / "capability.toml"
     capability_path.write_text(_capability_toml(), encoding="utf-8")
 
-    with pytest.raises(PolicyInvalid, match="missing/model"):
+    with pytest.raises(PolicyInvalid, match="codex/missing"):
         load_capability(capability_path, policy_path=policy_path)
 
 

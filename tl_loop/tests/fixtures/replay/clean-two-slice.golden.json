@@ -59,7 +59,7 @@
       "dispatch_last_boundary": "agent.spawned",
       "dispatch_started_at": "<timestamp>",
       "id": "leaf-a",
-      "model": null,
+      "model": "gpt-luna",
       "paths": [
         "src/leaf.py"
       ],
@@ -88,7 +88,7 @@
       "dispatch_last_boundary": "agent.spawned",
       "dispatch_started_at": "<timestamp>",
       "id": "worker-a",
-      "model": null,
+      "model": "gpt-luna",
       "paths": [
         "tl-loop/worker-a"
       ],

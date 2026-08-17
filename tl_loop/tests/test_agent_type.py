@@ -5,10 +5,10 @@ from __future__ import annotations
 import pytest
 
 from tl_loop.select.agent_type import (
-    parse_harness_identifier,
     SelectionFailure,
     SelectionLedger,
     estimate_cost,
+    parse_harness_identifier,
     select_agent_type,
     selection_failure,
 )
@@ -86,15 +86,23 @@ def test_total_budget_exhaustion_returns_none_and_has_typed_cause() -> None:
     choice = select_agent_type(_slice(), "worker", ledger, _policy(), CAPABILITIES)
 
     assert choice is None
-    assert selection_failure(_slice(), "worker", ledger, _policy(), CAPABILITIES) is SelectionFailure.OVER_BUDGET
+    assert (
+        selection_failure(_slice(), "worker", ledger, _policy(), CAPABILITIES)
+        is SelectionFailure.OVER_BUDGET
+    )
 
 
 def test_no_capable_harness_returns_none_and_has_typed_cause() -> None:
     capability = CapabilityMap({"codex/gpt-luna": Difficulty.TRIVIAL})
     slice_state = _slice(paths=("src/task.py", "src/task.rs"))
 
-    assert select_agent_type(slice_state, "worker", SelectionLedger(), _policy(), capability) is None
-    assert selection_failure(slice_state, "worker", SelectionLedger(), _policy(), capability) is SelectionFailure.NO_CAPABLE_HARNESS
+    assert (
+        select_agent_type(slice_state, "worker", SelectionLedger(), _policy(), capability) is None
+    )
+    assert (
+        selection_failure(slice_state, "worker", SelectionLedger(), _policy(), capability)
+        is SelectionFailure.NO_CAPABLE_HARNESS
+    )
 
 
 def test_per_harness_budget_exhaustion_drops_only_that_candidate() -> None:
@@ -108,7 +116,9 @@ def test_per_harness_budget_exhaustion_drops_only_that_candidate() -> None:
 def test_estimated_cost_is_positive_and_difficulty_sensitive() -> None:
     slice_state = _slice()
 
-    assert estimate_cost(slice_state, Difficulty.TRIVIAL) < estimate_cost(slice_state, Difficulty.HARD)
+    assert estimate_cost(slice_state, Difficulty.TRIVIAL) < estimate_cost(
+        slice_state, Difficulty.HARD
+    )
 
 
 def _policy():
@@ -119,7 +129,9 @@ def _policy():
         "per_harness_budget": {"codex/gpt-luna": 80000, "claude/sonnet": 40000},
         "escalate_after_attempts": 1,
     }
-    return validate_policy({"roles": {"tl": dict(role), "worker": dict(role), "reviewer": dict(role)}})
+    return validate_policy(
+        {"roles": {"tl": dict(role), "worker": dict(role), "reviewer": dict(role)}}
+    )
 
 
 def _slice(
