@@ -22,6 +22,17 @@ LedgerDocument: TypeAlias = dict[str, object]
 class LedgerReadError(RuntimeError):
     """A ledger segment or row could not be read without guessing."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        segment: Path | None = None,
+        line_number: int | None = None,
+    ) -> None:
+        self.segment = segment
+        self.line_number = line_number
+        super().__init__(message)
+
 
 class SequenceStatus(str, Enum):
     """The same three sequence states returned by Rust ``sequence_status``."""
@@ -172,21 +183,34 @@ class LedgerReader:
 
     def _read_rows(self) -> list[LedgerRow]:
         rows: list[LedgerRow] = []
-        for segment in self._segment_paths():
+        segments = self._segment_paths()
+        active_segment = segments[-1] if segments else None
+        for segment in segments:
             try:
-                with segment.open("r", encoding="utf-8") as stream:
+                with segment.open("rb") as stream:
                     for line_number, line in enumerate(stream, start=1):
                         if not line.strip():
                             continue
+                        # LedgerWriter writes the JSON object and its newline
+                        # together, but a reader can observe the active
+                        # segment between those writes.  Only the unterminated
+                        # final line of the newest segment is retryable; a
+                        # newline makes malformed data committed evidence.
+                        if segment == active_segment and not line.endswith(b"\n"):
+                            break
                         try:
                             value = json.loads(line)
                         except json.JSONDecodeError as error:
                             raise LedgerReadError(
-                                f"could not parse {segment} line {line_number}: {error}"
+                                f"could not parse {segment} line {line_number}: {error}",
+                                segment=segment,
+                                line_number=line_number,
                             ) from error
                         if not isinstance(value, dict):
                             raise LedgerReadError(
-                                f"{segment} line {line_number}: ledger row must be an object"
+                                f"{segment} line {line_number}: ledger row must be an object",
+                                segment=segment,
+                                line_number=line_number,
                             )
                         rows.append(LedgerRow(segment, line_number, value))
             except FileNotFoundError:
@@ -243,7 +267,11 @@ def _project_row(row: LedgerRow) -> EventEnvelope:
     except UnmappedEventType:
         raise
     except ValueError as error:
-        raise LedgerReadError(f"could not project {row.segment} line {row.line_number}: {error}") from error
+        raise LedgerReadError(
+            f"could not project {row.segment} line {row.line_number}: {error}",
+            segment=row.segment,
+            line_number=row.line_number,
+        ) from error
 
 
 def _resolve_superseded(rows: list[LedgerRow]) -> list[LedgerRow]:

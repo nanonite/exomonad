@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -91,3 +92,29 @@ def test_exit_reason_is_diagnostic_only(tmp_path: Path) -> None:
     store.record_exit_reason("capability file is missing")
     assert store.exit_reason() == "capability file is missing"
     assert not store.path.exists()
+
+
+def test_exit_reason_preserves_chained_error_diagnostics(tmp_path: Path) -> None:
+    store = RunStore("root", tmp_path / ".exo" / "tl-loop")
+    cause = ValueError("segment-000000000001.jsonl line 7")
+    cause.segment = Path("segment-000000000001.jsonl")  # type: ignore[attr-defined]
+    cause.line_number = 7  # type: ignore[attr-defined]
+    error = RuntimeError("ledger tailer stopped")
+    error.__cause__ = cause
+    error.cursor = 0  # type: ignore[attr-defined]
+    error.sequence_status = "partial"  # type: ignore[attr-defined]
+
+    store.record_exit_reason(str(error), error=error)
+
+    payload = json.loads(store.exit_reason_path.read_text(encoding="utf-8"))
+    assert payload["reason"] == "ledger tailer stopped"
+    assert payload["error_chain"] == [
+        "RuntimeError: ledger tailer stopped",
+        "ValueError: segment-000000000001.jsonl line 7",
+    ]
+    assert payload["context"] == {
+        "cursor": 0,
+        "line_number": 7,
+        "segment": "segment-000000000001.jsonl",
+        "sequence_status": "partial",
+    }

@@ -60,6 +60,31 @@ OrderedStagesInput: TypeAlias = (
 IntegrationInput: TypeAlias = IntegrationRuntimeState | Mapping[str, object]
 
 
+def _exception_chain(error: BaseException) -> tuple[str, ...]:
+    chain: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _exception_context(error: BaseException) -> dict[str, object]:
+    context: dict[str, object] = {}
+    current: BaseException | None = error
+    while current is not None:
+        for name in ("cursor", "sequence_status", "segment", "line_number"):
+            value = getattr(current, name, None)
+            if value is None or name in context:
+                continue
+            value = getattr(value, "value", value)
+            context[name] = str(value) if isinstance(value, Path) else value
+        current = current.__cause__ or current.__context__
+    return context
+
+
 class CorruptCheckpoint(ValueError):
     """A persisted run state is valid JSON but cannot be resumed safely."""
 
@@ -161,10 +186,20 @@ class RunStore:
         """Return the diagnostic marker written when startup fails."""
         return self.run_dir / "controller-exit.json"
 
-    def record_exit_reason(self, reason: str) -> None:
+    def record_exit_reason(
+        self,
+        reason: str,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
         """Persist a diagnostic-only controller exit reason outside run state."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
         payload = {"reason": reason, "recorded_at": time.time()}
+        if error is not None:
+            payload["error_chain"] = list(_exception_chain(error))
+            context = _exception_context(error)
+            if context:
+                payload["context"] = context
         temporary = self.exit_reason_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
         temporary.replace(self.exit_reason_path)

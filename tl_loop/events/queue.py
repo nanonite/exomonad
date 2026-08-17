@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import queue as queue_module
 import threading
 from typing import TypeAlias
@@ -10,10 +11,38 @@ from .envelope import EventEnvelope
 from .reader import LedgerFinding, LedgerReader, ReadResult, SequenceStatus
 
 FindingKey: TypeAlias = tuple[str, str, str, int]
+LOGGER = logging.getLogger(__name__)
+
+
+def _exception_chain(error: BaseException) -> tuple[str, ...]:
+    chain: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
 
 
 class QueueError(RuntimeError):
     """The ledger tailer stopped because it encountered an unrecoverable error."""
+
+    def __init__(
+        self,
+        *,
+        cursor: int,
+        sequence_status: SequenceStatus,
+        cause: BaseException,
+    ) -> None:
+        self.cursor = cursor
+        self.sequence_status = sequence_status
+        self.cause = cause
+        details = " -> ".join(_exception_chain(cause))
+        super().__init__(
+            "ledger tailer stopped "
+            f"(cursor={cursor}, sequence_status={sequence_status.value}): {details}"
+        )
 
 
 class LedgerQueue:
@@ -40,6 +69,7 @@ class LedgerQueue:
         self._finding_keys: set[FindingKey] = set()
         self._lock = threading.Lock()
         self._sequence_status = SequenceStatus.UNKNOWN
+        self._cursor = 0
 
     def start(self) -> LedgerQueue:
         """Start the single tailer thread."""
@@ -62,7 +92,11 @@ class LedgerQueue:
         except queue_module.Empty:
             error = self._error
             if error is not None:
-                raise QueueError("ledger tailer stopped") from error
+                raise QueueError(
+                    cursor=self._cursor,
+                    sequence_status=self.sequence_status,
+                    cause=error,
+                ) from error
             raise
 
     def task_done(self) -> None:
@@ -88,6 +122,7 @@ class LedgerQueue:
     def _run(self) -> None:
         try:
             cursor = self.reader.cursor()
+            self._cursor = cursor
             while not self._stop.is_set():
                 result = self.reader.read_from(cursor)
                 self._record_result(result)
@@ -96,11 +131,17 @@ class LedgerQueue:
                         return
                     self._put_until_stopped(event)
                     cursor = event.run_seq if event.run_seq is not None else cursor
+                    self._cursor = cursor
                 self._stop.wait(self.poll_interval)
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             # Surface any ordinary tailer failure to the consumer thread.
             if not self._stop.is_set():
                 self._error = error
+                LOGGER.exception(
+                    "ledger tailer stopped cursor=%d sequence_status=%s",
+                    self._cursor,
+                    self.sequence_status.value,
+                )
 
     def _put_until_stopped(self, event: EventEnvelope) -> None:
         while not self._stop.is_set():

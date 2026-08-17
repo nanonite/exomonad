@@ -96,7 +96,9 @@ def _record_run_failure(args: argparse.Namespace, error: Exception) -> None:
     try:
         project_root = args.project_root.expanduser().resolve()
         run_id = getattr(args, "run_id", DEFAULT_RUN_ID)
-        RunStore(run_id, project_root / ".exo" / "tl-loop").record_exit_reason(str(error))
+        RunStore(run_id, project_root / ".exo" / "tl-loop").record_exit_reason(
+            str(error), error=error
+        )
     except (OSError, ValueError, TypeError) as record_error:
         LOGGER.error("[TL loop] failed to persist controller exit reason: %s", record_error)
 
@@ -189,7 +191,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
             policy_path=project_root / ".exo" / "harness_policy.toml",
         )
     except Exception as error:
-        RunStore(run_id, state_root).record_exit_reason(str(error))
+        RunStore(run_id, state_root).record_exit_reason(str(error), error=error)
         raise
     config = TLLoopConfig(
         active=True,
@@ -222,7 +224,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
             cast(Mapping[str, object], budgets),
         )
     except Exception as error:
-        RunStore(run_id, state_root).record_exit_reason(str(error))
+        RunStore(run_id, state_root).record_exit_reason(str(error), error=error)
         raise
     finally:
         source.close(timeout=1.0)

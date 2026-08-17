@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix TL ledger tailer failure after successful worker spawn (#885)
 - Fix WASM spawn model propagation and runtime schema validation (#884)
 - Start a fresh TL run when exomonad init uses --recreate (#883)
 - Ignore TL runtime checkpoints in spawn clean-worktree checks (#882)

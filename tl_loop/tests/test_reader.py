@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import queue
 from copy import deepcopy
 from pathlib import Path
 from typing import cast
 
-from tl_loop.events.queue import LedgerQueue
-from tl_loop.events.reader import FindingKind, LedgerReader, SequenceStatus
+import pytest
+
+from tl_loop.events.queue import LedgerQueue, QueueError
+from tl_loop.events.reader import FindingKind, LedgerReader, LedgerReadError, SequenceStatus
 from tl_loop.state.store import create
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ledger_projection_events.json"
@@ -112,6 +115,66 @@ def test_superseded_event_does_not_drive_projection(tmp_path: Path) -> None:
     assert result.sequence_status is SequenceStatus.COMPLETE
 
 
+def test_active_segment_partial_tail_is_retried_after_append(tmp_path: Path) -> None:
+    event = _fixture_events()[0]
+    encoded = json.dumps(
+        {**event, "data": {"slice_id": "leaf-é", "large": "x" * 4096}},
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    path = segments / "segment-000000000001.jsonl"
+    split = len(encoded) // 2
+    path.write_bytes(encoded[:split])
+
+    reader = LedgerReader(segments)
+    assert reader.read_from().events == ()
+
+    with path.open("ab") as stream:
+        stream.write(encoded[split:] + b"\n")
+
+    result = reader.read_from()
+    assert [item.run_seq for item in result.events] == [101]
+
+
+def test_finalized_malformed_record_remains_a_hard_failure(tmp_path: Path) -> None:
+    segments = tmp_path / "segments"
+    _write_raw_segment(segments, 1, ["{\"committed\":\n"])
+
+    with pytest.raises(LedgerReadError, match=r"line 1"):
+        LedgerReader(segments).read_from()
+
+
+def test_queue_retries_partial_tail_and_reports_hard_failures(tmp_path: Path) -> None:
+    event = _fixture_events()[0]
+    encoded = json.dumps(event, sort_keys=True).encode("utf-8")
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    path = segments / "segment-000000000001.jsonl"
+    split = len(encoded) // 2
+    path.write_bytes(encoded[:split])
+    event_queue = LedgerQueue(LedgerReader(segments), poll_interval=0.005).start()
+    try:
+        with pytest.raises(queue.Empty):
+            event_queue.get(timeout=0.05)
+        with path.open("ab") as stream:
+            stream.write(encoded[split:] + b"\n")
+        received = event_queue.get(timeout=2)
+        assert received.run_seq == 101
+    finally:
+        event_queue.close(timeout=2)
+
+    _write_raw_segment(segments, 2, ["{\"committed\":\n"])
+    broken = LedgerQueue(LedgerReader(segments), poll_interval=0.005).start()
+    try:
+        with pytest.raises(QueueError, match=r"cursor=0.*parse .*line 1") as raised:
+            broken.get(timeout=2)
+        assert isinstance(raised.value.__cause__, LedgerReadError)
+    finally:
+        broken.close(timeout=2)
+
+
 def test_kill_and_restart_redelivers_only_unacknowledged_events(tmp_path: Path) -> None:
     events = _fixture_events()
     segments = tmp_path / "segments"
@@ -160,3 +223,9 @@ def _write_segment(directory: Path, index: int, events: list[dict[str, object]])
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"segment-{index:012}.jsonl"
     path.write_text("\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n", encoding="utf-8")
+
+
+def _write_raw_segment(directory: Path, index: int, lines: list[str]) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"segment-{index:012}.jsonl"
+    path.write_text("".join(lines), encoding="utf-8")
