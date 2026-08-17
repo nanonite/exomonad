@@ -80,6 +80,50 @@ class EmptyEventSource:
         return event.run_seq
 
 
+class LazyLedgerSource:
+    """Create a real ledger queue inside the forked sub-TL controller."""
+
+    def __init__(
+        self,
+        segments: Path,
+        state_root: Path,
+        run_id: str,
+        ledger_run_id: str,
+        scope_agent_id: str | None,
+    ) -> None:
+        self.segments = segments
+        self.state_root = state_root
+        self.run_id = run_id
+        self.ledger_run_id = ledger_run_id
+        self.scope_agent_id = scope_agent_id
+        self._queue: LedgerQueue | None = None
+
+    def _ensure_queue(self) -> LedgerQueue:
+        if self._queue is None:
+            self._queue = LedgerQueue(
+                LedgerReader(
+                    self.segments,
+                    run_id=self.run_id,
+                    state_root=self.state_root,
+                    ledger_run_id=self.ledger_run_id,
+                    scope_agent_id=self.scope_agent_id,
+                ),
+                poll_interval=0.01,
+                active_tail_timeout=5,
+            ).start()
+        return self._queue
+
+    def get(self, timeout: float | None = None) -> EventEnvelope:
+        return self._ensure_queue().get(timeout=timeout)
+
+    def acknowledge(self, event: EventEnvelope) -> int:
+        return self._ensure_queue().acknowledge(event)
+
+    def close(self) -> None:
+        if self._queue is not None:
+            self._queue.close(timeout=5)
+
+
 class StopAfterSpawnQueue:
     """Expose the real ledger until one authoritative spawn is consumed."""
 
@@ -647,8 +691,8 @@ def run_root_recursive_lifecycle_probe(
                 run_id="root",
                 ledger_run_id=swarm_id,
                 branch="main",
-                worktree=repo,
                 working_dir=str(repo),
+                worktree=repo,
             ),
             root_dir=state_root,
         )
@@ -705,38 +749,55 @@ def run_recursive_checkpoint_probe(
 ) -> None:
     """Run nested live controllers with local IDs and one shared ledger UUID."""
     state_root = root / "lifecycle-state"
+    sub_tl_source = LazyLedgerSource(
+        repo / ".exo" / "ledger" / "segments",
+        state_root / "recursive-root",
+        "sub-a",
+        swarm_id,
+        None,
+    )
     plan = WorkPlan(
         sub_tls=(
             SubTLTask(
                 "sub-a",
-                WorkPlan(sub_tls=(SubTLTask("nested", WorkPlan(), order=1),)),
+                WorkPlan(
+                    leaves=(
+                        LeafTask("nested-leaf", "recursive spawn correlation probe"),
+                    ),
+                    sub_tls=(SubTLTask("nested", WorkPlan(), order=1),),
+                ),
+                source=sub_tl_source,
                 order=1,
             ),
             SubTLTask("sub-b", WorkPlan(), order=1),
         )
     )
-    result = run_tl_loop(
-        "recursive-root",
-        plan,
-        EmptyEventSource(),
-        EffectClient(client, role="tl", name="recursive-root"),
-        config=TLLoopConfig(
-            active=True,
-            keep_alive_on_waiting=False,
-            max_parallel_slices=2,
-            max_events=16,
-            idle_timeout=0.2,
-            dispatch_timeout=5,
-            controller_stall_timeout=1.0,
+    try:
+        result = run_tl_loop(
+            "recursive-root",
+            plan,
+            EmptyEventSource(),
+            EffectClient(client, role="tl", name="recursive-root"),
+            config=TLLoopConfig(
+                active=True,
+                keep_alive_on_waiting=False,
+                max_parallel_slices=2,
+                max_events=16,
+                idle_timeout=30.0,
+                dispatch_timeout=30.0,
+                controller_stall_timeout=30.0,
+                root_dir=state_root,
+                run_id="recursive-root",
+                ledger_run_id=swarm_id,
+                branch="main",
+                worktree=state_root / "recursive-owner",
+                working_dir=str(repo),
+            ),
             root_dir=state_root,
-            run_id="recursive-root",
-            ledger_run_id=swarm_id,
-            branch="main",
-            worktree=repo,
-            working_dir=str(repo),
-        ),
-        root_dir=state_root,
-    )
+        )
+    finally:
+        sub_tl_source.close()
+        stop_spawned_worker(repo, "nested-leaf")
     if result.final_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLWaiting}:
         raise HarnessError(
             f"recursive lifecycle probe entered an invalid phase: {result.final_state!r}"
@@ -764,6 +825,30 @@ def run_recursive_checkpoint_probe(
             raise HarnessError(
                 f"recursive checkpoint identity was not isolated for {local_id}: {path}"
             )
+    sub_a_state = RunStore("sub-a", state_root / "recursive-root").load()
+    nested_leaf = sub_a_state.slices["nested-leaf"]
+    if (
+        nested_leaf.status is not SliceStatus.SPAWNED
+        or nested_leaf.dispatch_authoritative_event_seq is None
+        or sub_a_state.ledger_run_id != swarm_id
+    ):
+        raise HarnessError(
+            f"recursive sub-TL spawn was not authoritatively correlated: {nested_leaf!r}"
+        )
+    recursive_spawn_events = [
+        event
+        for event in server_ledger_events(repo)
+        if event.get("type") == "agent.spawned"
+        and event.get("run_id") == swarm_id
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("intent_id") == nested_leaf.dispatch_intent_id
+        and event["data"].get("spawn_type") == "leaf_subtree"
+        and event["data"].get("branch")
+    ]
+    if len(recursive_spawn_events) != 1:
+        raise HarnessError(
+            f"expected one recursive canonical spawn event: {recursive_spawn_events!r}"
+        )
     assert_stage_events(repo, swarm_id)
 
 

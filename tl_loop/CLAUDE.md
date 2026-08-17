@@ -107,7 +107,9 @@ status semantics. `LedgerQueue` is an in-process bounded tailer; handling is
 at-least-once and a consumer acknowledges only after successful handling.
 Acknowledgement persists the global `run_seq` in the run-state cursor through
 the single state writer, so restart begins at `cursor + 1`. No queue or event
-log file is created.
+log file is created. A ledger `run_id` mismatch is retained as a reader finding
+and surfaced in controller diagnostics rather than being reported only as
+silence.
 
 ## Durable child-dispatch protocol
 

@@ -52,6 +52,7 @@ class FindingKind(str, Enum):
     """Non-durable reader findings surfaced to the controller."""
 
     MISSING_RUN_SEQ = "missing_run_seq"
+    RUN_ID_MISMATCH = "run_id_mismatch"
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,20 @@ class LedgerReader:
             if event_type not in MAPPED_EVENT_TYPES:
                 continue
             envelope = _project_row(row)
+            if self.ledger_run_id is not None and envelope.run_id != self.ledger_run_id:
+                findings.append(
+                    LedgerFinding(
+                        kind=FindingKind.RUN_ID_MISMATCH,
+                        event_type=envelope.event_type,
+                        segment=row.segment,
+                        line_number=row.line_number,
+                        message=(
+                            f"ignored ledger event with run_id {envelope.run_id!r}; "
+                            f"expected {self.ledger_run_id!r}"
+                        ),
+                    )
+                )
+                continue
             if not self._in_scope(envelope):
                 continue
             if envelope.run_seq is None:
@@ -187,13 +202,21 @@ class LedgerReader:
         """Keep one run and its directly owned child events in scope."""
         if self.ledger_run_id is not None and event.run_id != self.ledger_run_id:
             return False
-        return not (self.scope_agent_id is not None and event.agent_id not in {self.scope_agent_id} and event.parent_agent_id != self.scope_agent_id)
+        return not (
+            self.scope_agent_id is not None
+            and event.agent_id not in {self.scope_agent_id}
+            and event.parent_agent_id != self.scope_agent_id
+        )
 
     def acknowledge(self, event_or_run_seq: EventEnvelope | int) -> int:
         """Persist a consumed global sequence through the M2.2 writer."""
         if self.run_dir is None:
             raise ValueError("acknowledgement requires a run-state directory")
-        run_seq = event_or_run_seq.run_seq if isinstance(event_or_run_seq, EventEnvelope) else event_or_run_seq
+        run_seq = (
+            event_or_run_seq.run_seq
+            if isinstance(event_or_run_seq, EventEnvelope)
+            else event_or_run_seq
+        )
         if type(run_seq) is not int or run_seq < 0:
             raise ValueError("acknowledged run_seq must be a non-negative integer")
 
@@ -246,7 +269,9 @@ class LedgerReader:
             except FileNotFoundError:
                 continue
             except OSError as error:
-                raise LedgerReadError(f"could not read ledger segment {segment}: {error}") from error
+                raise LedgerReadError(
+                    f"could not read ledger segment {segment}: {error}"
+                ) from error
         return _RowsRead(tuple(rows), active_tail)
 
     def _segment_paths(self) -> list[Path]:

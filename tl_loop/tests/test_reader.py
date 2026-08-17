@@ -72,6 +72,10 @@ def test_reader_scopes_authoritative_id_separately_from_local_checkpoint(tmp_pat
     )
 
     assert [event.run_seq for event in reader.read_from().events] == [101]
+    result = reader.read_from()
+    assert len(result.findings) == 1
+    assert result.findings[0].kind is FindingKind.RUN_ID_MISMATCH
+    assert "stale-swarm-uuid" in result.findings[0].message
     assert reader.cursor() == 0
 
 
@@ -168,7 +172,7 @@ def test_active_segment_partial_tail_is_retried_after_append(tmp_path: Path) -> 
 
 def test_finalized_malformed_record_remains_a_hard_failure(tmp_path: Path) -> None:
     segments = tmp_path / "segments"
-    _write_raw_segment(segments, 1, ["{\"committed\":\n"])
+    _write_raw_segment(segments, 1, ['{"committed":\n'])
 
     with pytest.raises(LedgerReadError, match=r"line 1"):
         LedgerReader(segments).read_from()
@@ -235,7 +239,7 @@ def test_abandoned_active_tail_eventually_fails_with_context(tmp_path: Path) -> 
     segments = tmp_path / "segments"
     segments.mkdir()
     path = segments / "segment-000000000001.jsonl"
-    path.write_bytes(b"{\"abandoned\":")
+    path.write_bytes(b'{"abandoned":')
     event_queue = LedgerQueue(
         LedgerReader(segments),
         poll_interval=0.001,
@@ -303,7 +307,7 @@ def test_queue_retries_partial_tail_and_reports_hard_failures(tmp_path: Path) ->
     finally:
         event_queue.close(timeout=2)
 
-    _write_raw_segment(segments, 2, ["{\"committed\":\n"])
+    _write_raw_segment(segments, 2, ['{"committed":\n'])
     broken = LedgerQueue(LedgerReader(segments), poll_interval=0.005).start()
     try:
         with pytest.raises(QueueError, match=r"cursor=0.*parse .*line 1") as raised:
@@ -340,7 +344,6 @@ def test_kill_and_restart_redelivers_only_unacknowledged_events(tmp_path: Path) 
     assert redelivered.run_seq == 102
 
 
-
 def test_reader_scope_excludes_grandchild_events_from_root(tmp_path: Path) -> None:
     events = deepcopy(_fixture_events()[:3])
     for sequence, (event, agent, parent) in enumerate(
@@ -353,6 +356,7 @@ def test_reader_scope_excludes_grandchild_events_from_root(tmp_path: Path) -> No
     segments = tmp_path / "segments"
     _write_segment(segments, 1, events)
 
+
 def _fixture_events() -> list[dict[str, object]]:
     return cast(list[dict[str, object]], json.loads(FIXTURE.read_text(encoding="utf-8")))
 
@@ -360,7 +364,9 @@ def _fixture_events() -> list[dict[str, object]]:
 def _write_segment(directory: Path, index: int, events: list[dict[str, object]]) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"segment-{index:012}.jsonl"
-    path.write_text("\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n", encoding="utf-8")
+    path.write_text(
+        "\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n", encoding="utf-8"
+    )
 
 
 def _write_raw_segment(directory: Path, index: int, lines: list[str | bytes]) -> None:

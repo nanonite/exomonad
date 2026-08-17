@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import queue
 import threading
 import time
@@ -17,6 +18,8 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.envelope import EventEnvelope, project
+from tl_loop.events.queue import LedgerQueue
+from tl_loop.events.reader import LedgerReader
 from tl_loop.fsm.event import PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning
 from tl_loop.loop.driver import (
@@ -501,6 +504,7 @@ def test_idle_timeout_parks_with_named_gate_and_never_merges(tmp_path: Path) -> 
         "correlated": 0,
         "rejected": 0,
         "last_event_seq": None,
+        "reader_findings": [],
     }
     assert [
         arguments["payload"]
@@ -669,6 +673,70 @@ def test_stale_spawn_intent_cannot_confirm_new_attempt(tmp_path: Path) -> None:
     assert result.diagnostics["filtered"] == 1
     assert result.diagnostics["rejected"] == 1
     assert result.diagnostics["acknowledged"] == 1
+
+
+def test_ledger_run_id_mismatch_reaches_driver_diagnostics(tmp_path: Path) -> None:
+    run_id = "production-mismatch-run"
+    current_swarm = "current-swarm"
+    stale_swarm = "stale-swarm"
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    (segments / "segment-000000000001.jsonl").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "event_id": "stale-spawn",
+                "id": "stale-spawn",
+                "event_time": "2026-08-11T00:00:00Z",
+                "observed_at": "2026-08-11T00:00:00Z",
+                "run_seq": 1,
+                "type": "agent.spawned",
+                "agent_id": "leaf-a",
+                "run_id": stale_swarm,
+                "session_id": "session-1",
+                "lifecycle_state": "observed",
+                "data": {
+                    "child_agent": "leaf-a",
+                    "agent_type": "codex",
+                    "branch": "main.leaf-a",
+                    "intent_id": "stale-intent",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    source = LedgerQueue(
+        LedgerReader(
+            segments,
+            run_id=run_id,
+            state_root=tmp_path,
+            ledger_run_id=current_swarm,
+        ),
+        poll_interval=0.001,
+    ).start()
+    try:
+        result = run_tl_loop(
+            run_id,
+            WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+            source,
+            EffectClient(RecordingTransport()),
+            config=TLLoopConfig(
+                poll_interval=0.001,
+                idle_timeout=0.1,
+                dispatch_timeout=0.01,
+                ledger_run_id=current_swarm,
+            ),
+            root_dir=tmp_path,
+        )
+    finally:
+        source.close(timeout=2)
+
+    assert result.diagnostics["received"] == 1
+    assert result.diagnostics["filtered"] == 1
+    assert result.diagnostics["reader_findings"] == [
+        "ignored ledger event with run_id 'stale-swarm'; expected 'current-swarm'",
+    ]
 
 
 def test_pr_head_change_clears_per_head_gate_state() -> None:

@@ -20,6 +20,7 @@ from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.envelope import EventEnvelope, EventKind
+from tl_loop.events.reader import FindingKind, LedgerFinding
 from tl_loop.fsm.event import (
     AllChildrenDone,
     ChildCompleted,
@@ -270,6 +271,24 @@ class EventDiagnostics:
     correlated: int = 0
     rejected: int = 0
     last_event_seq: int | None = None
+    reader_finding_keys: set[tuple[str, str, str, int]] = field(default_factory=set)
+    reader_findings: list[str] = field(default_factory=list)
+
+    def record_reader_findings(self, findings: Sequence[LedgerFinding]) -> None:
+        for finding in findings:
+            key = (
+                finding.kind.value,
+                finding.event_type,
+                str(finding.segment),
+                finding.line_number,
+            )
+            if key in self.reader_finding_keys:
+                continue
+            self.reader_finding_keys.add(key)
+            self.reader_findings.append(finding.message)
+            if finding.kind is FindingKind.RUN_ID_MISMATCH:
+                self.received += 1
+                self.filtered += 1
 
     def snapshot(self) -> Mapping[str, object]:
         return {
@@ -279,6 +298,7 @@ class EventDiagnostics:
             "correlated": self.correlated,
             "rejected": self.rejected,
             "last_event_seq": self.last_event_seq,
+            "reader_findings": list(self.reader_findings),
         }
 
 
@@ -702,9 +722,11 @@ def _run_loop(
     while len(consumed) < config.max_events:
         if isinstance(phase, (TLDone, TLFailed)):
             break
+        _record_reader_findings(source, diagnostics)
         try:
             event = _next_event(source, config, deadline)
         except LoopTimeout as error:
+            _record_reader_findings(source, diagnostics)
             if _has_pending_dispatch(state):
                 return _park_dispatch_timeout(
                     run_id,
@@ -730,6 +752,7 @@ def _run_loop(
                 error,
                 diagnostics,
             )
+        _record_reader_findings(source, diagnostics)
         if event is None:
             if config.heartbeat is not None:
                 heartbeat = heartbeat_once(
@@ -1109,6 +1132,13 @@ def _diagnostic_timeout_reason(reason: str | LoopTimeout, diagnostics: EventDiag
         f"{reason}; consumed {diagnostics.received} event(s), filtered "
         f"{diagnostics.filtered}, rejected {diagnostics.rejected} without a correlated event"
     )
+
+
+def _record_reader_findings(source: EventQueue, diagnostics: EventDiagnostics) -> None:
+    """Promote reader-side filtering into durable controller diagnostics."""
+    findings = getattr(source, "findings", ())
+    if findings:
+        diagnostics.record_reader_findings(tuple(findings))
 
 
 def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> LoopDeadline:
