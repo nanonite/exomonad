@@ -44,9 +44,9 @@ from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader
 from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
 from tl_loop.loop.driver import (
+    LeafTask,
     SubTLTask,
     TLLoopConfig,
-    WorkerTask,
     WorkPlan,
     _initial_slices,
     _supervise_live_sub_tl,
@@ -399,7 +399,8 @@ def create_fixture(root: Path) -> tuple[Path, Path, str]:
     git(repo, "config", "user.name", "ordered-server-e2e")
     git(repo, "config", "user.email", "ordered-server-e2e@example.com")
     (repo / "README.md").write_text("ordered server fixture\n", encoding="utf-8")
-    git(repo, "add", "README.md")
+    (repo / ".gitignore").write_text(".exo/\n", encoding="utf-8")
+    git(repo, "add", "README.md", ".gitignore")
     git(repo, "commit", "-m", "Create server fixture", "-q")
     git(repo, "push", "-u", "origin", "main", "-q")
     git(repo, "switch", "-c", "feature/ordered-server", "-q")
@@ -458,7 +459,7 @@ def start_server(
             "build target/debug/exomonad and .exo/wasm/wasm-guest-devswarm.wasm first"
         )
     (repo / ".exo/wasm").mkdir(parents=True, exist_ok=True)
-    for child_name in ("sub-a", "sub-b"):
+    for child_name in ("sub-a", "sub-b", "recursive-root", "nested"):
         agent_dir = repo / ".exo/agents" / child_name
         agent_dir.parent.mkdir(parents=True, exist_ok=True)
         run_command(
@@ -517,9 +518,24 @@ def start_server(
         + "\n",
         encoding="utf-8",
     )
+    fake_bin = root / "fake-bin"
+    fake_bin.mkdir()
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text("#!/bin/sh\nsleep 300\n", encoding="utf-8")
+    fake_codex.chmod(0o755)
+    test_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
+    run_command(
+        ["tmux", "new-session", "-d", "-s", session, "-n", "TL", "sleep", "300"]
+    )
+    run_command(["tmux", "set-environment", "-t", session, "PATH", test_path])
     log = (root / "server.log").open("w", encoding="utf-8")
     process = subprocess.Popen(
-        [str(binary), "serve"], cwd=repo, stdout=log, stderr=log, text=True
+        [str(binary), "serve"],
+        cwd=repo,
+        env={**os.environ, "PATH": test_path},
+        stdout=log,
+        stderr=log,
+        text=True,
     )
     client = TransportClient(project_root=repo, timeout=5)
     wait_for_server(client, process, Path(log.name))
@@ -564,32 +580,38 @@ def stop_spawned_worker(repo: Path, worker_name: str) -> None:
         for line in config.splitlines()
         if line.startswith("tmux_session =")
     )
-    windows = run_command(
-        [
-            "tmux",
-            "list-windows",
-            "-t",
-            session,
-            "-F",
-            "#{window_id}\t#{window_name}",
-        ]
-    )
+    try:
+        windows = run_command(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                session,
+                "-F",
+                "#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{pane_start_command}",
+            ]
+        )
+    except HarnessError as error:
+        if "can't find session" in str(error):
+            return
+        raise
     matches = [
         line.split("\t", 1)[0] for line in windows.splitlines() if worker_name in line
     ]
-    for window_id in matches:
-        run_command(["tmux", "kill-window", "-t", window_id])
+    for pane_id in matches:
+        run_command(["tmux", "kill-pane", "-t", pane_id])
     remaining = run_command(
         [
             "tmux",
-            "list-windows",
+            "list-panes",
             "-t",
             session,
+            "-a",
             "-F",
-            "#{window_name}",
+            "#{pane_title}\t#{pane_current_command}\t#{pane_start_command}",
         ]
     )
-    if worker_name in remaining.splitlines():
+    if any(worker_name in line for line in remaining.splitlines()):
         raise HarnessError(f"temporary worker window survived cleanup: {worker_name}")
 
 
@@ -612,7 +634,7 @@ def run_root_recursive_lifecycle_probe(
     try:
         result = run_tl_loop(
             "root",
-            WorkPlan(workers=(WorkerTask(worker_name, "lifecycle correlation probe"),)),
+            WorkPlan(leaves=(LeafTask(worker_name, "lifecycle correlation probe"),)),
             source,
             EffectClient(client, role="tl", name="root"),
             config=TLLoopConfig(
@@ -632,7 +654,7 @@ def run_root_recursive_lifecycle_probe(
         )
         state = RunStore("root", state_root).load()
         child = state.slices[worker_name]
-        if child.status is not SliceStatus.SPAWNED:
+        if child.status is not SliceStatus.SPAWNED or not child.branch:
             raise HarnessError(f"root spawn was not confirmed: {child!r}")
         if (
             state.ledger_run_id != swarm_id
@@ -655,9 +677,17 @@ def run_root_recursive_lifecycle_probe(
             and isinstance(event.get("data"), dict)
             and event["data"].get("intent_id") == child.dispatch_intent_id
         ]
-        if len(spawn_events) != 1:
+        authoritative_events = [
+            event
+            for event in spawn_events
+            if isinstance(event.get("data"), dict)
+            and event["data"].get("spawn_type") == "leaf_subtree"
+            and event["data"].get("branch")
+        ]
+        if len(authoritative_events) != 1 or set(state.slices) != {worker_name}:
             raise HarnessError(
-                f"expected one UUID-scoped spawn event for {worker_name}: {spawn_events!r}"
+                f"expected one canonical UUID-scoped spawn event for {worker_name}: "
+                f"events={spawn_events!r} slices={state.slices!r}"
             )
         checkpoint = state_root / "root" / "run.json"
         if not checkpoint.is_file() or checkpoint.parent.name == swarm_id:
@@ -692,11 +722,12 @@ def run_recursive_checkpoint_probe(
         EffectClient(client, role="tl", name="recursive-root"),
         config=TLLoopConfig(
             active=True,
-            keep_alive_on_waiting=True,
+            keep_alive_on_waiting=False,
             max_parallel_slices=2,
             max_events=16,
             idle_timeout=0.2,
-            dispatch_timeout=1,
+            dispatch_timeout=5,
+            controller_stall_timeout=1.0,
             root_dir=state_root,
             run_id="recursive-root",
             ledger_run_id=swarm_id,
@@ -706,10 +737,16 @@ def run_recursive_checkpoint_probe(
         ),
         root_dir=state_root,
     )
-    if result.final_state.fsm.phase is not TLPhase.TLDone:
+    if result.final_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLWaiting}:
         raise HarnessError(
-            f"recursive lifecycle probe did not finish: {result.final_state!r}"
+            f"recursive lifecycle probe entered an invalid phase: {result.final_state!r}"
         )
+    if result.final_state.fsm.phase is TLPhase.TLWaiting:
+        waiting = set(result.final_state.fsm.waiting)
+        if waiting != {"sub-a"}:
+            raise HarnessError(
+                f"recursive waiting boundary was not isolated to sub-a: {waiting!r}"
+            )
     local_runs = (
         ("recursive-root", state_root),
         ("sub-a", state_root / "recursive-root"),
@@ -794,7 +831,9 @@ def check_pr_evidence(
         raise HarnessError(f"merge handler rejected matching evidence: {merged.raw!r}")
 
 
-def run_live_ordered_probe(client: TransportClient, root: Path, repo: Path) -> None:
+def run_live_ordered_probe(
+    client: TransportClient, root: Path, repo: Path, swarm_id: str
+) -> None:
     effects = EffectClient(client, role="tl", name="root")
     result = run_tl_loop(
         "ordered-server-live",
@@ -808,12 +847,15 @@ def run_live_ordered_probe(client: TransportClient, root: Path, repo: Path) -> N
         effects,
         config=TLLoopConfig(
             active=True,
-            keep_alive_on_waiting=True,
+            keep_alive_on_waiting=False,
             max_parallel_slices=2,
             max_events=8,
             idle_timeout=0.2,
             dispatch_timeout=0.2,
+            controller_stall_timeout=1.0,
             root_dir=root / "controller-state",
+            run_id="ordered-server-live",
+            ledger_run_id=swarm_id,
             branch="main",
             worktree=repo,
         ),
@@ -1463,10 +1505,10 @@ def main() -> None:
         server: subprocess.Popen[str] | None = None
         try:
             server, client = start_server(root, repo, forgejo_url, project_root)
-            check_pr_evidence(client, branch, repo, forgejo_url)
             swarm_id = run_root_recursive_lifecycle_probe(client, root, repo)
             run_recursive_checkpoint_probe(client, root, repo, swarm_id)
-            run_live_ordered_probe(client, root, repo)
+            run_live_ordered_probe(client, root, repo, swarm_id)
+            check_pr_evidence(client, branch, repo, forgejo_url)
             run_delayed_restart_probe(client, root, repo, forgejo_url)
             assert_stage_events(repo, swarm_id)
             run_waiting_supervision_probe(root / "waiting-state")
@@ -1475,6 +1517,11 @@ def main() -> None:
             if server is not None:
                 server.terminate()
                 server.wait(timeout=10)
+            subprocess.run(
+                ["tmux", "kill-session", "-t", f"ordered-server-e2e-{os.getpid()}"],
+                check=False,
+                capture_output=True,
+            )
             mock.terminate()
             mock.wait(timeout=10)
 

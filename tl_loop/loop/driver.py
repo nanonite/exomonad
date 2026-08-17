@@ -607,8 +607,10 @@ def run_tl_loop(
             root_state["ledger_run_id"] = selected.ledger_run_id
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
-    if state.ledger_run_id and selected.ledger_run_id and (
-        state.ledger_run_id != selected.ledger_run_id
+    if (
+        state.ledger_run_id
+        and selected.ledger_run_id
+        and (state.ledger_run_id != selected.ledger_run_id)
     ):
         raise TLLoopError(
             f"checkpoint ledger_run_id {state.ledger_run_id!r} does not match "
@@ -834,24 +836,83 @@ def _run_loop(
             if isinstance(phase, (TLDone, TLFailed)):
                 break
             continue
+        # Rust's direct agent.spawned records carry the canonical branch and
+        # child identity; shadowed replay records use the normal decoder path.
+        if event.kind is EventKind.AGENT_SPAWNED:
+            if not _dispatch_confirmation_matches(state.slices, event):
+                diagnostics.filtered += 1
+                diagnostics.rejected += 1
+                LOGGER.warning(
+                    "Ignoring uncorrelated agent.spawned event run_id=%s event_seq=%s",
+                    run_id,
+                    event_seq,
+                )
+                _checkpoint_and_ack(store, source, event, state, phase)
+                diagnostics.acknowledged += 1
+                state = store.load()
+                continue
+            event_slice_id = _event_slice_id(event, state)
+            if event_slice_id is None:
+                raise TLLoopError("agent.spawned matched an intent but no dispatch slice was found")
+            current = state.slices[event_slice_id]
+            branch = event.data.get("branch")
+            branch = branch if isinstance(branch, str) and branch else current.branch or ""
+            agent_type = event.data.get("agent_type")
+            agent_type = (
+                agent_type
+                if isinstance(agent_type, str) and agent_type
+                else current.agent_type or "unknown"
+            )
+            fsm_event = ChildSpawned(ChildHandle(event_slice_id, branch, agent_type))
+            try:
+                next_phase = transition(phase, fsm_event)
+            except IllegalTransition as error:
+                raise TLLoopError(str(error)) from error
+            next_slices = _confirm_dispatch_event(
+                state.slices, state.slices, event, event_slice_id, event_seq
+            )
+            next_slices[event_slice_id] = replace(
+                next_slices[event_slice_id],
+                branch=branch or next_slices[event_slice_id].branch,
+            )
+            previous_state = state
+            state = store.checkpoint(next_phase, next_slices, state.budgets, event_seq)
+            _emit_slice_status_changes(
+                previous_state.slices,
+                next_slices,
+                config,
+                effects,
+                effects_log,
+            )
+            _emit_dispatch_confirmation(
+                previous_state.slices,
+                next_slices,
+                event,
+                event_slice_id,
+                config,
+                effects,
+                effects_log,
+            )
+            source.acknowledge(event)
+            diagnostics.acknowledged += 1
+            diagnostics.correlated += 1
+            transitions.append(
+                LoopTransition(
+                    event_seq,
+                    event.event_type,
+                    _phase_tag(phase),
+                    _phase_tag(next_phase),
+                )
+            )
+            _emit_phase_change(run_id, phase, next_phase, config, effects, effects_log)
+            phase = next_phase
+            if isinstance(phase, (TLDone, TLFailed)):
+                break
+            continue
         try:
             fsm_event = decoder.decode(event)
         except Exception as error:
             raise TLLoopError(str(error)) from error
-        if _is_spawn_confirmation_event(event) and not _dispatch_confirmation_matches(
-            state.slices, event
-        ):
-            diagnostics.filtered += 1
-            diagnostics.rejected += 1
-            LOGGER.warning(
-                "Ignoring uncorrelated agent.spawned event run_id=%s event_seq=%s",
-                run_id,
-                event_seq,
-            )
-            _checkpoint_and_ack(store, source, event, state, phase)
-            diagnostics.acknowledged += 1
-            state = store.load()
-            continue
         if _duplicate_event(phase, fsm_event, state):
             diagnostics.filtered += 1
             _checkpoint_and_ack(store, source, event, state, phase)
@@ -954,11 +1015,7 @@ def _run_loop(
         raise LoopTimeout(f"TL did not reach a terminal phase within {config.idle_timeout:g}s")
     if phase is TLFailed:
         reason = next(
-            (
-                current.dispatch_error
-                for current in state.slices.values()
-                if current.dispatch_error
-            ),
+            (current.dispatch_error for current in state.slices.values() if current.dispatch_error),
             "TL reached the failed terminal phase",
         )
         store.record_terminal_summary(
@@ -1535,9 +1592,9 @@ def _confirm_dispatch_event(
     if current is None or current.dispatch_intent_id is None:
         return dict(updated_slices)
     data_agent = event.data.get("child_agent") or event.data.get("slug")
-    agent_id = event.agent_id if isinstance(event.agent_id, str) else None
-    if not agent_id and isinstance(data_agent, str):
-        agent_id = data_agent
+    agent_id = data_agent if isinstance(data_agent, str) and data_agent else None
+    if not agent_id and isinstance(event.agent_id, str):
+        agent_id = event.agent_id
     return {
         **updated_slices,
         slice_id: replace(
