@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix WASM setup cache detection in justfile (#878)
 - Remove unused Ruff directive from ordered restart harness (#877)
 - Fix TL dispatch timeout when leaf spawn produces no observable event (#876)
 - Fix TL controller startup race and surface launch failures (#862)
