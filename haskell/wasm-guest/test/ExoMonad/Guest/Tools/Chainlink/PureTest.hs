@@ -33,6 +33,12 @@ pureTests =
         parseIssueId "12abc34" @=? Nothing,
       testCase "parseIssueId: zero" $
         parseIssueId "0" @=? Just 0,
+      testCase "parseIssueId: structured cicoIssueId" $
+        parseIssueId "{\"cicoIssueId\":630}" @=? Just 630,
+      testCase "parseIssueId: unrelated structured id returns Nothing" $
+        parseIssueId "{\"id\":630}" @=? Nothing,
+      testCase "parseIssueId: mixed text remains rejected" $
+        parseIssueId "created issue 630" @=? Nothing,
       -- buildCreateArgs
       testCase "buildCreateArgs: title only" $
         buildCreateArgs (ChainlinkIssueCreateArgs "My issue" Nothing Nothing Nothing)

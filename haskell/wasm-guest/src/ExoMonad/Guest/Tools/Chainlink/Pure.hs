@@ -80,10 +80,12 @@ module ExoMonad.Guest.Tools.Chainlink.Pure
   )
 where
 
-import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.!=), (.:), (.:?), (.=))
+import Control.Applicative ((<|>))
+import Data.Aeson (FromJSON (..), ToJSON (..), decodeStrict', object, withObject, (.!=), (.:), (.:?), (.=))
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import GHC.Generics (Generic)
 
 data ChainlinkIssueCreateArgs = ChainlinkIssueCreateArgs
@@ -373,13 +375,25 @@ chainlinkWorkerProtocolText =
       "- If scope creep appears, report it; do not absorb extra work silently."
     ]
 
+data StructuredIssueId = StructuredIssueId
+  { structuredIssueId :: Int
+  }
+
+instance FromJSON StructuredIssueId where
+  parseJSON = withObject "StructuredIssueId" $ \value ->
+    StructuredIssueId <$> value .: "cicoIssueId"
+
 parseIssueId :: Text -> Maybe Int
-parseIssueId output =
-  case T.strip output of
-    t
-      | not (T.null t), T.all isDigit t -> Just (read (T.unpack t))
-      | otherwise -> Nothing
+parseIssueId output = parseBareIssueId trimmed <|> parseStructuredIssueId trimmed
   where
+    trimmed = T.strip output
+
+    parseBareIssueId t
+      | not (T.null t), T.all isDigit t = Just (read (T.unpack t))
+      | otherwise = Nothing
+
+    parseStructuredIssueId t = structuredIssueId <$> decodeStrict' (TE.encodeUtf8 t)
+
     isDigit c = c >= '0' && c <= '9'
 
 buildCreateArgs :: ChainlinkIssueCreateArgs -> [String]

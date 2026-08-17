@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Accept structured Chainlink issue IDs from create responses (#881)
 - Fix harness and model routing in TL spawn dispatch (#880)
 - Fix WASM setup cache detection in justfile (#878)
 - Remove unused Ruff directive from ordered restart harness (#877)
