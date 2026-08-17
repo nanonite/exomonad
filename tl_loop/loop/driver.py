@@ -1136,22 +1136,8 @@ def _record_reader_findings(source: EventQueue, diagnostics: EventDiagnostics) -
 
 
 def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> LoopDeadline | None:
-    """Return only evidence-bound deadlines; ordinary silence is not terminal."""
-    remaining: list[float] = []
-    if config.active:
-        remaining = [
-            config.dispatch_timeout - max(0.0, time.time() - slice_state.dispatch_started_at)
-            for slice_state in state.slices.values()
-            if slice_state.status in DISPATCHING_STATUSES
-            and slice_state.dispatch_started_at is not None
-        ]
-    if remaining:
-        dispatch_remaining = min(remaining)
-        return LoopDeadline(
-            time.monotonic() + dispatch_remaining,
-            "dispatch",
-            config.dispatch_timeout,
-        )
+    """Return no lifecycle deadline; evidence and cancellation drive progress."""
+    del state, config
     return None
 
 

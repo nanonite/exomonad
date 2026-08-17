@@ -467,52 +467,61 @@ def test_observability_failure_does_not_change_terminal_state(
     assert "controller event tl.merge_decided failed: ledger unavailable" in caplog.text
 
 
-def test_idle_timeout_parks_with_named_gate_and_never_merges(tmp_path: Path) -> None:
+def test_dispatch_waits_for_delayed_authoritative_confirmation(tmp_path: Path) -> None:
+    run_id = "delayed-dispatch-run"
     transport = RecordingTransport()
-    result = run_tl_loop(
-        "timeout-run",
-        _plan(),
-        SyntheticQueue([]),
-        EffectClient(transport),
-        config=TLLoopConfig(
-            max_workers=1,
-            max_leaves=1,
-            max_events=5,
-            poll_interval=0.001,
-            idle_timeout=0.01,
-        ),
-        root_dir=tmp_path,
-    )
+    source = SyntheticQueue([])
+    cancel_event = threading.Event()
+    outcome: dict[str, BaseException] = {}
 
-    assert result.final_state.fsm.phase is TLPhase.TLFailed
-    assert result.final_state.gates == (
-        GateState(name="tl-dispatch-timeout", status=GateStatus.PENDING),
+    def run() -> None:
+        try:
+            run_tl_loop(
+                run_id,
+                WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "delayed"}]}),
+                source,
+                EffectClient(transport),
+                config=TLLoopConfig(
+                    max_workers=0,
+                    max_leaves=1,
+                    poll_interval=0.001,
+                    dispatch_timeout=0.001,
+                    cancel_event=cancel_event,
+                ),
+                root_dir=tmp_path,
+            )
+        except BaseException as error:  # noqa: BLE001 - assert explicit cancellation
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while not any(name == "spawn_leaf" for name, _ in transport.calls):
+        if time.monotonic() >= deadline:
+            pytest.fail("spawn request was not issued")
+        time.sleep(0.001)
+    time.sleep(0.02)
+    source.events.append(
+        _canonical_event(
+            1,
+            "agent.spawned",
+            "leaf-a",
+            run_id,
+            intent_id=_dispatch_intent(run_id, "leaf-a"),
+        )
     )
-    assert _effect_names(transport) == ["spawn_worker", "spawn_leaf"]
-    worker_state = result.final_state.slices["worker-a"]
-    assert worker_state.status is SliceStatus.DISPATCH_UNCONFIRMED
-    assert worker_state.park_cause.value == "dispatch_timeout"
-    assert worker_state.dispatch_intent_id
-    assert "authoritative agent.spawned" in (worker_state.dispatch_error or "")
-    summary = RunStore("timeout-run", tmp_path).terminal_summary()
-    assert summary is not None
-    assert summary["deadline_reason"] == "dispatch"
-    assert summary["timeout_seconds"] == 5.0
-    assert summary["diagnostics"] == {
-        "received": 0,
-        "acknowledged": 0,
-        "filtered": 0,
-        "correlated": 0,
-        "rejected": 0,
-        "last_event_seq": None,
-        "reader_findings": [],
-    }
-    assert [
-        arguments["payload"]
-        for tool_name, arguments in transport.calls
-        if tool_name == "emit_controller_event" and arguments["event_type"] == "tl.gate_opened"
-    ] == [{"gate_name": "tl-dispatch-timeout", "run_id": "timeout-run"}]
-    assert "merge_pr" not in _effect_names(transport)
+    deadline = time.monotonic() + 1.0
+    while source.acknowledged != [1] and time.monotonic() < deadline:
+        time.sleep(0.001)
+    cancel_event.set()
+    thread.join(timeout=2)
+
+    assert source.acknowledged == [1]
+    assert isinstance(outcome.get("error"), LoopCancelled)
+    state = RunStore(run_id, tmp_path).load()
+    assert state.fsm.phase is TLPhase.TLWaiting
+    assert state.slices["leaf-a"].status is SliceStatus.SPAWNED
+    assert not state.gates
 
 
 def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None:
@@ -549,7 +558,13 @@ def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None
 def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> None:
     run_id = "dispatch-restart-run"
     plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement the change"}]})
-    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.1)
+    cancel_event = threading.Event()
+    config = TLLoopConfig(
+        poll_interval=0.001,
+        idle_timeout=0.1,
+        dispatch_timeout=0.1,
+        cancel_event=cancel_event,
+    )
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["leaf-a"].update(
         {
@@ -562,17 +577,37 @@ def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> 
     )
     transport = RecordingTransport()
 
-    result = run_tl_loop(
-        run_id,
-        plan,
-        SyntheticQueue([]),
-        EffectClient(transport),
-        config=config,
-        root_dir=tmp_path,
-        initial_slices=initial,
-    )
+    outcome: dict[str, BaseException] = {}
 
-    slice_state = result.final_state.slices["leaf-a"]
+    def run() -> None:
+        try:
+            run_tl_loop(
+                run_id,
+                plan,
+                SyntheticQueue([]),
+                EffectClient(transport),
+                config=config,
+                root_dir=tmp_path,
+                initial_slices=initial,
+            )
+        except BaseException as error:  # noqa: BLE001 - assert explicit cancellation
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while "tl.dispatch_reconciliation_completed" not in [
+        arguments["event_type"]
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    ]:
+        if time.monotonic() >= deadline:
+            pytest.fail("dispatch reconciliation did not complete")
+        time.sleep(0.001)
+    cancel_event.set()
+    thread.join(timeout=2)
+
+    slice_state = RunStore(run_id, tmp_path).load().slices["leaf-a"]
     event_types = [
         arguments["event_type"]
         for name, arguments in transport.calls
@@ -583,9 +618,8 @@ def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> 
     assert slice_state.status is SliceStatus.DISPATCH_UNCONFIRMED
     assert "tl.dispatch_reconciliation_started" in event_types
     assert "tl.dispatch_reconciliation_completed" in event_types
-    assert result.final_state.gates == (
-        GateState(name="tl-dispatch-timeout", status=GateStatus.PENDING),
-    )
+    assert isinstance(outcome.get("error"), LoopCancelled)
+    assert not RunStore(run_id, tmp_path).load().gates
 
 
 def test_restart_adopts_owner_by_intent_without_duplicate_spawn(tmp_path: Path) -> None:
@@ -633,7 +667,13 @@ def test_restart_adopts_owner_by_intent_without_duplicate_spawn(tmp_path: Path) 
 def test_stale_spawn_intent_cannot_confirm_new_attempt(tmp_path: Path) -> None:
     run_id = "dispatch-stale-intent-run"
     plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]})
-    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.1)
+    cancel_event = threading.Event()
+    config = TLLoopConfig(
+        poll_interval=0.001,
+        idle_timeout=0.1,
+        dispatch_timeout=0.1,
+        cancel_event=cancel_event,
+    )
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["leaf-a"].update(
         {
@@ -645,35 +685,49 @@ def test_stale_spawn_intent_cannot_confirm_new_attempt(tmp_path: Path) -> None:
         }
     )
 
-    result = run_tl_loop(
-        run_id,
-        plan,
-        SyntheticQueue(
-            [
-                _canonical_event(
-                    1,
-                    "agent.spawned",
-                    "leaf-a",
-                    run_id,
-                    intent_id="intent-stale-1",
-                )
-            ]
-        ),
-        EffectClient(RecordingTransport()),
-        config=config,
-        root_dir=tmp_path,
-        initial_slices=initial,
+    source = SyntheticQueue(
+        [
+            _canonical_event(
+                1,
+                "agent.spawned",
+                "leaf-a",
+                run_id,
+                intent_id="intent-stale-1",
+            )
+        ]
     )
+    outcome: dict[str, BaseException] = {}
+    transport = RecordingTransport()
 
-    stale = result.final_state.slices["leaf-a"]
+    def run() -> None:
+        try:
+            run_tl_loop(
+                run_id,
+                plan,
+                source,
+                EffectClient(transport),
+                config=config,
+                root_dir=tmp_path,
+                initial_slices=initial,
+            )
+        except BaseException as error:  # noqa: BLE001 - assert explicit cancellation
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while source.acknowledged != [1] and time.monotonic() < deadline:
+        time.sleep(0.001)
+    cancel_event.set()
+    thread.join(timeout=2)
+
+    stale = RunStore(run_id, tmp_path).load().slices["leaf-a"]
     assert stale.status is SliceStatus.DISPATCH_UNCONFIRMED
     assert stale.dispatch_intent_id == "intent-new-2"
     assert stale.dispatch_authoritative_event_seq is None
-    assert stale.park_cause.value == "dispatch_timeout"
-    assert result.diagnostics["received"] == 1
-    assert result.diagnostics["filtered"] == 1
-    assert result.diagnostics["rejected"] == 1
-    assert result.diagnostics["acknowledged"] == 1
+    assert stale.park_cause.value == "dispatch_unconfirmed"
+    assert source.acknowledged == [1]
+    assert isinstance(outcome.get("error"), LoopCancelled)
 
 
 def test_ledger_run_id_mismatch_reaches_driver_diagnostics(tmp_path: Path) -> None:
@@ -707,6 +761,7 @@ def test_ledger_run_id_mismatch_reaches_driver_diagnostics(tmp_path: Path) -> No
         + "\n",
         encoding="utf-8",
     )
+    segment = segments / "segment-000000000001.jsonl"
     source = LedgerQueue(
         LedgerReader(
             segments,
@@ -716,24 +771,81 @@ def test_ledger_run_id_mismatch_reaches_driver_diagnostics(tmp_path: Path) -> No
         ),
         poll_interval=0.001,
     ).start()
-    try:
-        result = run_tl_loop(
-            run_id,
-            WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
-            source,
-            EffectClient(RecordingTransport()),
-            config=TLLoopConfig(
-                poll_interval=0.001,
-                idle_timeout=0.1,
-                dispatch_timeout=0.01,
-                ledger_run_id=current_swarm,
-            ),
-            root_dir=tmp_path,
-        )
-    finally:
-        source.close(timeout=2)
+    transport = RecordingTransport()
+    outcome: dict[str, object] = {}
 
-    assert result.diagnostics["received"] == 1
+    def run() -> None:
+        try:
+            outcome["result"] = run_tl_loop(
+                run_id,
+                WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+                source,
+                EffectClient(transport),
+                config=TLLoopConfig(
+                    poll_interval=0.001,
+                    idle_timeout=0.1,
+                    dispatch_timeout=0.01,
+                    ledger_run_id=current_swarm,
+                ),
+                root_dir=tmp_path,
+            )
+        except BaseException as error:  # noqa: BLE001 - fail the test with the worker error
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while not source.findings and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert source.findings
+    state_path = tmp_path / run_id / "run.json"
+    current_intent: str | None = None
+    while current_intent is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+        if not state_path.exists():
+            continue
+        current_intent = RunStore(run_id, tmp_path).load().slices["leaf-a"].dispatch_intent_id
+    assert current_intent
+    rows = [
+        {
+            "schema_version": 1,
+            "event_id": f"event-{sequence}",
+            "id": f"event-{sequence}",
+            "event_time": "2026-08-11T00:00:00Z",
+            "observed_at": "2026-08-11T00:00:00Z",
+            "run_seq": sequence,
+            "type": event_type,
+            "agent_id": "leaf-a",
+            "run_id": current_swarm,
+            "session_id": "session-1",
+            "lifecycle_state": "observed",
+            "data": data,
+        }
+        for sequence, event_type, data in (
+            (
+                2,
+                "agent.spawned",
+                {
+                    "child_agent": "leaf-a",
+                    "agent_type": "codex",
+                    "branch": "main.leaf-a",
+                    "intent_id": current_intent,
+                },
+            ),
+            (3, "agent.completed", {"status": "completed"}),
+            (4, "agent.notify_parent", {"shadow_event": {"kind": "all_children_done"}}),
+        )
+    ]
+    with segment.open("a", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row) + "\n")
+    thread.join(timeout=2)
+    source.close(timeout=2)
+
+    assert "error" not in outcome
+    result = cast(TLRunResult, outcome["result"])
+
+    assert result.diagnostics["received"] == 4
     assert result.diagnostics["filtered"] == 1
     assert result.diagnostics["reader_findings"] == [
         "ignored ledger event with run_id 'stale-swarm'; expected 'current-swarm'",
@@ -1988,7 +2100,13 @@ def test_failed_ordered_sub_tl_blocks_higher_order_work(tmp_path: Path) -> None:
     )
     plan = WorkPlan(
         sub_tls=(
-            SubTLTask("failed-stage", failing_child, source=SyntheticQueue([]), order=1),
+            SubTLTask(
+                "failed-stage",
+                failing_child,
+                source=SyntheticQueue([]),
+                effects=EffectClient(RecordingTransport(reject_spawns=True)),
+                order=1,
+            ),
             SubTLTask("later-stage", WorkPlan(), source=SyntheticQueue([]), order=2),
         )
     )
