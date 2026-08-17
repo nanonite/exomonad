@@ -132,6 +132,23 @@ async fn write_atomic(agent_dir: &Path, record: &InvocationRecord) -> Result<()>
     Ok(())
 }
 
+async fn persist_routing_ownership(
+    agent_dir: &Path,
+    routing: &RoutingInfo,
+    invocation_id: &str,
+    generation: u64,
+) -> Result<()> {
+    let agent_id = agent_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .context("agent directory has no usable identity for routing ownership")?;
+    routing
+        .with_ownership(agent_id, invocation_id, generation)
+        .write_to_dir(agent_dir)
+        .await
+}
+
 pub async fn read_invocation(agent_dir: &Path) -> Result<Option<InvocationRecord>> {
     read_locked(agent_dir).await
 }
@@ -179,6 +196,13 @@ pub async fn start_invocation(
         generation,
     };
     write_atomic(agent_dir, &record).await?;
+    persist_routing_ownership(
+        agent_dir,
+        &record.routing,
+        &record.invocation_id,
+        record.generation,
+    )
+    .await?;
     crate::services::lifecycle::record_invocation_started(agent_dir, &record);
     info!(
         path = %invocation_path(agent_dir).display(),
@@ -219,6 +243,13 @@ pub async fn start_invocation_with_provenance(
         generation,
     };
     write_atomic(agent_dir, &record).await?;
+    persist_routing_ownership(
+        agent_dir,
+        &record.routing,
+        &record.invocation_id,
+        record.generation,
+    )
+    .await?;
     crate::services::lifecycle::record_invocation_started(agent_dir, &record);
     info!(
         path = %invocation_path(agent_dir).display(),
@@ -287,7 +318,7 @@ pub async fn finish_invocation_and_tombstone(
     let _guard = mutation_lock().lock().await;
     let current = read_locked(agent_dir).await?;
     if let Some(record) = current.as_ref() {
-        if &record.routing != expected_routing {
+        if !record.routing.same_delivery_target(expected_routing) {
             warn!(
                 path = %invocation_path(agent_dir).display(),
                 invocation_id = %record.invocation_id,
@@ -303,6 +334,9 @@ pub async fn finish_invocation_and_tombstone(
     };
     let exited_at = unix_timestamp().to_string();
     tokio::fs::write(agent_dir.join("exited_at"), exited_at).await?;
+    if let Ok(routing) = RoutingInfo::read_from_dir(agent_dir).await {
+        routing.without_ownership().write_to_dir(agent_dir).await?;
+    }
     Ok(result)
 }
 

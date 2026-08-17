@@ -414,3 +414,39 @@ async fn live_tmux_dispatch_event_preserves_intent_and_sequence() {
     assert_eq!(events[0].event.data["intent_id"], json!("intent-live"));
     assert_eq!(events[0].event.data["child_agent"], json!("worker-live"));
 }
+
+#[tokio::test]
+async fn reused_tmux_target_rejects_stale_routing_owner() {
+    if !tmux_available() {
+        return;
+    }
+    let session = TestSession::create("exo-liveness-owner-reuse");
+    let window = session.new_shell_window("reused-target");
+    let ipc = session.ipc();
+    let target = RoutingInfo::window(window);
+
+    ipc.set_routing_owner(&target, "agent-a", "invocation-a", 1)
+        .await
+        .expect("persist first owner");
+    assert!(ipc
+        .routing_owner_matches(&target, "agent-a", "invocation-a", 1)
+        .await
+        .expect("read first owner"));
+
+    ipc.set_routing_owner(&target, "agent-b", "invocation-b", 2)
+        .await
+        .expect("persist replacement owner");
+
+    assert!(!ipc
+        .routing_owner_matches(&target, "agent-a", "invocation-a", 1)
+        .await
+        .expect("check stale owner"));
+    assert!(ipc
+        .routing_owner_matches(&target, "agent-b", "invocation-b", 2)
+        .await
+        .expect("check replacement owner"));
+    assert!(ipc
+        .window_exists(target.window_id.as_ref().unwrap())
+        .await
+        .unwrap());
+}

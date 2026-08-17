@@ -1077,6 +1077,33 @@ impl<
             metadata.effort,
         )
         .await?;
+        let effective_routing = RoutingInfo::read_from_dir(&agent_config_dir).await?;
+        if effective_routing.window_id.is_some() || effective_routing.pane_id.is_some() {
+            match self.tmux() {
+                Ok(tmux) => {
+                    if let Err(error) = tmux
+                        .set_routing_owner(
+                            &effective_routing,
+                            agent_name.as_str(),
+                            &invocation.invocation_id,
+                            invocation.generation,
+                        )
+                        .await
+                    {
+                        warn!(
+                            agent = %agent_name,
+                            %error,
+                            "Could not persist tmux ownership; cleanup will remain conservative"
+                        );
+                    }
+                }
+                Err(error) => warn!(
+                    agent = %agent_name,
+                    %error,
+                    "Could not create tmux client for ownership metadata; cleanup will remain conservative"
+                ),
+            }
+        }
         if let Err(error) = fs::remove_file(agent_config_dir.join("exited_at")).await {
             if error.kind() != std::io::ErrorKind::NotFound {
                 warn!(

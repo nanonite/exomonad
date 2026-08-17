@@ -69,7 +69,6 @@ impl<
             warn!(path = %agent_dir.display(), "Agent routing has no live target");
             return Some(false);
         }
-        let routing = invocation_routing.as_ref().unwrap_or(&routing);
         let tmux = match self.tmux() {
             Ok(tmux) => tmux,
             Err(error) => {
@@ -77,7 +76,7 @@ impl<
                 return Some(false);
             }
         };
-        let target_alive = crate::services::tmux_ipc::routing_target_alive(routing, &tmux)
+        let target_alive = crate::services::tmux_ipc::routing_target_alive(&routing, &tmux)
             .await
             .unwrap_or_else(|error| {
                 warn!(path = %agent_dir.display(), error = %error, "Routing liveness check failed");
@@ -87,7 +86,7 @@ impl<
             return Some(false);
         }
         Some(
-            tmux.routing_target_process_alive(routing)
+            tmux.routing_target_process_alive(&routing)
                 .await
                 .unwrap_or_else(|error| {
                     warn!(path = %agent_dir.display(), error = %error, "Routing process liveness check failed");

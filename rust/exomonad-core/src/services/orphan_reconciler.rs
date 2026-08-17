@@ -380,7 +380,8 @@ async fn reconcile_session_timeouts(
         };
 
         let expected_routing = routing;
-        match verify_routing_liveness(&expected_routing, session).await {
+        match verify_routing_liveness(&expected_routing, invocation.as_ref(), &slug, session).await
+        {
             RoutingLiveness::Live => {
                 info!(
                     agent = %slug,
@@ -486,14 +487,65 @@ fn timeout_due(age_secs: u64, limit_secs: u64) -> bool {
     age_secs > limit_secs
 }
 
-async fn verify_routing_liveness(routing: &RoutingInfo, session: &str) -> RoutingLiveness {
+async fn verify_routing_liveness(
+    routing: &RoutingInfo,
+    invocation: Option<&InvocationRecord>,
+    slug: &str,
+    session: &str,
+) -> RoutingLiveness {
     if !routing.has_delivery_target() {
         return RoutingLiveness::Unverifiable(
             "routing.json has no window_id or pane_id".to_string(),
         );
     }
+    let Some(invocation) = invocation else {
+        return RoutingLiveness::Unverifiable(
+            "current invocation metadata is unavailable".to_string(),
+        );
+    };
+    if !routing.has_ownership_proof() {
+        return RoutingLiveness::Unverifiable(format!(
+            "routing ownership proof is incomplete: expected agent={slug} invocation={} generation={}",
+            invocation.invocation_id, invocation.generation
+        ));
+    }
+    if routing.owner_agent_id.as_deref() != Some(slug)
+        || routing.owner_invocation_id.as_deref() != Some(invocation.invocation_id.as_str())
+        || routing.owner_generation != Some(invocation.generation)
+    {
+        return RoutingLiveness::Unverifiable(format!(
+            "routing ownership mismatch: expected agent={slug} invocation={} generation={}, observed agent={:?} invocation={:?} generation={:?}",
+            invocation.invocation_id,
+            invocation.generation,
+            routing.owner_agent_id,
+            routing.owner_invocation_id,
+            routing.owner_generation
+        ));
+    }
 
     let tmux = crate::services::tmux_ipc::TmuxIpc::new(session);
+    match tmux.routing_owner(routing).await {
+        Ok(Some(owner))
+            if owner.agent_id == slug
+                && owner.invocation_id == invocation.invocation_id
+                && owner.generation == invocation.generation => {}
+        Ok(Some(owner)) => {
+            return RoutingLiveness::Unverifiable(format!(
+                "tmux ownership mismatch: expected agent={slug} invocation={} generation={}, observed agent={} invocation={} generation={}",
+                invocation.invocation_id,
+                invocation.generation,
+                owner.agent_id,
+                owner.invocation_id,
+                owner.generation
+            ));
+        }
+        Ok(None) => {
+            return RoutingLiveness::Unverifiable(
+                "tmux target has no complete ownership proof".to_string(),
+            );
+        }
+        Err(error) => return RoutingLiveness::Unverifiable(error.to_string()),
+    }
     match crate::services::tmux_ipc::routing_target_alive(routing, &tmux).await {
         Ok(true) => RoutingLiveness::Live,
         Ok(false) => RoutingLiveness::Dead,
@@ -553,25 +605,65 @@ async fn kill_agent_window(
             return false;
         }
     };
-    if expected_routing != &routing {
+    if !routing.same_delivery_target(expected_routing) {
         warn!(agent = %slug, "Skipping kill for a replaced invocation routing target");
+        return false;
+    }
+    let Some(invocation) = invocation else {
+        warn!(agent = %slug, "Skipping kill because current invocation ownership is unavailable");
+        return false;
+    };
+    if routing.owner_agent_id.as_deref() != Some(slug)
+        || routing.owner_invocation_id.as_deref() != Some(invocation.invocation_id.as_str())
+        || routing.owner_generation != Some(invocation.generation)
+    {
+        warn!(
+            agent = %slug,
+            expected_invocation = %invocation.invocation_id,
+            expected_generation = invocation.generation,
+            observed_agent = ?routing.owner_agent_id,
+            observed_invocation = ?routing.owner_invocation_id,
+            observed_generation = ?routing.owner_generation,
+            "Skipping kill because routing ownership proof does not match"
+        );
+        return false;
+    }
+
+    let tmux = crate::services::tmux_ipc::TmuxIpc::new(session);
+    let owner = match tmux.routing_owner(&routing).await {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            warn!(agent = %slug, "Skipping kill because tmux target ownership is unverifiable");
+            return false;
+        }
+        Err(error) => {
+            warn!(agent = %slug, %error, "Skipping kill because tmux ownership could not be read");
+            return false;
+        }
+    };
+    if owner.agent_id != slug
+        || owner.invocation_id != invocation.invocation_id
+        || owner.generation != invocation.generation
+    {
+        warn!(
+            agent = %slug,
+            expected_invocation = %invocation.invocation_id,
+            expected_generation = invocation.generation,
+            observed_agent = %owner.agent_id,
+            observed_invocation = %owner.invocation_id,
+            observed_generation = owner.generation,
+            "Skipping kill because tmux target belongs to another invocation"
+        );
         return false;
     }
 
     if let Some(window_id) = &routing.window_id {
         let target = format!("{}:{}", session, window_id.as_str());
-        let status = Command::new("tmux")
-            .args(["kill-window", "-t", &target])
-            .status()
-            .await;
+        let status = tmux.kill_window(window_id).await;
         match status {
-            Ok(s) if s.success() => {
+            Ok(()) => {
                 info!(agent = %slug, target = %target, "Killed timed-out agent window");
                 true
-            }
-            Ok(s) => {
-                warn!(agent = %slug, target = %target, status = ?s, "kill-window returned non-zero (window may already be gone)");
-                false
             }
             Err(e) => {
                 warn!(agent = %slug, error = %e, "Failed to run tmux kill-window");
@@ -580,18 +672,11 @@ async fn kill_agent_window(
         }
     } else if let Some(pane_id) = &routing.pane_id {
         let target = format!("{}:{}", session, pane_id.as_str());
-        let status = Command::new("tmux")
-            .args(["kill-pane", "-t", &target])
-            .status()
-            .await;
+        let status = tmux.kill_pane(pane_id).await;
         match status {
-            Ok(s) if s.success() => {
+            Ok(()) => {
                 info!(agent = %slug, target = %target, "Killed timed-out agent pane");
                 true
-            }
-            Ok(s) => {
-                warn!(agent = %slug, target = %target, status = ?s, "kill-pane returned non-zero");
-                false
             }
             Err(e) => {
                 warn!(agent = %slug, error = %e, "Failed to run tmux kill-pane");

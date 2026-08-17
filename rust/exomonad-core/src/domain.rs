@@ -834,6 +834,17 @@ pub struct RoutingInfo {
     pub pane_id: Option<crate::services::tmux_ipc::PaneId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_tab: Option<String>,
+    /// Stable agent identity that owns the target at the time this routing
+    /// record was written. Numeric tmux IDs are reusable and are not enough
+    /// to authorize cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
+    /// Invocation identity that claimed the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_invocation_id: Option<String>,
+    /// Monotonic invocation generation for the owning agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
 }
 
 impl RoutingInfo {
@@ -842,6 +853,9 @@ impl RoutingInfo {
             window_id: Some(window_id),
             pane_id: None,
             parent_tab: None,
+            owner_agent_id: None,
+            owner_invocation_id: None,
+            owner_generation: None,
         }
     }
 
@@ -850,11 +864,52 @@ impl RoutingInfo {
             window_id: None,
             pane_id: Some(pane_id),
             parent_tab: Some(parent_tab.to_string()),
+            owner_agent_id: None,
+            owner_invocation_id: None,
+            owner_generation: None,
         }
     }
 
     pub fn has_delivery_target(&self) -> bool {
         self.window_id.is_some() || self.pane_id.is_some() || self.parent_tab.is_some()
+    }
+
+    pub fn has_ownership_proof(&self) -> bool {
+        self.owner_agent_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            && self
+                .owner_invocation_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            && self.owner_generation.is_some()
+    }
+
+    pub fn same_delivery_target(&self, other: &Self) -> bool {
+        self.window_id == other.window_id
+            && self.pane_id == other.pane_id
+            && self.parent_tab == other.parent_tab
+    }
+
+    pub fn with_ownership(
+        &self,
+        agent_id: impl Into<String>,
+        invocation_id: impl Into<String>,
+        generation: u64,
+    ) -> Self {
+        let mut owned = self.clone();
+        owned.owner_agent_id = Some(agent_id.into());
+        owned.owner_invocation_id = Some(invocation_id.into());
+        owned.owner_generation = Some(generation);
+        owned
+    }
+
+    pub fn without_ownership(&self) -> Self {
+        let mut retired = self.clone();
+        retired.owner_agent_id = None;
+        retired.owner_invocation_id = None;
+        retired.owner_generation = None;
+        retired
     }
 
     #[cfg(feature = "runtime")]

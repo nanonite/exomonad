@@ -14,6 +14,10 @@ use tracing::{debug, info, warn};
 
 use crate::domain::RoutingInfo;
 
+const OWNER_AGENT_OPTION: &str = "@exomonad_owner_agent";
+const OWNER_INVOCATION_OPTION: &str = "@exomonad_owner_invocation";
+const OWNER_GENERATION_OPTION: &str = "@exomonad_owner_generation";
+
 /// Per-target injection locks. Uses Weak references so entries are automatically
 /// reclaimable when no inject_input call holds the Arc.
 ///
@@ -136,6 +140,13 @@ pub(crate) fn classify_window_startup(window_exists: bool) -> WindowStartupStatu
 #[derive(Debug, Clone)]
 pub struct TmuxIpc {
     session_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxOwnership {
+    pub agent_id: String,
+    pub invocation_id: String,
+    pub generation: u64,
 }
 
 fn settle_delay_for_payload(payload: &str) -> Duration {
@@ -406,6 +417,135 @@ impl TmuxIpc {
         }
         info!(window = %window_id, "Killed tmux window");
         Ok(())
+    }
+
+    fn ownership_target(&self, routing: &RoutingInfo) -> Option<(&'static str, String)> {
+        if let Some(window_id) = &routing.window_id {
+            return Some((
+                "-w",
+                format!("{}:{}", self.session_name, window_id.as_str()),
+            ));
+        }
+        routing.pane_id.as_ref().map(|pane_id| {
+            (
+                "-p",
+                qualify_tmux_target(&self.session_name, pane_id.as_str()),
+            )
+        })
+    }
+
+    async fn set_ownership_option(
+        &self,
+        scope: &str,
+        target: &str,
+        option: &str,
+        value: &str,
+    ) -> Result<()> {
+        let output = tmux_command()
+            .args(["set-option", scope, "-t", target, option, value])
+            .output()
+            .await
+            .context("Failed to set tmux ownership option")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux set-option failed for {option}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    async fn read_ownership_option(
+        &self,
+        scope: &str,
+        target: &str,
+        option: &str,
+    ) -> Result<Option<String>> {
+        let output = tmux_command()
+            .args(["show-options", scope, "-t", target, "-v", option])
+            .output()
+            .await
+            .context("Failed to read tmux ownership option")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
+    }
+
+    pub async fn set_routing_owner(
+        &self,
+        routing: &RoutingInfo,
+        agent_id: &str,
+        invocation_id: &str,
+        generation: u64,
+    ) -> Result<()> {
+        let Some((scope, target)) = self.ownership_target(routing) else {
+            anyhow::bail!("cannot persist tmux ownership without a window or pane target");
+        };
+        self.set_ownership_option(scope, &target, OWNER_AGENT_OPTION, agent_id)
+            .await?;
+        self.set_ownership_option(scope, &target, OWNER_INVOCATION_OPTION, invocation_id)
+            .await?;
+        self.set_ownership_option(
+            scope,
+            &target,
+            OWNER_GENERATION_OPTION,
+            &generation.to_string(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn routing_owner(&self, routing: &RoutingInfo) -> Result<Option<TmuxOwnership>> {
+        let Some((scope, target)) = self.ownership_target(routing) else {
+            return Ok(None);
+        };
+        let Some(agent_id) = self
+            .read_ownership_option(scope, &target, OWNER_AGENT_OPTION)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(invocation_id) = self
+            .read_ownership_option(scope, &target, OWNER_INVOCATION_OPTION)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(generation) = self
+            .read_ownership_option(scope, &target, OWNER_GENERATION_OPTION)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Ok(generation) = generation.parse() else {
+            return Ok(None);
+        };
+        Ok(Some(TmuxOwnership {
+            agent_id,
+            invocation_id,
+            generation,
+        }))
+    }
+
+    pub async fn routing_owner_matches(
+        &self,
+        routing: &RoutingInfo,
+        agent_id: &str,
+        invocation_id: &str,
+        generation: u64,
+    ) -> Result<bool> {
+        let Some(owner) = self.routing_owner(routing).await? else {
+            return Ok(false);
+        };
+        Ok(owner.agent_id == agent_id
+            && owner.invocation_id == invocation_id
+            && owner.generation == generation)
     }
 
     pub async fn select_window(&self, window_id: &WindowId) -> Result<()> {
