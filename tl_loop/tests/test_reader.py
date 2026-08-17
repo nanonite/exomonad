@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import cast
@@ -12,7 +13,13 @@ from typing import cast
 import pytest
 
 from tl_loop.events.queue import LedgerQueue, QueueError
-from tl_loop.events.reader import FindingKind, LedgerReader, LedgerReadError, SequenceStatus
+from tl_loop.events.reader import (
+    ActiveTail,
+    FindingKind,
+    LedgerReader,
+    LedgerReadError,
+    SequenceStatus,
+)
 from tl_loop.state.store import create
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ledger_projection_events.json"
@@ -186,10 +193,15 @@ def test_concurrent_writer_partial_tail_is_retried_without_queue_failure(tmp_pat
     writer_thread = threading.Thread(target=writer)
     writer_thread.start()
     assert ready.wait(timeout=2)
-    event_queue = LedgerQueue(LedgerReader(segments), poll_interval=0.005).start()
+    event_queue = LedgerQueue(
+        LedgerReader(segments),
+        poll_interval=0.001,
+        active_tail_timeout=0.5,
+    ).start()
     try:
         with pytest.raises(queue.Empty):
             event_queue.get(timeout=0.05)
+        time.sleep(0.16)
         release.set()
         assert event_queue.get(timeout=2).run_seq == 101
     finally:
@@ -207,7 +219,7 @@ def test_abandoned_active_tail_eventually_fails_with_context(tmp_path: Path) -> 
     event_queue = LedgerQueue(
         LedgerReader(segments),
         poll_interval=0.001,
-        active_tail_retry_limit=3,
+        active_tail_timeout=0.01,
     ).start()
     try:
         with pytest.raises(QueueError, match=r"remained incomplete") as raised:
@@ -216,8 +228,40 @@ def test_abandoned_active_tail_eventually_fails_with_context(tmp_path: Path) -> 
         assert isinstance(cause, LedgerReadError)
         assert cause.segment == path
         assert cause.line_number == 1
+        assert cause.byte_length == len(b'{"abandoned":')
+        assert cause.elapsed_seconds is not None
+        assert cause.elapsed_seconds >= cause.timeout_seconds == 0.01
     finally:
         event_queue.close(timeout=2)
+
+
+def test_active_tail_timeout_uses_elapsed_time_for_any_poll_interval(tmp_path: Path) -> None:
+    class ManualClock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    path = tmp_path / "segment-000000000001.jsonl"
+    tail = ActiveTail(path, line_number=1, byte_length=12)
+    for poll_interval in (0.001, 0.05):
+        clock = ManualClock()
+        event_queue = LedgerQueue(
+            LedgerReader(tmp_path),
+            poll_interval=poll_interval,
+            active_tail_timeout=0.25,
+            clock=clock,
+        )
+        event_queue._check_active_tail(tail)
+        clock.now = 0.20
+        event_queue._check_active_tail(tail)
+        clock.now = 0.20
+        event_queue._check_active_tail(ActiveTail(path, line_number=1, byte_length=13))
+        clock.now = 0.44
+        event_queue._check_active_tail(ActiveTail(path, line_number=1, byte_length=13))
+        clock.now = 0.46
+        with pytest.raises(LedgerReadError, match=r"0.260s.*timeout 0.250s"):
+            event_queue._check_active_tail(ActiveTail(path, line_number=1, byte_length=13))
 
 
 def test_queue_retries_partial_tail_and_reports_hard_failures(tmp_path: Path) -> None:

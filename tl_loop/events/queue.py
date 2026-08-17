@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import queue as queue_module
 import threading
+import time
+from collections.abc import Callable
 from typing import TypeAlias
 
 from .envelope import EventEnvelope
@@ -18,7 +20,7 @@ from .reader import (
 )
 
 FindingKey: TypeAlias = tuple[str, str, str, int]
-DEFAULT_ACTIVE_TAIL_RETRY_LIMIT = 120
+DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS = 30.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -62,14 +64,15 @@ class LedgerQueue:
         *,
         maxsize: int = 128,
         poll_interval: float = 0.25,
-        active_tail_retry_limit: int = DEFAULT_ACTIVE_TAIL_RETRY_LIMIT,
+        active_tail_timeout: float = DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if maxsize <= 0:
             raise ValueError("queue maxsize must be positive")
         if poll_interval <= 0:
             raise ValueError("queue poll interval must be positive")
-        if active_tail_retry_limit <= 0:
-            raise ValueError("active tail retry limit must be positive")
+        if active_tail_timeout <= 0:
+            raise ValueError("active tail timeout must be positive")
         self.reader = reader
         self.poll_interval = poll_interval
         self._events: queue_module.Queue[EventEnvelope] = queue_module.Queue(maxsize=maxsize)
@@ -81,9 +84,10 @@ class LedgerQueue:
         self._lock = threading.Lock()
         self._sequence_status = SequenceStatus.UNKNOWN
         self._cursor = 0
-        self._active_tail_retry_limit = active_tail_retry_limit
+        self._active_tail_timeout = active_tail_timeout
+        self._clock = clock or time.monotonic
         self._active_tail_signature: tuple[object, ...] | None = None
-        self._active_tail_retries = 0
+        self._active_tail_started_at: float | None = None
 
     def start(self) -> LedgerQueue:
         """Start the single tailer thread."""
@@ -161,20 +165,29 @@ class LedgerQueue:
     def _check_active_tail(self, active_tail: ActiveTail | None) -> None:
         if active_tail is None:
             self._active_tail_signature = None
-            self._active_tail_retries = 0
+            self._active_tail_started_at = None
             return
+        now = self._clock()
         signature = (active_tail.segment, active_tail.line_number, active_tail.byte_length)
-        if signature == self._active_tail_signature:
-            self._active_tail_retries += 1
-        else:
+        if signature != self._active_tail_signature:
             self._active_tail_signature = signature
-            self._active_tail_retries = 1
-        if self._active_tail_retries > self._active_tail_retry_limit:
+            self._active_tail_started_at = now
+            return
+        started_at = self._active_tail_started_at
+        if started_at is None:
+            self._active_tail_started_at = now
+            return
+        elapsed_seconds = max(0.0, now - started_at)
+        if elapsed_seconds >= self._active_tail_timeout:
             raise LedgerReadError(
                 f"active ledger tail {active_tail.segment} line {active_tail.line_number} "
-                f"remained incomplete for {self._active_tail_retries} stable polls",
+                f"({active_tail.byte_length} bytes) remained incomplete for "
+                f"{elapsed_seconds:.3f}s (timeout {self._active_tail_timeout:.3f}s)",
                 segment=active_tail.segment,
                 line_number=active_tail.line_number,
+                byte_length=active_tail.byte_length,
+                elapsed_seconds=elapsed_seconds,
+                timeout_seconds=self._active_tail_timeout,
             )
 
     def _put_until_stopped(self, event: EventEnvelope) -> None:
@@ -198,4 +211,9 @@ class LedgerQueue:
 EventQueue = LedgerQueue
 
 
-__all__ = ["EventQueue", "LedgerQueue", "QueueError"]
+__all__ = [
+    "DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS",
+    "EventQueue",
+    "LedgerQueue",
+    "QueueError",
+]

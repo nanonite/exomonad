@@ -100,6 +100,9 @@ def test_exit_reason_preserves_chained_error_diagnostics(tmp_path: Path) -> None
     cause = ValueError("segment-000000000001.jsonl line 7")
     cause.segment = Path("segment-000000000001.jsonl")  # type: ignore[attr-defined]
     cause.line_number = 7  # type: ignore[attr-defined]
+    cause.byte_length = 128  # type: ignore[attr-defined]
+    cause.elapsed_seconds = 0.16  # type: ignore[attr-defined]
+    cause.timeout_seconds = 30.0  # type: ignore[attr-defined]
     error = RuntimeError("ledger tailer stopped")
     error.__cause__ = cause
     error.cursor = 0  # type: ignore[attr-defined]
@@ -115,9 +118,12 @@ def test_exit_reason_preserves_chained_error_diagnostics(tmp_path: Path) -> None
     ]
     assert payload["context"] == {
         "cursor": 0,
+        "byte_length": 128,
+        "elapsed_seconds": 0.16,
         "line_number": 7,
         "segment": "segment-000000000001.jsonl",
         "sequence_status": "partial",
+        "timeout_seconds": 30.0,
     }
 
 

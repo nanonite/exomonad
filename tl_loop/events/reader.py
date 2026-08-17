@@ -28,9 +28,15 @@ class LedgerReadError(RuntimeError):
         *,
         segment: Path | None = None,
         line_number: int | None = None,
+        byte_length: int | None = None,
+        elapsed_seconds: float | None = None,
+        timeout_seconds: float | None = None,
     ) -> None:
         self.segment = segment
         self.line_number = line_number
+        self.byte_length = byte_length
+        self.elapsed_seconds = elapsed_seconds
+        self.timeout_seconds = timeout_seconds
         super().__init__(message)
 
 

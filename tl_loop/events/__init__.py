@@ -14,7 +14,7 @@ from .envelope import (
     project,
     project_ledger_event,
 )
-from .queue import EventQueue, LedgerQueue, QueueError
+from .queue import DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS, EventQueue, LedgerQueue, QueueError
 from .reader import (
     DEFAULT_LEDGER_ROOT,
     ActiveTail,
@@ -30,6 +30,7 @@ from .reader import (
 from .stall import ReviewStallClassification, classify_review_stall
 
 __all__ = [
+    "DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS",
     "DEFAULT_LEDGER_ROOT",
     "EVENT_TYPE_BY_KIND",
     "KIND_BY_EVENT_TYPE",

@@ -75,7 +75,15 @@ def _exception_context(error: BaseException) -> dict[str, object]:
     context: dict[str, object] = {}
     current: BaseException | None = error
     while current is not None:
-        for name in ("cursor", "sequence_status", "segment", "line_number"):
+        for name in (
+            "cursor",
+            "sequence_status",
+            "segment",
+            "line_number",
+            "byte_length",
+            "elapsed_seconds",
+            "timeout_seconds",
+        ):
             value = getattr(current, name, None)
             if value is None or name in context:
                 continue
