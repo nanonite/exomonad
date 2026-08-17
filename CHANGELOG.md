@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Make dispatch and review waiting evidence-driven instead of deadline-driven (#895)
 - Remove elapsed-time terminal transitions from TL controllers (#894)
 - Fix recursive TL lifecycle correlation, stale tmux ownership, and diagnostics (#887–#892)
 - Fix TL ledger tailer failure after successful worker spawn (#885)
