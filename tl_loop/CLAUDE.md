@@ -138,6 +138,12 @@ never issues a second spawn for an existing intent; it waits for matching
 evidence or an explicit resolution. Controller boundary events are limited to
 scalar dimensions and are written by Rust through the `tl` event allowlist.
 
+Recursive sub-TL controllers remain supervised until their own authoritative
+terminal phase. Parent joins and configured leaf/reviewer session-age
+thresholds are observational only; they do not terminate an owned child or
+invocation. Explicit cancellation and verified dead-process cleanup remain
+destructive paths.
+
 ## Selector budget ledger
 
 The selector estimates a spawn before it is written to run state. The estimator

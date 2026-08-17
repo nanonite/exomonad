@@ -2149,7 +2149,7 @@ def _run_live_sub_tl_batch(
     store: RunStore,
     budgets: BudgetLedger,
 ) -> tuple[tuple[SubTLTask, TLPhase | None, RunState | None], ...]:
-    """Run live children as bounded, independently owned controller processes."""
+    """Run live children as independently owned controller processes."""
     if "fork" not in multiprocessing.get_all_start_methods():
         raise TLLoopError("live ordered sub-TLs require fork-capable controller isolation")
     context = multiprocessing.get_context("fork")
@@ -2166,11 +2166,10 @@ def _run_live_sub_tl_batch(
     ]
     for _, process in processes:
         process.start()
-    timeout = max(config.idle_timeout, config.dispatch_timeout)
     outcomes: list[tuple[SubTLTask, TLPhase | None, RunState | None]] = []
     for task, process in processes:
         child_store = RunStore(task.name, store.run_dir)
-        child_state = _supervise_live_sub_tl(process, child_store, config, timeout)
+        child_state = _supervise_live_sub_tl(process, child_store, config)
         phase = child_state.fsm.phase if child_state is not None else TLPhase.TLFailed
         outcomes.append((task, phase, child_state))
     return tuple(outcomes)
@@ -2180,84 +2179,32 @@ def _supervise_live_sub_tl(
     process: multiprocessing.Process,
     child_store: RunStore,
     config: TLLoopConfig,
-    timeout: float,
 ) -> RunState | None:
-    """Keep a waiting child alive while its checkpoint or heartbeat advances."""
-    process.join(timeout=timeout)
-    if process.is_alive():
+    """Supervise a child until it resolves or explicit cancellation is requested."""
+    poll_interval = max(config.poll_interval, 0.05)
+    cancelled = False
+    while process.is_alive():
+        if config.cancel_event is not None and config.cancel_event.is_set():
+            cancelled = True
+            process.terminate()
+            process.join()
+            child_store.record_exit_reason("sub-TL controller cancelled explicitly")
+            break
+        process.join(timeout=poll_interval)
+    exitcode = getattr(process, "exitcode", None)
+    if not cancelled and exitcode not in (None, 0):
         try:
             child_state = child_store.load()
         except (OSError, ValueError):
             child_state = None
-        if (
-            child_state is not None
-            and child_state.fsm.phase is TLPhase.TLWaiting
-            and (config.keep_alive_on_waiting)
-        ):
-            _join_waiting_child(process, child_store, config)
-        else:
-            process.terminate()
-            process.join()
-            child_store.record_exit_reason(f"sub-TL controller exceeded {timeout:.3f}s")
+        if child_state is None or child_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
+            child_store.record_exit_reason(
+                f"sub-TL controller exited unexpectedly with code {exitcode}"
+            )
     try:
         return child_store.load()
     except (OSError, ValueError):
         return None
-
-
-def _join_waiting_child(
-    process: multiprocessing.Process,
-    child_store: RunStore,
-    config: TLLoopConfig,
-) -> None:
-    """Join a legal wait in bounded slices, resetting on durable activity."""
-    stall_timeout = (
-        config.heartbeat.stall_threshold_seconds
-        if config.heartbeat is not None
-        else config.controller_stall_timeout
-    )
-    poll_interval = max(config.poll_interval, 0.05)
-    activity = _waiting_child_activity(child_store)
-    deadline = time.monotonic() + stall_timeout
-    while process.is_alive():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            process.terminate()
-            process.join()
-            child_store.record_exit_reason(
-                f"sub-TL controller stalled for {stall_timeout:.3f}s while waiting"
-            )
-            return
-        process.join(timeout=min(poll_interval, remaining))
-        if not process.is_alive():
-            return
-        updated_activity = _waiting_child_activity(child_store)
-        if updated_activity != activity:
-            activity = updated_activity
-            deadline = time.monotonic() + stall_timeout
-
-
-def _waiting_child_activity(child_store: RunStore) -> tuple[object, ...]:
-    """Return durable liveness markers without making the checkpoint authoritative."""
-    state = None
-    try:
-        state = child_store.load()
-    except (OSError, ValueError):
-        pass
-    checkpoint_mtime: int | None = None
-    path = getattr(child_store, "path", None)
-    if path is not None:
-        try:
-            checkpoint_mtime = path.stat().st_mtime_ns
-        except OSError:
-            pass
-    goals = getattr(state, "goals", None)
-    return (
-        checkpoint_mtime,
-        getattr(goals, "last_heartbeat_at", None),
-        getattr(goals, "last_progress_at", None),
-        getattr(getattr(state, "fsm", None), "phase", None),
-    )
 
 
 def _run_live_sub_tl(

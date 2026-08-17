@@ -74,7 +74,7 @@ async fn reconcile_once_with_event_log(
     }
     reconcile_issue_worktrees(project_dir, git_wt.clone(), event_log).await?;
     let _ = git_wt;
-    reconcile_session_timeouts(
+    observe_session_durations(
         project_dir,
         max_leaf_session_seconds,
         max_reviewer_session_seconds,
@@ -250,7 +250,7 @@ fn append_issue_closed_event(
     Ok(())
 }
 
-async fn reconcile_session_timeouts(
+async fn observe_session_durations(
     project_dir: &Path,
     max_leaf_session_seconds: u64,
     max_reviewer_session_seconds: u64,
@@ -298,7 +298,7 @@ async fn reconcile_session_timeouts(
                 warn!(
                     agent = %slug,
                     %error,
-                    "Skipping timeout because invocation metadata is malformed"
+                    "Skipping session-duration observation because invocation metadata is malformed"
                 );
                 continue;
             }
@@ -309,7 +309,7 @@ async fn reconcile_session_timeouts(
                 warn!(
                     agent = %slug,
                     %error,
-                    "Skipping session timeout because no routing target was recorded"
+                    "Skipping session-duration observation because no routing target was recorded"
                 );
                 continue;
             }
@@ -329,7 +329,7 @@ async fn reconcile_session_timeouts(
                 info!(
                     agent = %slug,
                     invocation_id = %invocation.invocation_id,
-                    "Skipping timeout for a dormant invocation-owned worktree"
+                    "Skipping session-duration observation for a dormant invocation-owned worktree"
                 );
                 continue;
             }
@@ -337,7 +337,7 @@ async fn reconcile_session_timeouts(
         if !routing.has_delivery_target() {
             warn!(
                 agent = %slug,
-                "Skipping session timeout because routing has no delivery target"
+                "Skipping session-duration observation because routing has no delivery target"
             );
             continue;
         }
@@ -359,7 +359,7 @@ async fn reconcile_session_timeouts(
         };
 
         let age_secs = session_age_secs(now_secs, spawned_at, last_activity_at);
-        if !timeout_due(age_secs, limit) {
+        if !duration_threshold_reached(age_secs, limit) {
             continue;
         }
 
@@ -367,105 +367,49 @@ async fn reconcile_session_timeouts(
             .await
             .ok()
             .map(|s| s.trim().to_string());
-
-        let limit_mins = limit / 60;
-        let Some(session) = tmux_session else {
+        let liveness = match tmux_session {
+            Some(session) => {
+                verify_routing_liveness(&routing, invocation.as_ref(), &slug, session).await
+            }
+            None => RoutingLiveness::Unverifiable(
+                "tmux routing cannot be verified without a session".to_string(),
+            ),
+        };
+        if liveness == RoutingLiveness::Dead {
+            match finish_invocation_and_tombstone(
+                &agent_dir,
+                &routing,
+                InvocationStatus::Exited,
+                None,
+            )
+            .await
+            {
+                Ok(InvocationFinishResult::IgnoredStale) => {
+                    warn!(agent = %slug, "Preserved newer invocation after verified exit")
+                }
+                Ok(InvocationFinishResult::Finished(_)) | Ok(InvocationFinishResult::Missing) => {}
+                Err(error) => warn!(
+                    agent = %slug,
+                    %error,
+                    "Failed to finish verified-dead invocation; preserving routing"
+                ),
+            }
+            info!(
+                agent = %slug,
+                age_secs,
+                limit_secs = limit,
+                issue = ?active_issue,
+                "Cleaned registry for a verified-dead invocation"
+            );
+        } else {
             warn!(
                 agent = %slug,
                 age_secs,
                 limit_secs = limit,
-                "Skipping session timeout because tmux routing cannot be verified without a session"
+                issue = ?active_issue,
+                liveness = ?liveness,
+                "Session duration threshold exceeded; retaining live invocation"
             );
-            continue;
-        };
-
-        let expected_routing = routing;
-        match verify_routing_liveness(&expected_routing, invocation.as_ref(), &slug, session).await
-        {
-            RoutingLiveness::Live => {
-                info!(
-                    agent = %slug,
-                    age_secs,
-                    limit_secs = limit,
-                    issue = ?active_issue,
-                    "Session timeout: killing verified live agent"
-                );
-                let was_alive =
-                    kill_agent_window(session, &agent_dir, &slug, &expected_routing).await;
-                match finish_invocation_and_tombstone(
-                    &agent_dir,
-                    &expected_routing,
-                    InvocationStatus::TimedOut,
-                    None,
-                )
-                .await
-                {
-                    Ok(InvocationFinishResult::IgnoredStale) => {
-                        warn!(agent = %slug, "Preserved newer invocation after stale timeout")
-                    }
-                    Ok(InvocationFinishResult::Finished(_))
-                    | Ok(InvocationFinishResult::Missing) => {}
-                    Err(error) => warn!(
-                        agent = %slug,
-                        %error,
-                        "Failed to finish timed-out invocation; preserving routing"
-                    ),
-                }
-                notify_tl_about_agent(
-                    project_dir,
-                    session,
-                    &slug,
-                    &active_issue,
-                    limit_mins,
-                    was_alive,
-                )
-                .await;
-            }
-            RoutingLiveness::Dead => {
-                match finish_invocation_and_tombstone(
-                    &agent_dir,
-                    &expected_routing,
-                    InvocationStatus::Exited,
-                    None,
-                )
-                .await
-                {
-                    Ok(InvocationFinishResult::IgnoredStale) => {
-                        warn!(agent = %slug, "Preserved newer invocation after stale exit")
-                    }
-                    Ok(InvocationFinishResult::Finished(_))
-                    | Ok(InvocationFinishResult::Missing) => {}
-                    Err(error) => warn!(
-                        agent = %slug,
-                        %error,
-                        "Failed to finish dead invocation; preserving routing"
-                    ),
-                }
-                info!(
-                    agent = %slug,
-                    age_secs,
-                    limit_secs = limit,
-                    "Cleaned stale registry for an already-dead agent"
-                );
-                notify_tl_about_agent(
-                    project_dir,
-                    session,
-                    &slug,
-                    &active_issue,
-                    limit_mins,
-                    false,
-                )
-                .await;
-            }
-            RoutingLiveness::Unverifiable(reason) => {
-                warn!(
-                    agent = %slug,
-                    age_secs,
-                    limit_secs = limit,
-                    reason,
-                    "Skipping session timeout because agent liveness is unverifiable"
-                );
-            }
         }
     }
     Ok(())
@@ -483,7 +427,7 @@ fn session_age_secs(now_secs: u64, spawned_at: u64, last_activity_at: Option<u64
     now_secs.saturating_sub(activity_at)
 }
 
-fn timeout_due(age_secs: u64, limit_secs: u64) -> bool {
+fn duration_threshold_reached(age_secs: u64, limit_secs: u64) -> bool {
     age_secs > limit_secs
 }
 
@@ -662,7 +606,7 @@ async fn kill_agent_window(
         let status = tmux.kill_window(window_id).await;
         match status {
             Ok(()) => {
-                info!(agent = %slug, target = %target, "Killed timed-out agent window");
+                info!(agent = %slug, target = %target, "Cleaned exited agent window");
                 true
             }
             Err(e) => {
@@ -675,7 +619,7 @@ async fn kill_agent_window(
         let status = tmux.kill_pane(pane_id).await;
         match status {
             Ok(()) => {
-                info!(agent = %slug, target = %target, "Killed timed-out agent pane");
+                info!(agent = %slug, target = %target, "Cleaned exited agent pane");
                 true
             }
             Err(e) => {
@@ -688,104 +632,17 @@ async fn kill_agent_window(
     }
 }
 
-async fn notify_tl_about_agent(
-    project_dir: &Path,
-    session: &str,
-    slug: &str,
-    active_issue: &Option<String>,
-    limit_mins: u64,
-    was_alive: bool,
-) {
-    let root_dir = project_dir.join(".exo/agents/root");
-    let Ok(routing) = crate::domain::RoutingInfo::read_from_dir(&root_dir).await else {
-        return;
-    };
-    let Some(window_id) = &routing.window_id else {
-        return;
-    };
-
-    let message = timeout_notification_message(slug, active_issue, limit_mins, was_alive);
-
-    let target = format!("{}:{}", session, window_id.as_str());
-    let tmp = std::env::temp_dir().join(format!("exomonad-timeout-{}.txt", slug));
-    if tokio::fs::write(&tmp, &message).await.is_ok() {
-        let _ = Command::new("tmux")
-            .args(["load-buffer", tmp.to_string_lossy().as_ref()])
-            .status()
-            .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let _ = Command::new("tmux")
-            .args(["paste-buffer", "-t", &target])
-            .status()
-            .await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &target, "", "Enter"])
-            .status()
-            .await;
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-}
-
-fn timeout_notification_message(
-    slug: &str,
-    active_issue: &Option<String>,
-    limit_mins: u64,
-    was_alive: bool,
-) -> String {
-    let issue_hint = timeout_issue_hint(active_issue, was_alive);
-    if was_alive {
-        format!("[TIMED OUT: {slug}] Exceeded {limit_mins}min session limit — killed.{issue_hint}")
-    } else {
-        format!(
-            "[STALE REGISTRY: {slug}] Agent window was already gone — registry entry cleaned up.{issue_hint}"
-        )
-    }
-}
-
-fn timeout_issue_hint(active_issue: &Option<String>, was_alive: bool) -> String {
-    match (active_issue, was_alive) {
-        (Some(id), true) => {
-            format!(" Issue #{id} — call chainlink_timer_stop {id} then re-spec or escalate.")
-        }
-        (Some(id), false) => {
-            format!(
-                " Issue #{id} — verify status with chainlink show {id} and re-spec or close if done."
-            )
-        }
-        (None, _) => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn timeout_message_reports_live_kill() {
-        let message = timeout_notification_message("agent-a", &Some("372".to_string()), 15, true);
-
-        assert!(message.contains("[TIMED OUT: agent-a]"));
-        assert!(message.contains("Exceeded 15min session limit"));
-        assert!(message.contains("chainlink_timer_stop 372"));
-    }
-
-    #[test]
-    fn timeout_message_reports_stale_registry() {
-        let message = timeout_notification_message("agent-b", &Some("372".to_string()), 15, false);
-
-        assert!(message.contains("[STALE REGISTRY: agent-b]"));
-        assert!(message.contains("registry entry cleaned up"));
-        assert!(message.contains("chainlink show 372"));
-    }
 
     #[test]
     fn recent_activity_prevents_timeout_from_old_spawn_age() {
         let age = session_age_secs(10_000, 1_000, Some(9_950));
 
         assert_eq!(age, 50);
-        assert!(!timeout_due(age, 60));
-        assert!(timeout_due(
+        assert!(!duration_threshold_reached(age, 60));
+        assert!(duration_threshold_reached(
             session_age_secs(10_000, 1_000, Some(9_900)),
             60
         ));

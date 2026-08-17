@@ -146,7 +146,7 @@ def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path)
     assert RunStore("beta", root).load().ledger_run_id == "swarm-uuid"
 
 
-def test_live_waiting_child_is_not_terminated_after_supervision_window() -> None:
+def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
     class FakeProcess:
         def __init__(self) -> None:
             self.alive = True
@@ -177,18 +177,16 @@ def test_live_waiting_child_is_not_terminated_after_supervision_window() -> None
         TLLoopConfig(
             keep_alive_on_waiting=True,
             idle_timeout=0.1,
-            controller_stall_timeout=0.05,
+            poll_interval=0.001,
         ),
-        0.01,
     )
 
     assert state is not None
-    assert process.joins[0] == 0.01
-    assert process.joins[1] == pytest.approx(0.05, abs=0.001)
+    assert process.joins == [0.05, 0.05]
     assert not process.terminated
 
 
-def test_live_waiting_child_is_terminated_after_stall_deadline() -> None:
+def test_live_waiting_child_is_terminated_on_explicit_cancellation() -> None:
     class FakeProcess:
         def __init__(self) -> None:
             self.alive = True
@@ -206,6 +204,8 @@ def test_live_waiting_child_is_terminated_after_stall_deadline() -> None:
 
     process = FakeProcess()
     reasons: list[str] = []
+    cancel_event = threading.Event()
+    cancel_event.set()
     child_store = SimpleNamespace(
         load=lambda: SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting)),
         record_exit_reason=reasons.append,
@@ -216,15 +216,13 @@ def test_live_waiting_child_is_terminated_after_stall_deadline() -> None:
         child_store,
         TLLoopConfig(
             keep_alive_on_waiting=True,
-            poll_interval=0.001,
-            controller_stall_timeout=0.01,
+            cancel_event=cancel_event,
         ),
-        0.001,
     )
 
     assert state is not None
     assert process.terminated
-    assert reasons == ["sub-TL controller stalled for 0.010s while waiting"]
+    assert reasons == ["sub-TL controller cancelled explicitly"]
 
 
 @dataclass

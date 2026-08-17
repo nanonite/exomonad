@@ -42,10 +42,12 @@ pub struct ReviewPolicy {
     /// CI merge gate behavior.
     pub ci: CiPolicy,
 
-    /// Maximum active session duration for leaf/worker agents in seconds. 0 = disabled.
+    /// Observational threshold for leaf/worker session age in seconds. 0 = disabled.
+    /// Exceeding it never terminates an owned invocation.
     pub max_leaf_session_seconds: u64,
 
-    /// Maximum active session duration for reviewer agents in seconds. 0 = disabled.
+    /// Observational threshold for reviewer session age in seconds. 0 = disabled.
+    /// Exceeding it never terminates an owned invocation.
     pub max_reviewer_session_seconds: u64,
 }
 
