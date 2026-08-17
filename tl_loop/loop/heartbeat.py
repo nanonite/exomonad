@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -21,6 +22,7 @@ from tl_loop.state.store import RunStore
 
 JsonMapping: TypeAlias = Mapping[str, object]
 LiveEffects: TypeAlias = EffectClient | ReadOnlyEffectClient
+LOGGER = logging.getLogger(__name__)
 
 
 class HeartbeatError(RuntimeError):
@@ -192,6 +194,12 @@ def heartbeat_once(
         last_progress_at=progress_at,
     )
     current = store.set_goals(updated_goals)
+    LOGGER.info(
+        "[TL loop] waiting observation active_slices=%d progress=%s elapsed_since_progress=%.3fs",
+        len(_active_slices(current)),
+        progress,
+        max(0.0, current_time - progress_at) if progress_at is not None else 0.0,
+    )
     return HeartbeatResult(
         True,
         progress,

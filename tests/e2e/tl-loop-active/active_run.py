@@ -7,6 +7,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -67,7 +68,9 @@ class ActiveEffectTransport:
     ) -> JsonObject:
         """Record and execute one active effect without an interactive agent."""
         del role, name
-        self.calls.append({"tool": tool_name, "arguments": json.loads(json.dumps(arguments))})
+        self.calls.append(
+            {"tool": tool_name, "arguments": json.loads(json.dumps(arguments))}
+        )
         if tool_name == "emit_controller_event":
             return self._emit_controller_event(arguments)
         if tool_name == "spawn_leaf":
@@ -91,7 +94,9 @@ class ActiveEffectTransport:
             "tl.spawn_request_accepted",
         }:
             if payload.get("harness") != "codex/gpt-luna":
-                raise AssertionError(f"dispatch telemetry lost harness identity: {event}")
+                raise AssertionError(
+                    f"dispatch telemetry lost harness identity: {event}"
+                )
             if payload.get("agent_type") != "codex":
                 raise AssertionError(f"dispatch telemetry lost agent type: {event}")
             if payload.get("model") != "gpt-luna":
@@ -102,7 +107,9 @@ class ActiveEffectTransport:
                     raise AssertionError(f"dispatch telemetry changed {key}: {event}")
         return {
             "success": True,
-            "result": {"event_id": f"active-controller-event-{len(self.controller_events)}"},
+            "result": {
+                "event_id": f"active-controller-event-{len(self.controller_events)}"
+            },
         }
 
     def file_upward_pr(self) -> dict[str, object]:
@@ -173,7 +180,10 @@ class ActiveEffectTransport:
 
     def _correlate_spawn_event(self, name: str, intent_id: str) -> None:
         segment = self.ledger_segments / "segment-0001.jsonl"
-        rows = [json.loads(line) for line in segment.read_text(encoding="utf-8").splitlines()]
+        rows = [
+            json.loads(line)
+            for line in segment.read_text(encoding="utf-8").splitlines()
+        ]
         for row in rows:
             if row.get("type") != "agent.spawned" or row.get("agent_id") != name:
                 continue
@@ -229,7 +239,7 @@ def run_active_wave(repo: Path, remote: Path, artifacts: Path) -> None:
     _write_ledger(segments)
     transport = ActiveEffectTransport(repo, remote, segments)
     reader = LedgerReader(segments, run_id=RUN_ID, state_root=state_root)
-    source = LazyLedgerQueue(reader)
+    source = LazyLedgerQueue(reader, first_event_delay=0.05)
     plan = WorkPlan.from_mapping(
         {
             "leaves": [
@@ -269,7 +279,8 @@ def run_active_wave(repo: Path, remote: Path, artifacts: Path) -> None:
         max_leaves=2,
         max_events=16,
         poll_interval=0.01,
-        idle_timeout=5.0,
+        idle_timeout=0.01,
+        dispatch_timeout=0.01,
         policy=policy,
         capabilities=CapabilityMap({"codex/gpt-luna": Difficulty.STANDARD}),
         source=source,
@@ -305,7 +316,9 @@ def run_active_wave(repo: Path, remote: Path, artifacts: Path) -> None:
             "sequence_status": reader.read_from(0).sequence_status.value,
             "event_count": len(reader.read_from(0).events),
             "last_consumed_offset": state.events.last_consumed_offset,
-            "charges_reconciled": all(charge.reconciled for charge in state.budgets.charges),
+            "charges_reconciled": all(
+                charge.reconciled for charge in state.budgets.charges
+            ),
             "reserved_tokens": dict(state.budgets.role_reserved),
             "spent_tokens": dict(state.budgets.role_spent),
         },
@@ -316,7 +329,9 @@ def run_active_wave(repo: Path, remote: Path, artifacts: Path) -> None:
         "worktrees_after_merge": _worktrees(repo),
     }
     artifacts.parent.mkdir(parents=True, exist_ok=True)
-    artifacts.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    artifacts.write_text(
+        json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(json.dumps(artifact, indent=2, sort_keys=True))
 
 
@@ -343,8 +358,23 @@ def _assert_result(
     repo: Path,
 ) -> None:
     state = RunStore(RUN_ID, state_root).load()
-    if result.final_state.fsm.phase is not TLPhase.TLDone or state.fsm.phase is not TLPhase.TLDone:
+    if (
+        result.final_state.fsm.phase is not TLPhase.TLDone
+        or state.fsm.phase is not TLPhase.TLDone
+    ):
         raise AssertionError(f"active loop did not finish at TLDone: {state.fsm.phase}")
+    if state.gates:
+        raise AssertionError(
+            f"observational delay opened lifecycle gates: {state.gates}"
+        )
+    if state.goals.controller_started_at is None:
+        raise AssertionError("controller start telemetry was not persisted")
+    if state.goals.last_authoritative_event_seq != 9:
+        raise AssertionError(
+            "last authoritative event telemetry did not reach the final ledger sequence"
+        )
+    if time.time() - state.goals.controller_started_at < 0.04:
+        raise AssertionError("active E2E did not cross its former lifecycle deadline")
     effect_tools = [
         cast(str, call["tool"])
         for call in transport.calls
@@ -370,7 +400,9 @@ def _assert_result(
         "tl.spawn_request_accepted",
         "tl.dispatch_confirmed",
     }.issubset(dispatch_events):
-        raise AssertionError(f"dispatch telemetry was incomplete: {transport.controller_events}")
+        raise AssertionError(
+            f"dispatch telemetry was incomplete: {transport.controller_events}"
+        )
     if transport.adjudications != 2 or len(transport.prs) != 2:
         raise AssertionError("both PRs must receive one deterministic approval")
     if not all(pr.merged for pr in transport.prs.values()):
@@ -381,17 +413,23 @@ def _assert_result(
             raise AssertionError(f"merged source file missing: {source_path}")
     read_result = reader.read_from(0)
     if read_result.sequence_status is not SequenceStatus.COMPLETE:
-        raise AssertionError(f"ledger sequence is not gap-free: {read_result.sequence_status}")
+        raise AssertionError(
+            f"ledger sequence is not gap-free: {read_result.sequence_status}"
+        )
     if read_result.findings:
         raise AssertionError(f"ledger reader findings: {read_result.findings}")
     if [event.run_seq for event in read_result.events] != list(range(1, 10)):
         raise AssertionError("active ledger did not contain the expected nine events")
     if state.events.last_consumed_offset != 9:
-        raise AssertionError(f"unexpected consumed ledger offset: {state.events.last_consumed_offset}")
+        raise AssertionError(
+            f"unexpected consumed ledger offset: {state.events.last_consumed_offset}"
+        )
     if len(state.budgets.charges) != 2 or not all(
         charge.reconciled for charge in state.budgets.charges
     ):
-        raise AssertionError(f"budget charges were not reconciled: {state.budgets.charges}")
+        raise AssertionError(
+            f"budget charges were not reconciled: {state.budgets.charges}"
+        )
     if state.budgets.role_reserved or state.budgets.harness_reserved:
         raise AssertionError("budget reservations remain after reconciliation")
     if state.budgets.role_spent != {"worker": 1200}:
@@ -419,7 +457,11 @@ def _write_ledger(segments: Path) -> None:
                 seq,
                 "agent.spawned",
                 name,
-                {"child_agent": name, "agent_type": "codex/gpt-luna", "branch": f"main.{name}"},
+                {
+                    "child_agent": name,
+                    "agent_type": "codex/gpt-luna",
+                    "branch": f"main.{name}",
+                },
             )
         )
     rows.extend(
@@ -494,7 +536,8 @@ def _write_ledger(segments: Path) -> None:
         raise AssertionError("active ledger fixture has a sequence gap")
     segment = segments / "segment-0001.jsonl"
     segment.write_text(
-        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
     )
 
 
@@ -525,11 +568,16 @@ class LazyLedgerQueue:
     """Start the ledger tailer after ``run_tl_loop`` publishes its checkpoint."""
 
     reader: LedgerReader
+    first_event_delay: float = 0.0
     queue: LedgerQueue | None = None
+    delayed: bool = False
 
     def get(self, timeout: float | None = None) -> Any:
         if self.queue is None:
             self.queue = LedgerQueue(self.reader, poll_interval=0.01).start()
+        if not self.delayed and self.first_event_delay:
+            time.sleep(self.first_event_delay)
+            self.delayed = True
         return self.queue.get(timeout)
 
     def acknowledge(self, event: Any) -> int:
@@ -550,7 +598,11 @@ def _assert_disjoint_boundaries(plan: WorkPlan) -> None:
 
 def _worktrees(repo: Path) -> list[str]:
     output = _git(repo, "worktree", "list", "--porcelain")
-    return [line.removeprefix("worktree ") for line in output.splitlines() if line.startswith("worktree ")]
+    return [
+        line.removeprefix("worktree ")
+        for line in output.splitlines()
+        if line.startswith("worktree ")
+    ]
 
 
 def _current_branch(repo: Path) -> str:
@@ -574,8 +626,12 @@ def _git(cwd: Path, *arguments: str, check: bool = True) -> str:
     return _run(["git", *arguments], cwd, check=check).stdout.strip()
 
 
-def _run(command: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(command, cwd=cwd, check=False, text=True, capture_output=True)
+def _run(
+    command: list[str], cwd: Path, check: bool = True
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        command, cwd=cwd, check=False, text=True, capture_output=True
+    )
     if check and completed.returncode != 0:
         raise RuntimeError(
             f"command failed ({completed.returncode}): {' '.join(command)}\n"
@@ -604,7 +660,11 @@ def main() -> None:
     parser.add_argument("--remote", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     arguments = parser.parse_args()
-    run_active_wave(arguments.repo.resolve(), arguments.remote.resolve(), arguments.artifacts.resolve())
+    run_active_wave(
+        arguments.repo.resolve(),
+        arguments.remote.resolve(),
+        arguments.artifacts.resolve(),
+    )
 
 
 if __name__ == "__main__":

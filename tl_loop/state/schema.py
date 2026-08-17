@@ -238,6 +238,8 @@ GOAL_KEYS = frozenset(
         "completion_predicate",
         "last_heartbeat_at",
         "last_progress_at",
+        "controller_started_at",
+        "last_authoritative_event_seq",
     }
 )
 
@@ -342,6 +344,8 @@ class GoalState:
     completion_predicate: str = ""
     last_heartbeat_at: float | None = None
     last_progress_at: float | None = None
+    controller_started_at: float | None = None
+    last_authoritative_event_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -598,7 +602,9 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
                 _non_negative_int(candidate, "merge_attempts", path, errors)
                 _non_negative_int(candidate, "base_revalidation_count", path, errors)
                 if candidate.get("stage_verification") not in INTEGRATION_VERIFICATION_VALUES:
-                    errors.append((f"{path}.stage_verification", "is not a recognised verification result"))
+                    errors.append(
+                        (f"{path}.stage_verification", "is not a recognised verification result")
+                    )
                 _validate_integration_evidence_contract(candidate, path, errors)
 
 
@@ -923,9 +929,15 @@ def _goals(value: object, errors: list[tuple[str, str]]) -> None:
     _goal_text(goals, "objective", "run.goals", errors)
     _non_negative_number(goals, "deadline", "run.goals", errors)
     _goal_text(goals, "completion_predicate", "run.goals", errors)
-    for key in ("last_heartbeat_at", "last_progress_at"):
+    for key in (
+        "last_heartbeat_at",
+        "last_progress_at",
+        "controller_started_at",
+    ):
         if goals.get(key) is not None:
             _non_negative_number(goals, key, "run.goals", errors)
+    if goals.get("last_authoritative_event_seq") is not None:
+        _non_negative_int(goals, "last_authoritative_event_seq", "run.goals", errors)
 
 
 def _goal_text(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -75,6 +76,7 @@ class SliceReadModel:
     dispatch_error: str | None
     dispatch_agent_id: str | None
     dispatch_authoritative_event_seq: int | None
+    task_started_at: float | None
 
     def to_document(self) -> dict[str, object]:
         """Return the body-free JSON representation."""
@@ -103,6 +105,7 @@ class SliceReadModel:
             "dispatch_error": self.dispatch_error,
             "dispatch_agent_id": self.dispatch_agent_id,
             "dispatch_authoritative_event_seq": self.dispatch_authoritative_event_seq,
+            "task_started_at": self.task_started_at,
         }
 
 
@@ -321,6 +324,10 @@ class ReadModel:
     gates: tuple[GateReadModel, ...]
     park_causes: Mapping[str, str]
     recent_transitions: tuple[TransitionReadModel, ...]
+    controller_started_at: float | None = None
+    elapsed_seconds: float | None = None
+    last_authoritative_event_seq: int | None = None
+    last_observed_progress_at: float | None = None
     schema_version: int = 2
     current_order: int = 1
     ordered_stages: tuple[OrderedStageReadModel, ...] = ()
@@ -359,6 +366,10 @@ class ReadModel:
             "recent_transitions": [
                 transition.to_document() for transition in self.recent_transitions
             ],
+            "controller_started_at": self.controller_started_at,
+            "elapsed_seconds": self.elapsed_seconds,
+            "last_authoritative_event_seq": self.last_authoritative_event_seq,
+            "last_observed_progress_at": self.last_observed_progress_at,
             "current_order": self.current_order,
             "ordered_stages": [stage.to_document() for stage in self.ordered_stages],
             "integration": self.integration.to_document(),
@@ -416,6 +427,10 @@ def project_read_model(
         gates=tuple(GateReadModel(gate.name, gate.status.value) for gate in state.gates),
         park_causes=MappingProxyType(park_causes),
         recent_transitions=recent,
+        controller_started_at=state.goals.controller_started_at,
+        elapsed_seconds=_elapsed_seconds(state.goals.controller_started_at),
+        last_authoritative_event_seq=state.goals.last_authoritative_event_seq,
+        last_observed_progress_at=state.goals.last_progress_at,
         current_order=state.current_order,
         ordered_stages=ordered_stages,
         integration=integration,
@@ -452,7 +467,11 @@ def _ordered_stage_models(
             if slice_model is None:
                 continue
             candidate = integration.candidates.get(slice_id)
-            lifecycle = candidate.lifecycle if candidate is not None else integration.sub_tl_states.get(slice_id)
+            lifecycle = (
+                candidate.lifecycle
+                if candidate is not None
+                else integration.sub_tl_states.get(slice_id)
+            )
             lifecycle_value = (
                 lifecycle.value if lifecycle is not None else _lifecycle_for_slice(slice_model)
             )
@@ -717,7 +736,14 @@ def _slice_model(state: SliceState, events: Mapping[str, EventEnvelope]) -> Slic
         dispatch_error=state.dispatch_error,
         dispatch_agent_id=state.dispatch_agent_id,
         dispatch_authoritative_event_seq=state.dispatch_authoritative_event_seq,
+        task_started_at=state.dispatch_started_at,
     )
+
+
+def _elapsed_seconds(started_at: float | None) -> float | None:
+    if started_at is None:
+        return None
+    return max(0.0, time.time() - started_at)
 
 
 def _head_model(state: SliceState, head_sha: str, event: EventEnvelope | None) -> HeadEvidence:

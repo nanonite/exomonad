@@ -24,6 +24,7 @@ from tl_loop.fsm.event import PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning
 from tl_loop.loop.driver import (
     DepthLimitExceeded,
+    EventDiagnostics,
     LoopCancelled,
     LoopLimitExceeded,
     SubTLTask,
@@ -79,6 +80,24 @@ class SyntheticQueue:
         assert event.run_seq is not None
         self.acknowledged.append(event.run_seq)
         return event.run_seq
+
+
+def test_event_diagnostics_exposes_non_terminal_timing() -> None:
+    started_at = time.time() - 2.0
+    diagnostics = EventDiagnostics(
+        controller_started_at=started_at,
+        task_started_at={"leaf-a": started_at + 0.1},
+        last_authoritative_event_seq=7,
+        last_observed_progress_at=started_at + 1.0,
+    )
+
+    snapshot = diagnostics.snapshot()
+
+    assert snapshot["controller_started_at"] == started_at
+    assert cast(float, snapshot["elapsed_seconds"]) >= 2.0
+    assert snapshot["task_started_at"] == {"leaf-a": started_at + 0.1}
+    assert snapshot["last_authoritative_event_seq"] == 7
+    assert snapshot["last_observed_progress_at"] == started_at + 1.0
 
 
 @dataclass

@@ -1,4 +1,13 @@
 {
+  "goals": {
+    "completion_predicate": "",
+    "controller_started_at": "<timestamp>",
+    "deadline": 0.0,
+    "last_authoritative_event_seq": 8,
+    "last_heartbeat_at": null,
+    "last_progress_at": "<timestamp>",
+    "objective": ""
+  },
   "budgets": {
     "ledger": {
       "charges": [
@@ -43,7 +52,7 @@
     "waiting": []
   },
   "gates": [],
-  "revision": 12,
+  "revision": 21,
   "run_id": "<run-id>",
   "slices": {
     "leaf-a": {

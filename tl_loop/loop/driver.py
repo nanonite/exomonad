@@ -270,12 +270,16 @@ class LoopDeadline:
 class EventDiagnostics:
     """Counters explaining what the controller did with projected events."""
 
+    controller_started_at: float = field(default_factory=time.time)
+    task_started_at: dict[str, float] = field(default_factory=dict)
     received: int = 0
     acknowledged: int = 0
     filtered: int = 0
     correlated: int = 0
     rejected: int = 0
     last_event_seq: int | None = None
+    last_authoritative_event_seq: int | None = None
+    last_observed_progress_at: float | None = None
     reader_finding_keys: set[tuple[str, str, str, int]] = field(default_factory=set)
     reader_findings: list[str] = field(default_factory=list)
 
@@ -297,12 +301,17 @@ class EventDiagnostics:
 
     def snapshot(self) -> Mapping[str, object]:
         return {
+            "controller_started_at": self.controller_started_at,
+            "elapsed_seconds": max(0.0, time.time() - self.controller_started_at),
+            "task_started_at": dict(self.task_started_at),
             "received": self.received,
             "acknowledged": self.acknowledged,
             "filtered": self.filtered,
             "correlated": self.correlated,
             "rejected": self.rejected,
             "last_event_seq": self.last_event_seq,
+            "last_authoritative_event_seq": self.last_authoritative_event_seq,
+            "last_observed_progress_at": self.last_observed_progress_at,
             "reader_findings": list(self.reader_findings),
         }
 
@@ -704,7 +713,17 @@ def _run_loop(
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
-    diagnostics = EventDiagnostics()
+    diagnostics = EventDiagnostics(
+        task_started_at={
+            slice_id: slice_state.dispatch_started_at
+            for slice_id, slice_state in state.slices.items()
+            if slice_state.dispatch_started_at is not None
+        }
+    )
+    if state.goals.controller_started_at is None:
+        state = store.set_goals(
+            replace(state.goals, controller_started_at=diagnostics.controller_started_at)
+        )
     if not expected and not plan.sub_tls:
         before_phase = phase
         state = store.checkpoint(
@@ -766,7 +785,16 @@ def _run_loop(
                     before_phase = phase
                     state = heartbeat.state
                     heartbeat_events.extend(heartbeat.events)
+                    diagnostics.last_observed_progress_at = state.goals.last_progress_at
                     phase = _phase_from_state(state)
+                    LOGGER.info(
+                        "[TL loop] waiting observation run_id=%s elapsed=%.3fs "
+                        "last_authoritative_event_seq=%s last_progress_at=%s",
+                        run_id,
+                        time.time() - diagnostics.controller_started_at,
+                        state.goals.last_authoritative_event_seq,
+                        state.goals.last_progress_at,
+                    )
                     _emit_phase_change(run_id, before_phase, phase, config, effects, effects_log)
                     if heartbeat.parked_slice_ids and _all_expected_terminal(state, expected):
                         before_phase = phase
@@ -819,6 +847,9 @@ def _run_loop(
             diagnostics.acknowledged += 1
             state = store.load()
             continue
+        state = _note_authoritative_event(store, state, event_seq)
+        diagnostics.last_authoritative_event_seq = event_seq
+        diagnostics.last_observed_progress_at = state.goals.last_progress_at
         if config.heartbeat is not None:
             state = _note_heartbeat_progress(store, state)
         if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW}:
@@ -4646,14 +4677,30 @@ def _note_heartbeat_progress(store: RunStore, state: RunState) -> RunState:
     return store.set_goals(replace(state.goals, last_progress_at=time.time()))
 
 
+def _note_authoritative_event(store: RunStore, state: RunState, event_seq: int) -> RunState:
+    now = time.time()
+    return store.set_goals(
+        replace(
+            state.goals,
+            last_authoritative_event_seq=event_seq,
+            last_progress_at=now,
+        )
+    )
+
+
 def _encode_goals(goals: GoalState) -> dict[str, object]:
-    return {
+    encoded = {
         "objective": goals.objective,
         "deadline": goals.deadline,
         "completion_predicate": goals.completion_predicate,
         "last_heartbeat_at": goals.last_heartbeat_at,
         "last_progress_at": goals.last_progress_at,
     }
+    if goals.controller_started_at is not None:
+        encoded["controller_started_at"] = goals.controller_started_at
+    if goals.last_authoritative_event_seq is not None:
+        encoded["last_authoritative_event_seq"] = goals.last_authoritative_event_seq
+    return encoded
 
 
 def _initial_slice_record(

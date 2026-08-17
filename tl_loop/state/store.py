@@ -851,13 +851,18 @@ def _decode_counter_map(value: object) -> Mapping[str, int]:
 
 
 def _encode_goals(goals: GoalState) -> dict[str, object]:
-    return {
+    encoded = {
         "objective": goals.objective,
         "deadline": goals.deadline,
         "completion_predicate": goals.completion_predicate,
         "last_heartbeat_at": goals.last_heartbeat_at,
         "last_progress_at": goals.last_progress_at,
     }
+    if goals.controller_started_at is not None:
+        encoded["controller_started_at"] = goals.controller_started_at
+    if goals.last_authoritative_event_seq is not None:
+        encoded["last_authoritative_event_seq"] = goals.last_authoritative_event_seq
+    return encoded
 
 
 def _decode_goals(value: dict[str, object]) -> GoalState:
@@ -867,6 +872,11 @@ def _decode_goals(value: dict[str, object]) -> GoalState:
         completion_predicate=cast(str, value.get("completion_predicate", "")),
         last_heartbeat_at=cast(float | None, value.get("last_heartbeat_at")),
         last_progress_at=cast(float | None, value.get("last_progress_at")),
+        controller_started_at=cast(float | None, value.get("controller_started_at")),
+        last_authoritative_event_seq=cast(
+            int | None,
+            value.get("last_authoritative_event_seq"),
+        ),
     )
 
 

@@ -18,6 +18,7 @@ from tl_loop.state.schema import (
     FSMState,
     GateState,
     GateStatus,
+    GoalState,
     IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
@@ -57,6 +58,11 @@ def test_projection_carries_cursor_and_bounded_operator_evidence() -> None:
     assert head.reviewer_attempt == 2
     assert model.park_causes == {"task-a": "review_stuck"}
     assert model.gates == (GateReadModel("review", "pending"),)
+    assert model.controller_started_at == 100.0
+    assert model.elapsed_seconds is not None and model.elapsed_seconds >= 0.0
+    assert model.last_authoritative_event_seq == 112
+    assert model.last_observed_progress_at == 150.0
+    assert model.slices["task-a"].task_started_at == 90.0
     budgets = cast(dict[str, object], document["budgets"])
     assert budgets["tokens"] == 321
 
@@ -189,6 +195,7 @@ def _state() -> RunState:
                 repair_attempts=1,
                 park_cause=ParkCause.REVIEW_STUCK,
                 park_issue_id=404,
+                dispatch_started_at=90.0,
             )
         },
         budgets=BudgetLedger(
@@ -212,4 +219,9 @@ def _state() -> RunState:
         ),
         gates=(GateState("review", GateStatus.PENDING),),
         events=EventCursor(last_consumed_offset=112),
+        goals=GoalState(
+            controller_started_at=100.0,
+            last_authoritative_event_seq=112,
+            last_progress_at=150.0,
+        ),
     )

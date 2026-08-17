@@ -144,6 +144,11 @@ thresholds are observational only; they do not terminate an owned child or
 invocation. Explicit cancellation and verified dead-process cleanup remain
 destructive paths.
 
+The durable goals/read model exposes controller start time, elapsed wall time,
+task dispatch start times, the last authoritative event sequence, and the last
+observed progress time. Heartbeat intervals log bounded waiting observations;
+these fields and logs are telemetry only and never change lifecycle status.
+
 ## Selector budget ledger
 
 The selector estimates a spawn before it is written to run state. The estimator

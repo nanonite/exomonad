@@ -200,6 +200,8 @@ def _normalize_value(key: str, value: object) -> object:
         return "<intent-id>"
     if key == "dispatch_started_at":
         return "<timestamp>"
+    if key in {"controller_started_at", "last_progress_at"} and isinstance(value, (int, float)):
+        return "<timestamp>"
     if key == "run_id":
         return "<run-id>"
     if key.endswith("_at") and isinstance(value, str):
