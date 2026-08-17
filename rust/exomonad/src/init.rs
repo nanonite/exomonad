@@ -1034,6 +1034,71 @@ fn clear_controller_exit_reason(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn archive_root_tl_run(project_dir: &Path) -> Result<Option<PathBuf>> {
+    archive_root_tl_run_at(project_dir, current_time_millis())
+}
+
+fn archive_root_tl_run_at(project_dir: &Path, timestamp_ms: u128) -> Result<Option<PathBuf>> {
+    let root_dir = project_dir.join(".exo/tl-loop/root");
+    if !root_dir.exists() {
+        return Ok(None);
+    }
+    if !root_dir.is_dir() {
+        anyhow::bail!(
+            "cannot recreate TL run: expected {} to be a directory",
+            root_dir.display()
+        );
+    }
+    let parent = root_dir
+        .parent()
+        .context("TL root checkpoint has no parent directory")?;
+    let stem = format!("root.invalid-{timestamp_ms}");
+    let mut suffix = 0u32;
+    loop {
+        let name = if suffix == 0 {
+            stem.clone()
+        } else {
+            format!("{stem}-{suffix}")
+        };
+        let archive = parent.join(name);
+        if archive.exists() {
+            suffix = suffix
+                .checked_add(1)
+                .context("too many TL root checkpoint archive collisions")?;
+            continue;
+        }
+        match std::fs::rename(&root_dir, &archive) {
+            Ok(()) => {
+                info!(
+                    source = %root_dir.display(),
+                    archive = %archive.display(),
+                    "Archived prior TL root checkpoint for --recreate"
+                );
+                return Ok(Some(archive));
+            }
+            Err(error)
+                if archive.exists()
+                    || matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
+                    ) =>
+            {
+                suffix = suffix
+                    .checked_add(1)
+                    .context("too many TL root checkpoint archive collisions")?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to archive prior TL root checkpoint {}",
+                        root_dir.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
 fn record_controller_exit_reason(project_dir: &Path, reason: &str) -> Result<()> {
     let path = controller_exit_path(project_dir);
     if path.exists() {
@@ -1065,17 +1130,19 @@ async fn wait_for_tl_controller_startup(
 
     loop {
         if let Some(reason) = controller_exit_reason(project_dir) {
-            return tl_controller_startup_failure(project_dir, window_id, reason);
+            return tl_controller_startup_failure(ipc, project_dir, window_id, reason).await;
         }
 
         if ipc.routing_target_process_alive(&routing).await? {
             observed_alive = true;
         } else if observed_alive {
             return tl_controller_startup_failure(
+                ipc,
                 project_dir,
                 window_id,
                 format!("tmux window {window_id} exited before TL startup completed"),
-            );
+            )
+            .await;
         }
 
         if Instant::now() >= deadline {
@@ -1083,25 +1150,57 @@ async fn wait_for_tl_controller_startup(
                 return Ok(());
             }
             return tl_controller_startup_failure(
+                ipc,
                 project_dir,
                 window_id,
                 format!("tmux window {window_id} never became live during TL startup"),
-            );
+            )
+            .await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-fn tl_controller_startup_failure(
+async fn tl_controller_startup_failure(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     project_dir: &Path,
     window_id: &exomonad_core::services::tmux_ipc::WindowId,
     fallback_reason: String,
 ) -> Result<()> {
-    let reason = controller_exit_reason(project_dir).unwrap_or(fallback_reason);
+    let reason = match controller_exit_reason(project_dir) {
+        Some(reason) => reason,
+        None => match ipc.capture_pane(window_id.as_str()).await {
+            Ok(output) => startup_failure_with_pane_output(fallback_reason, &output),
+            Err(error) => {
+                format!("{fallback_reason}; unable to capture controller output: {error}")
+            }
+        },
+    };
     if let Err(error) = record_controller_exit_reason(project_dir, &reason) {
         warn!(%error, "Failed to persist TL controller startup failure");
     }
     anyhow::bail!("TL controller failed during startup in tmux window {window_id}: {reason}");
+}
+
+fn startup_failure_with_pane_output(fallback_reason: String, output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let tail = lines
+        .into_iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    if tail.is_empty() {
+        return format!("{fallback_reason}; controller produced no captured output");
+    }
+    let captured = tail.join(" | ");
+    format!("{fallback_reason}; controller output: {captured}")
 }
 
 /// Run the init command: create or attach to tmux session.
@@ -1531,11 +1630,13 @@ pub async fn run(
             info!(session = %session, "Deleting session (--recreate)");
             TmuxIpc::kill_session(&session).await?;
         }
+
+        archive_root_tl_run(&cwd)?;
+        clear_controller_exit_reason(&cwd)?;
     }
 
     // Create fresh session
     info!(session = %session, "Creating session");
-    clear_controller_exit_reason(&cwd)?;
 
     // 1. Write .mcp.json (for Claude Code discovery)
     let mut mcp_servers = serde_json::Map::new();
@@ -2973,6 +3074,118 @@ mod tests {
 
         clear_controller_exit_reason(dir.path()).unwrap();
         assert!(controller_exit_reason(dir.path()).is_none());
+    }
+
+    #[test]
+    fn recreate_archives_terminal_and_live_root_checkpoints_with_evidence() {
+        for phase in ["tl_done", "tl_failed", "tl_waiting"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join(".exo/tl-loop/root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("run.json"),
+                format!(r#"{{"phase":"{phase}","dispatch_error":"preserve-me"}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("controller-exit.json"),
+                r#"{"reason":"specific controller failure"}"#,
+            )
+            .unwrap();
+            std::fs::write(root.join("gates.json"), "prior gate evidence").unwrap();
+
+            let archive = archive_root_tl_run_at(dir.path(), 123).unwrap().unwrap();
+
+            assert!(!root.exists());
+            assert_eq!(
+                std::fs::read_to_string(archive.join("run.json")).unwrap(),
+                format!(r#"{{"phase":"{phase}","dispatch_error":"preserve-me"}}"#)
+            );
+            assert_eq!(
+                std::fs::read_to_string(archive.join("controller-exit.json")).unwrap(),
+                r#"{"reason":"specific controller failure"}"#
+            );
+            assert_eq!(
+                std::fs::read_to_string(archive.join("gates.json")).unwrap(),
+                "prior gate evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn recreate_missing_root_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(archive_root_tl_run_at(dir.path(), 123).unwrap().is_none());
+        assert!(!dir.path().join(".exo/tl-loop").exists());
+    }
+
+    #[test]
+    fn recreate_archive_collision_preserves_existing_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join(".exo/tl-loop");
+        let root = parent.join("root");
+        let existing = parent.join("root.invalid-123");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("run.json"), "older archive").unwrap();
+        std::fs::write(root.join("run.json"), "current checkpoint").unwrap();
+
+        let archive = archive_root_tl_run_at(dir.path(), 123).unwrap().unwrap();
+
+        assert_eq!(archive, parent.join("root.invalid-123-1"));
+        assert_eq!(
+            std::fs::read_to_string(existing.join("run.json")).unwrap(),
+            "older archive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(archive.join("run.json")).unwrap(),
+            "current checkpoint"
+        );
+    }
+
+    #[test]
+    fn recreate_rejects_non_directory_root_without_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::write(&root, "not a checkpoint directory").unwrap();
+
+        let error = archive_root_tl_run_at(dir.path(), 123).unwrap_err();
+
+        assert!(error.to_string().contains("expected"));
+        assert_eq!(
+            std::fs::read_to_string(root).unwrap(),
+            "not a checkpoint directory"
+        );
+    }
+
+    #[test]
+    fn startup_failure_output_keeps_fallback_and_recent_diagnostics() {
+        let output = (1..=10)
+            .map(|line| format!("controller-line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let reason = startup_failure_with_pane_output("startup fallback".to_owned(), &output);
+
+        assert!(reason.starts_with("startup fallback; controller output:"));
+        assert!(!reason.split(" | ").any(|line| line == "controller-line-1"));
+        assert!(reason.contains("controller-line-3"));
+        assert!(reason.contains("controller-line-10"));
+    }
+
+    #[test]
+    fn recreate_archives_root_before_creating_tl_window() {
+        let source = include_str!("init.rs");
+        let archive = source
+            .find("archive_root_tl_run(&cwd)?")
+            .expect("recreate must archive the prior root checkpoint");
+        let tl_window = source
+            .find("ipc.new_window(\"TL\"")
+            .expect("init must create the TL window");
+
+        assert!(archive < tl_window);
     }
 
     #[test]
