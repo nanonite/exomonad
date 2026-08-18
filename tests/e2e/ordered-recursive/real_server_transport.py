@@ -30,7 +30,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +67,75 @@ from tl_loop.state.store import CorruptCheckpoint, RunStore, create
 
 class HarnessError(RuntimeError):
     """The server-backed acceptance contract was violated."""
+
+
+@dataclass
+class RecoveryTrace:
+    """Bounded, machine-readable evidence for one disposable recovery run."""
+
+    path: Path
+    records: list[dict[str, Any]]
+
+    @classmethod
+    def open(cls, path: Path) -> RecoveryTrace:
+        return cls(path, [])
+
+    def record(
+        self,
+        *,
+        boundary: str,
+        point: str,
+        run_id: str,
+        state_root: Path,
+        repo: Path,
+    ) -> None:
+        state = RunStore(run_id, state_root).load()
+        journal_path = state_root / run_id / "action-journal.json"
+        journal: list[dict[str, object]] = []
+        if journal_path.exists():
+            payload = json.loads(journal_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, list) or any(
+                not isinstance(item, dict) for item in payload
+            ):
+                raise HarnessError(f"invalid recovery action journal: {journal_path}")
+            journal = payload
+        session = f"ordered-server-e2e-{os.getpid()}"
+        panes = subprocess.run(
+            ["tmux", "list-panes", "-t", session, "-F", "#{pane_id}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        record = {
+            "boundary": boundary,
+            "point": point,
+            "run_id": run_id,
+            "phase": state.fsm.phase.value,
+            "cursor": state.events.last_consumed_offset,
+            "slices": {
+                slice_id: slice_state.status.value
+                for slice_id, slice_state in sorted(state.slices.items())
+            },
+            "action_keys": [
+                {
+                    "key": entry.get("key"),
+                    "operation": entry.get("operation"),
+                    "status": entry.get("status"),
+                }
+                for entry in journal
+            ],
+            "window_cardinality": len(panes.stdout.splitlines())
+            if panes.returncode == 0
+            else None,
+            "ledger_events": len(server_ledger_events(repo)),
+        }
+        self.records.append(record)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"records": self.records}, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)
 
 
 class EmptyEventSource:
@@ -1617,6 +1686,65 @@ def seed_dispatch_restart_run(root: Path, repo: Path) -> tuple[str, WorkPlan, in
     )
 
 
+def wait_for_restart_boundary(
+    run_id: str,
+    state_root: Path,
+    boundary: str,
+    *,
+    process: multiprocessing.Process,
+    timeout: float = 10.0,
+) -> Any:
+    """Wait for the persisted crash barrier instead of sleeping blindly."""
+    expected = {
+        "aggregate_review": IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        "base_revalidation": IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+        "merging": IntegrationLifecycle.MERGING,
+    }.get(boundary)
+    deadline = time.monotonic() + timeout
+    store = RunStore(run_id, state_root)
+    while time.monotonic() < deadline:
+        if not process.is_alive():
+            raise HarnessError(f"{boundary} controller exited before its crash barrier")
+        try:
+            state = store.load()
+        except CorruptCheckpoint:
+            time.sleep(0.01)
+            continue
+        if boundary == "dispatch":
+            if any(
+                slice_state.status
+                in {SliceStatus.DISPATCH_UNCONFIRMED, SliceStatus.SPAWNED}
+                for slice_state in state.slices.values()
+            ):
+                return state
+        elif expected is not None and state.integration.candidates and all(
+            candidate.lifecycle is expected
+            for candidate in state.integration.candidates.values()
+        ):
+            return state
+        time.sleep(0.01)
+    raise HarnessError(f"{boundary} controller did not reach its durable crash barrier")
+
+
+def assert_action_journal_converged(path: Path) -> None:
+    """Require one stable action key and a terminal outcome per side effect."""
+    if not path.exists():
+        raise HarnessError(f"recovery action journal missing: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or any(not isinstance(item, Mapping) for item in payload):
+        raise HarnessError(f"invalid recovery action journal: {path}")
+    keys = [item.get("key") for item in payload]
+    if any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
+        raise HarnessError(f"recovery action keys are not unique: {path}")
+    unresolved = [
+        item
+        for item in payload
+        if item.get("status") in {"intended", "unknown"}
+    ]
+    if unresolved:
+        raise HarnessError(f"recovery actions have unresolved outcomes: {unresolved!r}")
+
+
 def _run_restart_case(
     client: TransportClient,
     root: Path,
@@ -1634,6 +1762,7 @@ def _run_restart_case(
             client, root, repo, forgejo_url, boundary=boundary
         )
     state_root = root / "controller-state"
+    trace = RecoveryTrace.open(root / "recovery-trace.json")
     context = multiprocessing.get_context("fork")
     dispatch_marker = root / "dispatch-state-visible"
     dispatch_release = root / "dispatch-release"
@@ -1667,6 +1796,7 @@ def _run_restart_case(
             branch="main",
             worktree=repo,
             working_dir=str(repo / ".exo/worktrees/parent"),
+            ledger_run_id=server_run_id(repo),
         )
         run_tl_loop(run_id, plan, source, effects, config=config, root_dir=state_root)
 
@@ -1683,9 +1813,12 @@ def _run_restart_case(
         if not dispatch_marker.exists():
             stop_multiprocessing_process(first, f"{boundary} restart controller")
             raise HarnessError("dispatch controller did not reach its durable boundary")
-    else:
-        time.sleep(0.5)
-    waiting_state = RunStore(run_id, state_root).load()
+    waiting_state = wait_for_restart_boundary(
+        run_id,
+        state_root,
+        boundary,
+        process=first,
+    )
     expected_lifecycle = {
         "dispatch": IntegrationLifecycle.RUNNING,
         "aggregate_review": IntegrationLifecycle.AGGREGATE_PR_OPEN,
@@ -1725,6 +1858,13 @@ def _run_restart_case(
             f"{boundary} restart did not remain at a recoverable boundary: "
             f"{waiting_state!r}"
         )
+    trace.record(
+        boundary=boundary,
+        point="before_crash",
+        run_id=run_id,
+        state_root=state_root,
+        repo=repo,
+    )
     stop_multiprocessing_process(first, f"{boundary} restart controller")
     if first.exitcode == 0:
         raise HarnessError("restart probe controller exited before the forced restart")
@@ -1746,6 +1886,7 @@ def _run_restart_case(
         branch="main",
         worktree=repo,
         working_dir=str(repo / ".exo/worktrees/parent"),
+        ledger_run_id=server_run_id(repo),
     )
     result = run_tl_loop(
         run_id,
@@ -1755,6 +1896,14 @@ def _run_restart_case(
         config=config,
         root_dir=state_root,
     )
+    trace.record(
+        boundary=boundary,
+        point="after_recovery",
+        run_id=run_id,
+        state_root=state_root,
+        repo=repo,
+    )
+    assert_action_journal_converged(state_root / run_id / "action-journal.json")
     if result.final_state.fsm.phase is not TLPhase.TLDone:
         raise HarnessError(
             f"delayed restart did not converge: emitted={source.emitted!r} "
