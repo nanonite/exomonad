@@ -1672,6 +1672,7 @@ mod tests {
             model: None,
             effort: None,
             ledger_owned: false,
+            slice_id: None,
         };
         let pane_id = tmux_ipc::PaneId::parse("%42").unwrap();
         let agent_dir = service

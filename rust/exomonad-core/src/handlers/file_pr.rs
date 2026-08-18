@@ -17,8 +17,8 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use crate::services::{
-    HasEventLog, HasForgejoClient, HasForgejoReviewerClient, HasGitWorktreeService, HasProjectDir,
-    HasSessionMemory,
+    HasAgentResolver, HasEventLog, HasForgejoClient, HasForgejoReviewerClient,
+    HasGitWorktreeService, HasProjectDir, HasSessionMemory,
 };
 
 const FILE_PR_CAPTURE_TITLE_CHARS: usize = 120;
@@ -34,6 +34,7 @@ pub struct FilePRHandler<C> {
 impl<
         C: HasForgejoClient
             + HasForgejoReviewerClient
+            + HasAgentResolver
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
@@ -50,6 +51,7 @@ impl<
 impl<
         C: HasForgejoClient
             + HasForgejoReviewerClient
+            + HasAgentResolver
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
@@ -75,6 +77,7 @@ impl<
 impl<
         C: HasForgejoClient
             + HasForgejoReviewerClient
+            + HasAgentResolver
             + HasEventLog
             + HasGitWorktreeService
             + HasProjectDir
@@ -89,8 +92,12 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<FilePrResponse> {
         tracing::info!(title = %req.title, "[FilePR] file_pr starting");
-        let slice_id = pr_body_metadata_value(&req.body, "TL-Slice-ID")
-            .or_else(|| pr_body_metadata_value(&req.body, "Slice-ID"));
+        let slice_id = self
+            .ctx
+            .agent_resolver()
+            .get(&ctx.agent_name)
+            .await
+            .and_then(|record| record.slice_id);
         let base_branch = non_empty(req.base_branch).map(|s| {
             BranchName::try_from_str(s.as_str()).expect("validated string input is non-empty")
         });

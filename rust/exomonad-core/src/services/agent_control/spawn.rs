@@ -745,6 +745,7 @@ impl<
                 model: model.clone(),
                 effort: effort.clone(),
                 ledger_owned: false,
+                slice_id: None,
             };
             self.finalize_spawn(&agent_name, routing, Some(identity_record))
                 .await?;
@@ -1162,6 +1163,7 @@ impl<
                 model: model.clone(),
                 effort: effort.clone(),
                 ledger_owned: false,
+                slice_id: Some(options.name.to_string()),
             };
             self.finalize_spawn(&agent_name, routing, Some(identity_record))
                 .await?;
@@ -1492,6 +1494,7 @@ impl<
                 model: model.clone(),
                 effort: effort.clone(),
                 ledger_owned: false,
+                slice_id: Some(options.branch_name.clone()),
             };
             let trigger = if options
                 .role
@@ -1960,6 +1963,7 @@ impl<
                 model: identity_model.clone(),
                 effort: identity_effort.clone(),
                 ledger_owned: false,
+                slice_id: Some(options.branch_name.clone()),
             };
             let trigger = if options.expected_agent_name.is_some() {
                 InvocationTrigger::ResumePr

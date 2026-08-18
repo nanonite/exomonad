@@ -1893,6 +1893,7 @@ mod tests {
                 model: None,
                 effort: None,
                 ledger_owned: false,
+                slice_id: None,
             })
             .await
             .expect("identity registration should succeed");

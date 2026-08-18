@@ -44,6 +44,9 @@ pub struct AgentIdentityRecord {
     /// Whether this branch is owned by the ledger-backed TL loop rather than an interactive agent.
     #[serde(default)]
     pub ledger_owned: bool,
+    /// Stable TL slice supplied by the trusted spawn boundary.
+    #[serde(default)]
+    pub slice_id: Option<String>,
 }
 
 const IDENTITY_FILENAME: &str = "identity.json";
@@ -359,6 +362,7 @@ mod tests {
             model: None,
             effort: None,
             ledger_owned: false,
+            slice_id: None,
         }
     }
 
@@ -377,6 +381,7 @@ mod tests {
             model: None,
             effort: None,
             ledger_owned: false,
+            slice_id: None,
         }
     }
 

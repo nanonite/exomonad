@@ -1,6 +1,6 @@
 use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
-use crate::services::agent_control::AgentType;
+use crate::services::agent_control::{AgentIdentityRecord, AgentType};
 use crate::services::event_log::{
     canonical_review_wakeup_data, canonical_sibling_merged_data, PR_REVIEW_EVENT_TYPE,
 };
@@ -157,6 +157,25 @@ fn validate_publication_owner(
         ));
     }
     Ok(owner.to_string())
+}
+
+fn validate_publication_slice(
+    publication: &PublishedHead,
+    identity: Option<&AgentIdentityRecord>,
+) -> std::result::Result<(), String> {
+    let Some(slice_id) = publication.slice_id.as_deref() else {
+        return Ok(());
+    };
+    let identity = identity.ok_or_else(|| {
+        format!("publication slice '{slice_id}' has no registered owner identity")
+    })?;
+    if identity.slice_id.as_deref() != Some(slice_id) {
+        return Err(format!(
+            "publication slice '{slice_id}' conflicts with registered slice '{}'",
+            identity.slice_id.as_deref().unwrap_or("missing")
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -734,6 +753,40 @@ where
         + HasSessionMemory
         + 'static,
 {
+    async fn validate_publication_provenance(
+        &self,
+        pr: &PrEntry,
+        publication: &PublishedHead,
+    ) -> std::result::Result<String, String> {
+        let owner = validate_publication_owner(pr, publication)?;
+        let owner_name = AgentName::try_from_str(owner.as_str())
+            .map_err(|error| format!("publication owner is invalid: {error}"))?;
+        let identity = self.ctx.agent_resolver().get(&owner_name).await;
+        validate_publication_slice(publication, identity.as_ref())?;
+        if let Some(publication_invocation) = publication.invocation_id.as_deref() {
+            let invocation_dir = self
+                .ctx
+                .project_dir()
+                .join(".exo/agents")
+                .join(owner_name.as_str());
+            let current_invocation =
+                crate::services::agent_control::read_invocation_conservatively(&invocation_dir)
+                    .await
+                    .ok_or_else(|| {
+                        format!(
+                            "publication invocation '{publication_invocation}' has no durable owner record"
+                        )
+                    })?;
+            if current_invocation.invocation_id != publication_invocation {
+                return Err(format!(
+                    "publication invocation '{publication_invocation}' conflicts with current invocation '{}'",
+                    current_invocation.invocation_id
+                ));
+            }
+        }
+        Ok(owner)
+    }
+
     pub fn new(ctx: Arc<C>) -> Self {
         let watcher_state_path = ctx.project_dir().join(".exo/watcher-state.json");
         Self {
@@ -1311,7 +1364,7 @@ where
             }) else {
                 continue;
             };
-            if let Err(reason) = validate_publication_owner(pr, publication) {
+            if let Err(reason) = self.validate_publication_provenance(pr, publication).await {
                 self.log_watcher_event(
                     "watcher.ownership_unresolved",
                     &serde_json::json!({
@@ -1438,7 +1491,7 @@ where
                     );
                     continue;
                 };
-                let owner_id = match validate_publication_owner(pr, publication) {
+                let owner_id = match self.validate_publication_provenance(pr, publication).await {
                     Ok(owner) => owner,
                     Err(reason) => {
                         self.log_watcher_event(
@@ -3344,6 +3397,7 @@ mod tests {
                 model: None,
                 effort: None,
                 ledger_owned: true,
+                slice_id: None,
             })
             .await
             .unwrap();
@@ -5206,6 +5260,7 @@ mod tests {
                 model: None,
                 effort: None,
                 ledger_owned: false,
+                slice_id: None,
             })
             .await
             .unwrap();
