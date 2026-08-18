@@ -4947,8 +4947,11 @@ instance (HsJSONPB.ToJSON RestartReviewResponse) where
 instance (HsJSONPB.FromJSON RestartReviewResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
-newtype WatcherPrStateRequest
-  = WatcherPrStateRequest {watcherPrStateRequestPrNumber :: Hs.Word64}
+data WatcherPrStateRequest
+  = WatcherPrStateRequest
+  { watcherPrStateRequestPrNumber :: Hs.Word64,
+    watcherPrStateRequestSliceId :: Hs.Text
+  }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
 instance (Hs.NFData WatcherPrStateRequest)
@@ -4961,36 +4964,72 @@ instance (HsProtobuf.HasDefault WatcherPrStateRequest)
 instance (HsProtobuf.Message WatcherPrStateRequest) where
   encodeMessage
     _
-    WatcherPrStateRequest {watcherPrStateRequestPrNumber} =
-      ( HsProtobuf.encodeMessageField
-          (HsProtobuf.FieldNumber 1)
-          watcherPrStateRequestPrNumber
-      )
+    WatcherPrStateRequest
+      { watcherPrStateRequestPrNumber,
+        watcherPrStateRequestSliceId
+      } =
+      Hs.mappend
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 1)
+            watcherPrStateRequestPrNumber
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 2)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                watcherPrStateRequestSliceId
+            )
+        )
   decodeMessage _ =
     Hs.pure WatcherPrStateRequest
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
         (HsProtobufAST.Prim HsProtobufAST.UInt64)
         (HsProtobufAST.Single "pr_number")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "slice_id")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB WatcherPrStateRequest) where
-  toJSONPB (WatcherPrStateRequest f1) =
-    HsJSONPB.object ["pr_number" .= f1]
-  toEncodingPB (WatcherPrStateRequest f1) =
-    HsJSONPB.pairs ["pr_number" .= f1]
+  toJSONPB (WatcherPrStateRequest f1 f2) =
+    HsJSONPB.object
+      [ "pr_number" .= f1,
+        "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
+  toEncodingPB (WatcherPrStateRequest f1 f2) =
+    HsJSONPB.pairs
+      [ "pr_number" .= f1,
+        "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
+      ]
 
 instance (HsJSONPB.FromJSONPB WatcherPrStateRequest) where
   parseJSONPB =
     HsJSONPB.withObject
       "WatcherPrStateRequest"
-      (\obj -> Hs.pure WatcherPrStateRequest <*> obj .: "pr_number")
+      ( \obj ->
+          Hs.pure WatcherPrStateRequest
+            <*> obj .: "pr_number"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "slice_id")
+                )
+      )
 
 instance (HsJSONPB.ToJSON WatcherPrStateRequest) where
   toJSON = HsJSONPB.toAesonValue

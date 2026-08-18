@@ -88,13 +88,16 @@ def reconcile_slice(
     else:
         missing.append("runtime_owner")
 
-    if slice_state.pr_number is None:
-        missing.append("pr_number")
-    elif watcher is None or watcher.get("found") is not True:
-        missing.append("published_pr")
-    else:
+    if watcher is not None and watcher.get("found") is True:
+        # Evidence may have been recovered via slice_id lookup even when
+        # slice_state.pr_number was never persisted (e.g. a crash between
+        # pr.filed being acknowledged and identity association).
         evidence.append("published_pr")
         _append_watcher_evidence(slice_state, watcher, evidence, missing, conflicts)
+    elif slice_state.pr_number is None:
+        missing.append("pr_number")
+    else:
+        missing.append("published_pr")
 
     if conflicts:
         action = "open_integrity_gate"

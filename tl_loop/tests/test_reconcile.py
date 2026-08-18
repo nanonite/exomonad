@@ -136,6 +136,42 @@ def test_reconciliation_waits_without_authoritative_evidence() -> None:
     assert result.next_action == "await_authoritative_evidence"
 
 
+def test_reconciliation_recovers_missing_pr_number_from_watcher_evidence() -> None:
+    """A slice whose pr_number was never persisted (crash between pr.filed
+    being acknowledged and identity association) still reconciles when the
+    caller recovered PR identity via a slice_id-scoped watcher lookup."""
+    slice_state = _slice(SliceStatus.SPAWNED)
+    assert slice_state.pr_number is None
+
+    result = reconcile_slice(
+        slice_state,
+        authoritative_owner_id="agent-a",
+        watcher={
+            "found": True,
+            "pr_number": 99,
+            "head_sha": "head-a",
+            "review_state": "approved",
+            "ci_status": "success",
+            "merged": False,
+        },
+    )
+
+    assert "pr_number" not in result.missing_evidence
+    assert "published_pr" in result.authoritative_evidence
+    assert result.next_action == "await_review_event"
+
+
+def test_reconciliation_still_reports_missing_pr_number_without_recovered_evidence() -> None:
+    result = reconcile_slice(
+        _slice(SliceStatus.SPAWNED),
+        authoritative_owner_id="agent-a",
+        watcher=None,
+    )
+
+    assert result.missing_evidence == ("pr_number",)
+    assert result.next_action == "await_authoritative_evidence"
+
+
 def test_reconciliation_evidence_round_trips_through_checkpoint(tmp_path) -> None:
     create(
         "reconcile",

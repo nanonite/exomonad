@@ -23,6 +23,7 @@ use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
 use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
 #[cfg(test)]
 use crate::services::pr_registry::PrRegistry;
+use crate::services::pr_registry::{read_published_heads, resolve_pr_number_for_slice};
 use crate::services::pr_registry::{PrEntry, PrState};
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
@@ -1647,31 +1648,47 @@ impl<
         req: WatcherPrStateRequest,
         _ctx: &crate::effects::EffectContext,
     ) -> EffectResult<WatcherPrStateResponse> {
-        if req.pr_number == 0 {
-            return Err(EffectError::invalid_input("pr_number is required"));
-        }
+        let pr_number = if req.pr_number != 0 {
+            req.pr_number
+        } else if !req.slice_id.is_empty() {
+            let heads = read_published_heads(self.ctx.project_dir())
+                .await
+                .effect_err("agent")?;
+            match resolve_pr_number_for_slice(&heads, &req.slice_id) {
+                Some(pr_number) => pr_number,
+                None => {
+                    return Ok(watcher_pr_state_error(
+                        0,
+                        format!(
+                            "no published PR found for slice_id '{}' in the publication registry",
+                            req.slice_id
+                        ),
+                    ))
+                }
+            }
+        } else {
+            return Err(EffectError::invalid_input(
+                "either pr_number or slice_id is required",
+            ));
+        };
 
         let Some(forgejo) = self.ctx.forgejo_client() else {
             return Ok(watcher_pr_state_error(
-                req.pr_number,
+                pr_number,
                 "Forgejo is not configured; cannot query PR state",
             ));
         };
         let repo_info = match crate::services::repo::get_repo_info(self.ctx.project_dir()).await {
             Ok(repo_info) => repo_info,
-            Err(error) => return Ok(watcher_pr_state_error(req.pr_number, error.to_string())),
+            Err(error) => return Ok(watcher_pr_state_error(pr_number, error.to_string())),
         };
 
         let pr = match forgejo
-            .get_pull_request(
-                &repo_info.owner,
-                &repo_info.repo,
-                PRNumber::new(req.pr_number),
-            )
+            .get_pull_request(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
             .await
         {
             Ok(pr) => pr,
-            Err(error) => return Ok(watcher_pr_state_error(req.pr_number, error.to_string())),
+            Err(error) => return Ok(watcher_pr_state_error(pr_number, error.to_string())),
         };
         let head_sha = pr.head_sha.clone().unwrap_or_default();
         let project_dir = self.ctx.project_dir().to_string_lossy().into_owned();
@@ -1683,15 +1700,11 @@ impl<
         .await
         {
             Ok(evidence) => evidence,
-            Err(error) => return Ok(watcher_pr_state_error(req.pr_number, error.to_string())),
+            Err(error) => return Ok(watcher_pr_state_error(pr_number, error.to_string())),
         };
 
         let reviews = forgejo
-            .list_pull_request_reviews(
-                &repo_info.owner,
-                &repo_info.repo,
-                PRNumber::new(req.pr_number),
-            )
+            .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
             .await
             .effect_err("agent")?;
         let (review_state, review_count) = review_state_from_forgejo_reviews(&reviews, &head_sha);
@@ -1706,7 +1719,7 @@ impl<
         Ok(WatcherPrStateResponse {
             success: true,
             error: String::new(),
-            pr_number: req.pr_number,
+            pr_number,
             found: true,
             review_state,
             ci_status: ci_status.as_str().to_string(),

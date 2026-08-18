@@ -83,7 +83,8 @@ resumePrCore args
       stateResult <-
         suspendEffect @Agent.AgentWatcherPrState
           PA.WatcherPrStateRequest
-            { PA.watcherPrStateRequestPrNumber = fromIntegral (rpaPrNumber args)
+            { PA.watcherPrStateRequestPrNumber = fromIntegral (rpaPrNumber args),
+              PA.watcherPrStateRequestSliceId = ""
             }
       case stateResult of
         Left err -> pure $ Left (spawnErrorMessage err)

@@ -1660,6 +1660,19 @@ def _reconcile_nonterminal_slices(
                     effects_log,
                 )
             watcher = snapshots[current.pr_number]
+        elif config.ledger_run_id is not None:
+            # pr_number was never persisted (e.g. a crash between pr.filed
+            # being acknowledged and identity association). Recover it from
+            # the durable publication registry keyed by slice_id.
+            watcher = _watcher_snapshot_for_slice(
+                current.id,
+                config,
+                effects,
+                effects_log,
+            )
+            recovered_pr_number = watcher.get("pr_number") if watcher else None
+            if isinstance(recovered_pr_number, int) and recovered_pr_number > 0:
+                snapshots[recovered_pr_number] = watcher
         owner_id = _agent_for_dispatch_intent(
             agent_listing,
             current.dispatch_intent_id or "",
@@ -1730,6 +1743,10 @@ def _apply_reconciliation_observations(
         return replace(current, **updates)
 
     if watcher is not None and watcher.get("found") is True:
+        if current.pr_number is None:
+            recovered_pr_number = watcher.get("pr_number")
+            if isinstance(recovered_pr_number, int) and recovered_pr_number > 0:
+                updates["pr_number"] = recovered_pr_number
         head_sha = _snapshot_text(watcher, "head_sha")
         ci_status = _snapshot_text(watcher, "ci_status")
         review_state = _snapshot_text(watcher, "review_state")
@@ -3473,6 +3490,31 @@ def _watcher_snapshot(
         cast(EffectClient, effects),
         lambda client: client.watcher_pr_state(pr_number=pr_number),
         effects_log,
+    )
+    if result is None or result.success is not True or not isinstance(result.result, Mapping):
+        return None
+    return result.result
+
+
+def _watcher_snapshot_for_slice(
+    slice_id: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> Mapping[str, object] | None:
+    """Recover a slice's PR identity from the durable publication registry
+    when pr_number was never persisted onto checkpoint state. A miss is
+    expected whenever the slice genuinely has not filed a PR yet, so this
+    does not raise on failure."""
+    result = _invoke(
+        "watcher_pr_state",
+        f"slice:{slice_id}",
+        {"slice_id": slice_id},
+        config.active,
+        cast(EffectClient, effects),
+        lambda client: client.watcher_pr_state(slice_id=slice_id),
+        effects_log,
+        raise_on_failure=False,
     )
     if result is None or result.success is not True or not isinstance(result.result, Mapping):
         return None

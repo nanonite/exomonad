@@ -379,8 +379,14 @@ message RestartReviewResponse {
 // ============================================================================
 
 message WatcherPrStateRequest {
-  // Existing PR number to inspect.
+  // Existing PR number to inspect. May be 0 when the caller does not yet
+  // know the PR number and is recovering it via slice_id instead.
   uint64 pr_number = 1;
+  // TL slice identifier used to recover a PR number that was acknowledged
+  // as filed but never persisted onto checkpoint state (e.g. after a crash
+  // between pr.filed and identity association). Ignored when pr_number is
+  // nonzero. Resolved against the durable published-heads registry.
+  string slice_id = 2;
 }
 
 message WatcherPrStateResponse {

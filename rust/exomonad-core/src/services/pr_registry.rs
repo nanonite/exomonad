@@ -206,6 +206,26 @@ pub async fn read_published_heads(project_dir: &Path) -> Result<Vec<PublishedHea
     read_published_heads_locked(project_dir).await
 }
 
+/// Recover a slice's PR number from the durable publication registry when the
+/// checkpoint never persisted it (e.g. a crash between `pr.filed` being
+/// acknowledged and identity association). Ledger-owned publications are
+/// preferred over migrated legacy ones; among equally-provenanced matches,
+/// the most recently published entry wins.
+pub fn resolve_pr_number_for_slice(heads: &[PublishedHead], slice_id: &str) -> Option<u64> {
+    if slice_id.trim().is_empty() {
+        return None;
+    }
+    let matching = || {
+        heads
+            .iter()
+            .filter(|head| head.slice_id.as_deref() == Some(slice_id))
+    };
+    matching()
+        .rfind(|head| head.provenance == PublicationProvenance::LedgerOwned)
+        .or_else(|| matching().next_back())
+        .map(|head| head.pr_number)
+}
+
 /// Persist a verified publication without allowing duplicate events to grow
 /// the registry. Different SHAs remain durable so the watcher can reject an
 /// old publication when Forgejo has already confirmed a newer head.
@@ -598,5 +618,41 @@ mod tests {
             .join(".exo")
             .join(PUBLISHED_HEADS_FILENAME)
             .exists());
+    }
+
+    #[test]
+    fn resolve_pr_number_for_slice_prefers_ledger_owned_over_legacy() {
+        let mut legacy = publication("sha-1");
+        legacy.slice_id = Some("slice-a".to_string());
+        legacy.provenance = PublicationProvenance::Legacy;
+
+        let mut ledger_owned = publication("sha-2");
+        ledger_owned.pr_number = 43;
+        ledger_owned.slice_id = Some("slice-a".to_string());
+        ledger_owned.provenance = PublicationProvenance::LedgerOwned;
+
+        let heads = vec![legacy, ledger_owned];
+        assert_eq!(resolve_pr_number_for_slice(&heads, "slice-a"), Some(43));
+    }
+
+    #[test]
+    fn resolve_pr_number_for_slice_falls_back_to_legacy_when_no_ledger_owned_match() {
+        let mut legacy = publication("sha-1");
+        legacy.slice_id = Some("slice-a".to_string());
+        legacy.provenance = PublicationProvenance::Legacy;
+
+        let heads = vec![legacy];
+        assert_eq!(resolve_pr_number_for_slice(&heads, "slice-a"), Some(42));
+    }
+
+    #[test]
+    fn resolve_pr_number_for_slice_returns_none_when_unmatched_or_empty() {
+        let mut other = publication("sha-1");
+        other.slice_id = Some("slice-b".to_string());
+
+        let heads = vec![other];
+        assert_eq!(resolve_pr_number_for_slice(&heads, "slice-a"), None);
+        assert_eq!(resolve_pr_number_for_slice(&heads, ""), None);
+        assert_eq!(resolve_pr_number_for_slice(&[], "slice-a"), None);
     }
 }
