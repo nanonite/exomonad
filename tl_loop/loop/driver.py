@@ -689,6 +689,7 @@ def run_tl_loop(
         if selected.ledger_run_id is not None
         else []
     )
+    state = _reconcile_action_journal(state, store, effects_log)
     state = _reconcile_dispatches(state, selected, effects, store, effects_log)
     state = _reconcile_nonterminal_slices(state, selected, effects, store, effects_log)
     state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
@@ -1499,6 +1500,61 @@ def _record_dispatch_failure(
         effects,
         effects_log,
     )
+    return state
+
+
+ACTION_JOURNAL_GATE_PREFIX = "tl-action-journal-"
+
+
+def _action_journal_gate_name(key: str) -> str:
+    return f"{ACTION_JOURNAL_GATE_PREFIX}{key[:16]}"
+
+
+def _reconcile_action_journal(
+    state: RunState,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Resolve action-journal entries stuck at intended/unknown so a restart
+    does not crash permanently on the same blocked lifecycle effect.
+
+    Whether the underlying side effect (spawn, PR file, merge, cleanup, ...)
+    actually happened cannot be inferred generically here, so this never
+    guesses. Each stuck entry instead opens (or reuses) a durable named gate:
+    approving it records the entry as compensated, clearing the block so the
+    next matching dispatch proceeds as a genuinely fresh attempt; rejecting
+    it records a durable rejected outcome so callers observe a normal
+    failure instead of a crash on the next retry.
+    """
+    if not isinstance(effects_log, EffectJournal):
+        return state
+    for entry in effects_log.pending_entries():
+        key = entry.get("key")
+        if not isinstance(key, str) or not key:
+            continue
+        gate_name = _action_journal_gate_name(key)
+        gate = next((candidate for candidate in state.gates if candidate.name == gate_name), None)
+        if gate is None:
+            state = store.set_gate(gate_name, GateStatus.PENDING)
+            LOGGER.warning(
+                "[TL loop] action journal entry key=%s operation=%s target=%s has "
+                "unknown outcome; opened gate=%s for operator resolution",
+                key,
+                entry.get("operation"),
+                entry.get("target"),
+                gate_name,
+            )
+        elif gate.status is GateStatus.APPROVED:
+            effects_log.resolve_by_key(key, status="compensated")
+        elif gate.status is GateStatus.REJECTED:
+            effects_log.resolve_by_key(
+                key,
+                status="rejected",
+                result={
+                    "success": False,
+                    "error": f"operator rejected retry via gate {gate_name!r}",
+                },
+            )
     return state
 
 
@@ -4617,10 +4673,21 @@ def _invoke(
             return result
         if status in {"intended", "unknown"}:
             key = prior.get("key", journal.key_for(intent))
+            gate_name = _action_journal_gate_name(key)
             raise TLLoopError(
                 f"lifecycle effect {operation} for {target!r} has unknown outcome "
-                f"and requires reconciliation before retry (key={key})"
+                f"and requires reconciliation before retry (key={key}); restart to "
+                f"open gate={gate_name}, then answer it with `tl_loop gate --name "
+                f"{gate_name} --approve|--reject`"
             )
+        if status != "compensated":
+            key = prior.get("key", journal.key_for(intent))
+            raise TLLoopError(
+                f"lifecycle effect {operation} for {target!r} has unrecognized "
+                f"action journal status {status!r} (key={key})"
+            )
+        # An operator-approved _reconcile_action_journal() pass cleared this
+        # entry for a fresh attempt; fall through and dispatch as new.
     effects_log.append(intent)
     LOGGER.info("[TL loop] effect=%s target=%s active=%s", operation, target, active)
     if not active:

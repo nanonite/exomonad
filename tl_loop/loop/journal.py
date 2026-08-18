@@ -114,6 +114,24 @@ class EffectJournal(list[Any]):
         if intent.operation in MUTATING_OPERATIONS:
             self._update(intent, status="unknown", error=str(error))
 
+    def pending_entries(self) -> list[dict[str, object]]:
+        """Intended/unknown entries that block retry until reconciled."""
+        return [
+            entry
+            for entry in self._read()
+            if isinstance(entry, dict) and entry.get("status") in {"intended", "unknown"}
+        ]
+
+    def resolve_by_key(self, key: str, **updates: object) -> None:
+        """Apply a reconciliation decision to an entry found by its stable key."""
+        entries = self._read()
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("key") == key:
+                entry.update(updates)
+                self._write(entries)
+                return
+        raise ActionJournalError(f"action entry {key} was not recorded")
+
     def replay(self, entry: Mapping[str, object]) -> ToolResult:
         raw = entry.get("result")
         if not isinstance(raw, dict):
