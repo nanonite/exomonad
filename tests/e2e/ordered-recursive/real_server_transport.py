@@ -217,6 +217,7 @@ class DelayedAggregateEventSource:
         self.emitted: list[str] = []
         self.emitted_sequences: list[int] = []
         self.acknowledged: list[int] = []
+        self.observed_aliases: list[Mapping[str, object]] = []
 
     def get(self, timeout: float | None = None) -> EventEnvelope:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -296,11 +297,14 @@ class DelayedAggregateEventSource:
         extra: Mapping[str, object],
     ) -> EventEnvelope:
         data = {
-            "slice_id": current.id,
+            "agent_id": current.dispatch_agent_id or current.id,
+            "owner_id": current.dispatch_agent_id or current.id,
+            "branch": current.branch or f"main.{current.id}",
             "pr_number": current.pr_number,
             "head_sha": current.reviewed_head,
             **extra,
         }
+        self.observed_aliases.append(data)
         raw = {
             "schema_version": 1,
             "event_id": f"delayed-{state.events.last_consumed_offset + 1}",
@@ -309,7 +313,7 @@ class DelayedAggregateEventSource:
             "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "run_seq": state.events.last_consumed_offset + 1,
             "type": event_type,
-            "agent_id": current.id,
+            "agent_id": current.dispatch_agent_id or current.id,
             "run_id": state.run_id,
             "session_id": "delayed-e2e",
             "lifecycle_state": "observed",
@@ -1355,6 +1359,20 @@ def _run_restart_case(
         raise HarnessError(
             f"delayed restart did not converge: emitted={source.emitted!r} "
             f"acknowledged={source.acknowledged!r}"
+        )
+    if boundary != "dispatch" and (
+        not source.observed_aliases or any(
+            "slice_id" in alias
+            or not isinstance(alias.get("agent_id"), str)
+            or not isinstance(alias.get("owner_id"), str)
+            or not isinstance(alias.get("branch"), str)
+            or not isinstance(alias.get("pr_number"), int)
+            for alias in source.observed_aliases
+        )
+    ):
+        raise HarnessError(
+            f"{boundary} did not consume watcher-shaped owner aliases: "
+            f"{source.observed_aliases!r}"
         )
     required_events: set[str] = set()
     if boundary == "aggregate_review":
