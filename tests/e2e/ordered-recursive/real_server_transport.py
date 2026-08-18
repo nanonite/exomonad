@@ -551,7 +551,7 @@ def start_mock(
             return process, url
         except HarnessError:
             time.sleep(0.1)
-    process.terminate()
+    stop_subprocess(process, "mock API")
     raise HarnessError(f"timed out waiting for mock API: {stderr.name}")
 
 
@@ -646,7 +646,11 @@ def start_server(
         text=True,
     )
     client = TransportClient(project_root=repo, timeout=5)
-    wait_for_server(client, process, Path(log.name))
+    try:
+        wait_for_server(client, process, Path(log.name))
+    except BaseException:
+        stop_subprocess(process, "ExoMonad server startup")
+        raise
     return process, client
 
 
@@ -704,6 +708,36 @@ def reviewer_spawn_events(
     return events
 
 
+def stop_multiprocessing_process(
+    process: multiprocessing.Process, label: str, timeout: float = 5
+) -> None:
+    """Terminate, reap, and kill a child process that ignores termination."""
+    if process.is_alive():
+        process.terminate()
+    process.join(timeout=timeout)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=timeout)
+    if process.is_alive():
+        raise HarnessError(
+            f"{label} did not stop after terminate/kill fallback: "
+            f"exitcode={process.exitcode}"
+        )
+
+
+def stop_subprocess(process: subprocess.Popen[str], label: str, timeout: float = 10) -> None:
+    """Terminate, reap, and kill a subprocess with bounded cleanup."""
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout)
+    if process.poll() is None:
+        raise HarnessError(f"{label} did not stop after terminate/kill fallback")
+
+
 def assert_controller_alive(process: multiprocessing.Process, phase: str) -> None:
     """Fail the probe if the controller exited before the lifecycle was complete."""
     if process.is_alive():
@@ -755,6 +789,47 @@ def stop_spawned_worker(repo: Path, worker_name: str) -> None:
     )
     if any(worker_name in line for line in remaining.splitlines()):
         raise HarnessError(f"temporary worker window survived cleanup: {worker_name}")
+
+
+def best_effort_worker_cleanup(
+    repo: Path, worker_name: str, diagnostics: list[str]
+) -> None:
+    """Dispose one probe-owned worker without masking another cleanup attempt."""
+    try:
+        stop_spawned_worker(repo, worker_name)
+    except Exception as error:  # noqa: BLE001 - cleanup must continue for every error
+        diagnostics.append(f"{worker_name}: {error}")
+
+
+def cleanup_recursive_watcher_probe(
+    repo: Path,
+    swarm_id: str,
+    root_process: multiprocessing.Process,
+    cleanup_state: Mapping[str, Any],
+) -> None:
+    """Converge the controller and every worker known to the routing probe."""
+    diagnostics: list[str] = []
+    try:
+        stop_multiprocessing_process(root_process, "recursive watcher controller")
+    except Exception as error:  # noqa: BLE001 - cleanup must continue for every error
+        diagnostics.append(str(error))
+
+    worker_names: set[str] = set()
+    owner_id = cleanup_state.get("owner_id")
+    if isinstance(owner_id, str) and owner_id:
+        worker_names.add(owner_id)
+    pr_number = cleanup_state.get("pr_number")
+    if isinstance(pr_number, int):
+        for event in reviewer_spawn_events(repo, swarm_id, pr_number).values():
+            data = event.get("data")
+            if isinstance(data, Mapping) and isinstance(data.get("child_agent"), str):
+                worker_names.add(str(data["child_agent"]))
+    for worker_name in sorted(worker_names):
+        best_effort_worker_cleanup(repo, worker_name, diagnostics)
+    if diagnostics:
+        raise HarnessError(
+            "recursive watcher routing cleanup failed: " + "; ".join(diagnostics)
+        )
 
 
 def run_root_recursive_lifecycle_probe(
@@ -838,8 +913,13 @@ def run_root_recursive_lifecycle_probe(
             )
         return swarm_id
     finally:
-        source.close()
-        stop_spawned_worker(repo, worker_name)
+        try:
+            source.close()
+        finally:
+            diagnostics: list[str] = []
+            best_effort_worker_cleanup(repo, worker_name, diagnostics)
+            if diagnostics:
+                raise HarnessError("root probe cleanup failed: " + "; ".join(diagnostics))
 
 
 def run_real_watcher_routing_probe(
@@ -850,13 +930,38 @@ def run_real_watcher_routing_probe(
     swarm_id: str,
 ) -> None:
     """Route recursive Rust watcher events through the real Python controller."""
-    state_root = root / "recursive-watcher-state"
     root_process = multiprocessing.get_context("fork").Process(
         target=run_recursive_watcher_controller,
         args=(root, repo, swarm_id),
         name="real-recursive-watcher-controller",
     )
+    cleanup_state: dict[str, Any] = {"owner_id": None, "pr_number": None}
     root_process.start()
+    try:
+        _run_real_watcher_routing_probe_body(
+            client,
+            root,
+            repo,
+            forgejo_url,
+            swarm_id,
+            root_process,
+            cleanup_state,
+        )
+    finally:
+        cleanup_recursive_watcher_probe(repo, swarm_id, root_process, cleanup_state)
+
+
+def _run_real_watcher_routing_probe_body(
+    client: TransportClient,
+    root: Path,
+    repo: Path,
+    forgejo_url: str,
+    swarm_id: str,
+    root_process: multiprocessing.Process,
+    cleanup_state: dict[str, Any],
+) -> None:
+    """Route recursive Rust watcher events through the real Python controller."""
+    state_root = root / "recursive-watcher-state"
     slice_id = "real-watcher-leaf"
     child_state_root = state_root / "recursive-watcher-root"
     owner_id: str | None = None
@@ -870,11 +975,10 @@ def run_real_watcher_routing_probe(
             continue
         if child.status is SliceStatus.SPAWNED and child.dispatch_agent_id:
             owner_id = child.dispatch_agent_id
+            cleanup_state["owner_id"] = owner_id
             break
         time.sleep(0.1)
     if owner_id is None:
-        root_process.terminate()
-        root_process.join(timeout=5)
         raise HarnessError(
             "recursive controller did not durably spawn the watcher-routing leaf"
         )
@@ -887,6 +991,7 @@ def run_real_watcher_routing_probe(
     )
     filed_data = find_object(filed, {"pr_number", "head_branch"})
     pr_number = int(filed_data["pr_number"])
+    cleanup_state["pr_number"] = pr_number
     branch = str(filed_data["head_branch"])
     snapshot = owner_effects.watcher_pr_state(pr_number=pr_number)
     evidence = find_object(snapshot, {"head_sha"})
@@ -1039,18 +1144,6 @@ def run_real_watcher_routing_probe(
     }
     if len(reviewer_agents) != 1:
         raise HarnessError(f"reviewer ownership was not unique: {reviewer_events!r}")
-    assert_controller_alive(root_process, "post-routing lifecycle")
-    root_process.terminate()
-    root_process.join(timeout=5)
-    if root_process.is_alive():
-        raise HarnessError("recursive controller did not stop during probe cleanup")
-    for reviewer in reviewer_events:
-        data = reviewer.get("data")
-        if isinstance(data, Mapping) and isinstance(data.get("child_agent"), str):
-            stop_spawned_worker(repo, str(data["child_agent"]))
-    if owner_id:
-        stop_spawned_worker(repo, owner_id)
-
 
 def run_recursive_checkpoint_probe(
     client: TransportClient, root: Path, repo: Path, swarm_id: str
@@ -1104,8 +1197,15 @@ def run_recursive_checkpoint_probe(
             root_dir=state_root,
         )
     finally:
-        sub_tl_source.close()
-        stop_spawned_worker(repo, "nested-leaf")
+        try:
+            sub_tl_source.close()
+        finally:
+            diagnostics: list[str] = []
+            best_effort_worker_cleanup(repo, "nested-leaf", diagnostics)
+            if diagnostics:
+                raise HarnessError(
+                    "recursive checkpoint cleanup failed: " + "; ".join(diagnostics)
+                )
     if result.final_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLWaiting}:
         raise HarnessError(
             f"recursive lifecycle probe entered an invalid phase: {result.final_state!r}"
@@ -1581,8 +1681,7 @@ def _run_restart_case(
         ):
             time.sleep(0.01)
         if not dispatch_marker.exists():
-            first.terminate()
-            first.join(timeout=5)
+            stop_multiprocessing_process(first, f"{boundary} restart controller")
             raise HarnessError("dispatch controller did not reach its durable boundary")
     else:
         time.sleep(0.5)
@@ -1605,8 +1704,7 @@ def _run_restart_case(
         candidate.lifecycle is not expected_lifecycle
         for candidate in waiting_state.integration.candidates.values()
     ):
-        first.terminate()
-        first.join(timeout=5)
+        stop_multiprocessing_process(first, f"{boundary} restart controller")
         raise HarnessError(
             f"{boundary} restart was not captured at its requested lifecycle: "
             f"{waiting_state.integration.candidates!r}"
@@ -1622,14 +1720,12 @@ def _run_restart_case(
         }
         for current in waiting_state.slices.values()
     ):
-        first.terminate()
-        first.join(timeout=5)
+        stop_multiprocessing_process(first, f"{boundary} restart controller")
         raise HarnessError(
             f"{boundary} restart did not remain at a recoverable boundary: "
             f"{waiting_state!r}"
         )
-    first.terminate()
-    first.join(timeout=5)
+    stop_multiprocessing_process(first, f"{boundary} restart controller")
     if first.exitcode == 0:
         raise HarnessError("restart probe controller exited before the forced restart")
 
@@ -1887,20 +1983,23 @@ def run_waiting_supervision_probe(root: Path) -> None:
     context = multiprocessing.get_context("fork")
     process = context.Process(target=waiting_child, args=(str(root),))
     process.start()
-    store = RunStore("waiting-child", root)
-    deadline = time.monotonic() + 5
-    while not store.path.exists() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    started = time.monotonic()
-    state = _supervise_live_sub_tl(
-        process, store, TLLoopConfig(keep_alive_on_waiting=True), 0.05
-    )
-    elapsed = time.monotonic() - started
-    if state is None or state.fsm.phase is not TLPhase.TLWaiting or elapsed < 0.8:
-        raise HarnessError(
-            "waiting child was terminated at the supervision timeout: "
-            f"state={state!r} elapsed={elapsed:.3f} exitcode={process.exitcode}"
+    try:
+        store = RunStore("waiting-child", root)
+        deadline = time.monotonic() + 5
+        while not store.path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        started = time.monotonic()
+        state = _supervise_live_sub_tl(
+            process, store, TLLoopConfig(keep_alive_on_waiting=True), 0.05
         )
+        elapsed = time.monotonic() - started
+        if state is None or state.fsm.phase is not TLPhase.TLWaiting or elapsed < 0.8:
+            raise HarnessError(
+                "waiting child was terminated at the supervision timeout: "
+                f"state={state!r} elapsed={elapsed:.3f} exitcode={process.exitcode}"
+            )
+    finally:
+        stop_multiprocessing_process(process, "waiting supervision child")
 
 
 def main() -> None:
@@ -1922,16 +2021,23 @@ def main() -> None:
             run_waiting_supervision_probe(root / "waiting-state")
             print("real server TransportClient ordered recursion: passed")
         finally:
+            cleanup_errors: list[str] = []
             if server is not None:
-                server.terminate()
-                server.wait(timeout=10)
+                try:
+                    stop_subprocess(server, "ExoMonad server")
+                except Exception as error:  # noqa: BLE001 - cleanup must continue for every error
+                    cleanup_errors.append(str(error))
             subprocess.run(
                 ["tmux", "kill-session", "-t", f"ordered-server-e2e-{os.getpid()}"],
                 check=False,
                 capture_output=True,
             )
-            mock.terminate()
-            mock.wait(timeout=10)
+            try:
+                stop_subprocess(mock, "mock API")
+            except Exception as error:  # noqa: BLE001 - cleanup must continue for every error
+                cleanup_errors.append(str(error))
+            if cleanup_errors:
+                raise HarnessError("managed E2E cleanup failed: " + "; ".join(cleanup_errors))
 
 
 if __name__ == "__main__":
