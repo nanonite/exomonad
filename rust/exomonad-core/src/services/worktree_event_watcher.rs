@@ -178,6 +178,15 @@ fn validate_publication_slice(
     Ok(())
 }
 
+fn validate_publication_invocation(publication: &PublishedHead) -> std::result::Result<(), String> {
+    if publication.slice_id.is_some() && publication.invocation_id.is_none() {
+        return Err(
+            "new publication with a proven slice is missing invocation provenance".to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn canonical_watcher_event_data(
     agent_id: &str,
@@ -763,6 +772,7 @@ where
             .map_err(|error| format!("publication owner is invalid: {error}"))?;
         let identity = self.ctx.agent_resolver().get(&owner_name).await;
         validate_publication_slice(publication, identity.as_ref())?;
+        validate_publication_invocation(publication)?;
         if let Some(publication_invocation) = publication.invocation_id.as_deref() {
             let invocation_dir = self
                 .ctx
@@ -5138,6 +5148,20 @@ mod tests {
             )
             .unwrap(),
             "feat-codex"
+        );
+    }
+
+    #[test]
+    fn sliced_publication_requires_invocation_provenance() {
+        let error = validate_publication_invocation(&publication_for_owner(Some("feat-codex")))
+            .expect_err("new sliced publications must carry invocation provenance");
+        assert!(error.contains("missing invocation provenance"));
+
+        let mut legacy = publication_for_owner(Some("feat-codex"));
+        legacy.slice_id = None;
+        assert!(
+            validate_publication_invocation(&legacy).is_ok(),
+            "legacy publications without a proven slice remain migratable"
         );
     }
 

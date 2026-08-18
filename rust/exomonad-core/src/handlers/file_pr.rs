@@ -92,6 +92,25 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<FilePrResponse> {
         tracing::info!(title = %req.title, "[FilePR] file_pr starting");
+        let invocation_dir = self
+            .ctx
+            .project_dir()
+            .join(".exo/agents")
+            .join(ctx.agent_name.as_str());
+        let invocation =
+            crate::services::agent_control::read_invocation_conservatively(&invocation_dir)
+                .await
+                .ok_or_else(|| {
+                    EffectError::invalid_input(format!(
+                        "file_pr requires a durable invocation record for {}",
+                        ctx.agent_name
+                    ))
+                })?;
+        if invocation.invocation_id.trim().is_empty() {
+            return Err(EffectError::invalid_input(
+                "file_pr requires a non-empty invocation ID",
+            ));
+        }
         let slice_id = self
             .ctx
             .agent_resolver()
@@ -127,13 +146,6 @@ impl<
         .await
         .effect_err("file_pr")?;
 
-        let invocation_dir = self
-            .ctx
-            .project_dir()
-            .join(".exo/agents")
-            .join(ctx.agent_name.as_str());
-        let invocation =
-            crate::services::agent_control::read_invocation_conservatively(&invocation_dir).await;
         let publication = PublishedHead {
             pr_number: output.pr_number.as_u64(),
             head_branch: output.head_branch.to_string(),
@@ -142,15 +154,9 @@ impl<
             author_agent: Some(ctx.agent_name.to_string()),
             author_role: Some("dev".to_string()),
             slice_id,
-            invocation_id: invocation
-                .as_ref()
-                .map(|record| record.invocation_id.clone()),
-            invocation_trigger: invocation
-                .as_ref()
-                .map(|record| format!("{:?}", record.trigger).to_ascii_lowercase()),
-            invocation_runtime: invocation
-                .as_ref()
-                .map(|record| format!("{:?}", record.runtime).to_ascii_lowercase()),
+            invocation_id: Some(invocation.invocation_id.clone()),
+            invocation_trigger: Some(format!("{:?}", invocation.trigger).to_ascii_lowercase()),
+            invocation_runtime: Some(format!("{:?}", invocation.runtime).to_ascii_lowercase()),
         };
         let disposition = publish_verified_head(self.ctx.project_dir(), publication)
             .await
@@ -167,7 +173,7 @@ impl<
                     "base_branch": output.base_branch.to_string(),
                     "head_sha": output.head_sha.clone(),
                     "publication": format!("{:?}", disposition),
-                    "invocation_id": invocation.as_ref().map(|record| &record.invocation_id),
+                    "invocation_id": &invocation.invocation_id,
                 }),
             ) {
                 tracing::warn!(%error, "Failed to write verified PR publication event");

@@ -680,6 +680,30 @@ def server_ledger_events(repo: Path) -> list[dict[str, Any]]:
     return events
 
 
+def reviewer_spawn_events(
+    repo: Path, swarm_id: str, pr_number: int
+) -> dict[int, Mapping[str, Any]]:
+    """Return unique reviewer subtree spawns for one PR."""
+    events: dict[int, Mapping[str, Any]] = {}
+    for event in server_ledger_events(repo):
+        data = event.get("data")
+        branch = data.get("branch") if isinstance(data, Mapping) else None
+        if (
+            event.get("run_id") == swarm_id
+            and event.get("type") == "agent.spawned"
+            and isinstance(branch, str)
+            and (
+                branch == f"review-pr-{pr_number}"
+                or branch.endswith(f".review-pr-{pr_number}")
+                or branch.startswith(f"review-pr-{pr_number}-")
+            )
+        ):
+            run_seq = event.get("run_seq")
+            if type(run_seq) is int:
+                events[run_seq] = event
+    return events
+
+
 def stop_spawned_worker(repo: Path, worker_name: str) -> None:
     """Stop only the temporary worker window created by this probe."""
     config = (repo / ".exo" / "config.toml").read_text(encoding="utf-8")
@@ -865,7 +889,7 @@ def run_real_watcher_routing_probe(
     deadline = time.monotonic() + 30
     filed_event: Mapping[str, Any] | None = None
     watcher_event: Mapping[str, Any] | None = None
-    reviewer_events_by_seq: dict[int, Mapping[str, Any]] = {}
+    ci_event: Mapping[str, Any] | None = None
     while time.monotonic() < deadline:
         for event in server_ledger_events(repo):
             data = event.get("data")
@@ -878,27 +902,27 @@ def run_real_watcher_routing_probe(
                     filed_event = event
                 if event.get("type") == "copilot.review":
                     watcher_event = event
-            if (
-                event.get("type") == "agent.spawned"
-                and isinstance(data, Mapping)
-                and (
-                    str(data.get("branch", "")) == f"review-pr-{pr_number}"
-                    or str(data.get("branch", "")).endswith(f".review-pr-{pr_number}")
-                    or str(data.get("branch", "")).startswith(f"review-pr-{pr_number}-")
-                )
-            ):
-                run_seq = event.get("run_seq")
-                if type(run_seq) is int:
-                    reviewer_events_by_seq[run_seq] = event
-        reviewer_events = list(reviewer_events_by_seq.values())
-        if filed_event is not None and watcher_event is not None and reviewer_events:
+                if event.get("type") == "ci.status_changed":
+                    ci_event = event
+        reviewer_events = list(reviewer_spawn_events(repo, swarm_id, pr_number).values())
+        if (
+            filed_event is not None
+            and watcher_event is not None
+            and ci_event is not None
+            and reviewer_events
+        ):
             break
         time.sleep(0.1)
-    if filed_event is None or watcher_event is None or len(reviewer_events) != 1:
+    if (
+        filed_event is None
+        or watcher_event is None
+        or ci_event is None
+        or len(reviewer_events) != 1
+    ):
         raise HarnessError(
-            "recursive watcher did not publish file_pr, approval, and one reviewer spawn: "
+            "recursive watcher did not publish file_pr, approval, CI, and one reviewer spawn: "
             f"filed={filed_event!r} watcher={watcher_event!r} "
-            f"reviewers={reviewer_events!r}"
+            f"ci={ci_event!r} reviewers={reviewer_events!r}"
         )
     watcher_data = watcher_event.get("data")
     if not isinstance(watcher_data, Mapping) or watcher_data.get("owner_id") != owner_id:
@@ -908,8 +932,18 @@ def run_real_watcher_routing_probe(
 
     filed_seq = filed_event.get("run_seq")
     watcher_seq = watcher_event.get("run_seq")
-    if type(filed_seq) is not int or type(watcher_seq) is not int or watcher_seq <= filed_seq:
-        raise HarnessError(f"watcher event ordering was not durable: {filed_event!r} {watcher_event!r}")
+    ci_seq = ci_event.get("run_seq")
+    if (
+        type(filed_seq) is not int
+        or type(watcher_seq) is not int
+        or type(ci_seq) is not int
+        or watcher_seq <= filed_seq
+        or ci_seq <= filed_seq
+    ):
+        raise HarnessError(
+            f"watcher event ordering was not durable: filed={filed_event!r} "
+            f"review={watcher_event!r} ci={ci_event!r}"
+        )
     child = RunStore("sub-a", child_state_root).load()
     child_checkpoint = child_state_root / "sub-a" / "run.json"
     if not child_checkpoint.is_file() or child.ledger_run_id != swarm_id:
@@ -919,9 +953,34 @@ def run_real_watcher_routing_probe(
     current = child.slices[slice_id]
     if current.pr_number != pr_number or current.reviewed_head != head_sha:
         raise HarnessError(f"recursive controller did not route the PR to its leaf: {current!r}")
+    if child.events.last_consumed_offset < max(watcher_seq, ci_seq):
+        raise HarnessError(
+            "recursive controller did not consume the real watcher events: "
+            f"cursor={child.events.last_consumed_offset} review_seq={watcher_seq} "
+            f"ci_seq={ci_seq}"
+        )
+    if current.ci_state.get(head_sha) != "success":
+        raise HarnessError(f"recursive controller did not persist watcher CI: {current!r}")
+    if current.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
+        raise HarnessError(f"recursive controller did not persist watcher approval: {current!r}")
     attempts = current.reviewer_attempt
     if attempts.get(head_sha) != 1 or len(attempts) != 1:
         raise HarnessError(f"reviewer claim was not persisted exactly once: {current!r}")
+    stabilization_deadline = time.monotonic() + 3
+    while time.monotonic() < stabilization_deadline:
+        reviewer_events = list(
+            reviewer_spawn_events(repo, swarm_id, pr_number).values()
+        )
+        if len(reviewer_events) > 1:
+            raise HarnessError(
+                f"delayed duplicate reviewer spawn observed: {reviewer_events!r}"
+            )
+        time.sleep(0.1)
+    reviewer_events = list(reviewer_spawn_events(repo, swarm_id, pr_number).values())
+    if len(reviewer_events) != 1:
+        raise HarnessError(
+            f"reviewer spawn did not stabilize at exactly one event: {reviewer_events!r}"
+        )
     reviewer_agents = {
         data.get("child_agent")
         for reviewer in reviewer_events
