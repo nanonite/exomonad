@@ -667,6 +667,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["dispatch_agent_id"] = value.dispatch_agent_id
         if value.dispatch_authoritative_event_seq is not None:
             record["dispatch_authoritative_event_seq"] = value.dispatch_authoritative_event_seq
+        if value.reconciliation is not None:
+            record["reconciliation"] = copy.deepcopy(dict(value.reconciliation))
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
@@ -1057,6 +1059,11 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         dispatch_agent_id=cast(str | None, value.get("dispatch_agent_id")),
         dispatch_authoritative_event_seq=cast(
             int | None, value.get("dispatch_authoritative_event_seq")
+        ),
+        reconciliation=(
+            MappingProxyType(copy.deepcopy(cast(dict[str, object], value["reconciliation"])))
+            if isinstance(value.get("reconciliation"), dict)
+            else None
         ),
     )
 

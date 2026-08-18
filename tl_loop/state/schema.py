@@ -189,6 +189,16 @@ SLICE_KEYS = frozenset(
         "dispatch_error",
         "dispatch_agent_id",
         "dispatch_authoritative_event_seq",
+        "reconciliation",
+    }
+)
+RECONCILIATION_KEYS = frozenset(
+    {
+        "confirmed_stage",
+        "authoritative_evidence",
+        "missing_evidence",
+        "conflicts",
+        "next_action",
     }
 )
 PARK_AUDIT_KEYS = frozenset(
@@ -279,6 +289,7 @@ class SliceState:
     dispatch_error: str | None = None
     dispatch_agent_id: str | None = None
     dispatch_authoritative_event_seq: int | None = None
+    reconciliation: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -700,6 +711,7 @@ def _validate_slice(
     _nullable_string(value, "dispatch_error", path, errors)
     _nullable_string(value, "dispatch_agent_id", path, errors)
     _nullable_non_negative_int(value, "dispatch_authoritative_event_seq", path, errors)
+    _reconciliation(value.get("reconciliation"), path, errors)
     if value.get("status") == SliceStatus.SPAWNED.value:
         _non_empty_string(value, "dispatch_intent_id", path, errors)
         _non_empty_string(value, "dispatch_agent_id", path, errors)
@@ -822,6 +834,18 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
             for key in ("role_spent", "harness_spent", "role_reserved", "harness_reserved"):
                 _counter_map(parsed, key, f"{path}.park_audit.ledger", errors)
             _charges(parsed.get("charges"), f"{path}.park_audit.ledger", errors)
+
+
+def _reconciliation(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    reconciliation = _object(value, f"{path}.reconciliation", RECONCILIATION_KEYS, errors)
+    if reconciliation is None:
+        return
+    for key in ("confirmed_stage", "next_action"):
+        _non_empty_string(reconciliation, key, f"{path}.reconciliation", errors)
+    for key in ("authoritative_evidence", "missing_evidence", "conflicts"):
+        _string_list(reconciliation, key, f"{path}.reconciliation", errors, allow_empty=True)
 
 
 def _budgets(value: object, errors: list[tuple[str, str]]) -> None:

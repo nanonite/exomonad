@@ -98,6 +98,7 @@ from tl_loop.state.schema import (
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
+from .reconcile import ReconciliationResult, reconcile_slice
 
 LOGGER = logging.getLogger(__name__)
 TIMEOUT_GATE_NAME = "tl-timeout"
@@ -105,6 +106,7 @@ DISPATCH_TIMEOUT_GATE_NAME = "tl-dispatch-timeout"
 DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
+INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
 
 
@@ -683,6 +685,7 @@ def run_tl_loop(
     state = _initialize_ordered_runtime(work_plan, state, store)
     effects_log: list[EffectIntent] = []
     state = _reconcile_dispatches(state, selected, effects, store, effects_log)
+    state = _reconcile_nonterminal_slices(state, selected, effects, store, effects_log)
     state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
     state = _run_sub_tls(work_plan, state, selected, source, effects, store, effects_log)
     return _run_loop(
@@ -1602,6 +1605,125 @@ def _reconcile_dispatches(
             effects_log,
         )
     return state
+
+
+def _reconcile_nonterminal_slices(
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Rebuild safe derived fields before the cursor advances."""
+    candidates = [
+        slice_state
+        for slice_state in state.slices.values()
+        if slice_state.status
+        in {
+            SliceStatus.SPAWNED,
+            SliceStatus.IN_REVIEW,
+            SliceStatus.REPAIRING,
+        }
+    ]
+    if not candidates:
+        return state
+
+    agent_listing: ToolResult | None = None
+    if config.active:
+        agent_listing = _invoke(
+            "list_agents",
+            "controller-reconciliation",
+            {},
+            True,
+            cast(EffectClient, effects),
+            lambda client: client.list_agents(),
+            effects_log,
+            raise_on_failure=False,
+        )
+    snapshots: dict[int, Mapping[str, object] | None] = {}
+    updated = dict(state.slices)
+    conflicts_found = False
+    changed = False
+    for current in candidates:
+        watcher = None
+        if current.pr_number is not None and config.ledger_run_id is not None:
+            if current.pr_number not in snapshots:
+                snapshots[current.pr_number] = _watcher_snapshot(
+                    current.pr_number,
+                    config,
+                    effects,
+                    effects_log,
+                )
+            watcher = snapshots[current.pr_number]
+        owner_id = _agent_for_dispatch_intent(
+            agent_listing,
+            current.dispatch_intent_id or "",
+        )
+        result = reconcile_slice(
+            current,
+            authoritative_owner_id=owner_id,
+            watcher=watcher,
+        )
+        reconciled = _apply_reconciliation_observations(
+            current,
+            result,
+            watcher,
+            owner_id,
+        )
+        if reconciled != current:
+            updated[current.id] = reconciled
+            changed = True
+        conflicts_found |= bool(result.conflicts)
+
+    if changed:
+        state = store.checkpoint(
+            state.fsm,
+            updated,
+            state.budgets,
+            state.events.last_consumed_offset,
+            current_order=state.current_order,
+            ordered_stages=state.ordered_stages,
+            integration=state.integration,
+        )
+    if conflicts_found:
+        state = store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
+    return state
+
+
+def _apply_reconciliation_observations(
+    current: SliceState,
+    result: ReconciliationResult,
+    watcher: Mapping[str, object] | None,
+    owner_id: str | None,
+) -> SliceState:
+    updates: dict[str, object] = {"reconciliation": result.as_state()}
+    if result.conflicts:
+        return replace(current, **updates)
+
+    if watcher is not None and watcher.get("found") is True:
+        head_sha = _snapshot_text(watcher, "head_sha")
+        ci_status = _snapshot_text(watcher, "ci_status")
+        review_state = _snapshot_text(watcher, "review_state")
+        if head_sha and ci_status in CI_STATUS_VALUES:
+            ci_state = dict(current.ci_state)
+            ci_state[head_sha] = ci_status
+            updates["ci_state"] = ci_state
+        if (
+            head_sha
+            and current.reviewed_head is None
+            and review_state in {"approved", "go", "go-with-nits", "go_with_nits"}
+        ):
+            updates["reviewed_head"] = head_sha
+            updates["verdict"] = (
+                Verdict.GO_WITH_NITS
+                if review_state in {"go-with-nits", "go_with_nits"}
+                else Verdict.GO
+            )
+        if watcher.get("merged") is True:
+            updates["status"] = SliceStatus.MERGED
+    if owner_id is not None and current.dispatch_agent_id is None:
+        updates["dispatch_agent_id"] = owner_id
+    return replace(current, **updates)
 
 
 def _dispatch_waiting_phase(slices: Mapping[str, SliceState]) -> TLWaiting:
