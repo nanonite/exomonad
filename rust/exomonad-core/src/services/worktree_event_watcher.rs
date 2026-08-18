@@ -5,8 +5,8 @@ use crate::services::event_log::{
     canonical_review_wakeup_data, canonical_sibling_merged_data, PR_REVIEW_EVENT_TYPE,
 };
 use crate::services::pr_registry::{
-    read_published_heads, ForgejoReviewState, PrEntry, PrRegistry, PrState, PublishedHead,
-    ReviewerAttempt, ReviewerAttemptPhase,
+    read_published_heads, ForgejoReviewState, PrEntry, PrRegistry, PrState, PublicationProvenance,
+    PublishedHead, ReviewerAttempt, ReviewerAttemptPhase,
 };
 use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
@@ -163,8 +163,20 @@ fn validate_publication_slice(
     publication: &PublishedHead,
     identity: Option<&AgentIdentityRecord>,
 ) -> std::result::Result<(), String> {
-    let Some(slice_id) = publication.slice_id.as_deref() else {
-        return Ok(());
+    let slice_id = match publication.provenance {
+        PublicationProvenance::LedgerOwned => publication
+            .slice_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                "ledger-owned publication is missing a non-empty resolver-backed slice".to_string()
+            })?,
+        PublicationProvenance::Legacy => {
+            let Some(slice_id) = publication.slice_id.as_deref() else {
+                return Ok(());
+            };
+            slice_id
+        }
     };
     let identity = identity.ok_or_else(|| {
         format!("publication slice '{slice_id}' has no registered owner identity")
@@ -179,10 +191,14 @@ fn validate_publication_slice(
 }
 
 fn validate_publication_invocation(publication: &PublishedHead) -> std::result::Result<(), String> {
-    if publication.slice_id.is_some() && publication.invocation_id.is_none() {
-        return Err(
-            "new publication with a proven slice is missing invocation provenance".to_string(),
-        );
+    if publication.provenance == PublicationProvenance::LedgerOwned
+        && publication
+            .invocation_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+    {
+        return Err("ledger-owned publication is missing invocation provenance".to_string());
     }
     Ok(())
 }
@@ -1449,6 +1465,7 @@ where
             head_sha: head_sha.clone(),
             author_agent: Some(pr.author_agent.clone()),
             author_role: Some(pr.author_role.clone()),
+            provenance: PublicationProvenance::Legacy,
             slice_id: None,
             invocation_id: None,
             invocation_trigger: Some("debug_mock_watcher".to_string()),
@@ -5117,6 +5134,7 @@ mod tests {
             head_sha: "sha-1".to_string(),
             author_agent: owner.map(ToOwned::to_owned),
             author_role: Some("dev".to_string()),
+            provenance: PublicationProvenance::LedgerOwned,
             slice_id: Some("slice-a".to_string()),
             invocation_id: None,
             invocation_trigger: None,
@@ -5157,7 +5175,14 @@ mod tests {
             .expect_err("new sliced publications must carry invocation provenance");
         assert!(error.contains("missing invocation provenance"));
 
+        let mut missing_slice = publication_for_owner(Some("feat-codex"));
+        missing_slice.slice_id = None;
+        let error = validate_publication_slice(&missing_slice, None)
+            .expect_err("ledger-owned publications must carry a server-owned slice");
+        assert!(error.contains("missing a non-empty resolver-backed slice"));
+
         let mut legacy = publication_for_owner(Some("feat-codex"));
+        legacy.provenance = PublicationProvenance::Legacy;
         legacy.slice_id = None;
         assert!(
             validate_publication_invocation(&legacy).is_ok(),
@@ -5221,6 +5246,7 @@ mod tests {
                 head_sha: sha.to_string(),
                 author_agent: Some("feat-codex".to_string()),
                 author_role: None,
+                provenance: PublicationProvenance::Legacy,
                 slice_id: None,
                 invocation_id: None,
                 invocation_trigger: None,
@@ -5245,6 +5271,7 @@ mod tests {
                 head_sha: sha.to_string(),
                 author_agent: Some("feat-codex".to_string()),
                 author_role: None,
+                provenance: PublicationProvenance::Legacy,
                 slice_id: None,
                 invocation_id: None,
                 invocation_trigger: None,
@@ -5486,6 +5513,7 @@ mod tests {
                     head_sha: "abc123".to_string(),
                     author_agent: Some("feat-codex".to_string()),
                     author_role: None,
+                    provenance: PublicationProvenance::Legacy,
                     slice_id: None,
                     invocation_id: None,
                     invocation_trigger: None,
@@ -5683,6 +5711,7 @@ mod tests {
                     head_sha: "abc123".to_string(),
                     author_agent: Some("feat-codex".to_string()),
                     author_role: None,
+                    provenance: PublicationProvenance::Legacy,
                     slice_id: None,
                     invocation_id: None,
                     invocation_trigger: None,
@@ -5801,6 +5830,7 @@ mod tests {
                     head_sha: "abc123".to_string(),
                     author_agent: Some("feat-codex".to_string()),
                     author_role: None,
+                    provenance: PublicationProvenance::Legacy,
                     slice_id: None,
                     invocation_id: None,
                     invocation_trigger: None,

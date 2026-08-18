@@ -62,7 +62,7 @@ from tl_loop.state.schema import (
     SliceStatus,
     Verdict,
 )
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import CorruptCheckpoint, RunStore, create
 
 
 class HarnessError(RuntimeError):
@@ -944,16 +944,42 @@ def run_real_watcher_routing_probe(
             f"watcher event ordering was not durable: filed={filed_event!r} "
             f"review={watcher_event!r} ci={ci_event!r}"
         )
-    child = RunStore("sub-a", child_state_root).load()
     child_checkpoint = child_state_root / "sub-a" / "run.json"
-    if not child_checkpoint.is_file() or child.ledger_run_id != swarm_id:
+    expected_cursor = max(watcher_seq, ci_seq)
+    checkpoint_deadline = time.monotonic() + 30
+    child = None
+    while time.monotonic() < checkpoint_deadline:
+        try:
+            candidate = RunStore("sub-a", child_state_root).load()
+        except CorruptCheckpoint:
+            time.sleep(0.1)
+            continue
+        if not child_checkpoint.is_file() or candidate.ledger_run_id != swarm_id:
+            time.sleep(0.1)
+            continue
+        current = candidate.slices.get(slice_id)
+        if (
+            current is not None
+            and current.pr_number == pr_number
+            and current.reviewed_head == head_sha
+            and candidate.events.last_consumed_offset >= expected_cursor
+            and current.ci_state.get(head_sha) == "success"
+            and current.verdict in {Verdict.GO, Verdict.GO_WITH_NITS}
+            and current.reviewer_attempt.get(head_sha) == 1
+            and len(current.reviewer_attempt) == 1
+        ):
+            child = candidate
+            break
+        time.sleep(0.1)
+    if child is None:
         raise HarnessError(
-            f"recursive child checkpoint lost authoritative swarm identity: {child!r}"
+            "recursive controller did not durably consume approval and CI: "
+            f"checkpoint={child_checkpoint} expected_cursor={expected_cursor}"
         )
     current = child.slices[slice_id]
     if current.pr_number != pr_number or current.reviewed_head != head_sha:
         raise HarnessError(f"recursive controller did not route the PR to its leaf: {current!r}")
-    if child.events.last_consumed_offset < max(watcher_seq, ci_seq):
+    if child.events.last_consumed_offset < expected_cursor:
         raise HarnessError(
             "recursive controller did not consume the real watcher events: "
             f"cursor={child.events.last_consumed_offset} review_seq={watcher_seq} "

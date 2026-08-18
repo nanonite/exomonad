@@ -8,6 +8,16 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 pub const PUBLISHED_HEADS_FILENAME: &str = "published-heads.json";
+const PUBLISHED_HEADS_SCHEMA_VERSION: u32 = 1;
+
+/// Identifies whether publication metadata came from the current ledger-owned
+/// filing boundary or from a migrated pre-provenance record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationProvenance {
+    Legacy,
+    LedgerOwned,
+}
 
 /// A PR head that was confirmed by the Forgejo create/update response.
 ///
@@ -24,11 +34,12 @@ pub struct PublishedHead {
     pub author_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_role: Option<String>,
-    /// The TL slice identifier, when the filing boundary supplied one.
+    /// Explicitly identifies the publication's provenance contract.
+    pub provenance: PublicationProvenance,
+    /// The server-owned TL slice identifier for ledger-owned publications.
     ///
-    /// This is deliberately optional: legacy PRs can be replayed using their
-    /// verified owner and branch, but the watcher must never invent a slice
-    /// from a branch slug.
+    /// Migrated legacy publications may omit this field; the watcher must
+    /// never invent a slice from a branch slug.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slice_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +84,24 @@ impl PublishedHead {
         {
             anyhow::bail!("verified publication must not contain an empty slice_id");
         }
+        if self.provenance == PublicationProvenance::LedgerOwned {
+            if self
+                .slice_id
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "ledger-owned publication must include a non-empty resolver-backed slice_id"
+                );
+            }
+            if self
+                .invocation_id
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                anyhow::bail!("ledger-owned publication must include a non-empty invocation_id");
+            }
+        }
         Ok(())
     }
 }
@@ -83,10 +112,18 @@ pub enum PublicationDisposition {
     Duplicate,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PublishedHeadsFile {
-    #[serde(default)]
+    schema_version: u32,
     heads: Vec<PublishedHead>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPublishedHeadsFile {
+    #[serde(default)]
+    schema_version: Option<u32>,
+    #[serde(default)]
+    heads: Vec<serde_json::Value>,
 }
 
 fn published_heads_lock() -> &'static Mutex<()> {
@@ -107,9 +144,37 @@ async fn read_published_heads_locked(project_dir: &Path) -> Result<Vec<Published
             return Err(error).with_context(|| format!("failed to read {}", path.display()))
         }
     };
-    Ok(serde_json::from_str::<PublishedHeadsFile>(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))?
-        .heads)
+    let raw = serde_json::from_str::<RawPublishedHeadsFile>(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let schema_version = raw.schema_version.unwrap_or(0);
+    if schema_version > PUBLISHED_HEADS_SCHEMA_VERSION {
+        anyhow::bail!(
+            "{} uses unsupported publication registry schema version {}",
+            path.display(),
+            schema_version
+        );
+    }
+    raw.heads
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut value)| {
+            if schema_version == 0 {
+                let object = value.as_object_mut().ok_or_else(|| {
+                    anyhow::anyhow!("{} head {} must be a JSON object", path.display(), index)
+                })?;
+                object
+                    .entry("provenance")
+                    .or_insert_with(|| serde_json::json!("legacy"));
+            }
+            serde_json::from_value(value).with_context(|| {
+                format!(
+                    "failed to parse publication registry head {} in {}",
+                    index,
+                    path.display()
+                )
+            })
+        })
+        .collect()
 }
 
 pub async fn read_published_heads(project_dir: &Path) -> Result<Vec<PublishedHead>> {
@@ -127,6 +192,7 @@ pub async fn publish_verified_head(
     publication.validate()?;
     let _guard = published_heads_lock().lock().await;
     let mut file = PublishedHeadsFile {
+        schema_version: PUBLISHED_HEADS_SCHEMA_VERSION,
         heads: read_published_heads_locked(project_dir).await?,
     };
 
@@ -313,6 +379,7 @@ mod tests {
             head_sha: sha.to_string(),
             author_agent: Some("feature-codex".to_string()),
             author_role: Some("dev".to_string()),
+            provenance: PublicationProvenance::Legacy,
             slice_id: None,
             invocation_id: Some("invocation-1".to_string()),
             invocation_trigger: Some("resume_pr".to_string()),
@@ -371,6 +438,64 @@ mod tests {
 
         assert!(!old.matches_current(42, "main.feature-codex", "main", "sha-new"));
         assert!(old.matches_current(42, "main.feature-codex", "main", "sha-old"));
+    }
+
+    #[test]
+    fn ledger_owned_publication_requires_slice_and_invocation() {
+        let mut ledger_owned = publication("sha-1");
+        ledger_owned.provenance = PublicationProvenance::LedgerOwned;
+        assert!(ledger_owned
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("slice_id"));
+
+        ledger_owned.slice_id = Some("slice-a".to_string());
+        ledger_owned.invocation_id = None;
+        assert!(ledger_owned
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("invocation_id"));
+    }
+
+    #[tokio::test]
+    async fn legacy_registry_entries_are_explicitly_migrated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".exo").join(PUBLISHED_HEADS_FILENAME);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &path,
+            br#"{"heads":[{"pr_number":42,"head_branch":"main.feature-codex","base_branch":"main","head_sha":"sha-1","author_agent":"feature-codex","author_role":"dev"}]}"#,
+        )
+        .await
+        .unwrap();
+
+        let heads = read_published_heads(directory.path()).await.unwrap();
+        assert_eq!(heads[0].provenance, PublicationProvenance::Legacy);
+        assert!(heads[0].slice_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn new_registry_entries_persist_explicit_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut publication = publication("sha-1");
+        publication.provenance = PublicationProvenance::LedgerOwned;
+        publication.slice_id = Some("slice-a".to_string());
+
+        publish_verified_head(directory.path(), publication)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(directory.path().join(".exo").join(PUBLISHED_HEADS_FILENAME))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["schema_version"], PUBLISHED_HEADS_SCHEMA_VERSION);
+        assert_eq!(document["heads"][0]["provenance"], "ledger_owned");
     }
 
     #[tokio::test]

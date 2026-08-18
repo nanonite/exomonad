@@ -8,7 +8,7 @@ use crate::effects::{
     dispatch_file_pr_effect, EffectError, EffectHandler, EffectResult, FilePrEffects, ResultExt,
 };
 use crate::services::file_pr::{self, FilePRInput};
-use crate::services::pr_registry::{publish_verified_head, PublishedHead};
+use crate::services::pr_registry::{publish_verified_head, PublicationProvenance, PublishedHead};
 use crate::services::repo;
 use crate::services::{capture_memory, MemoryCapture, MemoryKind};
 use async_trait::async_trait;
@@ -116,7 +116,14 @@ impl<
             .agent_resolver()
             .get(&ctx.agent_name)
             .await
-            .and_then(|record| record.slice_id);
+            .and_then(|record| record.slice_id)
+            .filter(|slice_id| !slice_id.trim().is_empty())
+            .ok_or_else(|| {
+                EffectError::invalid_input(format!(
+                    "file_pr requires a non-empty server-owned slice identity for {}",
+                    ctx.agent_name
+                ))
+            })?;
         let base_branch = non_empty(req.base_branch).map(|s| {
             BranchName::try_from_str(s.as_str()).expect("validated string input is non-empty")
         });
@@ -153,7 +160,8 @@ impl<
             head_sha: output.head_sha.clone(),
             author_agent: Some(ctx.agent_name.to_string()),
             author_role: Some("dev".to_string()),
-            slice_id,
+            provenance: PublicationProvenance::LedgerOwned,
+            slice_id: Some(slice_id),
             invocation_id: Some(invocation.invocation_id.clone()),
             invocation_trigger: Some(format!("{:?}", invocation.trigger).to_ascii_lowercase()),
             invocation_runtime: Some(format!("{:?}", invocation.runtime).to_ascii_lowercase()),
