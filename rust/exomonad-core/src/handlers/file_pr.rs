@@ -208,11 +208,13 @@ impl<
                 event_type,
                 ctx.agent_name.as_ref(),
                 &serde_json::json!({
+                    "agent_id": ctx.agent_name.to_string(),
                     "pr_number": output.pr_number.as_u64(),
                     "pr_url": output.pr_url,
                     "head_branch": output.head_branch.to_string(),
                     "base_branch": output.base_branch.to_string(),
                     "head_sha": output.head_sha.clone(),
+                    "branch": output.head_branch.to_string(),
                     "created": output.created,
                     "title": input.title,
                 }),

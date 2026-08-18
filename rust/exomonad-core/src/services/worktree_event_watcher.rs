@@ -79,6 +79,7 @@ enum PendingAction {
         payload: serde_json::Value,
     },
     EmitEvent {
+        pr_number: u64,
         status: String,
         message: String,
         head_sha: String,
@@ -137,6 +138,30 @@ fn review_event_target(pr: &PrEntry) -> (BranchName, AgentType, String) {
         AgentType::from_dir_name(&pr.author_agent),
         pr.author_role.clone(),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_watcher_event_data(
+    agent_id: &str,
+    branch: &str,
+    pr_number: u64,
+    head_sha: &str,
+    status: &str,
+    message: &str,
+    comments: Option<Vec<ForgejoReviewComment>>,
+    reviews: Option<Vec<ForgejoReview>>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "agent_id": agent_id,
+        "owner_id": agent_id,
+        "branch": branch,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "status": status,
+        "message": message,
+        "comments": comments,
+        "reviews": reviews,
+    })
 }
 
 fn review_state_is_terminal(review_state: &ForgejoReviewState) -> bool {
@@ -1627,6 +1652,7 @@ where
                         }
                     }
                     PendingAction::EmitEvent {
+                        pr_number,
                         status,
                         message,
                         head_sha,
@@ -1634,7 +1660,9 @@ where
                         reviews,
                     } => {
                         self.emit_event(
+                            &pending.agent_name,
                             pending.branch.as_str(),
+                            pr_number,
                             &status,
                             &message,
                             &head_sha,
@@ -2090,7 +2118,9 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn emit_event(
         &self,
+        agent_id: &str,
         branch: &str,
+        pr_number: u64,
         status: &str,
         message: &str,
         head_sha: &str,
@@ -2120,9 +2150,10 @@ where
 
         tracing::info!(
             otel.name = event_name,
-            agent_id = %branch,
+            agent_id,
             head_sha = %head_sha,
             branch = %branch,
+            pr_number,
             status = %status,
             message = %message,
             comments = %comments_json,
@@ -2133,15 +2164,10 @@ where
         if let Some(log) = self.ctx.event_log() {
             let _ = log.append(
                 event_name,
-                branch,
-                &serde_json::json!({
-                    "branch": branch,
-                    "head_sha": head_sha,
-                    "status": status,
-                    "message": message,
-                    "comments": comments,
-                    "reviews": reviews,
-                }),
+                agent_id,
+                &canonical_watcher_event_data(
+                    agent_id, branch, pr_number, head_sha, status, message, comments, reviews,
+                ),
             );
         }
 
@@ -2509,6 +2535,7 @@ fn compute_pr_actions_with_context(
                 rounds: old_state.rounds,
             });
             pending_actions.push(PendingAction::EmitEvent {
+                pr_number: pr_number.as_u64(),
                 status: "copilot_review".to_string(),
                 message: message.clone(),
                 head_sha: pr_sha.to_string(),
@@ -2590,6 +2617,7 @@ fn compute_pr_actions_with_context(
             }),
         });
         pending_actions.push(PendingAction::EmitEvent {
+            pr_number: pr_number.as_u64(),
             status: ci_status.to_string(),
             message: format!("[CI STATUS: {}] {}", branch, ci_status),
             head_sha: pr_sha.to_string(),
@@ -4931,6 +4959,27 @@ mod tests {
         let state = state.get(&1).unwrap();
         assert_eq!(state.last_review_state, ForgejoReviewVerdict::None);
         assert!(state.reviewer_attempt.is_none());
+    }
+
+    #[test]
+    fn canonical_watcher_event_data_preserves_stable_owner_and_pr() {
+        let data = canonical_watcher_event_data(
+            "tunable-operator-body-opencode",
+            "main.tunable-operator-body-opencode",
+            42,
+            "head-42",
+            "failure",
+            "tests failed",
+            None,
+            None,
+        );
+
+        assert_eq!(data["agent_id"], "tunable-operator-body-opencode");
+        assert_eq!(data["owner_id"], "tunable-operator-body-opencode");
+        assert_eq!(data["branch"], "main.tunable-operator-body-opencode");
+        assert_eq!(data["pr_number"], 42);
+        assert_eq!(data["head_sha"], "head-42");
+        assert_eq!(data["status"], "failure");
     }
 
     fn test_pr_entry() -> crate::services::pr_registry::PrEntry {
