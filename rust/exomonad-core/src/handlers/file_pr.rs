@@ -89,6 +89,8 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<FilePrResponse> {
         tracing::info!(title = %req.title, "[FilePR] file_pr starting");
+        let slice_id = pr_body_metadata_value(&req.body, "TL-Slice-ID")
+            .or_else(|| pr_body_metadata_value(&req.body, "Slice-ID"));
         let base_branch = non_empty(req.base_branch).map(|s| {
             BranchName::try_from_str(s.as_str()).expect("validated string input is non-empty")
         });
@@ -132,6 +134,7 @@ impl<
             head_sha: output.head_sha.clone(),
             author_agent: Some(ctx.agent_name.to_string()),
             author_role: Some("dev".to_string()),
+            slice_id,
             invocation_id: invocation
                 .as_ref()
                 .map(|record| record.invocation_id.clone()),

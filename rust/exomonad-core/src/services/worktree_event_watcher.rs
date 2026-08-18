@@ -108,6 +108,7 @@ struct PendingPrActions {
     agent_type: AgentType,
     agent_name: String,
     agent_role: String,
+    slice_id: Option<String>,
     head_sha: String,
     issue_id: Option<i64>,
 }
@@ -140,11 +141,30 @@ fn review_event_target(pr: &PrEntry) -> (BranchName, AgentType, String) {
     )
 }
 
+fn validate_publication_owner(
+    pr: &PrEntry,
+    publication: &PublishedHead,
+) -> std::result::Result<String, String> {
+    let owner = publication
+        .author_agent
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "verified publication is missing author_agent".to_string())?;
+    if owner != pr.author_agent {
+        return Err(format!(
+            "publication owner '{owner}' conflicts with PR owner '{}'",
+            pr.author_agent
+        ));
+    }
+    Ok(owner.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn canonical_watcher_event_data(
     agent_id: &str,
     branch: &str,
     pr_number: u64,
+    slice_id: Option<&str>,
     head_sha: &str,
     status: &str,
     message: &str,
@@ -156,6 +176,7 @@ fn canonical_watcher_event_data(
         "owner_id": agent_id,
         "branch": branch,
         "pr_number": pr_number,
+        "slice_id": slice_id.filter(|value| !value.trim().is_empty()),
         "head_sha": head_sha,
         "status": status,
         "message": message,
@@ -1290,6 +1311,20 @@ where
             }) else {
                 continue;
             };
+            if let Err(reason) = validate_publication_owner(pr, publication) {
+                self.log_watcher_event(
+                    "watcher.ownership_unresolved",
+                    &serde_json::json!({
+                        "pr_number": number,
+                        "branch": pr.head_branch,
+                        "publication_owner": publication.author_agent,
+                        "registry_owner": pr.author_agent,
+                        "reason": reason,
+                    }),
+                );
+                warn!(pr_number = number, %reason, "Ignoring PR with unverified publication ownership");
+                continue;
+            }
 
             let (review_state, comments, reviews, changes_requested_rounds, forgejo_review_present) =
                 self.forgejo_review_parts(*number, &head_sha).await;
@@ -1351,6 +1386,7 @@ where
             head_sha: head_sha.clone(),
             author_agent: Some(pr.author_agent.clone()),
             author_role: Some(pr.author_role.clone()),
+            slice_id: None,
             invocation_id: None,
             invocation_trigger: Some("debug_mock_watcher".to_string()),
             invocation_runtime: None,
@@ -1402,6 +1438,26 @@ where
                     );
                     continue;
                 };
+                let owner_id = match validate_publication_owner(pr, publication) {
+                    Ok(owner) => owner,
+                    Err(reason) => {
+                        self.log_watcher_event(
+                            "watcher.ownership_unresolved",
+                            &serde_json::json!({
+                                "pr_number": pr_number,
+                                "branch": pr.head_branch,
+                                "publication_owner": publication.author_agent,
+                                "registry_owner": pr.author_agent,
+                                "reason": reason,
+                            }),
+                        );
+                        warn!(
+                            pr_number,
+                            "Ignoring PR observation with unverified ownership"
+                        );
+                        continue;
+                    }
+                };
                 if !publication.matches_current(
                     *pr_number,
                     pr.head_branch.as_str(),
@@ -1417,7 +1473,7 @@ where
                     continue;
                 }
 
-                let agent_name = &pr.author_agent;
+                let agent_name = owner_id;
                 let (branch, agent_type, agent_role) = review_event_target(pr);
                 let persisted = watcher_state
                     .prs
@@ -1543,8 +1599,9 @@ where
                         actions,
                         branch,
                         agent_type,
-                        agent_name: agent_name.clone(),
+                        agent_name,
                         agent_role,
+                        slice_id: publication.slice_id.clone(),
                         head_sha: obs.head_sha.clone(),
                         issue_id: pr
                             .chainlink_issue_id
@@ -1663,6 +1720,7 @@ where
                             &pending.agent_name,
                             pending.branch.as_str(),
                             pr_number,
+                            pending.slice_id.as_deref(),
                             &status,
                             &message,
                             &head_sha,
@@ -2121,6 +2179,7 @@ where
         agent_id: &str,
         branch: &str,
         pr_number: u64,
+        slice_id: Option<&str>,
         status: &str,
         message: &str,
         head_sha: &str,
@@ -2166,7 +2225,8 @@ where
                 event_name,
                 agent_id,
                 &canonical_watcher_event_data(
-                    agent_id, branch, pr_number, head_sha, status, message, comments, reviews,
+                    agent_id, branch, pr_number, slice_id, head_sha, status, message, comments,
+                    reviews,
                 ),
             );
         }
@@ -3387,6 +3447,7 @@ mod tests {
             agent_type: AgentType::Codex,
             agent_name: "feat-codex".to_string(),
             agent_role: "dev".to_string(),
+            slice_id: None,
             head_sha: "abc123".to_string(),
             issue_id: Some(632),
         }
@@ -4967,6 +5028,7 @@ mod tests {
             "tunable-operator-body-opencode",
             "main.tunable-operator-body-opencode",
             42,
+            Some("tunable-operator-body"),
             "head-42",
             "failure",
             "tests failed",
@@ -4978,8 +5040,51 @@ mod tests {
         assert_eq!(data["owner_id"], "tunable-operator-body-opencode");
         assert_eq!(data["branch"], "main.tunable-operator-body-opencode");
         assert_eq!(data["pr_number"], 42);
+        assert_eq!(data["slice_id"], "tunable-operator-body");
         assert_eq!(data["head_sha"], "head-42");
         assert_eq!(data["status"], "failure");
+    }
+
+    fn publication_for_owner(owner: Option<&str>) -> PublishedHead {
+        PublishedHead {
+            pr_number: 1,
+            head_branch: "main.feat-codex".to_string(),
+            base_branch: "main".to_string(),
+            head_sha: "sha-1".to_string(),
+            author_agent: owner.map(ToOwned::to_owned),
+            author_role: Some("dev".to_string()),
+            slice_id: Some("slice-a".to_string()),
+            invocation_id: None,
+            invocation_trigger: None,
+            invocation_runtime: None,
+        }
+    }
+
+    #[test]
+    fn missing_publication_owner_is_unresolved() {
+        let error = validate_publication_owner(&test_pr_entry(), &publication_for_owner(None))
+            .expect_err("missing owner must not be routable");
+        assert!(error.contains("missing author_agent"));
+    }
+
+    #[test]
+    fn conflicting_publication_owner_is_unresolved() {
+        let error =
+            validate_publication_owner(&test_pr_entry(), &publication_for_owner(Some("stale")))
+                .expect_err("conflicting owner must not be routable");
+        assert!(error.contains("conflicts with PR owner"));
+    }
+
+    #[test]
+    fn matching_publication_owner_is_authoritative() {
+        assert_eq!(
+            validate_publication_owner(
+                &test_pr_entry(),
+                &publication_for_owner(Some("feat-codex"))
+            )
+            .unwrap(),
+            "feat-codex"
+        );
     }
 
     fn test_pr_entry() -> crate::services::pr_registry::PrEntry {
@@ -5036,8 +5141,9 @@ mod tests {
                 head_branch: "main.feat-codex".to_string(),
                 base_branch: "main".to_string(),
                 head_sha: sha.to_string(),
-                author_agent: None,
+                author_agent: Some("feat-codex".to_string()),
                 author_role: None,
+                slice_id: None,
                 invocation_id: None,
                 invocation_trigger: None,
                 invocation_runtime: None,
@@ -5059,8 +5165,9 @@ mod tests {
                 head_branch: "main.feat-codex".to_string(),
                 base_branch: "main".to_string(),
                 head_sha: sha.to_string(),
-                author_agent: None,
+                author_agent: Some("feat-codex".to_string()),
                 author_role: None,
+                slice_id: None,
                 invocation_id: None,
                 invocation_trigger: None,
                 invocation_runtime: None,
@@ -5298,8 +5405,9 @@ mod tests {
                     head_branch: "main.feat-codex".to_string(),
                     base_branch: "main".to_string(),
                     head_sha: "abc123".to_string(),
-                    author_agent: None,
+                    author_agent: Some("feat-codex".to_string()),
                     author_role: None,
+                    slice_id: None,
                     invocation_id: None,
                     invocation_trigger: None,
                     invocation_runtime: None,
@@ -5494,8 +5602,9 @@ mod tests {
                     head_branch: "main.feat-codex".to_string(),
                     base_branch: "main".to_string(),
                     head_sha: "abc123".to_string(),
-                    author_agent: None,
+                    author_agent: Some("feat-codex".to_string()),
                     author_role: None,
+                    slice_id: None,
                     invocation_id: None,
                     invocation_trigger: None,
                     invocation_runtime: None,
@@ -5611,8 +5720,9 @@ mod tests {
                     head_branch: "main.feat-codex".to_string(),
                     base_branch: "main".to_string(),
                     head_sha: "abc123".to_string(),
-                    author_agent: None,
+                    author_agent: Some("feat-codex".to_string()),
                     author_role: None,
+                    slice_id: None,
                     invocation_id: None,
                     invocation_trigger: None,
                     invocation_runtime: None,

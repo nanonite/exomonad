@@ -24,6 +24,13 @@ pub struct PublishedHead {
     pub author_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_role: Option<String>,
+    /// The TL slice identifier, when the filing boundary supplied one.
+    ///
+    /// This is deliberately optional: legacy PRs can be replayed using their
+    /// verified owner and branch, but the watcher must never invent a slice
+    /// from a branch slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,6 +65,13 @@ impl PublishedHead {
             if value.trim().is_empty() {
                 anyhow::bail!("verified publication must include {field}");
             }
+        }
+        if self
+            .slice_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            anyhow::bail!("verified publication must not contain an empty slice_id");
         }
         Ok(())
     }
@@ -299,6 +313,7 @@ mod tests {
             head_sha: sha.to_string(),
             author_agent: Some("feature-codex".to_string()),
             author_role: Some("dev".to_string()),
+            slice_id: None,
             invocation_id: Some("invocation-1".to_string()),
             invocation_trigger: Some("resume_pr".to_string()),
             invocation_runtime: Some("codex".to_string()),
