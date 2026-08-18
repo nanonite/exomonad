@@ -99,6 +99,7 @@ from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 from .reconcile import ReconciliationResult, reconcile_slice
+from .journal import EffectJournal, MUTATING_OPERATIONS
 
 LOGGER = logging.getLogger(__name__)
 TIMEOUT_GATE_NAME = "tl-timeout"
@@ -683,7 +684,11 @@ def run_tl_loop(
     if effective_ledger_run_id is not None:
         selected = replace(selected, ledger_run_id=effective_ledger_run_id)
     state = _initialize_ordered_runtime(work_plan, state, store)
-    effects_log: list[EffectIntent] = []
+    effects_log: list[EffectIntent] = (
+        EffectJournal(run_id, store.run_dir / "action-journal.json")
+        if selected.ledger_run_id is not None
+        else []
+    )
     state = _reconcile_dispatches(state, selected, effects, store, effects_log)
     state = _reconcile_nonterminal_slices(state, selected, effects, store, effects_log)
     state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
@@ -4533,13 +4538,39 @@ def _invoke(
     *,
     raise_on_failure: bool = True,
 ) -> ToolResult | None:
-    effects_log.append(EffectIntent(operation, target, arguments, active))
+    intent = EffectIntent(operation, target, arguments, active)
+    journal = effects_log if isinstance(effects_log, EffectJournal) else None
+    prior = journal.existing(intent) if journal and operation in MUTATING_OPERATIONS else None
+    if prior is not None:
+        status = prior.get("status")
+        if status in {"confirmed", "rejected"}:
+            result = journal.replay(prior)
+            if result.success is False and raise_on_failure:
+                detail = result.error or f"{operation} returned failure"
+                raise EffectFailed(f"{operation} for {target!r}: {detail}")
+            return result
+        if status in {"intended", "unknown"}:
+            key = prior.get("key", journal.key_for(intent))
+            raise TLLoopError(
+                f"lifecycle effect {operation} for {target!r} has unknown outcome "
+                f"and requires reconciliation before retry (key={key})"
+            )
+    effects_log.append(intent)
     LOGGER.info("[TL loop] effect=%s target=%s active=%s", operation, target, active)
     if not active:
+        if journal is not None:
+            journal.mark_not_dispatched(intent)
         return None
     if client is None:
         raise TLLoopError("active loop has no effect client")
-    result = call(client)
+    try:
+        result = call(client)
+    except BaseException as error:
+        if journal is not None:
+            journal.mark_unknown(intent, error)
+        raise
+    if journal is not None:
+        journal.mark_result(intent, result)
     if result.success is False and raise_on_failure:
         detail = result.error or f"{operation} returned failure"
         raise EffectFailed(f"{operation} for {target!r}: {detail}")
