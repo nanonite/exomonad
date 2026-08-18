@@ -748,6 +748,139 @@ def run_root_recursive_lifecycle_probe(
         stop_spawned_worker(repo, worker_name)
 
 
+def run_real_watcher_routing_probe(
+    client: TransportClient,
+    root: Path,
+    repo: Path,
+    forgejo_url: str,
+    swarm_id: str,
+) -> None:
+    """Route Rust file_pr and watcher events through a real Python ledger reader."""
+    run_id = "real-watcher-routing"
+    state_root = root / "watcher-routing-state"
+    slice_id = "real-watcher-leaf"
+    owner_id = "sub-a"
+    owner_effects = EffectClient(client, role="tl", name=owner_id)
+    filed = owner_effects.file_pr(
+        title="Real watcher routing",
+        body="TL-Slice-ID: real-watcher-leaf\nProduction boundary fixture",
+        base_branch="main",
+    )
+    filed_data = find_object(filed, {"pr_number", "head_branch"})
+    pr_number = int(filed_data["pr_number"])
+    branch = str(filed_data["head_branch"])
+    snapshot = owner_effects.watcher_pr_state(pr_number=pr_number)
+    evidence = find_object(snapshot, {"head_sha"})
+    head_sha = str(evidence["head_sha"])
+    json_request(
+        "POST",
+        f"{forgejo_url}/api/v1/repos/owner/repo/pulls/{pr_number}/reviews",
+        {"event": "APPROVED", "commit_id": head_sha},
+    )
+
+    deadline = time.monotonic() + 20
+    filed_event: Mapping[str, Any] | None = None
+    watcher_event: Mapping[str, Any] | None = None
+    while time.monotonic() < deadline:
+        for event in server_ledger_events(repo):
+            data = event.get("data")
+            if (
+                event.get("run_id") == swarm_id
+                and isinstance(data, Mapping)
+                and data.get("pr_number") == pr_number
+            ):
+                if event.get("type") in {"pr.filed", "pr.updated"}:
+                    filed_event = event
+                if event.get("type") in {"copilot.review", "ci.status_changed"}:
+                    watcher_event = event
+        if filed_event is not None and watcher_event is not None:
+            break
+        time.sleep(0.1)
+    if filed_event is None or watcher_event is None:
+        raise HarnessError(
+            "real watcher did not publish both file_pr and watcher observations: "
+            f"filed={filed_event!r} watcher={watcher_event!r}"
+        )
+    watcher_data = watcher_event.get("data")
+    if not isinstance(watcher_data, Mapping) or watcher_data.get("owner_id") != owner_id:
+        raise HarnessError(f"watcher ownership was not canonical: {watcher_event!r}")
+    if watcher_data.get("slice_id") != slice_id or watcher_data.get("branch") != branch:
+        raise HarnessError(f"watcher omitted proven slice/branch identity: {watcher_event!r}")
+
+    plan = WorkPlan(leaves=(LeafTask(slice_id, "consume real watcher routing"),))
+    config = TLLoopConfig(
+        active=True,
+        test_harness=True,
+        keep_alive_on_waiting=True,
+        max_events=2,
+        poll_interval=0.01,
+        idle_timeout=5.0,
+        dispatch_timeout=5.0,
+        root_dir=state_root,
+        run_id=run_id,
+        ledger_run_id=swarm_id,
+        branch="main",
+        worktree=repo,
+    )
+    initial = _initial_slices(plan, config, state_root, run_id)
+    initial[slice_id].update(
+        {
+            "status": SliceStatus.IN_REVIEW.value,
+            "branch": branch,
+            "dispatch_agent_id": owner_id,
+            "dispatch_intent_id": "real-watcher-intent",
+            "dispatch_last_boundary": "agent.spawned",
+            "dispatch_authoritative_event_seq": 1,
+        }
+    )
+    filed_seq = filed_event.get("run_seq")
+    watcher_seq = watcher_event.get("run_seq")
+    if type(filed_seq) is not int or type(watcher_seq) is not int or watcher_seq <= filed_seq:
+        raise HarnessError(f"watcher event ordering was not durable: {filed_event!r} {watcher_event!r}")
+    create(
+        run_id,
+        {
+            "owner_branch": "main",
+            "owner_worktree": str(repo),
+            "slices": initial,
+            "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
+        },
+        root_dir=state_root,
+    )
+    store = RunStore(run_id, state_root)
+    seeded = store.load()
+    store.checkpoint(
+        TLWaiting({slice_id: ChildHandle(slice_id, branch, owner_id)}),
+        seeded.slices,
+        seeded.budgets,
+        filed_seq - 1,
+    )
+    reader = LedgerReader(
+        repo / ".exo" / "ledger" / "segments",
+        run_id=run_id,
+        state_root=state_root,
+        ledger_run_id=swarm_id,
+    )
+    source = LedgerQueue(reader, poll_interval=0.01, active_tail_timeout=5).start()
+    try:
+        result = run_tl_loop(
+            run_id,
+            plan,
+            source,
+            EffectClient(client, role="tl", name="parent"),
+            config=config,
+            root_dir=state_root,
+        )
+    finally:
+        source.close()
+    final = RunStore(run_id, state_root).load()
+    current = final.slices[slice_id]
+    if current.pr_number != pr_number or current.reviewed_head != head_sha:
+        raise HarnessError(f"real watcher event did not update the owning slice: {current!r}")
+    if result.diagnostics.get("correlated") != 2:
+        raise HarnessError(f"real watcher events were not consumed exactly once: {result.diagnostics}")
+
+
 def run_recursive_checkpoint_probe(
     client: TransportClient, root: Path, repo: Path, swarm_id: str
 ) -> None:
@@ -1609,6 +1742,7 @@ def main() -> None:
         try:
             server, client = start_server(root, repo, forgejo_url, project_root)
             swarm_id = run_root_recursive_lifecycle_probe(client, root, repo)
+            run_real_watcher_routing_probe(client, root, repo, forgejo_url, swarm_id)
             run_recursive_checkpoint_probe(client, root, repo, swarm_id)
             run_live_ordered_probe(client, root, repo, swarm_id)
             check_pr_evidence(client, branch, repo, forgejo_url)

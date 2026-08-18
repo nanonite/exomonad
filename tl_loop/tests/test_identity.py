@@ -5,13 +5,15 @@ from __future__ import annotations
 import queue
 from types import SimpleNamespace
 
+import pytest
+
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.envelope import project
 from tl_loop.events.identity import envelope_document, resolve_event_slice
 from tl_loop.fsm.phase import ChildHandle, TLWaiting
 from tl_loop.loop.driver import LeafTask, TLLoopConfig, WorkPlan, run_tl_loop
 from tl_loop.state.schema import BudgetLedger, SliceState, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import QuarantineStorageError, RunStore, create
 
 
 def _event(
@@ -96,6 +98,15 @@ def test_quarantine_round_trip_preserves_observation_for_replay(tmp_path) -> Non
     store.release_quarantined_event(7)
 
     assert store.quarantined_events() == ()
+
+
+def test_corrupt_quarantine_storage_is_visible_to_controller(tmp_path) -> None:
+    create("root", {}, root_dir=tmp_path)
+    store = RunStore("root", tmp_path)
+    store.event_quarantine_path.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(QuarantineStorageError, match="invalid event quarantine"):
+        store.quarantined_events()
 
 
 class _ScriptedQueue:

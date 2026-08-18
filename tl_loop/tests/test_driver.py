@@ -105,6 +105,7 @@ class RecordingTransport:
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
     fail_observability: bool = False
     reject_spawns: bool = False
+    spawned_agent_id: str | None = None
     listed_agents: list[JsonObject] = field(default_factory=list)
     next_controller_run_seq: int = 1000
 
@@ -121,6 +122,8 @@ class RecordingTransport:
             return {"success": False, "error": "ledger unavailable"}
         if self.reject_spawns and tool_name in {"spawn_worker", "spawn_leaf"}:
             return {"success": False, "error": "tmux launch rejected"}
+        if tool_name in {"spawn_worker", "spawn_leaf"} and self.spawned_agent_id:
+            return {"success": True, "result": {"agent_id": self.spawned_agent_id}}
         if tool_name == "list_agents":
             return {"success": True, "result": {"agents": self.listed_agents}}
         if tool_name == "emit_controller_event":
@@ -942,27 +945,33 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
         "type": "pr.filed",
         "run_seq": 1,
         "run_id": run_id,
-        "agent_id": "leaf-a",
+        "agent_id": "tunable-operator-body-opencode",
         "lifecycle_state": "emitted",
         "observed_at": "2026-08-12T00:00:00Z",
         "data": {
-            "slice_id": "leaf-a",
             "pr_number": 42,
             "head_sha": "head-a",
+            "branch": "main.tunable-operator-body-opencode",
         },
     }
     source = SyntheticQueue(
         [
             project(cast(dict[str, object], raw_pr_filed)),
-            _event(2, "all_children_done", run_id=run_id),
+            project(
+                {
+                    **raw_pr_filed,
+                    "run_seq": 2,
+                }
+            ),
+            _event(3, "all_children_done", run_id=run_id),
         ]
     )
-    transport = RecordingTransport()
+    transport = RecordingTransport(spawned_agent_id="tunable-operator-body-opencode")
     plan = WorkPlan.from_mapping(
         {
             "leaves": [
                 {
-                    "name": "leaf-a",
+                    "name": "tunable-operator-body",
                     "task": "implement the change",
                     "boundary": ["src/leaf.py"],
                     "verify": ["just tl-loop-test"],
@@ -989,6 +998,7 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
     )
 
     assert _effect_names(transport) == ["spawn_leaf", "spawn_reviewer"]
+    assert sum(name == "spawn_reviewer" for name, _ in transport.calls) == 1
     reviewer_args = next(
         arguments for name, arguments in transport.calls if name == "spawn_reviewer"
     )
@@ -997,9 +1007,9 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
     assert reviewer_args["force"] is False
     criteria = cast(list[object], reviewer_args["acceptance_criteria"])
     assert any("DONE CRITERIA: the changed behavior is covered" in str(item) for item in criteria)
-    slice_state = result.final_state.slices["leaf-a"]
+    slice_state = result.final_state.slices["tunable-operator-body"]
     assert slice_state.reviewer_attempt == {"head-a": 1}
-    assert source.acknowledged == [1, 2]
+    assert source.acknowledged == [1, 2, 3]
 
 
 def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -> None:

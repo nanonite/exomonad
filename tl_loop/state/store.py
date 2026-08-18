@@ -60,6 +60,16 @@ OrderedStagesInput: TypeAlias = (
 IntegrationInput: TypeAlias = IntegrationRuntimeState | Mapping[str, object]
 
 
+class QuarantineStorageError(RuntimeError):
+    """The durable unresolved-event queue cannot be trusted for replay."""
+
+    def __init__(self, path: Path, reason: str, *, cause: BaseException | None = None) -> None:
+        message = f"invalid event quarantine {path}: {reason}"
+        super().__init__(message)
+        if cause is not None:
+            self.__cause__ = cause
+
+
 def _exception_chain(error: BaseException) -> tuple[str, ...]:
     chain: list[str] = []
     seen: set[int] = set()
@@ -225,14 +235,30 @@ class RunStore:
         """Read unresolved observations retained for a later controller run."""
         try:
             payload = json.loads(self.event_quarantine_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except FileNotFoundError:
             return ()
+        except OSError as error:
+            raise QuarantineStorageError(
+                self.event_quarantine_path,
+                "read failed",
+                cause=error,
+            ) from error
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise QuarantineStorageError(
+                self.event_quarantine_path,
+                "invalid JSON or UTF-8",
+                cause=error,
+            ) from error
         if not isinstance(payload, list):
-            return ()
+            raise QuarantineStorageError(self.event_quarantine_path, "root must be a JSON array")
+        if any(not isinstance(item, dict) for item in payload):
+            raise QuarantineStorageError(
+                self.event_quarantine_path,
+                "every entry must be a JSON object",
+            )
         return tuple(
             MappingProxyType(dict(item))
             for item in payload
-            if isinstance(item, dict)
         )
 
     def release_quarantined_event(self, run_seq: int) -> None:
