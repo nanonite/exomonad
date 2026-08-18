@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from tl_loop.state.schema import SliceState, SliceStatus
 
@@ -90,9 +90,7 @@ def reconcile_slice(
 
     if slice_state.pr_number is None:
         missing.append("pr_number")
-    elif watcher is None:
-        missing.append("published_pr")
-    elif watcher.get("found") is not True:
+    elif watcher is None or watcher.get("found") is not True:
         missing.append("published_pr")
     else:
         evidence.append("published_pr")

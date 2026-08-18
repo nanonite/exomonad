@@ -26,6 +26,12 @@ from tl_loop.fsm.phase import (
 )
 from tl_loop.ordered import IntegrationLifecycle
 
+from .migration import (
+    MigrationError,
+    install_migration,
+    migrate_checkpoint_document,
+    record_migration_failure,
+)
 from .schema import (
     ActualTokens,
     BudgetCharge,
@@ -430,9 +436,34 @@ def load(path: str | Path) -> RunState:
         data = _read_bytes(target)
         value = json.loads(data.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        if target.exists():
+            report = record_migration_failure(target, error)
+            raise CorruptCheckpoint(
+                f"{target}: could not read checkpoint: {error}; "
+                f"migration blocked, see {report}"
+            ) from error
         raise CorruptCheckpoint(f"{target}: could not read checkpoint: {error}") from error
     if not isinstance(value, dict):
         raise CorruptCheckpoint(f"{target}: checkpoint must contain a JSON object")
+    try:
+        migration = migrate_checkpoint_document(value, run_id=target.parent.name)
+    except MigrationError as error:
+        report = record_migration_failure(target, error)
+        raise CorruptCheckpoint(
+            f"{target}: migration blocked: {error}; see {report}"
+        ) from error
+    if migration.migrated:
+        try:
+            validate(migration.document)
+            migrated_state = _decode(migration.document)
+            _assert_consistent(target, migrated_state)
+            install_migration(target, migration)
+            value = migration.document
+        except (OSError, SchemaError, CorruptCheckpoint, MigrationError) as error:
+            report = record_migration_failure(target, error)
+            raise CorruptCheckpoint(
+                f"{target}: migration validation failed: {error}; see {report}"
+            ) from error
     try:
         validate(value)
     except SchemaError as error:

@@ -97,9 +97,9 @@ from tl_loop.state.schema import (
 )
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
-from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
+from .journal import MUTATING_OPERATIONS, EffectJournal
 from .reconcile import ReconciliationResult, reconcile_slice
-from .journal import EffectJournal, MUTATING_OPERATIONS
+from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
 LOGGER = logging.getLogger(__name__)
 TIMEOUT_GATE_NAME = "tl-timeout"

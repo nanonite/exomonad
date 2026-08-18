@@ -10,7 +10,6 @@ from typing import Any
 
 from tl_loop.client.effects import ToolResult
 
-
 MUTATING_OPERATIONS = frozenset(
     {
         "spawn_worker",
