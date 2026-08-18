@@ -118,30 +118,20 @@ async fn ensure_watcher_dashboard_window(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     cwd: &Path,
     shell: &str,
-) {
-    let windows = match ipc.list_windows().await {
-        Ok(windows) => windows,
-        Err(e) => {
-            warn!(error = %e, "Failed to list tmux windows before checking Watcher dashboard (non-fatal)");
-            return;
-        }
-    };
+) -> Result<()> {
+    let windows = ipc.list_windows().await?;
 
     if has_watcher_dashboard_window(windows.iter().map(|window| window.window_name.as_str())) {
         debug!("Watcher dashboard window already exists");
-        return;
+        return Ok(());
     }
 
-    match watcher_dashboard_command(cwd) {
-        Ok(watcher_cmd) => match ipc
-            .new_window(WATCHER_WINDOW_NAME, cwd, shell, &watcher_cmd)
-            .await
-        {
-            Ok(watcher_win) => info!(window = %watcher_win, "Watcher dashboard window created"),
-            Err(e) => warn!(error = %e, "Failed to create Watcher dashboard window (non-fatal)"),
-        },
-        Err(e) => warn!(error = %e, "Failed to prepare Watcher dashboard window (non-fatal)"),
-    }
+    let watcher_cmd = watcher_dashboard_command(cwd)?;
+    let watcher_win = ipc
+        .new_window(WATCHER_WINDOW_NAME, cwd, shell, &watcher_cmd)
+        .await?;
+    info!(window = %watcher_win, "Watcher dashboard window created");
+    Ok(())
 }
 
 fn forgejo_host_from_url(input: &str) -> Option<String> {
@@ -1011,6 +1001,183 @@ fn tl_loop_command(cwd: &Path, package_root: &Path) -> String {
     )
 }
 
+fn server_command(session: &str, config: &Config, verbose: bool) -> String {
+    let model_env = agent_configuration_environment(config);
+    let verbose_prefix = if verbose {
+        "RUST_LOG=info EXOMONAD_HOOK_TRACE=1 EXOMONAD_CHAINLINK_TRACE=1 "
+    } else {
+        ""
+    };
+    format!(
+        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE={}{} exomonad serve",
+        verbose_prefix,
+        session,
+        agent_type_str(config.root_agent_type),
+        agent_type_str(config.spawn_agent_type),
+        agent_type_str(config.reviewer.agent_type),
+        model_env,
+    )
+}
+
+fn root_tl_needs_resume(project_dir: &Path) -> Result<bool> {
+    let run_path = project_dir.join(".exo/tl-loop/root/run.json");
+    if !run_path.exists() {
+        return Ok(true);
+    }
+    let payload = std::fs::read_to_string(&run_path)
+        .with_context(|| format!("failed to read {}", run_path.display()))?;
+    let value: Value = serde_json::from_str(&payload)
+        .with_context(|| format!("invalid TL checkpoint {}", run_path.display()))?;
+    let phase = value
+        .pointer("/fsm/phase")
+        .or_else(|| value.get("phase"))
+        .and_then(Value::as_str);
+    Ok(!matches!(
+        phase,
+        Some("tl_done" | "tl_failed" | "done" | "failed")
+    ))
+}
+
+fn archive_controller_exit_reason(project_dir: &Path) -> Result<Option<PathBuf>> {
+    let source = controller_exit_path(project_dir);
+    if !source.exists() {
+        return Ok(None);
+    }
+    let parent = source
+        .parent()
+        .context("controller exit marker has no parent directory")?;
+    let stamp = current_time_millis();
+    let mut suffix = 0u32;
+    loop {
+        let name = if suffix == 0 {
+            format!("controller-exit-{stamp}.json")
+        } else {
+            format!("controller-exit-{stamp}-{suffix}.json")
+        };
+        let archive = parent.join(name);
+        if archive.exists() {
+            suffix = suffix
+                .checked_add(1)
+                .context("too many controller exit marker collisions")?;
+            continue;
+        }
+        std::fs::rename(&source, &archive).with_context(|| {
+            format!(
+                "failed to archive controller exit marker {}",
+                source.display()
+            )
+        })?;
+        return Ok(Some(archive));
+    }
+}
+
+async fn server_socket_is_healthy(project_dir: &Path) -> bool {
+    let socket_path = project_dir.join(".exo/server.sock");
+    if !socket_path.exists() {
+        return false;
+    }
+    uds_client::ServerClient::new(socket_path)
+        .is_healthy()
+        .await
+}
+
+async fn launch_server_recovery(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+    shell: &str,
+    session: &str,
+    config: &Config,
+    verbose: bool,
+) -> Result<()> {
+    let socket_path = project_dir.join(".exo/server.sock");
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path)
+            .with_context(|| format!("failed to remove stale {}", socket_path.display()))?;
+    }
+    let server_window = ipc
+        .new_window(
+            "Server",
+            project_dir,
+            shell,
+            &server_command(session, config, verbose),
+        )
+        .await?;
+    ipc.set_window_remain_on_exit(&server_window, true).await?;
+    wait_for_server_socket(project_dir).await?;
+    report_observability_health(project_dir);
+    Ok(())
+}
+
+async fn launch_tl_recovery(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+    shell: &str,
+    tl_loop_root: &Path,
+) -> Result<()> {
+    let tl_window = ipc
+        .new_window(
+            "TL",
+            project_dir,
+            shell,
+            &tl_loop_command(project_dir, tl_loop_root),
+        )
+        .await?;
+    ipc.set_window_remain_on_exit(&tl_window, true).await?;
+    let startup = wait_for_tl_controller_startup(ipc, project_dir, &tl_window).await;
+    if startup.is_ok() {
+        ipc.set_window_remain_on_exit(&tl_window, false).await?;
+    }
+    startup
+}
+
+async fn reconcile_existing_session(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+    shell: &str,
+    session: &str,
+    config: &Config,
+    tl_loop_root: &Path,
+    verbose: bool,
+) -> Result<()> {
+    let windows = ipc.list_windows().await?;
+    let server_window = windows.iter().find(|window| window.window_name == "Server");
+    let server_healthy = server_socket_is_healthy(project_dir).await;
+    if !server_healthy {
+        let server_alive = match server_window {
+            Some(window) => {
+                let routing = exomonad_core::domain::RoutingInfo::window(window.window_id.clone());
+                ipc.routing_target_process_alive(&routing).await?
+            }
+            None => false,
+        };
+        if server_alive {
+            wait_for_server_socket(project_dir).await?;
+        } else {
+            launch_server_recovery(ipc, project_dir, shell, session, config, verbose).await?;
+        }
+    }
+
+    ensure_watcher_dashboard_window(ipc, project_dir, shell).await?;
+
+    let windows = ipc.list_windows().await?;
+    let tl_window = windows.iter().find(|window| window.window_name == "TL");
+    let tl_alive = match tl_window {
+        Some(window) => {
+            let routing = exomonad_core::domain::RoutingInfo::window(window.window_id.clone());
+            ipc.routing_target_process_alive(&routing).await?
+        }
+        None => false,
+    };
+    if tl_alive || !root_tl_needs_resume(project_dir)? {
+        return Ok(());
+    }
+
+    if let Some(archive) = archive_controller_exit_reason(project_dir)? {
+        info!(archive = %archive.display(), "Archived prior TL controller exit marker before resuming");
+    }
+    launch_tl_recovery(ipc, project_dir, shell, tl_loop_root).await
+}
+
 fn controller_exit_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".exo/tl-loop/root/controller-exit.json")
 }
@@ -1439,7 +1606,16 @@ pub async fn run(
         }
         let ipc = TmuxIpc::new(&session);
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await;
+        reconcile_existing_session(
+            &ipc,
+            &cwd,
+            &shell,
+            &session,
+            &config,
+            &tl_loop_root,
+            verbose,
+        )
+        .await?;
         report_orphaned_agent_windows(&session, &cwd).await;
         info!(session = %session, "Attaching to existing session");
         return TmuxIpc::attach_session(&session).await;
@@ -1851,21 +2027,7 @@ pub async fn run(
         }
     }
 
-    let model_env = agent_configuration_environment(&config);
-    let verbose_prefix = if verbose {
-        "RUST_LOG=info EXOMONAD_HOOK_TRACE=1 EXOMONAD_CHAINLINK_TRACE=1 "
-    } else {
-        ""
-    };
-    let serve_cmd = format!(
-        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE={}{} exomonad serve",
-        verbose_prefix,
-        &session,
-        agent_type_str(config.root_agent_type),
-        agent_type_str(config.spawn_agent_type),
-        agent_type_str(config.reviewer.agent_type),
-        model_env,
-    );
+    let serve_cmd = server_command(&session, &config, verbose);
     let send_status = std::process::Command::new("tmux")
         .args([
             "send-keys",
@@ -1886,7 +2048,7 @@ pub async fn run(
     // 4. Wait for the server before launching the controller or Watcher.
     wait_for_server_socket(&cwd).await?;
     report_observability_health(&cwd);
-    ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await;
+    ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await?;
 
     // The human-facing TL window runs one coordinator: the Python controller.
     // Root harness settings and root_command are intentionally ignored.
@@ -2813,6 +2975,62 @@ mod tests {
     #[test]
     fn init_does_not_attach_missing_session() {
         assert!(!should_attach_existing_session(false, false));
+    }
+
+    #[test]
+    fn root_tl_resume_requires_missing_or_nonterminal_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(root_tl_needs_resume(dir.path()).unwrap());
+
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_waiting"}}"#).unwrap();
+        assert!(root_tl_needs_resume(dir.path()).unwrap());
+
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        assert!(!root_tl_needs_resume(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn root_tl_resume_reports_corrupt_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), b"{not-json").unwrap();
+
+        let error = root_tl_needs_resume(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("invalid TL checkpoint"));
+    }
+
+    #[test]
+    fn archive_controller_exit_reason_preserves_prior_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        record_controller_exit_reason(dir.path(), "controller crashed").unwrap();
+
+        let archive = archive_controller_exit_reason(dir.path())
+            .unwrap()
+            .expect("exit marker should be archived");
+        assert!(!controller_exit_path(dir.path()).exists());
+        assert_eq!(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(archive).unwrap()).unwrap()
+                ["reason"],
+            "controller crashed"
+        );
+    }
+
+    #[test]
+    fn server_command_preserves_session_and_agent_routing() {
+        let mut config = Config::default();
+        config.root_agent_type = AgentType::Claude;
+        config.spawn_agent_type = AgentType::OpenCode;
+        config.reviewer.agent_type = AgentType::Codex;
+
+        let command = server_command("workspace", &config, false);
+        assert!(command.contains("EXOMONAD_TMUX_SESSION=workspace"));
+        assert!(command.contains("EXOMONAD_ROOT_AGENT_TYPE=claude"));
+        assert!(command.contains("EXOMONAD_SPAWN_AGENT_TYPE=opencode"));
+        assert!(command.contains("EXOMONAD_REVIEWER_AGENT_TYPE=codex"));
+        assert!(command.ends_with(" exomonad serve"));
     }
 
     #[test]
