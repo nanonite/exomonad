@@ -10,7 +10,7 @@ from typing import Literal, TypeAlias, cast
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.ordered import CI_STATUSES, IntegrationLifecycle
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SliceStatus(str, Enum):

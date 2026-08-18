@@ -9,8 +9,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .schema import SCHEMA_VERSION
+
 MIGRATION_VERSION = 1
-CURRENT_CHECKPOINT_VERSION = 1
+# The migration target always tracks the loader's own accepted version, so
+# the two can never drift the way pre-#898 schema_version=1 checkpoints did:
+# CURRENT_CHECKPOINT_VERSION previously duplicated SCHEMA_VERSION as a
+# separate literal, so a document already stamped version=1 was treated as
+# "current" and skipped _migrate_slices entirely even after schema.py grew
+# new requirements (e.g. dispatch identity fields for spawned slices) that
+# those legacy documents never satisfied.
+CURRENT_CHECKPOINT_VERSION = SCHEMA_VERSION
 
 
 class MigrationError(ValueError):

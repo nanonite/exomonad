@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-from tl_loop.state.schema import SchemaError, validate
+from tl_loop.state.schema import SCHEMA_VERSION, SchemaError, validate
 from tl_loop.state.write import ConcurrentWrite, WriteHooks, apply
 
 
@@ -118,7 +118,7 @@ def _make_run(tmp_path: Path) -> Path:
     run_dir = tmp_path / "run-1"
     run_dir.mkdir()
     document = {
-        "version": 1,
+        "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "run-1",
         "fsm": {"phase": "tl_planning", "waiting": []},

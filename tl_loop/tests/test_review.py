@@ -35,6 +35,7 @@ from tl_loop.loop.review import (
 )
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
+    SCHEMA_VERSION,
     IntegrationRuntimeState,
     RunState,
     SchemaError,
@@ -375,7 +376,7 @@ def _slice(
 
 def _document() -> dict[str, object]:
     return {
-        "version": 1,
+        "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "review-test",
         "fsm": {"phase": TLPhase.TLWaiting.value, "waiting": ["leaf"]},

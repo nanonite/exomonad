@@ -8,7 +8,7 @@ import pytest
 
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.schedule import ScheduleDeadlock, active_count, ready
-from tl_loop.state.schema import SchemaError, SliceState, SliceStatus, validate
+from tl_loop.state.schema import SCHEMA_VERSION, SchemaError, SliceState, SliceStatus, validate
 
 
 def test_diamond_dag_returns_roots_then_join() -> None:
@@ -98,7 +98,7 @@ def _slice(
 
 def _valid_document() -> dict[str, object]:
     return {
-        "version": 1,
+        "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "schedule-test",
         "fsm": {"phase": TLPhase.TLPlanning.value, "waiting": []},

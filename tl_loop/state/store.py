@@ -33,6 +33,7 @@ from .migration import (
     record_migration_failure,
 )
 from .schema import (
+    SCHEMA_VERSION,
     ActualTokens,
     BudgetCharge,
     BudgetLedger,
@@ -554,7 +555,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
     if unknown:
         raise ValueError(f"root_spec contains unknown sections: {', '.join(unknown)}")
     document: dict[str, object] = {
-        "version": 1,
+        "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": run_id,
         "fsm": {"phase": TLPhase.TLPlanning.value, "waiting": []},

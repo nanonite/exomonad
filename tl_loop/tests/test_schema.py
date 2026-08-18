@@ -6,7 +6,7 @@ from copy import deepcopy
 from typing import cast
 
 from tl_loop.ordered import IntegrationLifecycle
-from tl_loop.state.schema import SchemaError, validate
+from tl_loop.state.schema import SCHEMA_VERSION, SchemaError, validate
 
 
 def test_valid_run_state_document_is_accepted() -> None:
@@ -267,7 +267,7 @@ def test_waiting_ids_must_reference_slices_without_duplicates() -> None:
 
 def _valid_document() -> dict[str, object]:
     return {
-        "version": 1,
+        "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "run-1",
         "fsm": {"phase": "tl_planning", "waiting": []},
