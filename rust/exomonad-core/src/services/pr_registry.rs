@@ -110,6 +110,7 @@ impl PublishedHead {
 pub enum PublicationDisposition {
     Added,
     Duplicate,
+    Replaced,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,7 +155,8 @@ async fn read_published_heads_locked(project_dir: &Path) -> Result<Vec<Published
             schema_version
         );
     }
-    raw.heads
+    let heads = raw
+        .heads
         .into_iter()
         .enumerate()
         .map(|(index, mut value)| {
@@ -162,11 +164,9 @@ async fn read_published_heads_locked(project_dir: &Path) -> Result<Vec<Published
                 let object = value.as_object_mut().ok_or_else(|| {
                     anyhow::anyhow!("{} head {} must be a JSON object", path.display(), index)
                 })?;
-                object
-                    .entry("provenance")
-                    .or_insert_with(|| serde_json::json!("legacy"));
+                object.insert("provenance".to_string(), serde_json::json!("legacy"));
             }
-            serde_json::from_value(value).with_context(|| {
+            serde_json::from_value::<PublishedHead>(value).with_context(|| {
                 format!(
                     "failed to parse publication registry head {} in {}",
                     index,
@@ -174,7 +174,31 @@ async fn read_published_heads_locked(project_dir: &Path) -> Result<Vec<Published
                 )
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut deduplicated = Vec::with_capacity(heads.len());
+    for head in heads {
+        let Some(existing) = deduplicated
+            .iter_mut()
+            .find(|existing: &&mut PublishedHead| {
+                existing.matches_current(
+                    head.pr_number,
+                    head.head_branch.as_str(),
+                    head.base_branch.as_str(),
+                    head.head_sha.as_str(),
+                )
+            })
+        else {
+            deduplicated.push(head);
+            continue;
+        };
+        if existing.provenance == PublicationProvenance::Legacy
+            || head.provenance == PublicationProvenance::LedgerOwned
+        {
+            *existing = head;
+        }
+    }
+    Ok(deduplicated)
 }
 
 pub async fn read_published_heads(project_dir: &Path) -> Result<Vec<PublishedHead>> {
@@ -211,7 +235,25 @@ pub async fn publish_verified_head(
         return Ok(PublicationDisposition::Duplicate);
     }
 
-    file.heads.push(publication);
+    let disposition = if let Some(index) = file.heads.iter().position(|existing| {
+        existing.matches_current(
+            publication.pr_number,
+            publication.head_branch.as_str(),
+            publication.base_branch.as_str(),
+            publication.head_sha.as_str(),
+        )
+    }) {
+        if file.heads[index].provenance == PublicationProvenance::LedgerOwned
+            && publication.provenance == PublicationProvenance::Legacy
+        {
+            return Ok(PublicationDisposition::Duplicate);
+        }
+        file.heads[index] = publication;
+        PublicationDisposition::Replaced
+    } else {
+        file.heads.push(publication);
+        PublicationDisposition::Added
+    };
     let path = published_heads_path(project_dir);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -226,7 +268,7 @@ pub async fn publish_verified_head(
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error).with_context(|| format!("failed to replace {}", path.display()));
     }
-    Ok(PublicationDisposition::Added)
+    Ok(disposition)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -432,6 +474,50 @@ mod tests {
         assert!(!heads[0].matches_current(42, "main.feature-codex", "main", "sha-2"));
     }
 
+    #[tokio::test]
+    async fn same_head_publication_upgrades_legacy_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        publish_verified_head(directory.path(), publication("sha-1"))
+            .await
+            .unwrap();
+
+        let mut authoritative = publication("sha-1");
+        authoritative.provenance = PublicationProvenance::LedgerOwned;
+        authoritative.slice_id = Some("slice-a".to_string());
+        assert_eq!(
+            publish_verified_head(directory.path(), authoritative)
+                .await
+                .unwrap(),
+            PublicationDisposition::Replaced
+        );
+
+        let heads = read_published_heads(directory.path()).await.unwrap();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].provenance, PublicationProvenance::LedgerOwned);
+        assert_eq!(heads[0].slice_id.as_deref(), Some("slice-a"));
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_cannot_shadow_ledger_owned_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut authoritative = publication("sha-1");
+        authoritative.provenance = PublicationProvenance::LedgerOwned;
+        authoritative.slice_id = Some("slice-a".to_string());
+        publish_verified_head(directory.path(), authoritative)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            publish_verified_head(directory.path(), publication("sha-1"))
+                .await
+                .unwrap(),
+            PublicationDisposition::Duplicate
+        );
+        let heads = read_published_heads(directory.path()).await.unwrap();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].provenance, PublicationProvenance::LedgerOwned);
+    }
+
     #[test]
     fn stale_sha_does_not_match_the_current_forgejo_head() {
         let old = publication("sha-old");
@@ -468,7 +554,7 @@ mod tests {
             .unwrap();
         tokio::fs::write(
             &path,
-            br#"{"heads":[{"pr_number":42,"head_branch":"main.feature-codex","base_branch":"main","head_sha":"sha-1","author_agent":"feature-codex","author_role":"dev"}]}"#,
+            br#"{"heads":[{"pr_number":42,"head_branch":"main.feature-codex","base_branch":"main","head_sha":"sha-1","author_agent":"feature-codex","author_role":"dev","provenance":"ledger_owned"}]}"#,
         )
         .await
         .unwrap();

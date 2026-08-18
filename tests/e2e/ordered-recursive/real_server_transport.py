@@ -704,6 +704,16 @@ def reviewer_spawn_events(
     return events
 
 
+def assert_controller_alive(process: multiprocessing.Process, phase: str) -> None:
+    """Fail the probe if the controller exited before the lifecycle was complete."""
+    if process.is_alive():
+        return
+    process.join(timeout=1)
+    raise HarnessError(
+        f"recursive controller exited during {phase}: exitcode={process.exitcode}"
+    )
+
+
 def stop_spawned_worker(repo: Path, worker_name: str) -> None:
     """Stop only the temporary worker window created by this probe."""
     config = (repo / ".exo" / "config.toml").read_text(encoding="utf-8")
@@ -851,7 +861,8 @@ def run_real_watcher_routing_probe(
     child_state_root = state_root / "recursive-watcher-root"
     owner_id: str | None = None
     deadline = time.monotonic() + 30
-    while time.monotonic() < deadline and root_process.is_alive():
+    while time.monotonic() < deadline:
+        assert_controller_alive(root_process, "leaf dispatch")
         try:
             child = RunStore("sub-a", child_state_root).load().slices[slice_id]
         except (FileNotFoundError, KeyError, ValueError):
@@ -891,6 +902,7 @@ def run_real_watcher_routing_probe(
     watcher_event: Mapping[str, Any] | None = None
     ci_event: Mapping[str, Any] | None = None
     while time.monotonic() < deadline:
+        assert_controller_alive(root_process, "watcher event delivery")
         for event in server_ledger_events(repo):
             data = event.get("data")
             if (
@@ -929,6 +941,16 @@ def run_real_watcher_routing_probe(
         raise HarnessError(f"watcher ownership was not canonical: {watcher_event!r}")
     if watcher_data.get("slice_id") != slice_id or watcher_data.get("branch") != branch:
         raise HarnessError(f"watcher omitted proven slice/branch identity: {watcher_event!r}")
+    ci_data = ci_event.get("data")
+    if (
+        not isinstance(ci_data, Mapping)
+        or ci_data.get("owner_id") != owner_id
+        or ci_data.get("slice_id") != slice_id
+        or ci_data.get("branch") != branch
+        or ci_data.get("head_sha") != head_sha
+        or ci_data.get("status") != "success"
+    ):
+        raise HarnessError(f"CI event omitted canonical ownership evidence: {ci_event!r}")
 
     filed_seq = filed_event.get("run_seq")
     watcher_seq = watcher_event.get("run_seq")
@@ -949,6 +971,7 @@ def run_real_watcher_routing_probe(
     checkpoint_deadline = time.monotonic() + 30
     child = None
     while time.monotonic() < checkpoint_deadline:
+        assert_controller_alive(root_process, "recursive checkpoint persistence")
         try:
             candidate = RunStore("sub-a", child_state_root).load()
         except CorruptCheckpoint:
@@ -994,6 +1017,7 @@ def run_real_watcher_routing_probe(
         raise HarnessError(f"reviewer claim was not persisted exactly once: {current!r}")
     stabilization_deadline = time.monotonic() + 3
     while time.monotonic() < stabilization_deadline:
+        assert_controller_alive(root_process, "reviewer stabilization")
         reviewer_events = list(
             reviewer_spawn_events(repo, swarm_id, pr_number).values()
         )
@@ -1015,9 +1039,11 @@ def run_real_watcher_routing_probe(
     }
     if len(reviewer_agents) != 1:
         raise HarnessError(f"reviewer ownership was not unique: {reviewer_events!r}")
-    if root_process.is_alive():
-        root_process.terminate()
+    assert_controller_alive(root_process, "post-routing lifecycle")
+    root_process.terminate()
     root_process.join(timeout=5)
+    if root_process.is_alive():
+        raise HarnessError("recursive controller did not stop during probe cleanup")
     for reviewer in reviewer_events:
         data = reviewer.get("data")
         if isinstance(data, Mapping) and isinstance(data.get("child_agent"), str):

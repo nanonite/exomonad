@@ -1380,14 +1380,20 @@ where
             else {
                 continue;
             };
-            let Some(publication) = published_heads.iter().find(|publication| {
-                publication.matches_current(
-                    *number,
-                    pr.head_branch.as_str(),
-                    pr.base_branch.as_str(),
-                    &head_sha,
-                )
-            }) else {
+            let Some(publication) = published_heads
+                .iter()
+                .filter(|publication| {
+                    publication.matches_current(
+                        *number,
+                        pr.head_branch.as_str(),
+                        pr.base_branch.as_str(),
+                        &head_sha,
+                    )
+                })
+                .max_by_key(|publication| {
+                    publication.provenance == PublicationProvenance::LedgerOwned
+                })
+            else {
                 continue;
             };
             if let Err(reason) = self.validate_publication_provenance(pr, publication).await {
