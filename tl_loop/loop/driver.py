@@ -20,7 +20,12 @@ from typing import Protocol, cast
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject, TransportClient
-from tl_loop.events.envelope import EventEnvelope, EventKind
+from tl_loop.events.envelope import EnvelopeError, EventEnvelope, EventKind, project
+from tl_loop.events.identity import (
+    IdentityResolution,
+    envelope_document,
+    resolve_event_slice,
+)
 from tl_loop.events.reader import FindingKind, LedgerFinding
 from tl_loop.fsm.event import (
     AllChildrenDone,
@@ -282,6 +287,8 @@ class EventDiagnostics:
     last_observed_progress_at: float | None = None
     reader_finding_keys: set[tuple[str, str, str, int]] = field(default_factory=set)
     reader_findings: list[str] = field(default_factory=list)
+    unresolved_event_keys: set[tuple[int, str]] = field(default_factory=set)
+    unresolved_events: list[str] = field(default_factory=list)
 
     def record_reader_findings(self, findings: Sequence[LedgerFinding]) -> None:
         for finding in findings:
@@ -299,6 +306,21 @@ class EventDiagnostics:
                 self.received += 1
                 self.filtered += 1
 
+    def record_unresolved_event(
+        self, event: EventEnvelope, resolution: IdentityResolution
+    ) -> None:
+        """Record a valid observation retained until ownership is proven."""
+        key = (event.run_seq or 0, event.event_type)
+        if key in self.unresolved_event_keys:
+            return
+        self.unresolved_event_keys.add(key)
+        details = (
+            f"{event.event_type} seq={event.run_seq} reason={resolution.reason} "
+            f"candidates={list(resolution.candidates)}"
+        )
+        self.unresolved_events.append(details)
+        self.rejected += 1
+
     def snapshot(self) -> Mapping[str, object]:
         return {
             "controller_started_at": self.controller_started_at,
@@ -313,6 +335,7 @@ class EventDiagnostics:
             "last_authoritative_event_seq": self.last_authoritative_event_seq,
             "last_observed_progress_at": self.last_observed_progress_at,
             "reader_findings": list(self.reader_findings),
+            "unresolved_events": list(self.unresolved_events),
         }
 
 
@@ -720,6 +743,14 @@ def _run_loop(
             if slice_state.dispatch_started_at is not None
         }
     )
+    quarantined: list[EventEnvelope] = []
+    for document in store.quarantined_events():
+        try:
+            event = project(document)
+        except EnvelopeError as error:
+            LOGGER.error("Ignoring malformed quarantined event: %s", error)
+            continue
+        quarantined.append(event)
     if state.goals.controller_started_at is None:
         state = store.set_goals(
             replace(state.goals, controller_started_at=diagnostics.controller_started_at)
@@ -753,25 +784,31 @@ def _run_loop(
         if config.cancel_event is not None and config.cancel_event.is_set():
             raise LoopCancelled(f"TL controller {run_id!r} was cancelled")
         _record_reader_findings(source, diagnostics)
-        try:
-            event = _next_event(source, config, deadline)
-        except LoopTimeout as error:
-            _record_reader_findings(source, diagnostics)
-            if _has_pending_dispatch(state):
-                return _park_dispatch_timeout(
-                    run_id,
-                    store,
-                    state,
-                    effects,
-                    config,
-                    effects_log,
-                    transitions,
-                    consumed,
-                    error,
-                    diagnostics,
-                )
-            deadline = _next_loop_deadline(state, config)
-            continue
+        replaying = False
+        replay_index = _replayable_event_index(quarantined, state, expected)
+        if replay_index is not None:
+            event = quarantined.pop(replay_index)
+            replaying = True
+        else:
+            try:
+                event = _next_event(source, config, deadline)
+            except LoopTimeout as error:
+                _record_reader_findings(source, diagnostics)
+                if _has_pending_dispatch(state):
+                    return _park_dispatch_timeout(
+                        run_id,
+                        store,
+                        state,
+                        effects,
+                        config,
+                        effects_log,
+                        transitions,
+                        consumed,
+                        error,
+                        diagnostics,
+                    )
+                deadline = _next_loop_deadline(state, config)
+                continue
         _record_reader_findings(source, diagnostics)
         if event is None:
             if config.heartbeat is not None:
@@ -823,15 +860,21 @@ def _run_loop(
         event_seq = event.run_seq
         if event_seq is None:
             raise TLLoopError(f"{event.event_type!r} has no run_seq")
-        consumed.append(event_seq)
-        diagnostics.received += 1
+        if not replaying:
+            consumed.append(event_seq)
+            diagnostics.received += 1
         diagnostics.last_event_seq = event_seq
+        checkpoint_seq = max(event_seq, state.events.last_consumed_offset)
         deadline = _next_loop_deadline(state, config)
         ledger_run_id = config.ledger_run_id or run_id
         if event.run_id not in {None, ledger_run_id}:
             diagnostics.filtered += 1
-            _checkpoint_and_ack(store, source, event, state, phase)
-            diagnostics.acknowledged += 1
+            _checkpoint_and_ack(
+                store, source, event, state, phase, acknowledge=not replaying
+            )
+            if not replaying:
+                diagnostics.acknowledged += 1
+            _release_replayed_event(store, event, replaying)
             state = store.load()
             LOGGER.warning(
                 "Ignoring event from stale swarm run_id=%s expected=%s local_checkpoint=%s event_seq=%s",
@@ -841,13 +884,27 @@ def _run_loop(
                 event_seq,
             )
             continue
+        resolution = resolve_event_slice(event, state, allowed_ids=expected)
         if not _event_belongs_to_plan(event, expected, state):
+            if _is_reconcilable_identity_event(event):
+                if not replaying:
+                    quarantined.append(event)
+                    store.quarantine_event(envelope_document(event))
+                diagnostics.record_unresolved_event(event, resolution)
             diagnostics.filtered += 1
-            _checkpoint_and_ack(store, source, event, state, phase)
-            diagnostics.acknowledged += 1
+            _checkpoint_and_ack(
+                store,
+                source,
+                event,
+                state,
+                phase,
+                acknowledge=not replaying,
+            )
+            if not replaying:
+                diagnostics.acknowledged += 1
             state = store.load()
             continue
-        state = _note_authoritative_event(store, state, event_seq)
+        state = _note_authoritative_event(store, state, checkpoint_seq)
         diagnostics.last_authoritative_event_seq = event_seq
         diagnostics.last_observed_progress_at = state.goals.last_progress_at
         if config.heartbeat is not None:
@@ -856,30 +913,30 @@ def _run_loop(
             diagnostics.correlated += 1
             if _review_workflow_enabled(config):
                 state = _route_review_event(
-                    plan, store, state, phase, event, event_seq, config, effects, effects_log
+                    plan, store, state, phase, event, checkpoint_seq, config, effects, effects_log
                 )
             else:
-                state = _record_review_event(store, state, phase, event, event_seq)
+                state = _record_review_event(store, state, phase, event, checkpoint_seq)
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
                 deadline = _next_loop_deadline(state, config)
-            source.acknowledge(event)
-            diagnostics.acknowledged += 1
+            _ack_event(source, event, replaying, diagnostics)
+            _release_replayed_event(store, event, replaying)
             if isinstance(phase, (TLDone, TLFailed)):
                 break
             continue
         if event.kind is EventKind.CI_STATUS_CHANGED:
             diagnostics.correlated += 1
             state = _route_ci_event(
-                store, state, phase, event, event_seq, config, effects, effects_log
+                store, state, phase, event, checkpoint_seq, config, effects, effects_log
             )
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
                 deadline = _next_loop_deadline(state, config)
-            source.acknowledge(event)
-            diagnostics.acknowledged += 1
+            _ack_event(source, event, replaying, diagnostics)
+            _release_replayed_event(store, event, replaying)
             if isinstance(phase, (TLDone, TLFailed)):
                 break
             continue
@@ -894,8 +951,11 @@ def _run_loop(
                     run_id,
                     event_seq,
                 )
-                _checkpoint_and_ack(store, source, event, state, phase)
-                diagnostics.acknowledged += 1
+                _checkpoint_and_ack(
+                    store, source, event, state, phase, acknowledge=not replaying
+                )
+                if not replaying:
+                    diagnostics.acknowledged += 1
                 state = store.load()
                 continue
             event_slice_id = _event_slice_id(event, state)
@@ -923,7 +983,7 @@ def _run_loop(
                 branch=branch or next_slices[event_slice_id].branch,
             )
             previous_state = state
-            state = store.checkpoint(next_phase, next_slices, state.budgets, event_seq)
+            state = store.checkpoint(next_phase, next_slices, state.budgets, checkpoint_seq)
             _emit_slice_status_changes(
                 previous_state.slices,
                 next_slices,
@@ -940,8 +1000,8 @@ def _run_loop(
                 effects,
                 effects_log,
             )
-            source.acknowledge(event)
-            diagnostics.acknowledged += 1
+            _ack_event(source, event, replaying, diagnostics)
+            _release_replayed_event(store, event, replaying)
             diagnostics.correlated += 1
             transitions.append(
                 LoopTransition(
@@ -962,8 +1022,11 @@ def _run_loop(
             raise TLLoopError(str(error)) from error
         if _duplicate_event(phase, fsm_event, state):
             diagnostics.filtered += 1
-            _checkpoint_and_ack(store, source, event, state, phase)
-            diagnostics.acknowledged += 1
+            _checkpoint_and_ack(
+                store, source, event, state, phase, acknowledge=not replaying
+            )
+            if not replaying:
+                diagnostics.acknowledged += 1
             state = store.load()
             continue
         if isinstance(fsm_event, ChildCompleted):
@@ -979,8 +1042,9 @@ def _run_loop(
             )
             if not merge_allowed:
                 next_slices = _discard_review(state.slices, fsm_event.slug)
-                state = store.checkpoint(phase, next_slices, state.budgets, event_seq)
-                source.acknowledge(event)
+                state = store.checkpoint(phase, next_slices, state.budgets, checkpoint_seq)
+                _ack_event(source, event, replaying, diagnostics)
+                _release_replayed_event(store, event, replaying)
                 continue
         try:
             next_phase = transition(phase, fsm_event)
@@ -1015,7 +1079,7 @@ def _run_loop(
                 next_slices, fsm_event, _event_slice_id(event, state)
             )
         previous_state = state
-        state = store.checkpoint(next_phase, next_slices, state.budgets, event_seq)
+        state = store.checkpoint(next_phase, next_slices, state.budgets, checkpoint_seq)
         deadline = _next_loop_deadline(state, config)
         _emit_slice_status_changes(
             previous_state.slices,
@@ -1035,8 +1099,8 @@ def _run_loop(
         )
         if head_changed and config.enable_reviewer_spawn:
             _spawn_reviewer_for_head(plan, state, fsm_event, event, config, effects, effects_log)
-        source.acknowledge(event)
-        diagnostics.acknowledged += 1
+        _ack_event(source, event, replaying, diagnostics)
+        _release_replayed_event(store, event, replaying)
         diagnostics.correlated += 1
         before_tag = _phase_tag(phase)
         after_tag = _phase_tag(next_phase)
@@ -3803,23 +3867,7 @@ def _review_workflow_enabled(config: TLLoopConfig) -> bool:
 
 
 def _review_slice_id(event: EventEnvelope, state: RunState) -> str | None:
-    direct = event.slice_id or event.agent_id
-    if direct in state.slices:
-        return direct
-    if event.pr_number is None:
-        return direct
-    matches = [
-        slice_id
-        for slice_id, current in state.slices.items()
-        if current.pr_number == event.pr_number
-    ]
-    if len(matches) > 1:
-        raise TLLoopError(
-            f"review event PR {event.pr_number} matches multiple slices: {', '.join(matches)}"
-        )
-    if len(matches) == 1:
-        return matches[0]
-    return direct if direct in state.slices else None
+    return resolve_event_slice(event, state).slice_id
 
 
 def _is_aggregate_slice(slice_state: SliceState) -> bool:
@@ -4409,12 +4457,53 @@ def _checkpoint_and_ack(
     event: EventEnvelope,
     state: RunState,
     phase: PhaseValue,
+    *,
+    acknowledge: bool = True,
 ) -> None:
     if event.run_seq is None:
         raise TLLoopError(f"{event.event_type!r} has no run_seq")
     offset = max(state.events.last_consumed_offset, event.run_seq)
     store.checkpoint(phase, state.slices, state.budgets, offset)
-    source.acknowledge(event)
+    if acknowledge:
+        source.acknowledge(event)
+
+
+def _ack_event(
+    source: EventQueue,
+    event: EventEnvelope,
+    replaying: bool,
+    diagnostics: EventDiagnostics,
+) -> None:
+    """Acknowledge source events once; replayed rows were already acknowledged."""
+    if not replaying:
+        source.acknowledge(event)
+        diagnostics.acknowledged += 1
+
+
+def _release_replayed_event(store: RunStore, event: EventEnvelope, replaying: bool) -> None:
+    if replaying and event.run_seq is not None:
+        store.release_quarantined_event(event.run_seq)
+
+
+def _is_reconcilable_identity_event(event: EventEnvelope) -> bool:
+    return event.kind in {
+        EventKind.PR_FILED,
+        EventKind.PR_UPDATED,
+        EventKind.PR_REVIEW,
+        EventKind.COPILOT_REVIEW,
+        EventKind.CI_STATUS_CHANGED,
+    }
+
+
+def _replayable_event_index(
+    events: Sequence[EventEnvelope],
+    state: RunState,
+    expected: set[str],
+) -> int | None:
+    for index, event in enumerate(events):
+        if resolve_event_slice(event, state, allowed_ids=expected).resolved:
+            return index
+    return None
 
 
 def _event_belongs_to_plan(
@@ -4425,14 +4514,14 @@ def _event_belongs_to_plan(
         if isinstance(value, Mapping):
             slug = value.get("slug")
             return slug is None or slug in expected
-    if event.kind is EventKind.PR_FILED:
-        return True
-    if event.kind is EventKind.PR_UPDATED:
-        return True
     if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW, EventKind.CI_STATUS_CHANGED}:
         if state is None:
             return False
-        return _review_slice_id(event, state) is not None
+        return resolve_event_slice(event, state, allowed_ids=expected).resolved
+    if event.kind in {EventKind.PR_FILED, EventKind.PR_UPDATED}:
+        if state is None:
+            return False
+        return resolve_event_slice(event, state, allowed_ids=expected).resolved
     if event.agent_id in expected:
         return True
     intent_id = event.data.get("intent_id")
@@ -4452,24 +4541,14 @@ def _event_belongs_to_plan(
 
 
 def _event_slice_id(event: EventEnvelope, state: RunState) -> str | None:
-    intent_id = _event_dispatch_intent_id(event)
-    if isinstance(intent_id, str):
-        for slice_id, slice_state in state.slices.items():
-            if slice_state.dispatch_intent_id == intent_id:
-                return slice_id
-    if event.slice_id is not None:
-        return event.slice_id
+    resolved = resolve_event_slice(event, state)
+    if resolved.resolved:
+        return resolved.slice_id
     shadow_event = event.data.get("shadow_event")
     if isinstance(shadow_event, Mapping):
         shadow_slug = shadow_event.get("slug")
         if isinstance(shadow_slug, str) and shadow_slug in state.slices:
             return shadow_slug
-    for key in ("slug", "child_agent", "slice_id"):
-        value = event.data.get(key)
-        if isinstance(value, str) and value in state.slices:
-            return value
-    if event.kind in {EventKind.PR_FILED, EventKind.PR_UPDATED} and event.agent_id in state.slices:
-        return event.agent_id
     return None
 
 
@@ -4509,7 +4588,9 @@ def _claim_reviewer_attempt(
     if target_id is None or current is None:
         return dict(slices)
     attempts = dict(current.reviewer_attempt)
-    attempts[event.head_sha] = attempts.get(event.head_sha, 0) + 1
+    if attempts.get(event.head_sha, 0) > 0:
+        return dict(slices)
+    attempts[event.head_sha] = 1
     return {**slices, target_id: replace(current, reviewer_attempt=attempts)}
 
 

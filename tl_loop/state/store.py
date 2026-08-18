@@ -204,6 +204,54 @@ class RunStore:
         """Return the bounded-on-disk controller output capture path."""
         return self.run_dir / "controller-output.log"
 
+    @property
+    def event_quarantine_path(self) -> Path:
+        """Return the durable queue for valid observations awaiting ownership."""
+        return self.run_dir / "event-quarantine.json"
+
+    def quarantine_event(self, event: Mapping[str, object]) -> None:
+        """Persist one unresolved event without advancing its meaning."""
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        entries = list(self.quarantined_events())
+        run_seq = event.get("run_seq")
+        if any(item.get("run_seq") == run_seq for item in entries):
+            return
+        entries.append(copy.deepcopy(dict(event)))
+        temporary = self.event_quarantine_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(entries, sort_keys=True), encoding="utf-8")
+        temporary.replace(self.event_quarantine_path)
+
+    def quarantined_events(self) -> tuple[Mapping[str, object], ...]:
+        """Read unresolved observations retained for a later controller run."""
+        try:
+            payload = json.loads(self.event_quarantine_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return ()
+        if not isinstance(payload, list):
+            return ()
+        return tuple(
+            MappingProxyType(dict(item))
+            for item in payload
+            if isinstance(item, dict)
+        )
+
+    def release_quarantined_event(self, run_seq: int) -> None:
+        """Remove an event only after its ownership has been reconciled."""
+        entries = [
+            dict(item)
+            for item in self.quarantined_events()
+            if item.get("run_seq") != run_seq
+        ]
+        if entries:
+            temporary = self.event_quarantine_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(entries, sort_keys=True), encoding="utf-8")
+            temporary.replace(self.event_quarantine_path)
+        else:
+            try:
+                self.event_quarantine_path.unlink()
+            except FileNotFoundError:
+                pass
+
     def record_terminal_summary(self, summary: Mapping[str, object]) -> None:
         """Persist terminal diagnostics independently of the tmux process."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
