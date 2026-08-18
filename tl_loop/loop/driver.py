@@ -1681,8 +1681,9 @@ def _reconcile_nonterminal_slices(
         conflicts_found |= bool(result.conflicts)
 
     if changed:
+        checkpoint_phase = _reconciliation_phase(state, updated)
         state = store.checkpoint(
-            state.fsm,
+            checkpoint_phase,
             updated,
             state.budgets,
             state.events.last_consumed_offset,
@@ -1693,6 +1694,29 @@ def _reconcile_nonterminal_slices(
     if conflicts_found:
         state = store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
     return state
+
+
+def _reconciliation_phase(
+    state: RunState,
+    slices: Mapping[str, SliceState],
+) -> PhaseValue:
+    if not isinstance(state.fsm, TLWaiting):
+        return state.fsm
+    handles = {
+        slice_id: ChildHandle(
+            slice_id,
+            slice_state.branch or "",
+            slice_state.agent_type or "unknown",
+        )
+        for slice_id, slice_state in slices.items()
+        if slice_state.status
+        in {
+            SliceStatus.SPAWNED,
+            SliceStatus.IN_REVIEW,
+            SliceStatus.REPAIRING,
+        }
+    }
+    return TLWaiting(handles)
 
 
 def _apply_reconciliation_observations(
