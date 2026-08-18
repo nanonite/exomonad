@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Normalize spawned leaf identities across TL lifecycle events (#899)
 - Add non-terminal timing telemetry and long-running orchestration E2E coverage (#897)
 - Remove task-duration kills from recursive TL and agent reconciliation (#896)
 - Make dispatch and review waiting evidence-driven instead of deadline-driven (#895)
