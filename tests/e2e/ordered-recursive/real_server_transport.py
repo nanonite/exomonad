@@ -146,6 +146,66 @@ class StopAfterSpawnQueue:
         self.queue.close(timeout=5)
 
 
+def run_recursive_watcher_controller(root: Path, repo: Path, swarm_id: str) -> None:
+    """Run a real root/sub-TL controller pair for watcher routing coverage."""
+    state_root = root / "recursive-watcher-state"
+    child_source = LazyLedgerSource(
+        repo / ".exo" / "ledger" / "segments",
+        state_root / "recursive-watcher-root",
+        "sub-a",
+        swarm_id,
+        None,
+    )
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "sub-a",
+                WorkPlan(
+                    leaves=(
+                        LeafTask(
+                            "real-watcher-leaf",
+                            "file a PR and consume a real watcher approval",
+                        ),
+                    )
+                ),
+                source=child_source,
+                order=1,
+            ),
+        )
+    )
+    try:
+        run_tl_loop(
+            "recursive-watcher-root",
+            plan,
+            EmptyEventSource(),
+            EffectClient(
+                TransportClient(project_root=repo, timeout=5),
+                role="tl",
+                name="recursive-watcher-root",
+            ),
+            config=TLLoopConfig(
+                active=True,
+                enable_reviewer_spawn=True,
+                keep_alive_on_waiting=True,
+                max_events=128,
+                max_parallel_slices=1,
+                poll_interval=0.01,
+                idle_timeout=30.0,
+                dispatch_timeout=30.0,
+                controller_stall_timeout=30.0,
+                root_dir=state_root,
+                run_id="recursive-watcher-root",
+                ledger_run_id=swarm_id,
+                branch="main",
+                worktree=repo,
+                working_dir=str(repo),
+            ),
+            root_dir=state_root,
+        )
+    finally:
+        child_source.close()
+
+
 class DispatchBoundaryTransportClient(TransportClient):
     """Pause after durable dispatch state is visible through the real server."""
 
@@ -755,16 +815,40 @@ def run_real_watcher_routing_probe(
     forgejo_url: str,
     swarm_id: str,
 ) -> None:
-    """Route Rust file_pr and watcher events through a real Python ledger reader."""
-    run_id = "real-watcher-routing"
-    state_root = root / "watcher-routing-state"
+    """Route recursive Rust watcher events through the real Python controller."""
+    state_root = root / "recursive-watcher-state"
+    root_process = multiprocessing.get_context("fork").Process(
+        target=run_recursive_watcher_controller,
+        args=(root, repo, swarm_id),
+        name="real-recursive-watcher-controller",
+    )
+    root_process.start()
     slice_id = "real-watcher-leaf"
-    owner_id = "sub-a"
+    child_state_root = state_root / "recursive-watcher-root"
+    owner_id: str | None = None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and root_process.is_alive():
+        try:
+            child = RunStore("sub-a", child_state_root).load().slices[slice_id]
+        except (FileNotFoundError, KeyError, ValueError):
+            time.sleep(0.1)
+            continue
+        if child.status is SliceStatus.SPAWNED and child.dispatch_agent_id:
+            owner_id = child.dispatch_agent_id
+            break
+        time.sleep(0.1)
+    if owner_id is None:
+        root_process.terminate()
+        root_process.join(timeout=5)
+        raise HarnessError(
+            "recursive controller did not durably spawn the watcher-routing leaf"
+        )
+
     owner_effects = EffectClient(client, role="tl", name=owner_id)
     filed = owner_effects.file_pr(
-        title="Real watcher routing",
-        body="TL-Slice-ID: real-watcher-leaf\nProduction boundary fixture",
-        base_branch="main",
+        title="Real recursive watcher routing",
+        body="TL-Slice-ID: wrong-leaf\nThe server must ignore this leaf-controlled tag",
+        base_branch="main.sub-a",
     )
     filed_data = find_object(filed, {"pr_number", "head_branch"})
     pr_number = int(filed_data["pr_number"])
@@ -778,9 +862,10 @@ def run_real_watcher_routing_probe(
         {"event": "APPROVED", "commit_id": head_sha},
     )
 
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + 30
     filed_event: Mapping[str, Any] | None = None
     watcher_event: Mapping[str, Any] | None = None
+    reviewer_events_by_seq: dict[int, Mapping[str, Any]] = {}
     while time.monotonic() < deadline:
         for event in server_ledger_events(repo):
             data = event.get("data")
@@ -791,15 +876,29 @@ def run_real_watcher_routing_probe(
             ):
                 if event.get("type") in {"pr.filed", "pr.updated"}:
                     filed_event = event
-                if event.get("type") in {"copilot.review", "ci.status_changed"}:
+                if event.get("type") == "copilot.review":
                     watcher_event = event
-        if filed_event is not None and watcher_event is not None:
+            if (
+                event.get("type") == "agent.spawned"
+                and isinstance(data, Mapping)
+                and (
+                    str(data.get("branch", "")) == f"review-pr-{pr_number}"
+                    or str(data.get("branch", "")).endswith(f".review-pr-{pr_number}")
+                    or str(data.get("branch", "")).startswith(f"review-pr-{pr_number}-")
+                )
+            ):
+                run_seq = event.get("run_seq")
+                if type(run_seq) is int:
+                    reviewer_events_by_seq[run_seq] = event
+        reviewer_events = list(reviewer_events_by_seq.values())
+        if filed_event is not None and watcher_event is not None and reviewer_events:
             break
         time.sleep(0.1)
-    if filed_event is None or watcher_event is None:
+    if filed_event is None or watcher_event is None or len(reviewer_events) != 1:
         raise HarnessError(
-            "real watcher did not publish both file_pr and watcher observations: "
-            f"filed={filed_event!r} watcher={watcher_event!r}"
+            "recursive watcher did not publish file_pr, approval, and one reviewer spawn: "
+            f"filed={filed_event!r} watcher={watcher_event!r} "
+            f"reviewers={reviewer_events!r}"
         )
     watcher_data = watcher_event.get("data")
     if not isinstance(watcher_data, Mapping) or watcher_data.get("owner_id") != owner_id:
@@ -807,78 +906,39 @@ def run_real_watcher_routing_probe(
     if watcher_data.get("slice_id") != slice_id or watcher_data.get("branch") != branch:
         raise HarnessError(f"watcher omitted proven slice/branch identity: {watcher_event!r}")
 
-    plan = WorkPlan(leaves=(LeafTask(slice_id, "consume real watcher routing"),))
-    config = TLLoopConfig(
-        active=True,
-        test_harness=True,
-        keep_alive_on_waiting=True,
-        max_events=2,
-        poll_interval=0.01,
-        idle_timeout=5.0,
-        dispatch_timeout=5.0,
-        root_dir=state_root,
-        run_id=run_id,
-        ledger_run_id=swarm_id,
-        branch="main",
-        worktree=repo,
-    )
-    initial = _initial_slices(plan, config, state_root, run_id)
-    initial[slice_id].update(
-        {
-            "status": SliceStatus.IN_REVIEW.value,
-            "branch": branch,
-            "dispatch_agent_id": owner_id,
-            "dispatch_intent_id": "real-watcher-intent",
-            "dispatch_last_boundary": "agent.spawned",
-            "dispatch_authoritative_event_seq": 1,
-        }
-    )
     filed_seq = filed_event.get("run_seq")
     watcher_seq = watcher_event.get("run_seq")
     if type(filed_seq) is not int or type(watcher_seq) is not int or watcher_seq <= filed_seq:
         raise HarnessError(f"watcher event ordering was not durable: {filed_event!r} {watcher_event!r}")
-    create(
-        run_id,
-        {
-            "owner_branch": "main",
-            "owner_worktree": str(repo),
-            "slices": initial,
-            "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
-        },
-        root_dir=state_root,
-    )
-    store = RunStore(run_id, state_root)
-    seeded = store.load()
-    store.checkpoint(
-        TLWaiting({slice_id: ChildHandle(slice_id, branch, owner_id)}),
-        seeded.slices,
-        seeded.budgets,
-        filed_seq - 1,
-    )
-    reader = LedgerReader(
-        repo / ".exo" / "ledger" / "segments",
-        run_id=run_id,
-        state_root=state_root,
-        ledger_run_id=swarm_id,
-    )
-    source = LedgerQueue(reader, poll_interval=0.01, active_tail_timeout=5).start()
-    try:
-        result = run_tl_loop(
-            run_id,
-            plan,
-            source,
-            EffectClient(client, role="tl", name="parent"),
-            config=config,
-            root_dir=state_root,
+    child = RunStore("sub-a", child_state_root).load()
+    child_checkpoint = child_state_root / "sub-a" / "run.json"
+    if not child_checkpoint.is_file() or child.ledger_run_id != swarm_id:
+        raise HarnessError(
+            f"recursive child checkpoint lost authoritative swarm identity: {child!r}"
         )
-    finally:
-        source.close()
-    final = RunStore(run_id, state_root).load()
-    current = final.slices[slice_id]
+    current = child.slices[slice_id]
     if current.pr_number != pr_number or current.reviewed_head != head_sha:
-        raise HarnessError(f"real watcher event did not update the owning slice: {current!r}")
-    if result.diagnostics.get("correlated") != 2:
-        raise HarnessError(f"real watcher events were not consumed exactly once: {result.diagnostics}")
+        raise HarnessError(f"recursive controller did not route the PR to its leaf: {current!r}")
+    attempts = current.reviewer_attempt
+    if attempts.get(head_sha) != 1 or len(attempts) != 1:
+        raise HarnessError(f"reviewer claim was not persisted exactly once: {current!r}")
+    reviewer_agents = {
+        data.get("child_agent")
+        for reviewer in reviewer_events
+        for data in [reviewer.get("data")]
+        if isinstance(data, Mapping) and isinstance(data.get("child_agent"), str)
+    }
+    if len(reviewer_agents) != 1:
+        raise HarnessError(f"reviewer ownership was not unique: {reviewer_events!r}")
+    if root_process.is_alive():
+        root_process.terminate()
+    root_process.join(timeout=5)
+    for reviewer in reviewer_events:
+        data = reviewer.get("data")
+        if isinstance(data, Mapping) and isinstance(data.get("child_agent"), str):
+            stop_spawned_worker(repo, str(data["child_agent"]))
+    if owner_id:
+        stop_spawned_worker(repo, owner_id)
 
 
 def run_recursive_checkpoint_probe(

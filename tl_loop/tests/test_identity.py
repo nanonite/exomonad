@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 from types import SimpleNamespace
 
@@ -10,6 +11,8 @@ import pytest
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.envelope import project
 from tl_loop.events.identity import envelope_document, resolve_event_slice
+from tl_loop.events.queue import LedgerQueue
+from tl_loop.events.reader import LedgerReader
 from tl_loop.fsm.phase import ChildHandle, TLWaiting
 from tl_loop.loop.driver import LeafTask, TLLoopConfig, WorkPlan, run_tl_loop
 from tl_loop.state.schema import BudgetLedger, SliceState, SliceStatus
@@ -109,21 +112,21 @@ def test_corrupt_quarantine_storage_is_visible_to_controller(tmp_path) -> None:
         store.quarantined_events()
 
 
-class _ScriptedQueue:
-    def __init__(self, events: list[object]) -> None:
-        self.events = events
+class _RecordingLedgerQueue:
+    def __init__(self, queue: LedgerQueue) -> None:
+        self.queue = queue
         self.acknowledged: list[int] = []
 
     def get(self, timeout: float | None = None) -> object:
-        del timeout
-        if not self.events:
-            raise queue.Empty
-        return self.events.pop(0)
+        return self.queue.get(timeout=timeout)
 
     def acknowledge(self, event: object) -> int:
-        sequence = event.run_seq
+        sequence = self.queue.acknowledge(event)
         self.acknowledged.append(sequence)
         return sequence
+
+    def close(self) -> None:
+        self.queue.close(timeout=5)
 
 
 class _NoopTransport:
@@ -212,65 +215,83 @@ def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> 
         0,
     )
     branch = "main.tunable-operator-body-opencode"
-    source = _ScriptedQueue(
-        [
-            _routing_event(
-                1,
-                "ci.status_changed",
-                agent_id=branch,
-                data={
-                    "pr_number": 42,
-                    "head_sha": "head-42",
-                    "status": "pending",
-                    "branch": branch,
-                },
-            ),
-            _routing_event(
-                2,
-                "pr.filed",
-                agent_id="tunable-operator-body",
-                data={
-                    "slice_id": "tunable-operator-body",
-                    "pr_number": 42,
-                    "head_sha": "head-42",
-                    "branch": branch,
-                },
-            ),
-            _routing_event(
-                3,
-                "ci.status_changed",
-                agent_id=branch,
-                data={
-                    "pr_number": 42,
-                    "head_sha": "head-42",
-                    "status": "success",
-                    "branch": branch,
-                },
-            ),
-            _routing_event(
-                4,
-                "agent.notify_parent",
-                agent_id="tunable-operator-body",
-                data={"shadow_event": {"kind": "all_children_done"}},
-            ),
-        ]
-    )
-
-    result = run_tl_loop(
-        "routing-run",
-        WorkPlan(leaves=(LeafTask("tunable-operator-body", "route review and CI"),)),
-        source,
-        ReadOnlyEffectClient(_NoopTransport()),
-        config=TLLoopConfig(
-            active=False,
-            keep_alive_on_waiting=True,
-            max_events=8,
-            poll_interval=0.001,
-            idle_timeout=0.1,
-            root_dir=tmp_path,
+    events = [
+        _routing_event(
+            1,
+            "ci.status_changed",
+            agent_id=branch,
+            data={
+                "pr_number": 42,
+                "head_sha": "head-42",
+                "status": "pending",
+                "branch": branch,
+            },
         ),
-        root_dir=tmp_path,
+        _routing_event(
+            2,
+            "pr.filed",
+            agent_id="tunable-operator-body",
+            data={
+                "slice_id": "tunable-operator-body",
+                "pr_number": 42,
+                "head_sha": "head-42",
+                "branch": branch,
+            },
+        ),
+        _routing_event(
+            3,
+            "ci.status_changed",
+            agent_id=branch,
+            data={
+                "pr_number": 42,
+                "head_sha": "head-42",
+                "status": "success",
+                "branch": branch,
+            },
+        ),
+        _routing_event(
+            4,
+            "agent.notify_parent",
+            agent_id="tunable-operator-body",
+            data={"shadow_event": {"kind": "all_children_done"}},
+        ),
+    ]
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    (segments / "segment-000000000001.jsonl").write_text(
+        "\n".join(json.dumps(envelope_document(event)) for event in events) + "\n",
+        encoding="utf-8",
     )
+    source = _RecordingLedgerQueue(
+        LedgerQueue(
+            LedgerReader(
+                segments,
+                run_id="routing-run",
+                state_root=tmp_path,
+                ledger_run_id="routing-run",
+            ),
+            poll_interval=0.001,
+            active_tail_timeout=1,
+        ).start()
+    )
+    try:
+        result = run_tl_loop(
+            "routing-run",
+            WorkPlan(leaves=(LeafTask("tunable-operator-body", "route review and CI"),)),
+            source,
+            ReadOnlyEffectClient(_NoopTransport()),
+            config=TLLoopConfig(
+                active=False,
+                keep_alive_on_waiting=True,
+                max_events=8,
+                poll_interval=0.001,
+                idle_timeout=0.1,
+                root_dir=tmp_path,
+            ),
+            root_dir=tmp_path,
+        )
+    finally:
+        source.close()
 
     final = result.final_state.slices["tunable-operator-body"]
     assert result.final_state.fsm.phase.value == "tl_done"
