@@ -122,8 +122,20 @@ async fn ensure_watcher_dashboard_window(
     let windows = ipc.list_windows().await?;
 
     if has_watcher_dashboard_window(windows.iter().map(|window| window.window_name.as_str())) {
-        debug!("Watcher dashboard window already exists");
-        return Ok(());
+        let existing = windows
+            .iter()
+            .find(|window| window.window_name == WATCHER_WINDOW_NAME)
+            .expect("has_watcher_dashboard_window confirmed a matching window exists");
+        let routing = exomonad_core::domain::RoutingInfo::window(existing.window_id.clone());
+        if ipc.routing_target_process_alive(&routing).await? {
+            debug!("Watcher dashboard window already exists");
+            return Ok(());
+        }
+        info!(
+            window = %existing.window_id,
+            "Watcher dashboard window is dead, removing before recovery"
+        );
+        ipc.kill_window(&existing.window_id).await?;
     }
 
     let watcher_cmd = watcher_dashboard_command(cwd)?;
@@ -1130,6 +1142,30 @@ async fn launch_tl_recovery(
     startup
 }
 
+/// Serializes concurrent `exomonad init` invocations against the same
+/// project so two processes never race between inspecting session health
+/// and creating repair windows. The lock target need not exist; `FileLock`
+/// only ever touches the sibling `.lock` path.
+async fn acquire_init_reconciliation_lock(
+    project_dir: &Path,
+) -> Result<claude_teams_bridge::file_lock::FileLock> {
+    let lock_target = project_dir.join(".exo/tl-loop/init-reconcile");
+    if let Some(parent) = lock_target.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create init reconciliation lock directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    tokio::task::spawn_blocking(move || {
+        claude_teams_bridge::file_lock::FileLock::acquire(&lock_target, Duration::from_secs(30))
+    })
+    .await
+    .context("init reconciliation lock task panicked")?
+    .context("failed to acquire init reconciliation lock — another `exomonad init` may be running")
+}
+
 async fn reconcile_existing_session(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     project_dir: &Path,
@@ -1139,6 +1175,11 @@ async fn reconcile_existing_session(
     tl_loop_root: &Path,
     verbose: bool,
 ) -> Result<()> {
+    // Held for the whole inspect-then-create sequence below so a second
+    // concurrent `init` cannot observe the same dead window and race to
+    // create a duplicate repair window.
+    let _reconcile_lock = acquire_init_reconciliation_lock(project_dir).await?;
+
     let windows = ipc.list_windows().await?;
     let server_window = windows.iter().find(|window| window.window_name == "Server");
     let server_healthy = server_socket_is_healthy(project_dir).await;
@@ -1153,6 +1194,10 @@ async fn reconcile_existing_session(
         if server_alive {
             wait_for_server_socket(project_dir).await?;
         } else {
+            if let Some(window) = server_window {
+                info!(window = %window.window_id, "Server window is dead, removing before recovery");
+                ipc.kill_window(&window.window_id).await?;
+            }
             launch_server_recovery(ipc, project_dir, shell, session, config, verbose).await?;
         }
     }
@@ -1170,6 +1215,11 @@ async fn reconcile_existing_session(
     };
     if tl_alive || !root_tl_needs_resume(project_dir)? {
         return Ok(());
+    }
+
+    if let Some(window) = tl_window {
+        info!(window = %window.window_id, "TL window is dead, removing before recovery");
+        ipc.kill_window(&window.window_id).await?;
     }
 
     if let Some(archive) = archive_controller_exit_reason(project_dir)? {
@@ -2841,6 +2891,48 @@ mod tests {
         assert!(!has_watcher_dashboard_window(["Server", "TL"]));
     }
 
+    #[tokio::test]
+    async fn init_reconciliation_lock_serializes_concurrent_reconcile() {
+        // #903: reconcile_existing_session must hold one project-scoped lock
+        // across its inspect-then-create sequence, so two concurrent
+        // `exomonad init` invocations serialize instead of racing to create
+        // duplicate repair windows.
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().to_path_buf();
+
+        let first = acquire_init_reconciliation_lock(&project_dir)
+            .await
+            .expect("first init should acquire the reconciliation lock");
+
+        let lock_path = project_dir.join(".exo/tl-loop/init-reconcile.lock");
+        assert!(lock_path.exists(), "lock file should be published");
+
+        // A second concurrent init contends for the same lock while the
+        // first is still running its reconciliation.
+        let contender_dir = project_dir.clone();
+        let contender = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let lock = acquire_init_reconciliation_lock(&contender_dir)
+                .await
+                .expect("second init should eventually acquire the lock");
+            (started.elapsed(), lock)
+        });
+
+        // Give the contender time to start blocking on the held lock before
+        // releasing it, then confirm it only proceeds after release.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(first);
+
+        let (waited, second_lock) = contender.await.unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "second init should have blocked until the first lock was released, waited {waited:?}"
+        );
+        assert!(lock_path.exists(), "second init should now hold the lock");
+        drop(second_lock);
+        assert!(!lock_path.exists(), "lock should be released on drop");
+    }
+
     #[test]
     fn forgejo_token_remote_url_rewrites_matching_ssh_origin() {
         let url = forgejo_token_remote_url(
@@ -3020,10 +3112,15 @@ mod tests {
 
     #[test]
     fn server_command_preserves_session_and_agent_routing() {
-        let mut config = Config::default();
-        config.root_agent_type = AgentType::Claude;
-        config.spawn_agent_type = AgentType::OpenCode;
-        config.reviewer.agent_type = AgentType::Codex;
+        let config = Config {
+            root_agent_type: AgentType::Claude,
+            spawn_agent_type: AgentType::OpenCode,
+            reviewer: exomonad::config::ReviewerConfig {
+                agent_type: AgentType::Codex,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let command = server_command("workspace", &config, false);
         assert!(command.contains("EXOMONAD_TMUX_SESSION=workspace"));
