@@ -1506,8 +1506,14 @@ def _record_dispatch_failure(
 ACTION_JOURNAL_GATE_PREFIX = "tl-action-journal-"
 
 
-def _action_journal_gate_name(key: str) -> str:
-    return f"{ACTION_JOURNAL_GATE_PREFIX}{key[:16]}"
+def _action_journal_gate_name(key: str, attempt: int = 0) -> str:
+    suffix = f"-{attempt}" if attempt else ""
+    return f"{ACTION_JOURNAL_GATE_PREFIX}{key[:16]}{suffix}"
+
+
+def _action_journal_compensation_attempt(entry: Mapping[str, object]) -> int:
+    attempt = entry.get("compensation_attempt")
+    return attempt if isinstance(attempt, int) and attempt >= 0 else 0
 
 
 def _reconcile_action_journal(
@@ -1525,6 +1531,16 @@ def _reconcile_action_journal(
     next matching dispatch proceeds as a genuinely fresh attempt; rejecting
     it records a durable rejected outcome so callers observe a normal
     failure instead of a crash on the next retry.
+
+    An approval only ever authorizes the one ambiguous occurrence the
+    operator looked at. The gate name is scoped by a persisted per-key
+    compensation_attempt counter that increments every time this key is
+    resolved, so a *later* unknown/intended outcome for the same
+    operation+target+arguments (e.g. the retried dispatch itself lands in
+    another ambiguous state) opens a brand-new PENDING gate rather than
+    silently matching the earlier APPROVED one. Without this, one approval
+    would authorize the effect (spawn, merge, PR, or cleanup) to be retried
+    indefinitely with no further human check, risking it running twice.
     """
     if not isinstance(effects_log, EffectJournal):
         return state
@@ -1532,7 +1548,8 @@ def _reconcile_action_journal(
         key = entry.get("key")
         if not isinstance(key, str) or not key:
             continue
-        gate_name = _action_journal_gate_name(key)
+        attempt = _action_journal_compensation_attempt(entry)
+        gate_name = _action_journal_gate_name(key, attempt)
         gate = next((candidate for candidate in state.gates if candidate.name == gate_name), None)
         if gate is None:
             state = store.set_gate(gate_name, GateStatus.PENDING)
@@ -1545,11 +1562,14 @@ def _reconcile_action_journal(
                 gate_name,
             )
         elif gate.status is GateStatus.APPROVED:
-            effects_log.resolve_by_key(key, status="compensated")
+            effects_log.resolve_by_key(
+                key, status="compensated", compensation_attempt=attempt + 1
+            )
         elif gate.status is GateStatus.REJECTED:
             effects_log.resolve_by_key(
                 key,
                 status="rejected",
+                compensation_attempt=attempt + 1,
                 result={
                     "success": False,
                     "error": f"operator rejected retry via gate {gate_name!r}",
@@ -4715,7 +4735,9 @@ def _invoke(
             return result
         if status in {"intended", "unknown"}:
             key = prior.get("key", journal.key_for(intent))
-            gate_name = _action_journal_gate_name(key)
+            gate_name = _action_journal_gate_name(
+                key, _action_journal_compensation_attempt(prior)
+            )
             raise TLLoopError(
                 f"lifecycle effect {operation} for {target!r} has unknown outcome "
                 f"and requires reconciliation before retry (key={key}); restart to "

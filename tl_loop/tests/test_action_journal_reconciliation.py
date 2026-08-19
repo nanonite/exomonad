@@ -93,3 +93,67 @@ def test_reconciliation_is_a_noop_without_an_action_journal(tmp_path) -> None:
 
     assert new_state.gates == state.gates
     assert plain_effects_log == []
+
+
+def test_a_second_unknown_outcome_for_the_same_key_does_not_reuse_the_earlier_approval(
+    tmp_path,
+) -> None:
+    """chainlink #905 follow-up: one approval must not silently authorize a
+    retried effect (spawn/merge/PR/cleanup) to run again with no further
+    human check. The retried dispatch itself lands in another ambiguous
+    ("unknown") outcome here, exactly as an interrupted merge_pr retry
+    would; the operator must be asked again before it is compensated a
+    second time.
+    """
+    journal, intent, key = _journal_with_unknown_entry(tmp_path)
+    store, state = _store_and_state(tmp_path)
+    first_gate_name = _action_journal_gate_name(key)
+    state = store.set_gate(first_gate_name, GateStatus.APPROVED)
+
+    state = _reconcile_action_journal(state, store, journal)
+
+    assert journal.existing(intent)["status"] == "compensated"
+    assert journal.existing(intent)["compensation_attempt"] == 1
+
+    # The retried dispatch re-appends the same key (a fresh "intended"
+    # attempt), then itself becomes ambiguous again.
+    journal.append(intent)
+    journal.mark_unknown(intent, RuntimeError("connection lost again"))
+
+    state = _reconcile_action_journal(state, store, journal)
+
+    second_gate_name = _action_journal_gate_name(key, attempt=1)
+    assert second_gate_name != first_gate_name
+    second_gate = next((g for g in state.gates if g.name == second_gate_name), None)
+    assert second_gate is not None
+    assert second_gate.status is GateStatus.PENDING
+
+    # The first, already-spent approval remains as a durable audit record
+    # but must not have resolved the new occurrence.
+    first_gate = next((g for g in state.gates if g.name == first_gate_name), None)
+    assert first_gate.status is GateStatus.APPROVED
+    assert journal.existing(intent)["status"] == "unknown"
+
+
+def test_invoke_error_points_to_the_attempt_scoped_gate(tmp_path) -> None:
+    import pytest
+
+    from tl_loop.client.effects import ToolResult
+    from tl_loop.loop.driver import TLLoopError, _invoke
+
+    journal, intent, key = _journal_with_unknown_entry(tmp_path)
+    journal.resolve_by_key(key, compensation_attempt=1)
+
+    def call(_client: object) -> ToolResult:
+        raise AssertionError("must not dispatch while the entry is still blocked")
+
+    with pytest.raises(TLLoopError, match=_action_journal_gate_name(key, attempt=1)):
+        _invoke(
+            intent.operation,
+            intent.target,
+            intent.arguments,
+            intent.active,
+            None,
+            call,  # type: ignore[arg-type]
+            journal,
+        )
