@@ -265,6 +265,7 @@ spawn_agent_type = "codex"   # default harness for workers, leaves, and companio
 tl_effort_level = "medium"   # legacy compatibility; not used by the controller
 worker_effort_level = "medium"
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
+tl_transport_timeout_seconds = 120.0  # TL loop server transport timeout in seconds
 forgejo_url = "http://localhost:3000"           # optional — Forgejo base URL
 forgejo_token = "forgejo_pat"                      # optional — Forgejo API token
 forgejo_webhook_secret = "shared-secret"           # optional — webhook signature secret

@@ -8,6 +8,7 @@ use exomonad_core::Role;
 pub const REVIEWER_MAX_ROUNDS_ENV: &str = "EXOMONAD_REVIEWER_MAX_ROUNDS";
 pub const REVIEWER_MODEL_ENV: &str = "EXOMONAD_REVIEWER_MODEL";
 pub const REVIEWER_EFFORT_ENV: &str = "EXOMONAD_REVIEWER_EFFORT_LEVEL";
+pub const DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS: f64 = 120.0;
 
 pub fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
     let parsed = value
@@ -250,6 +251,9 @@ pub struct RawConfig {
     /// Orphan reconciler interval in seconds (default: 60).
     pub orphan_reconciler_interval_secs: Option<u64>,
 
+    /// TL loop transport timeout in seconds (default: 120).
+    pub tl_transport_timeout_seconds: Option<f64>,
+
     /// OpenRouter routing configuration.
     #[serde(default)]
     pub openrouter: Option<OpenRouterConfig>,
@@ -336,6 +340,9 @@ pub struct Config {
 
     /// Orphan reconciler interval in seconds (default: 60).
     pub orphan_reconciler_interval_secs: Option<u64>,
+
+    /// TL loop transport timeout in seconds.
+    pub tl_transport_timeout_seconds: f64,
 
     /// OpenRouter routing configuration.
     pub openrouter: OpenRouterConfig,
@@ -522,6 +529,13 @@ impl Config {
         let orphan_reconciler_interval_secs = local_raw
             .orphan_reconciler_interval_secs
             .or(global_raw.orphan_reconciler_interval_secs);
+        let tl_transport_timeout_seconds = local_raw
+            .tl_transport_timeout_seconds
+            .or(global_raw.tl_transport_timeout_seconds)
+            .unwrap_or(DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS);
+        if tl_transport_timeout_seconds <= 0.0 {
+            anyhow::bail!("tl_transport_timeout_seconds must be greater than zero");
+        }
 
         // Resolve openrouter: local > global > default
         let openrouter = local_raw
@@ -609,6 +623,7 @@ impl Config {
             poll_interval,
             inbox_poke_interval,
             orphan_reconciler_interval_secs,
+            tl_transport_timeout_seconds,
             openrouter,
             opencode,
             opencode_as_tl,
@@ -660,6 +675,7 @@ impl Default for Config {
             poll_interval: None,
             inbox_poke_interval: None,
             orphan_reconciler_interval_secs: None,
+            tl_transport_timeout_seconds: DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
             opencode_as_tl: false,
@@ -782,6 +798,10 @@ mod tests {
         assert_eq!(config.root_agent_type, AgentType::Claude);
         assert_eq!(config.spawn_agent_type, AgentType::Codex);
         assert_eq!(config.port, 7433);
+        assert_eq!(
+            config.tl_transport_timeout_seconds,
+            DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS
+        );
     }
 
     #[test]
@@ -805,6 +825,15 @@ mod tests {
         "#;
         let raw: RawConfig = toml::from_str(content).unwrap();
         assert_eq!(raw.inbox_poke_interval, Some(120));
+    }
+
+    #[test]
+    fn test_raw_config_parse_tl_transport_timeout() {
+        let content = r#"
+            tl_transport_timeout_seconds = 45.5
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.tl_transport_timeout_seconds, Some(45.5));
     }
 
     #[test]

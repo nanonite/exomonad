@@ -6,6 +6,7 @@ port = 7433
 yolo = true
 otlp_endpoint = "http://localhost:4317"
 orphan_reconciler_interval_secs = 60
+tl_transport_timeout_seconds = 120.0
 
 forgejo_url = "http://localhost:3000"
 forgejo_token = ""

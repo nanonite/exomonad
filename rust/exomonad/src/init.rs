@@ -996,7 +996,7 @@ fn write_tl_loop_identity(cwd: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn tl_loop_command(cwd: &Path, package_root: &Path) -> String {
+fn tl_loop_command(cwd: &Path, package_root: &Path, transport_timeout: f64) -> String {
     let package = shell_escape::escape(package_root.display().to_string().into());
     let project = shell_escape::escape(cwd.display().to_string().into());
     let plan = shell_escape::escape(
@@ -1006,7 +1006,7 @@ fn tl_loop_command(cwd: &Path, package_root: &Path) -> String {
             .into(),
     );
     format!(
-        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan",
+        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan --transport-timeout {transport_timeout}",
         shell_escape::escape(tl_loop_python(cwd).into()),
     )
 }
@@ -1891,7 +1891,7 @@ pub async fn run(
     // The human-facing TL window runs one coordinator: the Python controller.
     // Root harness settings and root_command are intentionally ignored.
     let tl_cwd = cwd.clone();
-    let base_command = tl_loop_command(&cwd, &tl_loop_root);
+    let base_command = tl_loop_command(&cwd, &tl_loop_root, config.tl_transport_timeout_seconds);
 
     let tl_command = match config.shell_command {
         Some(ref sc) => format!("{} -c \"{}\"", sc, base_command.replace('"', "\\\"")),
@@ -3214,11 +3214,12 @@ mod tests {
 
     #[test]
     fn tl_loop_command_uses_programmatic_controller() {
-        let command = tl_loop_command(Path::new("/tmp/repo"), Path::new("/tmp/exo"));
+        let command = tl_loop_command(Path::new("/tmp/repo"), Path::new("/tmp/exo"), 45.5);
         assert!(command.contains("EXOMONAD_ROLE=tl"));
         assert!(!command.contains("PYTHONPATH="));
         assert!(command.contains("python3 /tmp/exo run"));
         assert!(command.contains("--wait-for-plan"));
+        assert!(command.contains("--transport-timeout 45.5"));
     }
 
     #[test]

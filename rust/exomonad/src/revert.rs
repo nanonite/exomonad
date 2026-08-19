@@ -179,7 +179,7 @@ async fn remove_dir_if_exists(path: &Path, report: &mut RevertReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exomonad::config::{CompanionConfig, ReviewerConfig};
+    use exomonad::config::{CompanionConfig, ReviewerConfig, DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS};
     use exomonad_core::{services::AgentType, Role};
     use std::collections::HashMap;
 
@@ -216,6 +216,7 @@ mod tests {
             poll_interval: None,
             inbox_poke_interval: None,
             orphan_reconciler_interval_secs: None,
+            tl_transport_timeout_seconds: DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
             openrouter: Default::default(),
             opencode: Default::default(),
             opencode_as_tl: false,

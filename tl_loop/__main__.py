@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import cast
 
 from tl_loop.client.effects import EffectClient
-from tl_loop.client.transport import TransportClient
+from tl_loop.client.transport import DEFAULT_TIMEOUT_SECONDS, TransportClient
 from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
@@ -117,6 +117,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID))
     run.add_argument("--max-events", type=_positive_int, default=DEFAULT_MAX_EVENTS)
     run.add_argument("--idle-timeout", type=_positive_float, default=DEFAULT_IDLE_TIMEOUT)
+    run.add_argument("--transport-timeout", type=_positive_float, default=DEFAULT_TIMEOUT_SECONDS)
     run.add_argument("--poll-interval", type=_positive_float, default=0.25)
     run.add_argument("--wait-for-plan", action="store_true")
     run.add_argument("--verbose", action="store_true")
@@ -186,7 +187,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     )
     source = LedgerQueue(reader, poll_interval=args.poll_interval).start()
     effects = EffectClient(
-        TransportClient(project_root=project_root),
+        TransportClient(project_root=project_root, timeout=args.transport_timeout),
         role="tl",
         name="root",
     )

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 from urllib.parse import quote
 
-DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_TIMEOUT_SECONDS = 120.0
 LOGGER = logging.getLogger(__name__)
 
 JsonPrimitive: TypeAlias = None | bool | int | float | str

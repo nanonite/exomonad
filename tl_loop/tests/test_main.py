@@ -107,3 +107,41 @@ def test_rejected_plan_proposal_emits_bounded_reason_without_body(
     assert isinstance(payload["rejection_reason"], str)
     assert len(payload["rejection_reason"]) <= launcher.PLAN_REJECTION_REASON_LIMIT
     assert "secret" not in str(payload)
+
+
+def test_run_passes_transport_timeout_to_client(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class EmptySource:
+        def start(self):
+            return self
+
+        def close(self, timeout: float) -> None:
+            del timeout
+
+    def transport_client(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(launcher, "TransportClient", transport_client)
+    monkeypatch.setattr(launcher, "_load_plan", lambda path, wait: {"plan": {}})
+    monkeypatch.setattr(launcher, "LedgerReader", lambda *args, **kwargs: object())
+    monkeypatch.setattr(launcher, "LedgerQueue", lambda *args, **kwargs: EmptySource())
+    monkeypatch.setattr(launcher, "load_policy", lambda path: object())
+    monkeypatch.setattr(launcher, "load_capability", lambda path, policy_path: object())
+    monkeypatch.setattr(launcher, "tl_run", lambda *args: object())
+
+    launcher._run(
+        argparse.Namespace(
+            project_root=tmp_path,
+            plan=Path("plan.json"),
+            wait_for_plan=False,
+            run_id="root",
+            poll_interval=0.25,
+            max_events=256,
+            idle_timeout=30.0,
+            transport_timeout=45.5,
+        )
+    )
+
+    assert captured == {"project_root": tmp_path.resolve(), "timeout": 45.5}
