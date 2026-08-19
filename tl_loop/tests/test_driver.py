@@ -1266,6 +1266,145 @@ def test_ci_failure_records_head_and_resumes_same_pr(tmp_path: Path) -> None:
     ]
 
 
+def test_ci_failure_before_review_records_ci_state_without_verdict(tmp_path: Path) -> None:
+    """The exact crash shape: a CI failure lands before any head has been reviewed.
+
+    ``reviewed_head`` is None, so the schema invariant that a verdict requires
+    a bound reviewed head must not be violated. Before the fix this call raised
+    a schema error out of ``store.checkpoint`` and the event cursor never
+    advanced, so every restart replayed the same event forever.
+    """
+    transport = RecordingTransport()
+    store = _review_store(tmp_path, reviewed_head=None, verdict=None)
+    state = store.load()
+
+    result = _route_ci_event(
+        store,
+        state,
+        TLPlanning(),
+        _ci_failure_event(),
+        1,
+        TLLoopConfig(active=True, review_policy_path=Path(".exo/review-policy.toml")),
+        EffectClient(transport),
+        [],
+    )
+
+    assert result.slices["leaf-a"].verdict is None
+    restored = store.load().slices["leaf-a"]
+    assert restored.ci_state == {"head-a": "failure"}
+    assert restored.verdict is None
+    assert restored.verdict_at is None
+    assert restored.status is SliceStatus.IN_REVIEW
+    assert _effect_names(transport) == []
+
+
+def test_ci_failure_for_stale_head_does_not_override_verdict(tmp_path: Path) -> None:
+    """A late CI result for a head that isn't the currently reviewed head must not
+    clobber the verdict bound to the reviewed head."""
+    transport = RecordingTransport()
+    store = _review_store(tmp_path, reviewed_head="head-b", verdict=Verdict.GO)
+    state = store.load()
+
+    result = _route_ci_event(
+        store,
+        state,
+        TLPlanning(),
+        _ci_failure_event(),
+        1,
+        TLLoopConfig(active=True, review_policy_path=Path(".exo/review-policy.toml")),
+        EffectClient(transport),
+        [],
+    )
+
+    assert result.slices["leaf-a"].verdict is Verdict.GO
+    restored = store.load().slices["leaf-a"]
+    assert restored.ci_state == {"head-a": "failure"}
+    assert restored.verdict is Verdict.GO
+    assert restored.reviewed_head == "head-b"
+    assert _effect_names(transport) == []
+
+
+def test_ci_failure_after_review_binds_head_then_still_repairs(tmp_path: Path) -> None:
+    """A CI failure before review is recorded harmlessly; once review binds the
+    same head, a subsequent CI failure on it still sets NO_GO and repairs."""
+    backend = ReviewBackend(
+        [
+            RlmResponse(
+                {
+                    "root_cause": "CI exposed a failure in src/leaf.py",
+                    "proposed_solution": "Fix the failure in src/leaf.py",
+                    "read_first": ["src/leaf.py"],
+                    "steps": ["Update src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                    "boundary": ["Only edit src/leaf.py"],
+                    "done_criteria": ["CI passes"],
+                }
+            )
+        ]
+    )
+    pre_review_event = project(
+        {
+            "type": "ci.status_changed",
+            "run_seq": 1,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-x",
+                "status": "failure",
+                "message": "tests failed",
+            },
+        }
+    )
+    pre_review_transport = RecordingTransport()
+    store = _review_store(tmp_path, reviewed_head=None, verdict=None)
+    state = store.load()
+    state = _route_ci_event(
+        store,
+        state,
+        TLPlanning(),
+        pre_review_event,
+        1,
+        TLLoopConfig(active=True, review_policy_path=Path(".exo/review-policy.toml")),
+        EffectClient(pre_review_transport),
+        [],
+    )
+    assert state.slices["leaf-a"].verdict is None
+    assert state.slices["leaf-a"].ci_state == {"head-x": "failure"}
+    assert _effect_names(pre_review_transport) == []
+
+    reviewed = replace(state.slices["leaf-a"], reviewed_head="head-a", verdict=Verdict.GO)
+    state = store.checkpoint(TLPlanning(), {**state.slices, "leaf-a": reviewed}, state.budgets, 1)
+
+    repair_transport = ReviewRepairTransport()
+    state = _route_ci_event(
+        store,
+        state,
+        TLPlanning(),
+        _ci_failure_event(),
+        2,
+        TLLoopConfig(
+            active=True,
+            review_model_choice=_review_choice(backend),
+            review_policy_path=Path(".exo/review-policy.toml"),
+        ),
+        EffectClient(repair_transport),
+        [],
+    )
+
+    restored = store.load().slices["leaf-a"]
+    assert restored.ci_state == {"head-x": "failure", "head-a": "failure"}
+    assert restored.status is SliceStatus.REPAIRING
+    assert restored.verdict is Verdict.NO_GO
+    assert _effect_names(repair_transport) == [
+        "watcher_pr_state",
+        "resume_pr",
+    ]
+
+
 def _review_choice(backend: ReviewBackend) -> RlmModelChoice:
     return RlmModelChoice(
         model_id="test-model",
@@ -1275,7 +1414,9 @@ def _review_choice(backend: ReviewBackend) -> RlmModelChoice:
     )
 
 
-def _review_store(tmp_path: Path, *, verdict: Verdict | None = None) -> RunStore:
+def _review_store(
+    tmp_path: Path, *, verdict: Verdict | None = None, reviewed_head: str | None = "head-a"
+) -> RunStore:
     store = RunStore("review-run", tmp_path)
     create("review-run", {}, root_dir=tmp_path)
     store.checkpoint(
@@ -1293,7 +1434,7 @@ def _review_store(tmp_path: Path, *, verdict: Verdict | None = None) -> RunStore
                 branch="main.leaf-a",
                 worktree=".worktrees/leaf-a",
                 pr_number=42,
-                reviewed_head="head-a",
+                reviewed_head=reviewed_head,
                 attempts=1,
                 verdict=verdict,
             )

@@ -4449,13 +4449,14 @@ def _route_ci_event(
     status = _ci_status(event)
     ci_state = dict(current.ci_state)
     ci_state[head_sha] = status
+    reviewed_head_matches = status == "failure" and current.reviewed_head == head_sha
     updated = dict(state.slices)
     updated[slice_id] = replace(
         current,
         pr_number=event.pr_number or current.pr_number,
         ci_state=ci_state,
-        verdict=Verdict.NO_GO if status == "failure" else current.verdict,
-        verdict_at=event.observed_at if status == "failure" else current.verdict_at,
+        verdict=Verdict.NO_GO if reviewed_head_matches else current.verdict,
+        verdict_at=event.observed_at if reviewed_head_matches else current.verdict_at,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
     should_repair = (
