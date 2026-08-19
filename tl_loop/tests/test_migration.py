@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+import tl_loop.state.migration as migration_module
+from tl_loop.state.migration import install_migration, migrate_checkpoint_document
 from tl_loop.state.schema import SCHEMA_VERSION
 from tl_loop.state.store import CorruptCheckpoint, RunStore
 
@@ -95,6 +97,86 @@ def test_deployed_pre_898_version_1_checkpoint_is_migrated(tmp_path) -> None:
     assert report["status"] == "complete"
     assert report["source_version"] == 1
     assert report["target_version"] == SCHEMA_VERSION
+
+
+def test_install_migration_interrupted_before_report_leaves_checkpoint_untouched_and_retries_cleanly(
+    tmp_path, monkeypatch
+) -> None:
+    """chainlink #906 follow-up: an interruption between the backup write and
+    the report write must not leave the live checkpoint migrated with no
+    report, and a retry must not accumulate a second backup file."""
+    path = tmp_path / "run.json"
+    original = json.dumps(_legacy_spawned(), sort_keys=True)
+    path.write_text(original, encoding="utf-8")
+    result = migrate_checkpoint_document(json.loads(original), run_id="legacy")
+    assert result.migrated
+
+    real_atomic_write_json = migration_module._atomic_write_json
+    calls: list[object] = []
+
+    def crash_on_report(write_path, payload):
+        calls.append(write_path)
+        raise OSError("simulated interruption before the report write lands")
+
+    monkeypatch.setattr(migration_module, "_atomic_write_json", crash_on_report)
+    with pytest.raises(OSError, match="simulated interruption"):
+        install_migration(path, result)
+    monkeypatch.setattr(migration_module, "_atomic_write_json", real_atomic_write_json)
+
+    # The checkpoint must still be the pre-migration document -- otherwise
+    # the next load() would see source_version == CURRENT and never retry.
+    assert path.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "migration-report.json").exists()
+    backups = tuple(tmp_path.glob("run.json.legacy-*"))
+    assert len(backups) == 1
+
+    # Retry from scratch: must converge cleanly with exactly one backup.
+    install_migration(path, result)
+    assert path.read_text(encoding="utf-8") != original
+    report = json.loads((tmp_path / "migration-report.json").read_text())
+    assert report["status"] == "complete"
+    assert len(tuple(tmp_path.glob("run.json.legacy-*"))) == 1
+
+
+def test_install_migration_interrupted_after_report_before_checkpoint_retries_cleanly(
+    tmp_path, monkeypatch
+) -> None:
+    """An interruption after the report is written but before the live
+    checkpoint is overwritten must still be recoverable: the next load sees
+    the checkpoint as not-yet-migrated and retries, converging on one
+    backup and one up-to-date report rather than a stale report."""
+    path = tmp_path / "run.json"
+    original = json.dumps(_legacy_spawned(), sort_keys=True)
+    path.write_text(original, encoding="utf-8")
+    result = migrate_checkpoint_document(json.loads(original), run_id="legacy")
+    assert result.migrated
+
+    real_atomic_write_json = migration_module._atomic_write_json
+    call_count = 0
+
+    def crash_on_second_json_write(write_path, payload):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise OSError("simulated interruption before the checkpoint write lands")
+        return real_atomic_write_json(write_path, payload)
+
+    monkeypatch.setattr(migration_module, "_atomic_write_json", crash_on_second_json_write)
+    with pytest.raises(OSError, match="simulated interruption"):
+        install_migration(path, result)
+    monkeypatch.setattr(migration_module, "_atomic_write_json", real_atomic_write_json)
+
+    # The report landed durably before the interrupted checkpoint write.
+    assert json.loads((tmp_path / "migration-report.json").read_text())["status"] == "complete"
+    assert path.read_text(encoding="utf-8") == original
+    assert len(tuple(tmp_path.glob("run.json.legacy-*"))) == 1
+
+    # A retry (as the next real load() would trigger, since the checkpoint
+    # is still pre-migration on disk) converges cleanly.
+    install_migration(path, result)
+    assert path.read_text(encoding="utf-8") != original
+    assert len(tuple(tmp_path.glob("run.json.legacy-*"))) == 1
+    assert json.loads((tmp_path / "migration-report.json").read_text())["status"] == "complete"
 
 
 def test_unsupported_checkpoint_version_is_blocked(tmp_path) -> None:

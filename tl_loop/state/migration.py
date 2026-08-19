@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -71,13 +70,36 @@ def migrate_checkpoint_document(
 
 
 def install_migration(path: Path, result: MigrationResult) -> Path:
-    """Atomically preserve the original, install the result, and report it."""
+    """Preserve the original, report the migration, then install the result.
+
+    Every write below must be safe to redo from scratch if the process is
+    interrupted partway through -- this is called on every load() of a
+    legacy checkpoint until the live document itself reaches
+    CURRENT_CHECKPOINT_VERSION, at which point migrate_checkpoint_document
+    stops calling it at all. That makes the final checkpoint overwrite the
+    one truly irreversible step, so it goes last:
+
+    1. The backup name is a deterministic function of the source/target
+       versions (not a timestamp), so an interrupted-and-retried install
+       reuses the same backup file instead of accumulating a fresh
+       "legacy" copy on every restart before the checkpoint write lands.
+    2. The report is written next, while the on-disk checkpoint is still
+       the pre-migration document, so a report always exists before the
+       transition that makes the loader treat this checkpoint as already
+       current -- an interruption here still leaves migrate_checkpoint_document
+       able to detect and retry the whole migration on the next load.
+    3. Only then is the live checkpoint overwritten. If this step is what
+       gets interrupted, the report and backup are already correct and the
+       retry above will redo it idempotently; if it completes, a
+       "migrated checkpoint with no report" state is now unreachable.
+    """
     if not result.migrated:
         raise MigrationError("cannot install a non-migrated checkpoint")
-    backup = _collision_safe(path, f".legacy-{time.time_ns()}")
+    backup = path.with_name(
+        f"{path.name}.legacy-v{result.source_version}-to-v{CURRENT_CHECKPOINT_VERSION}"
+    )
     if not backup.exists():
         _atomic_write_bytes(backup, path.read_bytes())
-    _atomic_write_json(path, result.document)
     report = path.with_name("migration-report.json")
     _atomic_write_json(
         report,
@@ -91,6 +113,7 @@ def install_migration(path: Path, result: MigrationResult) -> Path:
             "status": "complete",
         },
     )
+    _atomic_write_json(path, result.document)
     return backup
 
 
@@ -168,15 +191,6 @@ def _has_spawn_evidence(value: dict[str, object]) -> bool:
         and bool(value["dispatch_agent_id"])
         and type(value.get("dispatch_authoritative_event_seq")) is int
     )
-
-
-def _collision_safe(path: Path, suffix: str) -> Path:
-    candidate = path.with_name(path.name + suffix)
-    index = 0
-    while candidate.exists():
-        index += 1
-        candidate = path.with_name(f"{path.name}{suffix}-{index}")
-    return candidate
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
