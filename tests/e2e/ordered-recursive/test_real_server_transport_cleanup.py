@@ -102,13 +102,11 @@ def test_recovery_action_journal_rejects_unresolved_or_duplicate_keys(tmp_path: 
         harness.assert_action_journal_converged(path)
 
 
-@pytest.mark.parametrize(
-    "phase",
-    ("dispatch", "publication", "watcher_delivery", "checkpoint", "stabilization"),
-)
 def test_routing_cleanup_attempts_every_owned_worker_after_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, phase: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """cleanup_recursive_watcher_probe itself: a failure disposing one owned
+    worker must not prevent best-effort disposal of the others."""
     process = multiprocessing.get_context("fork").Process(target=time.sleep, args=(60,))
     process.start()
     stopped: list[str] = []
@@ -116,7 +114,7 @@ def test_routing_cleanup_attempts_every_owned_worker_after_failure(
     def fake_stop_worker(repo: Path, worker_name: str) -> None:
         stopped.append(worker_name)
         if worker_name == "owner":
-            raise RuntimeError(f"injected {phase} cleanup failure")
+            raise RuntimeError("injected owner cleanup failure")
 
     monkeypatch.setattr(harness, "stop_spawned_worker", fake_stop_worker)
     monkeypatch.setattr(
@@ -136,6 +134,130 @@ def test_routing_cleanup_attempts_every_owned_worker_after_failure(
             )
         assert stopped == ["owner", "reviewer"]
         assert not process.is_alive()
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+
+
+_PROBE_PHASES = ("dispatch", "publication", "watcher_delivery", "checkpoint", "stabilization")
+
+
+def _install_fake_probe_phases(
+    monkeypatch: pytest.MonkeyPatch, failing_phase: str
+) -> None:
+    """Replace each of run_real_watcher_routing_probe's five phases with a
+    fast fake that returns deterministic values, except failing_phase, which
+    raises. This exercises the real probe wrapper and its finally-block
+    cleanup — not a direct call to the cleanup helper — so the assertions
+    prove cleanup actually fires from inside each real phase boundary."""
+
+    def dispatch(root_process: object, child_state_root: Path, slice_id: str) -> str:
+        if failing_phase == "dispatch":
+            raise RuntimeError("injected dispatch phase failure")
+        return "owner"
+
+    def publication(client: object, forgejo_url: str, owner_id: str) -> tuple[int, str, str]:
+        if failing_phase == "publication":
+            raise RuntimeError("injected publication phase failure")
+        return 42, "main.sub-a.real-watcher-leaf", "deadbeef"
+
+    def watcher_delivery(
+        root_process: object,
+        repo: Path,
+        swarm_id: str,
+        pr_number: int,
+        owner_id: str,
+        slice_id: str,
+        branch: str,
+        head_sha: str,
+    ) -> int:
+        if failing_phase == "watcher_delivery":
+            raise RuntimeError("injected watcher_delivery phase failure")
+        return 5
+
+    def checkpoint(
+        root_process: object,
+        child_state_root: Path,
+        slice_id: str,
+        swarm_id: str,
+        pr_number: int,
+        head_sha: str,
+        expected_cursor: int,
+    ) -> None:
+        if failing_phase == "checkpoint":
+            raise RuntimeError("injected checkpoint phase failure")
+
+    def stabilization(
+        root_process: object, repo: Path, swarm_id: str, pr_number: int
+    ) -> None:
+        if failing_phase == "stabilization":
+            raise RuntimeError("injected stabilization phase failure")
+
+    monkeypatch.setattr(harness, "_probe_dispatch_phase", dispatch)
+    monkeypatch.setattr(harness, "_probe_publication_phase", publication)
+    monkeypatch.setattr(harness, "_probe_watcher_delivery_phase", watcher_delivery)
+    monkeypatch.setattr(harness, "_probe_checkpoint_phase", checkpoint)
+    monkeypatch.setattr(harness, "_probe_stabilization_phase", stabilization)
+
+
+@pytest.mark.parametrize("phase", _PROBE_PHASES)
+def test_probe_failure_at_each_phase_disposes_controller_and_owned_workers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, phase: str
+) -> None:
+    """chainlink #908: a failure injected into the real dispatch, publication,
+    watcher_delivery, checkpoint, or stabilization phase of
+    run_real_watcher_routing_probe must still reach its finally block and
+    dispose the controller process and every owned worker/reviewer known by
+    that point — not just when cleanup is invoked directly."""
+    # Not started here: run_real_watcher_routing_probe owns start(), matching
+    # its real control flow (create → start → run body → finally cleanup).
+    process = multiprocessing.get_context("fork").Process(
+        target=_ignore_termination, name=f"fake-controller-{phase}"
+    )
+    monkeypatch.setattr(
+        harness.multiprocessing.get_context("fork"),
+        "Process",
+        lambda *a, **k: process,
+    )
+
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        harness, "stop_spawned_worker", lambda repo, worker_name: stopped.append(worker_name)
+    )
+    monkeypatch.setattr(
+        harness,
+        "reviewer_spawn_events",
+        lambda repo, swarm_id, pr_number: {1: {"data": {"child_agent": "reviewer"}}},
+    )
+    _install_fake_probe_phases(monkeypatch, phase)
+
+    try:
+        with pytest.raises(RuntimeError, match=f"injected {phase} phase failure"):
+            harness.run_real_watcher_routing_probe(
+                client=object(),
+                root=tmp_path,
+                repo=tmp_path,
+                forgejo_url="http://forgejo.invalid",
+                swarm_id="swarm",
+            )
+        assert not process.is_alive(), "controller process must be disposed after probe failure"
+
+        phase_index = _PROBE_PHASES.index(phase)
+        expected_workers: set[str] = set()
+        if phase_index >= _PROBE_PHASES.index("publication"):
+            # cleanup_state["owner_id"] is recorded right after the dispatch
+            # phase returns, so it is known — and must be cleaned up — for
+            # every later phase's failure, including publication's own.
+            expected_workers.add("owner")
+        if phase_index >= _PROBE_PHASES.index("watcher_delivery"):
+            # cleanup_state["pr_number"] is recorded right after the
+            # publication phase returns, so the reviewer lookup is only
+            # possible once a later phase (watcher_delivery onward) fails.
+            expected_workers.add("reviewer")
+        assert set(stopped) == expected_workers, (
+            f"phase={phase} stopped={stopped} expected={expected_workers}"
+        )
     finally:
         if process.is_alive():
             process.kill()

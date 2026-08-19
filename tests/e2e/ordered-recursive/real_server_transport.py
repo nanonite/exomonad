@@ -1020,19 +1020,12 @@ def run_real_watcher_routing_probe(
         cleanup_recursive_watcher_probe(repo, swarm_id, root_process, cleanup_state)
 
 
-def _run_real_watcher_routing_probe_body(
-    client: TransportClient,
-    root: Path,
-    repo: Path,
-    forgejo_url: str,
-    swarm_id: str,
+def _probe_dispatch_phase(
     root_process: multiprocessing.Process,
-    cleanup_state: dict[str, Any],
-) -> None:
-    """Route recursive Rust watcher events through the real Python controller."""
-    state_root = root / "recursive-watcher-state"
-    slice_id = "real-watcher-leaf"
-    child_state_root = state_root / "recursive-watcher-root"
+    child_state_root: Path,
+    slice_id: str,
+) -> str:
+    """Wait for the recursive controller to durably spawn the leaf; return its owner id."""
     owner_id: str | None = None
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -1044,14 +1037,21 @@ def _run_real_watcher_routing_probe_body(
             continue
         if child.status is SliceStatus.SPAWNED and child.dispatch_agent_id:
             owner_id = child.dispatch_agent_id
-            cleanup_state["owner_id"] = owner_id
             break
         time.sleep(0.1)
     if owner_id is None:
         raise HarnessError(
             "recursive controller did not durably spawn the watcher-routing leaf"
         )
+    return owner_id
 
+
+def _probe_publication_phase(
+    client: TransportClient,
+    forgejo_url: str,
+    owner_id: str,
+) -> tuple[int, str, str]:
+    """File and approve the leaf's PR; return (pr_number, branch, head_sha)."""
     owner_effects = EffectClient(client, role="tl", name=owner_id)
     filed = owner_effects.file_pr(
         title="Real recursive watcher routing",
@@ -1060,7 +1060,6 @@ def _run_real_watcher_routing_probe_body(
     )
     filed_data = find_object(filed, {"pr_number", "head_branch"})
     pr_number = int(filed_data["pr_number"])
-    cleanup_state["pr_number"] = pr_number
     branch = str(filed_data["head_branch"])
     snapshot = owner_effects.watcher_pr_state(pr_number=pr_number)
     evidence = find_object(snapshot, {"head_sha"})
@@ -1070,11 +1069,25 @@ def _run_real_watcher_routing_probe_body(
         f"{forgejo_url}/api/v1/repos/owner/repo/pulls/{pr_number}/reviews",
         {"event": "APPROVED", "commit_id": head_sha},
     )
+    return pr_number, branch, head_sha
 
+
+def _probe_watcher_delivery_phase(
+    root_process: multiprocessing.Process,
+    repo: Path,
+    swarm_id: str,
+    pr_number: int,
+    owner_id: str,
+    slice_id: str,
+    branch: str,
+    head_sha: str,
+) -> int:
+    """Wait for filed/approval/CI events and one reviewer spawn; return the expected cursor."""
     deadline = time.monotonic() + 30
     filed_event: Mapping[str, Any] | None = None
     watcher_event: Mapping[str, Any] | None = None
     ci_event: Mapping[str, Any] | None = None
+    reviewer_events: list[Mapping[str, Any]] = []
     while time.monotonic() < deadline:
         assert_controller_alive(root_process, "watcher event delivery")
         for event in server_ledger_events(repo):
@@ -1140,8 +1153,20 @@ def _run_real_watcher_routing_probe_body(
             f"watcher event ordering was not durable: filed={filed_event!r} "
             f"review={watcher_event!r} ci={ci_event!r}"
         )
+    return max(watcher_seq, ci_seq)
+
+
+def _probe_checkpoint_phase(
+    root_process: multiprocessing.Process,
+    child_state_root: Path,
+    slice_id: str,
+    swarm_id: str,
+    pr_number: int,
+    head_sha: str,
+    expected_cursor: int,
+) -> None:
+    """Wait for the child controller to durably persist approval and CI."""
     child_checkpoint = child_state_root / "sub-a" / "run.json"
-    expected_cursor = max(watcher_seq, ci_seq)
     checkpoint_deadline = time.monotonic() + 30
     child = None
     while time.monotonic() < checkpoint_deadline:
@@ -1179,8 +1204,7 @@ def _run_real_watcher_routing_probe_body(
     if child.events.last_consumed_offset < expected_cursor:
         raise HarnessError(
             "recursive controller did not consume the real watcher events: "
-            f"cursor={child.events.last_consumed_offset} review_seq={watcher_seq} "
-            f"ci_seq={ci_seq}"
+            f"cursor={child.events.last_consumed_offset} expected_cursor={expected_cursor}"
         )
     if current.ci_state.get(head_sha) != "success":
         raise HarnessError(f"recursive controller did not persist watcher CI: {current!r}")
@@ -1189,6 +1213,15 @@ def _run_real_watcher_routing_probe_body(
     attempts = current.reviewer_attempt
     if attempts.get(head_sha) != 1 or len(attempts) != 1:
         raise HarnessError(f"reviewer claim was not persisted exactly once: {current!r}")
+
+
+def _probe_stabilization_phase(
+    root_process: multiprocessing.Process,
+    repo: Path,
+    swarm_id: str,
+    pr_number: int,
+) -> None:
+    """Confirm the reviewer spawn stabilizes at exactly one event, uniquely owned."""
     stabilization_deadline = time.monotonic() + 3
     while time.monotonic() < stabilization_deadline:
         assert_controller_alive(root_process, "reviewer stabilization")
@@ -1213,6 +1246,45 @@ def _run_real_watcher_routing_probe_body(
     }
     if len(reviewer_agents) != 1:
         raise HarnessError(f"reviewer ownership was not unique: {reviewer_events!r}")
+
+
+def _run_real_watcher_routing_probe_body(
+    client: TransportClient,
+    root: Path,
+    repo: Path,
+    forgejo_url: str,
+    swarm_id: str,
+    root_process: multiprocessing.Process,
+    cleanup_state: dict[str, Any],
+) -> None:
+    """Route recursive Rust watcher events through the real Python controller.
+
+    Composed of five independently testable phases — dispatch, publication,
+    watcher_delivery, checkpoint, stabilization — matching the boundaries
+    tests/e2e/ordered-recursive/test_real_server_transport_cleanup.py injects
+    failures at. cleanup_state is updated as soon as each identity becomes
+    known so cleanup_recursive_watcher_probe can dispose it regardless of
+    which later phase fails.
+    """
+    state_root = root / "recursive-watcher-state"
+    slice_id = "real-watcher-leaf"
+    child_state_root = state_root / "recursive-watcher-root"
+
+    owner_id = _probe_dispatch_phase(root_process, child_state_root, slice_id)
+    cleanup_state["owner_id"] = owner_id
+
+    pr_number, branch, head_sha = _probe_publication_phase(client, forgejo_url, owner_id)
+    cleanup_state["pr_number"] = pr_number
+
+    expected_cursor = _probe_watcher_delivery_phase(
+        root_process, repo, swarm_id, pr_number, owner_id, slice_id, branch, head_sha
+    )
+
+    _probe_checkpoint_phase(
+        root_process, child_state_root, slice_id, swarm_id, pr_number, head_sha, expected_cursor
+    )
+
+    _probe_stabilization_phase(root_process, repo, swarm_id, pr_number)
 
 def run_recursive_checkpoint_probe(
     client: TransportClient, root: Path, repo: Path, swarm_id: str
