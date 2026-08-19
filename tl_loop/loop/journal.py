@@ -122,6 +122,23 @@ class EffectJournal(list[Any]):
             if isinstance(entry, dict) and entry.get("status") in {"intended", "unknown"}
         ]
 
+    def confirmed_entries(self, operation: str, target: str) -> list[dict[str, object]]:
+        """Confirmed entries for one operation+target.
+
+        Scans by operation/target/status rather than a recomputed stable key,
+        since a caller reconstructing arguments (e.g. reconciliation replaying
+        a live-path effect) is not guaranteed to produce byte-identical
+        arguments to the original dispatch.
+        """
+        return [
+            entry
+            for entry in self._read()
+            if isinstance(entry, dict)
+            and entry.get("operation") == operation
+            and entry.get("target") == target
+            and entry.get("status") == "confirmed"
+        ]
+
     def resolve_by_key(self, key: str, **updates: object) -> None:
         """Apply a reconciliation decision to an entry found by its stable key."""
         entries = self._read()

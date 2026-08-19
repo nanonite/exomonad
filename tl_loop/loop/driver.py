@@ -1688,6 +1688,39 @@ def _reconcile_dispatches(
     return state
 
 
+def _reviewer_spawn_confirmed(
+    effects_log: list[EffectIntent],
+    slice_id: str,
+    pr_number: int,
+    head_sha: str,
+) -> bool | None:
+    """Whether a spawn_reviewer effect for this exact head is journal-confirmed.
+
+    Both the live event path and reconciliation durably checkpoint the
+    reviewer_attempt claim ({head_sha: 1}) before spawn_reviewer is dispatched.
+    A crash between the claim and the dispatch leaves a claim that looks
+    identical to a completed spawn. Consulting the action journal tells them
+    apart: None means "unknown" (effects_log is a plain list, e.g. a unit test
+    with no durable journal) and the caller must conservatively treat a claim
+    as already spawned. False means a journal exists and holds no confirmed
+    spawn_reviewer entry for this PR/head, so the claim was checkpointed but
+    the spawn never landed (or its outcome is unknown) -- re-attempting is
+    journal-safe because _invoke replays a confirmed entry and blocks an
+    unknown one behind the existing action-journal gate.
+    """
+    if not isinstance(effects_log, EffectJournal):
+        return None
+    for entry in effects_log.confirmed_entries("spawn_reviewer", slice_id):
+        arguments = entry.get("arguments")
+        if (
+            isinstance(arguments, Mapping)
+            and arguments.get("pr_number") == pr_number
+            and arguments.get("head_sha") == head_sha
+        ):
+            return True
+    return False
+
+
 def _reconcile_nonterminal_slices(
     plan: WorkPlan,
     state: RunState,
@@ -1775,21 +1808,29 @@ def _reconcile_nonterminal_slices(
             and claimed_pr_number is not None
         ):
             recovered_head_sha = _snapshot_text(watcher, "head_sha")
-            if (
-                recovered_head_sha
-                and reconciled.reviewed_head != recovered_head_sha
-                and reconciled.reviewer_attempt.get(recovered_head_sha, 0) == 0
-            ):
-                reconciled = replace(
-                    reconciled,
-                    reviewer_attempt={
-                        **reconciled.reviewer_attempt,
-                        recovered_head_sha: 1,
-                    },
+            if recovered_head_sha and reconciled.reviewed_head != recovered_head_sha:
+                already_claimed = reconciled.reviewer_attempt.get(recovered_head_sha, 0) > 0
+                # A claim checkpointed before a crash between the claim and the
+                # spawn dispatch looks identical to a completed spawn; consult
+                # the action journal instead of assuming claimed means spawned.
+                spawn_confirmed = (
+                    _reviewer_spawn_confirmed(
+                        effects_log, current.id, claimed_pr_number, recovered_head_sha
+                    )
+                    if already_claimed
+                    else None
                 )
-                pending_reviewer_spawns.append(
-                    (current.id, claimed_pr_number, recovered_head_sha)
-                )
+                if not already_claimed or spawn_confirmed is False:
+                    reconciled = replace(
+                        reconciled,
+                        reviewer_attempt={
+                            **reconciled.reviewer_attempt,
+                            recovered_head_sha: 1,
+                        },
+                    )
+                    pending_reviewer_spawns.append(
+                        (current.id, claimed_pr_number, recovered_head_sha)
+                    )
         if reconciled != current:
             updated[current.id] = reconciled
             changed = True
