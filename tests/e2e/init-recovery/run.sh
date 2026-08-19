@@ -9,25 +9,46 @@ set -euo pipefail
 # of accumulating duplicates, and concurrent `exomonad init` invocations
 # converge on the same single-window-per-role outcome instead of racing.
 #
-# This does not exercise TL business logic — the seeded plan has no work,
-# so the TL controller exits immediately after each `exomonad init` call.
-# That failure is expected and tolerated: this test asserts tmux window
-# state and server socket health, not controller outcomes. TL crash/restart
-# *logic* is covered separately and thoroughly by tests/e2e/ordered-recursive
-# at the Python-controller level; this test covers what that harness
-# cannot: the real binary's tmux session reconciliation.
+# Phases 1-6 do not exercise TL business logic — the seeded plan has no
+# work, so the TL controller exits immediately after each `exomonad init`
+# call there. That failure is expected and tolerated: those phases assert
+# tmux window state and server socket health, not controller outcomes.
+#
+# Phase 7 exercises what phases 1-6 deliberately don't: automatic
+# continuation of a real nonterminal checkpoint through the embedded
+# controller, the real watcher poller, and the real ledger, ending in an
+# observable next lifecycle action (recovered review/CI evidence durably
+# written back to the checkpoint) -- not just tmux window repair. TL
+# controller crash/resume *decision logic* is covered separately and
+# thoroughly by tests/e2e/ordered-recursive at the Python-controller level;
+# this phase covers what that harness cannot: the real embedded `tl_loop.pyz`
+# archive, launched by the real binary, resuming a checkpoint that was
+# already on disk when `exomonad init` started.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/harness.sh
 source "$SCRIPT_DIR/../lib/harness.sh"
 
 SESSION="e2e-init-recovery"
+CONTINUATION_SESSION="e2e-init-recovery-continuation"
+MOCK_PID=""
 
-e2e_preflight tmux git curl
+e2e_preflight tmux git curl python3
 
 cleanup() {
     local code=$?
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    # Cleanup must always reach e2e_cleanup, including on a failing run.
+    # Under `set -e`, `(exit "$code")` below would itself trigger errexit
+    # for any nonzero code and abort this trap before e2e_cleanup runs,
+    # leaking the tmux session and scratch work dir. Disable errexit for
+    # the remainder of the trap so every step below always executes.
+    set +e
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
+    if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
+        kill "$MOCK_PID" 2>/dev/null
+        wait "$MOCK_PID" 2>/dev/null
+    fi
     trap - EXIT
     (exit "$code")
     e2e_cleanup
@@ -145,6 +166,115 @@ e2e_log "PASS: two concurrent exomonad init invocations converged on exactly one
 e2e_phase "Phase 6" "Confirming TL dead-window replacement never accumulated duplicates..."
 [[ "$(window_count TL)" == "1" ]] || e2e_fail "TL window duplicated across repeated crash-and-reinit cycles: $(window_count TL)"
 e2e_log "PASS: exactly one TL window survived five exomonad init invocations across three crash scenarios"
+
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+e2e_phase "Phase 7" "Seeding a real nonterminal checkpoint and confirming automatic continuation..."
+
+CONT_DIR="$WORK_DIR/continuation"
+CONT_REPO="$CONT_DIR/repo"
+CONT_REMOTE="$CONT_DIR/remote/owner/repo.git"
+mkdir -p "$CONT_DIR"
+
+# Bare remote lives at .../owner/repo.git: exomonad's owner/repo parser reads
+# the last two path segments of the git remote URL, independent of what
+# forgejo_url points at. origin uses file:// so `git fetch` genuinely works;
+# forgejo_url (below) is queried over real HTTP for PR/review/CI state.
+mkdir -p "$(dirname "$CONT_REMOTE")"
+git init --bare -q "$CONT_REMOTE"
+mkdir -p "$CONT_REPO"
+git -C "$CONT_REPO" init -q -b main
+git -C "$CONT_REPO" remote add origin "file://$CONT_REMOTE"
+git -C "$CONT_REPO" config user.name "Exomonad init-recovery E2E"
+git -C "$CONT_REPO" config user.email "init-recovery-e2e@example.invalid"
+git -C "$CONT_REPO" commit --allow-empty -q -m init
+git -C "$CONT_REPO" push -u origin main -q
+git -C "$CONT_REPO" checkout -q -b main.leaf-a
+echo "leaf change" > "$CONT_REPO/leaf.txt"
+git -C "$CONT_REPO" add leaf.txt
+git -C "$CONT_REPO" commit -q -m "leaf-a change"
+git -C "$CONT_REPO" push -q origin main.leaf-a
+git -C "$CONT_REPO" checkout -q main
+LEAF_SHA="$(git -C "$CONT_REPO" rev-parse main.leaf-a)"
+
+MOCK_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+MOCK_URL="http://127.0.0.1:$MOCK_PORT"
+REMOTE_DIR="$CONT_REMOTE" MOCK_LOG="$CONT_DIR/mock.log" \
+    python3 "$PROJECT_ROOT/tests/e2e/mock_github.py" --port "$MOCK_PORT" \
+    > "$CONT_DIR/mock.stderr" 2>&1 &
+MOCK_PID=$!
+for _ in $(seq 1 50); do
+    curl -fsS "$MOCK_URL/api/v1/admin/actions/runners" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+curl -fsS "$MOCK_URL/api/v1/admin/actions/runners" >/dev/null \
+    || { cat "$CONT_DIR/mock.stderr"; e2e_fail "mock Forgejo API did not become ready"; }
+
+cd "$CONT_REPO"
+"$EXOMONAD_BIN" new > "$CONT_DIR/new.log" 2>&1 || { cat "$CONT_DIR/new.log"; e2e_fail "'exomonad new' failed for the continuation fixture"; }
+mkdir -p .exo/wasm
+for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
+    ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
+done
+cp "$PROJECT_ROOT/.exo/harness_policy.toml" .exo/harness_policy.toml
+cp "$PROJECT_ROOT/.exo/review-policy.toml" .exo/review-policy.toml
+cp "$PROJECT_ROOT/.exo/harness_capability.toml" .exo/harness_capability.toml
+mkdir -p .exo/tl-loop
+printf '{"run_id":"root","plan":{"leaves":[{"name":"leaf-a","task":"leaf-a change"}]}}\n' > .exo/tl-loop/plan.json
+cat > .exo/config.toml <<EOF
+shell_command = "bash"
+tmux_session = "$CONTINUATION_SESSION"
+yolo = true
+poll_interval = 1
+spawn_agent_type = "codex"
+forgejo_url = "$MOCK_URL"
+forgejo_token = "test-token-e2e"
+EOF
+
+read -r PR_NUMBER HEAD_SHA < <(
+    python3 "$SCRIPT_DIR/seed_publication.py" \
+        --mock-url "$MOCK_URL" --repo "$CONT_REPO" \
+        --head-branch "main.leaf-a" --head-sha "$LEAF_SHA" --slice-id "leaf-a"
+)
+[[ "$HEAD_SHA" == "$LEAF_SHA" ]] || e2e_fail "seed_publication.py returned an unexpected head SHA"
+e2e_log "Filed and approved PR #$PR_NUMBER against the mock Forgejo (head=$HEAD_SHA)"
+
+PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_checkpoint.py" \
+    --repo "$CONT_REPO" --pr-number "$PR_NUMBER" --branch "main.leaf-a" --slice-id "leaf-a"
+
+BEFORE_STATUS="$(python3 -c "
+import json
+d = json.load(open('.exo/tl-loop/root/run.json'))
+s = d['slices']['leaf-a']
+print(s['reviewed_head'], s['verdict'], d['events']['last_consumed_offset'])
+")"
+read -r before_reviewed_head before_verdict before_offset <<< "$BEFORE_STATUS"
+[[ "$before_reviewed_head" == "None" && "$before_verdict" == "None" && "$before_offset" == "0" ]] \
+    || e2e_fail "seeded checkpoint was not in the expected pre-recovery state: $BEFORE_STATUS"
+e2e_log "Seeded nonterminal checkpoint: pr_number=$PR_NUMBER reviewed_head=None verdict=None (awaiting recovery)"
+
+tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null || true
+"$EXOMONAD_BIN" init --session "$CONTINUATION_SESSION" > "$CONT_DIR/init.log" 2>&1 || true
+
+AFTER_STATUS=""
+for _ in $(seq 1 50); do
+    AFTER_STATUS="$(python3 -c "
+import json
+d = json.load(open('.exo/tl-loop/root/run.json'))
+s = d['slices']['leaf-a']
+print(s['reviewed_head'], s['verdict'], d['events']['last_consumed_offset'])
+" 2>/dev/null)" || AFTER_STATUS=""
+    [[ -n "$AFTER_STATUS" ]] && [[ "$AFTER_STATUS" != "None None 0" ]] && break
+    sleep 0.2
+done
+read -r after_reviewed_head after_verdict after_offset <<< "$AFTER_STATUS"
+
+if [[ "$after_reviewed_head" != "$HEAD_SHA" || "$after_verdict" != "GO" ]]; then
+    cat "$CONT_DIR/init.log"
+    e2e_fail "embedded controller did not recover review evidence after restart: got '$AFTER_STATUS', expected reviewed_head=$HEAD_SHA verdict=GO"
+fi
+[[ "$after_offset" -gt 0 ]] || e2e_fail "embedded controller did not consume any ledger events during recovery"
+e2e_log "PASS: embedded controller resumed the nonterminal checkpoint, the real watcher observed the approved+green PR through the real ledger (offset 0 -> $after_offset), and recovered reviewed_head=$after_reviewed_head verdict=$after_verdict as its next lifecycle action"
 
 echo ""
 echo "============================================"
