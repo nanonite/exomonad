@@ -547,6 +547,15 @@ check-e2e-one-shot-lifecycle:
     bash -n tests/e2e/one-shot-lifecycle/fake-codex.sh
     {{py}} -m py_compile tests/e2e/one-shot-lifecycle/validate.py tests/e2e/one-shot-lifecycle/mock_forgejo.py
 
+# Drive the real exomonad init binary + tmux through Server/Watcher/TL crash
+# recovery and concurrent-init locking (chainlink #907)
+e2e-init-recovery:
+    ./tests/e2e/init-recovery/run.sh
+
+# Check the init-recovery E2E harness without launching tmux
+check-e2e-init-recovery:
+    bash -n tests/e2e/init-recovery/run.sh
+
 # Check E2E agent lifecycle scripts without launching the server
 check-e2e-lifecycle:
     bash -n tests/e2e/lifecycle/run.sh

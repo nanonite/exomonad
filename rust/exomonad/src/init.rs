@@ -142,6 +142,12 @@ async fn ensure_watcher_dashboard_window(
     let watcher_win = ipc
         .new_window(WATCHER_WINDOW_NAME, cwd, shell, &watcher_cmd)
         .await?;
+    // Without remain-on-exit, tmux destroys the window the instant the
+    // watcher process dies, so the liveness check above would never observe
+    // a dead-but-present window to repair — it would just see the name gone
+    // and recreate anyway. Setting it here makes a crashed Watcher behave
+    // like Server/TL: inspectable evidence until the next reconciliation.
+    ipc.set_window_remain_on_exit(&watcher_win, true).await?;
     info!(window = %watcher_win, "Watcher dashboard window created");
     Ok(())
 }
