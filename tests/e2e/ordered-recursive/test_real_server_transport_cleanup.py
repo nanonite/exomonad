@@ -157,7 +157,15 @@ def _install_fake_probe_phases(
             raise RuntimeError("injected dispatch phase failure")
         return "owner"
 
-    def publication(client: object, forgejo_url: str, owner_id: str) -> tuple[int, str, str]:
+    def publication(
+        client: object, forgejo_url: str, owner_id: str, cleanup_state: dict[str, object]
+    ) -> tuple[int, str, str]:
+        # Mirrors the real phase: the PR number is known (and a reviewer
+        # may already exist for it) as soon as it is filed, before this
+        # phase can fail on a later step such as watcher_pr_state or the
+        # approval POST, so cleanup_state must record it first -- on both
+        # the success and the injected-failure path.
+        cleanup_state["pr_number"] = 42
         if failing_phase == "publication":
             raise RuntimeError("injected publication phase failure")
         return 42, "main.sub-a.real-watcher-leaf", "deadbeef"
@@ -250,10 +258,13 @@ def test_probe_failure_at_each_phase_disposes_controller_and_owned_workers(
             # phase returns, so it is known — and must be cleaned up — for
             # every later phase's failure, including publication's own.
             expected_workers.add("owner")
-        if phase_index >= _PROBE_PHASES.index("watcher_delivery"):
-            # cleanup_state["pr_number"] is recorded right after the
-            # publication phase returns, so the reviewer lookup is only
-            # possible once a later phase (watcher_delivery onward) fails.
+        if phase_index >= _PROBE_PHASES.index("publication"):
+            # cleanup_state["pr_number"] is recorded the moment the PR is
+            # filed, inside the publication phase itself -- not after it
+            # returns -- so a failure injected mid-phase (chainlink #908,
+            # e.g. watcher_pr_state or the approval POST raising after
+            # file_pr already succeeded) must still find and dispose the
+            # reviewer, not just a later phase's failure.
             expected_workers.add("reviewer")
         assert set(stopped) == expected_workers, (
             f"phase={phase} stopped={stopped} expected={expected_workers}"

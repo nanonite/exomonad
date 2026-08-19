@@ -1050,8 +1050,17 @@ def _probe_publication_phase(
     client: TransportClient,
     forgejo_url: str,
     owner_id: str,
+    cleanup_state: dict[str, Any],
 ) -> tuple[int, str, str]:
-    """File and approve the leaf's PR; return (pr_number, branch, head_sha)."""
+    """File and approve the leaf's PR; return (pr_number, branch, head_sha).
+
+    cleanup_state["pr_number"] is recorded the moment the PR number is known
+    -- immediately after file_pr returns -- not after this whole phase
+    returns to its caller. A real PR (and any reviewer the watcher spawns in
+    response to it) already exists at that point; if watcher_pr_state or the
+    approval POST below raises, the finally-block cleanup must still be able
+    to find and dispose that reviewer instead of leaking it (chainlink #908).
+    """
     owner_effects = EffectClient(client, role="tl", name=owner_id)
     filed = owner_effects.file_pr(
         title="Real recursive watcher routing",
@@ -1061,6 +1070,7 @@ def _probe_publication_phase(
     filed_data = find_object(filed, {"pr_number", "head_branch"})
     pr_number = int(filed_data["pr_number"])
     branch = str(filed_data["head_branch"])
+    cleanup_state["pr_number"] = pr_number
     snapshot = owner_effects.watcher_pr_state(pr_number=pr_number)
     evidence = find_object(snapshot, {"head_sha"})
     head_sha = str(evidence["head_sha"])
@@ -1273,8 +1283,9 @@ def _run_real_watcher_routing_probe_body(
     owner_id = _probe_dispatch_phase(root_process, child_state_root, slice_id)
     cleanup_state["owner_id"] = owner_id
 
-    pr_number, branch, head_sha = _probe_publication_phase(client, forgejo_url, owner_id)
-    cleanup_state["pr_number"] = pr_number
+    pr_number, branch, head_sha = _probe_publication_phase(
+        client, forgejo_url, owner_id, cleanup_state
+    )
 
     expected_cursor = _probe_watcher_delivery_phase(
         root_process, repo, swarm_id, pr_number, owner_id, slice_id, branch, head_sha
