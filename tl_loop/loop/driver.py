@@ -691,7 +691,7 @@ def run_tl_loop(
     )
     state = _reconcile_action_journal(state, store, effects_log)
     state = _reconcile_dispatches(state, selected, effects, store, effects_log)
-    state = _reconcile_nonterminal_slices(state, selected, effects, store, effects_log)
+    state = _reconcile_nonterminal_slices(work_plan, state, selected, effects, store, effects_log)
     state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
     state = _run_sub_tls(work_plan, state, selected, source, effects, store, effects_log)
     return _run_loop(
@@ -1669,6 +1669,7 @@ def _reconcile_dispatches(
 
 
 def _reconcile_nonterminal_slices(
+    plan: WorkPlan,
     state: RunState,
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
@@ -1705,6 +1706,7 @@ def _reconcile_nonterminal_slices(
     updated = dict(state.slices)
     conflicts_found = False
     changed = False
+    pending_reviewer_spawns: list[tuple[str, int, str]] = []
     for current in candidates:
         watcher = None
         if current.pr_number is not None and config.ledger_run_id is not None:
@@ -1744,6 +1746,30 @@ def _reconcile_nonterminal_slices(
             watcher,
             owner_id,
         )
+        claimed_pr_number = reconciled.pr_number
+        if (
+            config.enable_reviewer_spawn
+            and watcher is not None
+            and watcher.get("found") is True
+            and reconciled.status is not SliceStatus.MERGED
+            and claimed_pr_number is not None
+        ):
+            recovered_head_sha = _snapshot_text(watcher, "head_sha")
+            if (
+                recovered_head_sha
+                and reconciled.reviewed_head != recovered_head_sha
+                and reconciled.reviewer_attempt.get(recovered_head_sha, 0) == 0
+            ):
+                reconciled = replace(
+                    reconciled,
+                    reviewer_attempt={
+                        **reconciled.reviewer_attempt,
+                        recovered_head_sha: 1,
+                    },
+                )
+                pending_reviewer_spawns.append(
+                    (current.id, claimed_pr_number, recovered_head_sha)
+                )
         if reconciled != current:
             updated[current.id] = reconciled
             changed = True
@@ -1762,6 +1788,10 @@ def _reconcile_nonterminal_slices(
         )
     if conflicts_found:
         state = store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
+    for target_id, pr_number, head_sha in pending_reviewer_spawns:
+        _spawn_reviewer_for_slice(
+            plan, state, target_id, pr_number, head_sha, config, effects, effects_log
+        )
     return state
 
 
@@ -1842,6 +1872,18 @@ def _dispatch_waiting_phase(slices: Mapping[str, SliceState]) -> TLWaiting:
 
 
 def _agent_for_dispatch_intent(result: ToolResult | None, intent_id: str) -> str | None:
+    """Resolve the owning agent id for a dispatch intent.
+
+    Deliberately does not require the agent to still be alive: intent_id is
+    a per-dispatch UUID persisted at spawn time (agent_dir/dispatch_intent)
+    and never reused, so a matching record safely identifies the owner
+    regardless of current liveness. Coding agents are one-shot by design
+    (see CLAUDE.md "One-shot coding invocations") -- a dev normally exits
+    right after filing its PR, well before the controller reconciles
+    ownership on restart. Requiring is_alive here would make runtime_owner
+    permanently unrecoverable for the common case of a dev that already
+    finished its one assignment.
+    """
     if result is None or result.success is False or not isinstance(result.result, Mapping):
         return None
     agents = result.result.get("agents")
@@ -1850,7 +1892,7 @@ def _agent_for_dispatch_intent(result: ToolResult | None, intent_id: str) -> str
     for raw_agent in agents:
         if not isinstance(raw_agent, Mapping):
             continue
-        if raw_agent.get("intent_id") != intent_id or raw_agent.get("is_alive") is not True:
+        if raw_agent.get("intent_id") != intent_id:
             continue
         for key in ("agent_id", "id"):
             agent_id = raw_agent.get(key)
@@ -4892,14 +4934,38 @@ def _spawn_reviewer_for_head(
     if not isinstance(event, (PRFiled, PRUpdated)):
         return
     target_id = _pr_event_target(state.slices, event, envelope.slice_id)
-    current = state.slices.get(target_id) if target_id is not None else None
+    if target_id is None:
+        return
+    _spawn_reviewer_for_slice(
+        plan, state, target_id, event.pr_number, event.head_sha, config, effects, effects_log
+    )
+
+
+def _spawn_reviewer_for_slice(
+    plan: WorkPlan,
+    state: RunState,
+    target_id: str,
+    pr_number: int,
+    head_sha: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    """Spawn a reviewer for a known PR head.
+
+    Shared by the live correlated-event path (_spawn_reviewer_for_head) and
+    startup reconciliation, which recovers a filed-but-unreviewed head from
+    watcher evidence after a crash and must act on it the same way a live
+    pr.filed/pr.updated event would (chainlink #904).
+    """
+    current = state.slices.get(target_id)
     leaf = next((candidate for candidate in plan.leaves if candidate.name == target_id), None)
-    if target_id is None or current is None or leaf is None:
+    if current is None or leaf is None:
         return
     criteria = compose_acceptance_criteria(current, leaf)
     arguments: dict[str, object] = {
-        "pr_number": event.pr_number,
-        "head_sha": event.head_sha,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
         "acceptance_criteria": list(criteria),
         "force": False,
     }
@@ -4911,8 +4977,8 @@ def _spawn_reviewer_for_head(
         config.active,
         live,
         lambda client: client.spawn_reviewer(
-            pr_number=event.pr_number,
-            head_sha=event.head_sha,
+            pr_number=pr_number,
+            head_sha=head_sha,
             acceptance_criteria=criteria,
             force=False,
         ),
