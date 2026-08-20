@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import cast
 
 from tl_loop.client.effects import EffectClient
-from tl_loop.client.transport import TransportClient
+from tl_loop.client.transport import DEFAULT_TIMEOUT_SECONDS, TransportClient
 from tl_loop.events.envelope import EventEnvelope
-from tl_loop.events.queue import LedgerQueue
+from tl_loop.events.queue import DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS, LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.loop.heartbeat import HeartbeatConfig
@@ -37,6 +37,8 @@ LOGGER = logging.getLogger("tl_loop")
 DEFAULT_RUN_ID = "root"
 DEFAULT_PLAN = Path(".exo/tl-loop/plan.json")
 DEFAULT_IDLE_TIMEOUT = 30.0
+DEFAULT_DISPATCH_TIMEOUT = 5.0
+DEFAULT_CONTROLLER_STALL_TIMEOUT = 300.0
 DEFAULT_MAX_EVENTS = 256
 PLAN_REJECTION_REASON_LIMIT = 160
 
@@ -118,6 +120,18 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID))
     run.add_argument("--max-events", type=_positive_int, default=DEFAULT_MAX_EVENTS)
     run.add_argument("--idle-timeout", type=_positive_float, default=DEFAULT_IDLE_TIMEOUT)
+    run.add_argument("--transport-timeout", type=_positive_float, default=DEFAULT_TIMEOUT_SECONDS)
+    run.add_argument(
+        "--active-tail-timeout",
+        type=_positive_float,
+        default=DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS,
+    )
+    run.add_argument("--dispatch-timeout", type=_positive_float, default=DEFAULT_DISPATCH_TIMEOUT)
+    run.add_argument(
+        "--controller-stall-timeout",
+        type=_positive_float,
+        default=DEFAULT_CONTROLLER_STALL_TIMEOUT,
+    )
     run.add_argument("--poll-interval", type=_positive_float, default=0.25)
     run.add_argument("--wait-for-plan", action="store_true")
     run.add_argument("--verbose", action="store_true")
@@ -185,9 +199,13 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         state_root=state_root,
         ledger_run_id=ledger_run_id,
     )
-    source = LedgerQueue(reader, poll_interval=args.poll_interval).start()
+    source = LedgerQueue(
+        reader,
+        poll_interval=args.poll_interval,
+        active_tail_timeout=args.active_tail_timeout,
+    ).start()
     effects = EffectClient(
-        TransportClient(project_root=project_root),
+        TransportClient(project_root=project_root, timeout=args.transport_timeout),
         role="tl",
         name="root",
     )
@@ -205,6 +223,8 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         active=True,
         max_events=args.max_events,
         idle_timeout=args.idle_timeout,
+        dispatch_timeout=args.dispatch_timeout,
+        controller_stall_timeout=args.controller_stall_timeout,
         keep_alive_on_waiting=True,
         heartbeat=HeartbeatConfig(),
         poll_interval=args.poll_interval,

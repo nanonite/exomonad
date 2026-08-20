@@ -8,6 +8,11 @@ use exomonad_core::Role;
 pub const REVIEWER_MAX_ROUNDS_ENV: &str = "EXOMONAD_REVIEWER_MAX_ROUNDS";
 pub const REVIEWER_MODEL_ENV: &str = "EXOMONAD_REVIEWER_MODEL";
 pub const REVIEWER_EFFORT_ENV: &str = "EXOMONAD_REVIEWER_EFFORT_LEVEL";
+pub const DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS: f64 = 10.0;
+pub const DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS: f64 = 30.0;
+pub const DEFAULT_TL_DISPATCH_TIMEOUT_SECONDS: f64 = 5.0;
+pub const DEFAULT_TL_CONTROLLER_STALL_TIMEOUT_SECONDS: f64 = 300.0;
+pub const DEFAULT_TL_IDLE_TIMEOUT_SECONDS: f64 = 30.0;
 
 pub fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
     let parsed = value
@@ -250,6 +255,21 @@ pub struct RawConfig {
     /// Orphan reconciler interval in seconds (default: 60).
     pub orphan_reconciler_interval_secs: Option<u64>,
 
+    /// TL loop server transport timeout in seconds (default: 10).
+    pub tl_transport_timeout_seconds: Option<f64>,
+
+    /// TL loop ledger active-tail timeout in seconds (default: 30).
+    pub tl_active_tail_timeout_seconds: Option<f64>,
+
+    /// TL loop dispatch timeout in seconds (default: 5).
+    pub tl_dispatch_timeout_seconds: Option<f64>,
+
+    /// TL loop controller stall timeout in seconds (default: 300).
+    pub tl_controller_stall_timeout_seconds: Option<f64>,
+
+    /// TL loop idle timeout in seconds (default: 30).
+    pub tl_idle_timeout_seconds: Option<f64>,
+
     /// OpenRouter routing configuration.
     #[serde(default)]
     pub openrouter: Option<OpenRouterConfig>,
@@ -336,6 +356,21 @@ pub struct Config {
 
     /// Orphan reconciler interval in seconds (default: 60).
     pub orphan_reconciler_interval_secs: Option<u64>,
+
+    /// TL loop server transport timeout in seconds.
+    pub tl_transport_timeout_seconds: f64,
+
+    /// TL loop ledger active-tail timeout in seconds.
+    pub tl_active_tail_timeout_seconds: f64,
+
+    /// TL loop dispatch timeout in seconds.
+    pub tl_dispatch_timeout_seconds: f64,
+
+    /// TL loop controller stall timeout in seconds.
+    pub tl_controller_stall_timeout_seconds: f64,
+
+    /// TL loop idle timeout in seconds.
+    pub tl_idle_timeout_seconds: f64,
 
     /// OpenRouter routing configuration.
     pub openrouter: OpenRouterConfig,
@@ -523,6 +558,45 @@ impl Config {
             .orphan_reconciler_interval_secs
             .or(global_raw.orphan_reconciler_interval_secs);
 
+        let tl_transport_timeout_seconds = local_raw
+            .tl_transport_timeout_seconds
+            .or(global_raw.tl_transport_timeout_seconds)
+            .unwrap_or(DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS);
+        let tl_active_tail_timeout_seconds = local_raw
+            .tl_active_tail_timeout_seconds
+            .or(global_raw.tl_active_tail_timeout_seconds)
+            .unwrap_or(DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS);
+        let tl_dispatch_timeout_seconds = local_raw
+            .tl_dispatch_timeout_seconds
+            .or(global_raw.tl_dispatch_timeout_seconds)
+            .unwrap_or(DEFAULT_TL_DISPATCH_TIMEOUT_SECONDS);
+        let tl_controller_stall_timeout_seconds = local_raw
+            .tl_controller_stall_timeout_seconds
+            .or(global_raw.tl_controller_stall_timeout_seconds)
+            .unwrap_or(DEFAULT_TL_CONTROLLER_STALL_TIMEOUT_SECONDS);
+        let tl_idle_timeout_seconds = local_raw
+            .tl_idle_timeout_seconds
+            .or(global_raw.tl_idle_timeout_seconds)
+            .unwrap_or(DEFAULT_TL_IDLE_TIMEOUT_SECONDS);
+
+        for (name, value) in [
+            ("tl_transport_timeout_seconds", tl_transport_timeout_seconds),
+            (
+                "tl_active_tail_timeout_seconds",
+                tl_active_tail_timeout_seconds,
+            ),
+            ("tl_dispatch_timeout_seconds", tl_dispatch_timeout_seconds),
+            (
+                "tl_controller_stall_timeout_seconds",
+                tl_controller_stall_timeout_seconds,
+            ),
+            ("tl_idle_timeout_seconds", tl_idle_timeout_seconds),
+        ] {
+            if value <= 0.0 {
+                anyhow::bail!("{name} must be greater than zero");
+            }
+        }
+
         // Resolve openrouter: local > global > default
         let openrouter = local_raw
             .openrouter
@@ -609,6 +683,11 @@ impl Config {
             poll_interval,
             inbox_poke_interval,
             orphan_reconciler_interval_secs,
+            tl_transport_timeout_seconds,
+            tl_active_tail_timeout_seconds,
+            tl_dispatch_timeout_seconds,
+            tl_controller_stall_timeout_seconds,
+            tl_idle_timeout_seconds,
             openrouter,
             opencode,
             opencode_as_tl,
@@ -660,6 +739,11 @@ impl Default for Config {
             poll_interval: None,
             inbox_poke_interval: None,
             orphan_reconciler_interval_secs: None,
+            tl_transport_timeout_seconds: DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
+            tl_active_tail_timeout_seconds: DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS,
+            tl_dispatch_timeout_seconds: DEFAULT_TL_DISPATCH_TIMEOUT_SECONDS,
+            tl_controller_stall_timeout_seconds: DEFAULT_TL_CONTROLLER_STALL_TIMEOUT_SECONDS,
+            tl_idle_timeout_seconds: DEFAULT_TL_IDLE_TIMEOUT_SECONDS,
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
             opencode_as_tl: false,
@@ -782,6 +866,26 @@ mod tests {
         assert_eq!(config.root_agent_type, AgentType::Claude);
         assert_eq!(config.spawn_agent_type, AgentType::Codex);
         assert_eq!(config.port, 7433);
+        assert_eq!(
+            config.tl_transport_timeout_seconds,
+            DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            config.tl_active_tail_timeout_seconds,
+            DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            config.tl_dispatch_timeout_seconds,
+            DEFAULT_TL_DISPATCH_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            config.tl_controller_stall_timeout_seconds,
+            DEFAULT_TL_CONTROLLER_STALL_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            config.tl_idle_timeout_seconds,
+            DEFAULT_TL_IDLE_TIMEOUT_SECONDS
+        );
     }
 
     #[test]
@@ -805,6 +909,23 @@ mod tests {
         "#;
         let raw: RawConfig = toml::from_str(content).unwrap();
         assert_eq!(raw.inbox_poke_interval, Some(120));
+    }
+
+    #[test]
+    fn test_raw_config_parse_tl_timeouts() {
+        let content = r#"
+            tl_transport_timeout_seconds = 45.5
+            tl_active_tail_timeout_seconds = 60.0
+            tl_dispatch_timeout_seconds = 12.0
+            tl_controller_stall_timeout_seconds = 600.0
+            tl_idle_timeout_seconds = 90.0
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.tl_transport_timeout_seconds, Some(45.5));
+        assert_eq!(raw.tl_active_tail_timeout_seconds, Some(60.0));
+        assert_eq!(raw.tl_dispatch_timeout_seconds, Some(12.0));
+        assert_eq!(raw.tl_controller_stall_timeout_seconds, Some(600.0));
+        assert_eq!(raw.tl_idle_timeout_seconds, Some(90.0));
     }
 
     #[test]

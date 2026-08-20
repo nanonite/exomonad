@@ -10,7 +10,9 @@ from pathlib import Path
 import pytest
 
 from tl_loop import __main__ as launcher
-from tl_loop.client.transport import JsonObject
+from tl_loop.client.transport import DEFAULT_TIMEOUT_SECONDS, JsonObject
+from tl_loop.events.queue import DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS
+from tl_loop.loop.driver import TLLoopConfig
 from tl_loop.state.store import RunStore, create
 
 
@@ -107,3 +109,81 @@ def test_rejected_plan_proposal_emits_bounded_reason_without_body(
     assert isinstance(payload["rejection_reason"], str)
     assert len(payload["rejection_reason"]) <= launcher.PLAN_REJECTION_REASON_LIMIT
     assert "secret" not in str(payload)
+
+
+def test_run_passes_all_timeouts_to_constructors(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class EmptySource:
+        def start(self) -> EmptySource:
+            return self
+
+        def close(self, timeout: float) -> None:
+            del timeout
+
+    def transport_client(**kwargs: object) -> object:
+        captured["transport"] = kwargs
+        return object()
+
+    def ledger_queue(*args: object, **kwargs: object) -> EmptySource:
+        captured["ledger_queue"] = kwargs
+        return EmptySource()
+
+    def tlloop_config(**kwargs: object) -> object:
+        captured["tlloop_config"] = kwargs
+        return object()
+
+    monkeypatch.setattr(launcher, "TransportClient", transport_client)
+    monkeypatch.setattr(launcher, "LedgerQueue", ledger_queue)
+    monkeypatch.setattr(launcher, "TLLoopConfig", tlloop_config)
+    monkeypatch.setattr(launcher, "EffectClient", lambda *a, **kw: object())
+    monkeypatch.setattr(launcher, "LedgerReader", lambda *a, **kw: object())
+    monkeypatch.setattr(launcher, "_load_plan", lambda path, wait: {"plan": {}})
+    monkeypatch.setattr(launcher, "_plan_from_document", lambda document: object())
+    monkeypatch.setattr(launcher, "_run_id", lambda document, configured: "root")
+    monkeypatch.setattr(launcher, "_authoritative_ledger_run_id", lambda root: None)
+    monkeypatch.setattr(launcher, "load_policy", lambda path: object())
+    monkeypatch.setattr(launcher, "load_capability", lambda path, policy_path: object())
+    monkeypatch.setattr(launcher, "load_model_catalog", lambda path: None)
+    monkeypatch.setattr(launcher, "tl_run", lambda *a, **kw: object())
+
+    launcher._run(
+        argparse.Namespace(
+            project_root=tmp_path,
+            plan=Path("plan.json"),
+            wait_for_plan=False,
+            run_id="root",
+            poll_interval=0.25,
+            max_events=256,
+            idle_timeout=90.0,
+            transport_timeout=45.5,
+            active_tail_timeout=60.0,
+            dispatch_timeout=12.0,
+            controller_stall_timeout=600.0,
+        )
+    )
+
+    assert captured["transport"] == {"project_root": tmp_path.resolve(), "timeout": 45.5}
+    assert captured["ledger_queue"]["active_tail_timeout"] == 60.0
+    assert captured["tlloop_config"]["idle_timeout"] == 90.0
+    assert captured["tlloop_config"]["dispatch_timeout"] == 12.0
+    assert captured["tlloop_config"]["controller_stall_timeout"] == 600.0
+
+
+def test_run_defaults_preserve_current_values() -> None:
+    assert DEFAULT_TIMEOUT_SECONDS == 10.0
+    assert DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS == 30.0
+    assert launcher.DEFAULT_DISPATCH_TIMEOUT == 5.0
+    assert launcher.DEFAULT_CONTROLLER_STALL_TIMEOUT == 300.0
+    assert launcher.DEFAULT_IDLE_TIMEOUT == 30.0
+
+    args = launcher._parser().parse_args(["run", "--project-root", "/tmp/repo"])
+    assert args.transport_timeout == 10.0
+    assert args.active_tail_timeout == 30.0
+    assert args.dispatch_timeout == 5.0
+    assert args.controller_stall_timeout == 300.0
+    assert args.idle_timeout == 30.0
+
+    assert TLLoopConfig.dispatch_timeout == 5.0
+    assert TLLoopConfig.controller_stall_timeout == 300.0
+    assert TLLoopConfig.idle_timeout == 30.0

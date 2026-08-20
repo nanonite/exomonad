@@ -1004,7 +1004,28 @@ fn write_tl_loop_identity(cwd: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn tl_loop_command(cwd: &Path, package_root: &Path) -> String {
+/// Bundled TL-loop timeout overrides threaded into the controller launch command.
+struct TlLoopTimeouts {
+    transport: f64,
+    active_tail: f64,
+    dispatch: f64,
+    controller_stall: f64,
+    idle: f64,
+}
+
+impl From<&Config> for TlLoopTimeouts {
+    fn from(config: &Config) -> Self {
+        Self {
+            transport: config.tl_transport_timeout_seconds,
+            active_tail: config.tl_active_tail_timeout_seconds,
+            dispatch: config.tl_dispatch_timeout_seconds,
+            controller_stall: config.tl_controller_stall_timeout_seconds,
+            idle: config.tl_idle_timeout_seconds,
+        }
+    }
+}
+
+fn tl_loop_command(cwd: &Path, package_root: &Path, timeouts: &TlLoopTimeouts) -> String {
     let package = shell_escape::escape(package_root.display().to_string().into());
     let project = shell_escape::escape(cwd.display().to_string().into());
     let plan = shell_escape::escape(
@@ -1014,8 +1035,14 @@ fn tl_loop_command(cwd: &Path, package_root: &Path) -> String {
             .into(),
     );
     format!(
-        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan",
+        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan \
+         --transport-timeout {} --active-tail-timeout {} --dispatch-timeout {} --controller-stall-timeout {} --idle-timeout {}",
         shell_escape::escape(tl_loop_python(cwd).into()),
+        timeouts.transport,
+        timeouts.active_tail,
+        timeouts.dispatch,
+        timeouts.controller_stall,
+        timeouts.idle,
     )
 }
 
@@ -1131,13 +1158,14 @@ async fn launch_tl_recovery(
     project_dir: &Path,
     shell: &str,
     tl_loop_root: &Path,
+    config: &Config,
 ) -> Result<()> {
     let tl_window = ipc
         .new_window(
             "TL",
             project_dir,
             shell,
-            &tl_loop_command(project_dir, tl_loop_root),
+            &tl_loop_command(project_dir, tl_loop_root, &TlLoopTimeouts::from(config)),
         )
         .await?;
     ipc.set_window_remain_on_exit(&tl_window, true).await?;
@@ -1231,7 +1259,7 @@ async fn reconcile_existing_session(
     if let Some(archive) = archive_controller_exit_reason(project_dir)? {
         info!(archive = %archive.display(), "Archived prior TL controller exit marker before resuming");
     }
-    launch_tl_recovery(ipc, project_dir, shell, tl_loop_root).await
+    launch_tl_recovery(ipc, project_dir, shell, tl_loop_root, config).await
 }
 
 fn controller_exit_path(project_dir: &Path) -> PathBuf {
@@ -2109,7 +2137,7 @@ pub async fn run(
     // The human-facing TL window runs one coordinator: the Python controller.
     // Root harness settings and root_command are intentionally ignored.
     let tl_cwd = cwd.clone();
-    let base_command = tl_loop_command(&cwd, &tl_loop_root);
+    let base_command = tl_loop_command(&cwd, &tl_loop_root, &TlLoopTimeouts::from(&config));
 
     let tl_command = match config.shell_command {
         Some(ref sc) => format!("{} -c \"{}\"", sc, base_command.replace('"', "\\\"")),
@@ -3535,11 +3563,23 @@ mod tests {
 
     #[test]
     fn tl_loop_command_uses_programmatic_controller() {
-        let command = tl_loop_command(Path::new("/tmp/repo"), Path::new("/tmp/exo"));
+        let timeouts = TlLoopTimeouts {
+            transport: 45.5,
+            active_tail: 60.0,
+            dispatch: 12.0,
+            controller_stall: 600.0,
+            idle: 90.0,
+        };
+        let command = tl_loop_command(Path::new("/tmp/repo"), Path::new("/tmp/exo"), &timeouts);
         assert!(command.contains("EXOMONAD_ROLE=tl"));
         assert!(!command.contains("PYTHONPATH="));
         assert!(command.contains("python3 /tmp/exo run"));
         assert!(command.contains("--wait-for-plan"));
+        assert!(command.contains("--transport-timeout 45.5"));
+        assert!(command.contains("--active-tail-timeout 60"));
+        assert!(command.contains("--dispatch-timeout 12"));
+        assert!(command.contains("--controller-stall-timeout 600"));
+        assert!(command.contains("--idle-timeout 90"));
     }
 
     #[test]
