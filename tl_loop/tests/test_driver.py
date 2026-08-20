@@ -1415,16 +1415,8 @@ def _review_choice(backend: ReviewBackend) -> RlmModelChoice:
     )
 
 
-def test_repair_model_escalates_only_past_threshold() -> None:
-    catalog = ModelCatalog.from_fixture(
-        Path(__file__).parent / "fixtures" / "model_catalog_scored.json"
-    )
-    config = TLLoopConfig(
-        catalog=catalog,
-        policy=validate_policy(_selector_policy()),
-        role="worker",
-    )
-    below = SliceState(
+def _repair_slice(*, attempts: int, model: str | None = None) -> SliceState:
+    return SliceState(
         id="leaf-a",
         status=SliceStatus.IN_REVIEW,
         paths=("src/leaf.py",),
@@ -1432,19 +1424,57 @@ def test_repair_model_escalates_only_past_threshold() -> None:
         base_ref="main",
         test_plan=("just tl-loop-test",),
         agent_type="codex",
-        model=None,
+        model=model,
         branch=None,
         worktree=None,
         pr_number=42,
         reviewed_head="head-a",
-        attempts=0,
+        attempts=attempts,
         verdict=Verdict.NO_GO,
     )
-    above = replace(below, attempts=1)
 
-    assert _repair_model(below, config) is None
-    assert _repair_model(above, config) == "gpt-5.5"
-    assert _repair_model(above, TLLoopConfig(role="worker")) is None
+
+def _repair_config(
+    *, requested_model: str | None = None, escalate_after_attempts: int = 1
+) -> TLLoopConfig:
+    catalog = ModelCatalog.from_fixture(
+        Path(__file__).parent / "fixtures" / "model_catalog_scored.json"
+    )
+    policy = validate_policy(_selector_policy(escalate_after_attempts))
+    return TLLoopConfig(
+        catalog=catalog,
+        policy=policy,
+        role="worker",
+        requested_model=requested_model,
+    )
+
+
+def test_repair_model_preserves_current_model_below_threshold() -> None:
+    config = _repair_config(escalate_after_attempts=2)
+
+    assert _repair_model(_repair_slice(attempts=0, model="gpt-5-mini"), config) == "gpt-5-mini"
+    assert _repair_model(_repair_slice(attempts=1, model="gpt-5-mini"), config) == "gpt-5-mini"
+
+
+def test_repair_model_escalates_to_strongest_at_threshold() -> None:
+    config = _repair_config(escalate_after_attempts=1)
+
+    assert _repair_model(_repair_slice(attempts=0, model="gpt-5-mini"), config) == "gpt-5-mini"
+    assert _repair_model(_repair_slice(attempts=1, model="gpt-5-mini"), config) == "gpt-5.5"
+
+
+def test_repair_model_requested_model_wins_at_any_attempt() -> None:
+    config = _repair_config(requested_model="gpt-5-mini", escalate_after_attempts=1)
+
+    assert _repair_model(_repair_slice(attempts=0), config) == "gpt-5-mini"
+    assert _repair_model(_repair_slice(attempts=1), config) == "gpt-5-mini"
+
+
+def test_repair_model_without_catalog_preserves_current_model() -> None:
+    config = TLLoopConfig(role="worker")
+
+    assert _repair_model(_repair_slice(attempts=1, model="gpt-5-mini"), config) == "gpt-5-mini"
+    assert _repair_model(_repair_slice(attempts=1), config) is None
 
 
 def _review_store(
@@ -1776,13 +1806,13 @@ def test_idle_silence_preserves_spawned_state_until_explicit_cancellation(
     assert not state.gates
 
 
-def _selector_policy() -> dict[str, object]:
+def _selector_policy(escalate_after_attempts: int = 1) -> dict[str, object]:
     role = {
         "allow": ["codex/gpt-luna", "claude/sonnet"],
         "cost_rank": {"codex/gpt-luna": 1, "claude/sonnet": 2},
         "token_budget": 120000,
         "per_harness_budget": {"codex/gpt-luna": 80000, "claude/sonnet": 40000},
-        "escalate_after_attempts": 1,
+        "escalate_after_attempts": escalate_after_attempts,
     }
     return {"roles": {"tl": dict(role), "worker": dict(role), "reviewer": dict(role)}}
 

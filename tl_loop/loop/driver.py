@@ -4652,16 +4652,21 @@ def _route_repair(
 
 
 def _repair_model(current: SliceState, config: TLLoopConfig) -> str | None:
+    if config.requested_model:
+        if config.catalog is not None and current.agent_type:
+            return select_model(
+                current.agent_type, config.catalog, config.requested_model
+            ).model_id
+        return config.requested_model
     if config.catalog is None or config.policy is None:
-        return None
+        return current.model
     role_policy = config.policy.roles[config.role]
     if current.attempts < role_policy.escalate_after_attempts:
-        return None
-    harness = current.agent_type
-    if not harness:
-        return None
+        return current.model
+    if not current.agent_type:
+        return current.model
     return select_model_for_difficulty(
-        harness,
+        current.agent_type,
         config.catalog,
         Difficulty.HARD,
         escalated=True,
