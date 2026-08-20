@@ -1477,6 +1477,11 @@ def test_repair_model_without_catalog_preserves_current_model() -> None:
     assert _repair_model(_repair_slice(attempts=1), config) is None
 
 
+def test_requested_model_requires_catalog() -> None:
+    with pytest.raises(ValueError, match="requested_model requires a model catalog"):
+        TLLoopConfig(requested_model="gpt-5-mini")
+
+
 def _review_store(
     tmp_path: Path, *, verdict: Verdict | None = None, reviewed_head: str | None = "head-a"
 ) -> RunStore:

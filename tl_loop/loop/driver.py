@@ -562,6 +562,8 @@ class TLLoopConfig:
         if self.worktree is not None:
             _require_text(str(self.worktree), "worktree")
         _optional_text(self.requested_model, "requested_model")
+        if self.requested_model is not None and self.catalog is None:
+            raise ValueError("requested_model requires a model catalog")
 
 
 @dataclass(frozen=True)
