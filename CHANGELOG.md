@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Per-slice model selection is architecturally dead: select_model() never wired, config.toml is the sole authority (#912)
+- TL controller heartbeat crashes on 'poll_workers result has no workers array' racing a leaf's own exit (#915)
+- spawn_leaf_subtree ignores SpawnLeafOptions.model, silently dropping any per-slice model override (#913)
 - Fix reviewer loss on crash between reviewer-attempt claim checkpoint and reviewer spawn (#909)
 - Fix TL controller crash loop when CI failure arrives before any review (#911)
 - Add production-shaped review and CI routing E2E coverage (#901)
@@ -145,6 +148,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Wire a difficulty/attempt-aware model catalog into select_model() and TL dispatch (#914)
 - Define ordered sub-TL stage and integration contracts (#864)
 - Validate and normalize ordered sub-TL plans (#865)
 - Persist ordered stage and integration state across restarts (#866)
