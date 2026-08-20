@@ -300,6 +300,10 @@ def _catalog_model(value: object, index: int) -> CatalogModel:
     name = _optional_string(record, "name", path)
     coding_score = _optional_float(record, "coding_score", path)
     price_per_1m_tokens = _optional_float(record, "price_per_1m_tokens", path)
+    if coding_score is not None and not 0.0 <= coding_score <= 100.0:
+        raise ModelResolutionError(f"{path}.coding_score: must be between 0 and 100")
+    if price_per_1m_tokens is not None and price_per_1m_tokens < 0.0:
+        raise ModelResolutionError(f"{path}.price_per_1m_tokens: must be non-negative")
     return CatalogModel(harness, model_id, provider, name, coding_score, price_per_1m_tokens)
 
 
@@ -323,7 +327,10 @@ def _optional_float(record: Mapping[str, object], key: str, path: str) -> float 
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ModelResolutionError(f"{path}.{key}: must be null or a number")
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise ModelResolutionError(f"{path}.{key}: must be a finite number")
+    return result
 
 
 __all__ = [

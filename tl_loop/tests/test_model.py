@@ -153,3 +153,38 @@ def test_load_model_catalog_invalid_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ModelResolutionError):
         load_model_catalog(bad)
+
+
+@pytest.mark.parametrize(
+    "coding_score",
+    [-1.0, 101.0, float("nan"), float("inf")],
+)
+def test_invalid_coding_score_is_rejected(coding_score: float) -> None:
+    payload = {
+        "models": [
+            {"harness": "codex", "model_id": "gpt-5.5", "coding_score": coding_score}
+        ]
+    }
+
+    with pytest.raises(ModelResolutionError, match="coding_score"):
+        ModelCatalog.from_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "price",
+    [-0.01, float("nan"), float("inf")],
+)
+def test_invalid_price_is_rejected(price: float) -> None:
+    payload = {
+        "models": [
+            {
+                "harness": "codex",
+                "model_id": "gpt-5.5",
+                "coding_score": 80.0,
+                "price_per_1m_tokens": price,
+            }
+        ]
+    }
+
+    with pytest.raises(ModelResolutionError, match="price_per_1m_tokens"):
+        ModelCatalog.from_payload(payload)
