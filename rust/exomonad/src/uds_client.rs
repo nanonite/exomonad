@@ -128,13 +128,23 @@ impl ServerClient {
     /// Low-level GET over UDS. Returns response body bytes.
     async fn raw_get(&self, path: &str) -> Result<Vec<u8>> {
         use hyper::Method;
-        self.raw_request(Method::GET, path, None).await
+        self.raw_request(Method::GET, path, None, &[]).await
     }
 
     /// Low-level POST over UDS. Returns response body bytes.
+    ///
+    /// POST is only used for MCP tool calls, which are translated back into MCP
+    /// content format by the `mcp-stdio` binary. The mail-piggyback header marks
+    /// this caller so the server appends unread inbox mail to the tool result.
     async fn raw_post(&self, path: &str, body: &[u8]) -> Result<Vec<u8>> {
         use hyper::Method;
-        self.raw_request(Method::POST, path, Some(body)).await
+        self.raw_request(
+            Method::POST,
+            path,
+            Some(body),
+            &[(crate::control::MAIL_PIGGYBACK_HEADER.as_str(), "1")],
+        )
+        .await
     }
 
     /// Shared low-level request logic over UDS.
@@ -143,6 +153,7 @@ impl ServerClient {
         method: hyper::Method,
         path: &str,
         body: Option<&[u8]>,
+        extra_headers: &[(&str, &str)],
     ) -> Result<Vec<u8>> {
         use http_body_util::{BodyExt, Full};
         use hyper::Request;
@@ -165,6 +176,10 @@ impl ServerClient {
             .method(&method)
             .uri(path)
             .header("host", "localhost");
+
+        for (name, value) in extra_headers {
+            req_builder = req_builder.header(*name, *value);
+        }
 
         if body.is_some() {
             req_builder = req_builder.header("content-type", "application/json");

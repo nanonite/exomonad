@@ -1158,6 +1158,29 @@ fn append_unread_mail_block(
     });
 }
 
+/// Append unread inbox mail to a successful tool result, but only for MCP
+/// stdio callers that mark themselves with the mail-piggyback header.
+///
+/// The programmatic TL controller (and any other raw REST caller) consumes the
+/// structured `result` object directly; wrapping it in MCP content format here
+/// would silently destroy fields like `poll_workers`' `workers` array.
+fn maybe_append_unread_mail(
+    output: &mut exomonad_core::mcp::tools::MCPCallOutput,
+    headers: &axum::http::HeaderMap,
+    agent_name: &str,
+    inbox_store: &exomonad_core::services::InboxStore,
+) {
+    if !output.success || !headers.contains_key(&control::MAIL_PIGGYBACK_HEADER) {
+        return;
+    }
+    match inbox_store.peek_unnotified(agent_name) {
+        Ok(messages) => append_unread_mail_block(output, &messages),
+        Err(error) => {
+            tracing::warn!(agent = %agent_name, error = %error, "Failed to peek unread inbox messages")
+        }
+    }
+}
+
 fn append_to_mcp_text_content(result: &mut serde_json::Value, block: &str) -> bool {
     let Some(content) = result
         .get_mut("content")
@@ -1198,6 +1221,7 @@ pub async fn call_tool(
     Path((role, name)): Path<(String, String)>,
     State(state): State<AppState>,
     Extension(plugin): Extension<Arc<PluginManager>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ToolCallRequest>,
 ) -> impl IntoResponse {
     tracing::info!(tool = %body.name, "Executing tool");
@@ -1273,12 +1297,7 @@ pub async fn call_tool(
     }
 
     if output.success {
-        match state.inbox_store.peek_unnotified(&name) {
-            Ok(messages) => append_unread_mail_block(&mut output, &messages),
-            Err(error) => {
-                tracing::warn!(agent = %name, error = %error, "Failed to peek unread inbox messages")
-            }
-        }
+        maybe_append_unread_mail(&mut output, &headers, &name, state.inbox_store.as_ref());
     }
 
     Json(serde_json::json!({
@@ -2106,5 +2125,54 @@ mod tests {
         append_unread_mail_block(&mut output, &[message()]);
 
         assert!(output.result.is_none());
+    }
+
+    #[test]
+    fn mail_piggyback_requires_mcp_stdio_header() {
+        let inbox = exomonad_core::services::InboxStore::open_in_memory().unwrap();
+        inbox
+            .write_message("leaf-opencode", "root", "PR ready", Some("approved"))
+            .unwrap();
+
+        let structured_result = serde_json::json!({
+            "workers": [{"name": "leaf-opencode", "pane_alive": false}],
+            "dead_workers": ["leaf-opencode"]
+        });
+
+        // Raw REST callers (the programmatic TL controller) do not send the
+        // header; their structured result must pass through untouched.
+        let mut raw_output = MCPCallOutput {
+            success: true,
+            result: Some(structured_result.clone()),
+            error: None,
+        };
+        maybe_append_unread_mail(
+            &mut raw_output,
+            &axum::http::HeaderMap::new(),
+            "root",
+            &inbox,
+        );
+        let raw_result = raw_output.result.unwrap();
+        assert!(
+            raw_result.get("workers").is_some(),
+            "raw caller lost the 'workers' key: {raw_result}"
+        );
+        assert_eq!(raw_result["workers"][0]["name"], "leaf-opencode");
+
+        // MCP stdio callers send the header and still get unread mail appended.
+        let mut mcp_output = MCPCallOutput {
+            success: true,
+            result: Some(structured_result),
+            error: None,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(control::MAIL_PIGGYBACK_HEADER, "1".parse().unwrap());
+        maybe_append_unread_mail(&mut mcp_output, &headers, "root", &inbox);
+        let mcp_result = mcp_output.result.unwrap();
+        assert!(mcp_result.get("content").is_some());
+        assert!(mcp_result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<unread-mail>"));
     }
 }
