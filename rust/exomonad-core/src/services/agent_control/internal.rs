@@ -774,17 +774,16 @@ impl<
             None => None,
         };
 
-        let model = model_override.or_else(|| self.default_model_for_spawn(agent_type, role));
-        let full_command = Self::build_agent_command_with_effort(
+        let full_command = self.build_launch_command(
             agent_type,
             prompt_file.as_deref(),
             fork_session_id,
             &env_vars,
             cwd,
             claude_flags,
-            self.yolo,
-            model,
-            effort_override.or_else(|| self.default_effort_for_spawn(role)),
+            role,
+            model_override,
+            effort_override,
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let tmux = self.tmux()?;
@@ -797,6 +796,35 @@ impl<
             .context("Failed to create tmux window")?;
 
         Ok(window_id)
+    }
+
+    /// Build the shell command a spawned window will run, resolving the model
+    /// and effort from the per-spawn override or the static per-role default.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_launch_command(
+        &self,
+        agent_type: AgentType,
+        prompt_file: Option<&Path>,
+        fork_session_id: Option<&str>,
+        env_vars: &HashMap<String, String>,
+        cwd: &Path,
+        claude_flags: Option<&ClaudeSpawnFlags>,
+        role: Option<&str>,
+        model_override: Option<&str>,
+        effort_override: Option<&str>,
+    ) -> String {
+        let model = model_override.or_else(|| self.default_model_for_spawn(agent_type, role));
+        Self::build_agent_command_with_effort(
+            agent_type,
+            prompt_file,
+            fork_session_id,
+            env_vars,
+            cwd,
+            claude_flags,
+            self.yolo,
+            model,
+            effort_override.or_else(|| self.default_effort_for_spawn(role)),
+        )
     }
 
     pub(crate) async fn get_tmux_windows(&self) -> Result<Vec<String>> {
@@ -1546,6 +1574,45 @@ mod tests {
             Some("high")
         );
         assert_eq!(service.default_effort_for_spawn(Some("dev")), Some("low"));
+    }
+
+    #[test]
+    fn launch_command_threads_model_override_into_the_cli() {
+        let service = AgentControlService::new(test_services(PathBuf::from(".")))
+            .with_spawn_agent_model(Some("config-default".to_string()));
+        let env = HashMap::new();
+
+        let overridden = service.build_launch_command(
+            AgentType::OpenCode,
+            None,
+            None,
+            &env,
+            Path::new("/tmp/worktree"),
+            None,
+            Some("dev"),
+            Some("override-model"),
+            None,
+        );
+        assert!(
+            overridden.contains("--model override-model"),
+            "override model missing from launch command: {overridden}"
+        );
+
+        let defaulted = service.build_launch_command(
+            AgentType::OpenCode,
+            None,
+            None,
+            &env,
+            Path::new("/tmp/worktree"),
+            None,
+            Some("dev"),
+            None,
+            None,
+        );
+        assert!(
+            defaulted.contains("--model config-default"),
+            "static default model missing from launch command: {defaulted}"
+        );
     }
 
     #[tokio::test]
