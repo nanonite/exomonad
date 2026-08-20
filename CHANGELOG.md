@@ -150,6 +150,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Add a versioned Chainlink issue export (#918)
 - Expose TL loop timeouts (transport, ledger tail, dispatch, stall, idle) as config so slower machines can raise them (#916)
 - Wire a difficulty/attempt-aware model catalog into select_model() and TL dispatch (#914)
 - Define ordered sub-TL stage and integration contracts (#864)
