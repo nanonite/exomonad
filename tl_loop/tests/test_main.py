@@ -187,3 +187,12 @@ def test_run_defaults_preserve_current_values() -> None:
     assert TLLoopConfig.dispatch_timeout == 5.0
     assert TLLoopConfig.controller_stall_timeout == 300.0
     assert TLLoopConfig.idle_timeout == 30.0
+
+
+def test_positive_float_rejects_nan() -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        launcher._positive_float("nan")
+    with pytest.raises(argparse.ArgumentTypeError):
+        launcher._positive_float("0")
+    assert launcher._positive_float("inf") == float("inf")
+    assert launcher._positive_float("10.0") == 10.0

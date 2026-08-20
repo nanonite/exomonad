@@ -24,6 +24,14 @@ pub fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
     Ok(parsed)
 }
 
+fn require_positive_timeout(name: &str, value: f64) -> Result<()> {
+    // `is_nan()` rejects NaN explicitly; `<= 0.0` rejects zero and negatives.
+    if value.is_nan() || value <= 0.0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(())
+}
+
 fn parse_agent_type_env(s: &str) -> Option<AgentType> {
     match s.to_lowercase().as_str() {
         "claude" | "claude-code" => Some(AgentType::Claude),
@@ -592,9 +600,7 @@ impl Config {
             ),
             ("tl_idle_timeout_seconds", tl_idle_timeout_seconds),
         ] {
-            if value <= 0.0 {
-                anyhow::bail!("{name} must be greater than zero");
-            }
+            require_positive_timeout(name, value)?;
         }
 
         // Resolve openrouter: local > global > default
@@ -822,6 +828,15 @@ mod tests {
         assert!(parse_positive_u32("0").is_err());
         assert!(parse_positive_u32("not-a-number").is_err());
         assert!(parse_positive_u32("4294967296").is_err());
+    }
+
+    #[test]
+    fn test_require_positive_timeout_rejects_nan_and_nonpositive() {
+        assert!(require_positive_timeout("t", 1.0).is_ok());
+        assert!(require_positive_timeout("t", f64::INFINITY).is_ok());
+        assert!(require_positive_timeout("t", f64::NAN).is_err());
+        assert!(require_positive_timeout("t", 0.0).is_err());
+        assert!(require_positive_timeout("t", -1.0).is_err());
     }
 
     #[test]

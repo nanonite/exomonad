@@ -513,7 +513,8 @@ def _positive_int(value: str) -> int:
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
+    # `not parsed > 0` also rejects NaN, which `parsed <= 0` would let through.
+    if not parsed > 0:
         raise argparse.ArgumentTypeError("must be positive")
     return parsed
 
