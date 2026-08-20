@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix legacy CI poller stamping branch name as agent_id on CI events (#910)
 - Make init reconcile and restore existing session components (#903)
 - Per-slice model selection is architecturally dead: select_model() never wired, config.toml is the sole authority (#912)
 - TL controller heartbeat crashes on 'poll_workers result has no workers array' racing a leaf's own exit (#915)
