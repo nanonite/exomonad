@@ -31,6 +31,14 @@ use crate::services::{
 
 type PluginMap = Arc<RwLock<HashMap<crate::AgentName, Arc<PluginManager>>>>;
 
+/// Resolve an agent's name (the suffix after the last dot) from a dotted branch.
+///
+/// Branch names use the `{parent}.{slug}-{agent-type}` coordinate form, so the
+/// agent identity is the final segment — never the full dotted branch.
+fn agent_name_from_branch(branch: &str) -> &str {
+    branch.rsplit_once('.').map(|(_, name)| name).unwrap_or(branch)
+}
+
 pub struct GitHubPoller<C> {
     ctx: Arc<C>,
     poll_interval: Duration,
@@ -377,7 +385,7 @@ impl<
         };
 
         // Resolve the agent name from branch (slug after last dot)
-        let agent_name = branch.rsplit_once('.').map(|(_, s)| s).unwrap_or(branch);
+        let agent_name = agent_name_from_branch(branch);
         let role = match agent_type {
             AgentType::Claude => "tl",
             AgentType::Codex => "dev",
@@ -1112,6 +1120,7 @@ impl<
             branch, status, message
         );
 
+        let agent_id = agent_name_from_branch(branch);
         let event_name = match status {
             "copilot_review" => "copilot.review",
             "success" => "ci.status_changed",
@@ -1131,7 +1140,7 @@ impl<
 
         tracing::info!(
             otel.name = event_name,
-            agent_id = %branch,
+            agent_id = %agent_id,
             head_sha = %head_sha,
             branch = %branch,
             status = %status,
@@ -1144,8 +1153,9 @@ impl<
         if let Some(log) = self.ctx.event_log() {
             let _ = log.append(
                 event_name,
-                branch,
+                agent_id,
                 &serde_json::json!({
+                    "agent_id": agent_id,
                     "branch": branch,
                     "head_sha": head_sha,
                     "status": status,
@@ -1232,6 +1242,16 @@ mod tests {
             CIStatus::Pending,
             0,
         )
+    }
+
+    #[test]
+    fn test_agent_name_from_branch_resolves_suffixed_agent() {
+        assert_eq!(agent_name_from_branch("main.feature-codex"), "feature-codex");
+        assert_eq!(
+            agent_name_from_branch("main.auth-claude.oauth-provider-codex"),
+            "oauth-provider-codex"
+        );
+        assert_eq!(agent_name_from_branch("feature-codex"), "feature-codex");
     }
 
     #[test]
