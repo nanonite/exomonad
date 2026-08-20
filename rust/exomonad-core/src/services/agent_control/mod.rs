@@ -1702,6 +1702,46 @@ mod tests {
         assert!(agent_dir.join(LAST_ACTIVITY_FILE).exists());
     }
 
+    #[test]
+    fn test_effective_model_for_override_wins_over_static_config() {
+        let services = crate::services::Services::test();
+        let service = AgentControlService::new(Arc::new(services))
+            .with_spawn_agent_model(Some("config-default-model".to_string()))
+            .with_reviewer_model(Some("config-reviewer-model".to_string()));
+
+        // An explicit per-spawn override must win over the static per-role config.
+        assert_eq!(
+            service
+                .effective_model_for(AgentType::OpenCode, "dev", Some("override-model"))
+                .as_deref(),
+            Some("override-model")
+        );
+
+        // Without an override, a dev leaf falls back to the static config default.
+        assert_eq!(
+            service
+                .effective_model_for(AgentType::OpenCode, "dev", None)
+                .as_deref(),
+            Some("config-default-model")
+        );
+
+        // The reviewer role uses its own static config default.
+        assert_eq!(
+            service
+                .effective_model_for(AgentType::OpenCode, "reviewer", None)
+                .as_deref(),
+            Some("config-reviewer-model")
+        );
+
+        // A whitespace-only override is treated as absent.
+        assert_eq!(
+            service
+                .effective_model_for(AgentType::OpenCode, "dev", Some("   "))
+                .as_deref(),
+            Some("config-default-model")
+        );
+    }
+
     #[tokio::test]
     async fn refresh_agent_activity_preserves_routing_and_identity() {
         let temp_dir = tempfile::tempdir().unwrap();

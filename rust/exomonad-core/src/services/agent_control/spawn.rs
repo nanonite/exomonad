@@ -1787,7 +1787,7 @@ impl<
 
             let default_dev = crate::domain::Role::dev();
             let role = options.role.as_ref().unwrap_or(&default_dev);
-            let model = self.effective_model_for(agent_type, role.as_str(), None);
+            let model = self.effective_model_for(agent_type, role.as_str(), options.model.as_deref());
             let effort = self.effective_effort_for(role.as_str(), None);
             let identity_model = existing_identity_record
                 .as_ref()
