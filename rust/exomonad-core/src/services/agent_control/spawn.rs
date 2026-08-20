@@ -1899,19 +1899,22 @@ impl<
                 agent_config_dir.join("exit_code").display().to_string(),
             );
             let _ = fs::remove_file(agent_config_dir.join("exit_code")).await;
-            let window_id = match self.new_tmux_window_inner(
-                &display_name,
-                &worktree_path,
-                agent_type,
-                Some(&task),
-                env_vars,
-                None,
-                Some(&options.claude_flags),
-                Some(role.as_str()),
-                model.as_deref(),
-                effort.as_deref(),
-            )
-            .await {
+            let launch_result = async {
+                let prompt_file =
+                    Self::write_prompt_file(self.project_dir(), &display_name, &task).await?;
+                let full_command = self.leaf_launch_command(
+                    agent_type,
+                    role.as_str(),
+                    options,
+                    Some(prompt_file.as_path()),
+                    &env_vars,
+                    &worktree_path,
+                );
+                self.new_tmux_window_with_command(&display_name, &worktree_path, &full_command)
+                    .await
+            }
+            .await;
+            let window_id = match launch_result {
                 Ok(wid) => wid,
                 Err(e) => {
                     warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");

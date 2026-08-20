@@ -785,17 +785,52 @@ impl<
             model_override,
             effort_override,
         );
+        self.new_tmux_window_with_command(name, cwd, &full_command)
+            .await
+    }
+
+    /// Open a tmux window that runs the already-built launch command.
+    pub(crate) async fn new_tmux_window_with_command(
+        &self,
+        name: &str,
+        cwd: &Path,
+        full_command: &str,
+    ) -> Result<super::tmux_ipc::WindowId> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let tmux = self.tmux()?;
         let window_name = name.to_string();
         let window_cwd = cwd.to_path_buf();
-
-        let window_id = tmux
-            .new_window(&window_name, &window_cwd, &shell, &full_command)
+        tmux.new_window(&window_name, &window_cwd, &shell, full_command)
             .await
-            .context("Failed to create tmux window")?;
+            .context("Failed to create tmux window")
+    }
 
-        Ok(window_id)
+    /// Resolve a leaf's model and effort from its spawn options and build the
+    /// launch command it will run. Kept separate so the launch-command boundary
+    /// can be tested starting from `SpawnLeafOptions.model`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn leaf_launch_command(
+        &self,
+        agent_type: AgentType,
+        role: &str,
+        options: &SpawnLeafOptions,
+        prompt_file: Option<&Path>,
+        env_vars: &HashMap<String, String>,
+        cwd: &Path,
+    ) -> String {
+        let model = self.effective_model_for(agent_type, role, options.model.as_deref());
+        let effort = self.effective_effort_for(role, None);
+        self.build_launch_command(
+            agent_type,
+            prompt_file,
+            None,
+            env_vars,
+            cwd,
+            Some(&options.claude_flags),
+            Some(role),
+            model.as_deref(),
+            effort.as_deref(),
+        )
     }
 
     /// Build the shell command a spawned window will run, resolving the model
@@ -1577,41 +1612,53 @@ mod tests {
     }
 
     #[test]
-    fn launch_command_threads_model_override_into_the_cli() {
+    fn leaf_launch_command_threads_spawn_leaf_options_model() {
         let service = AgentControlService::new(test_services(PathBuf::from(".")))
             .with_spawn_agent_model(Some("config-default".to_string()));
         let env = HashMap::new();
 
-        let overridden = service.build_launch_command(
+        let overridden = SpawnLeafOptions {
+            task: "implement it".to_string(),
+            branch_name: "leaf-a".to_string(),
+            role: None,
+            agent_type: AgentType::OpenCode,
+            model: Some("override-model".to_string()),
+            claude_flags: ClaudeSpawnFlags::default(),
+            standalone_repo: false,
+            allowed_dirs: Vec::new(),
+            start_point: None,
+            base_branch: None,
+            expected_agent_name: None,
+            invocation_pr_number: None,
+        };
+        let command = service.leaf_launch_command(
             AgentType::OpenCode,
-            None,
+            "dev",
+            &overridden,
             None,
             &env,
             Path::new("/tmp/worktree"),
-            None,
-            Some("dev"),
-            Some("override-model"),
-            None,
         );
         assert!(
-            overridden.contains("--model override-model"),
-            "override model missing from launch command: {overridden}"
+            command.contains("--model override-model"),
+            "override model missing from launch command: {command}"
         );
 
-        let defaulted = service.build_launch_command(
+        let defaulted = SpawnLeafOptions {
+            model: None,
+            ..overridden
+        };
+        let default_command = service.leaf_launch_command(
             AgentType::OpenCode,
-            None,
+            "dev",
+            &defaulted,
             None,
             &env,
             Path::new("/tmp/worktree"),
-            None,
-            Some("dev"),
-            None,
-            None,
         );
         assert!(
-            defaulted.contains("--model config-default"),
-            "static default model missing from launch command: {defaulted}"
+            default_command.contains("--model config-default"),
+            "static default model missing from launch command: {default_command}"
         );
     }
 
