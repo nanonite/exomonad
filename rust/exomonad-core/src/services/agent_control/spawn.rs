@@ -1899,12 +1899,17 @@ impl<
                 agent_config_dir.join("exit_code").display().to_string(),
             );
             let _ = fs::remove_file(agent_config_dir.join("exit_code")).await;
-            let window_id = match self.new_tmux_window(
+            let window_id = match self.new_tmux_window_inner(
                 &display_name,
                 &worktree_path,
                 agent_type,
                 Some(&task),
                 env_vars,
+                None,
+                Some(&options.claude_flags),
+                Some(role.as_str()),
+                model.as_deref(),
+                effort.as_deref(),
             )
             .await {
                 Ok(wid) => wid,
