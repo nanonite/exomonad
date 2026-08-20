@@ -6,15 +6,20 @@ from pathlib import Path
 
 import pytest
 
+from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import (
     ModelCatalog,
     ModelResolutionError,
+    load_model_catalog,
     parse_thinking_suffix,
     select_model,
+    select_model_for_difficulty,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "model_catalog.json"
+SCORED_FIXTURE = Path(__file__).parent / "fixtures" / "model_catalog_scored.json"
 CATALOG = ModelCatalog.from_fixture(FIXTURE)
+SCORED_CATALOG = ModelCatalog.from_fixture(SCORED_FIXTURE)
 
 
 def test_exact_reference_is_selected_first() -> None:
@@ -85,3 +90,66 @@ def test_effect_payload_uses_normalized_records() -> None:
     choice = select_model("codex", payload, "gpt-5.5")
 
     assert choice.model_id == "gpt-5.5"
+
+
+def test_standard_difficulty_picks_cheapest_per_intelligence_point() -> None:
+    choice = select_model_for_difficulty("codex", SCORED_CATALOG, Difficulty.STANDARD)
+
+    assert choice.model_id == "gpt-5-mini"
+    assert choice.ladder_rung_used == "cheapest_capable"
+
+
+def test_trivial_difficulty_also_picks_cheapest() -> None:
+    choice = select_model_for_difficulty("claude", SCORED_CATALOG, Difficulty.TRIVIAL)
+
+    assert choice.model_id == "claude-haiku"
+    assert choice.ladder_rung_used == "cheapest_capable"
+
+
+def test_hard_difficulty_picks_strongest() -> None:
+    choice = select_model_for_difficulty("codex", SCORED_CATALOG, Difficulty.HARD)
+
+    assert choice.model_id == "gpt-5.5"
+    assert choice.ladder_rung_used == "difficulty_strong"
+
+
+def test_escalation_picks_strongest_even_for_standard_difficulty() -> None:
+    choice = select_model_for_difficulty(
+        "claude", SCORED_CATALOG, Difficulty.STANDARD, escalated=True
+    )
+
+    assert choice.model_id == "claude-sonnet-4-6"
+    assert choice.ladder_rung_used == "escalation_strong"
+
+
+def test_unscored_records_remain_selectable_but_deprioritized() -> None:
+    payload = {
+        "models": [
+            {"harness": "codex", "model_id": "gpt-5.5", "coding_score": 80.0, "price_per_1m_tokens": 5.0},
+            {"harness": "codex", "model_id": "gpt-legacy"},
+        ]
+    }
+    catalog = ModelCatalog.from_payload(payload)
+
+    standard = select_model_for_difficulty("codex", catalog, Difficulty.STANDARD)
+    hard = select_model_for_difficulty("codex", catalog, Difficulty.HARD)
+
+    assert standard.model_id == "gpt-5.5"
+    assert hard.model_id == "gpt-5.5"
+
+
+def test_difficulty_selection_fails_closed_for_unknown_harness() -> None:
+    with pytest.raises(ModelResolutionError, match="no models available"):
+        select_model_for_difficulty("unknown", SCORED_CATALOG, Difficulty.STANDARD)
+
+
+def test_load_model_catalog_absent_returns_none(tmp_path: Path) -> None:
+    assert load_model_catalog(tmp_path / "missing.json") is None
+
+
+def test_load_model_catalog_invalid_raises(tmp_path: Path) -> None:
+    bad = tmp_path / "model-catalog.json"
+    bad.write_text("{ not json", encoding="utf-8")
+
+    with pytest.raises(ModelResolutionError):
+        load_model_catalog(bad)

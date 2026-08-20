@@ -174,6 +174,36 @@ flagged when its absolute value exceeds 20% of the estimate.
 
 A selector result of None with SelectionFailure.OVER_BUDGET is a bounded needs-human parking signal; the controller must not widen the allowlist or silently raise a ceiling to continue.
 
+## Per-slice model tier selection
+
+The selector resolves a model *within* the already-selected harness from a
+checked-in, human-authored `.exo/model-catalog.json`, loaded offline at
+controller startup (`tl_loop.select.model.load_model_catalog`). The catalog
+never widens `harness_policy.toml`'s allowlist or budget ceilings — it only
+orders model entries inside the harness the harness selector already chose.
+
+Each catalog entry may carry an optional `coding_score` (0-100 composite
+benchmark index) and `price_per_1m_tokens`. `select_model_for_difficulty`
+maps the classified `Difficulty` to an abstract tier against whatever catalog
+is loaded:
+
+- TRIVIAL/STANDARD, not escalated → lowest `price_per_1m_tokens / coding_score`
+  (cost per intelligence point). Entries missing score/price sort last; ties
+  resolve to catalog order.
+- HARD, or escalated → highest raw `coding_score`. Escalation reuses the same
+  `escalate_after_attempts` + NO-GO signal as harness escalation, surfaced via
+  `HarnessChoice.reason == "escalated_after_no_go"`; there is no second counter.
+
+Precedence at the dispatch call site mirrors `effective_model_for`'s
+override-wins-over-config: an explicit `TLLoopConfig.requested_model` wins over
+the difficulty-derived tier, which wins over the harness-pinned `route.model`.
+A missing catalog file fails open to today's static per-role model config
+(including the "unresolved" log line for a bare harness string); a
+present-but-malformed catalog raises `ModelResolutionError` rather than
+guessing. Catalog entries carry no vendor-specific model table in
+`tl_loop/select/` — the score/cost fields are seeded offline by the operator,
+the same way `harness_policy.toml` and `harness_capability.toml` are authored.
+
 ## FSM parity fixture
 
 `tl_loop/fsm/` is a pure port of `.exo/roles/devswarm/TLPhase.hs`. The golden

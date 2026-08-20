@@ -27,6 +27,7 @@ from tl_loop.plan_validation import (
 )
 from tl_loop.preflight import PreflightError, run_preflight
 from tl_loop.select.capability import load_capability
+from tl_loop.select.model import load_model_catalog
 from tl_loop.select.policy import load_policy
 from tl_loop.state.read_model import project_read_model
 from tl_loop.state.schema import GateStatus, RunState
@@ -196,6 +197,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
             project_root / ".exo" / "harness_capability.toml",
             policy_path=project_root / ".exo" / "harness_policy.toml",
         )
+        catalog = load_model_catalog(project_root / ".exo" / "model-catalog.json")
     except Exception as error:
         RunStore(run_id, state_root).record_exit_reason(str(error), error=error)
         raise
@@ -215,6 +217,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         review_policy_path=project_root / ".exo" / "review-policy.toml",
         policy=policy,
         capabilities=capabilities,
+        catalog=catalog,
     )
     budgets = plan_document.get("budgets", {"tokens": 0, "wall_seconds": 0})
     if not isinstance(budgets, Mapping):

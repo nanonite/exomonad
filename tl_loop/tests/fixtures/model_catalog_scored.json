@@ -1,0 +1,36 @@
+{
+  "models": [
+    {
+      "harness": "codex",
+      "provider": "openai-codex",
+      "model_id": "gpt-5-mini",
+      "name": "GPT-5 Mini",
+      "coding_score": 55.0,
+      "price_per_1m_tokens": 0.15
+    },
+    {
+      "harness": "codex",
+      "provider": "openai-codex",
+      "model_id": "gpt-5.5",
+      "name": "GPT-5.5",
+      "coding_score": 85.0,
+      "price_per_1m_tokens": 5.0
+    },
+    {
+      "harness": "claude",
+      "provider": "anthropic",
+      "model_id": "claude-haiku",
+      "name": "Claude Haiku",
+      "coding_score": 50.0,
+      "price_per_1m_tokens": 0.25
+    },
+    {
+      "harness": "claude",
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-4-6",
+      "name": "Claude Sonnet",
+      "coding_score": 80.0,
+      "price_per_1m_tokens": 3.0
+    }
+  ]
+}

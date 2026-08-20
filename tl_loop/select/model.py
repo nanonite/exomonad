@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import cast
 
 from tl_loop.client.effects import ToolResult
+from tl_loop.select.classify import Difficulty
 
 THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh", "max"})
 _DATE_SUFFIX = re.compile(r"-\d{8}$")
@@ -27,6 +29,8 @@ class CatalogModel:
     model_id: str
     provider: str | None = None
     name: str | None = None
+    coding_score: float | None = None
+    price_per_1m_tokens: float | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,19 @@ class ModelCatalog:
         """Return records belonging to the selected harness, preserving catalog order."""
         harness_name = harness.split("/", 1)[0].lower()
         return tuple(model for model in self.models if model.harness.lower() == harness_name)
+
+
+def load_model_catalog(path: str | Path) -> ModelCatalog | None:
+    """Load a committed model catalog, failing open when no file is configured.
+
+    An absent catalog defers entirely to the static per-role model config, which
+    is today's behavior. A present-but-malformed catalog is an operator error and
+    raises ``ModelResolutionError`` rather than silently guessing a model id.
+    """
+    target = Path(path)
+    if not target.exists():
+        return None
+    return ModelCatalog.from_fixture(target)
 
 
 @dataclass(frozen=True)
@@ -130,6 +147,32 @@ def resolve_model(
         provider_default=provider_default,
         exact_reference=exact_reference,
     )
+
+
+def select_model_for_difficulty(
+    harness: str,
+    catalog: ModelCatalog,
+    difficulty: Difficulty,
+    *,
+    escalated: bool = False,
+) -> ModelChoice:
+    """Resolve a catalog entry for a slice's difficulty and escalation state.
+
+    Cheap/standard work picks the lowest cost-per-intelligence-point entry;
+    hard or escalated work picks the highest raw ``coding_score`` entry. Records
+    without the required score/price fields are deprioritized but still
+    selectable, and ties resolve to catalog order so the result is deterministic.
+    """
+    records = catalog.for_harness(harness)
+    if not records:
+        raise ModelResolutionError(f"no models available for harness {harness!r}")
+    if difficulty is Difficulty.HARD or escalated:
+        selected = max(records, key=_strength_key)
+        rung = "escalation_strong" if escalated else "difficulty_strong"
+    else:
+        selected = min(records, key=_cost_key)
+        rung = "cheapest_capable"
+    return _choice(selected, None, rung, harness)
 
 
 def parse_thinking_suffix(reference: str) -> tuple[str, str | None]:
@@ -228,6 +271,20 @@ def _choice(
     return ModelChoice(record.model_id, thinking_level, rung, harness)
 
 
+def _strength_key(record: CatalogModel) -> float:
+    if record.coding_score is None:
+        return -math.inf
+    return record.coding_score
+
+
+def _cost_key(record: CatalogModel) -> float:
+    score = record.coding_score
+    price = record.price_per_1m_tokens
+    if score is None or price is None or score <= 0:
+        return math.inf
+    return price / score
+
+
 def _mapping(value: object, path: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ModelResolutionError(f"{path}: must be an object")
@@ -241,7 +298,9 @@ def _catalog_model(value: object, index: int) -> CatalogModel:
     model_id = _string(record, "model_id", path)
     provider = _optional_string(record, "provider", path)
     name = _optional_string(record, "name", path)
-    return CatalogModel(harness, model_id, provider, name)
+    coding_score = _optional_float(record, "coding_score", path)
+    price_per_1m_tokens = _optional_float(record, "price_per_1m_tokens", path)
+    return CatalogModel(harness, model_id, provider, name, coding_score, price_per_1m_tokens)
 
 
 def _string(record: Mapping[str, object], key: str, path: str) -> str:
@@ -258,13 +317,24 @@ def _optional_string(record: Mapping[str, object], key: str, path: str) -> str |
     return value
 
 
+def _optional_float(record: Mapping[str, object], key: str, path: str) -> float | None:
+    value = record.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ModelResolutionError(f"{path}.{key}: must be null or a number")
+    return float(value)
+
+
 __all__ = [
     "THINKING_LEVELS",
     "CatalogModel",
     "ModelCatalog",
     "ModelChoice",
     "ModelResolutionError",
+    "load_model_catalog",
     "parse_thinking_suffix",
     "resolve_model",
     "select_model",
+    "select_model_for_difficulty",
 ]

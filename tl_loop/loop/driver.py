@@ -79,7 +79,7 @@ from tl_loop.select.agent_type import parse_harness_identifier, select_agent_typ
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
-from tl_loop.select.model import ModelCatalog, select_model
+from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
 from tl_loop.select.policy import HarnessPolicy, load_policy
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
@@ -3916,7 +3916,15 @@ def _prepare_spawn(
         raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}; slice parked")
     route = parse_harness_identifier(choice.harness)
     if config.catalog is not None:
-        model_id = select_model(choice.harness, config.catalog, config.requested_model).model_id
+        if config.requested_model:
+            model_id = select_model(choice.harness, config.catalog, config.requested_model).model_id
+        else:
+            model_id = select_model_for_difficulty(
+                choice.harness,
+                config.catalog,
+                choice.difficulty,
+                escalated=choice.reason == "escalated_after_no_go",
+            ).model_id
     else:
         model_id = route.model
 
