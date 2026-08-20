@@ -36,6 +36,7 @@ from tl_loop.loop.driver import (
     _event_belongs_to_plan,
     _initial_slices,
     _record_review_event,
+    _repair_model,
     _route_ci_event,
     _route_review_event,
     _run_sub_tl_batch,
@@ -1412,6 +1413,38 @@ def _review_choice(backend: ReviewBackend) -> RlmModelChoice:
         store=RlmCallStore(),
         context_length=10_000,
     )
+
+
+def test_repair_model_escalates_only_past_threshold() -> None:
+    catalog = ModelCatalog.from_fixture(
+        Path(__file__).parent / "fixtures" / "model_catalog_scored.json"
+    )
+    config = TLLoopConfig(
+        catalog=catalog,
+        policy=validate_policy(_selector_policy()),
+        role="worker",
+    )
+    below = SliceState(
+        id="leaf-a",
+        status=SliceStatus.IN_REVIEW,
+        paths=("src/leaf.py",),
+        depends_on=(),
+        base_ref="main",
+        test_plan=("just tl-loop-test",),
+        agent_type="codex",
+        model=None,
+        branch=None,
+        worktree=None,
+        pr_number=42,
+        reviewed_head="head-a",
+        attempts=0,
+        verdict=Verdict.NO_GO,
+    )
+    above = replace(below, attempts=1)
+
+    assert _repair_model(below, config) is None
+    assert _repair_model(above, config) == "gpt-5.5"
+    assert _repair_model(above, TLLoopConfig(role="worker")) is None
 
 
 def _review_store(

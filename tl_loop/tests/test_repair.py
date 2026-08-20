@@ -127,7 +127,25 @@ def test_valid_repair_round_trips_through_resume_pr() -> None:
     assert "name" not in resume_arguments
     assert "branch" not in resume_arguments
     assert "agent_type" not in resume_arguments
+    assert "model" not in resume_arguments
     assert pr["attempts"] == 1
+
+
+def test_repair_model_override_reaches_resume_pr() -> None:
+    backend = FakeBackend([RlmResponse(_handoff())])
+    client = FakeClient()
+    pr = _pr(client)
+
+    compose_repair(
+        pr,
+        Verdict.NO_GO,
+        _review(),
+        model_choice=_choice(backend),
+        model="gpt-5.5",
+    )
+
+    resume_arguments = client.calls[1][1]
+    assert resume_arguments["model"] == "gpt-5.5"
 
 
 def test_out_of_boundary_handoff_is_rejected_and_retried() -> None:

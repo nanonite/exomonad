@@ -24,7 +24,8 @@ resumePrTests =
                   rpaVerify = Nothing,
                   rpaBoundary = Nothing,
                   rpaContext = Nothing,
-                  rpaDoneCriteria = Nothing
+                  rpaDoneCriteria = Nothing,
+                  rpaModel = Nothing
                 }
         (decode "{\"pr_number\":104,\"task\":\"Address the requested review changes and update the existing PR\"}" :: Maybe ResumePrArgs)
           @=? Just args,
@@ -38,7 +39,7 @@ resumePrTests =
         KeyMap.member "agent_type" properties @?= False
         mapM_
           (\field -> KeyMap.member field properties @?= True)
-          ["read_first", "steps", "verify", "boundary", "context", "done_criteria"],
+          ["read_first", "steps", "verify", "boundary", "context", "done_criteria", "model"],
       testCase "structured handoff fields render into the resumed task" $
         do
           let args =
@@ -50,7 +51,8 @@ resumePrTests =
                     rpaVerify = Just ["cargo test"],
                     rpaBoundary = Just ["Do not create a sibling branch"],
                     rpaContext = Just "ROOT CAUSE: stale state",
-                    rpaDoneCriteria = Just ["Push the fix and report results"]
+                    rpaDoneCriteria = Just ["Push the fix and report results"],
+                    rpaModel = Nothing
                   }
               rendered = renderResumePrTask args
           if all

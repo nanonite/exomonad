@@ -2806,7 +2806,7 @@ impl<
             base_branch: Some(pr.base_ref.to_string()),
             expected_agent_name: Some(owner.agent_name.clone()),
             invocation_pr_number: Some(req.resume_pr_number),
-            model: None,
+            model: non_empty(req.model.clone()),
         };
         let options = with_resume_task(options, continuation_prefix.as_deref());
         let owner_dir = self

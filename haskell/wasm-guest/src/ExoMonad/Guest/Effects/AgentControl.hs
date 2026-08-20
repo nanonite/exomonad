@@ -214,7 +214,8 @@ data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
 data ResumePrConfig = ResumePrConfig
   { rpcTask :: Text,
     rpcPrNumber :: Word64,
-    rpcExpectedHeadSha :: Text
+    rpcExpectedHeadSha :: Text,
+    rpcModel :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -314,7 +315,7 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestBranchName = fromText "",
               PA.spawnLeafSubtreeRequestRole = fromText "",
               PA.spawnLeafSubtreeRequestAgentType = Enumerated (Right PA.AgentTypeAGENT_TYPE_UNSPECIFIED),
-              PA.spawnLeafSubtreeRequestModel = fromText "",
+              PA.spawnLeafSubtreeRequestModel = maybe (fromText "") fromText (rpcModel cfg),
               PA.spawnLeafSubtreeRequestPermissionMode = fromText "",
               PA.spawnLeafSubtreeRequestAllowedTools = V.empty,
               PA.spawnLeafSubtreeRequestDisallowedTools = V.empty,

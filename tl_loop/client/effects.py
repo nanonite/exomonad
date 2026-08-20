@@ -228,6 +228,7 @@ class EffectClient:
         read_first: StringList | None = None,
         steps: StringList | None = None,
         verify: StringList | None = None,
+        model: str | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {"pr_number": pr_number, "task": task}
         _put_list(arguments, "boundary", boundary)
@@ -236,6 +237,7 @@ class EffectClient:
         _put_list(arguments, "read_first", read_first)
         _put_list(arguments, "steps", steps)
         _put_list(arguments, "verify", verify)
+        _put(arguments, "model", model)
         return self._call("resume_pr", arguments)
 
     def watcher_pr_state(

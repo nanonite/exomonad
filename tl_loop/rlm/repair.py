@@ -72,6 +72,7 @@ def compose_repair(
     model_choice: object | None = None,
     store: RunStore | None = None,
     slice_id: str | None = None,
+    model: str | None = None,
 ) -> RepairHandoff:
     """Compose, validate, dispatch, and account for one existing-PR repair."""
     number, paths = pr_identity(pr)
@@ -100,7 +101,7 @@ def compose_repair(
             if attempt == attempts:
                 raise RepairHandoffRejected(attempts, feedback) from error
             continue
-        _dispatch_resume(selected_client, number, handoff)
+        _dispatch_resume(selected_client, number, handoff, model)
         increment_attempts(pr, number, store, slice_id)
         return handoff
 
@@ -160,7 +161,9 @@ def _repair_inputs(
     return {"sections": cast(JsonValue, sections)}
 
 
-def _dispatch_resume(client: object, number: int, handoff: RepairHandoff) -> None:
+def _dispatch_resume(
+    client: object, number: int, handoff: RepairHandoff, model: str | None
+) -> None:
     resume = getattr(client, "resume_pr", None)
     if not callable(resume):
         raise RepairInputError("client has no resume_pr capability")
@@ -177,6 +180,8 @@ def _dispatch_resume(client: object, number: int, handoff: RepairHandoff) -> Non
         "boundary": list(handoff.boundary),
         "done_criteria": list(handoff.done_criteria),
     }
+    if model is not None:
+        kwargs["model"] = model
     parameters = inspect.signature(resume).parameters
     if "handoff" in parameters and "task" not in parameters:
         outcome = resume(number, handoff.to_mapping())

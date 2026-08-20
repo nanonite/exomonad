@@ -41,7 +41,8 @@ data ResumePrArgs = ResumePrArgs
     rpaVerify :: Maybe [Text],
     rpaBoundary :: Maybe [Text],
     rpaContext :: Maybe Text,
-    rpaDoneCriteria :: Maybe [Text]
+    rpaDoneCriteria :: Maybe [Text],
+    rpaModel :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -56,6 +57,7 @@ instance FromJSON ResumePrArgs where
       <*> v .:? "boundary"
       <*> v .:? "context"
       <*> v .:? "done_criteria"
+      <*> v .:? "model"
 
 resumePrDescription :: Text
 resumePrDescription =
@@ -71,7 +73,8 @@ resumePrSchema =
       ("verify", "Exact commands the leaf must run before reporting completion"),
       ("boundary", "Constraints and anti-patterns for the repair"),
       ("context", "Reviewer analysis, root cause, proposed solution, and relevant snippets"),
-      ("done_criteria", "Issue Definition-of-Done bullets for the repair; the resumed owner must copy them verbatim beneath the literal `## Acceptance Criteria` heading in the next file_pr body")
+      ("done_criteria", "Issue Definition-of-Done bullets for the repair; the resumed owner must copy them verbatim beneath the literal `## Acceptance Criteria` heading in the next file_pr body"),
+      ("model", "Optional per-spawn model override, separate from agent_type, used to escalate the resumed owner onto a stronger model within the same harness")
     ]
 
 resumePrCore :: ResumePrArgs -> Eff Effects (Either Text Aeson.Value)
@@ -107,7 +110,8 @@ resumePrCore args
                   AC.ResumePrConfig
                     { AC.rpcTask = renderedTask,
                       AC.rpcPrNumber = fromIntegral (rpaPrNumber args),
-                      AC.rpcExpectedHeadSha = lazyText (PA.watcherPrStateResponseHeadSha state)
+                      AC.rpcExpectedHeadSha = lazyText (PA.watcherPrStateResponseHeadSha state),
+                      AC.rpcModel = rpaModel args
                     }
               pure $ case spawnResult of
                 Left err -> Left (spawnErrorMessage err)

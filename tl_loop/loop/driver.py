@@ -77,6 +77,7 @@ from tl_loop.rlm.adjudicate import adjudicate_review
 from tl_loop.rlm.repair import RepairError, RepairHandoff, compose_repair
 from tl_loop.select.agent_type import parse_harness_identifier, select_agent_type, selection_failure
 from tl_loop.select.capability import CapabilityMap, load_capability
+from tl_loop.select.classify import Difficulty
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
@@ -4572,6 +4573,7 @@ def _route_repair(
     if current is None or current.pr_number is None:
         raise TLLoopError(f"repair event references slice without PR {slice_id!r}")
     live = cast(EffectClient, effects)
+    repair_model = _repair_model(current, config)
     pr = {
         "pr_number": current.pr_number,
         "paths": list(current.paths),
@@ -4595,6 +4597,7 @@ def _route_repair(
             model_choice=config.review_model_choice,
             store=store,
             slice_id=slice_id,
+            model=repair_model,
         )
     except (RepairError, ValueError) as error:
         parked = replace(
@@ -4640,7 +4643,7 @@ def _route_repair(
         EffectIntent(
             "resume_pr",
             slice_id,
-            _repair_arguments(current.pr_number, handoff),
+            _repair_arguments(current.pr_number, handoff, repair_model),
             True,
         )
     )
@@ -4648,10 +4651,29 @@ def _route_repair(
     return store.checkpoint(phase, refreshed.slices, refreshed.budgets, event_seq)
 
 
-def _repair_arguments(pr_number: int, handoff: RepairHandoff) -> dict[str, object]:
+def _repair_model(current: SliceState, config: TLLoopConfig) -> str | None:
+    if config.catalog is None or config.policy is None:
+        return None
+    role_policy = config.policy.roles[config.role]
+    if current.attempts < role_policy.escalate_after_attempts:
+        return None
+    harness = current.agent_type
+    if not harness:
+        return None
+    return select_model_for_difficulty(
+        harness,
+        config.catalog,
+        Difficulty.HARD,
+        escalated=True,
+    ).model_id
+
+
+def _repair_arguments(
+    pr_number: int, handoff: RepairHandoff, model: str | None
+) -> dict[str, object]:
     root_cause = handoff.root_cause
     proposed_solution = handoff.proposed_solution
-    return {
+    arguments: dict[str, object] = {
         "pr_number": pr_number,
         "task": proposed_solution,
         "context": f"ROOT CAUSE: {root_cause}\nPROPOSED SOLUTION: {proposed_solution}",
@@ -4661,6 +4683,9 @@ def _repair_arguments(pr_number: int, handoff: RepairHandoff) -> dict[str, objec
         "boundary": list(handoff.boundary),
         "done_criteria": list(handoff.done_criteria),
     }
+    if model is not None:
+        arguments["model"] = model
+    return arguments
 
 
 def _review_verdict(event: EventEnvelope) -> Verdict | None:
