@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Make init reconcile and restore existing session components (#903)
 - Per-slice model selection is architecturally dead: select_model() never wired, config.toml is the sole authority (#912)
 - TL controller heartbeat crashes on 'poll_workers result has no workers array' racing a leaf's own exit (#915)
 - spawn_leaf_subtree ignores SpawnLeafOptions.model, silently dropping any per-slice model override (#913)
