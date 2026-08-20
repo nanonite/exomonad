@@ -112,7 +112,7 @@ def test_rejected_plan_proposal_emits_bounded_reason_without_body(
 
 
 def test_run_passes_all_timeouts_to_constructors(tmp_path: Path, monkeypatch) -> None:
-    captured: dict[str, object] = {}
+    captured: dict[str, dict[str, object]] = {}
 
     class EmptySource:
         def start(self) -> EmptySource:
