@@ -1238,7 +1238,7 @@ pub async fn call_tool(
         plugin.call("handle_mcp_call", &input).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let mut output = match result {
+    let output = match result {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(tool = %body.name, error = %e, "WASM call failed");
@@ -1296,16 +1296,34 @@ pub async fn call_tool(
         );
     }
 
-    if output.success {
-        maybe_append_unread_mail(&mut output, &headers, &name, state.inbox_store.as_ref());
-    }
+    Json(finalize_tool_response(
+        output,
+        &headers,
+        &name,
+        state.inbox_store.as_ref(),
+    ))
+    .into_response()
+}
 
-    Json(serde_json::json!({
+/// Build the stable `{success, result, error}` REST envelope for a tool call.
+///
+/// Applies the unread-mail piggyback only for MCP stdio callers that mark
+/// themselves with the mail-piggyback header. The programmatic TL controller
+/// and any other raw REST caller must receive the structured `result` untouched.
+fn finalize_tool_response(
+    mut output: exomonad_core::mcp::tools::MCPCallOutput,
+    headers: &axum::http::HeaderMap,
+    agent_name: &str,
+    inbox_store: &exomonad_core::services::InboxStore,
+) -> serde_json::Value {
+    if output.success {
+        maybe_append_unread_mail(&mut output, headers, agent_name, inbox_store);
+    }
+    serde_json::json!({
         "success": output.success,
         "result": output.result,
         "error": output.error,
-    }))
-    .into_response()
+    })
 }
 
 pub async fn handle_events(
@@ -2128,7 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_piggyback_requires_mcp_stdio_header() {
+    fn poll_workers_result_survives_unread_mail_for_raw_controller() {
         let inbox = exomonad_core::services::InboxStore::open_in_memory().unwrap();
         inbox
             .write_message("leaf-opencode", "root", "PR ready", Some("approved"))
@@ -2139,36 +2157,41 @@ mod tests {
             "dead_workers": ["leaf-opencode"]
         });
 
-        // Raw REST callers (the programmatic TL controller) do not send the
-        // header; their structured result must pass through untouched.
-        let mut raw_output = MCPCallOutput {
-            success: true,
-            result: Some(structured_result.clone()),
-            error: None,
-        };
-        maybe_append_unread_mail(
-            &mut raw_output,
+        // Raw REST callers (the programmatic TL controller) omit the header;
+        // their structured poll_workers result must reach them intact.
+        let raw_response = finalize_tool_response(
+            MCPCallOutput {
+                success: true,
+                result: Some(structured_result.clone()),
+                error: None,
+            },
             &axum::http::HeaderMap::new(),
             "root",
             &inbox,
         );
-        let raw_result = raw_output.result.unwrap();
+        assert_eq!(raw_response["success"], serde_json::Value::Bool(true));
+        let raw_result = &raw_response["result"];
         assert!(
             raw_result.get("workers").is_some(),
-            "raw caller lost the 'workers' key: {raw_result}"
+            "raw controller lost the 'workers' key: {raw_result}"
         );
         assert_eq!(raw_result["workers"][0]["name"], "leaf-opencode");
+        assert!(raw_result.get("content").is_none());
 
         // MCP stdio callers send the header and still get unread mail appended.
-        let mut mcp_output = MCPCallOutput {
-            success: true,
-            result: Some(structured_result),
-            error: None,
-        };
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(control::MAIL_PIGGYBACK_HEADER, "1".parse().unwrap());
-        maybe_append_unread_mail(&mut mcp_output, &headers, "root", &inbox);
-        let mcp_result = mcp_output.result.unwrap();
+        let mcp_response = finalize_tool_response(
+            MCPCallOutput {
+                success: true,
+                result: Some(structured_result),
+                error: None,
+            },
+            &headers,
+            "root",
+            &inbox,
+        );
+        let mcp_result = &mcp_response["result"];
         assert!(mcp_result.get("content").is_some());
         assert!(mcp_result["content"][0]["text"]
             .as_str()
