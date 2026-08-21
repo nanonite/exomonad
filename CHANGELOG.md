@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Keep TL orchestration active until authoritative lifecycle resolution (#893)
 - Handle missing worker rows as durable liveness evidence (#920)
 - Fix legacy CI poller stamping branch name as agent_id on CI events (#910)
 - Make init reconcile and restore existing session components (#903)
