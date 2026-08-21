@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Make ExoMonad resume interrupted orchestration automatically (#902)
 - Fix review and CI routing for spawned leaf identities (#898)
 - Keep TL orchestration active until authoritative lifecycle resolution (#893)
 - Handle missing worker rows as durable liveness evidence (#920)
