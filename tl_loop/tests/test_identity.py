@@ -74,6 +74,22 @@ def test_branch_and_dispatch_agent_aliases_resolve_same_slice() -> None:
     assert result.reason == "resolved"
 
 
+@pytest.mark.parametrize("event_type", ["pr.review", "ci.status_changed"])
+def test_review_and_ci_runtime_branch_identity_resolves_without_branch_field(
+    event_type: str,
+) -> None:
+    event = _event(
+        event_type,
+        agent_id="main.tunable-operator-body-opencode",
+        branch=None,
+    )
+
+    result = resolve_event_slice(event, _state())
+
+    assert result.resolved
+    assert result.slice_id == "tunable-operator-body"
+
+
 def test_ambiguous_pr_is_rejected_without_first_match() -> None:
     event = _event("ci.status_changed", agent_id="unknown-owner", branch=None)
 
