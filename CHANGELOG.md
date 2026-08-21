@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix terminal invocation evidence parsing and park classification (#923)
 - Add regression and real-server coverage for mismatched worker names (#922)
 - Make ExoMonad resume interrupted orchestration automatically (#902)
 - Fix review and CI routing for spawned leaf identities (#898)
