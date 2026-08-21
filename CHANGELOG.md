@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix silent startup and runtime preflight diagnostics (#931)
 - Reconcile nonterminal TL slices from authoritative state on startup (#904)
 - Fix reader.py tuple annotation and cached active_tail semantics (#928)
 - Cache terminal invocation evidence and strengthen lifecycle regression coverage (#926)
