@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TypeAlias
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.loop.escalate import park
+from tl_loop.loop.observability import emit_controller_event
 from tl_loop.state.schema import (
     GoalState,
     ParkCause,
@@ -119,7 +122,62 @@ def heartbeat_once(
 
     for slice_state in active:
         row = worker_rows.get(slice_state.id)
-        if row is None or _retired_or_unrouted(row):
+        if row is None:
+            terminal, evidence = _missing_worker_evidence(store.root_dir, slice_state)
+            current = store.load()
+            current_slice = current.slices[slice_state.id]
+            reconciliation = _missing_worker_reconciliation(terminal)
+            if current_slice.reconciliation == reconciliation and not (
+                terminal and current_slice.status in _active_statuses()
+            ):
+                continue
+            if terminal:
+                if isinstance(effects, ReadOnlyEffectClient):
+                    raise HeartbeatError(
+                        f"terminal evidence for missing slice {slice_state.id!r} requires "
+                        "an active effect client to park"
+                    )
+                emit_controller_event(
+                    effects,
+                    "worker.terminal_reconciled",
+                    evidence,
+                )
+                park(
+                    current_slice,
+                    ParkCause.STALL_DETECTED,
+                    store=store,
+                    issue_creator=effects,
+                    ledger=current.budgets,
+                )
+                parked.append(slice_state.id)
+                progress = True
+                events.append(
+                    _event(
+                        "worker.terminal_reconciled",
+                        "invocation.finished",
+                        slice_state.id,
+                        evidence,
+                    )
+                )
+            else:
+                updated = replace(current_slice, reconciliation=reconciliation)
+                current = store.checkpoint(
+                    current.fsm,
+                    {**current.slices, slice_state.id: updated},
+                    current.budgets,
+                    current.events.last_consumed_offset,
+                )
+                emit_controller_event(effects, "worker.missing", evidence)
+                events.append(
+                    _event(
+                        "worker.missing",
+                        "heartbeat",
+                        slice_state.id,
+                        evidence,
+                    )
+                )
+            continue
+        if _retired_or_unrouted(row):
             continue
         if row.get("pane_alive") is False:
             if isinstance(effects, ReadOnlyEffectClient):
@@ -312,6 +370,133 @@ def _retired_or_unrouted(row: JsonMapping) -> bool:
         return False
     normalized = lifecycle.upper()
     return normalized.startswith("RETIRED") or normalized == "NO-ROUTING-RECORDED"
+
+
+def _missing_worker_evidence(
+    root_dir: Path,
+    slice_state: SliceState,
+) -> tuple[bool, dict[str, object]]:
+    runtime_agent_id = slice_state.dispatch_agent_id or slice_state.id
+    record = _read_invocation_record(root_dir, runtime_agent_id, slice_state.id)
+    if record is None:
+        record = _read_terminal_invocation_event(root_dir, runtime_agent_id, slice_state.id)
+    context = {
+        "slice_id": slice_state.id,
+        "runtime_agent_id": runtime_agent_id,
+        "invocation_id": _text(record, "invocation_id"),
+        "generation": record.get("generation") if isinstance(record, Mapping) else None,
+        "exit_code": record.get("exit_code") if isinstance(record, Mapping) else None,
+        "classification": _text(record, "exit_classification")
+        if isinstance(record, Mapping)
+        else None,
+        "reason": _text(record, "exit_reason") if isinstance(record, Mapping) else None,
+        "stderr_tail": _bounded_text(record, "stderr_tail")
+        if isinstance(record, Mapping)
+        else None,
+        "branch": _text(record, "branch") if isinstance(record, Mapping) else slice_state.branch,
+        "worktree": _text(record, "worktree") if isinstance(record, Mapping) else slice_state.worktree,
+    }
+    if isinstance(record, Mapping):
+        status = _text(record, "status")
+        terminal = status in {"exited", "failed", "killed", "timed_out"} or record.get(
+            "ended_at"
+        ) is not None
+        if terminal:
+            context["classification"] = context["classification"] or (
+                "missing_exit_marker" if context["exit_code"] is None else "terminal_exit"
+            )
+            context["reason"] = context["reason"] or "durable_invocation_finished"
+            return True, context
+    return False, context
+
+
+def _read_invocation_record(
+    root_dir: Path,
+    runtime_agent_id: str,
+    slice_id: str,
+) -> JsonMapping | None:
+    if not _safe_agent_name(runtime_agent_id):
+        return None
+    for base in (root_dir / ".exo/agents", root_dir / ".exo/worktrees"):
+        path = base / runtime_agent_id / "invocation.json"
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(document, Mapping):
+            continue
+        recorded_slice = document.get("slice_id")
+        if isinstance(recorded_slice, str) and recorded_slice and recorded_slice != slice_id:
+            continue
+        return document
+    return None
+
+
+def _read_terminal_invocation_event(
+    root_dir: Path,
+    runtime_agent_id: str,
+    slice_id: str,
+) -> JsonMapping | None:
+    segments = root_dir / ".exo/ledger/segments"
+    try:
+        paths = sorted(path for path in segments.iterdir() if path.suffix == ".jsonl")
+    except OSError:
+        return None
+    match: JsonMapping | None = None
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                document = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(document, Mapping) or document.get("type") != "agent.invocation.finished":
+                continue
+            if document.get("agent_id") != runtime_agent_id:
+                data = document.get("data")
+                if not isinstance(data, Mapping) or data.get("slice_id") != slice_id:
+                    continue
+            data = document.get("data")
+            if isinstance(data, Mapping):
+                match = data
+    return match
+
+
+def _missing_worker_reconciliation(terminal: bool) -> dict[str, object]:
+    return {
+        "confirmed_stage": "worker_terminal" if terminal else "worker_row_missing",
+        "authoritative_evidence": ["invocation.finished"] if terminal else [],
+        "missing_evidence": [] if terminal else ["worker.row"],
+        "conflicts": [],
+        "next_action": "park_slice" if terminal else "continue_observing",
+    }
+
+
+def _active_statuses() -> frozenset[SliceStatus]:
+    return frozenset(
+        {
+            SliceStatus.SPAWNED,
+            SliceStatus.IN_REVIEW,
+            SliceStatus.REPAIRING,
+        }
+    )
+
+
+def _safe_agent_name(value: str) -> bool:
+    return bool(value) and Path(value).name == value and value not in {".", ".."}
+
+
+def _text(value: Mapping[str, object] | None, key: str) -> str | None:
+    candidate = value.get(key) if isinstance(value, Mapping) else None
+    return candidate if isinstance(candidate, str) and candidate else None
+
+
+def _bounded_text(value: Mapping[str, object] | None, key: str) -> str | None:
+    text = _text(value, key)
+    return text[-4096:] if text is not None else None
 
 
 def _event(kind: str, source: str, slice_id: str, payload: JsonMapping) -> SyntheticHeartbeatEvent:

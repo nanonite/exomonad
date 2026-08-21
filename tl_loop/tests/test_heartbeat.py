@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
@@ -24,6 +25,7 @@ class HeartbeatTransport:
     """Effect transport with deterministic liveness and watcher responses."""
 
     pane_alive: bool = True
+    worker_present: bool = True
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
@@ -47,13 +49,17 @@ class HeartbeatTransport:
                 {
                     "success": True,
                     "result": {
-                        "workers": [
-                            {
-                                "name": worker_name,
-                                "pane_alive": self.pane_alive,
-                                "lifecycle_status": "ACTIVE",
-                            }
-                        ],
+                        "workers": (
+                            [
+                                {
+                                    "name": worker_name,
+                                    "pane_alive": self.pane_alive,
+                                    "lifecycle_status": "ACTIVE",
+                                }
+                            ]
+                            if self.worker_present
+                            else []
+                        ),
                         "dead_workers": [],
                     },
                 },
@@ -204,6 +210,83 @@ def test_poll_workers_rejects_ambiguous_runtime_identity(tmp_path: Path) -> None
 
     with pytest.raises(HeartbeatError, match="ambiguous runtime agent identity"):
         _poll_workers(EffectClient(HeartbeatTransport()), (first, second))
+
+
+def test_missing_worker_row_is_persisted_but_not_failed(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    transport = HeartbeatTransport(worker_present=False)
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.status is SliceStatus.SPAWNED
+    assert observed.reconciliation == {
+        "confirmed_stage": "worker_row_missing",
+        "authoritative_evidence": [],
+        "missing_evidence": ["worker.row"],
+        "conflicts": [],
+        "next_action": "continue_observing",
+    }
+    assert [event.kind for event in result.events] == ["worker.missing"]
+    assert [name for name, _ in transport.calls] == ["poll_workers", "emit_controller_event"]
+
+
+def test_missing_worker_row_with_terminal_invocation_is_parked_once(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    invocation_dir = tmp_path / ".exo" / "agents" / "agent-slice-a"
+    invocation_dir.mkdir(parents=True)
+    (invocation_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": "inv-1",
+                "runtime": "opencode",
+                "trigger": "spawn",
+                "started_at": 1,
+                "ended_at": 2,
+                "status": "killed",
+                "exit_code": None,
+                "generation": 3,
+                "runtime_agent_id": "agent-slice-a",
+                "slice_id": "slice-a",
+                "branch": "main.slice-a",
+                "worktree": ".exo/worktrees/agent-slice-a",
+                "exit_reason": "tmux_target_exited_without_exit_marker",
+                "exit_classification": "missing_exit_marker",
+                "stderr_tail": "worker crashed",
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = HeartbeatTransport(worker_present=False)
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+    )
+
+    parked = result.state.slices["slice-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.STALL_DETECTED
+    assert result.parked_slice_ids == ("slice-a",)
+    assert result.events[0].kind == "worker.terminal_reconciled"
+    assert result.events[0].payload["generation"] == 3
+    assert result.events[0].payload["stderr_tail"] == "worker crashed"
+    event_calls = [
+        arguments
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "worker.terminal_reconciled"
+    ]
+    assert len(event_calls) == 1
 
 
 def _state(
