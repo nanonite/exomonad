@@ -8,6 +8,7 @@ use exomonad_core::Role;
 pub const REVIEWER_MAX_ROUNDS_ENV: &str = "EXOMONAD_REVIEWER_MAX_ROUNDS";
 pub const REVIEWER_MODEL_ENV: &str = "EXOMONAD_REVIEWER_MODEL";
 pub const REVIEWER_EFFORT_ENV: &str = "EXOMONAD_REVIEWER_EFFORT_LEVEL";
+pub const TL_PREFLIGHT_RUNTIME_PATHS_ENV: &str = "EXOMONAD_TL_PREFLIGHT_RUNTIME_PATHS";
 pub const DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS: f64 = 10.0;
 pub const DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS: f64 = 30.0;
 pub const DEFAULT_TL_TASK_TIMEOUT_SECONDS: f64 = 3600.0;
@@ -33,6 +34,21 @@ fn require_positive_timeout(name: &str, value: f64) -> Result<()> {
 fn require_task_timeout(name: &str, value: f64) -> Result<()> {
     if value.is_nan() || value < 0.0 {
         anyhow::bail!("{name} must be zero or greater");
+    }
+    Ok(())
+}
+
+fn validate_preflight_runtime_paths(paths: &[String]) -> Result<()> {
+    for path in paths {
+        let trimmed = path.trim().trim_start_matches("./");
+        if trimmed.is_empty()
+            || trimmed.starts_with('/')
+            || trimmed.split('/').any(|component| component == "..")
+        {
+            anyhow::bail!(
+                "tl_preflight_runtime_paths entries must be non-empty relative paths without '..': {path:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -277,6 +293,10 @@ pub struct RawConfig {
     /// Project default per-task ceiling in seconds (default: 3600; zero disables).
     pub tl_task_timeout_seconds: Option<f64>,
 
+    /// Additional relative runtime paths ignored by TL spawn preflight.
+    /// Built-in ExoMonad paths are always excluded; local role config overrides project config.
+    pub tl_preflight_runtime_paths: Option<Vec<String>>,
+
     /// OpenRouter routing configuration.
     #[serde(default)]
     pub openrouter: Option<OpenRouterConfig>,
@@ -372,6 +392,9 @@ pub struct Config {
 
     /// Project default per-task ceiling in seconds; zero means no ceiling.
     pub tl_task_timeout_seconds: f64,
+
+    /// Additional relative runtime paths ignored by TL spawn preflight.
+    pub tl_preflight_runtime_paths: Vec<String>,
 
     /// OpenRouter routing configuration.
     pub openrouter: OpenRouterConfig,
@@ -572,6 +595,12 @@ impl Config {
             .or(global_raw.tl_task_timeout_seconds)
             .unwrap_or(DEFAULT_TL_TASK_TIMEOUT_SECONDS);
 
+        let tl_preflight_runtime_paths = local_raw
+            .tl_preflight_runtime_paths
+            .or(global_raw.tl_preflight_runtime_paths)
+            .unwrap_or_default();
+        validate_preflight_runtime_paths(&tl_preflight_runtime_paths)?;
+
         for (name, value) in [
             ("tl_transport_timeout_seconds", tl_transport_timeout_seconds),
             (
@@ -672,6 +701,7 @@ impl Config {
             tl_transport_timeout_seconds,
             tl_active_tail_timeout_seconds,
             tl_task_timeout_seconds,
+            tl_preflight_runtime_paths,
             openrouter,
             opencode,
             opencode_as_tl,
@@ -726,6 +756,7 @@ impl Default for Config {
             tl_transport_timeout_seconds: DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
             tl_active_tail_timeout_seconds: DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS,
             tl_task_timeout_seconds: DEFAULT_TL_TASK_TIMEOUT_SECONDS,
+            tl_preflight_runtime_paths: Vec::new(),
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
             opencode_as_tl: false,
@@ -905,6 +936,29 @@ mod tests {
         assert_eq!(raw.tl_transport_timeout_seconds, Some(45.5));
         assert_eq!(raw.tl_active_tail_timeout_seconds, Some(60.0));
         assert_eq!(raw.tl_task_timeout_seconds, Some(90.0));
+    }
+
+    #[test]
+    fn test_raw_config_parse_tl_preflight_runtime_paths() {
+        let content = r#"
+              tl_preflight_runtime_paths = [".cache/tool/", "runtime/state"]
+          "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(
+            raw.tl_preflight_runtime_paths,
+            Some(vec![
+                ".cache/tool/".to_string(),
+                "runtime/state".to_string()
+            ])
+        );
+        validate_preflight_runtime_paths(raw.tl_preflight_runtime_paths.as_ref().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_preflight_runtime_paths_reject_absolute_and_parent_paths() {
+        assert!(validate_preflight_runtime_paths(&["/tmp/runtime".to_string()]).is_err());
+        assert!(validate_preflight_runtime_paths(&["runtime/../source".to_string()]).is_err());
+        assert!(validate_preflight_runtime_paths(&[" ".to_string()]).is_err());
     }
 
     #[test]

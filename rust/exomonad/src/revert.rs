@@ -222,6 +222,7 @@ mod tests {
             tl_transport_timeout_seconds: DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
             tl_active_tail_timeout_seconds: DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS,
             tl_task_timeout_seconds: DEFAULT_TL_TASK_TIMEOUT_SECONDS,
+            tl_preflight_runtime_paths: Vec::new(),
             openrouter: Default::default(),
             opencode: Default::default(),
             opencode_as_tl: false,

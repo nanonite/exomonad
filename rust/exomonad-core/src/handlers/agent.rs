@@ -321,8 +321,23 @@ impl<
         let mut failures = Vec::new();
 
         match spawn_dirty_worktree_entries(&ctx.working_dir).await {
-            Ok(entries) if entries.is_empty() => {}
-            Ok(entries) => failures.push(dirty_worktree_message(&entries)),
+            Ok(report) => {
+                if !report.excluded.is_empty() {
+                    warn!(
+                        branch = %ctx.birth_branch,
+                        excluded = ?report.excluded,
+                        exclusions = ?report.exclusions,
+                        "tracked ExoMonad runtime state is ignored by TL preflight; keep the runtime paths out of source control and track the JSON mirror where applicable"
+                    );
+                }
+                if !report.blocking.is_empty() {
+                    failures.push(dirty_worktree_message(&report.blocking));
+                    failures.push(format!(
+                        "TL preflight runtime exclusions (built-in plus configured): {}",
+                        report.exclusions.join(", ")
+                    ));
+                }
+            }
             Err(message) => failures.push(format!("worktree check failed: {message}")),
         }
 
@@ -477,6 +492,74 @@ async fn dirty_worktree_entries(project_dir: &Path) -> Result<Vec<String>, Strin
     Ok(parse_git_status_paths(&output.stdout))
 }
 
+const BUILTIN_TL_PREFLIGHT_RUNTIME_PATHS: &[&str] = &[
+    ".chainlink/",
+    ".exo/",
+    ".claude/settings.local.json",
+    ".codex/",
+    ".opencode/",
+    "opencode.json",
+];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SpawnPreflightReport {
+    blocking: Vec<String>,
+    excluded: Vec<String>,
+    exclusions: Vec<String>,
+}
+
+fn normalize_runtime_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_start_matches("./").trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.split('/').any(|component| component == "..")
+    {
+        return None;
+    }
+    Some(format!("{trimmed}/"))
+}
+
+fn tl_preflight_runtime_paths() -> Vec<String> {
+    let mut paths = BUILTIN_TL_PREFLIGHT_RUNTIME_PATHS
+        .iter()
+        .filter_map(|path| normalize_runtime_path(path))
+        .collect::<Vec<_>>();
+    if let Ok(configured) = std::env::var("EXOMONAD_TL_PREFLIGHT_RUNTIME_PATHS") {
+        for path in configured.split(',').filter_map(normalize_runtime_path) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn runtime_path_is_excluded(path: &str, exclusions: &[String]) -> bool {
+    let normalized = path.strip_prefix("./").unwrap_or(path);
+    exclusions.iter().any(|rule| {
+        let prefix = rule.trim_end_matches('/');
+        normalized == prefix || normalized.starts_with(rule)
+    })
+}
+
+fn classify_spawn_preflight_entries(
+    entries: Vec<String>,
+    exclusions: Vec<String>,
+) -> SpawnPreflightReport {
+    let mut report = SpawnPreflightReport {
+        exclusions,
+        ..SpawnPreflightReport::default()
+    };
+    for entry in entries {
+        if runtime_path_is_excluded(&entry, &report.exclusions) {
+            report.excluded.push(entry);
+        } else {
+            report.blocking.push(entry);
+        }
+    }
+    report
+}
+
 fn parse_git_status_paths(stdout: &[u8]) -> Vec<String> {
     let records: Vec<&[u8]> = stdout
         .split(|byte| *byte == 0)
@@ -501,15 +584,12 @@ fn parse_git_status_paths(stdout: &[u8]) -> Vec<String> {
     paths
 }
 
-async fn spawn_dirty_worktree_entries(project_dir: &Path) -> Result<Vec<String>, String> {
+async fn spawn_dirty_worktree_entries(project_dir: &Path) -> Result<SpawnPreflightReport, String> {
     let entries = dirty_worktree_entries(project_dir).await?;
-    Ok(entries
-        .into_iter()
-        .filter(|path| {
-            let normalized = path.strip_prefix("./").unwrap_or(path);
-            normalized != ".exo/tl-loop" && !normalized.starts_with(".exo/tl-loop/")
-        })
-        .collect())
+    Ok(classify_spawn_preflight_entries(
+        entries,
+        tl_preflight_runtime_paths(),
+    ))
 }
 
 struct VerifiedOrphan {
@@ -4082,6 +4162,44 @@ mod tests {
         let services = Arc::new(crate::services::Services::test());
         let service = Arc::new(AgentControlService::new(services.clone()));
         AgentHandler::new(service, services)
+    }
+
+    #[test]
+    fn tl_spawn_preflight_excludes_runtime_state_but_blocks_source_changes() {
+        let report = classify_spawn_preflight_entries(
+            vec![
+                ".chainlink/issues.db".to_string(),
+                ".exo/tl-loop/root/run.json".to_string(),
+                "src/lib.rs".to_string(),
+            ],
+            vec![".chainlink/".to_string(), ".exo/".to_string()],
+        );
+
+        assert_eq!(
+            report.excluded,
+            vec![
+                ".chainlink/issues.db".to_string(),
+                ".exo/tl-loop/root/run.json".to_string()
+            ]
+        );
+        assert_eq!(report.blocking, vec!["src/lib.rs"]);
+        let message = dirty_worktree_message(&report.blocking);
+        assert!(message.contains("src/lib.rs"));
+        assert!(!message.contains("issues.db"));
+    }
+
+    #[test]
+    fn tl_spawn_preflight_runtime_paths_are_normalized_and_fail_closed() {
+        assert_eq!(
+            normalize_runtime_path(" ./runtime/state/ "),
+            Some("runtime/state/".to_string())
+        );
+        assert!(normalize_runtime_path("/absolute/path").is_none());
+        assert!(normalize_runtime_path("runtime/../source").is_none());
+        assert!(runtime_path_is_excluded(
+            "./runtime/state/record.json",
+            &["runtime/state/".to_string()]
+        ));
     }
 
     #[tokio::test]

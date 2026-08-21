@@ -2,7 +2,7 @@ use crate::uds_client;
 use anyhow::{Context, Result};
 use exomonad::config::{
     Config, EffortLevel, ResolvedEffort, REVIEWER_EFFORT_ENV, REVIEWER_MAX_ROUNDS_ENV,
-    REVIEWER_MODEL_ENV,
+    REVIEWER_MODEL_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV,
 };
 use exomonad_core::services::AgentType;
 use serde_json::Value;
@@ -1681,6 +1681,8 @@ pub async fn run(
 
     // Resolve config
     let mut config = Config::discover()?;
+    let runtime_paths = config.tl_preflight_runtime_paths.join(",");
+    std::env::set_var(TL_PREFLIGHT_RUNTIME_PATHS_ENV, &runtime_paths);
     ensure_harness_capability(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
     write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
@@ -2155,6 +2157,16 @@ pub async fn run(
             &session,
             "EXOMONAD_MAILBOX_PROTOCOL_AVAILABLE",
             mailbox_protocol_available,
+        ])
+        .status();
+
+    let _ = std::process::Command::new("tmux")
+        .args([
+            "set-environment",
+            "-t",
+            &session,
+            TL_PREFLIGHT_RUNTIME_PATHS_ENV,
+            &runtime_paths,
         ])
         .status();
 
@@ -2830,7 +2842,7 @@ pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
         ".claude/settings.local.json",
         ".opencode/",
         "opencode.json",
-        ".chainlink/",
+        ".chainlink/issues.db",
     ]
     .into_iter()
     .filter(|line| !has_line(line))
@@ -3473,7 +3485,7 @@ mod tests {
             ".claude/settings.local.json",
             ".opencode/",
             "opencode.json",
-            ".chainlink/",
+            ".chainlink/issues.db",
         ] {
             assert!(
                 content.lines().any(|line| line.trim() == expected),

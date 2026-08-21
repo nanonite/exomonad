@@ -266,9 +266,10 @@ tl_effort_level = "medium"   # legacy compatibility; not used by the controller
 worker_effort_level = "medium"
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
 # TL loop operational timeouts (seconds). Lifecycle progress is driven by authoritative events.
-tl_transport_timeout_seconds = 10.0           # UDS RPC timeout to the local server (default: 10)
-tl_active_tail_timeout_seconds = 30.0         # ledger tailer active-tail timeout (default: 30)
-tl_task_timeout_seconds = 3600.0              # project task ceiling; 0 disables enforcement
+  tl_transport_timeout_seconds = 10.0           # UDS RPC timeout to the local server (default: 10)
+  tl_active_tail_timeout_seconds = 30.0         # ledger tailer active-tail timeout (default: 30)
+  tl_task_timeout_seconds = 3600.0              # project task ceiling; 0 disables enforcement
+  tl_preflight_runtime_paths = [".my-tool/runtime/"] # extra relative runtime paths ignored by spawn preflight
 forgejo_url = "http://localhost:3000"           # optional — Forgejo base URL
 forgejo_token = "forgejo_pat"                      # optional — Forgejo API token
 forgejo_webhook_secret = "shared-secret"           # optional — webhook signature secret
@@ -341,7 +342,18 @@ automatically. Omit the flag to keep today's auto-detect behavior.
 - `config.toml` uses `default_role` (project-wide default)
 - `config.local.toml` uses `role` (worktree-specific override)
 - Resolution: `local.role > global.default_role`
-- WASM: `wasm_dir` in config > `.exo/wasm/` (project-local)
+  - WASM: `wasm_dir` in config > `.exo/wasm/` (project-local)
+
+**TL spawn preflight and Chainlink state:** ExoMonad-owned runtime paths are
+excluded from the source-cleanliness check: `.chainlink/`, `.exo/`, and the
+generated harness state paths. The optional `tl_preflight_runtime_paths` list
+adds project-specific relative runtime directories; `config.local.toml`
+overrides the project list for a role worktree. The effective rules are passed
+to the controller and printed in any preflight failure. Keep
+`.chainlink/issues.db` ignored and track a JSON mirror (for example
+`.chainlink/issues.json`) when reviewable issue state is needed. Source edits
+remain blocking; do not use `EXOMONAD_TL_PREFLIGHT_ACK=1` as a substitute for
+the ignore rule.
 
 **Hook configuration** is auto-generated in two places:
 - **`exomonad init`**: Writes `.claude/settings.local.json` with hooks for workers and companions; the root TL controller is not an interactive harness session

@@ -42,6 +42,23 @@ exomonad init --set-git-remote <name>           # in the migrated one
 Git worktrees share the main repo's `.git/config`, so this applies to every
 spawned agent automatically.
 
+### Keep Chainlink runtime state out of the worktree diff
+
+The Chainlink SQLite database is ExoMonad runtime state, not a source artifact.
+Ensure the project ignores it:
+
+```gitignore
+.chainlink/issues.db
+```
+
+If the issue snapshot should be reviewable, export and track a JSON mirror such
+as `.chainlink/issues.json`; do not track the SQLite database. TL spawn
+preflight always excludes ExoMonad-owned runtime paths (`.chainlink/`, `.exo/`,
+and generated harness state) while still blocking source edits. Projects with
+additional runtime directories can set `tl_preflight_runtime_paths` in
+`.exo/config.toml`; `config.local.toml` overrides that list for a role-specific
+worktree. `exomonad new` scaffolds the database ignore rule for new projects.
+
 Verify before going further. CI status is what gates every merge:
 
 ```bash
