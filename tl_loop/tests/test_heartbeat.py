@@ -237,7 +237,7 @@ def test_missing_worker_row_is_persisted_but_not_failed(tmp_path: Path) -> None:
     assert [name for name, _ in transport.calls] == ["poll_workers", "emit_controller_event"]
 
 
-def test_missing_worker_row_with_terminal_invocation_is_parked_once(tmp_path: Path) -> None:
+def test_missing_worker_row_after_invocation_finished_is_parked_once(tmp_path: Path) -> None:
     store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
     invocation_dir = tmp_path / ".exo" / "agents" / "agent-slice-a"
     invocation_dir.mkdir(parents=True)

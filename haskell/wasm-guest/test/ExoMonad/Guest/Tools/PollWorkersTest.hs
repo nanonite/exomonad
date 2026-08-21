@@ -5,9 +5,9 @@ module ExoMonad.Guest.Tools.PollWorkersTest (pollWorkersTests) where
 import Data.Aeson (Value, object, (.=))
 import Data.Text (Text)
 import Data.Text qualified as T
-import ExoMonad.Guest.Tools.PollWorkers (pollWorkersNote, renderWorkersTable)
+import ExoMonad.Guest.Tools.PollWorkers (filterSelectedNames, pollWorkersNote, renderWorkersTable)
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (assertBool, testCase)
+import Test.Tasty.HUnit (assertBool, assertEqual, testCase)
 
 pollWorkersTests :: TestTree
 pollWorkersTests =
@@ -26,6 +26,12 @@ pollWorkersTests =
         let table = renderWorkersTable [missingLifecycleRow]
         assertDoesNotContain "  LIVE" table
         assertDoesNotContain "  DEAD" table
+      , testCase "runtime identity is selected without slice-name suffix guessing" $ do
+        let available = ["tunable-operator-body-opencode", "other-opencode"]
+        assertEqual
+          "canonical runtime identity selection"
+          ["tunable-operator-body-opencode"]
+          (filterSelectedNames (Just ["tunable-operator-body-opencode"]) available)
     ]
 
 retiredWindowRow :: Value

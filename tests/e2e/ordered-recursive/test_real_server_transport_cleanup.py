@@ -102,6 +102,70 @@ def test_recovery_action_journal_rejects_unresolved_or_duplicate_keys(tmp_path: 
         harness.assert_action_journal_converged(path)
 
 
+def test_real_server_mismatched_runtime_name_retains_terminal_exit_context(tmp_path: Path) -> None:
+    """Production-shaped fixture for a slice slug and suffixed runtime owner.
+
+    The server writes the terminal invocation record under the runtime agent
+    directory; the slice's worktree remains available for later reconciliation.
+    """
+    runtime_name = "tunable-operator-body-opencode"
+    slice_id = "tunable-operator-body"
+    repo = tmp_path / "repo"
+    agent_dir = repo / ".exo" / "agents" / runtime_name
+    worktree = repo / ".exo" / "worktrees" / runtime_name
+    agent_dir.mkdir(parents=True)
+    worktree.mkdir(parents=True)
+    (agent_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": "inv-mismatch-1",
+                "runtime": "opencode",
+                "trigger": "spawn",
+                "started_at": 1,
+                "ended_at": 2,
+                "status": "killed",
+                "exit_code": None,
+                "generation": 4,
+                "runtime_agent_id": runtime_name,
+                "slice_id": slice_id,
+                "branch": "main.tunable-operator-body",
+                "worktree": str(worktree),
+                "exit_reason": "tmux_target_exited_without_exit_marker",
+                "exit_classification": "missing_exit_marker",
+                "stderr_tail": "opencode exited before writing exit marker",
+            }
+        ),
+        encoding="utf-8",
+    )
+    segments = repo / ".exo" / "ledger" / "segments"
+    segments.mkdir(parents=True)
+    (segments / "0001.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "agent.invocation.finished",
+                "agent_id": runtime_name,
+                "data": {
+                    "invocation_id": "inv-mismatch-1",
+                    "runtime_agent_id": runtime_name,
+                    "slice_id": slice_id,
+                    "generation": 4,
+                    "exit_classification": "missing_exit_marker",
+                    "stderr_tail": "opencode exited before writing exit marker",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    events = harness.server_ledger_events(repo)
+    finished = next(event for event in events if event["type"] == "agent.invocation.finished")
+    assert finished["agent_id"] == runtime_name
+    assert finished["data"]["slice_id"] == slice_id
+    assert finished["data"]["exit_classification"] == "missing_exit_marker"
+    assert worktree.is_dir(), "recovery must preserve the worktree before reconciliation"
+
+
 def test_routing_cleanup_attempts_every_owned_worker_after_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

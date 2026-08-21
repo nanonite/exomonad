@@ -9,6 +9,7 @@ module ExoMonad.Guest.Tools.PollWorkers
     pollWorkersDescription,
     pollWorkersSchema,
     pollWorkersCore,
+    filterSelectedNames,
     renderWorkersTable,
     pollWorkersNote,
   )
@@ -155,7 +156,13 @@ chainlinkSessionState activeSessionIssue maybeIssue maybeIssueStatus maybeIssueE
 
 filterSelected :: Maybe [Text] -> [PS.AgentStatus] -> [PS.AgentStatus]
 filterSelected Nothing agents = agents
-filterSelected (Just names) agents = filter ((`elem` nub names) . strictField PS.agentStatusName) agents
+filterSelected names agents =
+  let selected = filterSelectedNames names (map (strictField PS.agentStatusName) agents)
+   in filter ((`elem` selected) . strictField PS.agentStatusName) agents
+
+filterSelectedNames :: Maybe [Text] -> [Text] -> [Text]
+filterSelectedNames Nothing names = names
+filterSelectedNames (Just names) available = filter (`elem` nub names) available
 
 renderWorkersTable :: [Value] -> Text
 renderWorkersTable rows =
