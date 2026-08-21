@@ -3115,6 +3115,15 @@ mod tests {
 
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
         assert!(!root_tl_needs_resume(dir.path()).unwrap());
+
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_failed"}}"#).unwrap();
+        assert!(!root_tl_needs_resume(dir.path()).unwrap());
+
+        std::fs::write(root.join("run.json"), r#"{"phase":"done"}"#).unwrap();
+        assert!(!root_tl_needs_resume(dir.path()).unwrap());
+
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_waiting"}}"#).unwrap();
+        assert!(root_tl_needs_resume(dir.path()).unwrap());
     }
 
     #[test]
