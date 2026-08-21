@@ -359,6 +359,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- init startup liveness gate reports a parked controller as a startup crash (#929)
 - Update README onboarding for the current TL workflow (#861)
 - E19 :: E19.4 Watch-mode tests (#842)
 - E19 :: E19.3 Degrade gracefully with no state (#841)
