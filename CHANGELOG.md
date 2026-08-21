@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Require explicit project roots for heartbeat reconciliation (#924)
 - Make TL lifecycle side effects crash-idempotent (#905)
 - Fix poll_workers filtering for runtime agent identities (#919)
 - Persist complete invocation-exit context for liveness recovery (#921)
