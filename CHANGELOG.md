@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Make TL lifecycle side effects crash-idempotent (#905)
 - Fix poll_workers filtering for runtime agent identities (#919)
 - Persist complete invocation-exit context for liveness recovery (#921)
 - Fix terminal invocation evidence parsing and park classification (#923)
