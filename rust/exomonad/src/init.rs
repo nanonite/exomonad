@@ -1082,12 +1082,22 @@ fn root_tl_needs_resume(project_dir: &Path) -> Result<bool> {
         .with_context(|| format!("invalid TL checkpoint {}", run_path.display()))?;
     let phase = value
         .pointer("/fsm/phase")
-        .or_else(|| value.get("phase"))
-        .and_then(Value::as_str);
-    Ok(!matches!(
-        phase,
-        Some("tl_done" | "tl_failed" | "done" | "failed")
-    ))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported TL checkpoint {}: missing string /fsm/phase",
+                run_path.display()
+            )
+        })?;
+    match phase {
+        "tl_done" | "tl_failed" => Ok(false),
+        "tl_planning" | "tl_dispatching" | "tl_waiting" | "tl_merging" | "tl_all_merged"
+        | "tl_pr_filed" => Ok(true),
+        other => Err(anyhow::anyhow!(
+            "unsupported TL checkpoint {}: unknown phase '{other}'",
+            run_path.display()
+        )),
+    }
 }
 
 fn archive_controller_exit_reason(project_dir: &Path) -> Result<Option<PathBuf>> {
@@ -3127,7 +3137,8 @@ mod tests {
         assert!(!root_tl_needs_resume(dir.path()).unwrap());
 
         std::fs::write(root.join("run.json"), r#"{"phase":"done"}"#).unwrap();
-        assert!(!root_tl_needs_resume(dir.path()).unwrap());
+        let error = root_tl_needs_resume(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("unsupported TL checkpoint"));
 
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_waiting"}}"#).unwrap();
         assert!(root_tl_needs_resume(dir.path()).unwrap());
