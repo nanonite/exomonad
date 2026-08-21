@@ -12,8 +12,8 @@ mod spawn;
 
 pub use invocation::{
     finish_invocation, finish_invocation_and_tombstone,
-    finish_invocation_and_tombstone_with_context, finish_invocation_with_context, read_invocation,
-    read_invocation_conservatively, start_invocation, start_invocation_with_provenance,
+    finish_invocation_and_tombstone_with_context, read_invocation, read_invocation_conservatively,
+    start_invocation, start_invocation_with_provenance,
     start_invocation_with_provenance_and_context, InvocationExitContext, InvocationFinishResult,
     InvocationIdentityContext, InvocationMetadata, InvocationRecord, InvocationStatus,
     InvocationTrigger, INVOCATION_FILENAME,
@@ -63,13 +63,22 @@ async fn read_invocation_stderr_tail(agent_dir: &Path) -> Option<String> {
         if bytes.is_empty() {
             continue;
         }
-        let start = bytes.len().saturating_sub(MAX_INVOCATION_STDERR_TAIL_BYTES);
-        let tail = String::from_utf8_lossy(&bytes[start..]).trim().to_string();
+        let tail = bounded_stderr_tail(&bytes);
         if !tail.is_empty() {
             return Some(tail);
         }
     }
     None
+}
+
+fn bounded_stderr_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let minimum_start = text.len().saturating_sub(MAX_INVOCATION_STDERR_TAIL_BYTES);
+    let start = text
+        .char_indices()
+        .find_map(|(index, _)| (index >= minimum_start).then_some(index))
+        .unwrap_or(0);
+    text[start..].trim().to_string()
 }
 
 /// Push the parent branch to the remote so child PRs can reference it as
@@ -1618,6 +1627,18 @@ mod tests {
     #[test]
     fn test_agent_type_default() {
         assert_eq!(AgentType::default(), AgentType::Codex);
+    }
+
+    #[test]
+    fn stderr_tail_is_utf8_safe_and_byte_bounded() {
+        let mut bytes = vec![b'x'; MAX_INVOCATION_STDERR_TAIL_BYTES + 8];
+        bytes.extend_from_slice("é最後".as_bytes());
+
+        let tail = bounded_stderr_tail(&bytes);
+
+        assert!(tail.len() <= MAX_INVOCATION_STDERR_TAIL_BYTES);
+        assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
+        assert!(tail.ends_with("é最後"));
     }
 
     #[test]

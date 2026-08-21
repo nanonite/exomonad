@@ -394,7 +394,7 @@ pub async fn finish_invocation(
     .await
 }
 
-pub async fn finish_invocation_with_context(
+pub(crate) async fn finish_invocation_with_context(
     agent_dir: &Path,
     invocation_id: &str,
     status: InvocationStatus,
