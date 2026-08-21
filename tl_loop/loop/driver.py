@@ -103,7 +103,6 @@ from .reconcile import ReconciliationResult, reconcile_slice
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
 LOGGER = logging.getLogger(__name__)
-TIMEOUT_GATE_NAME = "tl-timeout"
 DISPATCH_TIMEOUT_GATE_NAME = "tl-dispatch-timeout"
 DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
@@ -266,15 +265,6 @@ class DispatchAttempt:
     model: str | None = None
 
 
-@dataclass(frozen=True)
-class LoopDeadline:
-    """Effective deadline and the budget that selected it."""
-
-    at: float
-    reason: str
-    timeout_seconds: float
-
-
 @dataclass
 class EventDiagnostics:
     """Counters explaining what the controller did with projected events."""
@@ -310,9 +300,7 @@ class EventDiagnostics:
                 self.received += 1
                 self.filtered += 1
 
-    def record_unresolved_event(
-        self, event: EventEnvelope, resolution: IdentityResolution
-    ) -> None:
+    def record_unresolved_event(self, event: EventEnvelope, resolution: IdentityResolution) -> None:
         """Record a valid observation retained until ownership is proven."""
         key = (event.run_seq or 0, event.event_type)
         if key in self.unresolved_event_keys:
@@ -540,8 +528,6 @@ class TLLoopConfig:
             raise ValueError("poll_interval must be non-negative")
         if self.heartbeat is not None and self.project_root is None:
             raise ValueError("project_root is required when heartbeat reconciliation is enabled")
-        if self.idle_timeout <= 0:
-            raise ValueError("idle_timeout must be positive")
         if type(self.keep_alive_on_waiting) is not bool:
             raise ValueError("keep_alive_on_waiting must be a boolean")
         if self.dispatch_timeout <= 0:
@@ -795,8 +781,6 @@ def _run_loop(
             diagnostics=diagnostics.snapshot(),
         )
 
-    deadline = _next_loop_deadline(state, config)
-
     while not config.test_harness or len(consumed) < config.max_events:
         if isinstance(phase, (TLDone, TLFailed)):
             break
@@ -810,7 +794,7 @@ def _run_loop(
             replaying = True
         else:
             try:
-                event = _next_event(source, config, deadline)
+                event = _next_event(source, config)
             except LoopTimeout as error:
                 _record_reader_findings(source, diagnostics)
                 if _has_pending_dispatch(state):
@@ -826,7 +810,6 @@ def _run_loop(
                         error,
                         diagnostics,
                     )
-                deadline = _next_loop_deadline(state, config)
                 continue
         _record_reader_findings(source, diagnostics)
         if event is None:
@@ -865,17 +848,15 @@ def _run_loop(
                         _emit_phase_change(
                             run_id, before_phase, phase, config, effects, effects_log
                         )
-            if _sub_tls_waiting_for_integration(plan, state):
-                if not config.keep_alive_on_waiting:
-                    return TLRunResult(
-                        state,
-                        tuple(effects_log),
-                        tuple(transitions),
-                        tuple(consumed),
-                        tuple(heartbeat_events),
-                        diagnostics.snapshot(),
-                    )
-                deadline = _next_loop_deadline(state, config)
+            if _sub_tls_waiting_for_integration(plan, state) and not config.keep_alive_on_waiting:
+                return TLRunResult(
+                    state,
+                    tuple(effects_log),
+                    tuple(transitions),
+                    tuple(consumed),
+                    tuple(heartbeat_events),
+                    diagnostics.snapshot(),
+                )
             continue
         event_seq = event.run_seq
         if event_seq is None:
@@ -885,13 +866,10 @@ def _run_loop(
             diagnostics.received += 1
         diagnostics.last_event_seq = event_seq
         checkpoint_seq = max(event_seq, state.events.last_consumed_offset)
-        deadline = _next_loop_deadline(state, config)
         ledger_run_id = config.ledger_run_id or run_id
         if event.run_id not in {None, ledger_run_id}:
             diagnostics.filtered += 1
-            _checkpoint_and_ack(
-                store, source, event, state, phase, acknowledge=not replaying
-            )
+            _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
             if not replaying:
                 diagnostics.acknowledged += 1
             _release_replayed_event(store, event, replaying)
@@ -940,7 +918,6 @@ def _run_loop(
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
-                deadline = _next_loop_deadline(state, config)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
             if isinstance(phase, (TLDone, TLFailed)):
@@ -954,7 +931,6 @@ def _run_loop(
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
-                deadline = _next_loop_deadline(state, config)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
             if isinstance(phase, (TLDone, TLFailed)):
@@ -971,9 +947,7 @@ def _run_loop(
                     run_id,
                     event_seq,
                 )
-                _checkpoint_and_ack(
-                    store, source, event, state, phase, acknowledge=not replaying
-                )
+                _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
                 if not replaying:
                     diagnostics.acknowledged += 1
                 state = store.load()
@@ -1042,9 +1016,7 @@ def _run_loop(
             raise TLLoopError(str(error)) from error
         if _duplicate_event(phase, fsm_event, state):
             diagnostics.filtered += 1
-            _checkpoint_and_ack(
-                store, source, event, state, phase, acknowledge=not replaying
-            )
+            _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
             if not replaying:
                 diagnostics.acknowledged += 1
             state = store.load()
@@ -1100,7 +1072,6 @@ def _run_loop(
             )
         previous_state = state
         state = store.checkpoint(next_phase, next_slices, state.budgets, checkpoint_seq)
-        deadline = _next_loop_deadline(state, config)
         _emit_slice_status_changes(
             previous_state.slices,
             next_slices,
@@ -1168,79 +1139,8 @@ def _run_loop(
     )
 
 
-def _park_timeout(
-    run_id: str,
-    store: RunStore,
-    state: RunState,
-    effects: EffectClient | ReadOnlyEffectClient,
-    config: TLLoopConfig,
-    effects_log: list[EffectIntent],
-    transitions: list[LoopTransition],
-    consumed: list[int],
-    reason: str | LoopTimeout,
-    diagnostics: EventDiagnostics,
-) -> TLRunResult:
-    """Persist a named timeout gate before returning a terminal failed run."""
-    before_phase = _phase_from_state(state)
-    previous_gate = next(
-        (gate for gate in state.gates if gate.name == TIMEOUT_GATE_NAME),
-        None,
-    )
-    state = store.set_gate(TIMEOUT_GATE_NAME, GateStatus.PENDING)
-    if previous_gate is None or previous_gate.status is not GateStatus.PENDING:
-        _record_controller_event(
-            "controller",
-            "tl.gate_opened",
-            {"gate_name": TIMEOUT_GATE_NAME, "run_id": run_id},
-            config,
-            effects,
-            effects_log,
-        )
-    timeout_reason = _diagnostic_timeout_reason(reason, diagnostics)
-    message = f"timeout parked at gate {TIMEOUT_GATE_NAME!r}: {timeout_reason}"
-    state = store.checkpoint(
-        TLFailed(message),
-        state.slices,
-        state.budgets,
-        state.events.last_consumed_offset,
-    )
-    _emit_phase_change(
-        run_id,
-        before_phase,
-        _phase_from_state(state),
-        config,
-        effects,
-        effects_log,
-    )
-    LOGGER.warning("[TL loop] %s", message)
-    store.record_terminal_summary(
-        {
-            "reason": message,
-            "deadline_reason": getattr(reason, "deadline_reason", "idle"),
-            "timeout_seconds": getattr(reason, "timeout_seconds", None),
-            "diagnostics": diagnostics.snapshot(),
-        }
-    )
-    return TLRunResult(
-        state,
-        tuple(effects_log),
-        tuple(transitions),
-        tuple(consumed),
-        diagnostics=diagnostics.snapshot(),
-    )
-
-
 def _has_pending_dispatch(state: RunState) -> bool:
     return any(slice_state.status in DISPATCHING_STATUSES for slice_state in state.slices.values())
-
-
-def _diagnostic_timeout_reason(reason: str | LoopTimeout, diagnostics: EventDiagnostics) -> str:
-    if diagnostics.received == 0:
-        return str(reason)
-    return (
-        f"{reason}; consumed {diagnostics.received} event(s), filtered "
-        f"{diagnostics.filtered}, rejected {diagnostics.rejected} without a correlated event"
-    )
 
 
 def _record_reader_findings(source: EventQueue, diagnostics: EventDiagnostics) -> None:
@@ -1248,23 +1148,6 @@ def _record_reader_findings(source: EventQueue, diagnostics: EventDiagnostics) -
     findings = getattr(source, "findings", ())
     if findings:
         diagnostics.record_reader_findings(tuple(findings))
-
-
-def _next_loop_deadline(state: RunState, config: TLLoopConfig) -> LoopDeadline | None:
-    """Return no lifecycle deadline; evidence and cancellation drive progress."""
-    del state, config
-    return None
-
-
-def _next_waiting_deadline(config: TLLoopConfig) -> LoopDeadline:
-    """Use the liveness budget while review or CI is legally outstanding."""
-    timeout = (
-        config.heartbeat.stall_threshold_seconds
-        if config.heartbeat is not None
-        else config.controller_stall_timeout
-    )
-    reason = "stall" if config.heartbeat is not None else "waiting"
-    return LoopDeadline(time.monotonic() + timeout, reason, timeout)
 
 
 def _park_dispatch_timeout(
@@ -1573,9 +1456,7 @@ def _reconcile_action_journal(
                 gate_name,
             )
         elif gate.status is GateStatus.APPROVED:
-            effects_log.resolve_by_key(
-                key, status="compensated", compensation_attempt=attempt + 1
-            )
+            effects_log.resolve_by_key(key, status="compensated", compensation_attempt=attempt + 1)
         elif gate.status is GateStatus.REJECTED:
             effects_log.resolve_by_key(
                 key,
@@ -4671,9 +4552,7 @@ def _route_repair(
 def _repair_model(current: SliceState, config: TLLoopConfig) -> str | None:
     if config.requested_model:
         if config.catalog is not None and current.agent_type:
-            return select_model(
-                current.agent_type, config.catalog, config.requested_model
-            ).model_id
+            return select_model(current.agent_type, config.catalog, config.requested_model).model_id
         return config.requested_model
     if config.catalog is None or config.policy is None:
         return current.model
@@ -4832,9 +4711,7 @@ def _invoke(
             return result
         if status in {"intended", "unknown"}:
             key = prior.get("key", journal.key_for(intent))
-            gate_name = _action_journal_gate_name(
-                key, _action_journal_compensation_attempt(prior)
-            )
+            gate_name = _action_journal_gate_name(key, _action_journal_compensation_attempt(prior))
             raise TLLoopError(
                 f"lifecycle effect {operation} for {target!r} has unknown outcome "
                 f"and requires reconciliation before retry (key={key}); restart to "
@@ -4874,27 +4751,15 @@ def _invoke(
 def _next_event(
     source: EventQueue,
     config: TLLoopConfig,
-    deadline: LoopDeadline | None,
 ) -> EventEnvelope | None:
     if config.cancel_event is not None and config.cancel_event.is_set():
         raise LoopCancelled("TL controller cancellation requested")
-    if deadline is None:
-        remaining = config.poll_interval or 0.01
-    else:
-        remaining = deadline.at - time.monotonic()
-    if remaining <= 0 and deadline is not None:
-        raise LoopTimeout(
-            f"TL did not receive an event within {deadline.timeout_seconds:g}s "
-            f"(deadline={deadline.reason})",
-            reason=deadline.reason,
-            timeout_seconds=deadline.timeout_seconds,
-        )
-    timeout = min(config.poll_interval or 0.01, remaining)
+    timeout = config.poll_interval or 0.01
     try:
         return source.get(timeout=timeout)
     except queue_module.Empty:
         if config.poll_interval == 0:
-            time.sleep(min(0.01, remaining))
+            time.sleep(0.01)
         return None
 
 
@@ -5556,7 +5421,6 @@ def _optional_argument(arguments: dict[str, object], key: str, value: object) ->
 
 
 __all__ = [
-    "TIMEOUT_GATE_NAME",
     "DepthLimitExceeded",
     "EffectFailed",
     "EffectIntent",

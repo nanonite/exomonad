@@ -119,7 +119,12 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
     run.add_argument("--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID))
     run.add_argument("--max-events", type=_positive_int, default=DEFAULT_MAX_EVENTS)
-    run.add_argument("--idle-timeout", type=_positive_float, default=DEFAULT_IDLE_TIMEOUT)
+    run.add_argument(
+        "--idle-timeout",
+        type=_positive_float,
+        default=DEFAULT_IDLE_TIMEOUT,
+        help="legacy compatibility option; lifecycle progress has no idle deadline",
+    )
     run.add_argument("--transport-timeout", type=_positive_float, default=DEFAULT_TIMEOUT_SECONDS)
     run.add_argument(
         "--active-tail-timeout",
@@ -229,10 +234,10 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         heartbeat=HeartbeatConfig(),
         poll_interval=args.poll_interval,
         source=source,
-          effects=effects,
-          root_dir=state_root,
-          project_root=project_root,
-          run_id=run_id,
+        effects=effects,
+        root_dir=state_root,
+        project_root=project_root,
+        run_id=run_id,
         ledger_run_id=ledger_run_id,
         role="worker",
         review_policy_path=project_root / ".exo" / "review-policy.toml",

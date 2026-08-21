@@ -265,12 +265,12 @@ spawn_agent_type = "codex"   # default harness for workers, leaves, and companio
 tl_effort_level = "medium"   # legacy compatibility; not used by the controller
 worker_effort_level = "medium"
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
-# TL loop timeouts (seconds). Optional; raise on slower machines. Each must be > 0.
+# TL loop operational timeouts (seconds). Lifecycle progress is driven by authoritative events.
 tl_transport_timeout_seconds = 10.0           # UDS RPC timeout to the local server (default: 10)
 tl_active_tail_timeout_seconds = 30.0         # ledger tailer active-tail timeout (default: 30)
 tl_dispatch_timeout_seconds = 5.0             # spawn transport operation timeout (default: 5)
-tl_controller_stall_timeout_seconds = 300.0   # controller stall timeout (default: 300)
-tl_idle_timeout_seconds = 30.0                # controller idle timeout (default: 30)
+tl_controller_stall_timeout_seconds = 300.0   # retained compatibility setting (default: 300)
+tl_idle_timeout_seconds = 30.0                # legacy compatibility setting; no lifecycle deadline
 forgejo_url = "http://localhost:3000"           # optional — Forgejo base URL
 forgejo_token = "forgejo_pat"                      # optional — Forgejo API token
 forgejo_webhook_secret = "shared-secret"           # optional — webhook signature secret

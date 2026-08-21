@@ -40,7 +40,6 @@ from tl_loop.loop.driver import (
     _route_ci_event,
     _route_review_event,
     _run_sub_tl_batch,
-    _next_loop_deadline,
     _supervise_live_sub_tl,
     run_tl_loop,
     tl_run,
@@ -208,12 +207,6 @@ def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
     assert state is not None
     assert process.joins == [0.05, 0.05]
     assert not process.terminated
-
-
-def test_idle_timeout_never_creates_a_lifecycle_deadline() -> None:
-    state = SimpleNamespace()
-
-    assert _next_loop_deadline(state, TLLoopConfig(idle_timeout=0.001)) is None
 
 
 def test_recursive_tl_waiting_child_is_not_marked_failed(
