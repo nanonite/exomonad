@@ -359,6 +359,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- TL preflight blocks all spawning when ExoMonad's own Chainlink DB is tracked (#930)
 - init startup liveness gate reports a parked controller as a startup crash (#929)
 - Update README onboarding for the current TL workflow (#861)
 - E19 :: E19.4 Watch-mode tests (#842)
