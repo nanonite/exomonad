@@ -86,6 +86,7 @@ def heartbeat_once(
     config: HeartbeatConfig,
     *,
     now: float | None = None,
+    project_root: Path | str | None = None,
 ) -> HeartbeatResult:
     """Poll liveness and reconcile one idle wave through the durable store."""
     current_time = time.time() if now is None else now
@@ -123,7 +124,8 @@ def heartbeat_once(
     for slice_state in active:
         row = worker_rows.get(slice_state.id)
         if row is None:
-            terminal, evidence = _missing_worker_evidence(store.root_dir, slice_state)
+            evidence_root = store.root_dir if project_root is None else Path(project_root)
+            terminal, evidence = _missing_worker_evidence(evidence_root, slice_state)
             current = store.load()
             current_slice = current.slices[slice_state.id]
             reconciliation = _missing_worker_reconciliation(terminal)

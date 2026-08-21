@@ -492,6 +492,7 @@ class TLLoopConfig:
     source: EventQueue | None = None
     effects: EffectClient | ReadOnlyEffectClient | None = None
     root_dir: str | Path = DEFAULT_ROOT
+    project_root: str | Path | None = None
     run_id: str = "tl-run"
     ledger_run_id: str | None = None
     policy: HarnessPolicy | None = None
@@ -513,6 +514,8 @@ class TLLoopConfig:
     max_depth: int = 3
 
     def __post_init__(self) -> None:
+        if self.project_root is not None:
+            object.__setattr__(self, "project_root", Path(self.project_root))
         for name in (
             "max_workers",
             "max_leaves",
@@ -829,6 +832,7 @@ def _run_loop(
                     store,
                     effects,
                     config.heartbeat,
+                    project_root=config.project_root,
                 )
                 if heartbeat.fired:
                     before_phase = phase

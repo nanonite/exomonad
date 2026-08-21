@@ -289,6 +289,40 @@ def test_missing_worker_row_after_invocation_finished_is_parked_once(tmp_path: P
     assert len(event_calls) == 1
 
 
+def test_missing_worker_evidence_uses_project_root_not_tl_state_root(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    state_root = project_root / ".exo" / "tl-loop"
+    state_root.mkdir(parents=True)
+    store, state = _state(state_root, status="spawned", heartbeat_at=0.0)
+    invocation_dir = project_root / ".exo" / "agents" / "agent-slice-a"
+    invocation_dir.mkdir(parents=True)
+    (invocation_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": "inv-project-root",
+                "slice_id": "slice-a",
+                "status": "killed",
+                "ended_at": 2,
+                "exit_code": None,
+                "exit_classification": "missing_exit_marker",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(HeartbeatTransport(worker_present=False)),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=project_root,
+    )
+
+    assert result.state.slices["slice-a"].status is SliceStatus.PARKED
+    assert result.events[0].payload["invocation_id"] == "inv-project-root"
+
+
 def _state(
     tmp_path: Path,
     *,
