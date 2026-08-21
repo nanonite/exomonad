@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Reconcile nonterminal TL slices from authoritative state on startup (#904)
 - Fix reader.py tuple annotation and cached active_tail semantics (#928)
 - Cache terminal invocation evidence and strengthen lifecycle regression coverage (#926)
 - Remove obsolete TL idle timeout scaffolding and correct lifecycle documentation (#925)
