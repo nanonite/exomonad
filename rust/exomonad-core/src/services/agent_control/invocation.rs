@@ -284,6 +284,9 @@ pub async fn start_invocation_with_provenance(
     .await
 }
 
+// The explicit provenance fields mirror the invocation record and keep the
+// compatibility wrapper above source-compatible for existing callers.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_invocation_with_provenance_and_context(
     agent_dir: &Path,
     runtime: AgentType,
