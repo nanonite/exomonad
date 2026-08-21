@@ -40,6 +40,7 @@ class ParkCause(str, Enum):
     REVIEW_STUCK = "review_stuck"
     HARNESS_SWITCH_REQUESTED = "harness_switch_requested"
     STALL_DETECTED = "stall_detected"
+    WORKER_TERMINAL = "worker_terminal"
     DISPATCH_TIMEOUT = "dispatch_timeout"
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
     DISPATCH_FAILED = "dispatch_failed"

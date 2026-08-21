@@ -198,6 +198,32 @@ class LedgerReader:
         projected.sort(key=lambda event: cast(int, event.run_seq))
         return ReadResult(tuple(projected), status, tuple(findings), read_rows.active_tail)
 
+    def find_invocation_finished(
+        self,
+        runtime_agent_id: str,
+        slice_id: str,
+    ) -> Mapping[str, object] | None:
+        """Return the newest raw terminal invocation payload for one worker.
+
+        Invocation lifecycle rows are intentionally not projected into the TL
+        FSM event union, but they still use the reader's single JSONL parsing
+        and active-tail/error semantics.
+        """
+        match: Mapping[str, object] | None = None
+        for row in self._read_rows().rows:
+            if _raw_event_type(row.document) != "agent.invocation.finished":
+                continue
+            data = row.document.get("data")
+            if not isinstance(data, Mapping):
+                continue
+            recorded_slice = data.get("slice_id")
+            if isinstance(recorded_slice, str) and recorded_slice and recorded_slice != slice_id:
+                continue
+            if row.document.get("agent_id") != runtime_agent_id and recorded_slice != slice_id:
+                continue
+            match = data
+        return match
+
     def _in_scope(self, event: EventEnvelope) -> bool:
         """Keep one run and its directly owned child events in scope."""
         if self.ledger_run_id is not None and event.run_id != self.ledger_run_id:

@@ -12,6 +12,7 @@ from typing import TypeAlias
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
+from tl_loop.events.reader import LedgerReadError, LedgerReader
 from tl_loop.loop.escalate import park
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.state.schema import (
@@ -146,7 +147,7 @@ def heartbeat_once(
                 )
                 park(
                     current_slice,
-                    ParkCause.STALL_DETECTED,
+                    ParkCause.WORKER_TERMINAL,
                     store=store,
                     issue_creator=effects,
                     ledger=current.budgets,
@@ -439,32 +440,14 @@ def _read_terminal_invocation_event(
     runtime_agent_id: str,
     slice_id: str,
 ) -> JsonMapping | None:
-    segments = root_dir / ".exo/ledger/segments"
     try:
-        paths = sorted(path for path in segments.iterdir() if path.suffix == ".jsonl")
-    except OSError:
+        return LedgerReader(root_dir / ".exo/ledger/segments").find_invocation_finished(
+            runtime_agent_id,
+            slice_id,
+        )
+    except LedgerReadError as error:
+        LOGGER.warning("Unable to read terminal invocation evidence: %s", error)
         return None
-    match: JsonMapping | None = None
-    for path in paths:
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            try:
-                document = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(document, Mapping) or document.get("type") != "agent.invocation.finished":
-                continue
-            if document.get("agent_id") != runtime_agent_id:
-                data = document.get("data")
-                if not isinstance(data, Mapping) or data.get("slice_id") != slice_id:
-                    continue
-            data = document.get("data")
-            if isinstance(data, Mapping):
-                match = data
-    return match
 
 
 def _missing_worker_reconciliation(terminal: bool) -> dict[str, object]:

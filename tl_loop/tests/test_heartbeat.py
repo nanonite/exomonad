@@ -275,7 +275,7 @@ def test_missing_worker_row_after_invocation_finished_is_parked_once(tmp_path: P
 
     parked = result.state.slices["slice-a"]
     assert parked.status is SliceStatus.PARKED
-    assert parked.park_cause is ParkCause.STALL_DETECTED
+    assert parked.park_cause is ParkCause.WORKER_TERMINAL
     assert result.parked_slice_ids == ("slice-a",)
     assert result.events[0].kind == "worker.terminal_reconciled"
     assert result.events[0].payload["generation"] == 3

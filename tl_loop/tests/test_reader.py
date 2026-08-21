@@ -37,6 +37,33 @@ def test_replay_from_arbitrary_run_seq_returns_exact_cross_segment_suffix(tmp_pa
     assert result.sequence_status is SequenceStatus.COMPLETE
 
 
+def test_reader_finds_terminal_invocation_payload_with_shared_segment_parser(tmp_path: Path) -> None:
+    segments = tmp_path / "segments"
+    _write_segment(
+        segments,
+        1,
+        [
+            {
+                "type": "agent.invocation.finished",
+                "agent_id": "slice-a-opencode",
+                "data": {
+                    "slice_id": "slice-a",
+                    "invocation_id": "inv-1",
+                    "status": "exited",
+                },
+            }
+        ],
+    )
+
+    result = LedgerReader(segments).find_invocation_finished("slice-a-opencode", "slice-a")
+
+    assert result == {
+        "slice_id": "slice-a",
+        "invocation_id": "inv-1",
+        "status": "exited",
+    }
+
+
 def test_cursor_persists_and_resume_spans_segment_boundary(tmp_path: Path) -> None:
     events = _fixture_events()
     segments = tmp_path / "segments"
