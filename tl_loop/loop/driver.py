@@ -1560,6 +1560,59 @@ def _reconcile_nonterminal_slices(
             watcher,
             owner_id,
         )
+        if result.next_action in {"park_closed_unmerged_pr", "park_unreachable_pr_head"}:
+            if isinstance(effects, ReadOnlyEffectClient):
+                raise TLLoopError(
+                    f"reconciliation for {current.id!r} requires an active effect client to park"
+                )
+            cause = (
+                ParkCause.PR_CLOSED_UNMERGED
+                if result.next_action == "park_closed_unmerged_pr"
+                else ParkCause.PR_HEAD_UNREACHABLE
+            )
+            park_audit = {
+                "reconciliation": result.as_state(),
+                "pr_number": (
+                    current.pr_number
+                    or (watcher.get("pr_number") if watcher else None)
+                ),
+                "head_sha": _snapshot_text(watcher, "head_sha") if watcher else None,
+                "branch": _snapshot_text(watcher, "head_branch") if watcher else current.branch,
+                "observed_at": _now_timestamp(),
+                "observation_error": _snapshot_text(watcher, "evidence_error") if watcher else None,
+            }
+            if reconciled != current:
+                state = store.checkpoint(
+                    state.fsm,
+                    {**state.slices, current.id: reconciled},
+                    state.budgets,
+                    state.events.last_consumed_offset,
+                    current_order=state.current_order,
+                    ordered_stages=state.ordered_stages,
+                    integration=state.integration,
+                )
+            park(
+                state.slices[current.id],
+                cause,
+                store=store,
+                issue_creator=effects,
+                ledger=state.budgets,
+                audit=park_audit,
+            )
+            state = store.load()
+            parked_slice = replace(state.slices[current.id], reconciliation=result.as_state())
+            state = store.checkpoint(
+                state.fsm,
+                {**state.slices, current.id: parked_slice},
+                state.budgets,
+                state.events.last_consumed_offset,
+                current_order=state.current_order,
+                ordered_stages=state.ordered_stages,
+                integration=state.integration,
+            )
+            updated = dict(state.slices)
+            changed = False
+            continue
         claimed_pr_number = reconciled.pr_number
         if (
             config.enable_reviewer_spawn

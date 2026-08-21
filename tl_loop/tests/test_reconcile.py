@@ -38,22 +38,7 @@ def _slice(status: SliceStatus) -> SliceState:
     )
 
 
-@pytest.mark.parametrize(
-    "status",
-    [
-        SliceStatus.PENDING,
-        SliceStatus.READY,
-        SliceStatus.DISPATCHING,
-        SliceStatus.DISPATCH_UNCONFIRMED,
-        SliceStatus.SPAWNED,
-        SliceStatus.IN_REVIEW,
-        SliceStatus.REPAIRING,
-        SliceStatus.MERGED,
-        SliceStatus.FAILED,
-        SliceStatus.PARKED,
-        SliceStatus.BLOCKED,
-    ],
-)
+@pytest.mark.parametrize("status", list(SliceStatus))
 def test_reconciliation_is_defined_for_every_slice_status(status: SliceStatus) -> None:
     result = reconcile_slice(
         _slice(status),
@@ -68,7 +53,14 @@ def test_reconciliation_is_defined_for_every_slice_status(status: SliceStatus) -
     )
 
     assert result.slice_id == "slice-a"
-    assert result.next_action
+    expected_action = {
+        SliceStatus.DISPATCHING: "await_authoritative_spawn_event",
+        SliceStatus.DISPATCH_UNCONFIRMED: "await_authoritative_spawn_event",
+        SliceStatus.SPAWNED: "await_review_event",
+        SliceStatus.IN_REVIEW: "await_merge_event",
+        SliceStatus.REPAIRING: "await_repair_event",
+    }.get(status, "no_action")
+    assert result.next_action == expected_action
     assert result.as_state()["next_action"] == result.next_action
 
 
@@ -92,9 +84,68 @@ def test_reconciliation_adopts_authoritative_review_and_ci_evidence() -> None:
         "published_head",
         "review_state",
         "ci_state",
+        "pr_state_unknown",
     )
     assert result.missing_evidence == ()
     assert result.next_action == "await_merge_event"
+
+
+def test_closed_unmerged_pr_is_terminal_reconciliation_evidence() -> None:
+    result = reconcile_slice(
+        _slice(SliceStatus.IN_REVIEW),
+        authoritative_owner_id="agent-a",
+        watcher={
+            "found": True,
+            "pr_number": 42,
+            "head_sha": "head-a",
+            "review_state": "changes_requested",
+            "ci_status": "failure",
+            "pr_state": "closed",
+            "merged": False,
+            "head_reachable": True,
+        },
+    )
+
+    assert result.next_action == "park_closed_unmerged_pr"
+    assert "pr_state" in result.authoritative_evidence
+
+
+def test_open_unmerged_pr_still_waits_for_merge() -> None:
+    result = reconcile_slice(
+        _slice(SliceStatus.IN_REVIEW),
+        authoritative_owner_id="agent-a",
+        watcher={
+            "found": True,
+            "head_sha": "head-a",
+            "review_state": "approved",
+            "ci_status": "success",
+            "pr_state": "open",
+            "merged": False,
+            "head_reachable": True,
+        },
+    )
+
+    assert result.next_action == "await_merge_event"
+
+
+def test_missing_pr_head_is_a_typed_terminal_reconciliation_observation() -> None:
+    result = reconcile_slice(
+        _slice(SliceStatus.IN_REVIEW),
+        authoritative_owner_id="agent-a",
+        watcher={
+            "found": True,
+            "head_sha": "head-a",
+            "review_state": "approved",
+            "ci_status": "success",
+            "pr_state": "open",
+            "merged": False,
+            "head_reachable": False,
+            "evidence_error": "pr_head_unreachable: object missing",
+        },
+    )
+
+    assert result.next_action == "park_unreachable_pr_head"
+    assert "pr_head_unreachable" in result.authoritative_evidence
 
 
 def test_reconciliation_quarantines_conflicting_owner_and_head() -> None:

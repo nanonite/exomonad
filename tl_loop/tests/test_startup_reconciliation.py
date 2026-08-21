@@ -61,6 +61,9 @@ class FakeClient:
     spawn_reviewer_calls: list[dict[str, object]] = field(default_factory=list)
     resolved_pr_number: int | None = 99
     review_state: str = "pending"
+    pr_state: str = "open"
+    merged: bool = False
+    head_reachable: bool = True
 
     def list_agents(self, *, filter_type: str | None = None) -> ToolResult:
         return ToolResult(
@@ -88,7 +91,9 @@ class FakeClient:
                     "head_sha": "head-a",
                     "review_state": self.review_state,
                     "ci_status": "success",
-                    "merged": False,
+                    "pr_state": self.pr_state,
+                    "merged": self.merged,
+                    "head_reachable": self.head_reachable,
                 },
                 error=None,
             )
@@ -115,6 +120,26 @@ class FakeClient:
                 "force": force,
             }
         )
+        return ToolResult(raw={"success": True}, success=True, result={}, error=None)
+
+    def chainlink_issue_create(
+        self,
+        *,
+        title: str,
+        description: str | None = None,
+        labels: tuple[str, ...] | None = None,
+        priority: str | None = None,
+    ) -> ToolResult:
+        del title, description, labels, priority
+        return ToolResult(
+            raw={"success": True},
+            success=True,
+            result={"issue_id": 932},
+            error=None,
+        )
+
+    def emit_controller_event(self, *, event_type: str, payload: dict[str, object]) -> ToolResult:
+        del event_type, payload
         return ToolResult(raw={"success": True}, success=True, result={}, error=None)
 
 
@@ -180,6 +205,21 @@ def test_reconciliation_does_not_respawn_reviewer_when_head_already_claimed(
     _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
 
     assert client.spawn_reviewer_calls == []
+
+
+def test_reconciliation_parks_closed_unmerged_pr_without_resurrecting_slice(tmp_path) -> None:
+    store, state = _load_state(tmp_path)
+    client = FakeClient(pr_state="closed")
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+    new_state = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+
+    parked = new_state.slices["slice-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause.value == "pr_closed_unmerged"
+    assert parked.reconciliation["next_action"] == "park_closed_unmerged_pr"
+    assert client.spawn_reviewer_calls == []
+    assert store.load().slices["slice-a"].status is SliceStatus.PARKED
 
 
 def _claim_reviewer_attempt(store, state):

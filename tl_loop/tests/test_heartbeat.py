@@ -27,6 +27,9 @@ class HeartbeatTransport:
     pane_alive: bool = True
     worker_present: bool = True
     report_missing_agents: bool = False
+    pr_state: str = "open"
+    merged: bool = False
+    head_reachable: bool = True
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
@@ -76,10 +79,19 @@ class HeartbeatTransport:
                 {
                     "success": True,
                     "result": {
-                        "head_sha": "head-new",
-                        "review_state": "approved",
-                        "ci_status": "success",
-                    },
+                    "head_sha": "head-new",
+                    "review_state": "approved",
+                    "ci_status": "success",
+                    "found": True,
+                    "pr_state": self.pr_state,
+                    "merged": self.merged,
+                    "head_reachable": self.head_reachable,
+                    "evidence_error": (
+                        "pr_head_unreachable: object missing"
+                        if not self.head_reachable
+                        else ""
+                    ),
+                },
                 },
             )
         if tool_name == "chainlink_issue_create":
@@ -200,6 +212,53 @@ def test_repeated_heartbeat_reconciliation_is_idempotent(tmp_path: Path) -> None
         "poll_workers",
         "watcher_pr_state",
     ]
+
+
+def test_heartbeat_parks_closed_unmerged_pr(tmp_path: Path) -> None:
+    store, state = _state(
+        tmp_path,
+        status="in_review",
+        heartbeat_at=0.0,
+        pr_number=42,
+        reviewed_head="head-new",
+    )
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(HeartbeatTransport(pr_state="closed")),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    parked = result.state.slices["slice-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.PR_CLOSED_UNMERGED
+    assert result.parked_slice_ids == ("slice-a",)
+    assert result.events[0].kind == "pr.closed_unmerged"
+
+
+def test_heartbeat_parks_unreachable_pr_head_without_raising(tmp_path: Path) -> None:
+    store, state = _state(
+        tmp_path,
+        status="in_review",
+        heartbeat_at=0.0,
+        pr_number=42,
+        reviewed_head="head-new",
+    )
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(HeartbeatTransport(head_reachable=False)),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    parked = result.state.slices["slice-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.PR_HEAD_UNREACHABLE
+    assert result.events[0].kind == "pr.head_unreachable"
 
 
 def test_poll_workers_uses_persisted_runtime_identity(tmp_path: Path) -> None:

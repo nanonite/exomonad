@@ -242,6 +242,56 @@ def heartbeat_once(
         if slice_state.pr_number is None:
             continue
         watcher = _watch_pr(effects, slice_state.pr_number)
+        terminal_cause = _pr_terminal_cause(watcher)
+        if terminal_cause is not None:
+            if isinstance(effects, ReadOnlyEffectClient):
+                raise HeartbeatError(
+                    f"authoritative PR terminal observation for {slice_state.id!r} "
+                    "requires an active effect client to park"
+                )
+            park(
+                slice_state,
+                terminal_cause,
+                store=store,
+                issue_creator=effects,
+                ledger=current.budgets,
+                audit=_pr_payload(watcher),
+            )
+            current = store.load()
+            parked_slice = current.slices[slice_state.id]
+            parked_slice = replace(
+                parked_slice,
+                reconciliation={
+                    "confirmed_stage": "lifecycle",
+                    "authoritative_evidence": ["published_pr", "pr_state"],
+                    "missing_evidence": [],
+                    "conflicts": [],
+                    "next_action": (
+                        "park_closed_unmerged_pr"
+                        if terminal_cause is ParkCause.PR_CLOSED_UNMERGED
+                        else "park_unreachable_pr_head"
+                    ),
+                },
+            )
+            current = store.checkpoint(
+                current.fsm,
+                {**current.slices, slice_state.id: parked_slice},
+                current.budgets,
+                current.events.last_consumed_offset,
+            )
+            progress = True
+            parked.append(slice_state.id)
+            events.append(
+                _event(
+                    "pr.closed_unmerged"
+                    if terminal_cause is ParkCause.PR_CLOSED_UNMERGED
+                    else "pr.head_unreachable",
+                    "watcher_pr_state",
+                    slice_state.id,
+                    _pr_payload(watcher),
+                )
+            )
+            continue
         updated, observed = _reconcile_pr(slice_state, watcher)
         if updated == slice_state:
             continue
@@ -558,8 +608,32 @@ def _reconcile_pr(slice_state: SliceState, payload: JsonMapping) -> tuple[SliceS
 
 def _pr_payload(payload: JsonMapping) -> dict[str, object]:
     return {
-        key: payload[key] for key in ("head_sha", "review_state", "ci_status") if key in payload
+        key: payload[key]
+        for key in (
+            "head_sha",
+            "review_state",
+            "ci_status",
+            "pr_state",
+            "merged",
+            "head_reachable",
+            "evidence_error",
+        )
+        if key in payload
     }
+
+
+def _pr_terminal_cause(payload: JsonMapping) -> ParkCause | None:
+    """Classify only explicit Forgejo/head observations as terminal."""
+    pr_state = payload.get("pr_state")
+    if (
+        isinstance(pr_state, str)
+        and pr_state.lower() == "closed"
+        and payload.get("merged") is False
+    ):
+        return ParkCause.PR_CLOSED_UNMERGED
+    if payload.get("head_reachable") is False:
+        return ParkCause.PR_HEAD_UNREACHABLE
+    return None
 
 
 def _retired_or_unrouted(row: JsonMapping) -> bool:

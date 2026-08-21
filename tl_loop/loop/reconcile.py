@@ -99,7 +99,23 @@ def reconcile_slice(
     else:
         missing.append("published_pr")
 
-    if conflicts:
+    pr_state = _pr_state(watcher)
+    closed_unmerged = (
+        watcher is not None
+        and watcher.get("found") is True
+        and pr_state == "closed"
+        and watcher.get("merged") is False
+    )
+    head_unreachable = (
+        watcher is not None
+        and watcher.get("found") is True
+        and watcher.get("head_reachable") is False
+    )
+    if closed_unmerged:
+        action = "park_closed_unmerged_pr"
+    elif head_unreachable:
+        action = "park_unreachable_pr_head"
+    elif conflicts:
         action = "open_integrity_gate"
     elif missing:
         action = "await_authoritative_evidence"
@@ -138,6 +154,23 @@ def _append_watcher_evidence(
         evidence.append("ci_state")
     else:
         missing.append("ci_state")
+    pr_state = _pr_state(watcher)
+    if pr_state == "unknown":
+        evidence.append("pr_state_unknown")
+    else:
+        evidence.append("pr_state")
+    if watcher.get("head_reachable") is False:
+        evidence.append("pr_head_unreachable")
+
+
+def _pr_state(watcher: Mapping[str, object] | None) -> str:
+    """Return an explicit compatibility state for older watcher payloads."""
+    if watcher is None:
+        return "unknown"
+    value = watcher.get("pr_state")
+    if isinstance(value, str) and value.lower() in {"open", "closed"}:
+        return value.lower()
+    return "unknown"
 
 
 def _result(

@@ -756,9 +756,10 @@ fn parse_repo(repo: &str) -> EffectResult<GithubRepo> {
 }
 
 fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPrStateResponse {
+    let error = error.into();
     WatcherPrStateResponse {
         success: false,
-        error: error.into(),
+        error: error.clone(),
         pr_number,
         found: false,
         review_state: "unknown".to_string(),
@@ -772,6 +773,8 @@ fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPr
         pr_state: String::new(),
         merged: false,
         review_count: 0,
+        head_reachable: false,
+        evidence_error: error,
     }
 }
 
@@ -1738,16 +1741,21 @@ impl<
         };
         let head_sha = pr.head_sha.clone().unwrap_or_default();
         let project_dir = self.ctx.project_dir().to_string_lossy().into_owned();
-        let evidence = match crate::services::merge_pr::observe_pr_evidence(
-            &project_dir,
-            pr.base_ref.as_str(),
-            &head_sha,
-        )
-        .await
-        {
-            Ok(evidence) => evidence,
-            Err(error) => return Ok(watcher_pr_state_error(pr_number, error.to_string())),
-        };
+        let (evidence, head_reachable, evidence_error) =
+            match crate::services::merge_pr::observe_pr_evidence_for_pr(
+                &project_dir,
+                pr.base_ref.as_str(),
+                &head_sha,
+                pr_number,
+            )
+            .await
+            {
+                Ok(evidence) => (Some(evidence), true, String::new()),
+                Err(error) if error.to_string().contains("pr_head_unreachable:") => {
+                    (None, false, error.to_string())
+                }
+                Err(error) => return Ok(watcher_pr_state_error(pr_number, error.to_string())),
+            };
 
         let reviews = forgejo
             .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
@@ -1772,12 +1780,23 @@ impl<
             head_sha,
             head_branch: pr.head_ref.to_string(),
             base_branch: pr.base_ref.to_string(),
-            base_sha: evidence.base_sha,
-            patch_digest: evidence.patch_digest,
-            merge_tree_sha: evidence.merge_tree_sha,
+            base_sha: evidence
+                .as_ref()
+                .map(|value| value.base_sha.clone())
+                .unwrap_or_default(),
+            patch_digest: evidence
+                .as_ref()
+                .map(|value| value.patch_digest.clone())
+                .unwrap_or_default(),
+            merge_tree_sha: evidence
+                .as_ref()
+                .map(|value| value.merge_tree_sha.clone())
+                .unwrap_or_default(),
             pr_state: pr.state,
             merged: pr.merged,
             review_count,
+            head_reachable,
+            evidence_error,
         })
     }
 

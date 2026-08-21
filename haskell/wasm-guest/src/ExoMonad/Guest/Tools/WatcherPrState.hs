@@ -85,7 +85,9 @@ watcherPrStateCore args
                     "merge_tree_sha" .= lazyText (PA.watcherPrStateResponseMergeTreeSha resp),
                     "pr_state" .= lazyText (PA.watcherPrStateResponsePrState resp),
                     "merged" .= PA.watcherPrStateResponseMerged resp,
-                    "review_count" .= PA.watcherPrStateResponseReviewCount resp
+                    "review_count" .= PA.watcherPrStateResponseReviewCount resp,
+                    "head_reachable" .= PA.watcherPrStateResponseHeadReachable resp,
+                    "evidence_error" .= lazyText (PA.watcherPrStateResponseEvidenceError resp)
                   ]
 
 instance MCPTool WatcherPrState where

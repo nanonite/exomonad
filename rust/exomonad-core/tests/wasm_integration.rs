@@ -576,6 +576,8 @@ impl EffectHandler for MockAgentHandler {
                     pr_state: "open".into(),
                     merged: false,
                     review_count: 1,
+                    head_reachable: true,
+                    evidence_error: String::new(),
                 }
                 .encode_to_vec())
             }

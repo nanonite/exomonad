@@ -89,7 +89,14 @@ pub async fn merge_pr_async(
                 head_sha,
             ));
         };
-        let observed = match observe_pr_evidence(dir, pr.base_ref.as_str(), actual_head).await {
+        let observed = match observe_pr_evidence_for_pr(
+            dir,
+            pr.base_ref.as_str(),
+            actual_head,
+            pr_number.as_u64(),
+        )
+        .await
+        {
             Ok(observed) => observed,
             Err(error) => {
                 return Ok(cas_failure(
@@ -190,7 +197,44 @@ pub async fn observe_pr_evidence(
     head_sha: &str,
 ) -> Result<MergeObservedEvidence> {
     let base_sha = authoritative_base_sha(dir, base_ref).await?;
+    ensure_head_object(dir, head_sha, None).await?;
     observe_merge_evidence(dir, &base_sha, head_sha).await
+}
+
+/// Observe PR evidence after attempting one bounded recovery of a missing
+/// Forgejo pull-request head ref. A missing object is expected after branch
+/// deletion, so callers can classify the pr_head_unreachable: error without
+/// treating it as a controller-fatal transport failure.
+pub async fn observe_pr_evidence_for_pr(
+    dir: &str,
+    base_ref: &str,
+    head_sha: &str,
+    pr_number: u64,
+) -> Result<MergeObservedEvidence> {
+    let base_sha = authoritative_base_sha(dir, base_ref).await?;
+    ensure_head_object(dir, head_sha, Some(pr_number)).await?;
+    observe_merge_evidence(dir, &base_sha, head_sha).await
+}
+
+async fn ensure_head_object(dir: &str, head_sha: &str, pr_number: Option<u64>) -> Result<()> {
+    let object = format!("{head_sha}^{{commit}}");
+    if run_git(dir, &["cat-file", "-e", &object]).await.is_ok() {
+        return Ok(());
+    }
+    let Some(pr_number) = pr_number else {
+        anyhow::bail!("pr_head_unreachable: local object {head_sha} is unavailable");
+    };
+    let remote = configured_remote(dir).await?;
+    let refspec = format!("refs/pull/{pr_number}/head");
+    if let Err(error) = run_git(dir, &["fetch", "--no-tags", &remote, &refspec]).await {
+        anyhow::bail!("pr_head_unreachable: fetch of {refspec} from {remote} failed: {error}");
+    }
+    if run_git(dir, &["cat-file", "-e", &object]).await.is_err() {
+        anyhow::bail!(
+            "pr_head_unreachable: fetched {refspec}, but local object {head_sha} is still absent"
+        );
+    }
+    Ok(())
 }
 
 async fn configured_remote(dir: &str) -> Result<String> {
@@ -338,5 +382,70 @@ mod tests {
             let error = compare_expected_evidence(&expected, &observed).unwrap_err();
             assert!(error.contains(label), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn missing_pr_head_is_recovered_from_pull_ref_once() {
+        use std::process::Command;
+
+        fn git(dir: &std::path::Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        let source = tempfile::tempdir().expect("source repo");
+        git(source.path(), &["init", "-q"]);
+        git(source.path(), &["config", "user.email", "test@example.com"]);
+        git(source.path(), &["config", "user.name", "Test"]);
+        std::fs::write(source.path().join("file.txt"), "head\n").expect("write source");
+        git(source.path(), &["add", "file.txt"]);
+        git(source.path(), &["commit", "-qm", "head"]);
+        let head = git(source.path(), &["rev-parse", "HEAD"]);
+
+        let remote = tempfile::tempdir().expect("bare remote");
+        git(remote.path(), &["init", "--bare", "-q"]);
+        git(
+            source.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        git(
+            source.path(),
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        );
+        git(remote.path(), &["update-ref", "refs/pull/7/head", &head]);
+
+        let local = tempfile::tempdir().expect("local repo");
+        git(local.path(), &["init", "-q"]);
+        git(
+            local.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+
+        ensure_head_object(local.path().to_str().unwrap(), &head, Some(7))
+            .await
+            .expect("pull ref should recover the missing head");
+        git(
+            local.path(),
+            &["cat-file", "-e", &format!("{head}^{{commit}}")],
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_head_without_pr_identity_is_typed() {
+        let repo = tempfile::tempdir().expect("repo");
+        let error = ensure_head_object(repo.path().to_str().unwrap(), "deadbeef", None)
+            .await
+            .expect_err("missing identity must not trigger a broad fetch");
+        assert!(error.to_string().contains("pr_head_unreachable:"));
     }
 }

@@ -404,9 +404,13 @@ message WatcherPrStateResponse {
   uint32 review_count = 14;
   // Authoritative Git evidence observed for this exact PR head.
   string base_sha = 15;
-  string patch_digest = 16;
-  string merge_tree_sha = 17;
-}
+    string patch_digest = 16;
+    string merge_tree_sha = 17;
+    // False means the Forgejo head was authoritative but unavailable locally
+    // after the bounded refs/pull/<n>/head recovery attempt.
+    bool head_reachable = 18;
+    string evidence_error = 19;
+  }
 
 // ============================================================================
 // SpawnLeafSubtree - Spawn a leaf agent in a new git worktree

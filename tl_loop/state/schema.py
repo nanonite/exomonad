@@ -42,6 +42,8 @@ class ParkCause(str, Enum):
     STALL_DETECTED = "stall_detected"
     WORKER_TERMINAL = "worker_terminal"
     TASK_BUDGET_EXCEEDED = "task_budget_exceeded"
+    PR_CLOSED_UNMERGED = "pr_closed_unmerged"
+    PR_HEAD_UNREACHABLE = "pr_head_unreachable"
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
     DISPATCH_FAILED = "dispatch_failed"
     CORRUPT_STATE = "corrupt_state"
