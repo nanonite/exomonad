@@ -1,7 +1,212 @@
 {
   "version": 1,
-  "exported_at": "2026-08-20T14:55:54.355016215+00:00",
+  "exported_at": "2026-08-21T14:33:46.543864739+00:00",
   "issues": [
+    {
+      "id": 928,
+      "title": "Fix reader.py tuple annotation and cached active_tail semantics",
+      "description": "Two narrow defects found while reviewing #926 (4e41f55e). Both are in\ntl_loop/events/reader.py. Neither is caught by the current gates: ruff check\npasses, 464 Python tests pass, and mypy is already failing repo-wide (202\npre-existing errors) so its signal is buried.\n\n## ANTI-PATTERNS\n\n- Do not \"fix\" the mypy errors by widening the annotation to Any or adding\n  a type: ignore. The precise element type is known and correct.\n- Do not disable or bypass the segment cache to sidestep the active_tail\n  question. The cache is a deliberate fix for the per-heartbeat full-ledger\n  rescan; removing it reintroduces that cost.\n- Do not weaken the committed-evidence invariant. A newline-terminated\n  malformed row must stay a hard LedgerReadError.\n- Do not attempt a repo-wide mypy cleanup here. Scope is reader.py only.\n\n## READ FIRST\n\n- tl_loop/events/reader.py (LedgerReader, _SegmentCacheEntry, _read_rows,\n  _read_segment, find_invocation_finished)\n- tl_loop/tests/test_reader.py\n- tl_loop/loop/heartbeat.py (_read_terminal_invocation_event, the only\n  find_invocation_finished caller)\n\n## DEFECT 1 - malformed tuple annotation\n\ntl_loop/events/reader.py:151 declares:\n\n    self._terminal_matches: tuple[tuple[str | None, str | None, Mapping[str, object]]] = ()\n\nThe outer tuple is missing its `, ...`, so it types a fixed-length 1-tuple\nrather than a variable-length one. This produces three new mypy errors:\n\n    reader.py:151 Incompatible types in assignment (expression has type\n      \"tuple[()]\", variable has type \"tuple[tuple[str | None, str | None,\n      Mapping[str, object]]]\")\n    reader.py:303 Argument 4 to \"_SegmentCacheEntry\" has incompatible type\n      \"tuple[tuple[object, object, Mapping[str, object]], ...]\"\n    reader.py:313 Incompatible types in assignment\n\n### STEPS\n\n1. Change the annotation at reader.py:151 to\n   `tuple[tuple[str | None, str | None, Mapping[str, object]], ...]`.\n2. Resolve the reader.py:303 arg-type error. The generator at 293-303 loses\n   the `str | None` narrowing to `object`; add the narrowing so the element\n   type matches _SegmentCacheEntry.terminal_matches without a cast-to-Any.\n3. Confirm `mypy tl_loop 2>&1 | grep events/reader` is empty. The repo-wide\n   count must drop by exactly these three and introduce no new errors.\n\n## DEFECT 2 - cached active_tail can outlive its active segment\n\n_SegmentCacheEntry stores active_tail per segment, and _read_rows replays it\nfrom cache whenever the segment's (st_mtime_ns, st_size) signature is\nunchanged.\n\n_read_segment only sets active_tail when `segment == active_segment` and the\nfinal line lacks a newline. That verdict is then frozen in the cache entry.\nIf that segment is later closed by rollover while its bytes never change,\nthe cached entry keeps reporting a retryable active tail for a segment that\nis no longer newest. A fresh parse of the same file would instead reach\njson.loads on the partial line and raise LedgerReadError, because the\nin-code comment states that a closed segment's malformed data is committed\nevidence.\n\nLikelihood is low: LedgerWriter writes the JSON object and its newline\ntogether, so rollover mid-line requires a crash between those writes. It is\nstill a silent downgrade from a hard integrity error to a retry.\n\n### STEPS\n\n1. In _read_rows, honor a cached active_tail only when that segment is still\n   `active_segment`. For a cached entry whose segment is no longer newest and\n   whose active_tail is set, re-parse it via _read_segment with the current\n   active_segment so the committed-evidence path runs and raises.\n2. Keep the fast path intact: an unchanged closed segment with no active_tail\n   must still be served from cache without re-reading.\n3. Note the secondary divergence introduced at the same time: the precomputed\n   `recorded_slice` in _read_rows drops the old non-empty check, so a literal\n   empty-string slice_id now skips a row where the pre-#926 code fell through.\n   Restore the non-empty check or document why empty is treated as present.\n\n## VERIFY\n\n- EXOMONAD_PY=tl_loop/.venv/bin/python just tl-loop-test\n- just tl-loop-lint\n- tl_loop/.venv/bin/python -m mypy tl_loop 2>&1 | grep events/reader\n  (must be empty)\n- New test: a segment cached while active with an unterminated tail, then\n  superseded by a newer segment without its bytes changing, must raise\n  LedgerReadError rather than report an active tail.\n- New test: an unchanged closed segment with no active tail is served from\n  cache (assert no re-read, e.g. via a stat/open counter).\n\n## DONE CRITERIA\n\n- reader.py contributes zero mypy errors.\n- A cached active_tail is never honored for a segment that is no longer the\n  newest one.\n- The committed-evidence invariant holds identically on cached and uncached\n  reads.\n- Cache hit behavior for unchanged closed segments is unchanged, with a test\n  proving the ledger is not rescanned per heartbeat.",
+      "status": "open",
+      "priority": "medium",
+      "parent_id": null,
+      "labels": [
+        "bug",
+        "ledger",
+        "tl-loop"
+      ],
+      "comments": [],
+      "created_at": "2026-08-21T14:17:57.043561951+00:00",
+      "updated_at": "2026-08-21T14:18:11.801188155+00:00",
+      "closed_at": null
+    },
+    {
+      "id": 927,
+      "title": "Configurable per-task time budgets with auditable kill and typed failure events",
+      "description": "## Objective\n\nGive the TL loop one explicit, user-configurable, per-task time budget. When\na task exceeds its declared budget, the controller kills the owning dev leaf\nor worker, emits a typed terminal lifecycle event carrying full task-level\ncontext, and parks the slice with an unambiguous cause. Every other\ntime-related knob in the controller is either wired into this mechanism or\ndeleted. No inert timeout config survives this issue.\n\nOperator intent: budgets on the order of 30 minutes to 1 hour, tunable per\nproject and per slice, with the resulting failures inspectable as task-level\ndata in the ledger and Failure Atlas.\n\n## Why now - the current state is ambiguous\n\nThe controller currently ships five time knobs in three different states:\n\n| Knob | Default | Actual behavior today |\n|---|---|---|\n| `idle_timeout` / `--idle-timeout` / `tl_idle_timeout_seconds` | 30s | Inert. Validation removed in #925 (b99feb81). CLI flag and config key retained as \"legacy compatibility\". |\n| `controller_stall_timeout` / `tl_controller_stall_timeout_seconds` | 300s | Inert. Set from CLI at `tl_loop/__main__.py:232`, validated at `driver.py:535`, never consumed for control flow. |\n| `dispatch_timeout` / `tl_dispatch_timeout_seconds` | 5s | Validated at `driver.py:533`. Its consumer `_park_dispatch_timeout` (`driver.py:1153`) is **unreachable**: `_next_event` (`driver.py:4751`) no longer takes a deadline and can only raise `LoopCancelled`. `grep -rn \"raise LoopTimeout\" tl_loop/` outside tests returns nothing, so `except LoopTimeout` at `driver.py:798` never fires and `ParkCause.DISPATCH_TIMEOUT` / `DISPATCH_TIMEOUT_GATE_NAME` cannot be produced by that path. |\n| `heartbeat.stall_threshold_seconds` | 300s | Live, observation only. Emits `wave.stalled` with `\"action\": \"observe\"` at `heartbeat.py:247-263`. Correct under #893. |\n| `reviewer_max_wait_seconds` | 1200s | Live, watcher/review-policy owned. Out of scope except for precedence. |\n\nNo test asserts the dispatch-timeout gate ever fires: `grep DISPATCH_TIMEOUT\ntl_loop/tests` finds only a config-default assertion in `test_main.py:176`.\n464 tests pass over an unreachable ~95-line parking path.\n\nThe result is that a leaf which hangs indefinitely is never bounded, while\nthree config keys advertise bounds that do not exist.\n\n## Relationship to #893 - this issue amends it\n\n#893 states: \"Elapsed task time must be observational only and must never by\nitself create TLFailed, park a slice, open a gate, terminate a controller, or\nkill an active worker.\"\n\nThat contract was written against a specific failure: a generic 30-second\nidle deadline inferring death from silence and killing a healthy worker. The\ninference was the defect, not the existence of a bound.\n\nThis issue introduces a different thing: a **declared resource ceiling**. The\noperator states in advance how long a task may run. Exceeding it is not an\ninference about liveness - it is the configured budget being spent. It\nproduces an auditable typed event rather than a silent exit.\n\nBoth statements cannot stand unqualified. Part of this issue is amending\n#893's terminal contract and the corresponding text in `CLAUDE.md` and\n`.claude/rules/exomonad.md` so the two are consistent. The amended rule:\n\n- Elapsed time may never be used to **infer** that a worker is dead, stalled,\n  or failed. Silence, unchanged checkpoints, and absent tool traffic remain\n  non-evidence.\n- Elapsed time **may** enforce an explicitly declared, operator-configured\n  task budget, provided the enforcement is bounded, typed, auditable, and\n  attributable to the specific configuration value that caused it.\n\nIf a reviewer or future agent cannot tell which rule applies to a given code\npath, that path is wrong.\n\n## ANTI-PATTERNS\n\n- Do not reintroduce a generic controller idle deadline. The budget is\n  per-task and starts at dispatch, not per-event.\n- Do not reuse `idle_timeout`, `controller_stall_timeout`, or\n  `LoopDeadline` as the mechanism. They are removed or repurposed, not\n  revived under new defaults.\n- Do not infer expiry from tmux pane state, event silence, or an unchanged\n  checkpoint. Expiry is computed only from the persisted dispatch timestamp\n  and the resolved budget.\n- Do not kill a worker without first writing the durable intent record. A\n  crash between kill and record must be reconcilable, per #905.\n- Do not kill on budget expiry while an authoritative terminal event for the\n  same slice is already pending in the queue. Drain and apply it first.\n- Do not leave `wave.stalled` as a kill trigger. It stays observational.\n- Do not apply a task budget to the controller process itself, to reviewer\n  wait (owned by `reviewer_max_wait_seconds`), or to transport timeouts.\n- Do not silently clamp an out-of-range configured value. Reject it at load.\n- Do not leave any timeout key in `config.toml`, the CLI, or `TLLoopConfig`\n  that has no consumer when this issue closes.\n\n## READ FIRST\n\n- `tl_loop/loop/driver.py` - `TLLoopConfig` (462-540), `_run_loop` event\n  loop (781-1140), `_park_dispatch_timeout` (1153), `LoopTimeout` (236)\n- `tl_loop/loop/heartbeat.py` - `heartbeat_once`, `HeartbeatConfig`,\n  `_missing_worker_evidence`, `_poll_workers`\n- `tl_loop/loop/escalate.py` - `park`\n- `tl_loop/state/schema.py` - `ParkCause`, `SliceState`, `GoalState`\n- `tl_loop/loop/journal.py` - `MUTATING_OPERATIONS`, `stable_action_key`\n- `tl_loop/__main__.py` - CLI flags and `TLLoopConfig` construction\n- `rust/exomonad-core/src/services/lifecycle.rs` - `LifecycleEventKind`,\n  `LifecycleTelemetry`\n- `rust/exomonad-core/src/services/agent_control/invocation.rs` -\n  `InvocationStatus::TimedOut` (already defined, currently unused),\n  `InvocationExitContext`\n- `rust/exomonad-core/src/services/agent_control/mod.rs` - the tmux\n  kill/dispose path and `read_invocation_stderr_tail`\n- `docs/observability/event-registry.json` and `expected-events.v1.json`\n- Issue #893 (terminal contract), #905 (crash-idempotent effects), #920\n  (missing-worker evidence), #925 (scaffolding removal)\n\n## STEPS\n\n1. **Inventory and decide.** Produce a table of every time-based value in\n   the controller, the Rust runtime, and the config surface, each marked\n   `enforce`, `observe`, `io-safeguard`, or `delete`. This table is the\n   deliverable that removes the ambiguity; put it in\n   `docs/decisions/tl-as-loop.md`.\n\n2. **Define the configuration surface.** Resolution order, most specific\n   wins:\n   - per-slice `task_timeout_seconds` in `plan.json`\n   - per-role default in `.exo/harness_policy.toml`\n   - project default `tl_task_timeout_seconds` in `.exo/config.toml`\n   - built-in default (propose 3600; state the choice explicitly)\n\n   `0` or explicit `null` means no ceiling and must be expressible. Reject\n   negative, non-numeric, or absurd values at load with a named error rather\n   than clamping. Document the full surface in `CLAUDE.md` and\n   `docs/guides/programming-the-tl.md`.\n\n3. **Persist the budget with the slice.** On dispatch, write the resolved\n   budget, its source (which config layer supplied it), and the dispatch\n   timestamp into `SliceState` in the same state write that records dispatch\n   ownership. Recovery after a controller restart must recompute remaining\n   budget from the persisted dispatch timestamp, never from process start.\n\n4. **Enforce in the heartbeat, not the event loop.** `heartbeat_once`\n   already runs on the configured interval, already holds the store, and\n   already owns the park path. Add budget evaluation there, after worker-row\n   reconciliation, so an authoritative terminal event always wins over an\n   expiry in the same tick.\n\n5. **Kill through the existing disposal path.** Reuse the leaf/worker\n   disposal effects rather than adding a new kill. Record the intent in the\n   action journal before dispatch and the outcome after, per #905. Add the\n   operation to `MUTATING_OPERATIONS`. Killing twice across a restart must\n   converge on one outcome.\n\n6. **Emit typed task-level evidence.** Add a distinct terminal lifecycle\n   event - propose `agent.task_budget_exceeded` - carrying at minimum:\n   slice_id, runtime_agent_id, invocation_id, generation, harness, model,\n   effort, branch, worktree, pr_number, configured budget, budget source\n   layer, dispatch timestamp, elapsed seconds, last authoritative event seq,\n   and stderr tail. Register it in `docs/observability/event-registry.json`\n   and `expected-events.v1.json`, and validate with\n   `just validate-observability-contracts`.\n\n   Set `InvocationStatus::TimedOut` on the invocation record and populate\n   `InvocationExitContext` with a `task_budget_exceeded` classification so\n   the #920 missing-row reconciliation path reads it correctly.\n\n7. **Add an unambiguous park cause.** New `ParkCause.TASK_BUDGET_EXCEEDED`.\n   Do not overload `STALL_DETECTED` or `WORKER_TERMINAL`.\n\n8. **Resolve every legacy knob.** Per the step 1 table: delete\n   `idle_timeout` and `controller_stall_timeout` from `TLLoopConfig`, the\n   CLI, and `config.toml`, or wire them to the new mechanism. Delete the\n   unreachable `_park_dispatch_timeout`, `LoopTimeout`, and the dead\n   `except LoopTimeout` block, or restore a real dispatch-confirmation\n   bound as its own `enforce` row. `dispatch_timeout` must end up in exactly\n   one state, not both.\n\n9. **Make it queryable as task data.** Confirm the new event survives\n   `exomonad logs import` into `.exo/analysis/atlas.db` and is visible to\n   `exomonad logs measure`, so budget exhaustion is analyzable across runs\n   rather than only greppable in a segment.\n\n10. **Amend #893.** Update the issue body, `CLAUDE.md`, and\n    `.claude/rules/exomonad.md` with the infer-vs-declare distinction above.\n\n## VERIFY\n\n- `EXOMONAD_PY=tl_loop/.venv/bin/python just tl-loop-test`\n- `just tl-loop-lint`\n- `tl_loop/.venv/bin/python -m mypy tl_loop 2>&1 | grep -E \"driver|heartbeat|schema\"` introduces no new errors\n- `cargo test -p exomonad-core`\n- `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`\n- `just validate-observability-contracts`\n- `just e2e-tl-loop-active`\n\nRequired tests:\n\n- A slice under budget is never killed regardless of silence duration\n  (the #893 regression guard).\n- A slice over budget is killed exactly once, parks with\n  `TASK_BUDGET_EXCEEDED`, and emits one `agent.task_budget_exceeded` event.\n- Budget survives a controller restart: remaining time is computed from the\n  persisted dispatch timestamp, and a restart at any point does not\n  duplicate the kill.\n- An authoritative terminal event arriving in the same tick as expiry wins;\n  no kill is issued.\n- `0` / null budget disables enforcement entirely.\n- Per-slice overrides per-role overrides project default, with the source\n  layer recorded in the event.\n- Invalid configured values are rejected at load with a named error.\n- Recursive sub-TLs enforce their own budgets identically to root.\n- A grep-level assertion that no timeout key exists in `TLLoopConfig`, the\n  CLI, or `config.toml` without a consumer.\n\n## DONE CRITERIA\n\n- One mechanism bounds task duration, and it is configurable at project,\n  role, and slice level with a documented precedence.\n- Budget exhaustion kills the owning leaf/worker exactly once, crash-safely,\n  through the existing disposal path.\n- The failure is a typed ledger event with full task-level context,\n  registered in the observability contracts and importable into the Failure\n  Atlas.\n- `ParkCause.TASK_BUDGET_EXCEEDED` is distinct from stall and worker-terminal\n  causes.\n- Every time-based knob is classified `enforce`, `observe`, `io-safeguard`,\n  or `delete`, with the table recorded in `docs/decisions/tl-as-loop.md`.\n  No inert timeout config remains.\n- #893's contract, `CLAUDE.md`, and `.claude/rules/exomonad.md` state the\n  infer-vs-declare distinction, so a future agent cannot \"fix\" one issue by\n  breaking the other.",
+      "status": "open",
+      "priority": "high",
+      "parent_id": null,
+      "labels": [
+        "config",
+        "feature",
+        "lifecycle",
+        "tl-loop"
+      ],
+      "comments": [],
+      "created_at": "2026-08-21T14:17:51.596650841+00:00",
+      "updated_at": "2026-08-21T14:18:11.769427483+00:00",
+      "closed_at": null
+    },
+    {
+      "id": 926,
+      "title": "Cache terminal invocation evidence and strengthen lifecycle regression coverage",
+      "description": null,
+      "status": "closed",
+      "priority": "high",
+      "parent_id": null,
+      "labels": [
+        "bug"
+      ],
+      "comments": [],
+      "created_at": "2026-08-21T13:57:28.541357261+00:00",
+      "updated_at": "2026-08-21T14:03:46.189600187+00:00",
+      "closed_at": "2026-08-21T14:03:46.189600187+00:00"
+    },
+    {
+      "id": 925,
+      "title": "Remove obsolete TL idle timeout scaffolding and correct lifecycle documentation",
+      "description": null,
+      "status": "closed",
+      "priority": "high",
+      "parent_id": null,
+      "labels": [
+        "fix"
+      ],
+      "comments": [],
+      "created_at": "2026-08-21T13:50:42.622820763+00:00",
+      "updated_at": "2026-08-21T13:57:20.649615450+00:00",
+      "closed_at": "2026-08-21T13:57:20.649615450+00:00"
+    },
+    {
+      "id": 924,
+      "title": "Require explicit project roots for heartbeat reconciliation",
+      "description": null,
+      "status": "closed",
+      "priority": "high",
+      "parent_id": null,
+      "labels": [
+        "bug"
+      ],
+      "comments": [],
+      "created_at": "2026-08-21T13:48:02.379175662+00:00",
+      "updated_at": "2026-08-21T13:50:32.071374113+00:00",
+      "closed_at": "2026-08-21T13:50:32.071374113+00:00"
+    },
+    {
+      "id": 923,
+      "title": "Fix terminal invocation evidence parsing and park classification",
+      "description": null,
+      "status": "closed",
+      "priority": "high",
+      "parent_id": null,
+      "labels": [
+        "bug"
+      ],
+      "comments": [
+        {
+          "content": "Heartbeat terminal invocation evidence now uses LedgerReader's shared segment parser instead of duplicating JSONL scans. Authoritative worker-terminal parking uses ParkCause.WORKER_TERMINAL; dead panes remain STALL_DETECTED. Reader, heartbeat, and full TL suite pass (463 tests).",
+          "created_at": "2026-08-21T13:25:42.588946936+00:00",
+          "kind": "note"
+        }
+      ],
+      "created_at": "2026-08-21T13:24:38.720802483+00:00",
+      "updated_at": "2026-08-21T13:25:42.618579511+00:00",
+      "closed_at": "2026-08-21T13:25:42.618579511+00:00"
+    },
+    {
+      "id": 922,
+      "title": "Add regression and real-server coverage for mismatched worker names",
+      "description": "SCOPE: prove the complete failure and recovery path for a slice ID that differs from its runtime agent directory/name.\n\nREAD FIRST: haskell/wasm-guest/test/ExoMonad/Guest/Tools/PollWorkersTest.hs; tl_loop/tests/test_heartbeat.py; tl_loop/tests/test_identity.py; tests/e2e/ordered-recursive/; existing real-server transport and cleanup tests.\n\nSTEPS: Add a Haskell filter/resolution regression; add a Python heartbeat test named for a missing worker row after invocation.finished; add replay tests proving one FAILED/PARKED transition and no duplicate side effect; add a production-shaped server test with tunable-operator-body and tunable-operator-body-opencode, including exit-marker absence, stderr-tail capture, worktree preservation/reconciliation, and cleanup assertions.\n\nVERIFY: targeted Haskell and Python tests; just tl-loop-ordered-e2e; then three consecutive real-server acceptance runs with phase, controller exit, ledger cursor, and cleanup evidence recorded.\n\nDONE: the mismatch reproduces before the fix, passes after the fix, remains idempotent across restart, and leaves no orphan process/worktree/session.",
+      "status": "closed",
+      "priority": "high",
+      "parent_id": 893,
+      "labels": [
+        "bug"
+      ],
+      "comments": [
+        {
+          "content": "Added PollWorkers, heartbeat, and production-shaped mismatched-name regression coverage in 75e2d55f. WASM guest tests, mock ordered E2E, and targeted cleanup tests pass; real-server harness cannot create its temporary socket here.",
+          "created_at": "2026-08-21T06:09:46.197566474+00:00",
+          "kind": "result"
+        },
+        {
+          "content": "Replaced the prior Haskell exact-match-only coverage with production behavior: poll_workers now returns missing_agents for every requested runtime identity absent from the server response. This makes a slice/runtime-name mismatch durable and visible while preserving exact selection. WASM guest suite: 74 passed.",
+          "created_at": "2026-08-21T13:23:16.917627797+00:00",
+          "kind": "note"
+        }
+      ],
+      "created_at": "2026-08-21T05:12:36.689331969+00:00",
+      "updated_at": "2026-08-21T13:23:16.948087762+00:00",
+      "closed_at": "2026-08-21T13:23:16.948087762+00:00"
+    },
+    {
+      "id": 921,
+      "title": "Persist complete invocation-exit context for liveness recovery",
+      "description": "SCOPE: make lifecycle/agent-control exit records sufficient for the TL to reconcile a missing poll row.\n\nREAD FIRST: rust/exomonad-core/src/services/lifecycle.rs; rust/exomonad-core/src/services/agent_control/invocation.rs; rust/exomonad-core/src/services/expected_events.rs; tl_loop/loop/shadow.py; tl_loop/state/schema.py; existing lifecycle and invocation tests.\n\nSTEPS: Audit invocation started/finished/failed/stuck event payloads and persisted agent-directory records; ensure exit code, reason/classification, stderr tail, branch, worktree, canonical slice ID, runtime agent ID, and invocation generation are retained; define stable serialization and redaction bounds; make readers tolerate absent legacy fields through migration/defaults.\n\nVERIFY: Rust lifecycle/agent-control tests, Python ledger replay tests, rustfmt, clippy with warnings denied.\n\nDONE: a missing poll row can be reconciled from durable exit context without inspecting transient tmux state or guessing from names.",
+      "status": "closed",
+      "priority": "high",
+      "parent_id": 893,
+      "labels": [
+        "bug"
+      ],
+      "comments": [
+        {
+          "content": "Implemented durable invocation exit provenance in c3ea6420; Clippy follow-up 547568ae. Core tests and Clippy pass.",
+          "created_at": "2026-08-21T06:09:46.155951368+00:00",
+          "kind": "resolution"
+        },
+        {
+          "content": "Closed the API/redaction nits: finish_invocation_with_context is now crate-internal because only the compatibility wrapper and local tests use it, and stderr-tail bounding is UTF-8-safe while respecting the 4096-byte bound. Core suite: 956 passed, 3 ignored.",
+          "created_at": "2026-08-21T13:27:16.333971193+00:00",
+          "kind": "note"
+        }
+      ],
+      "created_at": "2026-08-21T05:12:36.649683729+00:00",
+      "updated_at": "2026-08-21T13:27:16.363940112+00:00",
+      "closed_at": "2026-08-21T13:27:16.363940112+00:00"
+    },
+    {
+      "id": 920,
+      "title": "Handle missing worker rows as durable liveness evidence",
+      "description": "ROOT CAUSE: tl_loop/loop/heartbeat.py treats a missing worker row as an unconditional continue. When a worker has finished or been killed, the slice receives no worker.dead event, no FAILED/PARKED transition, and no repair decision.\n\nANTI-PATTERNS: Do not infer failure from elapsed time alone. Do not mark a quiet but valid worker dead. Do not convert an unknown transport response into task failure. Do not mutate lifecycle state without authoritative invocation/session evidence.\n\nREAD FIRST: tl_loop/loop/heartbeat.py; tl_loop/loop/driver.py; tl_loop/loop/shadow.py; tl_loop/state/schema.py; tl_loop/tests/test_heartbeat.py; tl_loop/tests/test_startup_reconciliation.py.\n\nSTEPS: When a requested worker row is absent, query durable invocation/session/ledger evidence; classify missing exit markers as abnormal/killed only when terminal evidence or owner loss is authoritative; record exit code, classification, stderr tail, branch, worktree, slice ID, and invocation generation; emit a durable terminal lifecycle event; transition to FAILED or PARKED with an explicit cause; keep unresolved cases nonterminal and observable.\n\nVERIFY: focused heartbeat, lifecycle, and replay tests; crash-window tests; full TL Python suite and Ruff.\n\nDONE: missing rows no longer disappear silently; authoritative terminal evidence produces exactly one durable transition and unresolved evidence remains inspectable without false failure.",
+      "status": "closed",
+      "priority": "critical",
+      "parent_id": 893,
+      "labels": [
+        "bug"
+      ],
+      "comments": [
+        {
+          "content": "Implemented durable missing-worker reconciliation in 751f9b76; unresolved rows remain nonterminal and authoritative terminal evidence parks exactly once.",
+          "created_at": "2026-08-21T06:09:46.176554072+00:00",
+          "kind": "resolution"
+        },
+        {
+          "content": "Fixed project-root evidence lookup: production TL config now propagates the project root through nested TLs into heartbeat reconciliation, with a regression fixture separating .exo/tl-loop state from project .exo evidence. Focused heartbeat suite: 10 passed.",
+          "created_at": "2026-08-21T13:02:12.811706219+00:00",
+          "kind": "note"
+        }
+      ],
+      "created_at": "2026-08-21T05:12:36.610256866+00:00",
+      "updated_at": "2026-08-21T13:02:12.841770447+00:00",
+      "closed_at": "2026-08-21T13:02:12.841770447+00:00"
+    },
+    {
+      "id": 919,
+      "title": "Fix poll_workers filtering for runtime agent identities",
+      "description": "ROOT CAUSE: tl_loop/loop/heartbeat.py sends slice IDs such as tunable-operator-body, while the runtime agent is named tunable-operator-body-opencode. haskell/wasm-guest PollWorkers.hs applies exact name filtering and omits the runtime row.\n\nANTI-PATTERNS: Do not use suffix stripping or ambiguous fuzzy matching. Do not make branch names the owner identity. Do not silently widen every filtered poll to all agents without preserving requested ownership.\n\nREAD FIRST: haskell/wasm-guest/src/ExoMonad/Guest/Tools/PollWorkers.hs; haskell/wasm-guest/test/ExoMonad/Guest/Tools/PollWorkersTest.hs; tl_loop/loop/heartbeat.py; tl_loop/tests/test_heartbeat.py; tl_loop/identity.py and current #898 routing code.\n\nSTEPS: Define one canonical slice-to-runtime-agent resolution path using persisted dispatch_agent_id/owner identity; make poll_workers accept or resolve canonical runtime names before filtering; preserve explicit unresolved/ambiguous results for the caller; add unit tests for tunable-operator-body -> tunable-operator-body-opencode and collision rejection.\n\nVERIFY: Haskell wasm-guest tests; focused TL heartbeat/identity tests; formatting and relevant integration tests.\n\nDONE: filtered polling returns the owning runtime row for a valid canonical mapping, rejects ambiguity, and never hides a live or terminal agent because its runtime suffix differs.",
+      "status": "closed",
+      "priority": "critical",
+      "parent_id": 893,
+      "labels": [
+        "bug"
+      ],
+      "comments": [
+        {
+          "content": "Implemented runtime identity polling in 9d71b8de; exact dispatch_agent_id mapping, collision rejection, and tests pass.",
+          "created_at": "2026-08-21T06:09:46.135239510+00:00",
+          "kind": "resolution"
+        },
+        {
+          "content": "Runtime identity polling is complete: heartbeat sends persisted dispatch_agent_id, rejects ambiguous mappings, and Haskell poll_workers now reports missing requested identities. Focused heartbeat and WASM suites pass; #920 and #922 are closed.",
+          "created_at": "2026-08-21T13:28:32.591669943+00:00",
+          "kind": "note"
+        }
+      ],
+      "created_at": "2026-08-21T05:12:36.561041566+00:00",
+      "updated_at": "2026-08-21T13:28:32.612679694+00:00",
+      "closed_at": "2026-08-21T13:28:32.612679694+00:00"
+    },
     {
       "id": 918,
       "title": "Add a versioned Chainlink issue export",
@@ -418,7 +623,7 @@
       "id": 905,
       "title": "Make TL lifecycle side effects crash-idempotent",
       "description": "## ANTI-PATTERNS\n- Do not rely on process-local flags for exactly-once behavior.\n- Do not assume a tool timeout means the side effect failed.\n- Do not retry merge, reviewer spawn, PR filing, or cleanup before reconciling an unknown outcome.\n- Do not use random retry identities that defeat deduplication.\n\n## READ FIRST\n- TL dispatch intent and reviewer_attempt claim code\n- spawn_leaf/spawn_reviewer, file_pr/update PR, merge_pr, dispose/cleanup handlers\n- checkpoint atomic writer and ledger acknowledgement ordering\n- Forgejo compare-and-swap/verified-head logic and invocation/routing stores\n\n## CODE SCAFFOLD\n- Define stable operation keys from run ID, slice ID, lifecycle operation, attempt/generation, PR number, and head SHA as applicable.\n- Persist an action journal with intended, dispatched/unknown, confirmed, rejected, and compensated outcomes.\n- Centralize claim/reconcile/execute/confirm behavior rather than adding per-handler booleans.\n\n## STEPS\n1. Inventory every externally visible lifecycle side effect: worker/TL/reviewer spawn, guidance, PR file/update, review response, merge, issue close, notification, and resource cleanup.\n2. Specify authoritative confirmation for each effect.\n3. Persist intent before dispatch and confirmation after observing authority.\n4. On restart, reconcile intended or unknown outcomes before retrying.\n5. Make duplicate delivery and replay converge on the same outcome.\n6. Preserve explicit cancellation and human escalation semantics.\n\n## VERIFY\n- Inject crashes before intent, after intent, after external success but before checkpoint, after checkpoint but before ledger ack, and after ack.\n- Assert one worker/reviewer/PR/merge/cleanup outcome across repeated restarts.\n- Property-test stable keys and conflicting generations/head SHAs.\n\n## DONE CRITERIA\n- Every lifecycle side effect is crash-idempotent or has a documented authoritative reconciliation/compensation path.\n- Unknown outcomes never cause blind retries.\n- Journal evidence remains inspectable after success and failure.",
-      "status": "open",
+      "status": "closed",
       "priority": "critical",
       "parent_id": 902,
       "labels": [
@@ -454,11 +659,21 @@
           "content": "REOPENED — HIGH-SEVERITY REVIEW FINDING (2026-08-20).\n\nROOT CAUSE\nThe repair resume side effect bypasses the durable action journal. _route_repair calls compose_repair, which dispatches resume_pr inside tl_loop/rlm/repair.py::_dispatch_resume; only after the host call returns does it increment attempts/checkpoint and append an in-memory EffectIntent. A crash after the host successfully starts the resumed invocation but before that checkpoint leaves no durable intended/unknown/confirmed resume record. On replay, Rust spawn_leaf_subtree sees the exact owner already alive and returns the existing invocation; resume_existing_pr then rejects it because no fresh invocation was created. The controller converts that rejection to RepairDispatchError and parks the slice as review_stuck. _reconcile_nonterminal_slices reconstructs owner/PR observations but does not reconcile the outcome of the resume action. This is safe against a duplicate process, but it is not crash-idempotent convergence and does not satisfy this issue's required crash-after-external-success verification.\n\nANTI-PATTERNS — DO NOT\n- Do not treat every already-running owner as success; require exact PR, owner, head SHA, invocation provenance, and repair attempt/generation agreement.\n- Do not blindly retry an intended/unknown resume.\n- Do not create a replacement owner, branch, worktree, or PR.\n- Do not weaken the fresh-invocation guard for ordinary calls.\n- Do not solve this only with an in-memory EffectIntent or a generic review_stuck park.\n- Do not start/restart exomonad init, exomonad serve, or exomonad new in the developer workspace.\n\nREAD FIRST\n- tl_loop/loop/driver.py: _route_repair, _invoke, _reconcile_action_journal, _reconcile_nonterminal_slices\n- tl_loop/rlm/repair.py: compose_repair, _dispatch_resume\n- tl_loop/loop/journal.py\n- rust/exomonad-core/src/handlers/agent.rs: resume_existing_pr\n- rust/exomonad-core/src/services/agent_control/spawn.rs: resume guard and existing-live-owner path\n- tl_loop/tests/test_repair.py, test_journal.py, test_action_journal_reconciliation.py, test_startup_reconciliation.py, test_reconcile.py\n\nSTEPS\n1. Define a stable repair-resume action identity containing run ID, slice ID, operation, repair attempt/generation, PR number, expected head SHA, owner identity, and selected model where relevant.\n2. Persist resume intent before calling the host and persist confirmed/rejected/unknown outcome at the same boundary used by _invoke, or extend _invoke so repair composition and dispatch are separated cleanly.\n3. On startup, reconcile intended/unknown resume entries against authoritative owner invocation metadata, PR number, head SHA, routing liveness, and watcher evidence.\n4. If the exact resumed invocation already exists, mark the action confirmed, increment repair attempts exactly once, and reconstruct the correct repairing/waiting state without redispatch.\n5. If authority proves no matching invocation exists, require a fresh compensation/approval gate before retry. If evidence is ambiguous or contradictory, preserve it and open a human gate.\n6. Keep the host fresh-invocation guard for normal resume calls; add an explicit inspect/reconcile path rather than converting unrelated live owners into success.\n7. Ensure journal evidence remains inspectable across confirmation, rejection, compensation, and repeated restart.\n\nVERIFY\n- Add deterministic crash-window tests: before intent, after intent/before host call, after host success/before attempt increment, after checkpoint/before ledger acknowledgement, and repeated restart/replay.\n- Assert exactly one resumed invocation, one repair-attempt increment, no replacement PR/branch/owner, and no review_stuck park when exact authoritative evidence confirms success.\n- Assert mismatched PR/head/owner/invocation evidence opens a human gate and never retries.\n- Run:\n  - tl_loop/.venv/bin/python -m pytest -q tl_loop/tests/test_repair.py tl_loop/tests/test_journal.py tl_loop/tests/test_action_journal_reconciliation.py tl_loop/tests/test_startup_reconciliation.py tl_loop/tests/test_reconcile.py\n  - tl_loop/.venv/bin/python -m pytest -q tl_loop/tests\n  - tl_loop/.venv/bin/ruff check tl_loop\n\nBOUNDARY\nLimit changes to repair dispatch/journaling/reconciliation and focused Rust inspection support if required. Do not implement the #907 live crash matrix here.\n\nDONE CRITERIA\nA crash at every resume boundary converges through ordinary restart to the same single authoritative invocation and correct controller state; unknown outcomes are reconciled before retry; attempts increment once; contradictions preserve evidence and require human approval; focused and full Python suites are green.",
           "created_at": "2026-08-20T14:55:37.704824925+00:00",
           "kind": "note"
+        },
+        {
+          "content": "Implemented crash-idempotent repair/resume side effects in bf543b13; journaled resume_pr dispatch and added replay/unknown-outcome coverage. Focused TL tests and Ruff pass.",
+          "created_at": "2026-08-21T06:09:46.105047972+00:00",
+          "kind": "resolution"
+        },
+        {
+          "content": "Crash-idempotent TL side effects are implemented in bf543b13: resume_pr intent is journaled before dispatch, unknown outcomes reconcile through durable owner evidence, and the action-journal/restart tests are green. This closure is limited to the #905 repair/resume boundary; the separate live #907 matrix remains open.",
+          "created_at": "2026-08-21T13:28:38.626657277+00:00",
+          "kind": "note"
         }
       ],
       "created_at": "2026-08-18T13:19:52.114067705+00:00",
-      "updated_at": "2026-08-20T14:55:37.045381820+00:00",
-      "closed_at": null
+      "updated_at": "2026-08-21T13:28:38.647510455+00:00",
+      "closed_at": "2026-08-21T13:28:38.647510455+00:00"
     },
     {
       "id": 904,
@@ -541,7 +756,7 @@
       "id": 902,
       "title": "Make ExoMonad resume interrupted orchestration automatically",
       "description": "## Objective\n\nMake interruption recovery a default ExoMonad invariant. Running exomonad init must reconcile the existing session to its desired healthy state and resume the persisted TL orchestration automatically. A controller, tmux window, server, watcher, worker, reviewer, or host interruption may delay work but must not lose the lifecycle position, duplicate side effects, or require --recreate.\n\n## Product contract\n\n- exomonad init is idempotent desired-state reconciliation, not attach-only behavior.\n- If the session is healthy, init attaches without disruption.\n- If Server, Watcher, or TL is missing or exited, init restores only the missing component and preserves healthy workers, reviewers, panes, checkpoints, ledgers, and PRs.\n- A restarted TL loads its checkpoint, reconciles every nonterminal slice against authoritative runtime and Forgejo evidence, executes the next required action exactly once, and continues watching.\n- --recreate remains the only explicit archive-and-fresh-start operation.\n- No --continue flag is required for correctness; continuation is the normal init behavior.\n- Elapsed time is telemetry only. Terminal transitions require authoritative completion, failure, cancellation, integrity failure, or human escalation evidence.\n\n## Confirmed motivating failure\n\nIn beast workspace PR #42, pr.filed was acknowledged before identity association. The checkpoint retained a spawned slice with branch/dispatch owner but no pr_number or reviewer_attempt, and the cursor advanced beyond the reviewer-triggering event. The TL later exited on branch-identified CI. Restarting the controller from cursor+1 cannot reconstruct the missing PR/reviewer state, while init without --recreate only attaches to the live session and does not restore the missing TL window.\n\n## Architectural boundary\n\n- Rust init/session supervision owns process and tmux desired state: install the correct embedded controller, inspect health, restore missing components, serialize concurrent init, and launch exactly one root TL against the existing checkpoint.\n- The Python TL controller owns semantic recovery: reconcile checkpoint state with immutable ledger events, routing/invocation state, published-head evidence, Forgejo PR/review/CI state, and durable action claims.\n- External observations are evidence. Branch parsing, pane existence, process exit, inbox delivery, and elapsed time are not authoritative lifecycle completion.\n\n## Authoritative recovery invariants\n\n1. Never archive or reset a checkpoint during ordinary init.\n2. Never kill or respawn a healthy worker/reviewer merely because the TL died.\n3. Never acknowledge an observation without either applying it, durably quarantining it, or recording an explicit non-reconcilable integrity disposition.\n4. Every external side effect has a stable idempotency key and durable intent/outcome record.\n5. Unknown side-effect outcomes are reconciled from the authoritative target before retry.\n6. Startup reconciliation is deterministic, ambiguity-safe, restartable, and identical for root and recursive sub-TLs.\n7. Corrupt or unsupported recovery artifacts are preserved and surfaced; they are never silently treated as empty.\n\n## Anti-patterns\n\n- Do not introduce an opt-in --continue mode as the only recovery path.\n- Do not implement recovery by calling --recreate, rewinding the entire ledger, deleting checkpoints, or resubmitting all work.\n- Do not infer ownership by stripping main. prefixes or harness suffixes.\n- Do not duplicate workers, reviewers, PRs, merge operations, notifications, or cleanup actions after a crash.\n- Do not make every inconsistency nonfatal; contradictory authoritative evidence must open a durable integrity/human gate.\n- Do not use production lifecycle timeouts to declare work failed.\n- Do not test against the operator workspace or require manual timing.\n\n## Global acceptance criteria\n\n- Re-running init in every partial-session state converges to one healthy Server, Watcher, and root TL without disturbing healthy child agents.\n- Killing the TL at every lifecycle boundary resumes the same run and advances to the correct next action.\n- The historical PR #42 shape recovers pr_number/head ownership and spawns exactly one reviewer despite the original pr.filed already being acknowledged.\n- Root and nested sub-TLs recover equivalently.\n- Repeated init and controller restarts are idempotent.\n- Recovery preserves controller-exit, checkpoint, ledger, gate, quarantine, and action-journal evidence.\n- Unit, property/replay, Rust integration, real-server watcher-to-ledger-to-Python, tmux lifecycle, and Forgejo-shaped E2E tests pass.\n- The full recovery E2E matrix passes three consecutive times.\n\n## Verification baseline\n\n- just tl-loop-test and just tl-loop-lint.\n- cargo fmt --all --check.\n- cargo clippy for modified Rust crates with -D warnings.\n- Relevant Rust unit/integration suites.\n- Disposable real-server and tmux recovery harnesses; never run exomonad init against the developer workspace.\n\n## Done criteria\n\nAfter any recoverable interruption, an operator can run plain exomonad init and observe the same orchestration resume from authoritative state without data loss, duplicate side effects, manual checkpoint edits, or --recreate.",
-      "status": "open",
+      "status": "closed",
       "priority": "critical",
       "parent_id": null,
       "labels": [
@@ -562,11 +777,21 @@
           "content": "PARENT CLOSURE PLAN (2026-08-20 audit). Most recovery infrastructure exists, but this epic cannot close until child acceptance converges. Dependency order: #898 routing acceptance -> #904 reconciliation closure; #905 side-effect safety audit; then #906 migration closure; then #907 full crash-injection matrix; finally #902. #903 was independently verified and closed on 2026-08-20. Parent DONE evidence must show plain exomonad init resumes the same orchestration after every recoverable interruption without data loss, duplicate side effects, manual checkpoint edits, or recreate. Require all children closed and attach the three-consecutive #907 run traces before closing #902.",
           "created_at": "2026-08-20T13:33:43.705619311+00:00",
           "kind": "note"
+        },
+        {
+          "content": "Added checkpoint resume terminal-state coverage and pinned init recovery server launches to the binary that launched init in 1837d197 and 8adc09bb. Rust init tests, full core tests, Clippy, and formatting pass. Existing live workspace server is /home/goya/.cargo/bin/exomonad; source build is target/debug/exomonad.",
+          "created_at": "2026-08-21T06:09:46.260108683+00:00",
+          "kind": "resolution"
+        },
+        {
+          "content": "Resume reconciliation now fails closed on unsupported checkpoint shapes/phases instead of treating a top-level or unknown phase as terminal/empty. Recognized TL FSM phases resume only when nonterminal; tl_done/tl_failed are terminal. Init tests for missing, waiting, terminal, corrupt, and unsupported checkpoints pass.",
+          "created_at": "2026-08-21T13:22:09.624920775+00:00",
+          "kind": "note"
         }
       ],
       "created_at": "2026-08-18T13:19:51.982446275+00:00",
-      "updated_at": "2026-08-18T13:19:51.982446275+00:00",
-      "closed_at": null
+      "updated_at": "2026-08-21T13:22:09.654411581+00:00",
+      "closed_at": "2026-08-21T13:22:09.654411581+00:00"
     },
     {
       "id": 901,
@@ -664,7 +889,7 @@
       "id": 898,
       "title": "Fix review and CI routing for spawned leaf identities",
       "description": "## Objective\n\nRoute PR, review, and CI observations to the owning TL plan slice using stable, deterministic identity. A valid but temporarily unresolved watcher observation must never crash the TL controller.\n\n## Confirmed production failure\n\n- Beast workspace PR #42, head 7e0aeb5f6d18156d6409d523cda56ff3353dd521.\n- Plan slice: tunable-operator-body.\n- Spawned agent: tunable-operator-body-opencode; branch: main.tunable-operator-body-opencode.\n- Ledger seq 1060 pr.filed used the spawned agent/branch identity. The controller left pr_number null and reviewer_attempt empty, so no reviewer spawned.\n- Ledger seq 1083 CI pending used the branch as agent_id. The controller raised: CI event references unknown slice main.tunable-operator-body-opencode.\n- The actual CI failure was seq 1147, about eleven minutes later, and did not cause the crash.\n\n## Root cause\n\n- tl_loop/loop/driver.py _review_slice_id and _event_slice_id do not normalize SliceState.branch or dispatch_agent_id to the plan slice.\n- pr.filed is admitted but silently fails to update the slice when its runtime identity differs from the plan key.\n- The same unresolved branch identity is later admitted for CI and treated as a fatal TLLoopError.\n- rust/exomonad-core/src/services/worktree_event_watcher.rs canonical emission uses branch as agent_id and omits stable slice_id/pr_number ownership.\n- Existing tests use canonical leaf-a identities or pre-associated PR numbers and do not reproduce the production sequence.\n\n## Authoritative contract\n\nUse one centralized, ambiguity-safe resolver for lifecycle observations. Resolution precedence must include dispatch intent, canonical slice_id, persisted PR ownership, dispatch_agent_id, and current branch. Reject ambiguity explicitly. When ownership cannot yet be established, quarantine/diagnose the observation and allow later authoritative evidence or replay to reconcile it; do not mutate an arbitrary slice and do not terminate the controller.\n\n## Anti-patterns\n\n- Do not strip main. or harness suffixes heuristically as the primary identity model.\n- Do not make every unknown event globally nonfatal; malformed or contradictory authoritative evidence must remain an integrity error.\n- Do not rely only on PR-number fallback because first pr.filed establishes that association.\n- Do not fix only Python or only Rust while leaving their event contract incompatible.\n- Do not spawn duplicate reviewers during replay or reordered delivery.\n\n## Global verification\n\n- Python TL-loop unit and replay tests.\n- Rust watcher unit/integration tests.\n- Real-server root and recursive/sub-TL lifecycle tests using production-shaped branch identities.\n- Ruff, rustfmt, Clippy, and relevant full suites.\n- Run the production-shaped E2E at least three consecutive times.\n\n## Done criteria\n\n- PR filing associates PR #42-shaped evidence with its plan slice and launches exactly one reviewer.\n- Pending/success/failure CI events using branch or spawned-agent identities update only the owning slice.\n- Unresolved observations are durable and diagnosable but nonfatal.\n- Ambiguous or contradictory ownership is rejected without arbitrary routing.\n- Replay and event reordering are idempotent for root and recursive TLs.",
-      "status": "open",
+      "status": "closed",
       "priority": "critical",
       "parent_id": null,
       "labels": [
@@ -710,11 +935,21 @@
           "content": "CLOSURE GUIDANCE (2026-08-20 audit). Core routing and all referenced repairs are present in HEAD: 973a308f, 25b049cb, 276ec171, e66d140c, 2b98346d, 1de764d7, b5658573, 6190dc98, 36a9d4e3, and c90a8038. Remaining gap is managed live acceptance through child #901 and cleanup child #908. Closure order: verify/close #908, complete/close #901, then close #898. Required evidence: three consecutive production-shaped real-server runs proving PR #42-shaped filing binds one plan slice and spawns exactly one SHA-scoped reviewer; branch/agent CI pending-success-failure updates only that slice; unresolved evidence is durable/nonfatal; ambiguity is rejected; replay/root/recursive routing is idempotent. Do not use suffix stripping or weaken ownership assertions.",
           "created_at": "2026-08-20T13:33:43.555674352+00:00",
           "kind": "note"
+        },
+        {
+          "content": "Added explicit runtime branch identity review/CI coverage in 02325fdd. Routing and mock ordered E2E suites pass. Managed real-server acceptance remains blocked by the same temporary server.sock startup failure.",
+          "created_at": "2026-08-21T06:09:46.239113543+00:00",
+          "kind": "blocker"
+        },
+        {
+          "content": "Fixed production watcher delivery to use the persisted runtime owner identity in AgentMessage instead of the branch string. Canonical ledger payload continues to carry owner_id, branch, slice_id, pr_number, and head_sha. Focused exomonad-core tests pass.",
+          "created_at": "2026-08-21T13:20:59.163073010+00:00",
+          "kind": "note"
         }
       ],
       "created_at": "2026-08-18T09:08:54.904995661+00:00",
-      "updated_at": "2026-08-18T09:08:54.904995661+00:00",
-      "closed_at": null
+      "updated_at": "2026-08-21T13:20:59.192945795+00:00",
+      "closed_at": "2026-08-21T13:20:59.192945795+00:00"
     },
     {
       "id": 897,
@@ -824,7 +1059,7 @@
       "id": 893,
       "title": "Keep TL orchestration active until authoritative lifecycle resolution",
       "description": "## Objective\n\nKeep the root TL and recursive sub-TL orchestrators active until authoritative lifecycle evidence, an explicit human decision, cancellation, or an unrecoverable integrity/process failure resolves the work. Elapsed task time must be observational only and must never by itself create TLFailed, park a slice, open a gate, terminate a controller, or kill an active worker.\n\n## Confirmed production failure\n\nBeast-rs session on 2026-08-17:\n\n- 15:55:08: canonical agent.spawned is correlated and the slice transitions dispatch_unconfirmed -> spawned.\n- 15:55:08: root FSM transitions tl_planning -> tl_waiting.\n- Worker invocation 8ffc4d22-0728-4158-9c76-2eaeb072a693 remains running in window @3 with the correct model and effort.\n- 15:55:38: the generic 30-second idle deadline expires.\n- _park_timeout opens tl-timeout and writes TLFailed while the slice remains spawned.\n- The TL process exits normally and its tmux window disappears.\n\nThis is current intended code behavior, not a race. The root loop does not consult worker liveness before applying the idle timeout, and it should not need to: a quiet active worker is a valid orchestration state.\n\n## Authoritative terminal contract\n\nTL orchestration may change to a terminal/parked state only from:\n\n- authoritative agent lifecycle evidence such as completion, explicit failure, or stuck escalation;\n- authoritative review/CI history and watcher-produced escalation events;\n- an explicit human gate/cancel/shutdown decision;\n- verified process death when recovery/reconciliation cannot preserve ownership;\n- unrecoverable checkpoint, ledger-integrity, or protocol errors.\n\nElapsed wall time, event silence, unchanged checkpoints, or lack of tool traffic are not terminal evidence.\n\nPer-call network/process timeouts may remain as bounded I/O safeguards, but they must be retryable/reconcilable and must not be promoted into task lifecycle failure solely because time elapsed.\n\n## Global anti-patterns\n\n- Do not replace the 30-second timeout with a larger number.\n- Do not poll worker liveness merely to reset an orchestration countdown.\n- Do not convert time thresholds into hidden kill switches elsewhere.\n- Do not remove human escalation or authoritative review-timeout events; those are evidence inputs, not controller timers.\n- Do not let tests depend on production task timeouts to terminate.\n- Do not confuse tmux pane survival with controller correctness.\n\n## Work breakdown\n\nThis epic is complete only after all subissues are closed and a real-server long-running-worker scenario passes.\n\n## Global verification\n\n- EXOMONAD_PY=tl_loop/.venv/bin/python just tl-loop-test\n- cargo test -p exomonad-core\n- bash tests/e2e/tl-loop-active/run.sh\n- python3 tests/e2e/ordered-recursive/real_server_transport.py\n- cargo fmt --check\n- cargo clippy --workspace --all-targets -- -D warnings\n\n## Done criteria\n\n- Root and nested TLs remain in tl_waiting for an active delegated task regardless of elapsed time.\n- Time is recorded and emitted as observability without changing lifecycle state.\n- Dispatch uncertainty is reconciled from authoritative evidence without elapsed-time failure.\n- Active agents are not killed because a task/session duration threshold elapsed.\n- Tests use explicit cancellation or bounded harness controls rather than production lifecycle timers.\n- Review history and human escalation remain the mechanisms that bound unresolved work.",
-      "status": "open",
+      "status": "closed",
       "priority": "critical",
       "parent_id": null,
       "labels": [
@@ -840,11 +1075,26 @@
           "content": "CLOSURE GUIDANCE (2026-08-20 audit). Implementation is present in e170ddba, de207b3d, 41d69b6b, and 076ec0a6; all children #894-#897 are closed. Remaining gap is acceptance evidence, not known missing production code: the final ordered-recursive real-server harness previously timed out and no durable record of three consecutive green runs exists. Delegate in a disposable environment. Do not enlarge timeouts or add elapsed-time terminal behavior. Verify: just tl-loop-ordered-e2e; then run just tl-loop-ordered-server-e2e three consecutive times. Record phase, controller exit, ledger cursor, and cleanup evidence on failure. DONE: three consecutive real-server passes, quiet live work stays nonterminal, and every run leaves no tmux/process/worktree residue; then close #893.",
           "created_at": "2026-08-20T13:33:43.524323867+00:00",
           "kind": "note"
+        },
+        {
+          "content": "Verified 2026-08-21: PollWorkers.hs exact-filters requested names (filterSelected), heartbeat.py requests slice_state.id and silently continues when worker_rows has no matching row. Therefore tunable-operator-body vs tunable-operator-body-opencode is a live liveness bug, not merely a historical incident. The four child tasks decompose canonical identity resolution, authoritative missing-row lifecycle handling, durable exit context, and regression/real-server acceptance.",
+          "created_at": "2026-08-21T05:12:36.728826400+00:00",
+          "kind": "observation"
+        },
+        {
+          "content": "Added process-loss handling for recursive sub-TLs in aa9ff286. Deterministic TL suite (459 tests) and active-controller E2E pass. The disposable real-server harness timed out after 180s because its temporary server.sock never appeared; no durable server process/session residue remains.",
+          "created_at": "2026-08-21T06:09:46.218362220+00:00",
+          "kind": "blocker"
+        },
+        {
+          "content": "Removed lifecycle idle-timeout failure: the controller no longer raises LoopTimeout for live orchestration, and the default keeps waiting until authoritative resolution. Explicit bounded/test callers can opt out with keep_alive_on_waiting=False. Driver suite: 58 passed.",
+          "created_at": "2026-08-21T13:19:14.227261788+00:00",
+          "kind": "note"
         }
       ],
       "created_at": "2026-08-17T16:00:57.156149950+00:00",
-      "updated_at": "2026-08-17T16:00:57.156149950+00:00",
-      "closed_at": null
+      "updated_at": "2026-08-21T13:19:14.257352279+00:00",
+      "closed_at": "2026-08-21T13:19:14.257352279+00:00"
     },
     {
       "id": 892,
@@ -17803,7 +18053,7 @@
       "comments": [],
       "created_at": "2026-04-28T23:58:27.124214369+00:00",
       "updated_at": "2026-04-28T23:58:27.124214369+00:00",
-      "closed_at": "2026-08-20T14:55:54.337110169+00:00"
+      "closed_at": "2026-08-21T14:33:46.525719017+00:00"
     },
     {
       "id": 54,
@@ -17819,7 +18069,7 @@
       "comments": [],
       "created_at": "2026-04-28T23:58:27.057834162+00:00",
       "updated_at": "2026-04-28T23:58:27.057834162+00:00",
-      "closed_at": "2026-08-20T14:55:54.337115198+00:00"
+      "closed_at": "2026-08-21T14:33:46.525727493+00:00"
     },
     {
       "id": 53,
@@ -18115,7 +18365,7 @@
       "comments": [],
       "created_at": "2026-04-26T00:12:17.908966219+00:00",
       "updated_at": "2026-04-26T00:12:17.908966219+00:00",
-      "closed_at": "2026-08-20T14:55:54.337184809+00:00"
+      "closed_at": "2026-08-21T14:33:46.525844953+00:00"
     },
     {
       "id": 36,
