@@ -148,7 +148,7 @@ class LedgerReader:
         self.scope_run_id = effective_scope
         self.scope_agent_id = scope_agent_id
         self._segment_cache: dict[Path, _SegmentCacheEntry] = {}
-        self._terminal_matches: tuple[tuple[str | None, str | None, Mapping[str, object]]] = ()
+        self._terminal_matches: tuple[tuple[str | None, str | None, Mapping[str, object]], ...] = ()
 
     def cursor(self) -> int:
         """Return the persisted global cursor, or zero for a new local reader."""
@@ -288,7 +288,9 @@ class LedgerReader:
                         row.document.get("agent_id")
                         if isinstance(row.document.get("agent_id"), str)
                         else None,
-                        data.get("slice_id") if isinstance(data.get("slice_id"), str) else None,
+                        data.get("slice_id")
+                        if isinstance(data.get("slice_id"), str) and data.get("slice_id")
+                        else None,
                         data,
                     )
                     for row in parsed.rows
@@ -305,7 +307,7 @@ class LedgerReader:
                 self._segment_cache[segment] = cached
                 changed = True
             rows.extend(cached.rows)
-            if cached.active_tail is not None:
+            if segment == active_segment and cached.active_tail is not None:
                 active_tail = cached.active_tail
         for segment in set(self._segment_cache) - current_segments:
             del self._segment_cache[segment]

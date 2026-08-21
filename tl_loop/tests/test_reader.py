@@ -66,6 +66,26 @@ def test_reader_finds_terminal_invocation_payload_with_shared_segment_parser(
     }
 
 
+def test_reader_keeps_empty_recorded_slice_compatible_with_agent_match(tmp_path: Path) -> None:
+    segments = tmp_path / "segments"
+    _write_segment(
+        segments,
+        1,
+        [
+            {
+                "type": "agent.invocation.finished",
+                "agent_id": "slice-a-opencode",
+                "data": {"slice_id": "", "status": "exited"},
+            }
+        ],
+    )
+
+    assert LedgerReader(segments).find_invocation_finished("slice-a-opencode", "slice-a") == {
+        "slice_id": "",
+        "status": "exited",
+    }
+
+
 def test_reader_reuses_unchanged_segment_for_terminal_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -95,6 +115,21 @@ def test_reader_reuses_unchanged_segment_for_terminal_evidence(
     reader.find_invocation_finished("slice-a-opencode", "slice-a")
 
     assert reads == [segments / "segment-000000000001.jsonl"]
+
+
+def test_reader_drops_cached_active_tail_when_new_segment_becomes_active(tmp_path: Path) -> None:
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    (segments / "segment-000000000001.jsonl").write_bytes(b'{"partial":')
+    reader = LedgerReader(segments)
+
+    assert reader.read_from().active_tail is not None
+
+    (segments / "segment-000000000002.jsonl").write_text(
+        json.dumps(_fixture_events()[0]) + "\n", encoding="utf-8"
+    )
+
+    assert reader.read_from().active_tail is None
 
 
 def test_cursor_persists_and_resume_spans_segment_boundary(tmp_path: Path) -> None:
