@@ -5,7 +5,7 @@ module ExoMonad.Guest.Tools.PollWorkersTest (pollWorkersTests) where
 import Data.Aeson (Value, object, (.=))
 import Data.Text (Text)
 import Data.Text qualified as T
-import ExoMonad.Guest.Tools.PollWorkers (filterSelectedNames, pollWorkersNote, renderWorkersTable)
+import ExoMonad.Guest.Tools.PollWorkers (filterSelectedNames, missingSelectedNames, pollWorkersNote, renderWorkersTable)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, testCase)
 
@@ -31,7 +31,14 @@ pollWorkersTests =
         assertEqual
           "canonical runtime identity selection"
           ["tunable-operator-body-opencode"]
-          (filterSelectedNames (Just ["tunable-operator-body-opencode"]) available)
+          (filterSelectedNames (Just ["tunable-operator-body-opencode"]) available),
+      testCase "missing requested identity is reported instead of silently dropped" $ do
+        let requested = ["tunable-operator-body", "tunable-operator-body-opencode"]
+            available = ["tunable-operator-body-opencode"]
+        assertEqual
+          "runtime mismatch evidence"
+          ["tunable-operator-body"]
+          (missingSelectedNames (Just requested) available)
     ]
 
 retiredWindowRow :: Value

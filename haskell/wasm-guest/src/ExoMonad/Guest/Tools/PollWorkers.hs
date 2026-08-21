@@ -10,6 +10,7 @@ module ExoMonad.Guest.Tools.PollWorkers
     pollWorkersSchema,
     pollWorkersCore,
     filterSelectedNames,
+    missingSelectedNames,
     renderWorkersTable,
     pollWorkersNote,
   )
@@ -72,13 +73,16 @@ pollWorkersCore args = do
       sessionResult <- chainlinkSessionStatusCore
       let sessionValue = either (String . ("ERROR: " <>)) id sessionResult
           activeSessionIssue = either (const Nothing) activeIssueId sessionResult
-          agents = filterSelected (pwaAgents args) (V.toList (PS.listAgentsResponseAgents resp))
+          availableAgents = V.toList (PS.listAgentsResponseAgents resp)
+          agents = filterSelected (pwaAgents args) availableAgents
+          missingAgents = missingSelectedNames (pwaAgents args) (map (strictField PS.agentStatusName) availableAgents)
       rows <- forM agents (agentPollRow activeSessionIssue)
       pure $
         Right $
           object
             [ "table" .= renderWorkersTable rows,
               "workers" .= rows,
+              "missing_agents" .= missingAgents,
               "chainlink_session" .= sessionValue,
               "dead_workers" .= mapMaybe deadWorkerName rows,
               "stale_workers" .= mapMaybe staleWorkerName rows,
@@ -163,6 +167,11 @@ filterSelected names agents =
 filterSelectedNames :: Maybe [Text] -> [Text] -> [Text]
 filterSelectedNames Nothing names = names
 filterSelectedNames (Just names) available = filter (`elem` nub names) available
+
+missingSelectedNames :: Maybe [Text] -> [Text] -> [Text]
+missingSelectedNames Nothing _ = []
+missingSelectedNames (Just requested) available =
+  filter (`notElem` available) (nub requested)
 
 renderWorkersTable :: [Value] -> Text
 renderWorkersTable rows =
