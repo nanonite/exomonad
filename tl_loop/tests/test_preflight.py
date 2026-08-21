@@ -205,7 +205,7 @@ def test_cli_persists_actual_ledger_queue_failure_diagnostics(
                 str(project),
                 "--poll-interval",
                 "0.001",
-                "--idle-timeout",
+                "--task-timeout",
                 "1",
             ]
         )

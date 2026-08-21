@@ -352,6 +352,108 @@ def test_missing_worker_evidence_uses_project_root_not_tl_state_root(tmp_path: P
     assert result.events[0].payload["invocation_id"] == "inv-project-root"
 
 
+def test_task_budget_exceeded_is_journaled_killed_and_parked(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    current = state.slices["slice-a"]
+    updated = replace(
+        current,
+        dispatch_started_at=1.0,
+        task_timeout_seconds=5.0,
+        task_timeout_source="slice",
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    transport = HeartbeatTransport()
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    parked = result.state.slices["slice-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.TASK_BUDGET_EXCEEDED
+    assert result.events[0].kind == "agent.task_budget_exceeded"
+    assert result.events[0].payload["budget_source_layer"] == "slice"
+    assert [name for name, _ in transport.calls].count("close_worker_pane") == 1
+    journal = json.loads((store.run_dir / "action-journal.json").read_text(encoding="utf-8"))
+    assert journal[0]["status"] == "confirmed"
+
+
+def test_authoritative_terminal_wins_over_budget_in_same_heartbeat(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    current = state.slices["slice-a"]
+    updated = replace(
+        current,
+        dispatch_started_at=1.0,
+        task_timeout_seconds=5.0,
+        task_timeout_source="slice",
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    invocation_dir = tmp_path / ".exo" / "agents" / "agent-slice-a"
+    invocation_dir.mkdir(parents=True)
+    (invocation_dir / "invocation.json").write_text(
+        json.dumps({"slice_id": "slice-a", "status": "exited", "ended_at": 2}),
+        encoding="utf-8",
+    )
+    transport = HeartbeatTransport()
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    assert result.state.slices["slice-a"].status is SliceStatus.SPAWNED
+    assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+
+
+def test_zero_task_budget_disables_enforcement(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    current = state.slices["slice-a"]
+    updated = replace(
+        current,
+        dispatch_started_at=1.0,
+        task_timeout_seconds=None,
+        task_timeout_source="slice",
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    transport = HeartbeatTransport()
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10000.0,
+        project_root=tmp_path,
+    )
+
+    assert result.state.slices["slice-a"].status is SliceStatus.SPAWNED
+    assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+
+
 def _state(
     tmp_path: Path,
     *,

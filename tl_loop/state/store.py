@@ -263,17 +263,12 @@ class RunStore:
                 self.event_quarantine_path,
                 "every entry must be a JSON object",
             )
-        return tuple(
-            MappingProxyType(dict(item))
-            for item in payload
-        )
+        return tuple(MappingProxyType(dict(item)) for item in payload)
 
     def release_quarantined_event(self, run_seq: int) -> None:
         """Remove an event only after its ownership has been reconciled."""
         entries = [
-            dict(item)
-            for item in self.quarantined_events()
-            if item.get("run_seq") != run_seq
+            dict(item) for item in self.quarantined_events() if item.get("run_seq") != run_seq
         ]
         if entries:
             temporary = self.event_quarantine_path.with_suffix(".tmp")
@@ -440,8 +435,7 @@ def load(path: str | Path) -> RunState:
         if target.exists():
             report = record_migration_failure(target, error)
             raise CorruptCheckpoint(
-                f"{target}: could not read checkpoint: {error}; "
-                f"migration blocked, see {report}"
+                f"{target}: could not read checkpoint: {error}; migration blocked, see {report}"
             ) from error
         raise CorruptCheckpoint(f"{target}: could not read checkpoint: {error}") from error
     if not isinstance(value, dict):
@@ -450,9 +444,7 @@ def load(path: str | Path) -> RunState:
         migration = migrate_checkpoint_document(value, run_id=target.parent.name)
     except MigrationError as error:
         report = record_migration_failure(target, error)
-        raise CorruptCheckpoint(
-            f"{target}: migration blocked: {error}; see {report}"
-        ) from error
+        raise CorruptCheckpoint(f"{target}: migration blocked: {error}; see {report}") from error
     if migration.migrated:
         try:
             validate(migration.document)
@@ -701,6 +693,10 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["dispatch_authoritative_event_seq"] = value.dispatch_authoritative_event_seq
         if value.reconciliation is not None:
             record["reconciliation"] = copy.deepcopy(dict(value.reconciliation))
+        if value.task_timeout_seconds is not None:
+            record["task_timeout_seconds"] = value.task_timeout_seconds
+        if value.task_timeout_source is not None:
+            record["task_timeout_source"] = value.task_timeout_source
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
@@ -1097,6 +1093,8 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
             if isinstance(value.get("reconciliation"), dict)
             else None
         ),
+        task_timeout_seconds=cast(float | None, value.get("task_timeout_seconds")),
+        task_timeout_source=cast(str | None, value.get("task_timeout_source")),
     )
 
 

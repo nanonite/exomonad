@@ -300,7 +300,6 @@ def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> 
                 keep_alive_on_waiting=True,
                 max_events=8,
                 poll_interval=0.001,
-                idle_timeout=0.1,
                 root_dir=tmp_path,
             ),
             root_dir=tmp_path,

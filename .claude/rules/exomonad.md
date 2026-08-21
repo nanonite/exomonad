@@ -82,6 +82,14 @@ The controller is complete only at `TLDone` or `TLFailed`. It does not wait on
 an interactive prompt, scrape tmux output, manually fix a leaf, or silently
 continue past a bound.
 
+### Time and liveness
+
+Elapsed time may never infer worker death, failure, or stall. Silence and an
+unchanged checkpoint remain non-evidence. A declared task budget may enforce a
+bounded kill only when it is resolved slice → role → project → 3600-second
+default, persisted with dispatch ownership, journaled before disposal, and
+reported as `agent.task_budget_exceeded`. Zero or null disables that ceiling.
+
 ## Spec Quality
 
 Specs are self-contained — the leaf has no context from previous attempts. Every spec must include:

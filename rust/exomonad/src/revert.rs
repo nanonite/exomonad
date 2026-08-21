@@ -181,8 +181,7 @@ mod tests {
     use super::*;
     use exomonad::config::{
         CompanionConfig, ReviewerConfig, DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS,
-        DEFAULT_TL_CONTROLLER_STALL_TIMEOUT_SECONDS, DEFAULT_TL_DISPATCH_TIMEOUT_SECONDS,
-        DEFAULT_TL_IDLE_TIMEOUT_SECONDS, DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
+        DEFAULT_TL_TASK_TIMEOUT_SECONDS, DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
     };
     use exomonad_core::{services::AgentType, Role};
     use std::collections::HashMap;
@@ -222,9 +221,7 @@ mod tests {
             orphan_reconciler_interval_secs: None,
             tl_transport_timeout_seconds: DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
             tl_active_tail_timeout_seconds: DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS,
-            tl_dispatch_timeout_seconds: DEFAULT_TL_DISPATCH_TIMEOUT_SECONDS,
-            tl_controller_stall_timeout_seconds: DEFAULT_TL_CONTROLLER_STALL_TIMEOUT_SECONDS,
-            tl_idle_timeout_seconds: DEFAULT_TL_IDLE_TIMEOUT_SECONDS,
+            tl_task_timeout_seconds: DEFAULT_TL_TASK_TIMEOUT_SECONDS,
             openrouter: Default::default(),
             opencode: Default::default(),
             opencode_as_tl: false,

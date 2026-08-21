@@ -818,8 +818,6 @@ def main() -> None:
             max_events=128,
             max_parallel_slices=2,
             poll_interval=0.01,
-            idle_timeout=30.0,
-            dispatch_timeout=5.0,
             keep_alive_on_waiting=True,
             review_model_choice=_review_choice(),
             review_policy_path=Path(__file__).resolve().parents[3]

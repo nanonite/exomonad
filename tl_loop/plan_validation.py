@@ -10,7 +10,7 @@ from pathlib import Path
 _PLAN_KEYS = frozenset({"run_id", "budgets", "plan", "workers", "leaves", "sub_tls"})
 _PROPOSAL_KEYS = frozenset({"plan", "workers", "leaves", "sub_tls"})
 _TASK_KEYS = {
-    "workers": frozenset({"name", "task", "agent_type"}),
+    "workers": frozenset({"name", "task", "agent_type", "task_timeout_seconds"}),
     "leaves": frozenset(
         {
             "name",
@@ -22,6 +22,7 @@ _TASK_KEYS = {
             "steps",
             "verify",
             "done_criteria",
+            "task_timeout_seconds",
         }
     ),
     "sub_tls": frozenset(
@@ -36,6 +37,7 @@ _TASK_KEYS = {
             "agent_id",
             "order",
             "integration",
+            "task_timeout_seconds",
         }
     ),
 }

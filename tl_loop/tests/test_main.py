@@ -111,7 +111,7 @@ def test_rejected_plan_proposal_emits_bounded_reason_without_body(
     assert "secret" not in str(payload)
 
 
-def test_run_passes_all_timeouts_to_constructors(tmp_path: Path, monkeypatch) -> None:
+def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) -> None:
     captured: dict[str, dict[str, object]] = {}
 
     class EmptySource:
@@ -155,38 +155,29 @@ def test_run_passes_all_timeouts_to_constructors(tmp_path: Path, monkeypatch) ->
             run_id="root",
             poll_interval=0.25,
             max_events=256,
-            idle_timeout=90.0,
             transport_timeout=45.5,
             active_tail_timeout=60.0,
-            dispatch_timeout=12.0,
-            controller_stall_timeout=600.0,
+            task_timeout=90.0,
         )
     )
 
     assert captured["transport"] == {"project_root": tmp_path.resolve(), "timeout": 45.5}
     assert captured["ledger_queue"]["active_tail_timeout"] == 60.0
-    assert captured["tlloop_config"]["idle_timeout"] == 90.0
-    assert captured["tlloop_config"]["dispatch_timeout"] == 12.0
-    assert captured["tlloop_config"]["controller_stall_timeout"] == 600.0
+    assert captured["tlloop_config"]["task_timeout_seconds"] == 90.0
+    assert captured["tlloop_config"]["task_timeout_source"] == "project"
 
 
 def test_run_defaults_preserve_current_values() -> None:
     assert DEFAULT_TIMEOUT_SECONDS == 10.0
     assert DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS == 30.0
-    assert launcher.DEFAULT_DISPATCH_TIMEOUT == 5.0
-    assert launcher.DEFAULT_CONTROLLER_STALL_TIMEOUT == 300.0
-    assert launcher.DEFAULT_IDLE_TIMEOUT == 30.0
+    assert launcher.DEFAULT_TASK_TIMEOUT_SECONDS == 3600.0
 
     args = launcher._parser().parse_args(["run", "--project-root", "/tmp/repo"])
     assert args.transport_timeout == 10.0
     assert args.active_tail_timeout == 30.0
-    assert args.dispatch_timeout == 5.0
-    assert args.controller_stall_timeout == 300.0
-    assert args.idle_timeout == 30.0
+    assert args.task_timeout == 3600.0
 
-    assert TLLoopConfig.dispatch_timeout == 5.0
-    assert TLLoopConfig.controller_stall_timeout == 300.0
-    assert TLLoopConfig.idle_timeout == 30.0
+    assert TLLoopConfig.task_timeout_seconds == 3600.0
 
 
 def test_positive_float_rejects_nan() -> None:
@@ -196,3 +187,11 @@ def test_positive_float_rejects_nan() -> None:
         launcher._positive_float("0")
     assert launcher._positive_float("inf") == float("inf")
     assert launcher._positive_float("10.0") == 10.0
+
+
+def test_non_negative_float_rejects_nan_and_negative() -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        launcher._non_negative_float("nan")
+    with pytest.raises(argparse.ArgumentTypeError):
+        launcher._non_negative_float("-1")
+    assert launcher._non_negative_float("0") == 0.0

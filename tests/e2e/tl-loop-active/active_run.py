@@ -279,8 +279,6 @@ def run_active_wave(repo: Path, remote: Path, artifacts: Path) -> None:
         max_leaves=2,
         max_events=16,
         poll_interval=0.01,
-        idle_timeout=0.01,
-        dispatch_timeout=0.01,
         policy=policy,
         capabilities=CapabilityMap({"codex/gpt-luna": Difficulty.STANDARD}),
         source=source,

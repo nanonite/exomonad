@@ -268,9 +268,7 @@ poll_interval = 60           # optional — GitHub poll cycle in seconds (defaul
 # TL loop operational timeouts (seconds). Lifecycle progress is driven by authoritative events.
 tl_transport_timeout_seconds = 10.0           # UDS RPC timeout to the local server (default: 10)
 tl_active_tail_timeout_seconds = 30.0         # ledger tailer active-tail timeout (default: 30)
-tl_dispatch_timeout_seconds = 5.0             # spawn transport operation timeout (default: 5)
-tl_controller_stall_timeout_seconds = 300.0   # retained compatibility setting (default: 300)
-tl_idle_timeout_seconds = 30.0                # legacy compatibility setting; no lifecycle deadline
+tl_task_timeout_seconds = 3600.0              # project task ceiling; 0 disables enforcement
 forgejo_url = "http://localhost:3000"           # optional — Forgejo base URL
 forgejo_token = "forgejo_pat"                      # optional — Forgejo API token
 forgejo_webhook_secret = "shared-secret"           # optional — webhook signature secret
@@ -320,6 +318,13 @@ allowlist and budget boundary for the programmatic controller. It must contain e
 ceilings whose keys must be allowed), and `escalate_after_attempts` (a positive
 NO-GO threshold). A missing or invalid file is a startup error; the selector never
 creates a permissive default or widens these boundaries.
+
+Task duration uses one explicit precedence: a slice's `task_timeout_seconds` in
+`plan.json` overrides the role's value in `.exo/harness_policy.toml`, which
+overrides project `tl_task_timeout_seconds`, which defaults to 3600 seconds.
+A value of `0` or explicit `null` means no ceiling. Elapsed time never infers
+that a worker is dead or stalled; it may enforce only this declared, typed,
+journaled task ceiling.
 
 **Multiple git remotes:** By default, PR/CI operations (`file_pr`, `merge_pr`, the
 Forgejo watcher, and pushes) auto-detect the git remote to use, preferring one

@@ -41,7 +41,7 @@ class ParkCause(str, Enum):
     HARNESS_SWITCH_REQUESTED = "harness_switch_requested"
     STALL_DETECTED = "stall_detected"
     WORKER_TERMINAL = "worker_terminal"
-    DISPATCH_TIMEOUT = "dispatch_timeout"
+    TASK_BUDGET_EXCEEDED = "task_budget_exceeded"
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
     DISPATCH_FAILED = "dispatch_failed"
     CORRUPT_STATE = "corrupt_state"
@@ -191,6 +191,8 @@ SLICE_KEYS = frozenset(
         "dispatch_agent_id",
         "dispatch_authoritative_event_seq",
         "reconciliation",
+        "task_timeout_seconds",
+        "task_timeout_source",
     }
 )
 RECONCILIATION_KEYS = frozenset(
@@ -291,6 +293,8 @@ class SliceState:
     dispatch_agent_id: str | None = None
     dispatch_authoritative_event_seq: int | None = None
     reconciliation: Mapping[str, object] | None = None
+    task_timeout_seconds: float | None = None
+    task_timeout_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -713,6 +717,8 @@ def _validate_slice(
     _nullable_string(value, "dispatch_agent_id", path, errors)
     _nullable_non_negative_int(value, "dispatch_authoritative_event_seq", path, errors)
     _reconciliation(value.get("reconciliation"), path, errors)
+    _nullable_number(value, "task_timeout_seconds", path, errors)
+    _nullable_string(value, "task_timeout_source", path, errors)
     if value.get("status") == SliceStatus.SPAWNED.value:
         _non_empty_string(value, "dispatch_intent_id", path, errors)
         _non_empty_string(value, "dispatch_agent_id", path, errors)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -15,7 +16,14 @@ DEFAULT_POLICY_PATH = Path(".exo/harness_policy.toml")
 ROLE_NAMES = ("tl", "worker", "reviewer")
 _POLICY_KEYS = frozenset({"roles"})
 _ROLE_KEYS = frozenset(
-    {"allow", "cost_rank", "token_budget", "per_harness_budget", "escalate_after_attempts"}
+    {
+        "allow",
+        "cost_rank",
+        "token_budget",
+        "per_harness_budget",
+        "escalate_after_attempts",
+        "task_timeout_seconds",
+    }
 )
 StringMap: TypeAlias = Mapping[str, int]
 
@@ -41,6 +49,8 @@ class RolePolicy:
     token_budget: int
     per_harness_budget: StringMap
     escalate_after_attempts: int
+    task_timeout_seconds: float | None = None
+    task_timeout_configured: bool = False
 
 
 @dataclass(frozen=True)
@@ -105,12 +115,16 @@ def _parse_role(role: str, roles: Mapping[str, object]) -> RolePolicy:
     attempts = _positive_int(
         _required(table, "escalate_after_attempts", path), f"{path}.escalate_after_attempts"
     )
+    task_timeout_configured = "task_timeout_seconds" in table
+    task_timeout = _optional_timeout(table.get("task_timeout_seconds"), f"{path}.task_timeout_seconds")
     return RolePolicy(
         allow=allow,
         cost_rank=MappingProxyType(cost_rank),
         token_budget=token_budget,
         per_harness_budget=MappingProxyType(per_harness),
         escalate_after_attempts=attempts,
+        task_timeout_seconds=task_timeout,
+        task_timeout_configured=task_timeout_configured,
     )
 
 
@@ -160,6 +174,17 @@ def _positive_int_map(value: object, path: str) -> dict[str, int]:
             raise PolicyInvalid(f"{path}: keys must be non-empty strings")
         result[key] = _positive_int(item, f"{path}.{key}")
     return result
+
+
+def _optional_timeout(value: object, path: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PolicyInvalid(f"{path}: must be a non-negative number or null")
+    parsed = float(value)
+    if parsed < 0 or not math.isfinite(parsed):
+        raise PolicyInvalid(f"{path}: must be a non-negative number or null")
+    return None if parsed == 0 else parsed
 
 
 def _require_exact_keys(values: Mapping[str, int], allow: tuple[str, ...], path: str) -> None:

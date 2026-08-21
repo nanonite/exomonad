@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import math
 import multiprocessing
 import queue as queue_module
 import threading
@@ -103,7 +104,6 @@ from .reconcile import ReconciliationResult, reconcile_slice
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
 LOGGER = logging.getLogger(__name__)
-DISPATCH_TIMEOUT_GATE_NAME = "tl-dispatch-timeout"
 DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
@@ -233,15 +233,6 @@ class LoopLimitExceeded(TLLoopError):
     """The loop reached its event ceiling before reaching a terminal state."""
 
 
-class LoopTimeout(TLLoopError):
-    """The loop received no event for its configured idle window."""
-
-    def __init__(self, message: str, *, reason: str = "idle", timeout_seconds: float | None = None):
-        super().__init__(message)
-        self.deadline_reason = reason
-        self.timeout_seconds = timeout_seconds
-
-
 class LoopCancelled(TLLoopError):
     """The caller explicitly cancelled the controller without changing state."""
 
@@ -348,11 +339,14 @@ class WorkerTask:
     name: str
     task: str
     agent_type: str | None = None
+    task_timeout_seconds: float | None = None
+    task_timeout_declared: bool = False
 
     def __post_init__(self) -> None:
         _require_text(self.name, "worker name")
         _require_text(self.task, "worker task")
         _optional_text(self.agent_type, "worker agent_type")
+        _validate_task_timeout(self.task_timeout_seconds, "worker task_timeout_seconds")
 
 
 @dataclass(frozen=True)
@@ -368,12 +362,15 @@ class LeafTask:
     steps: tuple[str, ...] = ()
     verify: tuple[str, ...] = ()
     done_criteria: tuple[str, ...] = ()
+    task_timeout_seconds: float | None = None
+    task_timeout_declared: bool = False
 
     def __post_init__(self) -> None:
         _require_text(self.name, "leaf name")
         _require_text(self.task, "leaf task")
         _optional_text(self.agent_type, "leaf agent_type")
         _optional_text(self.context, "leaf context")
+        _validate_task_timeout(self.task_timeout_seconds, "leaf task_timeout_seconds")
         for field_name, values in (
             ("boundary", self.boundary),
             ("read_first", self.read_first),
@@ -437,6 +434,8 @@ class SubTLTask:
     order: int = 1
     integration: IntegrationContract = field(default_factory=IntegrationContract)
     order_explicit: bool = True
+    task_timeout_seconds: float | None = None
+    task_timeout_declared: bool = False
 
     def __post_init__(self) -> None:
         _require_text(self.name, "sub-TL name")
@@ -452,6 +451,7 @@ class SubTLTask:
             raise TypeError("sub-TL integration must be an IntegrationContract")
         if not isinstance(self.order_explicit, bool):
             raise TypeError("sub-TL order_explicit must be a boolean")
+        _validate_task_timeout(self.task_timeout_seconds, "sub-TL task_timeout_seconds")
 
 
 @dataclass(frozen=True)
@@ -466,12 +466,9 @@ class TLLoopConfig:
     test_harness: bool = False
     cancel_event: threading.Event | None = None
     poll_interval: float = 0.1
-    # Retained for configuration compatibility; lifecycle progress is driven
-    # by authoritative events, cancellation, and explicit test ceilings.
-    idle_timeout: float = 30.0
     keep_alive_on_waiting: bool = True
-    dispatch_timeout: float = 5.0
-    controller_stall_timeout: float = 300.0
+    task_timeout_seconds: float | None = 3600.0
+    task_timeout_source: str = "built_in"
     max_base_revalidations: int = 3
     max_integration_repairs: int = 3
     heartbeat: HeartbeatConfig | None = None
@@ -530,10 +527,8 @@ class TLLoopConfig:
             raise ValueError("project_root is required when heartbeat reconciliation is enabled")
         if type(self.keep_alive_on_waiting) is not bool:
             raise ValueError("keep_alive_on_waiting must be a boolean")
-        if self.dispatch_timeout <= 0:
-            raise ValueError("dispatch_timeout must be positive")
-        if self.controller_stall_timeout <= 0:
-            raise ValueError("controller_stall_timeout must be positive")
+        _validate_task_timeout(self.task_timeout_seconds, "task_timeout_seconds")
+        _require_text(self.task_timeout_source, "task_timeout_source")
         if type(self.enable_reviewer_spawn) is not bool:
             raise ValueError("enable_reviewer_spawn must be a boolean")
         if self.chainlink_issue_id is not None and self.chainlink_issue_id <= 0:
@@ -793,24 +788,7 @@ def _run_loop(
             event = quarantined.pop(replay_index)
             replaying = True
         else:
-            try:
-                event = _next_event(source, config)
-            except LoopTimeout as error:
-                _record_reader_findings(source, diagnostics)
-                if _has_pending_dispatch(state):
-                    return _park_dispatch_timeout(
-                        run_id,
-                        store,
-                        state,
-                        effects,
-                        config,
-                        effects_log,
-                        transitions,
-                        consumed,
-                        error,
-                        diagnostics,
-                    )
-                continue
+            event = _next_event(source, config)
         _record_reader_findings(source, diagnostics)
         if event is None:
             if config.heartbeat is not None:
@@ -1139,120 +1117,11 @@ def _run_loop(
     )
 
 
-def _has_pending_dispatch(state: RunState) -> bool:
-    return any(slice_state.status in DISPATCHING_STATUSES for slice_state in state.slices.values())
-
-
 def _record_reader_findings(source: EventQueue, diagnostics: EventDiagnostics) -> None:
     """Promote reader-side filtering into durable controller diagnostics."""
     findings = getattr(source, "findings", ())
     if findings:
         diagnostics.record_reader_findings(tuple(findings))
-
-
-def _park_dispatch_timeout(
-    run_id: str,
-    store: RunStore,
-    state: RunState,
-    effects: EffectClient | ReadOnlyEffectClient,
-    config: TLLoopConfig,
-    effects_log: list[EffectIntent],
-    transitions: list[LoopTransition],
-    consumed: list[int],
-    reason: str | LoopTimeout,
-    diagnostics: EventDiagnostics,
-) -> TLRunResult:
-    """Persist a distinct dispatch timeout when spawn proof never arrives."""
-    before_phase = _phase_from_state(state)
-    if diagnostics.received:
-        observed = (
-            f"consumed {diagnostics.received} event(s), filtered {diagnostics.filtered}, "
-            f"rejected {diagnostics.rejected} without an authoritative match"
-        )
-    else:
-        observed = "no event was received"
-    bounded_reason = (
-        f"no authoritative agent.spawned event within {config.dispatch_timeout:g}s; "
-        f"{observed}; {reason}"
-    )[:500]
-    pending = [
-        current for current in state.slices.values() if current.status in DISPATCHING_STATUSES
-    ]
-    updated_slices = {
-        current.id: replace(
-            current,
-            status=SliceStatus.DISPATCH_UNCONFIRMED,
-            park_cause=ParkCause.DISPATCH_TIMEOUT,
-            dispatch_last_boundary="dispatch_timeout",
-            dispatch_error=bounded_reason,
-        )
-        for current in pending
-    }
-    state = store.checkpoint(
-        TLFailed(f"dispatch timeout: {bounded_reason}"),
-        {**state.slices, **updated_slices},
-        state.budgets,
-        state.events.last_consumed_offset,
-    )
-    previous_gate = next(
-        (gate for gate in state.gates if gate.name == DISPATCH_TIMEOUT_GATE_NAME),
-        None,
-    )
-    state = store.set_gate(DISPATCH_TIMEOUT_GATE_NAME, GateStatus.PENDING)
-    if previous_gate is None or previous_gate.status is not GateStatus.PENDING:
-        _record_controller_event(
-            "controller",
-            "tl.gate_opened",
-            {"gate_name": DISPATCH_TIMEOUT_GATE_NAME, "run_id": run_id},
-            config,
-            effects,
-            effects_log,
-        )
-    for current in pending:
-        if current.dispatch_intent_id is None or current.dispatch_started_at is None:
-            continue
-        attempt = DispatchAttempt(
-            current.dispatch_intent_id,
-            current.dispatch_started_at,
-            current.agent_type or "",
-        )
-        _record_controller_event(
-            current.id,
-            "tl.dispatch_reconciliation_completed",
-            _dispatch_payload(
-                current.id,
-                attempt,
-                "dispatch_timeout",
-                error=bounded_reason,
-            ),
-            config,
-            effects,
-            effects_log,
-        )
-    _emit_phase_change(
-        run_id,
-        before_phase,
-        _phase_from_state(state),
-        config,
-        effects,
-        effects_log,
-    )
-    LOGGER.warning("[TL loop] dispatch timeout: %s", bounded_reason)
-    store.record_terminal_summary(
-        {
-            "reason": f"dispatch timeout: {bounded_reason}",
-            "deadline_reason": "dispatch",
-            "timeout_seconds": config.dispatch_timeout,
-            "diagnostics": diagnostics.snapshot(),
-        }
-    )
-    return TLRunResult(
-        state,
-        tuple(effects_log),
-        tuple(transitions),
-        tuple(consumed),
-        diagnostics=diagnostics.snapshot(),
-    )
 
 
 def _record_dispatch_intent(
@@ -5051,6 +4920,9 @@ def _initial_slices(
             derive_child_branch(selected.branch, worker.name) if nested else None,
             str(derive_child_worktree(owner_worktree, worker.name)) if nested else None,
             selected.parent_branch if nested else None,
+            config=selected,
+            task_timeout_seconds=worker.task_timeout_seconds,
+            task_timeout_declared=worker.task_timeout_declared,
         )
     for leaf in plan.leaves:
         paths = leaf.boundary or (f"tl-loop/{leaf.name}",)
@@ -5063,6 +4935,9 @@ def _initial_slices(
             derive_child_branch(selected.branch, leaf.name) if nested else None,
             str(derive_child_worktree(owner_worktree, leaf.name)) if nested else None,
             selected.parent_branch if nested else None,
+            config=selected,
+            task_timeout_seconds=leaf.task_timeout_seconds,
+            task_timeout_declared=leaf.task_timeout_declared,
         )
     for task in plan.sub_tls:
         result[task.name] = _initial_slice_record(
@@ -5073,6 +4948,9 @@ def _initial_slices(
             derive_child_branch(selected.branch, task.name),
             str(task.worktree or derive_child_worktree(owner_worktree, task.name)),
             selected.branch,
+            config=selected,
+            task_timeout_seconds=task.task_timeout_seconds,
+            task_timeout_declared=task.task_timeout_declared,
         )
     return result
 
@@ -5128,7 +5006,14 @@ def _initial_slice_record(
     branch: str | None = None,
     worktree: str | None = None,
     base_ref: str | None = None,
+    *,
+    config: TLLoopConfig | None = None,
+    task_timeout_seconds: float | None = None,
+    task_timeout_declared: bool = False,
 ) -> dict[str, object]:
+    resolved_timeout, timeout_source = _resolve_task_timeout(
+        config or TLLoopConfig(), task_timeout_seconds, task_timeout_declared
+    )
     return {
         "id": name,
         "status": SliceStatus.PENDING.value,
@@ -5148,7 +5033,33 @@ def _initial_slice_record(
         "reviewed_head": None,
         "attempts": 0,
         "verdict": None,
+        "task_timeout_seconds": resolved_timeout,
+        "task_timeout_source": timeout_source,
     }
+
+
+def _resolve_task_timeout(
+    config: TLLoopConfig,
+    task_timeout_seconds: float | None,
+    task_timeout_declared: bool,
+) -> tuple[float | None, str]:
+    if task_timeout_declared:
+        _validate_task_timeout(task_timeout_seconds, "task_timeout_seconds")
+        return task_timeout_seconds, "slice"
+    policy = config.policy
+    role_policy = policy.roles.get(config.role) if policy is not None else None
+    if role_policy is not None and role_policy.task_timeout_configured:
+        return role_policy.task_timeout_seconds, "role"
+    return config.task_timeout_seconds, config.task_timeout_source
+
+
+def _validate_task_timeout(value: float | None, name: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be null or a non-negative number")
+    if value < 0 or not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be null or a non-negative number")
 
 
 def _budget_root(
@@ -5219,6 +5130,7 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
         "agent_id",
         "order",
         "integration",
+        "task_timeout_seconds",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -5243,6 +5155,8 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
         _positive_order(value.get("order", 1), f"{path}.order"),
         integration,
         "order" in value,
+        _optional_timeout(value.get("task_timeout_seconds"), f"{path}.task_timeout_seconds"),
+        "task_timeout_seconds" in value,
     )
 
 
@@ -5353,9 +5267,13 @@ def _worker(value: object) -> WorkerTask:
     if not isinstance(value, Mapping):
         raise TypeError("worker task must be an object")
     return WorkerTask(
-        _required_text(value, "name", "worker"),
-        _required_text(value, "task", "worker"),
-        _optional_string(value, "agent_type", "worker"),
+        name=_required_text(value, "name", "worker"),
+        task=_required_text(value, "task", "worker"),
+        agent_type=_optional_string(value, "agent_type", "worker"),
+        task_timeout_seconds=_optional_timeout(
+            value.get("task_timeout_seconds"), "worker.task_timeout_seconds"
+        ),
+        task_timeout_declared="task_timeout_seconds" in value,
     )
 
 
@@ -5365,15 +5283,19 @@ def _leaf(value: object) -> LeafTask:
     if not isinstance(value, Mapping):
         raise TypeError("leaf task must be an object")
     return LeafTask(
-        _required_text(value, "name", "leaf"),
-        _required_text(value, "task", "leaf"),
-        _optional_string(value, "agent_type", "leaf"),
-        _string_tuple(value.get("boundary", ()), "leaf boundary"),
-        _optional_string(value, "context", "leaf"),
-        _string_tuple(value.get("read_first", ()), "leaf read_first"),
-        _string_tuple(value.get("steps", ()), "leaf steps"),
-        _string_tuple(value.get("verify", ()), "leaf verify"),
-        _string_tuple(value.get("done_criteria", ()), "leaf done_criteria"),
+        name=_required_text(value, "name", "leaf"),
+        task=_required_text(value, "task", "leaf"),
+        agent_type=_optional_string(value, "agent_type", "leaf"),
+        boundary=_string_tuple(value.get("boundary", ()), "leaf boundary"),
+        context=_optional_string(value, "context", "leaf"),
+        read_first=_string_tuple(value.get("read_first", ()), "leaf read_first"),
+        steps=_string_tuple(value.get("steps", ()), "leaf steps"),
+        verify=_string_tuple(value.get("verify", ()), "leaf verify"),
+        done_criteria=_string_tuple(value.get("done_criteria", ()), "leaf done_criteria"),
+        task_timeout_seconds=_optional_timeout(
+            value.get("task_timeout_seconds"), "leaf.task_timeout_seconds"
+        ),
+        task_timeout_declared="task_timeout_seconds" in value,
     )
 
 
@@ -5391,6 +5313,17 @@ def _optional_string(value: Mapping[str, object], key: str, kind: str) -> str | 
     if not isinstance(candidate, str) or not candidate:
         raise ValueError(f"{kind}.{key} must be null or a non-empty string")
     return candidate
+
+
+def _optional_timeout(value: object, label: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{label} must be null or a non-negative number")
+    parsed = float(value)
+    if parsed < 0 or not math.isfinite(parsed):
+        raise ValueError(f"{label} must be null or a non-negative number")
+    return None if parsed == 0 else parsed
 
 
 def _string_tuple(value: object, label: str) -> tuple[str, ...]:
@@ -5428,7 +5361,6 @@ __all__ = [
     "LeafTask",
     "LoopCancelled",
     "LoopLimitExceeded",
-    "LoopTimeout",
     "SubTLTask",
     "TLLoopConfig",
     "TLLoopError",

@@ -83,6 +83,8 @@
       "test_plan": [
         "just tl-loop-test"
       ],
+      "task_timeout_seconds": 3600.0,
+      "task_timeout_source": "built_in",
       "verdict": "GO",
       "verdict_at": "<timestamp>",
       "worktree": null
@@ -113,6 +115,8 @@
       "test_plan": [
         "controller"
       ],
+      "task_timeout_seconds": 3600.0,
+      "task_timeout_source": "built_in",
       "verdict": null,
       "worktree": null
     }

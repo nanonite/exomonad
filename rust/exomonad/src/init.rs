@@ -1008,9 +1008,7 @@ fn write_tl_loop_identity(cwd: &Path, branch: &str) -> Result<()> {
 struct TlLoopTimeouts {
     transport: f64,
     active_tail: f64,
-    dispatch: f64,
-    controller_stall: f64,
-    idle: f64,
+    task: f64,
 }
 
 impl From<&Config> for TlLoopTimeouts {
@@ -1018,9 +1016,7 @@ impl From<&Config> for TlLoopTimeouts {
         Self {
             transport: config.tl_transport_timeout_seconds,
             active_tail: config.tl_active_tail_timeout_seconds,
-            dispatch: config.tl_dispatch_timeout_seconds,
-            controller_stall: config.tl_controller_stall_timeout_seconds,
-            idle: config.tl_idle_timeout_seconds,
+            task: config.tl_task_timeout_seconds,
         }
     }
 }
@@ -1036,13 +1032,11 @@ fn tl_loop_command(cwd: &Path, package_root: &Path, timeouts: &TlLoopTimeouts) -
     );
     format!(
         "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan \
-         --transport-timeout {} --active-tail-timeout {} --dispatch-timeout {} --controller-stall-timeout {} --idle-timeout {}",
+           --transport-timeout {} --active-tail-timeout {} --task-timeout {}",
         shell_escape::escape(tl_loop_python(cwd).into()),
         timeouts.transport,
         timeouts.active_tail,
-        timeouts.dispatch,
-        timeouts.controller_stall,
-        timeouts.idle,
+          timeouts.task,
     )
 }
 
@@ -3593,9 +3587,7 @@ mod tests {
         let timeouts = TlLoopTimeouts {
             transport: 45.5,
             active_tail: 60.0,
-            dispatch: 12.0,
-            controller_stall: 600.0,
-            idle: 90.0,
+            task: 90.0,
         };
         let command = tl_loop_command(Path::new("/tmp/repo"), Path::new("/tmp/exo"), &timeouts);
         assert!(command.contains("EXOMONAD_ROLE=tl"));
@@ -3604,9 +3596,7 @@ mod tests {
         assert!(command.contains("--wait-for-plan"));
         assert!(command.contains("--transport-timeout 45.5"));
         assert!(command.contains("--active-tail-timeout 60"));
-        assert!(command.contains("--dispatch-timeout 12"));
-        assert!(command.contains("--controller-stall-timeout 600"));
-        assert!(command.contains("--idle-timeout 90"));
+        assert!(command.contains("--task-timeout 90"));
     }
 
     #[test]

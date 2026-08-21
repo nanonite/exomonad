@@ -125,7 +125,6 @@ def replay_fixture(fixture: str | Path, root_dir: str | Path) -> ReplayResult:
         max_leaves=1,
         max_events=32,
         poll_interval=0.001,
-        idle_timeout=0.2,
         review_policy_path=FIXTURE_ROOT / "review-policy.toml",
     )
     try:

@@ -205,6 +205,7 @@ def validate_expected_events(contract: dict[str, Any], event_types: set[str]) ->
     expected_rules = {
         "spawn_requires_invocation_start",
         "invocation_requires_finish",
+        "task_budget_requires_typed_failure",
         "parent_notification_requires_delivery",
         "delivery_requires_consumption_observation",
         "published_pr_requires_observation",

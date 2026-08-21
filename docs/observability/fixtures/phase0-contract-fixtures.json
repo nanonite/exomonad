@@ -55,9 +55,10 @@
     "I8": ["review_and_merge_loop"]
   },
   "required_event_contracts": [
-    "spawn_requires_invocation_start",
-    "invocation_requires_finish",
-    "parent_notification_requires_delivery",
+      "spawn_requires_invocation_start",
+      "invocation_requires_finish",
+      "task_budget_requires_typed_failure",
+      "parent_notification_requires_delivery",
     "delivery_requires_consumption_observation",
     "published_pr_requires_observation",
     "merge_request_requires_merge_outcome",

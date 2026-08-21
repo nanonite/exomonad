@@ -38,7 +38,7 @@ SAFE_CATEGORICAL_VALUES = {
     "event_type": {
         "agent.spawned", "agent.resumed", "agent.harness_switch", "agent.stuck",
         "agent.notify_parent", "agent.sibling_merged", "agent.completed", "agent.stop_check",
-        "agent.invocation.started", "agent.invocation.finished", "agent.guidance.delivery",
+          "agent.invocation.started", "agent.invocation.finished", "agent.task_budget_exceeded", "agent.guidance.delivery",
         "pr.filed", "pr.updated", "pr.published", "pr.replaced", "pr.merge_requested",
         "pr.merged", "pr.merge_failed", "copilot.review", "ci.status_changed",
         "event.dispatched", "event.dispatch_failed", "watcher.poll_cycle",

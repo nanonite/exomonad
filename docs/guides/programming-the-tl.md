@@ -47,6 +47,7 @@ allow = ["codex/gpt-luna"]
 cost_rank = { "codex/gpt-luna" = 1 }
 token_budget = 120000
 escalate_after_attempts = 1
+task_timeout_seconds = 3600.0 # optional; zero disables the task ceiling
 
 [roles.worker]
 allow = ["codex/gpt-luna", "claude/sonnet"]
@@ -72,6 +73,14 @@ role names and unknown keys are rejected.
 | `token_budget` | Positive per-role ceiling |
 | `per_harness_budget` | Optional; every key must appear in `allow` |
 | `escalate_after_attempts` | Positive NO-GO threshold before the slice parks |
+| `task_timeout_seconds` | Optional non-negative task ceiling; zero disables it |
+
+Task timeout precedence is most-specific-wins: the slice's
+`task_timeout_seconds` in `plan.json`, then the selected role's value here,
+then project `tl_task_timeout_seconds` in `.exo/config.toml`, then the built-in
+3600-second default. `null` and `0` explicitly disable enforcement. The
+controller persists the resolved value and dispatch timestamp, and only the
+heartbeat may enforce it; observational stall thresholds never kill a worker.
 
 ### How the selector spends this
 
@@ -783,7 +792,7 @@ python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> -
 python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --reject
 ```
 
-`run` flags: `--max-events` (default 256), `--idle-timeout` (30s),
+`run` flags: `--max-events` (default 256), `--task-timeout` (3600s; `0` disables),
 `--poll-interval` (0.25s), `--wait-for-plan` (block until `plan.json` appears),
 `--verbose`. `EXOMONAD_TL_LOOP_PROJECT_ROOT` and `EXOMONAD_TL_LOOP_RUN_ID` set
 the defaults.

@@ -26,6 +26,17 @@
       "denominator_effect": "Add one expected invocation-finished event for each observed invocation start."
     },
     {
+      "rule_id": "task_budget_requires_typed_failure",
+      "prerequisite_event": "tl.slice_parked",
+      "required_event": "agent.task_budget_exceeded",
+      "allowed_delay_ms": null,
+      "allowed_window": "until session termination or explicit reconciliation",
+      "prerequisite_data": {"park_cause": "task_budget_exceeded"},
+      "applicable_sources": ["tl_loop", "lifecycle"],
+      "legacy_confidence_rule": "A budget-caused park without the typed task-level event is unknown, not safely bounded.",
+      "denominator_effect": "Add one expected task-budget failure event for each budget-caused slice park."
+    },
+    {
       "rule_id": "parent_notification_requires_delivery",
       "prerequisite_event": "agent.notify_parent",
       "required_event": "message.delivery",

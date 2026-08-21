@@ -41,6 +41,27 @@ interactive coordinator. Agent harnesses remain bounded implementation and
 review processes. Their branches, worktrees, PRs, Chainlink issues, and
 reviewer lifecycle are unchanged.
 
+### Time-value classification
+
+Every time value has one owner and one behavior:
+
+| Value | Layer | Classification | Consumer |
+|---|---|---|---|
+| `tl_task_timeout_seconds` / role and slice `task_timeout_seconds` | Python TL | enforce | `heartbeat_once` task-budget disposal |
+| `heartbeat.interval_seconds` | Python TL | observe cadence | heartbeat scheduler |
+| `heartbeat.stall_threshold_seconds` | Python TL | observe only | `wave.stalled` telemetry |
+| `tl_transport_timeout_seconds` | Rust transport | io-safeguard | UDS RPC client |
+| `tl_active_tail_timeout_seconds` | ledger reader | io-safeguard | active ledger tail |
+| `reviewer_max_wait_seconds` | review policy | enforce | watcher/review policy |
+| retention windows | ledger maintenance | delete | segment retention tooling |
+| removed idle/controller/dispatch lifecycle deadlines | — | delete | no lifecycle consumer |
+
+Elapsed time may never infer death, failure, or stall. It may enforce only an
+explicitly declared task ceiling, after the authoritative terminal event check
+for the same heartbeat tick. This rule amends the older liveness wording in
+#893 so silence remains observational while declared resource budgets remain
+auditable enforcement.
+
 The conceptual hylomorphism remains useful: a plan and checkpoint are the
 unfold boundary, while event-driven review, merge, and upward PR effects are
 the fold boundary. The controller makes those transitions executable and

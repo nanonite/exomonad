@@ -145,8 +145,6 @@ def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path)
     )
     config = TLLoopConfig(
         active=True,
-        idle_timeout=0.5,
-        dispatch_timeout=0.5,
         root_dir=root,
         run_id="parent",
         ledger_run_id="swarm-uuid",
@@ -199,7 +197,6 @@ def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
         child_store,
         TLLoopConfig(
             keep_alive_on_waiting=True,
-            idle_timeout=0.1,
             poll_interval=0.001,
         ),
     )
@@ -227,10 +224,9 @@ def test_recursive_tl_waiting_child_is_not_marked_failed(
         config=TLLoopConfig(
             active=True,
             keep_alive_on_waiting=False,
-            max_parallel_slices=1,
-            poll_interval=0.001,
-            idle_timeout=0.01,
-        ),
+          max_parallel_slices=1,
+          poll_interval=0.001,
+      ),
         root_dir=tmp_path,
     )
 
@@ -561,11 +557,10 @@ def test_dispatch_waits_for_delayed_authoritative_confirmation(tmp_path: Path) -
                 source,
                 EffectClient(transport),
                 config=TLLoopConfig(
-                    max_workers=0,
-                    max_leaves=1,
-                    poll_interval=0.001,
-                    dispatch_timeout=0.001,
-                    cancel_event=cancel_event,
+                      max_workers=0,
+                      max_leaves=1,
+                      poll_interval=0.001,
+                      cancel_event=cancel_event,
                 ),
                 root_dir=tmp_path,
             )
@@ -611,7 +606,7 @@ def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None
         plan,
         SyntheticQueue([]),
         EffectClient(transport),
-        config=TLLoopConfig(poll_interval=0.001, idle_timeout=0.1),
+          config=TLLoopConfig(poll_interval=0.001),
         root_dir=tmp_path,
     )
 
@@ -640,8 +635,6 @@ def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> 
     cancel_event = threading.Event()
     config = TLLoopConfig(
         poll_interval=0.001,
-        idle_timeout=0.1,
-        dispatch_timeout=0.1,
         cancel_event=cancel_event,
     )
     initial = _initial_slices(plan, config, tmp_path, run_id)
@@ -704,7 +697,7 @@ def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> 
 def test_restart_adopts_owner_by_intent_without_duplicate_spawn(tmp_path: Path) -> None:
     run_id = "dispatch-adopt-run"
     plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]})
-    config = TLLoopConfig(poll_interval=0.001, idle_timeout=0.1, dispatch_timeout=0.01)
+    config = TLLoopConfig(poll_interval=0.001)
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["leaf-a"].update(
         {
@@ -749,8 +742,6 @@ def test_stale_spawn_intent_cannot_confirm_new_attempt(tmp_path: Path) -> None:
     cancel_event = threading.Event()
     config = TLLoopConfig(
         poll_interval=0.001,
-        idle_timeout=0.1,
-        dispatch_timeout=0.1,
         cancel_event=cancel_event,
     )
     initial = _initial_slices(plan, config, tmp_path, run_id)
@@ -860,11 +851,9 @@ def test_ledger_run_id_mismatch_reaches_driver_diagnostics(tmp_path: Path) -> No
                 WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
                 source,
                 EffectClient(transport),
-                config=TLLoopConfig(
-                    poll_interval=0.001,
-                    idle_timeout=0.1,
-                    dispatch_timeout=0.01,
-                    ledger_run_id=current_swarm,
+                  config=TLLoopConfig(
+                      poll_interval=0.001,
+                      ledger_run_id=current_swarm,
                 ),
                 root_dir=tmp_path,
             )
@@ -1049,10 +1038,9 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
             enable_reviewer_spawn=True,
             max_workers=0,
             max_leaves=1,
-            max_events=2,
-            poll_interval=0.001,
-            idle_timeout=0.1,
-        ),
+              max_events=2,
+              poll_interval=0.001,
+          ),
         root_dir=tmp_path,
     )
 
@@ -1671,10 +1659,9 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
         requested_model="gpt-5.5",
         max_workers=1,
         max_leaves=1,
-        max_events=5,
-        poll_interval=0.001,
-        idle_timeout=0.1,
-    )
+      max_events=5,
+      poll_interval=0.001,
+  )
 
     result = tl_run({"run_id": run_id, "plan": _plan()}, config, BudgetLedger(0, 0))
 
@@ -1711,11 +1698,10 @@ def test_tl_run_width_gate_dispatches_next_ready_slice_after_completion(
         ),
         max_workers=2,
         max_leaves=0,
-        max_parallel_slices=1,
-        max_events=5,
-        poll_interval=0.001,
-        idle_timeout=0.1,
-    )
+          max_parallel_slices=1,
+          max_events=5,
+          poll_interval=0.001,
+      )
     plan = WorkPlan(
         workers=(
             WorkerTask("worker-a", "first"),
@@ -1768,10 +1754,9 @@ def test_canonical_completion_and_parent_notification_are_idempotent(
         config=TLLoopConfig(
             max_workers=1,
             max_leaves=1,
-            max_events=6,
-            poll_interval=0.001,
-            idle_timeout=0.1,
-        ),
+              max_events=6,
+              poll_interval=0.001,
+          ),
         root_dir=tmp_path,
     )
 
@@ -1806,11 +1791,10 @@ def test_loop_rejects_an_event_stream_over_its_event_ceiling(tmp_path: Path) -> 
             source,
             EffectClient(RecordingTransport()),
             config=TLLoopConfig(
-                max_events=1,
-                test_harness=True,
-                poll_interval=0.001,
-                idle_timeout=0.1,
-            ),
+                  max_events=1,
+                  test_harness=True,
+                  poll_interval=0.001,
+              ),
             root_dir=tmp_path,
         )
 
@@ -1841,12 +1825,10 @@ def test_idle_silence_preserves_spawned_state_until_explicit_cancellation(
                 source,
                 EffectClient(RecordingTransport()),
                 config=TLLoopConfig(
-                    max_workers=0,
-                    max_leaves=1,
-                    poll_interval=0.001,
-                    idle_timeout=0.001,
-                    dispatch_timeout=5.0,
-                    cancel_event=cancel_event,
+                      max_workers=0,
+                      max_leaves=1,
+                      poll_interval=0.001,
+                      cancel_event=cancel_event,
                 ),
                 root_dir=tmp_path,
             )
@@ -1901,10 +1883,9 @@ def _config(*, active: bool = True) -> TLLoopConfig:
         active=active,
         max_workers=1,
         max_leaves=1,
-        max_events=5,
-        poll_interval=0.001,
-        idle_timeout=0.1,
-    )
+         max_events=5,
+         poll_interval=0.001,
+     )
 
 
 def _lifecycle_events(run_id: str) -> list[EventEnvelope]:
@@ -2105,7 +2086,7 @@ def test_recursive_depth_ceiling_parks_schedule_deadlock(tmp_path: Path) -> None
             WorkPlan(sub_tls=(SubTLTask("child", WorkPlan(), source=SyntheticQueue([])),)),
             SyntheticQueue([]),
             EffectClient(RecordingTransport()),
-            config=TLLoopConfig(max_depth=0, poll_interval=0.001, idle_timeout=0.1),
+            config=TLLoopConfig(max_depth=0, poll_interval=0.001),
             root_dir=tmp_path,
         )
 
@@ -2154,7 +2135,7 @@ def test_same_order_sub_tls_overlap_and_wait_for_prior_stage(
         plan,
         SyntheticQueue([]),
         EffectClient(RecordingTransport()),
-        config=TLLoopConfig(max_parallel_slices=2, poll_interval=0.001, idle_timeout=0.1),
+        config=TLLoopConfig(max_parallel_slices=2, poll_interval=0.001),
         root_dir=tmp_path,
     )
 
@@ -2194,7 +2175,6 @@ def test_active_parent_stays_alive_for_later_recursive_event(
             max_parallel_slices=1,
             max_events=1,
             poll_interval=0.001,
-            idle_timeout=0.01,
         ),
         root_dir=tmp_path,
     )
@@ -2268,7 +2248,6 @@ def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
         max_workers=0,
         max_events=5,
         poll_interval=0.001,
-        idle_timeout=0.1,
         keep_alive_on_waiting=False,
     )
     parent_root = tmp_path / "ordered-e2e-run"
@@ -2389,7 +2368,6 @@ def test_failed_ordered_sub_tl_blocks_higher_order_work(tmp_path: Path) -> None:
             max_workers=0,
             max_events=5,
             poll_interval=0.001,
-            idle_timeout=0.01,
         ),
         root_dir=tmp_path,
     )
@@ -2418,7 +2396,7 @@ def test_nested_ordered_stages_round_trip_the_recursive_checkpoint(tmp_path: Pat
         WorkPlan(sub_tls=(SubTLTask("outer", nested, source=SyntheticQueue([]), order=1),)),
         SyntheticQueue([]),
         EffectClient(transport),
-        config=TLLoopConfig(max_parallel_slices=2, poll_interval=0.001, idle_timeout=0.1),
+        config=TLLoopConfig(max_parallel_slices=2, poll_interval=0.001),
         root_dir=tmp_path,
     )
 
@@ -2451,7 +2429,7 @@ def test_ordered_sub_tl_restart_does_not_rerun_merged_children(
             SubTLTask("restart-b", WorkPlan(), order=1),
         )
     )
-    config = TLLoopConfig(max_parallel_slices=2, poll_interval=0.001, idle_timeout=0.1)
+    config = TLLoopConfig(max_parallel_slices=2, poll_interval=0.001)
     run_tl_loop(
         "restart-run",
         plan,
@@ -2533,7 +2511,6 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
-        idle_timeout=0.1,
         keep_alive_on_waiting=False,
     )
 
@@ -2623,7 +2600,6 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
-        idle_timeout=0.1,
         keep_alive_on_waiting=False,
     )
     verified: list[tuple[str, str, str, str]] = []
@@ -2717,7 +2693,6 @@ def test_restart_during_merging_reconciles_without_duplicate_merge(tmp_path: Pat
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
-        idle_timeout=0.1,
         keep_alive_on_waiting=False,
     )
     initial = _initial_slices(plan, config, tmp_path, run_id)
@@ -2849,7 +2824,6 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
-        idle_timeout=0.1,
         max_base_revalidations=1,
         keep_alive_on_waiting=False,
     )
@@ -2967,7 +2941,6 @@ def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, 
         max_parallel_slices=1,
         max_integration_repairs=0,
         poll_interval=0.001,
-        idle_timeout=0.1,
         keep_alive_on_waiting=False,
     )
     run_tl_loop(
@@ -3092,7 +3065,6 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
-        idle_timeout=0.01,
         review_model_choice=_review_choice(backend),
         keep_alive_on_waiting=False,
     )
@@ -3196,7 +3168,6 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
-        idle_timeout=0.01,
         max_integration_repairs=0,
         keep_alive_on_waiting=False,
     )

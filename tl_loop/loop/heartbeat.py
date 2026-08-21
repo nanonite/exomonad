@@ -14,6 +14,7 @@ from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.reader import LedgerReader, LedgerReadError
 from tl_loop.loop.escalate import park
+from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.state.schema import (
     GoalState,
@@ -43,12 +44,15 @@ class HeartbeatConfig:
 
     interval_seconds: float = 30.0
     stall_threshold_seconds: float = 300.0
+    task_timeout_seconds: float | None = 3600.0
 
     def __post_init__(self) -> None:
         if self.interval_seconds <= 0:
             raise ValueError("heartbeat interval_seconds must be positive")
         if self.stall_threshold_seconds <= 0:
             raise ValueError("heartbeat stall_threshold_seconds must be positive")
+        if self.task_timeout_seconds is not None and self.task_timeout_seconds < 0:
+            raise ValueError("heartbeat task_timeout_seconds must be null or non-negative")
 
 
 @dataclass(frozen=True)
@@ -195,6 +199,21 @@ def heartbeat_once(
             continue
         if _retired_or_unrouted(row):
             continue
+        budget_event = _enforce_task_budget(
+            current=store.load(),
+            slice_state=slice_state,
+            row=row,
+            effects=effects,
+            config=config,
+            now=current_time,
+            project_root=Path(project_root),
+            store=store,
+        )
+        if budget_event is not None:
+            events.append(budget_event)
+            parked.append(slice_state.id)
+            progress = True
+            continue
         if row.get("pane_alive") is False:
             if isinstance(effects, ReadOnlyEffectClient):
                 raise HeartbeatError(
@@ -281,6 +300,147 @@ def heartbeat_once(
         tuple(events),
         tuple(dict.fromkeys(parked)),
     )
+
+
+@dataclass(frozen=True)
+class _BudgetIntent:
+    operation: str
+    target: str
+    arguments: Mapping[str, object]
+    active: bool = True
+
+
+def _enforce_task_budget(
+    *,
+    current: RunState,
+    slice_state: SliceState,
+    row: JsonMapping,
+    effects: LiveEffects,
+    config: HeartbeatConfig,
+    now: float,
+    project_root: Path,
+    store: RunStore,
+) -> SyntheticHeartbeatEvent | None:
+    budget = slice_state.task_timeout_seconds
+    budget_source = slice_state.task_timeout_source
+    if budget is None and budget_source is None:
+        budget = config.task_timeout_seconds
+        budget_source = "built_in"
+    if budget is None or slice_state.dispatch_started_at is None:
+        return None
+    elapsed = max(0.0, now - slice_state.dispatch_started_at)
+    if elapsed < budget:
+        return None
+    terminal, terminal_evidence = _missing_worker_evidence(
+        project_root, slice_state, poll_workers_missing=False
+    )
+    if terminal:
+        LOGGER.info(
+            "[TL loop] authoritative terminal wins over task budget slice=%s elapsed=%.3fs",
+            slice_state.id,
+            elapsed,
+        )
+        return None
+    if isinstance(effects, ReadOnlyEffectClient):
+        raise HeartbeatError(
+            f"task budget exceeded for {slice_state.id!r} requires an active effect client"
+        )
+    runtime_agent_id = slice_state.dispatch_agent_id or slice_state.id
+    pane_id = _text(row, "pane_id") or _text(row, "window_id") or runtime_agent_id
+    intent = _BudgetIntent(
+        "close_worker_pane",
+        slice_state.id,
+        {"pane_id": pane_id, "runtime_agent_id": runtime_agent_id},
+    )
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    existing = journal.existing(intent)
+    if existing is not None:
+        status = existing.get("status")
+        if status == "confirmed":
+            result = journal.replay(existing)
+        elif status == "rejected":
+            raise HeartbeatError(existing.get("error") or "task budget disposal was rejected")
+        else:
+            raise HeartbeatError(
+                f"task budget disposal for {slice_state.id!r} has unresolved journal status {status!r}"
+            )
+    else:
+        journal.append(intent)
+        try:
+            result = effects.close_worker_pane(pane_id=pane_id)
+        except BaseException as error:
+            journal.mark_unknown(intent, error)
+            raise
+        journal.mark_result(intent, result)
+    if result.success is False:
+        raise HeartbeatError(result.error or f"unable to dispose {slice_state.id!r}")
+    record = _read_invocation_record(project_root, runtime_agent_id, slice_state.id)
+    evidence = dict(terminal_evidence)
+    if isinstance(record, Mapping):
+        evidence.update(record)
+    _mark_invocation_timed_out(project_root, runtime_agent_id, slice_state.id, evidence, now)
+    payload = {
+        "slice_id": slice_state.id,
+        "runtime_agent_id": runtime_agent_id,
+        "invocation_id": _text(evidence, "invocation_id"),
+        "generation": evidence.get("generation"),
+        "harness": slice_state.agent_type,
+        "model": slice_state.model,
+        "effort": _text(row, "effort") or _text(evidence, "effort"),
+        "branch": slice_state.branch or _text(evidence, "branch"),
+        "worktree": slice_state.worktree or _text(evidence, "worktree"),
+        "pr_number": slice_state.pr_number,
+        "configured_budget_seconds": budget,
+        "budget_source_layer": budget_source or "unknown",
+        "dispatch_started_at": slice_state.dispatch_started_at,
+        "elapsed_seconds": elapsed,
+        "last_authoritative_event_seq": current.goals.last_authoritative_event_seq,
+        "stderr_tail": _bounded_text(evidence, "stderr_tail"),
+    }
+    emit_controller_event(effects, "agent.task_budget_exceeded", payload)
+    park(
+        slice_state,
+        ParkCause.TASK_BUDGET_EXCEEDED,
+        store=store,
+        issue_creator=effects,
+        ledger=current.budgets,
+    )
+    return _event("agent.task_budget_exceeded", "heartbeat", slice_state.id, payload)
+
+
+def _mark_invocation_timed_out(
+    project_root: Path,
+    runtime_agent_id: str,
+    slice_id: str,
+    evidence: Mapping[str, object],
+    now: float,
+) -> None:
+    if not _safe_agent_name(runtime_agent_id):
+        return
+    path = project_root / ".exo" / "agents" / runtime_agent_id / "invocation.json"
+    if not path.is_file():
+        return
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(document, dict):
+        return
+    recorded_slice = document.get("slice_id")
+    if isinstance(recorded_slice, str) and recorded_slice and recorded_slice != slice_id:
+        return
+    document["status"] = "timed_out"
+    document["exit_classification"] = "task_budget_exceeded"
+    document["exit_reason"] = "declared_task_budget_exceeded"
+    document["ended_at"] = now
+    if evidence.get("stderr_tail") is not None:
+        document["stderr_tail"] = _bounded_text(evidence, "stderr_tail")
+    temporary = path.with_suffix(".timed-out.tmp")
+    try:
+        temporary.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        LOGGER.warning("Unable to persist timed-out invocation record: %s", path)
 
 
 def _active_slices(state: RunState) -> tuple[SliceState, ...]:
