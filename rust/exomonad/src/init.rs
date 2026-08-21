@@ -1053,14 +1053,21 @@ fn server_command(session: &str, config: &Config, verbose: bool) -> String {
     } else {
         ""
     };
+    let binary = shell_escape::escape(
+        exomonad_core::find_exomonad_binary()
+            .display()
+            .to_string()
+            .into(),
+    );
     format!(
-        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE={}{} exomonad serve",
+        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE={}{} {} serve",
         verbose_prefix,
         session,
         agent_type_str(config.root_agent_type),
         agent_type_str(config.spawn_agent_type),
         agent_type_str(config.reviewer.agent_type),
         model_env,
+        binary,
     )
 }
 
@@ -3170,7 +3177,7 @@ mod tests {
         assert!(command.contains("EXOMONAD_ROOT_AGENT_TYPE=claude"));
         assert!(command.contains("EXOMONAD_SPAWN_AGENT_TYPE=opencode"));
         assert!(command.contains("EXOMONAD_REVIEWER_AGENT_TYPE=codex"));
-        assert!(command.ends_with(" exomonad serve"));
+        assert!(command.ends_with("/exomonad serve"));
     }
 
     #[test]
