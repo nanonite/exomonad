@@ -12,7 +12,7 @@ from typing import TypeAlias
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
-from tl_loop.events.reader import LedgerReadError, LedgerReader
+from tl_loop.events.reader import LedgerReader, LedgerReadError
 from tl_loop.loop.escalate import park
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.state.schema import (
@@ -73,6 +73,14 @@ class HeartbeatResult:
     parked_slice_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PollWorkersSnapshot:
+    """Worker rows plus the runtime identities the server could not report."""
+
+    rows: dict[str, JsonMapping]
+    missing_agents: frozenset[str]
+
+
 def heartbeat_due(goals: GoalState, now: float, interval_seconds: float) -> bool:
     """Return whether the configured interval has elapsed since the last fire."""
     if interval_seconds <= 0:
@@ -87,7 +95,7 @@ def heartbeat_once(
     config: HeartbeatConfig,
     *,
     now: float | None = None,
-    project_root: Path | str | None = None,
+    project_root: Path | str,
 ) -> HeartbeatResult:
     """Poll liveness and reconcile one idle wave through the durable store."""
     current_time = time.time() if now is None else now
@@ -115,7 +123,8 @@ def heartbeat_once(
             (),
         )
 
-    worker_rows = _poll_workers(effects, tuple(active))
+    worker_snapshot = _poll_workers(effects, tuple(active))
+    worker_rows = worker_snapshot.rows
     events: list[SyntheticHeartbeatEvent] = []
     if deadline_event is not None:
         events.append(deadline_event)
@@ -125,8 +134,12 @@ def heartbeat_once(
     for slice_state in active:
         row = worker_rows.get(slice_state.id)
         if row is None:
-            evidence_root = store.root_dir if project_root is None else Path(project_root)
-            terminal, evidence = _missing_worker_evidence(evidence_root, slice_state)
+            runtime_agent_id = slice_state.dispatch_agent_id or slice_state.id
+            terminal, evidence = _missing_worker_evidence(
+                Path(project_root),
+                slice_state,
+                poll_workers_missing=runtime_agent_id in worker_snapshot.missing_agents,
+            )
             current = store.load()
             current_slice = current.slices[slice_state.id]
             reconciliation = _missing_worker_reconciliation(terminal)
@@ -284,7 +297,10 @@ def _active_slices(state: RunState) -> tuple[SliceState, ...]:
     )
 
 
-def _poll_workers(effects: LiveEffects, agents: tuple[SliceState, ...]) -> dict[str, JsonMapping]:
+def _poll_workers(
+    effects: LiveEffects,
+    agents: tuple[SliceState, ...],
+) -> PollWorkersSnapshot:
     aliases: dict[str, str] = {}
     for slice_state in agents:
         runtime_name = slice_state.dispatch_agent_id or slice_state.id
@@ -303,6 +319,25 @@ def _poll_workers(effects: LiveEffects, agents: tuple[SliceState, ...]) -> dict[
     rows = payload.get("workers")
     if not isinstance(rows, list):
         raise HeartbeatError("poll_workers result has no workers array")
+    missing_agents = payload.get("missing_agents", [])
+    if not isinstance(missing_agents, list) or not all(
+        isinstance(name, str) and name for name in missing_agents
+    ):
+        raise HeartbeatError("poll_workers missing_agents must be an array of names")
+    requested_names = set(aliases)
+    unexpected_missing = set(missing_agents) - requested_names
+    if unexpected_missing:
+        raise HeartbeatError(
+            "poll_workers reported unrequested missing agents: "
+            + ", ".join(sorted(unexpected_missing))
+        )
+    observed_names = {
+        row.get("name")
+        for row in rows
+        if isinstance(row, Mapping) and isinstance(row.get("name"), str)
+    }
+    if observed_names.intersection(missing_agents):
+        raise HeartbeatError("poll_workers reported an agent as both present and missing")
     dead_rows = payload.get("dead_workers", [])
     if dead_rows is None:
         dead_rows = []
@@ -311,7 +346,7 @@ def _poll_workers(effects: LiveEffects, agents: tuple[SliceState, ...]) -> dict[
     indexed: dict[str, JsonMapping] = {}
     _index_worker_rows(rows, indexed, aliases=aliases, dead=False)
     _index_worker_rows(dead_rows, indexed, aliases=aliases, dead=True)
-    return indexed
+    return PollWorkersSnapshot(indexed, frozenset(missing_agents))
 
 
 def _index_worker_rows(
@@ -378,6 +413,8 @@ def _retired_or_unrouted(row: JsonMapping) -> bool:
 def _missing_worker_evidence(
     root_dir: Path,
     slice_state: SliceState,
+    *,
+    poll_workers_missing: bool,
 ) -> tuple[bool, dict[str, object]]:
     runtime_agent_id = slice_state.dispatch_agent_id or slice_state.id
     record = _read_invocation_record(root_dir, runtime_agent_id, slice_state.id)
@@ -397,13 +434,17 @@ def _missing_worker_evidence(
         if isinstance(record, Mapping)
         else None,
         "branch": _text(record, "branch") if isinstance(record, Mapping) else slice_state.branch,
-        "worktree": _text(record, "worktree") if isinstance(record, Mapping) else slice_state.worktree,
+        "worktree": _text(record, "worktree")
+        if isinstance(record, Mapping)
+        else slice_state.worktree,
+        "poll_workers_missing": poll_workers_missing,
     }
     if isinstance(record, Mapping):
         status = _text(record, "status")
-        terminal = status in {"exited", "failed", "killed", "timed_out"} or record.get(
-            "ended_at"
-        ) is not None
+        terminal = (
+            status in {"exited", "failed", "killed", "timed_out"}
+            or record.get("ended_at") is not None
+        )
         if terminal:
             context["classification"] = context["classification"] or (
                 "missing_exit_marker" if context["exit_code"] is None else "terminal_exit"

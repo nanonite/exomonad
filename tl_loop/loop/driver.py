@@ -538,6 +538,8 @@ class TLLoopConfig:
             raise ValueError("test_harness must be a boolean")
         if self.poll_interval < 0:
             raise ValueError("poll_interval must be non-negative")
+        if self.heartbeat is not None and self.project_root is None:
+            raise ValueError("project_root is required when heartbeat reconciliation is enabled")
         if self.idle_timeout <= 0:
             raise ValueError("idle_timeout must be positive")
         if type(self.keep_alive_on_waiting) is not bool:

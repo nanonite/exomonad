@@ -26,6 +26,7 @@ class HeartbeatTransport:
 
     pane_alive: bool = True
     worker_present: bool = True
+    report_missing_agents: bool = False
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
@@ -61,6 +62,11 @@ class HeartbeatTransport:
                             else []
                         ),
                         "dead_workers": [],
+                        "missing_agents": (
+                            [worker_name]
+                            if self.report_missing_agents and not self.worker_present
+                            else []
+                        ),
                     },
                 },
             )
@@ -89,12 +95,12 @@ def test_idle_heartbeat_waits_for_configured_interval_without_polling(
     effects = EffectClient(transport)
     config = HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0)
 
-    before_due = heartbeat_once(state, store, effects, config, now=13.9)
+    before_due = heartbeat_once(state, store, effects, config, now=13.9, project_root=tmp_path)
 
     assert before_due.fired is False
     assert transport.calls == []
 
-    due = heartbeat_once(state, store, effects, config, now=14.0)
+    due = heartbeat_once(state, store, effects, config, now=14.0, project_root=tmp_path)
 
     assert due.fired is True
     assert [name for name, _ in transport.calls] == ["poll_workers"]
@@ -111,6 +117,7 @@ def test_silently_dead_worker_is_parked(tmp_path: Path) -> None:
         effects,
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
         now=10.0,
+        project_root=tmp_path,
     )
 
     parked = result.state.slices["slice-a"]
@@ -136,6 +143,7 @@ def test_silent_live_worker_stall_is_observational(tmp_path: Path) -> None:
         EffectClient(transport),
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=1.0),
         now=10.0,
+        project_root=tmp_path,
     )
 
     observed = result.state.slices["slice-a"]
@@ -156,6 +164,7 @@ def test_goal_deadline_is_observational_for_live_work(tmp_path: Path) -> None:
         EffectClient(transport),
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
         now=2000.0,
+        project_root=tmp_path,
     )
 
     assert result.state.slices["slice-a"].status is SliceStatus.SPAWNED
@@ -175,8 +184,8 @@ def test_repeated_heartbeat_reconciliation_is_idempotent(tmp_path: Path) -> None
     effects = EffectClient(transport)
     config = HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0)
 
-    first = heartbeat_once(state, store, effects, config, now=10.0)
-    second = heartbeat_once(first.state, store, effects, config, now=20.0)
+    first = heartbeat_once(state, store, effects, config, now=10.0, project_root=tmp_path)
+    second = heartbeat_once(first.state, store, effects, config, now=20.0, project_root=tmp_path)
 
     reconciled = first.state.slices["slice-a"]
     assert reconciled.verdict is None
@@ -197,10 +206,11 @@ def test_poll_workers_uses_persisted_runtime_identity(tmp_path: Path) -> None:
     _, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
     transport = HeartbeatTransport()
 
-    _poll_workers(EffectClient(transport), (state.slices["slice-a"],))
+    snapshot = _poll_workers(EffectClient(transport), (state.slices["slice-a"],))
 
     poll_arguments = transport.calls[0][1]
     assert poll_arguments["agents"] == ["agent-slice-a"]
+    assert snapshot.missing_agents == frozenset()
 
 
 def test_poll_workers_rejects_ambiguous_runtime_identity(tmp_path: Path) -> None:
@@ -222,6 +232,7 @@ def test_missing_worker_row_is_persisted_but_not_failed(tmp_path: Path) -> None:
         EffectClient(transport),
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
         now=10.0,
+        project_root=tmp_path,
     )
 
     observed = result.state.slices["slice-a"]
@@ -235,6 +246,23 @@ def test_missing_worker_row_is_persisted_but_not_failed(tmp_path: Path) -> None:
     }
     assert [event.kind for event in result.events] == ["worker.missing"]
     assert [name for name, _ in transport.calls] == ["poll_workers", "emit_controller_event"]
+
+
+def test_missing_worker_identity_is_recorded_in_reconciliation_evidence(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    transport = HeartbeatTransport(worker_present=False, report_missing_agents=True)
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    assert result.events[0].kind == "worker.missing"
+    assert result.events[0].payload["poll_workers_missing"] is True
 
 
 def test_missing_worker_row_after_invocation_finished_is_parked_once(tmp_path: Path) -> None:
@@ -271,6 +299,7 @@ def test_missing_worker_row_after_invocation_finished_is_parked_once(tmp_path: P
         EffectClient(transport),
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
         now=10.0,
+        project_root=tmp_path,
     )
 
     parked = result.state.slices["slice-a"]
