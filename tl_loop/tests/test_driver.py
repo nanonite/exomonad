@@ -40,6 +40,7 @@ from tl_loop.loop.driver import (
     _route_ci_event,
     _route_review_event,
     _run_sub_tl_batch,
+    _next_loop_deadline,
     _supervise_live_sub_tl,
     run_tl_loop,
     tl_run,
@@ -207,6 +208,41 @@ def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
     assert state is not None
     assert process.joins == [0.05, 0.05]
     assert not process.terminated
+
+
+def test_idle_timeout_never_creates_a_lifecycle_deadline() -> None:
+    state = SimpleNamespace()
+
+    assert _next_loop_deadline(state, TLLoopConfig(idle_timeout=0.001)) is None
+
+
+def test_recursive_tl_waiting_child_is_not_marked_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def waiting_child(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
+        del root_spec, config, budgets
+        return SimpleNamespace(
+            final_state=SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting), slices={})
+        )
+
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", waiting_child)
+    result = run_tl_loop(
+        "waiting-child-parent",
+        WorkPlan(sub_tls=(SubTLTask("waiting-child", WorkPlan(), order=1),)),
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=TLLoopConfig(
+            active=True,
+            keep_alive_on_waiting=False,
+            max_parallel_slices=1,
+            poll_interval=0.001,
+            idle_timeout=0.01,
+        ),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLWaiting
+    assert result.final_state.slices["waiting-child"].status is SliceStatus.SPAWNED
 
 
 def test_live_waiting_child_is_terminated_on_explicit_cancellation() -> None:
@@ -2135,34 +2171,6 @@ def test_same_order_sub_tls_overlap_and_wait_for_prior_stage(
     assert timeline.index(("start", "stage-two")) > timeline.index(("end", "stage-one-b"))
 
 
-def test_recursive_tl_waiting_child_is_not_marked_failed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def waiting_child(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
-        del root_spec, config, budgets
-        return SimpleNamespace(
-            final_state=SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting), slices={})
-        )
-
-    monkeypatch.setattr("tl_loop.loop.driver.tl_run", waiting_child)
-    result = run_tl_loop(
-        "waiting-child-parent",
-        WorkPlan(sub_tls=(SubTLTask("waiting-child", WorkPlan(), order=1),)),
-        SyntheticQueue([]),
-        EffectClient(RecordingTransport()),
-        config=TLLoopConfig(
-            active=True,
-            max_parallel_slices=1,
-            poll_interval=0.001,
-            idle_timeout=0.01,
-        ),
-        root_dir=tmp_path,
-    )
-
-    assert result.final_state.fsm.phase is TLPhase.TLWaiting
-    assert result.final_state.slices["waiting-child"].status is SliceStatus.SPAWNED
-
-
 def test_active_parent_stays_alive_for_later_recursive_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2268,6 +2276,7 @@ def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
         max_events=5,
         poll_interval=0.001,
         idle_timeout=0.1,
+        keep_alive_on_waiting=False,
     )
     parent_root = tmp_path / "ordered-e2e-run"
     for sub_tl_id, pr_number in (("alpha", 101), ("beta", 102)):
@@ -2528,7 +2537,12 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
             SubTLTask("later-stage", WorkPlan(), source=SyntheticQueue([]), order=2),
         )
     )
-    config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
+    config = TLLoopConfig(
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        idle_timeout=0.1,
+        keep_alive_on_waiting=False,
+    )
 
     first = run_tl_loop(
         "aggregate-run",
@@ -2613,7 +2627,12 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
     plan = WorkPlan(
         sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
     )
-    config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
+    config = TLLoopConfig(
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        idle_timeout=0.1,
+        keep_alive_on_waiting=False,
+    )
     verified: list[tuple[str, str, str, str]] = []
     from tl_loop.loop import driver
 
@@ -2702,7 +2721,12 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
 def test_restart_during_merging_reconciles_without_duplicate_merge(tmp_path: Path) -> None:
     run_id = "merging-restart-run"
     plan = WorkPlan(sub_tls=(SubTLTask("aggregate-child", WorkPlan(), order=1),))
-    config = TLLoopConfig(max_parallel_slices=1, poll_interval=0.001, idle_timeout=0.1)
+    config = TLLoopConfig(
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        idle_timeout=0.1,
+        keep_alive_on_waiting=False,
+    )
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["aggregate-child"].update(
         {
@@ -2834,6 +2858,7 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
         poll_interval=0.001,
         idle_timeout=0.1,
         max_base_revalidations=1,
+        keep_alive_on_waiting=False,
     )
     run_tl_loop(
         "serialized-run",
@@ -2950,6 +2975,7 @@ def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, 
         max_integration_repairs=0,
         poll_interval=0.001,
         idle_timeout=0.1,
+        keep_alive_on_waiting=False,
     )
     run_tl_loop(
         "mismatch-run",
@@ -3075,6 +3101,7 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
         poll_interval=0.001,
         idle_timeout=0.01,
         review_model_choice=_review_choice(backend),
+        keep_alive_on_waiting=False,
     )
     run_tl_loop(
         "conflict-run",
@@ -3178,6 +3205,7 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
         poll_interval=0.001,
         idle_timeout=0.01,
         max_integration_repairs=0,
+        keep_alive_on_waiting=False,
     )
     run_tl_loop(
         "gate-run",

@@ -478,8 +478,10 @@ class TLLoopConfig:
     test_harness: bool = False
     cancel_event: threading.Event | None = None
     poll_interval: float = 0.1
+    # Retained for configuration compatibility; lifecycle progress is driven
+    # by authoritative events, cancellation, and explicit test ceilings.
     idle_timeout: float = 30.0
-    keep_alive_on_waiting: bool = False
+    keep_alive_on_waiting: bool = True
     dispatch_timeout: float = 5.0
     controller_stall_timeout: float = 300.0
     max_base_revalidations: int = 3
@@ -1140,7 +1142,7 @@ def _run_loop(
                 f"event limit {config.max_events} reached before TL reached a terminal phase"
             )
     if not isinstance(phase, (TLDone, TLFailed)):
-        raise LoopTimeout(f"TL did not reach a terminal phase within {config.idle_timeout:g}s")
+        raise TLLoopError("TL controller exited without an authoritative terminal phase")
     if phase is TLFailed:
         reason = next(
             (current.dispatch_error for current in state.slices.values() if current.dispatch_error),
