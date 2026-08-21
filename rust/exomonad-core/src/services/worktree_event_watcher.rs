@@ -229,6 +229,18 @@ fn canonical_watcher_event_data(
     })
 }
 
+fn watcher_agent_message(agent_id: &str, status: &str, message: &str) -> Event {
+    Event {
+        event_id: 0,
+        event_type: Some(EventType::AgentMessage(AgentMessage {
+            agent_id: agent_id.to_string(),
+            status: status.to_string(),
+            message: message.to_string(),
+            changes: vec![],
+        })),
+    }
+}
+
 fn review_state_is_terminal(review_state: &ForgejoReviewState) -> bool {
     matches!(
         review_state,
@@ -2317,15 +2329,7 @@ where
             );
         }
 
-        let event = Event {
-            event_id: 0,
-            event_type: Some(EventType::AgentMessage(AgentMessage {
-                agent_id: branch.to_string(),
-                status: status.to_string(),
-                message: message.to_string(),
-                changes: vec![],
-            })),
-        };
+        let event = watcher_agent_message(agent_id, status, message);
         self.ctx.event_queue().notify_event(branch, event).await;
     }
 
@@ -5130,6 +5134,19 @@ mod tests {
         assert_eq!(data["slice_id"], "tunable-operator-body");
         assert_eq!(data["head_sha"], "head-42");
         assert_eq!(data["status"], "failure");
+    }
+
+    #[test]
+    fn watcher_delivery_message_uses_stable_agent_identity_not_branch() {
+        let event =
+            watcher_agent_message("tunable-operator-body-opencode", "failure", "tests failed");
+        let Some(EventType::AgentMessage(message)) = event.event_type else {
+            panic!("watcher message must use the AgentMessage event type");
+        };
+
+        assert_eq!(message.agent_id, "tunable-operator-body-opencode");
+        assert_eq!(message.status, "failure");
+        assert_eq!(message.message, "tests failed");
     }
 
     fn publication_for_owner(owner: Option<&str>) -> PublishedHead {
