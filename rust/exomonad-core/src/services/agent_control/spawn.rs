@@ -1160,9 +1160,9 @@ impl<
                 working_dir: ctx.working_dir.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::SharedDir,
-                model: model.clone(),
-                effort: effort.clone(),
-                ledger_owned: false,
+                      model: model.clone(),
+                      effort: effort.clone(),
+                  ledger_owned: false,
                 slice_id: Some(options.name.to_string()),
             };
             self.finalize_spawn(&agent_name, routing, Some(identity_record))
@@ -1491,9 +1491,9 @@ impl<
                 working_dir: worktree_path.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,
-                model: model.clone(),
-                effort: effort.clone(),
-                ledger_owned: false,
+                      model: model.clone(),
+                      effort: effort.clone(),
+                  ledger_owned: false,
                 slice_id: Some(options.branch_name.clone()),
             };
             let trigger = if options
@@ -1514,8 +1514,9 @@ impl<
                     trigger,
                     pr_number: options.invocation_pr_number,
                     head_sha: options.invocation_head_sha.clone(),
-                    model: model.clone(),
-                    effort: effort.clone(),
+                      model: model.clone(),
+                      effort: effort.clone(),
+                      identity: None,
                 },
             )
                 .await?;
@@ -1983,14 +1984,15 @@ impl<
                 &agent_name,
                 routing,
                 Some(identity_record),
-                InvocationMetadata {
-                    runtime: agent_type,
-                    trigger,
-                    pr_number: options.invocation_pr_number,
-                    head_sha: options.start_point.clone(),
-                    model: model.clone(),
-                    effort: effort.clone(),
-                },
+                  InvocationMetadata {
+                      runtime: agent_type,
+                      trigger,
+                      pr_number: options.invocation_pr_number,
+                      head_sha: options.start_point.clone(),
+                      model: model.clone(),
+                      effort: effort.clone(),
+                      identity: None,
+                  },
             )
                 .await
             {

@@ -32,6 +32,22 @@ pub struct InvocationMetadata {
     pub head_sha: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub identity: Option<InvocationIdentityContext>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InvocationIdentityContext {
+    pub runtime_agent_id: Option<String>,
+    pub slice_id: Option<String>,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InvocationExitContext {
+    pub reason: Option<String>,
+    pub classification: Option<String>,
+    pub stderr_tail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +82,20 @@ pub struct InvocationRecord {
     pub effort: Option<String>,
     #[serde(default)]
     pub generation: u64,
+    #[serde(default)]
+    pub runtime_agent_id: Option<String>,
+    #[serde(default)]
+    pub slice_id: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub worktree: Option<String>,
+    #[serde(default)]
+    pub exit_reason: Option<String>,
+    #[serde(default)]
+    pub exit_classification: Option<String>,
+    #[serde(default)]
+    pub stderr_tail: Option<String>,
 }
 
 impl InvocationRecord {
@@ -178,8 +208,24 @@ pub async fn start_invocation(
     pr_number: Option<u64>,
     head_sha: Option<String>,
 ) -> Result<InvocationRecord> {
+    start_invocation_with_context(
+        agent_dir, runtime, trigger, routing, pr_number, head_sha, None,
+    )
+    .await
+}
+
+async fn start_invocation_with_context(
+    agent_dir: &Path,
+    runtime: AgentType,
+    trigger: InvocationTrigger,
+    routing: RoutingInfo,
+    pr_number: Option<u64>,
+    head_sha: Option<String>,
+    identity: Option<InvocationIdentityContext>,
+) -> Result<InvocationRecord> {
     let _guard = mutation_lock().lock().await;
     let generation = next_generation(agent_dir).await?;
+    let identity = identity.unwrap_or_default();
     let record = InvocationRecord {
         invocation_id: Uuid::new_v4().to_string(),
         runtime,
@@ -194,6 +240,13 @@ pub async fn start_invocation(
         model: None,
         effort: None,
         generation,
+        runtime_agent_id: identity.runtime_agent_id,
+        slice_id: identity.slice_id,
+        branch: identity.branch,
+        worktree: identity.worktree,
+        exit_reason: None,
+        exit_classification: None,
+        stderr_tail: None,
     };
     write_atomic(agent_dir, &record).await?;
     persist_routing_ownership(
@@ -225,8 +278,26 @@ pub async fn start_invocation_with_provenance(
     model: Option<String>,
     effort: Option<String>,
 ) -> Result<InvocationRecord> {
+    start_invocation_with_provenance_and_context(
+        agent_dir, runtime, trigger, routing, pr_number, head_sha, model, effort, None,
+    )
+    .await
+}
+
+pub async fn start_invocation_with_provenance_and_context(
+    agent_dir: &Path,
+    runtime: AgentType,
+    trigger: InvocationTrigger,
+    routing: RoutingInfo,
+    pr_number: Option<u64>,
+    head_sha: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    identity: Option<InvocationIdentityContext>,
+) -> Result<InvocationRecord> {
     let _guard = mutation_lock().lock().await;
     let generation = next_generation(agent_dir).await?;
+    let identity = identity.unwrap_or_default();
     let record = InvocationRecord {
         invocation_id: Uuid::new_v4().to_string(),
         runtime,
@@ -241,6 +312,13 @@ pub async fn start_invocation_with_provenance(
         model,
         effort,
         generation,
+        runtime_agent_id: identity.runtime_agent_id,
+        slice_id: identity.slice_id,
+        branch: identity.branch,
+        worktree: identity.worktree,
+        exit_reason: None,
+        exit_classification: None,
+        stderr_tail: None,
     };
     write_atomic(agent_dir, &record).await?;
     persist_routing_ownership(
@@ -267,6 +345,7 @@ async fn finish_locked(
     invocation_id: &str,
     status: InvocationStatus,
     exit_code: Option<i32>,
+    exit_context: InvocationExitContext,
 ) -> Result<InvocationFinishResult> {
     let Some(mut record) = read_locked(agent_dir).await? else {
         return Ok(InvocationFinishResult::Missing);
@@ -280,6 +359,9 @@ async fn finish_locked(
     record.ended_at = Some(unix_timestamp());
     record.status = status;
     record.exit_code = exit_code;
+    record.exit_reason = exit_context.reason;
+    record.exit_classification = exit_context.classification;
+    record.stderr_tail = exit_context.stderr_tail;
     write_atomic(agent_dir, &record).await?;
     crate::services::lifecycle::record_invocation_finished(agent_dir, &record);
     info!(
@@ -299,8 +381,25 @@ pub async fn finish_invocation(
     status: InvocationStatus,
     exit_code: Option<i32>,
 ) -> Result<InvocationFinishResult> {
+    finish_invocation_with_context(
+        agent_dir,
+        invocation_id,
+        status,
+        exit_code,
+        InvocationExitContext::default(),
+    )
+    .await
+}
+
+pub async fn finish_invocation_with_context(
+    agent_dir: &Path,
+    invocation_id: &str,
+    status: InvocationStatus,
+    exit_code: Option<i32>,
+    exit_context: InvocationExitContext,
+) -> Result<InvocationFinishResult> {
     let _guard = mutation_lock().lock().await;
-    finish_locked(agent_dir, invocation_id, status, exit_code).await
+    finish_locked(agent_dir, invocation_id, status, exit_code, exit_context).await
 }
 
 /// Finish and tombstone a routing target only when the current invocation
@@ -314,6 +413,23 @@ pub async fn finish_invocation_and_tombstone(
     expected_routing: &RoutingInfo,
     status: InvocationStatus,
     exit_code: Option<i32>,
+) -> Result<InvocationFinishResult> {
+    finish_invocation_and_tombstone_with_context(
+        agent_dir,
+        expected_routing,
+        status,
+        exit_code,
+        InvocationExitContext::default(),
+    )
+    .await
+}
+
+pub async fn finish_invocation_and_tombstone_with_context(
+    agent_dir: &Path,
+    expected_routing: &RoutingInfo,
+    status: InvocationStatus,
+    exit_code: Option<i32>,
+    exit_context: InvocationExitContext,
 ) -> Result<InvocationFinishResult> {
     let _guard = mutation_lock().lock().await;
     let current = read_locked(agent_dir).await?;
@@ -329,7 +445,16 @@ pub async fn finish_invocation_and_tombstone(
     }
 
     let result = match current {
-        Some(record) => finish_locked(agent_dir, &record.invocation_id, status, exit_code).await?,
+        Some(record) => {
+            finish_locked(
+                agent_dir,
+                &record.invocation_id,
+                status,
+                exit_code,
+                exit_context,
+            )
+            .await?
+        }
         None => InvocationFinishResult::Missing,
     };
     let exited_at = unix_timestamp().to_string();
@@ -372,6 +497,61 @@ mod tests {
         assert!(!persisted.invocation_id.is_empty());
         assert!(persisted.is_live());
         assert!(dir.path().join(INVOCATION_FILENAME).exists());
+    }
+
+    #[tokio::test]
+    async fn invocation_exit_context_is_bounded_and_persisted() {
+        let dir = tempdir().expect("tempdir");
+        let record = start_invocation_with_provenance_and_context(
+            dir.path(),
+            AgentType::OpenCode,
+            InvocationTrigger::Spawn,
+            routing(),
+            None,
+            None,
+            None,
+            None,
+            Some(InvocationIdentityContext {
+                runtime_agent_id: Some("tunable-operator-body-opencode".to_string()),
+                slice_id: Some("tunable-operator-body".to_string()),
+                branch: Some("main.tunable-operator-body".to_string()),
+                worktree: Some(".exo/worktrees/tunable-operator-body-opencode".to_string()),
+            }),
+        )
+        .await
+        .expect("start invocation");
+        let result = finish_invocation_with_context(
+            dir.path(),
+            &record.invocation_id,
+            InvocationStatus::Killed,
+            None,
+            InvocationExitContext {
+                reason: Some("tmux_target_exited_without_exit_marker".to_string()),
+                classification: Some("missing_exit_marker".to_string()),
+                stderr_tail: Some("stderr tail".to_string()),
+            },
+        )
+        .await
+        .expect("finish invocation");
+        let InvocationFinishResult::Finished(finished) = result else {
+            panic!("expected finished invocation");
+        };
+
+        assert_eq!(
+            finished.runtime_agent_id.as_deref(),
+            Some("tunable-operator-body-opencode")
+        );
+        assert_eq!(finished.slice_id.as_deref(), Some("tunable-operator-body"));
+        assert_eq!(
+            finished.exit_classification.as_deref(),
+            Some("missing_exit_marker")
+        );
+        assert_eq!(finished.stderr_tail.as_deref(), Some("stderr tail"));
+        let persisted = tokio::fs::read_to_string(dir.path().join(INVOCATION_FILENAME))
+            .await
+            .expect("persisted invocation");
+        assert!(persisted.contains("missing_exit_marker"));
+        assert!(persisted.contains("tunable-operator-body-opencode"));
     }
 
     #[tokio::test]

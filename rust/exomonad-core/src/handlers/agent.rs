@@ -4614,6 +4614,13 @@ mod tests {
             model: Some("gpt-5.6-luna".to_string()),
             effort: Some("xhigh".to_string()),
             generation: 2,
+            runtime_agent_id: None,
+            slice_id: None,
+            branch: None,
+            worktree: None,
+            exit_reason: None,
+            exit_classification: None,
+            stderr_tail: None,
         };
         let same_generation = InvocationRecord {
             invocation_id: current.invocation_id.clone(),

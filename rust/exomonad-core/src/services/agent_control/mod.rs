@@ -11,9 +11,11 @@ pub mod invocation;
 mod spawn;
 
 pub use invocation::{
-    finish_invocation, finish_invocation_and_tombstone, read_invocation,
+    finish_invocation, finish_invocation_and_tombstone,
+    finish_invocation_and_tombstone_with_context, finish_invocation_with_context, read_invocation,
     read_invocation_conservatively, start_invocation, start_invocation_with_provenance,
-    InvocationFinishResult, InvocationMetadata, InvocationRecord, InvocationStatus,
+    start_invocation_with_provenance_and_context, InvocationExitContext, InvocationFinishResult,
+    InvocationIdentityContext, InvocationMetadata, InvocationRecord, InvocationStatus,
     InvocationTrigger, INVOCATION_FILENAME,
 };
 pub use spawn::{
@@ -51,6 +53,24 @@ pub(crate) const TMUX_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const INVOCATION_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const INVOCATION_MONITOR_INTERVAL: Duration = Duration::from_millis(200);
 pub(crate) const LAST_ACTIVITY_FILE: &str = "last_activity_at";
+const MAX_INVOCATION_STDERR_TAIL_BYTES: usize = 4096;
+
+async fn read_invocation_stderr_tail(agent_dir: &Path) -> Option<String> {
+    for filename in ["stderr_tail", "stderr.log", "stderr"] {
+        let Ok(bytes) = fs::read(agent_dir.join(filename)).await else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let start = bytes.len().saturating_sub(MAX_INVOCATION_STDERR_TAIL_BYTES);
+        let tail = String::from_utf8_lossy(&bytes[start..]).trim().to_string();
+        if !tail.is_empty() {
+            return Some(tail);
+        }
+    }
+    None
+}
 
 /// Push the parent branch to the remote so child PRs can reference it as
 /// their base. Non-fatal: warns on failure (supports local/airgapped setups
@@ -1031,6 +1051,16 @@ impl<
             .unwrap_or_else(|| AgentType::from_dir_name(agent_name.as_str()));
         let model = identity.as_ref().and_then(|record| record.model.clone());
         let effort = identity.as_ref().and_then(|record| record.effort.clone());
+        let identity_context = InvocationIdentityContext {
+            runtime_agent_id: Some(agent_name.to_string()),
+            slice_id: identity.as_ref().and_then(|record| record.slice_id.clone()),
+            branch: identity
+                .as_ref()
+                .map(|record| record.birth_branch.to_string()),
+            worktree: identity
+                .as_ref()
+                .map(|record| record.working_dir.to_string_lossy().into_owned()),
+        };
         self.finalize_spawn_with_invocation(
             agent_name,
             routing,
@@ -1042,6 +1072,7 @@ impl<
                 head_sha: None,
                 model,
                 effort,
+                identity: Some(identity_context),
             },
         )
         .await
@@ -1066,7 +1097,19 @@ impl<
             ));
         }
         routing.write_to_dir(&agent_config_dir).await?;
-        let invocation = invocation::start_invocation_with_provenance(
+        let identity_context = metadata.identity.or_else(|| {
+            Some(InvocationIdentityContext {
+                runtime_agent_id: Some(agent_name.to_string()),
+                slice_id: identity.as_ref().and_then(|record| record.slice_id.clone()),
+                branch: identity
+                    .as_ref()
+                    .map(|record| record.birth_branch.to_string()),
+                worktree: identity
+                    .as_ref()
+                    .map(|record| record.working_dir.to_string_lossy().into_owned()),
+            })
+        });
+        let invocation = invocation::start_invocation_with_provenance_and_context(
             &agent_config_dir,
             metadata.runtime,
             metadata.trigger,
@@ -1075,6 +1118,7 @@ impl<
             metadata.head_sha,
             metadata.model,
             metadata.effort,
+            identity_context,
         )
         .await?;
         let effective_routing = RoutingInfo::read_from_dir(&agent_config_dir).await?;
@@ -1179,19 +1223,38 @@ impl<
                         consecutive_errors = 0;
                     }
                     Ok(false) => {
-                        let exit_code = tokio::fs::read_to_string(agent_dir.join("exit_code"))
+                        let exit_marker = tokio::fs::read_to_string(agent_dir.join("exit_code"))
                             .await
-                            .ok()
+                            .ok();
+                        let exit_code = exit_marker
+                            .as_deref()
                             .and_then(|value| value.trim().parse::<i32>().ok());
-                        let status = match exit_code {
-                            Some(0) | None => InvocationStatus::Exited,
-                            Some(_) => InvocationStatus::Failed,
+                        let (status, classification, reason) = match exit_code {
+                            Some(0) => {
+                                (InvocationStatus::Exited, "clean_exit", "tmux_target_exited")
+                            }
+                            Some(_) => (
+                                InvocationStatus::Failed,
+                                "nonzero_exit",
+                                "tmux_target_exited_with_nonzero_code",
+                            ),
+                            None => (
+                                InvocationStatus::Killed,
+                                "missing_exit_marker",
+                                "tmux_target_exited_without_exit_marker",
+                            ),
                         };
-                        match invocation::finish_invocation_and_tombstone(
+                        let exit_context = InvocationExitContext {
+                            reason: Some(reason.to_string()),
+                            classification: Some(classification.to_string()),
+                            stderr_tail: read_invocation_stderr_tail(&agent_dir).await,
+                        };
+                        match invocation::finish_invocation_and_tombstone_with_context(
                             &agent_dir,
                             &invocation.routing,
                             status,
                             exit_code,
+                            exit_context,
                         )
                         .await
                         {

@@ -124,12 +124,20 @@ pub struct LifecycleTelemetry {
     pub role: String,
     pub invocation_id: Option<String>,
     pub generation: Option<u64>,
+    pub runtime_agent_id: Option<String>,
+    pub slice_id: Option<String>,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
     pub trigger: Option<String>,
     pub pr_number: Option<u64>,
     pub issue_number: Option<u64>,
     pub head_sha: Option<String>,
     pub outcome: String,
     pub status: Option<String>,
+    pub exit_code: Option<i32>,
+    pub exit_reason: Option<String>,
+    pub exit_classification: Option<String>,
+    pub stderr_tail: Option<String>,
     pub delivery_vs_authoritative: String,
     pub rollout_mode: OneShotLifecycleMode,
     pub channel: Option<String>,
@@ -152,12 +160,20 @@ impl LifecycleTelemetry {
             role: role_for_trigger(record.trigger).to_string(),
             invocation_id: Some(record.invocation_id.clone()),
             generation: Some(record.generation),
+            runtime_agent_id: record.runtime_agent_id.clone(),
+            slice_id: record.slice_id.clone(),
+            branch: record.branch.clone(),
+            worktree: record.worktree.clone(),
             trigger: Some(trigger_label(record.trigger).to_string()),
             pr_number: record.pr_number,
             issue_number: None,
             head_sha: record.head_sha.clone(),
             outcome: outcome.to_string(),
             status: Some(status_label(record.status).to_string()),
+            exit_code: record.exit_code,
+            exit_reason: record.exit_reason.clone(),
+            exit_classification: record.exit_classification.clone(),
+            stderr_tail: record.stderr_tail.clone(),
             delivery_vs_authoritative: "metadata_only".to_string(),
             rollout_mode: OneShotLifecycleMode::from_env(),
             channel: None,
@@ -192,12 +208,20 @@ impl LifecycleTelemetry {
                 .unwrap_or_else(|| "unknown".to_string()),
             invocation_id: invocation.map(|record| record.invocation_id.clone()),
             generation: invocation.map(|record| record.generation),
+            runtime_agent_id: invocation.and_then(|record| record.runtime_agent_id.clone()),
+            slice_id: invocation.and_then(|record| record.slice_id.clone()),
+            branch: invocation.and_then(|record| record.branch.clone()),
+            worktree: invocation.and_then(|record| record.worktree.clone()),
             trigger: invocation.map(|record| trigger_label(record.trigger).to_string()),
             pr_number: invocation.and_then(|record| record.pr_number),
             issue_number: None,
             head_sha: invocation.and_then(|record| record.head_sha.clone()),
             outcome: outcome.to_string(),
             status: None,
+            exit_code: invocation.and_then(|record| record.exit_code),
+            exit_reason: invocation.and_then(|record| record.exit_reason.clone()),
+            exit_classification: invocation.and_then(|record| record.exit_classification.clone()),
+            stderr_tail: invocation.and_then(|record| record.stderr_tail.clone()),
             delivery_vs_authoritative: "delivery_only".to_string(),
             rollout_mode: OneShotLifecycleMode::from_env(),
             channel: Some(channel.to_string()),
@@ -545,6 +569,8 @@ mod tests {
         assert_eq!(record.invocation_id, "legacy");
         assert_eq!(record.pr_number, None);
         assert_eq!(record.head_sha, None);
+        assert_eq!(record.exit_classification, None);
+        assert_eq!(record.stderr_tail, None);
     }
 
     #[test]
@@ -563,6 +589,13 @@ mod tests {
             model: Some("gpt-5.6-luna".to_string()),
             effort: Some("xhigh".to_string()),
             generation: 1,
+            runtime_agent_id: None,
+            slice_id: None,
+            branch: None,
+            worktree: None,
+            exit_reason: None,
+            exit_classification: None,
+            stderr_tail: None,
         };
         let telemetry = LifecycleTelemetry::from_invocation(&record, "finished");
         let value = serde_json::to_value(telemetry).expect("telemetry JSON");
@@ -604,6 +637,13 @@ mod tests {
             model: None,
             effort: None,
             generation: 1,
+            runtime_agent_id: None,
+            slice_id: None,
+            branch: None,
+            worktree: None,
+            exit_reason: None,
+            exit_classification: None,
+            stderr_tail: None,
         };
         record_invocation_started(&agent_dir, &record);
         let files = fs::read_dir(root.path().join(".exo/events"))
