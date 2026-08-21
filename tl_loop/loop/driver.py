@@ -2617,15 +2617,16 @@ def _supervise_live_sub_tl(
             break
         process.join(timeout=poll_interval)
     exitcode = getattr(process, "exitcode", None)
-    if not cancelled and exitcode not in (None, 0):
+    if not cancelled and exitcode is not None:
         try:
             child_state = child_store.load()
         except (OSError, ValueError):
             child_state = None
         if child_state is None or child_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
             child_store.record_exit_reason(
-                f"sub-TL controller exited unexpectedly with code {exitcode}"
+                f"sub-TL controller exited before authoritative resolution with code {exitcode}"
             )
+            return None
     try:
         return child_store.load()
     except (OSError, ValueError):

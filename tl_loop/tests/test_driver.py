@@ -248,6 +248,35 @@ def test_live_waiting_child_is_terminated_on_explicit_cancellation() -> None:
     assert reasons == ["sub-TL controller cancelled explicitly"]
 
 
+def test_exited_waiting_child_is_failed_as_process_loss() -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.alive = True
+            self.exitcode = 0
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+            self.alive = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    reasons: list[str] = []
+    child_store = SimpleNamespace(
+        load=lambda: SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting)),
+        record_exit_reason=reasons.append,
+    )
+
+    state = _supervise_live_sub_tl(
+        FakeProcess(),
+        child_store,
+        TLLoopConfig(poll_interval=0.001),
+    )
+
+    assert state is None
+    assert reasons == ["sub-TL controller exited before authoritative resolution with code 0"]
+
+
 @dataclass
 class IntegrationTransport(RecordingTransport):
     snapshots: list[JsonObject] = field(default_factory=list)
