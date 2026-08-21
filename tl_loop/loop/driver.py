@@ -4591,7 +4591,20 @@ def _route_repair(
         )
     )
     try:
-        handoff = compose_repair(
+
+        def dispatch_resume(arguments: JsonObject) -> object:
+            return _invoke(
+                "resume_pr",
+                slice_id,
+                arguments,
+                True,
+                live,
+                lambda client: client.resume_pr(**arguments),
+                effects_log,
+                raise_on_failure=False,
+            )
+
+        compose_repair(
             pr,
             Verdict.NO_GO,
             review,
@@ -4600,6 +4613,7 @@ def _route_repair(
             store=store,
             slice_id=slice_id,
             model=repair_model,
+            dispatch=dispatch_resume,
         )
     except (RepairError, ValueError) as error:
         parked = replace(
@@ -4641,14 +4655,6 @@ def _route_repair(
             effects_log,
         )
         return state
-    effects_log.append(
-        EffectIntent(
-            "resume_pr",
-            slice_id,
-            _repair_arguments(current.pr_number, handoff, repair_model),
-            True,
-        )
-    )
     refreshed = store.load()
     return store.checkpoint(phase, refreshed.slices, refreshed.budgets, event_seq)
 

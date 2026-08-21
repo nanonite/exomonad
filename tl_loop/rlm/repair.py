@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import cast
 
 from tl_loop.client.effects import EffectClient, ToolResult
@@ -73,6 +73,7 @@ def compose_repair(
     store: RunStore | None = None,
     slice_id: str | None = None,
     model: str | None = None,
+    dispatch: Callable[[JsonObject], object] | None = None,
 ) -> RepairHandoff:
     """Compose, validate, dispatch, and account for one existing-PR repair."""
     number, paths = pr_identity(pr)
@@ -101,7 +102,7 @@ def compose_repair(
             if attempt == attempts:
                 raise RepairHandoffRejected(attempts, feedback) from error
             continue
-        _dispatch_resume(selected_client, number, handoff, model)
+        _dispatch_resume(selected_client, number, handoff, model, dispatch=dispatch)
         increment_attempts(pr, number, store, slice_id)
         return handoff
 
@@ -162,12 +163,17 @@ def _repair_inputs(
 
 
 def _dispatch_resume(
-    client: object, number: int, handoff: RepairHandoff, model: str | None
+    client: object,
+    number: int,
+    handoff: RepairHandoff,
+    model: str | None,
+    *,
+    dispatch: Callable[[JsonObject], object] | None = None,
 ) -> None:
     resume = getattr(client, "resume_pr", None)
     if not callable(resume):
         raise RepairInputError("client has no resume_pr capability")
-    kwargs = {
+    kwargs: JsonObject = {
         "pr_number": number,
         "task": handoff.proposed_solution,
         "context": (
@@ -182,6 +188,15 @@ def _dispatch_resume(
     }
     if model is not None:
         kwargs["model"] = model
+    if dispatch is not None:
+        outcome = dispatch(kwargs)
+        if isinstance(outcome, ToolResult) and outcome.success is False:
+            raise RepairDispatchError(outcome.error or "resume_pr failed")
+        if isinstance(outcome, Mapping) and outcome.get("success") is False:
+            raise RepairDispatchError(
+                cast(str, outcome.get("error") or "resume_pr failed")
+            )
+        return
     parameters = inspect.signature(resume).parameters
     if "handoff" in parameters and "task" not in parameters:
         outcome = resume(number, handoff.to_mapping())

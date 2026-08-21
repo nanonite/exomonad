@@ -42,6 +42,28 @@ def test_confirmed_action_replays_after_journal_reload(tmp_path) -> None:
     assert reloaded.replay(entry).result == {"merge_id": "m-1"}
 
 
+def test_resume_action_is_journaled_and_replayed_after_reload(tmp_path) -> None:
+    path = tmp_path / "action-journal.json"
+    intent = _intent(operation="resume_pr")
+    journal = EffectJournal("run-a", path)
+    journal.append(intent)
+    result = ToolResult.from_raw(
+        {
+            "success": True,
+            "result": {"invocation": {"invocation_id": "resume-1", "fresh": True}},
+        }
+    )
+    journal.mark_result(intent, result)
+
+    reloaded = EffectJournal("run-a", path)
+    entry = reloaded.existing(intent)
+    assert entry is not None
+    assert entry["operation"] == "resume_pr"
+    assert reloaded.replay(entry).result == {
+        "invocation": {"invocation_id": "resume-1", "fresh": True}
+    }
+
+
 def test_unknown_action_cannot_be_retried_blindly(tmp_path) -> None:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-a", path)

@@ -131,6 +131,28 @@ def test_valid_repair_round_trips_through_resume_pr() -> None:
     assert pr["attempts"] == 1
 
 
+def test_repair_uses_supplied_dispatch_boundary() -> None:
+    backend = FakeBackend([RlmResponse(_handoff())])
+    client = FakeClient()
+    dispatched: list[dict[str, object]] = []
+
+    result = compose_repair(
+        _pr(client),
+        Verdict.NO_GO,
+        _review(),
+        model_choice=_choice(backend),
+        dispatch=lambda arguments: (
+            dispatched.append(arguments)
+            or ToolResult.from_raw({"success": True, "result": {"fresh": True}})
+        ),
+    )
+
+    assert result.proposed_solution == "Handle the failure in src/owned.py"
+    assert len(dispatched) == 1
+    assert dispatched[0]["pr_number"] == 42
+    assert [name for name, _ in client.calls] == ["watcher_pr_state"]
+
+
 def test_repair_model_override_reaches_resume_pr() -> None:
     backend = FakeBackend([RlmResponse(_handoff())])
     client = FakeClient()
