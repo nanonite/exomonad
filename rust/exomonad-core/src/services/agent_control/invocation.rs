@@ -394,7 +394,7 @@ pub async fn finish_invocation(
     .await
 }
 
-pub(crate) async fn finish_invocation_with_context(
+async fn finish_invocation_with_context(
     agent_dir: &Path,
     invocation_id: &str,
     status: InvocationStatus,
@@ -523,9 +523,9 @@ mod tests {
         )
         .await
         .expect("start invocation");
-        let result = finish_invocation_with_context(
+        let result = finish_invocation_and_tombstone_with_context(
             dir.path(),
-            &record.invocation_id,
+            &routing(),
             InvocationStatus::Killed,
             None,
             InvocationExitContext {

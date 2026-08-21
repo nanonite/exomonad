@@ -2271,68 +2271,6 @@ where
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn emit_event(
-        &self,
-        agent_id: &str,
-        branch: &str,
-        pr_number: u64,
-        slice_id: Option<&str>,
-        status: &str,
-        message: &str,
-        head_sha: &str,
-        _agent_type: AgentType,
-        comments: Option<Vec<ForgejoReviewComment>>,
-        reviews: Option<Vec<ForgejoReview>>,
-    ) {
-        info!(
-            "Emitting event for branch {}: {} - {}",
-            branch, status, message
-        );
-
-        let event_name = match status {
-            "copilot_review" => "copilot.review",
-            "success" | "failure" | "pending" => "ci.status_changed",
-            other => other,
-        };
-
-        let comments_json = comments
-            .as_ref()
-            .and_then(|c| serde_json::to_string(c).ok())
-            .unwrap_or_default();
-        let reviews_json = reviews
-            .as_ref()
-            .and_then(|r| serde_json::to_string(r).ok())
-            .unwrap_or_default();
-
-        tracing::info!(
-            otel.name = event_name,
-            agent_id,
-            head_sha = %head_sha,
-            branch = %branch,
-            pr_number,
-            status = %status,
-            message = %message,
-            comments = %comments_json,
-            reviews = %reviews_json,
-            "[event] {}",
-            event_name
-        );
-        if let Some(log) = self.ctx.event_log() {
-            let _ = log.append(
-                event_name,
-                agent_id,
-                &canonical_watcher_event_data(
-                    agent_id, branch, pr_number, slice_id, head_sha, status, message, comments,
-                    reviews,
-                ),
-            );
-        }
-
-        let event = watcher_agent_message(agent_id, status, message);
-        self.ctx.event_queue().notify_event(branch, event).await;
-    }
-
     async fn forgejo_review_parts(
         &self,
         pr_number: u64,
@@ -2442,6 +2380,73 @@ where
             changes_requested_rounds,
             forgejo_review_present,
         )
+    }
+}
+
+impl<C> WorktreeEventWatcher<C>
+where
+    C: HasEventLog + HasEventQueue,
+{
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_event(
+        &self,
+        agent_id: &str,
+        branch: &str,
+        pr_number: u64,
+        slice_id: Option<&str>,
+        status: &str,
+        message: &str,
+        head_sha: &str,
+        _agent_type: AgentType,
+        comments: Option<Vec<ForgejoReviewComment>>,
+        reviews: Option<Vec<ForgejoReview>>,
+    ) {
+        info!(
+            "Emitting event for branch {}: {} - {}",
+            branch, status, message
+        );
+
+        let event_name = match status {
+            "copilot_review" => "copilot.review",
+            "success" | "failure" | "pending" => "ci.status_changed",
+            other => other,
+        };
+
+        let comments_json = comments
+            .as_ref()
+            .and_then(|c| serde_json::to_string(c).ok())
+            .unwrap_or_default();
+        let reviews_json = reviews
+            .as_ref()
+            .and_then(|r| serde_json::to_string(r).ok())
+            .unwrap_or_default();
+
+        tracing::info!(
+            otel.name = event_name,
+            agent_id,
+            head_sha = %head_sha,
+            branch = %branch,
+            pr_number,
+            status = %status,
+            message = %message,
+            comments = %comments_json,
+            reviews = %reviews_json,
+            "[event] {}",
+            event_name
+        );
+        if let Some(log) = self.ctx.event_log() {
+            let _ = log.append(
+                event_name,
+                agent_id,
+                &canonical_watcher_event_data(
+                    agent_id, branch, pr_number, slice_id, head_sha, status, message, comments,
+                    reviews,
+                ),
+            );
+        }
+
+        let event = watcher_agent_message(agent_id, status, message);
+        self.ctx.event_queue().notify_event(branch, event).await;
     }
 }
 
@@ -5136,14 +5141,65 @@ mod tests {
         assert_eq!(data["status"], "failure");
     }
 
-    #[test]
-    fn watcher_delivery_message_uses_stable_agent_identity_not_branch() {
-        let event =
-            watcher_agent_message("tunable-operator-body-opencode", "failure", "tests failed");
+    struct DeliveryContext {
+        event_queue: crate::services::event_queue::EventQueue,
+    }
+
+    impl HasEventQueue for DeliveryContext {
+        fn event_queue(&self) -> &crate::services::event_queue::EventQueue {
+            &self.event_queue
+        }
+    }
+
+    impl HasEventLog for DeliveryContext {
+        fn event_log(&self) -> Option<&crate::services::event_log::EventLog> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_delivery_message_uses_stable_agent_identity_not_branch() {
+        let ctx = Arc::new(DeliveryContext {
+            event_queue: crate::services::event_queue::EventQueue::new(),
+        });
+        let branch = "main.tunable-operator-body";
+        let watcher = WorktreeEventWatcher {
+            ctx: Arc::clone(&ctx),
+            poll_interval: Duration::from_secs(60),
+            inbox_poke_interval: DEFAULT_INBOX_POKE_INTERVAL,
+            state: Arc::new(WatcherRuntimeState::new()),
+            watcher_state_path: std::path::PathBuf::new(),
+            plugins: None,
+            policy: ReviewPolicy::default(),
+            ci_status_map: Arc::new(RwLock::new(HashMap::new())),
+            ci_source_configured: false,
+            forgejo_absent_warned: Arc::new(AtomicBool::new(false)),
+        };
+
+        watcher
+            .emit_event(
+                "tunable-operator-body-opencode",
+                branch,
+                42,
+                Some("tunable-operator-body"),
+                "failure",
+                "tests failed",
+                "head-42",
+                AgentType::OpenCode,
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(ctx.event_queue.queue_len(branch).await, 1);
+        let event = ctx
+            .event_queue
+            .wait_for_event(branch, &[], Duration::from_secs(1), 0)
+            .await
+            .expect("watcher delivery");
         let Some(EventType::AgentMessage(message)) = event.event_type else {
             panic!("watcher message must use the AgentMessage event type");
         };
-
         assert_eq!(message.agent_id, "tunable-operator-body-opencode");
         assert_eq!(message.status, "failure");
         assert_eq!(message.message, "tests failed");

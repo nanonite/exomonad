@@ -92,6 +92,14 @@ class _RowsRead:
 
 
 @dataclass(frozen=True)
+class _SegmentCacheEntry:
+    signature: tuple[int, int]
+    rows: tuple[LedgerRow, ...]
+    active_tail: ActiveTail | None
+    terminal_matches: tuple[tuple[str | None, str | None, Mapping[str, object]], ...]
+
+
+@dataclass(frozen=True)
 class ReadResult:
     """Projected replay rows plus sequence status and read-time findings."""
 
@@ -139,6 +147,8 @@ class LedgerReader:
         self.ledger_run_id = effective_scope
         self.scope_run_id = effective_scope
         self.scope_agent_id = scope_agent_id
+        self._segment_cache: dict[Path, _SegmentCacheEntry] = {}
+        self._terminal_matches: tuple[tuple[str | None, str | None, Mapping[str, object]]] = ()
 
     def cursor(self) -> int:
         """Return the persisted global cursor, or zero for a new local reader."""
@@ -209,17 +219,12 @@ class LedgerReader:
         FSM event union, but they still use the reader's single JSONL parsing
         and active-tail/error semantics.
         """
+        self._read_rows()
         match: Mapping[str, object] | None = None
-        for row in self._read_rows().rows:
-            if _raw_event_type(row.document) != "agent.invocation.finished":
+        for agent_id, recorded_slice, data in self._terminal_matches:
+            if recorded_slice is not None and recorded_slice != slice_id:
                 continue
-            data = row.document.get("data")
-            if not isinstance(data, Mapping):
-                continue
-            recorded_slice = data.get("slice_id")
-            if isinstance(recorded_slice, str) and recorded_slice and recorded_slice != slice_id:
-                continue
-            if row.document.get("agent_id") != runtime_agent_id and recorded_slice != slice_id:
+            if agent_id != runtime_agent_id and recorded_slice != slice_id:
                 continue
             match = data
         return match
@@ -263,41 +268,90 @@ class LedgerReader:
         active_tail: ActiveTail | None = None
         segments = self._segment_paths()
         active_segment = segments[-1] if segments else None
+        current_segments = set(segments)
+        changed = current_segments != set(self._segment_cache)
         for segment in segments:
             try:
-                with segment.open("rb") as stream:
-                    for line_number, line in enumerate(stream, start=1):
-                        if not line.strip():
-                            continue
-                        # LedgerWriter writes the JSON object and its newline
-                        # together, but a reader can observe the active
-                        # segment between those writes.  Only the unterminated
-                        # final line of the newest segment is retryable; a
-                        # newline makes malformed data committed evidence.
-                        if segment == active_segment and not line.endswith(b"\n"):
-                            active_tail = ActiveTail(segment, line_number, len(line))
-                            break
-                        try:
-                            value = json.loads(line)
-                        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                            raise LedgerReadError(
-                                f"could not parse {segment} line {line_number}: {error}",
-                                segment=segment,
-                                line_number=line_number,
-                            ) from error
-                        if not isinstance(value, dict):
-                            raise LedgerReadError(
-                                f"{segment} line {line_number}: ledger row must be an object",
-                                segment=segment,
-                                line_number=line_number,
-                            )
-                        rows.append(LedgerRow(segment, line_number, value))
+                stat = segment.stat()
             except FileNotFoundError:
                 continue
             except OSError as error:
                 raise LedgerReadError(
                     f"could not read ledger segment {segment}: {error}"
                 ) from error
+            signature = (stat.st_mtime_ns, stat.st_size)
+            cached = self._segment_cache.get(segment)
+            if cached is None or cached.signature != signature:
+                parsed = self._read_segment(segment, active_segment)
+                terminal_matches = tuple(
+                    (
+                        row.document.get("agent_id")
+                        if isinstance(row.document.get("agent_id"), str)
+                        else None,
+                        data.get("slice_id") if isinstance(data.get("slice_id"), str) else None,
+                        data,
+                    )
+                    for row in parsed.rows
+                    if _raw_event_type(row.document) == "agent.invocation.finished"
+                    and isinstance(row.document.get("data"), Mapping)
+                    for data in (cast(Mapping[str, object], row.document["data"]),)
+                )
+                cached = _SegmentCacheEntry(
+                    signature,
+                    parsed.rows,
+                    parsed.active_tail,
+                    terminal_matches,
+                )
+                self._segment_cache[segment] = cached
+                changed = True
+            rows.extend(cached.rows)
+            if cached.active_tail is not None:
+                active_tail = cached.active_tail
+        for segment in set(self._segment_cache) - current_segments:
+            del self._segment_cache[segment]
+        if changed:
+            self._terminal_matches = tuple(
+                match
+                for segment in sorted(self._segment_cache)
+                for match in self._segment_cache[segment].terminal_matches
+            )
+        return _RowsRead(tuple(rows), active_tail)
+
+    def _read_segment(self, segment: Path, active_segment: Path | None) -> _RowsRead:
+        rows: list[LedgerRow] = []
+        active_tail: ActiveTail | None = None
+        try:
+            with segment.open("rb") as stream:
+                for line_number, line in enumerate(stream, start=1):
+                    if not line.strip():
+                        continue
+                    # LedgerWriter writes the JSON object and its newline
+                    # together, but a reader can observe the active
+                    # segment between those writes.  Only the unterminated
+                    # final line of the newest segment is retryable; a
+                    # newline makes malformed data committed evidence.
+                    if segment == active_segment and not line.endswith(b"\n"):
+                        active_tail = ActiveTail(segment, line_number, len(line))
+                        break
+                    try:
+                        value = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                        raise LedgerReadError(
+                            f"could not parse {segment} line {line_number}: {error}",
+                            segment=segment,
+                            line_number=line_number,
+                        ) from error
+                    if not isinstance(value, dict):
+                        raise LedgerReadError(
+                            f"{segment} line {line_number}: ledger row must be an object",
+                            segment=segment,
+                            line_number=line_number,
+                        )
+                    rows.append(LedgerRow(segment, line_number, value))
+        except FileNotFoundError:
+            return _RowsRead((), None)
+        except OSError as error:
+            raise LedgerReadError(f"could not read ledger segment {segment}: {error}") from error
         return _RowsRead(tuple(rows), active_tail)
 
     def _segment_paths(self) -> list[Path]:

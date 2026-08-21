@@ -37,7 +37,9 @@ def test_replay_from_arbitrary_run_seq_returns_exact_cross_segment_suffix(tmp_pa
     assert result.sequence_status is SequenceStatus.COMPLETE
 
 
-def test_reader_finds_terminal_invocation_payload_with_shared_segment_parser(tmp_path: Path) -> None:
+def test_reader_finds_terminal_invocation_payload_with_shared_segment_parser(
+    tmp_path: Path,
+) -> None:
     segments = tmp_path / "segments"
     _write_segment(
         segments,
@@ -62,6 +64,37 @@ def test_reader_finds_terminal_invocation_payload_with_shared_segment_parser(tmp
         "invocation_id": "inv-1",
         "status": "exited",
     }
+
+
+def test_reader_reuses_unchanged_segment_for_terminal_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    segments = tmp_path / "segments"
+    _write_segment(
+        segments,
+        1,
+        [
+            {
+                "type": "agent.invocation.finished",
+                "agent_id": "slice-a-opencode",
+                "data": {"slice_id": "slice-a", "status": "exited"},
+            }
+        ],
+    )
+    reader = LedgerReader(segments)
+    reads: list[Path] = []
+    original = reader._read_segment
+
+    def counted(segment: Path, active_segment: Path | None) -> object:
+        reads.append(segment)
+        return original(segment, active_segment)
+
+    monkeypatch.setattr(reader, "_read_segment", counted)
+
+    reader.find_invocation_finished("slice-a-opencode", "slice-a")
+    reader.find_invocation_finished("slice-a-opencode", "slice-a")
+
+    assert reads == [segments / "segment-000000000001.jsonl"]
 
 
 def test_cursor_persists_and_resume_spans_segment_boundary(tmp_path: Path) -> None:
