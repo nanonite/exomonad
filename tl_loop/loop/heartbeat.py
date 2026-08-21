@@ -224,9 +224,19 @@ def _active_slices(state: RunState) -> tuple[SliceState, ...]:
 
 
 def _poll_workers(effects: LiveEffects, agents: tuple[SliceState, ...]) -> dict[str, JsonMapping]:
+    aliases: dict[str, str] = {}
+    for slice_state in agents:
+        runtime_name = slice_state.dispatch_agent_id or slice_state.id
+        previous = aliases.get(runtime_name)
+        if previous is not None and previous != slice_state.id:
+            raise HeartbeatError(
+                f"ambiguous runtime agent identity {runtime_name!r} for "
+                f"slices {previous!r} and {slice_state.id!r}"
+            )
+        aliases[runtime_name] = slice_state.id
     result = effects.poll_workers(
         include_dead=True,
-        agents=tuple(slice_state.id for slice_state in agents),
+        agents=tuple(aliases),
     )
     payload = _result_object(result, "poll_workers")
     rows = payload.get("workers")
@@ -238,8 +248,8 @@ def _poll_workers(effects: LiveEffects, agents: tuple[SliceState, ...]) -> dict[
     elif not isinstance(dead_rows, list):
         raise HeartbeatError("poll_workers dead_workers must be an array")
     indexed: dict[str, JsonMapping] = {}
-    _index_worker_rows(rows, indexed, dead=False)
-    _index_worker_rows(dead_rows, indexed, dead=True)
+    _index_worker_rows(rows, indexed, aliases=aliases, dead=False)
+    _index_worker_rows(dead_rows, indexed, aliases=aliases, dead=True)
     return indexed
 
 
@@ -247,15 +257,24 @@ def _index_worker_rows(
     rows: list[object],
     indexed: dict[str, JsonMapping],
     *,
+    aliases: Mapping[str, str],
     dead: bool,
 ) -> None:
     for row in rows:
+        if isinstance(row, str):
+            slice_id = aliases.get(row)
+            if slice_id is not None:
+                indexed[slice_id] = {"name": row, "pane_alive": False}
+            continue
         if not isinstance(row, Mapping):
             raise HeartbeatError("poll_workers worker array contains a non-object")
         name = row.get("name")
         if not isinstance(name, str) or not name:
             continue
-        indexed[name] = {**row, "pane_alive": False} if dead else row
+        slice_id = aliases.get(name)
+        if slice_id is None:
+            continue
+        indexed[slice_id] = {**row, "pane_alive": False} if dead else row
 
 
 def _watch_pr(effects: LiveEffects, pr_number: int) -> JsonMapping:

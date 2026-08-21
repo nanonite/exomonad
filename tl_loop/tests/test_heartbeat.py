@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import JsonObject
-from tl_loop.loop.heartbeat import HeartbeatConfig, heartbeat_once
+from tl_loop.loop.heartbeat import HeartbeatConfig, HeartbeatError, _poll_workers, heartbeat_once
 from tl_loop.state.schema import (
     ParkCause,
     RunState,
@@ -34,6 +36,12 @@ class HeartbeatTransport:
         del role, name
         self.calls.append((tool_name, arguments))
         if tool_name == "poll_workers":
+            requested = arguments.get("agents")
+            worker_name = (
+                requested[0]
+                if isinstance(requested, list) and requested and isinstance(requested[0], str)
+                else "slice-a"
+            )
             return cast(
                 JsonObject,
                 {
@@ -41,7 +49,7 @@ class HeartbeatTransport:
                     "result": {
                         "workers": [
                             {
-                                "name": "slice-a",
+                                "name": worker_name,
                                 "pane_alive": self.pane_alive,
                                 "lifecycle_status": "ACTIVE",
                             }
@@ -177,6 +185,25 @@ def test_repeated_heartbeat_reconciliation_is_idempotent(tmp_path: Path) -> None
         "poll_workers",
         "watcher_pr_state",
     ]
+
+
+def test_poll_workers_uses_persisted_runtime_identity(tmp_path: Path) -> None:
+    _, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    transport = HeartbeatTransport()
+
+    _poll_workers(EffectClient(transport), (state.slices["slice-a"],))
+
+    poll_arguments = transport.calls[0][1]
+    assert poll_arguments["agents"] == ["agent-slice-a"]
+
+
+def test_poll_workers_rejects_ambiguous_runtime_identity(tmp_path: Path) -> None:
+    _, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    first = state.slices["slice-a"]
+    second = replace(first, id="slice-b", dispatch_agent_id=first.dispatch_agent_id)
+
+    with pytest.raises(HeartbeatError, match="ambiguous runtime agent identity"):
+        _poll_workers(EffectClient(HeartbeatTransport()), (first, second))
 
 
 def _state(
