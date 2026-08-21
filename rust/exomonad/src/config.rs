@@ -2,13 +2,13 @@
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use exomonad_core::services::AgentType;
+use exomonad_core::services::{normalize_tl_preflight_runtime_path, AgentType};
 use exomonad_core::Role;
 
 pub const REVIEWER_MAX_ROUNDS_ENV: &str = "EXOMONAD_REVIEWER_MAX_ROUNDS";
 pub const REVIEWER_MODEL_ENV: &str = "EXOMONAD_REVIEWER_MODEL";
 pub const REVIEWER_EFFORT_ENV: &str = "EXOMONAD_REVIEWER_EFFORT_LEVEL";
-pub const TL_PREFLIGHT_RUNTIME_PATHS_ENV: &str = "EXOMONAD_TL_PREFLIGHT_RUNTIME_PATHS";
+pub use exomonad_core::services::TL_PREFLIGHT_RUNTIME_PATHS_ENV;
 pub const DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS: f64 = 10.0;
 pub const DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS: f64 = 30.0;
 pub const DEFAULT_TL_TASK_TIMEOUT_SECONDS: f64 = 3600.0;
@@ -40,15 +40,7 @@ fn require_task_timeout(name: &str, value: f64) -> Result<()> {
 
 fn validate_preflight_runtime_paths(paths: &[String]) -> Result<()> {
     for path in paths {
-        let trimmed = path.trim().trim_start_matches("./");
-        if trimmed.is_empty()
-            || trimmed.starts_with('/')
-            || trimmed.split('/').any(|component| component == "..")
-        {
-            anyhow::bail!(
-                "tl_preflight_runtime_paths entries must be non-empty relative paths without '..': {path:?}"
-            );
-        }
+        normalize_tl_preflight_runtime_path(path).map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }

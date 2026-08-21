@@ -3,7 +3,7 @@ use crate::control;
 use crate::control_gate;
 use crate::control_plan;
 use crate::control_read_model;
-use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV};
+use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -1410,6 +1410,10 @@ pub async fn run(config: &Config) -> Result<()> {
         };
         raw.canonicalize().unwrap_or(raw)
     };
+    // `exomonad serve` may be launched outside the init-created tmux session;
+    // propagate the same configured preflight rules directly to this process.
+    let runtime_paths = config.tl_preflight_runtime_paths.join(",");
+    std::env::set_var(TL_PREFLIGHT_RUNTIME_PATHS_ENV, runtime_paths);
 
     // Generate or load swarm run_id (persists across server restarts, resets on init --recreate)
     let run_id_path = project_dir.join(".exo/run_id");

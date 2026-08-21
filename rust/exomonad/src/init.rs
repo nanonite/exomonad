@@ -1547,15 +1547,29 @@ async fn wait_for_tl_controller_startup(
         if process_alive {
             observed_alive = true;
         } else {
-            if let Ok(checkpoint) = read_startup_checkpoint(project_dir) {
-                if let Some(message) = startup_checkpoint_message(&checkpoint) {
-                    println!("{message}");
-                    if let Err(error) =
-                        record_startup_checkpoint_classification(project_dir, &checkpoint)
-                    {
-                        warn!(%error, "Failed to persist TL startup classification");
+            match read_startup_checkpoint(project_dir) {
+                Ok(checkpoint @ StartupCheckpoint::TerminalOrParked { .. }) => {
+                    if let Some(message) = startup_checkpoint_message(&checkpoint) {
+                        println!("{message}");
+                        if let Err(error) =
+                            record_startup_checkpoint_classification(project_dir, &checkpoint)
+                        {
+                            warn!(%error, "Failed to persist TL startup classification");
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
+                }
+                Ok(StartupCheckpoint::Missing) => {
+                    debug!(
+                        project_dir = %project_dir.display(),
+                        "No durable TL checkpoint found while classifying startup exit"
+                    );
+                }
+                Ok(StartupCheckpoint::Nonterminal { phase }) => {
+                    debug!(phase, "TL startup exited with a nonterminal checkpoint");
+                }
+                Err(error) => {
+                    warn!(%error, "Failed to read TL startup checkpoint; retaining diagnostic");
                 }
             }
             if let Some(reason) = controller_exit_reason(project_dir) {
@@ -3364,6 +3378,29 @@ mod tests {
                 phase: "tl_waiting".to_string()
             }
         );
+    }
+
+    #[test]
+    fn startup_checkpoint_missing_is_not_treated_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            read_startup_checkpoint(dir.path()).unwrap(),
+            StartupCheckpoint::Missing
+        );
+        assert!(startup_checkpoint_message(&StartupCheckpoint::Missing).is_none());
+    }
+
+    #[test]
+    fn startup_checkpoint_parse_error_preserves_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"phase":"done"}"#).unwrap();
+
+        let error = read_startup_checkpoint(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("unsupported TL checkpoint"));
+        assert!(error.to_string().contains("missing string /fsm/phase"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::services::agent_control::{
     SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
 };
 use crate::services::agent_resources::dispose_agent_resources;
+use crate::services::configured_tl_preflight_runtime_paths;
 use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
 use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
 #[cfg(test)]
@@ -492,46 +493,11 @@ async fn dirty_worktree_entries(project_dir: &Path) -> Result<Vec<String>, Strin
     Ok(parse_git_status_paths(&output.stdout))
 }
 
-const BUILTIN_TL_PREFLIGHT_RUNTIME_PATHS: &[&str] = &[
-    ".chainlink/",
-    ".exo/",
-    ".claude/settings.local.json",
-    ".codex/",
-    ".opencode/",
-    "opencode.json",
-];
-
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SpawnPreflightReport {
     blocking: Vec<String>,
     excluded: Vec<String>,
     exclusions: Vec<String>,
-}
-
-fn normalize_runtime_path(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_start_matches("./").trim_end_matches('/');
-    if trimmed.is_empty()
-        || trimmed.starts_with('/')
-        || trimmed.split('/').any(|component| component == "..")
-    {
-        return None;
-    }
-    Some(format!("{trimmed}/"))
-}
-
-fn tl_preflight_runtime_paths() -> Vec<String> {
-    let mut paths = BUILTIN_TL_PREFLIGHT_RUNTIME_PATHS
-        .iter()
-        .filter_map(|path| normalize_runtime_path(path))
-        .collect::<Vec<_>>();
-    if let Ok(configured) = std::env::var("EXOMONAD_TL_PREFLIGHT_RUNTIME_PATHS") {
-        for path in configured.split(',').filter_map(normalize_runtime_path) {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-    }
-    paths
 }
 
 fn runtime_path_is_excluded(path: &str, exclusions: &[String]) -> bool {
@@ -588,7 +554,7 @@ async fn spawn_dirty_worktree_entries(project_dir: &Path) -> Result<SpawnPreflig
     let entries = dirty_worktree_entries(project_dir).await?;
     Ok(classify_spawn_preflight_entries(
         entries,
-        tl_preflight_runtime_paths(),
+        configured_tl_preflight_runtime_paths()?,
     ))
 }
 
@@ -4191,11 +4157,11 @@ mod tests {
     #[test]
     fn tl_spawn_preflight_runtime_paths_are_normalized_and_fail_closed() {
         assert_eq!(
-            normalize_runtime_path(" ./runtime/state/ "),
-            Some("runtime/state/".to_string())
+            crate::services::normalize_tl_preflight_runtime_path(" ./runtime/state/ "),
+            Ok("runtime/state/".to_string())
         );
-        assert!(normalize_runtime_path("/absolute/path").is_none());
-        assert!(normalize_runtime_path("runtime/../source").is_none());
+        assert!(crate::services::normalize_tl_preflight_runtime_path("/absolute/path").is_err());
+        assert!(crate::services::normalize_tl_preflight_runtime_path("runtime/../source").is_err());
         assert!(runtime_path_is_excluded(
             "./runtime/state/record.json",
             &["runtime/state/".to_string()]

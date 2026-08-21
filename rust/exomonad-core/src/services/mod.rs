@@ -48,6 +48,7 @@ pub mod sink_health;
 pub mod state_mirror;
 pub mod supervisor_registry;
 pub mod synthetic_members;
+pub mod tl_preflight;
 pub mod tmux_events;
 pub mod tmux_ipc;
 pub mod topic_vocabulary;
@@ -110,6 +111,10 @@ pub use self::session_state::{
 };
 pub use self::sink_health::{read as read_sink_health, SinkHealth};
 pub use self::supervisor_registry::SupervisorRegistry;
+pub use self::tl_preflight::{
+    configured_tl_preflight_runtime_paths, normalize_tl_preflight_runtime_path,
+    BUILTIN_TL_PREFLIGHT_RUNTIME_PATHS, TL_PREFLIGHT_RUNTIME_PATHS_ENV,
+};
 pub use self::topic_vocabulary::{
     decode_segment, encode_segment, parse_topic, serialize_topic, InTopic, ObsTopic, ParkSignal,
 };
