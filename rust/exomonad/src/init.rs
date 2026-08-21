@@ -1094,6 +1094,150 @@ fn root_tl_needs_resume(project_dir: &Path) -> Result<bool> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum StartupCheckpoint {
+    Missing,
+    Nonterminal {
+        phase: String,
+    },
+    TerminalOrParked {
+        phase: String,
+        pending_gates: Vec<String>,
+        dispatch_errors: Vec<(String, String)>,
+    },
+}
+
+fn read_startup_checkpoint(project_dir: &Path) -> Result<StartupCheckpoint> {
+    let run_path = project_dir.join(".exo/tl-loop/root/run.json");
+    if !run_path.exists() {
+        return Ok(StartupCheckpoint::Missing);
+    }
+    let payload = std::fs::read_to_string(&run_path)
+        .with_context(|| format!("failed to read {}", run_path.display()))?;
+    let value: Value = serde_json::from_str(&payload)
+        .with_context(|| format!("invalid TL checkpoint {}", run_path.display()))?;
+    let phase = value
+        .pointer("/fsm/phase")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported TL checkpoint {}: missing string /fsm/phase",
+                run_path.display()
+            )
+        })?;
+    let pending_gates = value
+        .get("gates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|gate| gate.get("status").and_then(Value::as_str) == Some("pending"))
+        .filter_map(|gate| {
+            gate.get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    let dispatch_errors = value
+        .get("slices")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|slices| slices.iter())
+        .filter_map(|(slice_id, slice)| {
+            slice
+                .get("dispatch_error")
+                .and_then(Value::as_str)
+                .filter(|error| !error.is_empty())
+                .map(|error| (slice_id.clone(), error.to_string()))
+        })
+        .collect::<Vec<_>>();
+    if matches!(phase, "tl_done" | "tl_failed") || !pending_gates.is_empty() {
+        return Ok(StartupCheckpoint::TerminalOrParked {
+            phase: phase.to_string(),
+            pending_gates,
+            dispatch_errors,
+        });
+    }
+    Ok(StartupCheckpoint::Nonterminal {
+        phase: phase.to_string(),
+    })
+}
+
+fn pending_gate_names(project_dir: &Path) -> Result<Option<Vec<String>>> {
+    match read_startup_checkpoint(project_dir)? {
+        StartupCheckpoint::TerminalOrParked { pending_gates, .. } if !pending_gates.is_empty() => {
+            Ok(Some(pending_gates))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn ensure_recreate_allowed(project_dir: &Path, allow_pending_gate: bool) -> Result<()> {
+    if allow_pending_gate {
+        return Ok(());
+    }
+    if let Some(gates) = pending_gate_names(project_dir)? {
+        anyhow::bail!(
+            "refusing --recreate: unanswered human gate(s) {} would be archived; pass --allow-pending-gate to override",
+            gates.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn startup_checkpoint_message(checkpoint: &StartupCheckpoint) -> Option<String> {
+    let StartupCheckpoint::TerminalOrParked {
+        phase,
+        pending_gates,
+        dispatch_errors,
+    } = checkpoint
+    else {
+        return None;
+    };
+    let mut message = format!("TL controller completed with durable checkpoint phase={phase}.");
+    for gate in pending_gates {
+        message.push_str(&format!(
+            "\nHuman gate pending: {gate}. Answer with `python3 -m tl_loop gate --run-id root --name {gate} --approve|--reject`."
+        ));
+    }
+    for (slice_id, error) in dispatch_errors {
+        message.push_str(&format!("\nSlice {slice_id} dispatch_error: {error}"));
+    }
+    Some(message)
+}
+
+fn record_startup_checkpoint_classification(
+    project_dir: &Path,
+    checkpoint: &StartupCheckpoint,
+) -> Result<()> {
+    let Some(message) = startup_checkpoint_message(checkpoint) else {
+        return Ok(());
+    };
+    let StartupCheckpoint::TerminalOrParked {
+        phase,
+        pending_gates,
+        ..
+    } = checkpoint
+    else {
+        unreachable!();
+    };
+    let path = project_dir.join(".exo/tl-loop/root/startup-classification.json");
+    let parent = path
+        .parent()
+        .context("startup classification has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let payload = serde_json::json!({
+        "classification": "terminal_or_parked",
+        "phase": phase,
+        "pending_gates": pending_gates,
+        "message": message,
+        "recorded_at": current_time_millis() as f64 / 1000.0,
+    });
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, serde_json::to_string_pretty(&payload)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn archive_controller_exit_reason(project_dir: &Path) -> Result<Option<PathBuf>> {
     let source = controller_exit_path(project_dir);
     if !source.exists() {
@@ -1399,20 +1543,39 @@ async fn wait_for_tl_controller_startup(
     let mut observed_alive = false;
 
     loop {
-        if let Some(reason) = controller_exit_reason(project_dir) {
-            return tl_controller_startup_failure(ipc, project_dir, window_id, reason).await;
+        let process_alive = ipc.routing_target_process_alive(&routing).await?;
+        if process_alive {
+            observed_alive = true;
+        } else {
+            if let Ok(checkpoint) = read_startup_checkpoint(project_dir) {
+                if let Some(message) = startup_checkpoint_message(&checkpoint) {
+                    println!("{message}");
+                    if let Err(error) =
+                        record_startup_checkpoint_classification(project_dir, &checkpoint)
+                    {
+                        warn!(%error, "Failed to persist TL startup classification");
+                    }
+                    return Ok(());
+                }
+            }
+            if let Some(reason) = controller_exit_reason(project_dir) {
+                return tl_controller_startup_failure(ipc, project_dir, window_id, reason).await;
+            }
+            if observed_alive {
+                return tl_controller_startup_failure(
+                    ipc,
+                    project_dir,
+                    window_id,
+                    format!("tmux window {window_id} exited before TL startup completed"),
+                )
+                .await;
+            }
         }
 
-        if ipc.routing_target_process_alive(&routing).await? {
-            observed_alive = true;
-        } else if observed_alive {
-            return tl_controller_startup_failure(
-                ipc,
-                project_dir,
-                window_id,
-                format!("tmux window {window_id} exited before TL startup completed"),
-            )
-            .await;
+        if process_alive {
+            if let Some(reason) = controller_exit_reason(project_dir) {
+                return tl_controller_startup_failure(ipc, project_dir, window_id, reason).await;
+            }
         }
 
         if Instant::now() >= deadline {
@@ -1479,6 +1642,7 @@ fn startup_failure_with_pane_output(fallback_reason: String, output: &str) -> St
 pub async fn run(
     session_override: Option<String>,
     recreate: bool,
+    allow_pending_gate: bool,
     openrouter: bool,
     worker: Option<String>,
     worker_model: Option<String>,
@@ -1878,6 +2042,7 @@ pub async fn run(
     }
 
     if recreate {
+        ensure_recreate_allowed(&cwd, allow_pending_gate)?;
         // Kill the running server process before tearing down the session
         let pid_path = cwd.join(".exo/server.pid");
         if let Ok(content) = std::fs::read_to_string(&pid_path) {
@@ -3147,6 +3312,62 @@ mod tests {
 
         let error = root_tl_needs_resume(dir.path()).unwrap_err();
         assert!(error.to_string().contains("invalid TL checkpoint"));
+    }
+
+    #[test]
+    fn startup_checkpoint_terminal_and_gate_are_operator_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+              root.join("run.json"),
+              r#"{"fsm":{"phase":"tl_failed"},"gates":[{"name":"tl-dispatch-failed","status":"pending"}],"slices":{"leaf-a":{"dispatch_error":"worktree is dirty"}}}"#,
+          )
+          .unwrap();
+
+        let checkpoint = read_startup_checkpoint(dir.path()).unwrap();
+        let message = startup_checkpoint_message(&checkpoint).unwrap();
+        assert!(message.contains("phase=tl_failed"));
+        assert!(message.contains("tl-dispatch-failed"));
+        assert!(message.contains("python3 -m tl_loop gate --run-id root"));
+        assert!(message.contains("worktree is dirty"));
+        record_startup_checkpoint_classification(dir.path(), &checkpoint).unwrap();
+        assert!(root.join("startup-classification.json").exists());
+    }
+
+    #[test]
+    fn startup_checkpoint_nonterminal_is_not_treated_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("run.json"),
+            r#"{"fsm":{"phase":"tl_waiting"},"gates":[]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_startup_checkpoint(dir.path()).unwrap(),
+            StartupCheckpoint::Nonterminal {
+                phase: "tl_waiting".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn recreate_refuses_unanswered_gate_without_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("run.json"),
+            r#"{"fsm":{"phase":"tl_failed"},"gates":[{"name":"review","status":"pending"}]}"#,
+        )
+        .unwrap();
+
+        let error = ensure_recreate_allowed(dir.path(), false).unwrap_err();
+        assert!(error.to_string().contains("--allow-pending-gate"));
+        ensure_recreate_allowed(dir.path(), true).unwrap();
     }
 
     #[test]

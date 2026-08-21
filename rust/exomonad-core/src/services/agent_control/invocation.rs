@@ -505,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn invocation_exit_context_is_bounded_and_persisted() {
         let dir = tempdir().expect("tempdir");
-        let record = start_invocation_with_provenance_and_context(
+        let _record = start_invocation_with_provenance_and_context(
             dir.path(),
             AgentType::OpenCode,
             InvocationTrigger::Spawn,

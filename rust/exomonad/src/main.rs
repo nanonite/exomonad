@@ -80,6 +80,9 @@ enum Commands {
         /// Delete existing session and create fresh
         #[arg(long)]
         recreate: bool,
+        /// Allow --recreate to archive an unanswered human gate.
+        #[arg(long)]
+        allow_pending_gate: bool,
         /// Enable OpenRouter for LLM routing
         #[arg(long)]
         openrouter: bool,
@@ -494,6 +497,7 @@ async fn main() -> Result<()> {
         Commands::Init {
             session,
             recreate,
+            allow_pending_gate,
             openrouter,
             worker,
             worker_model,
@@ -512,6 +516,7 @@ async fn main() -> Result<()> {
             if let Err(e) = init::run(
                 session,
                 recreate,
+                allow_pending_gate,
                 openrouter,
                 worker,
                 worker_model,
