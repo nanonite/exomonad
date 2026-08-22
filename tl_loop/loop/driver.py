@@ -255,6 +255,7 @@ class DispatchAttempt:
     harness: str
     agent_type: str = ""
     model: str | None = None
+    attempt: int = 0
 
 
 @dataclass
@@ -1240,6 +1241,7 @@ def _record_dispatch_result(
         park_cause=ParkCause.DISPATCH_UNCONFIRMED,
         dispatch_last_boundary=boundary,
         dispatch_agent_id=_spawn_agent_id(result),
+        dispatch_invocation_id=_spawn_invocation_id(result),
         dispatch_error=None,
     )
     state = store.checkpoint(
@@ -1428,6 +1430,7 @@ def _reconcile_dispatches(
             current.dispatch_intent_id,
             current.dispatch_started_at,
             current.agent_type or "",
+            attempt=current.attempts,
         )
         _record_controller_event(
             current.id,
@@ -1848,6 +1851,7 @@ def _dispatch_payload(
         "intent_id": attempt.intent_id,
         "boundary": boundary,
         "started_at": attempt.started_at,
+        "attempt": attempt.attempt,
     }
     if error is not None:
         payload["error"] = error
@@ -1901,6 +1905,7 @@ def _confirm_dispatch_event(
             dispatch_last_boundary="agent.spawned",
             dispatch_error=None,
             dispatch_agent_id=agent_id,
+            dispatch_invocation_id=event.invocation_id,
             dispatch_authoritative_event_seq=event_seq,
         ),
     }
@@ -1958,6 +1963,7 @@ def _emit_dispatch_confirmation(
         previous.dispatch_intent_id,
         previous.dispatch_started_at or time.time(),
         previous.agent_type or "",
+        attempt=previous.attempts,
     )
     _record_controller_event(
         slice_id,
@@ -1981,6 +1987,20 @@ def _spawn_agent_id(result: ToolResult | None) -> str | None:
         return None
     for key in ("agent_id", "id", "child_agent"):
         value = result.result.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _spawn_invocation_id(result: ToolResult | None) -> str | None:
+    if result is None or not isinstance(result.result, Mapping):
+        return None
+    value = result.result.get("invocation_id")
+    if isinstance(value, str) and value:
+        return value
+    nested = result.result.get("invocation")
+    if isinstance(nested, Mapping):
+        value = nested.get("invocation_id")
         if isinstance(value, str) and value:
             return value
     return None
@@ -2344,6 +2364,7 @@ def _prepare_sub_tl_stage(
                 internal_intent_id,
                 time.time() if config.active else 0.0,
                 current.agent_type or "sub-tl",
+                attempt=current.attempts + 1,
             )
             confirmation = _record_controller_event(
                 task.name,
@@ -3742,6 +3763,7 @@ def _prepare_spawn(
             dispatch_last_boundary="dispatch_intended",
             dispatch_error=None,
             dispatch_agent_id=None,
+            dispatch_invocation_id=None,
             dispatch_authoritative_event_seq=None,
             park_cause=None,
         )
@@ -3805,6 +3827,7 @@ def _prepare_spawn(
         choice.harness,
         route.agent_type,
         model_id,
+        intent.attempt,
     )
 
     def record_spawn(document: dict[str, object]) -> dict[str, object]:
@@ -3823,6 +3846,7 @@ def _prepare_spawn(
         raw_slice["dispatch_last_boundary"] = "dispatch_intended"
         raw_slice["dispatch_error"] = None
         raw_slice["dispatch_agent_id"] = None
+        raw_slice["dispatch_invocation_id"] = None
         raw_slice["dispatch_authoritative_event_seq"] = None
         raw_slice["park_cause"] = None
         return document
@@ -3845,7 +3869,7 @@ def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> D
     identity = f"{state.run_id}:{name}:{attempt}"
     intent_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
     started_at = time.time() if config.active else 0.0
-    return DispatchAttempt(intent_id, started_at, "")
+    return DispatchAttempt(intent_id, started_at, "", attempt=attempt)
 
 
 def _worker_call(

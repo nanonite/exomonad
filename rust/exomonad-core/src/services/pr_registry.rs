@@ -27,6 +27,19 @@ pub enum LivePrResolution {
     Live(u64),
 }
 
+/// Durable identity for a publication attempt that an operator abandoned.
+///
+/// invocation_id is the primary identity for current publications. Legacy
+/// records have no invocation ID, so attempt one is treated as the implicit
+/// legacy attempt and may be matched by its PR/head evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbandonedAttempt {
+    pub attempt: u64,
+    pub pr_number: Option<u64>,
+    pub head_sha: Option<String>,
+    pub invocation_id: Option<String>,
+}
+
 /// A PR head that was confirmed by the Forgejo create/update response.
 ///
 /// This is publication metadata for the existing issue-owned PR. It is not a
@@ -242,15 +255,46 @@ pub fn resolve_live_pr_for_slice(
     slice_id: &str,
     live_pr_numbers: &HashSet<u64>,
 ) -> LivePrResolution {
+    resolve_live_pr_for_slice_with_abandonments(heads, slice_id, live_pr_numbers, &[])
+}
+
+/// Resolve a live PR while excluding publications whose durable attempt was
+/// explicitly abandoned. Replayed abandonment events are harmless because
+/// the matching projection is set-like.
+pub fn resolve_live_pr_for_slice_with_abandonments(
+    heads: &[PublishedHead],
+    slice_id: &str,
+    live_pr_numbers: &HashSet<u64>,
+    abandoned_attempts: &[AbandonedAttempt],
+) -> LivePrResolution {
     let history = publication_history_for_slice(heads, slice_id);
     if history.is_empty() {
         return LivePrResolution::NeverPublished;
     }
+    let is_abandoned = |head: &PublishedHead| {
+        abandoned_attempts.iter().any(|abandoned| {
+            if abandoned
+                .invocation_id
+                .as_deref()
+                .is_some_and(|invocation_id| head.invocation_id.as_deref() == Some(invocation_id))
+            {
+                return true;
+            }
+            if abandoned.attempt != 1 || head.invocation_id.is_some() {
+                return false;
+            }
+            abandoned.pr_number.is_none_or(|pr| pr == head.pr_number)
+                && abandoned
+                    .head_sha
+                    .as_deref()
+                    .is_none_or(|sha| sha == head.head_sha)
+        })
+    };
     let matching = || {
         history
             .iter()
             .copied()
-            .filter(|head| live_pr_numbers.contains(&head.pr_number))
+            .filter(|head| live_pr_numbers.contains(&head.pr_number) && !is_abandoned(head))
     };
     matching()
         .rfind(|head| head.provenance == PublicationProvenance::LedgerOwned)
@@ -725,6 +769,77 @@ mod tests {
         assert_eq!(
             resolve_live_pr_for_slice(&[], "slice-a", &none),
             LivePrResolution::NeverPublished
+        );
+    }
+
+    #[test]
+    fn abandoned_publication_is_excluded_but_retained_in_history() {
+        let mut first = publication("sha-1");
+        first.slice_id = Some("slice-a".to_string());
+        first.invocation_id = Some("invocation-1".to_string());
+        let mut second = publication("sha-2");
+        second.pr_number = 43;
+        second.slice_id = Some("slice-a".to_string());
+        second.invocation_id = Some("invocation-2".to_string());
+
+        let heads = vec![first, second];
+        let abandoned = vec![AbandonedAttempt {
+            attempt: 1,
+            pr_number: Some(42),
+            head_sha: Some("sha-1".to_string()),
+            invocation_id: Some("invocation-1".to_string()),
+        }];
+        let live = [42, 43].into_iter().collect();
+
+        assert_eq!(publication_history_for_slice(&heads, "slice-a").len(), 2);
+        assert_eq!(
+            resolve_live_pr_for_slice_with_abandonments(&heads, "slice-a", &live, &abandoned),
+            LivePrResolution::Live(43)
+        );
+    }
+
+    #[test]
+    fn replayed_abandonment_is_idempotent() {
+        let mut head = publication("sha-1");
+        head.slice_id = Some("slice-a".to_string());
+        head.invocation_id = Some("invocation-1".to_string());
+        let heads = vec![head];
+        let abandoned = AbandonedAttempt {
+            attempt: 1,
+            pr_number: Some(42),
+            head_sha: Some("sha-1".to_string()),
+            invocation_id: Some("invocation-1".to_string()),
+        };
+        let live = [42].into_iter().collect();
+
+        assert_eq!(
+            resolve_live_pr_for_slice_with_abandonments(
+                &heads,
+                "slice-a",
+                &live,
+                &[abandoned.clone(), abandoned]
+            ),
+            LivePrResolution::AllAttemptsAbandoned
+        );
+    }
+
+    #[test]
+    fn legacy_publication_uses_implicit_first_attempt() {
+        let mut legacy = publication("sha-legacy");
+        legacy.slice_id = Some("slice-a".to_string());
+        legacy.invocation_id = None;
+        let heads = vec![legacy];
+        let live = [42].into_iter().collect();
+        let abandoned = [AbandonedAttempt {
+            attempt: 1,
+            pr_number: Some(42),
+            head_sha: Some("sha-legacy".to_string()),
+            invocation_id: None,
+        }];
+
+        assert_eq!(
+            resolve_live_pr_for_slice_with_abandonments(&heads, "slice-a", &live, &abandoned),
+            LivePrResolution::AllAttemptsAbandoned
         );
     }
 }

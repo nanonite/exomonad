@@ -23,6 +23,7 @@ from tl_loop.events.reader import LedgerReader
 from tl_loop.fsm.event import PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning
 from tl_loop.loop.driver import (
+    DispatchAttempt,
     DepthLimitExceeded,
     EventDiagnostics,
     LoopCancelled,
@@ -34,11 +35,13 @@ from tl_loop.loop.driver import (
     WorkerTask,
     WorkPlan,
     _event_belongs_to_plan,
+    _dispatch_payload,
     _initial_slices,
     _record_review_event,
     _repair_model,
     _route_ci_event,
     _route_review_event,
+    _spawn_invocation_id,
     _run_sub_tl_batch,
     _supervise_live_sub_tl,
     run_tl_loop,
@@ -101,6 +104,17 @@ def test_event_diagnostics_exposes_non_terminal_timing() -> None:
     assert snapshot["task_started_at"] == {"leaf-a": started_at + 0.1}
     assert snapshot["last_authoritative_event_seq"] == 7
     assert snapshot["last_observed_progress_at"] == started_at + 1.0
+
+
+def test_dispatch_attempt_payload_and_invocation_identity_are_explicit() -> None:
+    attempt = DispatchAttempt("intent-2", 1.0, "codex/gpt-luna", attempt=2)
+
+    assert _dispatch_payload("slice-a", attempt, "dispatch_intended")["attempt"] == 2
+    assert _spawn_invocation_id(SimpleNamespace(result={"invocation_id": "inv-2"})) == "inv-2"
+    assert (
+        _spawn_invocation_id(SimpleNamespace(result={"invocation": {"invocation_id": "inv-3"}}))
+        == "inv-3"
+    )
 
 
 @dataclass

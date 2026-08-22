@@ -25,8 +25,9 @@ use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
 #[cfg(test)]
 use crate::services::pr_registry::PrRegistry;
 use crate::services::pr_registry::{
-    publication_history_for_slice, read_published_heads, resolve_live_pr_for_slice,
-    LivePrResolution, PrEntry, PrState,
+    publication_history_for_slice, read_published_heads,
+    resolve_live_pr_for_slice_with_abandonments, AbandonedAttempt, LivePrResolution, PrEntry,
+    PrState,
 };
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
@@ -1707,6 +1708,44 @@ impl<
         let heads = read_published_heads(self.ctx.project_dir())
             .await
             .effect_err("agent")?;
+        let abandoned_attempts = if let Some(event_log) = self.ctx.event_log() {
+            event_log
+                .ledger()
+                .read_events()
+                .effect_err("agent")?
+                .into_iter()
+                .filter_map(|record| {
+                    if record.event.event_type != "tl.slice_abandoned" {
+                        return None;
+                    }
+                    let data = record.event.data.as_object()?;
+                    if data.get("slice_id").and_then(|value| value.as_str()) != Some(slice_id) {
+                        return None;
+                    }
+                    Some(AbandonedAttempt {
+                        attempt: data
+                            .get("attempt")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(1),
+                        pr_number: data
+                            .get("pr_number")
+                            .and_then(|value| value.as_u64())
+                            .filter(|value| *value > 0),
+                        head_sha: data
+                            .get("head_sha")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        invocation_id: data
+                            .get("invocation_id")
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let Some(forgejo) = self.ctx.forgejo_client() else {
             return Ok(ResolveLivePrForSliceResponse {
                 success: false,
@@ -1736,11 +1775,14 @@ impl<
                 live_pr_numbers.insert(publication.pr_number);
             }
         }
-        let resolution = resolve_live_pr_for_slice(&heads, slice_id, &live_pr_numbers);
+        let resolution = resolve_live_pr_for_slice_with_abandonments(
+            &heads,
+            slice_id,
+            &live_pr_numbers,
+            &abandoned_attempts,
+        );
         let (resolution_kind, pr_number) = match resolution {
-            LivePrResolution::NeverPublished => {
-                (LivePrResolutionKind::NeverPublished, 0)
-            }
+            LivePrResolution::NeverPublished => (LivePrResolutionKind::NeverPublished, 0),
             LivePrResolution::AllAttemptsAbandoned => {
                 (LivePrResolutionKind::AllAttemptsAbandoned, 0)
             }

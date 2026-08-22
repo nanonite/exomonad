@@ -11,10 +11,11 @@ use exomonad_proto::effects::tl::*;
 use serde_json::Value;
 use std::sync::Arc;
 
-const CONTROLLER_EVENT_TYPES: [&str; 25] = [
+const CONTROLLER_EVENT_TYPES: [&str; 26] = [
     "tl.phase_changed",
     "tl.slice_status_changed",
     "tl.slice_parked",
+    "tl.slice_abandoned",
     "tl.gate_opened",
     "tl.gate_answered",
     "tl.merge_decided",
@@ -44,6 +45,15 @@ fn allowed_fields(event_type: &str) -> &'static [&'static str] {
         "tl.phase_changed" => &["from_phase", "to_phase", "run_id"],
         "tl.slice_status_changed" => &["slice_id", "from_status", "to_status"],
         "tl.slice_parked" => &["slice_id", "park_cause", "attempts"],
+        "tl.slice_abandoned" => &[
+            "slice_id",
+            "attempt",
+            "pr_number",
+            "head_sha",
+            "invocation_id",
+            "operator_source",
+            "cause",
+        ],
         "tl.gate_opened" => &["gate_name", "run_id", "reason"],
         "tl.gate_answered" => &["gate_name", "decision", "source"],
         "tl.merge_decided" => &["slice_id", "pr_number", "decision", "head_sha_hash"],
@@ -263,6 +273,29 @@ mod tests {
                 EmitEventRequest {
                     event_type: "tl.spawn_requested".to_string(),
                     payload: br#"{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"spawn_requested","started_at":1,"harness":"opencode","agent_type":"opencode","model":"opencode-go/deepseek-v4-pro"}"#.to_vec(),
+                },
+                &context(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!response.event_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn accepts_slice_abandonment_dimensions() {
+        let directory = tempdir().unwrap();
+        let mut services = Services::test();
+        services.event_log = Some(Arc::new(
+            EventLog::open(directory.path().join("logs")).unwrap(),
+        ));
+        let handler = TlHandler::new(Arc::new(services));
+
+        let response = handler
+            .emit_event(
+                EmitEventRequest {
+                    event_type: "tl.slice_abandoned".to_string(),
+                    payload: br#"{"slice_id":"leaf-a","attempt":2,"pr_number":42,"head_sha":"abc123","invocation_id":"inv-2","operator_source":"operator","cause":"retry"}"#.to_vec(),
                 },
                 &context(),
             )

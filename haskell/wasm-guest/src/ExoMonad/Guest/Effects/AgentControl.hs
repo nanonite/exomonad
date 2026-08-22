@@ -307,7 +307,9 @@ runAgentControlSuspend = interpret $ \case
       Left err -> Left err
       Right resp -> case PA.spawnLeafSubtreeResponseAgent resp of
         Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnLeafSubtree succeeded but no agent info returned"))))
-        Just info -> Right (protoAgentInfoToSpawnResult info)
+        Just info ->
+          Right
+            (applyInvocationHandoff (protoAgentInfoToSpawnResult info) (PA.spawnLeafSubtreeResponseInvocation resp))
   ResumePrC cfg -> do
     let req =
           PA.SpawnLeafSubtreeRequest
@@ -424,6 +426,20 @@ protoAgentInfoToSpawnResult info =
       invocationFresh = Nothing,
       invocationReady = Nothing,
       invocationOutcome = Nothing
+    }
+
+applyInvocationHandoff :: SpawnResult -> Maybe PA.InvocationHandoff -> SpawnResult
+applyInvocationHandoff result Nothing = result
+applyInvocationHandoff result (Just handoff) =
+  result
+    { invocationId = Just (toText (PA.invocationHandoffInvocationId handoff)),
+      invocationTrigger = Just (toText (PA.invocationHandoffTrigger handoff)),
+      invocationRuntime = Just (toText (PA.invocationHandoffRuntime handoff)),
+      routingTargetType = Just (toText (PA.invocationHandoffTargetType handoff)),
+      routingTargetId = Just (toText (PA.invocationHandoffTargetId handoff)),
+      invocationFresh = Just (PA.invocationHandoffFresh handoff),
+      invocationReady = Just (PA.invocationHandoffReady handoff),
+      invocationOutcome = Just (toText (PA.invocationHandoffOutcome handoff))
     }
 
 resumeHandoffError :: Text -> EffectError

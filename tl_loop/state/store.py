@@ -694,6 +694,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["dispatch_error"] = value.dispatch_error
         if value.dispatch_agent_id is not None:
             record["dispatch_agent_id"] = value.dispatch_agent_id
+        if value.dispatch_invocation_id is not None:
+            record["dispatch_invocation_id"] = value.dispatch_invocation_id
         if value.dispatch_authoritative_event_seq is not None:
             record["dispatch_authoritative_event_seq"] = value.dispatch_authoritative_event_seq
         if value.reconciliation is not None:
@@ -1090,6 +1092,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         dispatch_last_boundary=cast(str | None, value.get("dispatch_last_boundary")),
         dispatch_error=cast(str | None, value.get("dispatch_error")),
         dispatch_agent_id=cast(str | None, value.get("dispatch_agent_id")),
+        dispatch_invocation_id=cast(str | None, value.get("dispatch_invocation_id")),
         dispatch_authoritative_event_seq=cast(
             int | None, value.get("dispatch_authoritative_event_seq")
         ),

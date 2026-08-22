@@ -192,6 +192,7 @@ SLICE_KEYS = frozenset(
         "dispatch_last_boundary",
         "dispatch_error",
         "dispatch_agent_id",
+        "dispatch_invocation_id",
         "dispatch_authoritative_event_seq",
         "reconciliation",
         "task_timeout_seconds",
@@ -294,6 +295,7 @@ class SliceState:
     dispatch_last_boundary: str | None = None
     dispatch_error: str | None = None
     dispatch_agent_id: str | None = None
+    dispatch_invocation_id: str | None = None
     dispatch_authoritative_event_seq: int | None = None
     reconciliation: Mapping[str, object] | None = None
     task_timeout_seconds: float | None = None

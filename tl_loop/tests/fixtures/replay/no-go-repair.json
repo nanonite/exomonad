@@ -188,6 +188,7 @@
         "event_type": "tl.dispatch_intended",
         "payload": {
           "agent_type": "codex",
+          "attempt": 1,
           "boundary": "dispatch_intended",
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
@@ -206,6 +207,7 @@
         "event_type": "tl.spawn_requested",
         "payload": {
           "agent_type": "codex",
+          "attempt": 1,
           "boundary": "spawn_requested",
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
@@ -237,6 +239,7 @@
         "event_type": "tl.spawn_request_accepted",
         "payload": {
           "agent_type": "codex",
+          "attempt": 1,
           "boundary": "spawn_request_accepted",
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
@@ -255,6 +258,7 @@
         "event_type": "tl.dispatch_intended",
         "payload": {
           "agent_type": "codex",
+          "attempt": 1,
           "boundary": "dispatch_intended",
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
@@ -273,6 +277,7 @@
         "event_type": "tl.spawn_requested",
         "payload": {
           "agent_type": "codex",
+          "attempt": 1,
           "boundary": "spawn_requested",
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
@@ -312,6 +317,7 @@
         "event_type": "tl.spawn_request_accepted",
         "payload": {
           "agent_type": "codex",
+          "attempt": 1,
           "boundary": "spawn_request_accepted",
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
@@ -371,6 +377,7 @@
       "arguments": {
         "event_type": "tl.dispatch_confirmed",
         "payload": {
+          "attempt": 1,
           "boundary": "agent.spawned",
           "harness": "codex",
           "intent_id": "<intent-id>",
@@ -415,6 +422,7 @@
       "arguments": {
         "event_type": "tl.dispatch_confirmed",
         "payload": {
+          "attempt": 1,
           "boundary": "agent.spawned",
           "harness": "codex",
           "intent_id": "<intent-id>",
