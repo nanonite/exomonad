@@ -1034,6 +1034,32 @@
       "name": "cleanup_leaf"
     },
     {
+      "description": "Dispose one explicitly identified agent's tmux target, configuration, and worktree through the host cleanup path.",
+      "inputSchema": {
+        "properties": {
+          "force": {
+            "description": "Force cleanup of uncommitted resources. Defaults to false.",
+            "type": "boolean"
+          },
+          "issue": {
+            "description": "Agent runtime identity to clean up.",
+            "type": "string"
+          },
+          "subrepo": {
+            "description": "Optional sub-repository path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issue",
+          "force",
+          "subrepo"
+        ],
+        "type": "object"
+      },
+      "name": "cleanup"
+    },
+    {
       "description": "TL/SubTL-only timer start. Starts Chainlink timing for a coordinator-owned task lifecycle.",
       "inputSchema": {
         "properties": {

@@ -18,6 +18,7 @@ from tl_loop.client.transport import DEFAULT_TIMEOUT_SECONDS, TransportClient
 from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.queue import DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS, LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
+from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.loop.heartbeat import HeartbeatConfig
 from tl_loop.loop.observability import emit_controller_event
@@ -54,6 +55,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "run",
         "status",
         "gate",
+        "abandon",
         "plan-proposal",
         "preflight",
         "-h",
@@ -79,6 +81,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 "TL preflight passed: config.toml, harness_policy.toml, review-policy.toml, harness_capability.toml"
             )
+        elif args.command == "abandon":
+            _abandon(args)
         else:
             _set_gate(args)
     except (
@@ -158,6 +162,21 @@ def _parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     gate.set_defaults(command="gate")
+
+    abandon = subcommands.add_parser(
+        "abandon", help="operator-authorize abandonment of one live slice attempt"
+    )
+    _add_project_options(abandon)
+    abandon.add_argument(
+        "--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID)
+    )
+    abandon.add_argument("--slice", dest="slice_id", required=True)
+    abandon.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required confirmation; this command never abandons implicitly",
+    )
+    abandon.set_defaults(command="abandon")
 
     proposal = subcommands.add_parser(
         "plan-proposal", help="validate an inert control-plane plan proposal"
@@ -483,6 +502,14 @@ def _set_gate(args: argparse.Namespace) -> None:
         },
     )
     LOGGER.info("[TL loop] gate name=%s status=%s", args.name, status)
+
+
+def _abandon(args: argparse.Namespace) -> None:
+    if not args.confirm:
+        raise LauncherError("abandon requires explicit --confirm")
+    project_root = args.project_root.expanduser().resolve()
+    result = abandon_slice(project_root, args.run_id, args.slice_id)
+    print(json.dumps(result, sort_keys=True))
 
 
 def _state_document(

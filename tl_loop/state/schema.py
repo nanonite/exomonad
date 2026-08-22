@@ -42,6 +42,7 @@ class ParkCause(str, Enum):
     STALL_DETECTED = "stall_detected"
     WORKER_TERMINAL = "worker_terminal"
     TASK_BUDGET_EXCEEDED = "task_budget_exceeded"
+    ATTEMPT_ABANDONED = "attempt_abandoned"
     PR_CLOSED_UNMERGED = "pr_closed_unmerged"
     PR_HEAD_UNREACHABLE = "pr_head_unreachable"
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
@@ -219,6 +220,8 @@ PARK_AUDIT_KEYS = frozenset(
         "to_harness",
         "reason",
         "effort",
+        "agent_id",
+        "recovered",
     }
 )
 BUDGET_KEYS = frozenset({"ledger"})

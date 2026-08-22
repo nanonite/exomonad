@@ -120,6 +120,7 @@ raw ledger payloads. `NEEDS_BASE_REVALIDATION` refreshes base-bound evidence;
 | `replace_close_pr` | x | x | | | |
 | `cleanup_orphan` | x | x | | | |
 | `cleanup_leaf` | x | x | | | |
+| `cleanup` | x | x | | | |
 | `watcher_pr_state` | x | x | | | |
 | `file_pr` | | x | x | | |
 | `merge_pr` | x | x | | | |

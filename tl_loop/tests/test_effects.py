@@ -219,6 +219,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     client.close_issue_and_cleanup(issue_id=1, leaf_name="leaf")
     client.cleanup_orphan(name="leaf", dry_run=True)
     client.cleanup_leaf(dry_run=True, sweep=False, name="leaf")
+    client.cleanup(issue="leaf", force=False, subrepo="")
     client.chainlink_timer_start(issue_id=1)
     client.chainlink_timer_stop(issue_id=1)
     client.chainlink_timer_status(issue_id=1)

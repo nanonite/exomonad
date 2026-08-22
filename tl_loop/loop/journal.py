@@ -25,6 +25,7 @@ MUTATING_OPERATIONS = frozenset(
         "close_reviewer_window",
         "cleanup_orphan",
         "cleanup_leaf",
+        "cleanup",
         "close_worker_pane",
         "close_issue_and_cleanup",
         "emit_controller_event",

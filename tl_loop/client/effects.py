@@ -95,6 +95,7 @@ TOOL_METHODS: tuple[str, ...] = (
     "close_issue_and_cleanup",
     "cleanup_orphan",
     "cleanup_leaf",
+    "cleanup",
     "chainlink_timer_start",
     "chainlink_timer_stop",
     "chainlink_timer_status",
@@ -251,6 +252,12 @@ class EffectClient:
 
     def close_worker_pane(self, *, pane_id: str) -> ToolResult:
         return self._call("close_worker_pane", {"pane_id": pane_id})
+
+    def cleanup(self, *, issue: str, force: bool = False, subrepo: str = "") -> ToolResult:
+        return self._call(
+            "cleanup",
+            {"issue": issue, "force": force, "subrepo": subrepo},
+        )
 
     def spawn_codex(
         self,
