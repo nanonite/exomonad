@@ -492,6 +492,7 @@ class TLLoopConfig:
     role: str = "worker"
     review_policy_path: str | Path | None = None
     enable_reviewer_spawn: bool = False
+    dispatch_names: Mapping[str, str] = field(default_factory=dict)
     review_model_choice: object | None = None
     branch: str = "main"
     worktree: str | Path | None = None
@@ -523,6 +524,11 @@ class TLLoopConfig:
             raise ValueError("max_events must be positive")
         if type(self.test_harness) is not bool:
             raise ValueError("test_harness must be a boolean")
+        if not isinstance(self.dispatch_names, Mapping):
+            raise TypeError("dispatch_names must be a mapping")
+        for slice_id, runtime_name in self.dispatch_names.items():
+            _require_text(slice_id, "dispatch_names slice id")
+            _require_text(runtime_name, "dispatch_names runtime name")
         if self.poll_interval < 0:
             raise ValueError("poll_interval must be non-negative")
         if self.heartbeat is not None and self.project_root is None:
@@ -722,7 +728,8 @@ def _recover_durable_write_failure(
             (
                 candidate
                 for candidate in state.slices.values()
-                if candidate.status not in {
+                if candidate.status
+                not in {
                     SliceStatus.MERGED,
                     SliceStatus.FAILED,
                     SliceStatus.PARKED,
@@ -1628,10 +1635,7 @@ def _reconcile_nonterminal_slices(
             )
             park_audit = {
                 "reconciliation": result.as_state(),
-                "pr_number": (
-                    current.pr_number
-                    or (watcher.get("pr_number") if watcher else None)
-                ),
+                "pr_number": (current.pr_number or (watcher.get("pr_number") if watcher else None)),
                 "head_sha": _snapshot_text(watcher, "head_sha") if watcher else None,
                 "branch": _snapshot_text(watcher, "head_branch") if watcher else current.branch,
                 "observed_at": _now_timestamp(),
@@ -2029,7 +2033,8 @@ def _dispatch_children(
         attempt = _prepare_spawn(worker.name, state, config, effects, store, effects_log)
         state = store.load()
         _record_spawn_request(worker.name, attempt, config, effects, effects_log)
-        worker_args: dict[str, object] = {"name": worker.name, "task": worker.task}
+        runtime_name = config.dispatch_names.get(worker.name, worker.name)
+        worker_args: dict[str, object] = {"name": runtime_name, "task": worker.task}
         agent_type, model = _spawn_route(attempt, worker.agent_type)
         _optional_argument(worker_args, "agent_type", agent_type)
         _optional_argument(worker_args, "model", model)
@@ -2040,7 +2045,7 @@ def _dispatch_children(
                 worker_args,
                 config.active,
                 live,
-                _worker_call(worker, agent_type, model, attempt.intent_id),
+                _worker_call(worker, agent_type, model, attempt.intent_id, runtime_name),
                 effects_log,
                 raise_on_failure=False,
             )
@@ -2066,7 +2071,8 @@ def _dispatch_children(
         attempt = _prepare_spawn(leaf.name, state, config, effects, store, effects_log)
         state = store.load()
         _record_spawn_request(leaf.name, attempt, config, effects, effects_log)
-        leaf_args: dict[str, object] = {"name": leaf.name, "task": leaf.task}
+        runtime_name = config.dispatch_names.get(leaf.name, leaf.name)
+        leaf_args: dict[str, object] = {"name": runtime_name, "task": leaf.task}
         _optional_argument(leaf_args, "intent_id", attempt.intent_id)
         agent_type, model = _spawn_route(attempt, leaf.agent_type)
         _optional_argument(leaf_args, "agent_type", agent_type)
@@ -2087,7 +2093,7 @@ def _dispatch_children(
                 leaf_args,
                 config.active,
                 live,
-                _leaf_call(leaf, agent_type, model, attempt.intent_id),
+                _leaf_call(leaf, agent_type, model, attempt.intent_id, runtime_name),
                 effects_log,
                 raise_on_failure=False,
             )
@@ -3692,6 +3698,7 @@ def _child_config(
         parent_agent_id=config.agent_id or store.run_id,
         agent_id=task.agent_id or task.name,
         depth=config.depth + 1,
+        dispatch_names={},
     )
 
 
@@ -3877,10 +3884,11 @@ def _worker_call(
     selected_agent_type: str | None,
     selected_model: str | None,
     intent_id: str | None,
+    runtime_name: str | None = None,
 ) -> Callable[[EffectClient], ToolResult]:
     def invoke(client: EffectClient) -> ToolResult:
         return client.spawn_worker(
-            name=task.name,
+            name=runtime_name or task.name,
             task=task.task,
             intent_id=intent_id,
             agent_type=selected_agent_type or task.agent_type,
@@ -3895,10 +3903,11 @@ def _leaf_call(
     selected_agent_type: str | None,
     selected_model: str | None,
     intent_id: str | None,
+    runtime_name: str | None = None,
 ) -> Callable[[EffectClient], ToolResult]:
     def invoke(client: EffectClient) -> ToolResult:
         return client.spawn_leaf(
-            name=task.name,
+            name=runtime_name or task.name,
             task=task.task,
             intent_id=intent_id,
             agent_type=selected_agent_type or task.agent_type,

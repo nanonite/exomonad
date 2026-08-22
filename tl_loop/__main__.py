@@ -22,6 +22,10 @@ from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.loop.heartbeat import HeartbeatConfig
 from tl_loop.loop.observability import emit_controller_event
+from tl_loop.loop.redispatch import (
+    DEFAULT_ABANDONMENT_RETRY_CEILING,
+    redispatch_slice,
+)
 from tl_loop.plan_validation import (
     PlanValidationError,
     validate_plan_document,
@@ -56,6 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status",
         "gate",
         "abandon",
+        "redispatch",
         "plan-proposal",
         "preflight",
         "-h",
@@ -83,6 +88,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "abandon":
             _abandon(args)
+        elif args.command == "redispatch":
+            _redispatch(args)
         else:
             _set_gate(args)
     except (
@@ -178,6 +185,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     abandon.set_defaults(command="abandon")
 
+    redispatch = subcommands.add_parser(
+        "redispatch", help="operator-authorize a fresh attempt for an abandoned slice"
+    )
+    _add_project_options(redispatch)
+    redispatch.add_argument(
+        "--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID)
+    )
+    redispatch.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
+    redispatch.add_argument("--slice", dest="slice_id", required=True)
+    redispatch.add_argument(
+        "--max-attempts",
+        type=_positive_int,
+        default=DEFAULT_ABANDONMENT_RETRY_CEILING,
+        help="total dispatch attempts allowed for this planned slice",
+    )
+    redispatch.add_argument(
+        "--confirm",
+        action="store_true",
+        help="required confirmation; this command never redispatches implicitly",
+    )
+    redispatch.add_argument(
+        "--transport-timeout", type=_positive_float, default=DEFAULT_TIMEOUT_SECONDS
+    )
+    redispatch.set_defaults(command="redispatch")
+
     proposal = subcommands.add_parser(
         "plan-proposal", help="validate an inert control-plane plan proposal"
     )
@@ -243,9 +275,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         task_timeout_seconds=None if task_timeout == 0 else task_timeout,
         task_timeout_source="project",
         keep_alive_on_waiting=True,
-        heartbeat=HeartbeatConfig(
-            task_timeout_seconds=None if task_timeout == 0 else task_timeout
-        ),
+        heartbeat=HeartbeatConfig(task_timeout_seconds=None if task_timeout == 0 else task_timeout),
         poll_interval=args.poll_interval,
         source=source,
         effects=effects,
@@ -306,6 +336,41 @@ def _load_plan(path: Path, wait_for_plan: bool) -> dict[str, object]:
         return validate_plan_document(value)
     except PlanValidationError as error:
         raise LauncherError(f"plan {path} is invalid: {error}") from error
+
+
+def _redispatch(args: argparse.Namespace) -> None:
+    if not args.confirm:
+        raise LauncherError("redispatch requires --confirm; no attempt was started")
+    project_root = args.project_root.expanduser().resolve()
+    plan_path = _resolve_under_project(project_root, args.plan)
+    plan = _plan_from_document(_load_plan(plan_path, wait_for_plan=False))
+    state_root = project_root / ".exo" / "tl-loop"
+    store = RunStore(args.run_id, state_root)
+    state = store.load()
+    effects = EffectClient(
+        TransportClient(project_root=project_root, timeout=args.transport_timeout),
+        role="tl",
+        name="root",
+    )
+    config = TLLoopConfig(
+        active=True,
+        root_dir=state_root,
+        project_root=project_root,
+        run_id=args.run_id,
+        ledger_run_id=_authoritative_ledger_run_id(project_root),
+        branch=state.owner_branch or "main",
+        effects=effects,
+    )
+    result = redispatch_slice(
+        project_root,
+        args.run_id,
+        args.slice_id,
+        plan,
+        effects=effects,
+        max_attempts=args.max_attempts,
+        config=config,
+    )
+    print(json.dumps(result, sort_keys=True))
 
 
 def _plan_from_document(document: Mapping[str, object]) -> WorkPlan:

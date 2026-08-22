@@ -151,8 +151,9 @@ auto-suffix pattern that `.exo/roles/devswarm/context/root.md` forbids.
   `--recreate` dead end observed in the beast workspace.
 - `PARKED` gains a documented exit for the abandonment case only. Other park
   causes keep their current terminal semantics.
-- Abandonment consumes an attempt, so it cannot be used to bypass the retry
-  ceiling. This must be explicit rather than incidental.
+- Re-dispatch consumes the next attempt exactly once at the normal dispatch
+  boundary, so an abandonment cannot be used to bypass the retry ceiling.
+  The abandoned attempt remains counted in `SliceState.attempts`.
 - Recursion is unaffected by construction: sub-TLs run through the same
   `tl_run` -> `run_tl_loop` -> reconciliation path, so any behaviour defined
   here applies to nested slices without a second implementation.
@@ -179,6 +180,24 @@ from the abandoned attempt's branch. The abandoned work is discarded, not
 inherited. This keeps a retry deterministic and reproducible from the plan
 alone, and avoids silently carrying forward the defects that caused the
 abandonment.
+
+### Redispatch is an explicit, bounded transition
+
+`PARKED` is not generally resumable. The operator-only `redispatch` command
+accepts exactly one parked cause: `ATTEMPT_ABANDONED`. It first checks the
+total-attempt ceiling (three by default, configurable per invocation), then
+returns the slice to `PENDING` and invokes the ordinary dispatcher. That
+dispatcher increments `SliceState.attempts` once and journals the new intent.
+Every other park cause remains terminal until its own documented operator
+workflow resolves it.
+
+The fresh runtime identity is derived explicitly as
+`<slice-slug>-attempt-<N>`. It is not the old branch and is not an implicit
+`-2`/`-retry` collision workaround. The plan slice ID remains unchanged for
+dependency and ledger correlation; only the runtime agent/branch identity is
+new. The old PR number, head, branch, worktree, review, and CI associations
+are cleared from the live slice view while the abandonment event and audit
+record remain durable evidence.
 
 ### The abandoned branch and worktree are disposed
 

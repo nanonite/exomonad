@@ -363,6 +363,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Re-dispatch an abandoned slice from spec with explicit retry accounting (#939)
 - Operator-only abandon command with journaled intent and shared disposal (#938)
 - Make attempt identity explicit and record abandonment as a ledger event (#937)
 - Split slice-to-PR resolution and make watcher_pr_state a pure Forgejo sensor (#936)
