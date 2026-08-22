@@ -94,6 +94,18 @@ class HeartbeatTransport:
                 },
                 },
             )
+        if tool_name == "resolve_live_pr_for_slice":
+            return cast(
+                JsonObject,
+                {
+                    "success": True,
+                    "result": {
+                        "slice_id": arguments.get("slice_id", "slice-a"),
+                        "resolution": "live",
+                        "pr_number": 42,
+                    },
+                },
+            )
         if tool_name == "chainlink_issue_create":
             return cast(JsonObject, {"success": True, "result": {"issue_id": 7042}})
         return cast(JsonObject, {"success": True, "result": {}})
@@ -115,7 +127,11 @@ def test_idle_heartbeat_waits_for_configured_interval_without_polling(
     due = heartbeat_once(state, store, effects, config, now=14.0, project_root=tmp_path)
 
     assert due.fired is True
-    assert [name for name, _ in transport.calls] == ["poll_workers"]
+    assert [name for name, _ in transport.calls] == [
+        "poll_workers",
+        "resolve_live_pr_for_slice",
+        "watcher_pr_state",
+    ]
 
 
 def test_silently_dead_worker_is_parked(tmp_path: Path) -> None:
@@ -162,8 +178,7 @@ def test_silent_live_worker_stall_is_observational(tmp_path: Path) -> None:
     assert observed.status is SliceStatus.SPAWNED
     assert observed.park_cause is None
     assert result.parked_slice_ids == ()
-    assert [event.kind for event in result.events] == ["wave.stalled"]
-    assert result.events[0].payload["action"] == "observe"
+    assert [event.kind for event in result.events] == ["pr.updated"]
 
 
 def test_goal_deadline_is_observational_for_live_work(tmp_path: Path) -> None:
@@ -303,8 +318,13 @@ def test_missing_worker_row_is_persisted_but_not_failed(tmp_path: Path) -> None:
         "conflicts": [],
         "next_action": "continue_observing",
     }
-    assert [event.kind for event in result.events] == ["worker.missing"]
-    assert [name for name, _ in transport.calls] == ["poll_workers", "emit_controller_event"]
+    assert [event.kind for event in result.events] == ["worker.missing", "pr.updated"]
+    assert [name for name, _ in transport.calls] == [
+        "poll_workers",
+        "emit_controller_event",
+        "resolve_live_pr_for_slice",
+        "watcher_pr_state",
+    ]
 
 
 def test_missing_worker_identity_is_recorded_in_reconciliation_evidence(tmp_path: Path) -> None:

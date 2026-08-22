@@ -77,11 +77,32 @@ class FakeClient:
             error=None,
         )
 
-    def watcher_pr_state(
-        self, *, pr_number: int | None = None, slice_id: str | None = None
-    ) -> ToolResult:
-        self.watcher_calls.append({"pr_number": pr_number, "slice_id": slice_id})
+    def resolve_live_pr_for_slice(self, *, slice_id: str) -> ToolResult:
         if slice_id == "slice-a" and self.resolved_pr_number is not None:
+            return ToolResult(
+                raw={"success": True},
+                success=True,
+                result={
+                    "slice_id": slice_id,
+                    "resolution": "live",
+                    "pr_number": self.resolved_pr_number,
+                },
+                error=None,
+            )
+        return ToolResult(
+            raw={"success": True},
+            success=True,
+            result={
+                "slice_id": slice_id,
+                "resolution": "never_published",
+                "pr_number": 0,
+            },
+            error=None,
+        )
+
+    def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
+        self.watcher_calls.append({"pr_number": pr_number})
+        if pr_number == self.resolved_pr_number and self.resolved_pr_number is not None:
             return ToolResult(
                 raw={"success": True},
                 success=True,
@@ -101,7 +122,7 @@ class FakeClient:
             raw={"success": False},
             success=False,
             result=None,
-            error=f"no published PR found for slice_id '{slice_id}'",
+            error=f"no live PR found for pr_number {pr_number}",
         )
 
     def spawn_reviewer(
@@ -160,7 +181,7 @@ def test_reconciliation_recovers_and_persists_missing_pr_number(tmp_path) -> Non
 
     new_state = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
 
-    assert [call["slice_id"] for call in client.watcher_calls] == ["slice-a"]
+    assert [call["pr_number"] for call in client.watcher_calls] == [99]
     slice_state = new_state.slices["slice-a"]
     assert slice_state.pr_number == 99
     assert slice_state.reconciliation is not None

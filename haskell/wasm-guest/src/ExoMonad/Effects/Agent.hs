@@ -14,6 +14,7 @@ module ExoMonad.Effects.Agent
     AgentSpawnReviewer,
     AgentCleanupReviewerLeaf,
     AgentRestartReview,
+    AgentResolveLivePrForSlice,
     AgentWatcherPrState,
     AgentSpawnLeafSubtree,
     AgentCleanup,
@@ -95,6 +96,13 @@ instance Effect AgentWatcherPrState where
   type Input AgentWatcherPrState = WatcherPrStateRequest
   type Output AgentWatcherPrState = WatcherPrStateResponse
   effectId = "agent.watcher_pr_state"
+
+data AgentResolveLivePrForSlice
+
+instance Effect AgentResolveLivePrForSlice where
+  type Input AgentResolveLivePrForSlice = ResolveLivePrForSliceRequest
+  type Output AgentResolveLivePrForSlice = ResolveLivePrForSliceResponse
+  effectId = "agent.resolve_live_pr_for_slice"
 
 data AgentSpawnLeafSubtree
 

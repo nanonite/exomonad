@@ -66,6 +66,7 @@ TOOL_METHODS: tuple[str, ...] = (
     "restart_review",
     "replace_close_pr",
     "resume_pr",
+    "resolve_live_pr_for_slice",
     "watcher_pr_state",
     "close_worker_pane",
     "spawn_codex",
@@ -241,14 +242,12 @@ class EffectClient:
         return self._call("resume_pr", arguments)
 
     def watcher_pr_state(
-        self, *, pr_number: int | None = None, slice_id: str | None = None
+        self, *, pr_number: int
     ) -> ToolResult:
-        arguments: JsonObject = {}
-        if pr_number is not None:
-            arguments["pr_number"] = pr_number
-        if slice_id is not None:
-            arguments["slice_id"] = slice_id
-        return self._call("watcher_pr_state", arguments)
+        return self._call("watcher_pr_state", {"pr_number": pr_number})
+
+    def resolve_live_pr_for_slice(self, *, slice_id: str) -> ToolResult:
+        return self._call("resolve_live_pr_for_slice", {"slice_id": slice_id})
 
     def close_worker_pane(self, *, pane_id: str) -> ToolResult:
         return self._call("close_worker_pane", {"pane_id": pane_id})

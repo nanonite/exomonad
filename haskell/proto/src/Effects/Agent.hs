@@ -4947,11 +4947,311 @@ instance (HsJSONPB.ToJSON RestartReviewResponse) where
 instance (HsJSONPB.FromJSON RestartReviewResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
-data WatcherPrStateRequest
-  = WatcherPrStateRequest
-  { watcherPrStateRequestPrNumber :: Hs.Word64,
-    watcherPrStateRequestSliceId :: Hs.Text
+data LivePrResolutionKind
+  = LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_UNSPECIFIED
+  | LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_NEVER_PUBLISHED
+  | LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_ALL_ATTEMPTS_ABANDONED
+  | LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_LIVE
+  deriving (Hs.Show, Hs.Eq, Hs.Generic, Hs.NFData)
+
+instance (HsProtobuf.Named LivePrResolutionKind) where
+  nameOf _ = Hs.fromString "LivePrResolutionKind"
+
+instance (HsProtobuf.HasDefault LivePrResolutionKind)
+
+instance (Hs.Bounded LivePrResolutionKind) where
+  minBound = LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_UNSPECIFIED
+  maxBound = LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_LIVE
+
+instance (Hs.Ord LivePrResolutionKind) where
+  compare x y =
+    Hs.compare
+      (HsProtobuf.fromProtoEnum x)
+      (HsProtobuf.fromProtoEnum y)
+
+instance (HsProtobuf.ProtoEnum LivePrResolutionKind) where
+  toProtoEnumMay 0 =
+    Hs.Just LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_UNSPECIFIED
+  toProtoEnumMay 1 =
+    Hs.Just
+      LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_NEVER_PUBLISHED
+  toProtoEnumMay 2 =
+    Hs.Just
+      LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_ALL_ATTEMPTS_ABANDONED
+  toProtoEnumMay 3 =
+    Hs.Just LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_LIVE
+  toProtoEnumMay _ = Hs.Nothing
+  fromProtoEnum
+    LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_UNSPECIFIED =
+      0
+  fromProtoEnum
+    LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_NEVER_PUBLISHED =
+      1
+  fromProtoEnum
+    LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_ALL_ATTEMPTS_ABANDONED =
+      2
+  fromProtoEnum LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_LIVE = 3
+
+instance (HsJSONPB.ToJSONPB LivePrResolutionKind) where
+  toJSONPB x _ = HsJSONPB.enumFieldString x
+  toEncodingPB x _ = HsJSONPB.enumFieldEncoding x
+
+instance (HsJSONPB.FromJSONPB LivePrResolutionKind) where
+  parseJSONPB (HsJSONPB.String "LIVE_PR_RESOLUTION_KIND_UNSPECIFIED") =
+    Hs.pure LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_UNSPECIFIED
+  parseJSONPB
+    (HsJSONPB.String "LIVE_PR_RESOLUTION_KIND_NEVER_PUBLISHED") =
+      Hs.pure
+        LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_NEVER_PUBLISHED
+  parseJSONPB
+    (HsJSONPB.String "LIVE_PR_RESOLUTION_KIND_ALL_ATTEMPTS_ABANDONED") =
+      Hs.pure
+        LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_ALL_ATTEMPTS_ABANDONED
+  parseJSONPB (HsJSONPB.String "LIVE_PR_RESOLUTION_KIND_LIVE") =
+    Hs.pure LivePrResolutionKindLIVE_PR_RESOLUTION_KIND_LIVE
+  parseJSONPB v = HsJSONPB.typeMismatch "LivePrResolutionKind" v
+
+instance (HsJSONPB.ToJSON LivePrResolutionKind) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON LivePrResolutionKind) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+instance (HsProtobuf.Finite LivePrResolutionKind)
+
+newtype ResolveLivePrForSliceRequest
+  = ResolveLivePrForSliceRequest {resolveLivePrForSliceRequestSliceId :: Hs.Text}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData ResolveLivePrForSliceRequest)
+
+instance (HsProtobuf.Named ResolveLivePrForSliceRequest) where
+  nameOf _ = Hs.fromString "ResolveLivePrForSliceRequest"
+
+instance (HsProtobuf.HasDefault ResolveLivePrForSliceRequest)
+
+instance (HsProtobuf.Message ResolveLivePrForSliceRequest) where
+  encodeMessage
+    _
+    ResolveLivePrForSliceRequest {resolveLivePrForSliceRequestSliceId} =
+      ( HsProtobuf.encodeMessageField
+          (HsProtobuf.FieldNumber 1)
+          ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+              resolveLivePrForSliceRequestSliceId
+          )
+      )
+  decodeMessage _ =
+    Hs.pure ResolveLivePrForSliceRequest
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "slice_id")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB ResolveLivePrForSliceRequest) where
+  toJSONPB (ResolveLivePrForSliceRequest f1) =
+    HsJSONPB.object
+      [ "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+      ]
+  toEncodingPB (ResolveLivePrForSliceRequest f1) =
+    HsJSONPB.pairs
+      [ "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1)
+      ]
+
+instance (HsJSONPB.FromJSONPB ResolveLivePrForSliceRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "ResolveLivePrForSliceRequest"
+      ( \obj ->
+          Hs.pure ResolveLivePrForSliceRequest
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "slice_id")
+                )
+      )
+
+instance (HsJSONPB.ToJSON ResolveLivePrForSliceRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON ResolveLivePrForSliceRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data ResolveLivePrForSliceResponse
+  = ResolveLivePrForSliceResponse
+  { resolveLivePrForSliceResponseSuccess :: Hs.Bool,
+    resolveLivePrForSliceResponseError :: Hs.Text,
+    resolveLivePrForSliceResponseSliceId :: Hs.Text,
+    resolveLivePrForSliceResponseResolution :: (HsProtobuf.Enumerated Effects.Agent.LivePrResolutionKind),
+    resolveLivePrForSliceResponsePrNumber :: Hs.Word64
   }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData ResolveLivePrForSliceResponse)
+
+instance (HsProtobuf.Named ResolveLivePrForSliceResponse) where
+  nameOf _ = Hs.fromString "ResolveLivePrForSliceResponse"
+
+instance (HsProtobuf.HasDefault ResolveLivePrForSliceResponse)
+
+instance (HsProtobuf.Message ResolveLivePrForSliceResponse) where
+  encodeMessage
+    _
+    ResolveLivePrForSliceResponse
+      { resolveLivePrForSliceResponseSuccess,
+        resolveLivePrForSliceResponseError,
+        resolveLivePrForSliceResponseSliceId,
+        resolveLivePrForSliceResponseResolution,
+        resolveLivePrForSliceResponsePrNumber
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 1)
+                        resolveLivePrForSliceResponseSuccess
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 2)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            resolveLivePrForSliceResponseError
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 3)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        resolveLivePrForSliceResponseSliceId
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 4)
+                resolveLivePrForSliceResponseResolution
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 5)
+            resolveLivePrForSliceResponsePrNumber
+        )
+  decodeMessage _ =
+    Hs.pure ResolveLivePrForSliceResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 4)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 5)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "slice_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        ( HsProtobufAST.Prim
+            ( HsProtobufAST.Named
+                (HsProtobufAST.Single "LivePrResolutionKind")
+            )
+        )
+        (HsProtobufAST.Single "resolution")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "pr_number")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB ResolveLivePrForSliceResponse) where
+  toJSONPB (ResolveLivePrForSliceResponse f1 f2 f3 f4 f5) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "resolution" .= f4,
+        "pr_number" .= f5
+      ]
+  toEncodingPB (ResolveLivePrForSliceResponse f1 f2 f3 f4 f5) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "resolution" .= f4,
+        "pr_number" .= f5
+      ]
+
+instance (HsJSONPB.FromJSONPB ResolveLivePrForSliceResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "ResolveLivePrForSliceResponse"
+      ( \obj ->
+          Hs.pure ResolveLivePrForSliceResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "slice_id")
+                )
+            <*> obj .: "resolution"
+            <*> obj .: "pr_number"
+      )
+
+instance (HsJSONPB.ToJSON ResolveLivePrForSliceResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON ResolveLivePrForSliceResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+newtype WatcherPrStateRequest
+  = WatcherPrStateRequest {watcherPrStateRequestPrNumber :: Hs.Word64}
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
 instance (Hs.NFData WatcherPrStateRequest)
@@ -4964,72 +5264,36 @@ instance (HsProtobuf.HasDefault WatcherPrStateRequest)
 instance (HsProtobuf.Message WatcherPrStateRequest) where
   encodeMessage
     _
-    WatcherPrStateRequest
-      { watcherPrStateRequestPrNumber,
-        watcherPrStateRequestSliceId
-      } =
-      Hs.mappend
-        ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 1)
-            watcherPrStateRequestPrNumber
-        )
-        ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 2)
-            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                watcherPrStateRequestSliceId
-            )
-        )
+    WatcherPrStateRequest {watcherPrStateRequestPrNumber} =
+      ( HsProtobuf.encodeMessageField
+          (HsProtobuf.FieldNumber 1)
+          watcherPrStateRequestPrNumber
+      )
   decodeMessage _ =
     Hs.pure WatcherPrStateRequest
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 1)
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 2)
-              )
-          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
         (HsProtobufAST.Prim HsProtobufAST.UInt64)
         (HsProtobufAST.Single "pr_number")
         []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 2)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "slice_id")
-        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB WatcherPrStateRequest) where
-  toJSONPB (WatcherPrStateRequest f1 f2) =
-    HsJSONPB.object
-      [ "pr_number" .= f1,
-        "slice_id"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
-      ]
-  toEncodingPB (WatcherPrStateRequest f1 f2) =
-    HsJSONPB.pairs
-      [ "pr_number" .= f1,
-        "slice_id"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2)
-      ]
+  toJSONPB (WatcherPrStateRequest f1) =
+    HsJSONPB.object ["pr_number" .= f1]
+  toEncodingPB (WatcherPrStateRequest f1) =
+    HsJSONPB.pairs ["pr_number" .= f1]
 
 instance (HsJSONPB.FromJSONPB WatcherPrStateRequest) where
   parseJSONPB =
     HsJSONPB.withObject
       "WatcherPrStateRequest"
-      ( \obj ->
-          Hs.pure WatcherPrStateRequest
-            <*> obj .: "pr_number"
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "slice_id")
-                )
-      )
+      (\obj -> Hs.pure WatcherPrStateRequest <*> obj .: "pr_number")
 
 instance (HsJSONPB.ToJSON WatcherPrStateRequest) where
   toJSON = HsJSONPB.toAesonValue

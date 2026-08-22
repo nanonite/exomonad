@@ -13,11 +13,9 @@ module ExoMonad.Guest.Tools.WatcherPrState
 where
 
 import Control.Monad.Freer (Eff)
-import Data.Aeson (FromJSON (..), object, withObject, (.:), (.:?), (.=))
+import Data.Aeson (FromJSON (..), object, withObject, (.:), (.=))
 import Data.Aeson qualified as Aeson
-import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
-import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
 import Effects.Agent qualified as PA
 import ExoMonad.Effects.Agent qualified as Agent
@@ -31,37 +29,29 @@ import GHC.Generics (Generic)
 data WatcherPrState
 
 data WatcherPrStateArgs = WatcherPrStateArgs
-  { wpsPrNumber :: Maybe Int,
-    wpsSliceId :: Maybe Text
+  { wpsPrNumber :: Int
   }
   deriving (Show, Eq, Generic)
 
 instance FromJSON WatcherPrStateArgs where
   parseJSON = withObject "WatcherPrStateArgs" $ \v ->
-    WatcherPrStateArgs
-      <$> v .:? "pr_number"
-      <*> v .:? "slice_id"
+    WatcherPrStateArgs <$> v .: "pr_number"
 
 watcherPrStateDescription :: Text
-watcherPrStateDescription = "Query live Forgejo PR review and CI observations for an existing PR, including its current head SHA, review state, and CI status. Pass pr_number when known. When pr_number is not yet persisted (e.g. after a crash between pr.filed and identity association), pass slice_id instead to recover it from the durable published-heads registry. Use the returned evidence for diagnostics; this tool does not authorize merging."
+watcherPrStateDescription = "Query live Forgejo PR review and CI observations for an existing PR, including its current head SHA, review state, and CI status. Pass the concrete pr_number resolved by the controller. Use the returned evidence for diagnostics; this tool does not authorize merging."
 
 watcherPrStateSchema :: Aeson.Object
 watcherPrStateSchema =
   genericToolSchemaWith @WatcherPrStateArgs
-    [ ("pr_number", "Existing PR number whose live Forgejo review and CI state should be inspected. Omit when recovering identity via slice_id."),
-      ("slice_id", "TL slice identifier used to recover a PR number that was never persisted onto checkpoint state. Ignored when pr_number is supplied.")
-    ]
+    [("pr_number", "Existing PR number whose live Forgejo review and CI state should be inspected.")]
 
 watcherPrStateCore :: WatcherPrStateArgs -> Eff Effects (Either Text Aeson.Value)
 watcherPrStateCore args
-  | maybe False (<= 0) (wpsPrNumber args) = pure $ Left "pr_number must be positive"
-  | isNothing (wpsPrNumber args) && maybe True T.null (wpsSliceId args) =
-      pure $ Left "either pr_number or slice_id is required"
+  | wpsPrNumber args <= 0 = pure $ Left "pr_number must be positive"
   | otherwise = do
       let req =
             PA.WatcherPrStateRequest
-              { PA.watcherPrStateRequestPrNumber = maybe 0 fromIntegral (wpsPrNumber args),
-                PA.watcherPrStateRequestSliceId = TL.fromStrict (fromMaybe "" (wpsSliceId args))
+              { PA.watcherPrStateRequestPrNumber = fromIntegral (wpsPrNumber args)
               }
       result <- suspendEffect @Agent.AgentWatcherPrState req
       pure $ case result of

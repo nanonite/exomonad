@@ -240,9 +240,32 @@ def heartbeat_once(
 
     current = store.load()
     for slice_state in _active_slices(current):
-        if slice_state.pr_number is None:
-            continue
-        watcher = _watch_pr(effects, slice_state.pr_number)
+        pr_number = slice_state.pr_number
+        if pr_number is None:
+            resolution, pr_number = _resolve_live_pr(effects, slice_state.id)
+            if pr_number is None:
+                events.append(
+                    _event(
+                        "pr.unresolved",
+                        "resolve_live_pr_for_slice",
+                        slice_state.id,
+                        {"resolution": resolution},
+                    )
+                )
+                continue
+            current = store.load()
+            current_slice = current.slices[slice_state.id]
+            if current_slice.pr_number != pr_number:
+                current_slice = replace(current_slice, pr_number=pr_number)
+                current = store.checkpoint(
+                    current.fsm,
+                    {**current.slices, slice_state.id: current_slice},
+                    current.budgets,
+                    current.events.last_consumed_offset,
+                )
+                progress = True
+            slice_state = current.slices[slice_state.id]
+        watcher = _watch_pr(effects, pr_number)
         terminal_cause = _pr_terminal_cause(watcher)
         if terminal_cause is not None:
             if isinstance(effects, ReadOnlyEffectClient):
@@ -586,6 +609,25 @@ def _index_worker_rows(
 
 def _watch_pr(effects: LiveEffects, pr_number: int) -> JsonMapping:
     return _result_object(effects.watcher_pr_state(pr_number=pr_number), "watcher_pr_state")
+
+
+def _resolve_live_pr(effects: LiveEffects, slice_id: str) -> tuple[str, int | None]:
+    result = _result_object(
+        effects.resolve_live_pr_for_slice(slice_id=slice_id),
+        "resolve_live_pr_for_slice",
+    )
+    resolution = result.get("resolution")
+    if resolution not in {"never_published", "all_attempts_abandoned", "live"}:
+        raise HeartbeatError(
+            "resolve_live_pr_for_slice resolution must be one of "
+            "never_published, all_attempts_abandoned, live"
+        )
+    if resolution != "live":
+        return resolution, None
+    pr_number = result.get("pr_number")
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+        raise HeartbeatError("resolve_live_pr_for_slice live result requires a positive pr_number")
+    return resolution, pr_number
 
 
 def _result_object(result: ToolResult, operation: str) -> JsonMapping:

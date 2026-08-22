@@ -3529,23 +3529,26 @@ def _watcher_snapshot_for_slice(
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
 ) -> Mapping[str, object] | None:
-    """Recover a slice's PR identity from the durable publication registry
-    when pr_number was never persisted onto checkpoint state. A miss is
-    expected whenever the slice genuinely has not filed a PR yet, so this
-    does not raise on failure."""
+    """Resolve a live PR identity, then read its Forgejo facts."""
     result = _invoke(
-        "watcher_pr_state",
+        "resolve_live_pr_for_slice",
         f"slice:{slice_id}",
         {"slice_id": slice_id},
         config.active,
         cast(EffectClient, effects),
-        lambda client: client.watcher_pr_state(slice_id=slice_id),
+        lambda client: client.resolve_live_pr_for_slice(slice_id=slice_id),
         effects_log,
         raise_on_failure=False,
     )
     if result is None or result.success is not True or not isinstance(result.result, Mapping):
         return None
-    return result.result
+    resolution = result.result.get("resolution")
+    if resolution != "live":
+        return None
+    pr_number = result.result.get("pr_number")
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+        return None
+    return _watcher_snapshot(pr_number, config, effects, effects_log)
 
 
 def _snapshot_text(snapshot: Mapping[str, object], key: str) -> str | None:

@@ -378,15 +378,29 @@ message RestartReviewResponse {
 // WatcherPrState - Query live Forgejo PR review/CI state for TL diagnostics
 // ============================================================================
 
+enum LivePrResolutionKind {
+  LIVE_PR_RESOLUTION_KIND_UNSPECIFIED = 0;
+  LIVE_PR_RESOLUTION_KIND_NEVER_PUBLISHED = 1;
+  LIVE_PR_RESOLUTION_KIND_ALL_ATTEMPTS_ABANDONED = 2;
+  LIVE_PR_RESOLUTION_KIND_LIVE = 3;
+}
+
+message ResolveLivePrForSliceRequest {
+  // Stable TL slice identifier whose current live PR should be resolved.
+  string slice_id = 1;
+}
+
+message ResolveLivePrForSliceResponse {
+  bool success = 1;
+  string error = 2;
+  string slice_id = 3;
+  LivePrResolutionKind resolution = 4;
+  uint64 pr_number = 5;
+}
+
 message WatcherPrStateRequest {
-  // Existing PR number to inspect. May be 0 when the caller does not yet
-  // know the PR number and is recovering it via slice_id instead.
+  // Existing PR number to inspect.
   uint64 pr_number = 1;
-  // TL slice identifier used to recover a PR number that was acknowledged
-  // as filed but never persisted onto checkpoint state (e.g. after a crash
-  // between pr.filed and identity association). Ignored when pr_number is
-  // nonzero. Resolved against the durable published-heads registry.
-  string slice_id = 2;
 }
 
 message WatcherPrStateResponse {
@@ -592,6 +606,7 @@ service AgentEffects {
   rpc SpawnReviewer(SpawnReviewerRequest) returns (SpawnReviewerResponse);
   rpc CleanupReviewerLeaf(CleanupReviewerLeafRequest) returns (CleanupReviewerLeafResponse);
   rpc RestartReview(RestartReviewRequest) returns (RestartReviewResponse);
+  rpc ResolveLivePrForSlice(ResolveLivePrForSliceRequest) returns (ResolveLivePrForSliceResponse);
   rpc WatcherPrState(WatcherPrStateRequest) returns (WatcherPrStateResponse);
   rpc SpawnLeafSubtree(SpawnLeafSubtreeRequest) returns (SpawnLeafSubtreeResponse);
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);

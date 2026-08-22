@@ -2,7 +2,7 @@ use crate::domain::{BranchName, RoutingInfo};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
@@ -17,6 +17,14 @@ const PUBLISHED_HEADS_SCHEMA_VERSION: u32 = 1;
 pub enum PublicationProvenance {
     Legacy,
     LedgerOwned,
+}
+
+/// The controller-facing result of resolving a slice's current publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivePrResolution {
+    NeverPublished,
+    AllAttemptsAbandoned,
+    Live(u64),
 }
 
 /// A PR head that was confirmed by the Forgejo create/update response.
@@ -211,19 +219,45 @@ pub async fn read_published_heads(project_dir: &Path) -> Result<Vec<PublishedHea
 /// acknowledged and identity association). Ledger-owned publications are
 /// preferred over migrated legacy ones; among equally-provenanced matches,
 /// the most recently published entry wins.
-pub fn resolve_pr_number_for_slice(heads: &[PublishedHead], slice_id: &str) -> Option<u64> {
+pub fn publication_history_for_slice<'a>(
+    heads: &'a [PublishedHead],
+    slice_id: &str,
+) -> Vec<&'a PublishedHead> {
     if slice_id.trim().is_empty() {
-        return None;
+        return Vec::new();
+    }
+    heads
+        .iter()
+        .filter(|head| head.slice_id.as_deref() == Some(slice_id))
+        .collect()
+}
+
+/// Resolve the live PR for a slice from history and Forgejo-derived liveness.
+///
+/// The caller supplies the PR numbers that Forgejo reported as open and
+/// unmerged. Ledger-owned publications retain precedence over legacy entries;
+/// among equally-provenanced candidates the newest publication wins.
+pub fn resolve_live_pr_for_slice(
+    heads: &[PublishedHead],
+    slice_id: &str,
+    live_pr_numbers: &HashSet<u64>,
+) -> LivePrResolution {
+    let history = publication_history_for_slice(heads, slice_id);
+    if history.is_empty() {
+        return LivePrResolution::NeverPublished;
     }
     let matching = || {
-        heads
+        history
             .iter()
-            .filter(|head| head.slice_id.as_deref() == Some(slice_id))
+            .copied()
+            .filter(|head| live_pr_numbers.contains(&head.pr_number))
     };
     matching()
         .rfind(|head| head.provenance == PublicationProvenance::LedgerOwned)
         .or_else(|| matching().next_back())
-        .map(|head| head.pr_number)
+        .map_or(LivePrResolution::AllAttemptsAbandoned, |head| {
+            LivePrResolution::Live(head.pr_number)
+        })
 }
 
 /// Persist a verified publication without allowing duplicate events to grow
@@ -621,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pr_number_for_slice_prefers_ledger_owned_over_legacy() {
+    fn publication_history_for_slice_keeps_terminal_publications() {
         let mut legacy = publication("sha-1");
         legacy.slice_id = Some("slice-a".to_string());
         legacy.provenance = PublicationProvenance::Legacy;
@@ -632,27 +666,65 @@ mod tests {
         ledger_owned.provenance = PublicationProvenance::LedgerOwned;
 
         let heads = vec![legacy, ledger_owned];
-        assert_eq!(resolve_pr_number_for_slice(&heads, "slice-a"), Some(43));
+        let history = publication_history_for_slice(&heads, "slice-a");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].pr_number, 42);
+        assert_eq!(history[1].pr_number, 43);
     }
 
     #[test]
-    fn resolve_pr_number_for_slice_falls_back_to_legacy_when_no_ledger_owned_match() {
+    fn live_resolver_preserves_ledger_owned_precedence() {
         let mut legacy = publication("sha-1");
         legacy.slice_id = Some("slice-a".to_string());
         legacy.provenance = PublicationProvenance::Legacy;
 
-        let heads = vec![legacy];
-        assert_eq!(resolve_pr_number_for_slice(&heads, "slice-a"), Some(42));
+        let mut ledger_owned = publication("sha-2");
+        ledger_owned.pr_number = 43;
+        ledger_owned.slice_id = Some("slice-a".to_string());
+        ledger_owned.provenance = PublicationProvenance::LedgerOwned;
+
+        let heads = vec![legacy, ledger_owned];
+        let live = [42, 43].into_iter().collect();
+        assert_eq!(
+            resolve_live_pr_for_slice(&heads, "slice-a", &live),
+            LivePrResolution::Live(43)
+        );
     }
 
     #[test]
-    fn resolve_pr_number_for_slice_returns_none_when_unmatched_or_empty() {
+    fn live_resolver_skips_terminal_publications() {
+        let mut terminal = publication("sha-1");
+        terminal.slice_id = Some("slice-a".to_string());
+        let mut live = publication("sha-2");
+        live.pr_number = 43;
+        live.slice_id = Some("slice-a".to_string());
+
+        let heads = vec![terminal, live];
+        let live_numbers = [43].into_iter().collect();
+        assert_eq!(
+            resolve_live_pr_for_slice(&heads, "slice-a", &live_numbers),
+            LivePrResolution::Live(43)
+        );
+    }
+
+    #[test]
+    fn live_resolver_classifies_absence() {
         let mut other = publication("sha-1");
         other.slice_id = Some("slice-b".to_string());
 
         let heads = vec![other];
-        assert_eq!(resolve_pr_number_for_slice(&heads, "slice-a"), None);
-        assert_eq!(resolve_pr_number_for_slice(&heads, ""), None);
-        assert_eq!(resolve_pr_number_for_slice(&[], "slice-a"), None);
+        let none = HashSet::new();
+        assert_eq!(
+            resolve_live_pr_for_slice(&heads, "slice-a", &none),
+            LivePrResolution::NeverPublished
+        );
+        assert_eq!(
+            resolve_live_pr_for_slice(&heads, "slice-b", &none),
+            LivePrResolution::AllAttemptsAbandoned
+        );
+        assert_eq!(
+            resolve_live_pr_for_slice(&[], "slice-a", &none),
+            LivePrResolution::NeverPublished
+        );
     }
 }

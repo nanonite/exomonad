@@ -308,6 +308,22 @@
       "name": "resume_pr"
     },
     {
+      "description": "Resolve the current live Forgejo PR for a TL slice through the publication effect. The typed result distinguishes never_published, all_attempts_abandoned, and live; absence is a successful diagnosis, not an error.",
+      "inputSchema": {
+        "properties": {
+          "slice_id": {
+            "description": "Stable TL slice identifier whose live PR should be resolved.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slice_id"
+        ],
+        "type": "object"
+      },
+      "name": "resolve_live_pr_for_slice"
+    },
+    {
       "description": "Query live Forgejo PR review and CI observations for an existing PR, including its current head SHA, review state, and CI status. Use the returned evidence for diagnostics; this tool does not authorize merging.",
       "inputSchema": {
         "properties": {

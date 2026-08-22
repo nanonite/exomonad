@@ -272,8 +272,7 @@ mergeFromHostedPr args prNum owner repo currentBranch localPrResult = do
               watcherResult <-
                 suspendEffect @AgentWatcherPrState
                   Agent.WatcherPrStateRequest
-                    { Agent.watcherPrStateRequestPrNumber = fromIntegral prNum,
-                      Agent.watcherPrStateRequestSliceId = ""
+                    { Agent.watcherPrStateRequestPrNumber = fromIntegral prNum
                     }
               case watcherResult of
                 Left err ->

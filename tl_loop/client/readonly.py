@@ -16,6 +16,7 @@ READ_METHODS = frozenset(
     {
         "poll_workers",
         "watcher_pr_state",
+        "resolve_live_pr_for_slice",
         "session_status",
         "check_inbox",
         "memory_list",
@@ -49,6 +50,9 @@ class ReadOnlyEffectClient:
 
     def watcher_pr_state(self, **kwargs: object) -> ToolResult:
         return self._read("watcher_pr_state", kwargs)
+
+    def resolve_live_pr_for_slice(self, **kwargs: object) -> ToolResult:
+        return self._read("resolve_live_pr_for_slice", kwargs)
 
     def session_status(self, **kwargs: object) -> ToolResult:
         return self._read("session_status", kwargs)

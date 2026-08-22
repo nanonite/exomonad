@@ -24,14 +24,17 @@ use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
 use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
 #[cfg(test)]
 use crate::services::pr_registry::PrRegistry;
-use crate::services::pr_registry::{read_published_heads, resolve_pr_number_for_slice};
-use crate::services::pr_registry::{PrEntry, PrState};
+use crate::services::pr_registry::{
+    publication_history_for_slice, read_published_heads, resolve_live_pr_for_slice,
+    LivePrResolution, PrEntry, PrState,
+};
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use async_trait::async_trait;
 use chrono::Utc;
 use exomonad_proto::effects::agent::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1692,34 +1695,75 @@ impl<
         Ok(record.to_response(false))
     }
 
+    async fn resolve_live_pr_for_slice(
+        &self,
+        req: ResolveLivePrForSliceRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<ResolveLivePrForSliceResponse> {
+        let slice_id = req.slice_id.trim();
+        if slice_id.is_empty() {
+            return Err(EffectError::invalid_input("slice_id is required"));
+        }
+        let heads = read_published_heads(self.ctx.project_dir())
+            .await
+            .effect_err("agent")?;
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return Ok(ResolveLivePrForSliceResponse {
+                success: false,
+                error: "Forgejo is not configured; cannot resolve a live PR".to_string(),
+                slice_id: slice_id.to_string(),
+                resolution: LivePrResolutionKind::Unspecified as i32,
+                pr_number: 0,
+            });
+        };
+        let repo_info = crate::services::repo::get_repo_info(self.ctx.project_dir())
+            .await
+            .effect_err("agent")?;
+        let mut live_pr_numbers = HashSet::new();
+        for publication in publication_history_for_slice(&heads, slice_id) {
+            if live_pr_numbers.contains(&publication.pr_number) {
+                continue;
+            }
+            let pr = forgejo
+                .get_pull_request(
+                    &repo_info.owner,
+                    &repo_info.repo,
+                    PRNumber::new(publication.pr_number),
+                )
+                .await
+                .effect_err("agent")?;
+            if !pr.merged && pr.state.eq_ignore_ascii_case("open") {
+                live_pr_numbers.insert(publication.pr_number);
+            }
+        }
+        let resolution = resolve_live_pr_for_slice(&heads, slice_id, &live_pr_numbers);
+        let (resolution_kind, pr_number) = match resolution {
+            LivePrResolution::NeverPublished => {
+                (LivePrResolutionKind::NeverPublished, 0)
+            }
+            LivePrResolution::AllAttemptsAbandoned => {
+                (LivePrResolutionKind::AllAttemptsAbandoned, 0)
+            }
+            LivePrResolution::Live(pr_number) => (LivePrResolutionKind::Live, pr_number),
+        };
+        Ok(ResolveLivePrForSliceResponse {
+            success: true,
+            error: String::new(),
+            slice_id: slice_id.to_string(),
+            resolution: resolution_kind as i32,
+            pr_number,
+        })
+    }
+
     async fn watcher_pr_state(
         &self,
         req: WatcherPrStateRequest,
         _ctx: &crate::effects::EffectContext,
     ) -> EffectResult<WatcherPrStateResponse> {
-        let pr_number = if req.pr_number != 0 {
-            req.pr_number
-        } else if !req.slice_id.is_empty() {
-            let heads = read_published_heads(self.ctx.project_dir())
-                .await
-                .effect_err("agent")?;
-            match resolve_pr_number_for_slice(&heads, &req.slice_id) {
-                Some(pr_number) => pr_number,
-                None => {
-                    return Ok(watcher_pr_state_error(
-                        0,
-                        format!(
-                            "no published PR found for slice_id '{}' in the publication registry",
-                            req.slice_id
-                        ),
-                    ))
-                }
-            }
-        } else {
-            return Err(EffectError::invalid_input(
-                "either pr_number or slice_id is required",
-            ));
-        };
+        let pr_number = req.pr_number;
+        if pr_number == 0 {
+            return Err(EffectError::invalid_input("pr_number is required"));
+        }
 
         let Some(forgejo) = self.ctx.forgejo_client() else {
             return Ok(watcher_pr_state_error(

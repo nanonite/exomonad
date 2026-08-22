@@ -147,6 +147,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         steps=["step"],
         verify=["just test"],
     )
+    client.resolve_live_pr_for_slice(slice_id="slice-a")
     client.watcher_pr_state(pr_number=1)
     client.close_worker_pane(pane_id="%1")
     client.spawn_codex(
