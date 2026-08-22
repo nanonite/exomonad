@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- TL controller dies on unserializable mappingproxy in durable writes, orphaning the worker (#934)
 - Migrate legacy TL recovery state without losing evidence (#906)
 - Fix silent startup and runtime preflight diagnostics (#931)
 - Reconcile nonterminal TL slices from authoritative state on startup (#904)
