@@ -363,6 +363,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Split slice-to-PR resolution and make watcher_pr_state a pure Forgejo sensor (#936)
 - Research: slice identity vs PR ownership - abandoning an attempt and re-dispatching work (#933)
 - Closed-unmerged PRs resurrect slices and unreachable PR heads kill the TL controller (#932)
 - TL preflight blocks all spawning when ExoMonad's own Chainlink DB is tracked (#930)
