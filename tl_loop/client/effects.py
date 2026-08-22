@@ -72,7 +72,6 @@ TOOL_METHODS: tuple[str, ...] = (
     "spawn_codex",
     "session_status",
     "poll_workers",
-    "check_inbox",
     "emit_controller_event",
     "memory_append",
     "memory_list",

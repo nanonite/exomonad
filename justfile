@@ -106,6 +106,11 @@ tl-loop-ordered-server-e2e:
 tl-loop-lint:
     {{py}} -m ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py
 
+# Verify every declared tool is role-registered and controller-callable tools
+# are exposed by the TL role.
+tool-surface-check:
+    python3 scripts/check_tool_surface.py --project-root .
+
 # Type-check the programmatic TL controller
 tl-loop-typecheck:
     mypy tl_loop
@@ -155,7 +160,7 @@ wasm-guest-test:
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
 # Run tests: Python checks, formatting, Rust check, WASM build/tests, Rust tests, proto freshness
-test: tl-loop-replay tl-loop-test tl-loop-lint
+test: tl-loop-replay tl-loop-test tl-loop-lint tool-surface-check
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/8] Observability contract checks..."

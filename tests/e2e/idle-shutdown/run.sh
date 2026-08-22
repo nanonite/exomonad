@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # E2E idle/shutdown convergence test.
-# Validates that root closes a small Chainlink backlog, observes empty inbox
-# checks, calls has_pending_work, then calls shutdown_server.
+# Validates that the controller closes a small Chainlink backlog and shuts down.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -40,7 +39,7 @@ if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-g
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
 
-for tool in check_inbox has_pending_work shutdown_server chainlink_issue_list chainlink_issue_show chainlink_issue_comment chainlink_issue_close; do
+for tool in chainlink_issue_list chainlink_issue_show chainlink_issue_comment chainlink_issue_close; do
     if grep -q "$tool" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
         echo "  MCP tool '$tool': FOUND"
     else
@@ -210,7 +209,7 @@ echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
 echo ""
 echo "  Root should close two seeded Chainlink issues"
-echo "  then call has_pending_work and shutdown_server."
+echo "  then wait for controller-owned shutdown."
 echo "============================================"
 echo ""
 

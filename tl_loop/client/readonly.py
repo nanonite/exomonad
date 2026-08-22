@@ -18,7 +18,6 @@ READ_METHODS = frozenset(
         "watcher_pr_state",
         "resolve_live_pr_for_slice",
         "session_status",
-        "check_inbox",
         "memory_list",
         "continuation_brief",
         "list_agents",

@@ -58,6 +58,7 @@ import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), M
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
+import ExoMonad.Guest.Tools.ResolveLivePrForSlice (ResolveLivePrForSlice (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
 import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
@@ -272,7 +273,10 @@ data Tools mode = Tools
     restartReview :: mode :- RestartReview,
     replaceClosedPr :: mode :- ReplaceClosedPr,
     resumePr :: mode :- ResumePr,
+    resolveLivePrForSlice :: mode :- ResolveLivePrForSlice,
     watcherPrState :: mode :- WatcherPrState,
+    discardWorkerOutput :: mode :- DiscardWorkerOutput,
+    disposeLeaf :: mode :- DisposeLeaf,
     closeWorkerPane :: mode :- TLCloseWorkerPane,
     spawnCodex :: mode :- TLSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
@@ -327,7 +331,10 @@ config =
             restartReview = mkHandler @RestartReview,
             replaceClosedPr = mkHandler @ReplaceClosedPr,
             resumePr = mkHandler @ResumePr,
+            resolveLivePrForSlice = mkHandler @ResolveLivePrForSlice,
             watcherPrState = mkHandler @WatcherPrState,
+            discardWorkerOutput = mkHandler @DiscardWorkerOutput,
+            disposeLeaf = mkHandler @DisposeLeaf,
             closeWorkerPane = mkHandler @TLCloseWorkerPane,
             spawnCodex = mkHandler @TLSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,

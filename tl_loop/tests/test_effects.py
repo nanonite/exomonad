@@ -162,7 +162,6 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     )
     client.session_status(include_dead=True)
     client.poll_workers(include_dead=False, agents=["leaf"])
-    client.check_inbox()
     client.emit_controller_event(
         event_type="tl.phase_changed",
         payload={"from_phase": "planning", "to_phase": "running"},

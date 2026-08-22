@@ -7,7 +7,6 @@
 -- Request and response types are proto-generated from @proto/effects/lifecycle.proto@.
 module ExoMonad.Effects.Lifecycle
   ( -- * Effect Types
-    LifecycleHasPendingWork,
     LifecycleShutdownServer,
 
     -- * Re-exported proto types
@@ -17,13 +16,6 @@ where
 
 import Effects.Lifecycle
 import ExoMonad.Effect.Class (Effect (..))
-
-data LifecycleHasPendingWork
-
-instance Effect LifecycleHasPendingWork where
-  type Input LifecycleHasPendingWork = HasPendingWorkEffect
-  type Output LifecycleHasPendingWork = HasPendingWorkResult
-  effectId = "lifecycle.has_pending_work"
 
 data LifecycleShutdownServer
 

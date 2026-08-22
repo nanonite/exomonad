@@ -68,10 +68,6 @@ write_result_and_exit() {
 main() {
     wait_for "Chainlink backlog reaches zero open issues" \
         "[[ \"\$(bash '$0' --open-count '$REPO_DIR')\" == \"0\" ]]"
-    wait_for "has_pending_work tool call is logged" \
-        "grep -R 'has_pending_work' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
-    wait_for "shutdown_server tool call is logged" \
-        "grep -R 'shutdown_server' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
     wait_for "ExoMonad server socket is gone" \
         "[[ ! -S '$REPO_DIR/.exo/server.sock' ]]"
 

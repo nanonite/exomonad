@@ -455,14 +455,6 @@
       "name": "poll_workers"
     },
     {
-      "description": "Check and mark as read the durable inbox messages addressed to the current agent. Returns message sender, content, summary, and creation time.",
-      "inputSchema": {
-        "properties": {},
-        "type": "object"
-      },
-      "name": "check_inbox"
-    },
-    {
       "description": "Emit bounded controller observability dimensions to the canonical ledger.",
       "inputSchema": {
         "properties": {

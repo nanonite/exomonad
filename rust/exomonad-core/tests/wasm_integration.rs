@@ -978,6 +978,7 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
         "restart_review",
         "replace_close_pr",
         "watcher_pr_state",
+        "resolve_live_pr_for_slice",
     ] {
         assert!(
             names.contains(&expected),

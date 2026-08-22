@@ -25,8 +25,8 @@ pollWorkersTests =
       testCase "missing lifecycle status is not inferred from tmux state" $ do
         let table = renderWorkersTable [missingLifecycleRow]
         assertDoesNotContain "  LIVE" table
-        assertDoesNotContain "  DEAD" table
-      , testCase "runtime identity is selected without slice-name suffix guessing" $ do
+        assertDoesNotContain "  DEAD" table,
+      testCase "runtime identity is selected without slice-name suffix guessing" $ do
         let available = ["tunable-operator-body-opencode", "other-opencode"]
         assertEqual
           "canonical runtime identity selection"
