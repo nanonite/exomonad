@@ -54,6 +54,8 @@ from .schema import (
     Verdict,
     validate,
 )
+from .serialization import dumps as dumps_json
+from .serialization import to_jsonable
 from .write import apply
 
 DEFAULT_ROOT = Path(".exo/tl-loop")
@@ -233,9 +235,12 @@ class RunStore:
         run_seq = event.get("run_seq")
         if any(item.get("run_seq") == run_seq for item in entries):
             return
-        entries.append(copy.deepcopy(dict(event)))
+        normalized = to_jsonable(event)
+        if not isinstance(normalized, dict):
+            raise QuarantineStorageError(self.event_quarantine_path, "event must be an object")
+        entries.append(normalized)
         temporary = self.event_quarantine_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(entries, sort_keys=True), encoding="utf-8")
+        temporary.write_text(dumps_json(entries, sort_keys=True), encoding="utf-8")
         temporary.replace(self.event_quarantine_path)
 
     def quarantined_events(self) -> tuple[Mapping[str, object], ...]:
@@ -272,7 +277,7 @@ class RunStore:
         ]
         if entries:
             temporary = self.event_quarantine_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(entries, sort_keys=True), encoding="utf-8")
+            temporary.write_text(dumps_json(entries, sort_keys=True), encoding="utf-8")
             temporary.replace(self.event_quarantine_path)
         else:
             try:
@@ -291,7 +296,7 @@ class RunStore:
         if output:
             payload["recent_output"] = "\n".join(output.splitlines()[-20:])
         temporary = self.terminal_summary_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temporary.write_text(dumps_json(payload, sort_keys=True), encoding="utf-8")
         temporary.replace(self.terminal_summary_path)
 
     def terminal_summary(self) -> Mapping[str, object] | None:
@@ -323,7 +328,7 @@ class RunStore:
         if output:
             payload["recent_output"] = "\n".join(output.splitlines()[-20:])
         temporary = self.exit_reason_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temporary.write_text(dumps_json(payload, sort_keys=True), encoding="utf-8")
         temporary.replace(self.exit_reason_path)
 
     def exit_reason(self) -> str | None:

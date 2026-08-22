@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import copy
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .schema import SCHEMA_VERSION
+from .serialization import dumps as dumps_json
 
 MIGRATION_VERSION = 1
 # The migration target always tracks the loader's own accepted version, so
@@ -203,5 +203,5 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
 def _atomic_write_json(path: Path, payload: Any) -> None:
     _atomic_write_bytes(
         path,
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        dumps_json(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
     )

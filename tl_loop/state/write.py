@@ -16,6 +16,8 @@ from typing import TypeAlias
 
 from .lock import RunLock
 from .schema import SchemaError, validate
+from .serialization import dumps as dumps_json
+from .serialization import to_jsonable
 
 Document: TypeAlias = dict[str, object]
 Mutator: TypeAlias = Callable[[Document], Document]
@@ -81,7 +83,9 @@ def apply(
                 candidate_value = mutator(copy.deepcopy(initial))
                 if not isinstance(candidate_value, dict):
                     raise MutationError("run-state mutator must return an object")
-                candidate = copy.deepcopy(candidate_value)
+                candidate = to_jsonable(candidate_value)
+                if not isinstance(candidate, dict):
+                    raise MutationError("run-state mutator must return an object")
                 candidate["revision"] = initial["revision"]
                 validator(candidate)
                 temporary = _write_temp(directory, candidate)
@@ -100,7 +104,9 @@ def apply(
         candidate_value = mutator(copy.deepcopy(observed.document))
         if not isinstance(candidate_value, dict):
             raise MutationError("run-state mutator must return an object")
-        candidate = copy.deepcopy(candidate_value)
+        candidate = to_jsonable(candidate_value)
+        if not isinstance(candidate, dict):
+            raise MutationError("run-state mutator must return an object")
         candidate["revision"] = observed.revision + 1
         validator(candidate)
 
@@ -186,7 +192,7 @@ def _write_temp(directory: Path, candidate: Document) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     descriptor, raw_path = tempfile.mkstemp(prefix=".run.json.", suffix=".tmp", dir=directory)
     temporary = Path(raw_path)
-    payload = (json.dumps(candidate, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    payload = (dumps_json(candidate, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(payload)

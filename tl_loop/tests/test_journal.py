@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from types import MappingProxyType
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +27,24 @@ def test_stable_action_key_is_order_independent() -> None:
     second = stable_action_key("run-a", "merge_pr", "slice-a", {"b": 2, "a": 1})
 
     assert first == second
+
+
+def test_nested_mappingproxy_arguments_are_durable(tmp_path) -> None:
+    path = tmp_path / "action-journal.json"
+    intent = SimpleNamespace(
+        operation="spawn_worker",
+        target="slice-a",
+        arguments={
+            "payload": MappingProxyType(
+                {"nested": MappingProxyType({"value": "preserved"})}
+            )
+        },
+    )
+
+    EffectJournal("run-a", path).append(intent)
+
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document[0]["arguments"]["payload"]["nested"]["value"] == "preserved"
 
 
 def test_confirmed_action_replays_after_journal_reload(tmp_path) -> None:

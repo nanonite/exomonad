@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import cast
 
 import pytest
@@ -14,6 +15,7 @@ from tl_loop.loop.escalate import (
     HarnessSwitchDecision,
     IssueCreationError,
     ParkResult,
+    _create_issue,
     authorize_harness_switch,
     park,
     switch_harness,
@@ -95,6 +97,27 @@ def test_failed_issue_creation_does_not_mutate_state(tmp_path: Path) -> None:
         park(_slice(), ParkCause.RETRIES_EXHAUSTED, store=store, issue_creator=lambda *_: 0)
 
     assert store.load().slices["root"].status is SliceStatus.PENDING
+
+
+def test_nested_mappingproxy_audit_is_durable() -> None:
+    descriptions: list[str] = []
+
+    def create_issue(title: str, description: str) -> int:
+        del title
+        descriptions.append(description)
+        return 702
+
+    result = _create_issue(
+        create_issue,
+        _slice(),
+        ParkCause.REVIEW_STUCK,
+        MappingProxyType(
+            {"nested": MappingProxyType({"classification": MappingProxyType({"value": "stalled"})})}
+        ),
+    )
+
+    assert result == 702
+    assert '"classification": {"value": "stalled"}' in descriptions[0]
 
 
 def test_declared_harness_switch_is_allowed_and_audited() -> None:

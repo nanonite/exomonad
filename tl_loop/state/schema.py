@@ -47,6 +47,7 @@ class ParkCause(str, Enum):
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
     DISPATCH_FAILED = "dispatch_failed"
     CORRUPT_STATE = "corrupt_state"
+    DURABLE_WRITE_FAILED = "durable_write_failed"
 
 
 class Verdict(str, Enum):

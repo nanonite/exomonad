@@ -23,6 +23,7 @@ from tl_loop.state.schema import (
     SliceState,
     SliceStatus,
 )
+from tl_loop.state.serialization import dumps as dumps_json
 from tl_loop.state.store import RunStore
 
 JsonMapping: TypeAlias = Mapping[str, object]
@@ -487,7 +488,7 @@ def _mark_invocation_timed_out(
         document["stderr_tail"] = _bounded_text(evidence, "stderr_tail")
     temporary = path.with_suffix(".timed-out.tmp")
     try:
-        temporary.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+        temporary.write_text(dumps_json(document, sort_keys=True), encoding="utf-8")
         temporary.replace(path)
     except OSError:
         LOGGER.warning("Unable to persist timed-out invocation record: %s", path)

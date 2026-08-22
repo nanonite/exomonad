@@ -44,6 +44,7 @@ from tl_loop.loop.driver import (
     run_tl_loop,
     tl_run,
 )
+from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
@@ -64,6 +65,7 @@ from tl_loop.state.schema import (
 )
 from tl_loop.state.store import RunStore, create
 from tl_loop.state.store import load as load_state
+from tl_loop.state.serialization import DurableWriteError
 
 
 @dataclass
@@ -505,6 +507,48 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
         "tl.dispatch_confirmed",
         "tl.dispatch_confirmed",
     ]
+
+
+def test_durable_journal_failure_parks_the_affected_slice(tmp_path: Path, monkeypatch) -> None:
+    class ParkingTransport(RecordingTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            if tool_name == "chainlink_issue_create":
+                self.calls.append((tool_name, arguments))
+                return {"success": True, "result": {"issue_id": 9340}}
+            return super().call_tool(role, name, tool_name, arguments)
+
+    def fail_append(_journal: EffectJournal, intent: object) -> None:
+        raise DurableWriteError(
+            "mappingproxy",
+            operation=getattr(intent, "operation", None),
+            target=getattr(intent, "target", None),
+        )
+
+    monkeypatch.setattr(EffectJournal, "append", fail_append)
+    transport = ParkingTransport()
+    result = run_tl_loop(
+        "durable-failure",
+        _plan(),
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=replace(_config(), ledger_run_id="durable-failure"),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLFailed
+    parked = [
+        slice_state
+        for slice_state in result.final_state.slices.values()
+        if slice_state.park_cause is not None
+    ]
+    assert len(parked) == 1
+    assert parked[0].park_cause.value == "durable_write_failed"
 
 
 def test_observability_failure_does_not_change_terminal_state(

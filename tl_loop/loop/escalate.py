@@ -8,7 +8,6 @@ parks the slice and blocks its dependents.
 from __future__ import annotations
 
 import copy
-import json
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -19,6 +18,8 @@ from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.select.ledger import LedgerInput
 from tl_loop.state.schema import BudgetLedger, ParkCause, SliceState, SliceStatus
+from tl_loop.state.serialization import dumps as dumps_json
+from tl_loop.state.serialization import to_jsonable
 from tl_loop.state.store import RunStore
 from tl_loop.state.write import apply
 
@@ -319,7 +320,7 @@ def _build_audit(
     if extra is not None:
         for key in _AUDIT_FIELDS:
             if key in extra:
-                result[key] = copy.deepcopy(extra[key])
+                result[key] = to_jsonable(extra[key])
     return result
 
 
@@ -349,7 +350,9 @@ def _ledger_snapshot(ledger: LedgerInput | None) -> dict[str, object]:
                 for charge in ledger.charges
             ],
         }
-    value = copy.deepcopy(dict(ledger))
+    value = to_jsonable(ledger)
+    if not isinstance(value, dict):
+        raise EscalationError("ledger audit must be an object")
     nested = value.get("ledger")
     if isinstance(nested, Mapping):
         return copy.deepcopy(dict(nested))
@@ -365,7 +368,7 @@ def _create_issue(
     title = f"Escalate slice {slice.id}: {cause.value}"
     description = (
         f"Slice {slice.id} is parked for human action. "
-        f"Cause: {cause.value}. Audit: {json.dumps(dict(audit), sort_keys=True)}"
+        f"Cause: {cause.value}. Audit: {dumps_json(audit, sort_keys=True)}"
     )
     if callable(creator) and not hasattr(creator, "chainlink_issue_create"):
         value: object = creator(title, description)

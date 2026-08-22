@@ -97,6 +97,7 @@ from tl_loop.state.schema import (
     SliceStatus,
     Verdict,
 )
+from tl_loop.state.serialization import DurableWriteError
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .journal import MUTATING_OPERATIONS, EffectJournal
@@ -680,22 +681,74 @@ def run_tl_loop(
         if selected.ledger_run_id is not None
         else []
     )
-    state = _reconcile_action_journal(state, store, effects_log)
-    state = _reconcile_dispatches(state, selected, effects, store, effects_log)
-    state = _reconcile_nonterminal_slices(work_plan, state, selected, effects, store, effects_log)
-    state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
-    state = _run_sub_tls(work_plan, state, selected, source, effects, store, effects_log)
-    return _run_loop(
-        run_id,
-        work_plan,
-        source,
-        effects,
-        selected,
-        store,
-        state,
-        effects_log,
-        decoder or TLEventDecoder(),
+    try:
+        state = _reconcile_action_journal(state, store, effects_log)
+        state = _reconcile_dispatches(state, selected, effects, store, effects_log)
+        state = _reconcile_nonterminal_slices(
+            work_plan, state, selected, effects, store, effects_log
+        )
+        state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
+        state = _run_sub_tls(work_plan, state, selected, source, effects, store, effects_log)
+        return _run_loop(
+            run_id,
+            work_plan,
+            source,
+            effects,
+            selected,
+            store,
+            state,
+            effects_log,
+            decoder or TLEventDecoder(),
+        )
+    except DurableWriteError as error:
+        return _recover_durable_write_failure(store, effects, effects_log, error)
+
+
+def _recover_durable_write_failure(
+    store: RunStore,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    error: DurableWriteError,
+) -> TLRunResult:
+    """Park the affected slice when lifecycle journaling cannot be trusted."""
+    if not isinstance(effects, EffectClient):
+        store.record_exit_reason("durable write failed in shadow mode", error=error)
+        raise error
+    state = store.load()
+    slice_state = state.slices.get(error.target or "")
+    if slice_state is None:
+        slice_state = next(
+            (
+                candidate
+                for candidate in state.slices.values()
+                if candidate.status not in {
+                    SliceStatus.MERGED,
+                    SliceStatus.FAILED,
+                    SliceStatus.PARKED,
+                    SliceStatus.BLOCKED,
+                }
+            ),
+            None,
+        )
+    if slice_state is None:
+        store.record_exit_reason("durable write failed without an active slice", error=error)
+        raise error
+    park(
+        slice_state,
+        ParkCause.DURABLE_WRITE_FAILED,
+        store=store,
+        issue_creator=effects,
+        audit={"reason": str(error)},
     )
+    state = store.load()
+    if state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
+        state = store.checkpoint(
+            TLFailed(f"durable write failed for {slice_state.id!r}"),
+            state.slices,
+            state.budgets,
+            state.events.last_consumed_offset,
+        )
+    return TLRunResult(state, tuple(effects_log), (), ())
 
 
 def _initialize_ordered_runtime(plan: WorkPlan, state: RunState, store: RunStore) -> RunState:
@@ -4622,7 +4675,10 @@ def _invoke(
 ) -> ToolResult | None:
     intent = EffectIntent(operation, target, arguments, active)
     journal = effects_log if isinstance(effects_log, EffectJournal) else None
-    prior = journal.existing(intent) if journal and operation in MUTATING_OPERATIONS else None
+    try:
+        prior = journal.existing(intent) if journal and operation in MUTATING_OPERATIONS else None
+    except DurableWriteError as error:
+        raise error.with_context(operation=operation, target=target) from error
     if prior is not None:
         status = prior.get("status")
         if status in {"confirmed", "rejected"}:
@@ -4648,11 +4704,17 @@ def _invoke(
             )
         # An operator-approved _reconcile_action_journal() pass cleared this
         # entry for a fresh attempt; fall through and dispatch as new.
-    effects_log.append(intent)
+    try:
+        effects_log.append(intent)
+    except DurableWriteError as error:
+        raise error.with_context(operation=operation, target=target) from error
     LOGGER.info("[TL loop] effect=%s target=%s active=%s", operation, target, active)
     if not active:
         if journal is not None:
-            journal.mark_not_dispatched(intent)
+            try:
+                journal.mark_not_dispatched(intent)
+            except DurableWriteError as error:
+                raise error.with_context(operation=operation, target=target) from error
         return None
     if client is None:
         raise TLLoopError("active loop has no effect client")
@@ -4660,10 +4722,16 @@ def _invoke(
         result = call(client)
     except BaseException as error:
         if journal is not None:
-            journal.mark_unknown(intent, error)
+            try:
+                journal.mark_unknown(intent, error)
+            except DurableWriteError as journal_error:
+                raise journal_error.with_context(operation=operation, target=target) from error
         raise
     if journal is not None:
-        journal.mark_result(intent, result)
+        try:
+            journal.mark_result(intent, result)
+        except DurableWriteError as error:
+            raise error.with_context(operation=operation, target=target) from error
     if result.success is False and raise_on_failure:
         detail = result.error or f"{operation} returned failure"
         raise EffectFailed(f"{operation} for {target!r}: {detail}")

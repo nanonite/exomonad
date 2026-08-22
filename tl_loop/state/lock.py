@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
 
+from .serialization import dumps as dumps_json
+
 
 class LockTimeout(TimeoutError):
     """The run-state lock was not acquired before its deadline."""
@@ -114,7 +116,9 @@ def owner_is_stale(path: str | Path) -> bool:
 
 
 def _write_owner(fd: int, owner: LockOwner) -> None:
-    payload = json.dumps({"pid": owner.pid, "acquired_at": owner.acquired_at}, sort_keys=True).encode("utf-8")
+    payload = dumps_json(
+        {"pid": owner.pid, "acquired_at": owner.acquired_at}, sort_keys=True
+    ).encode("utf-8")
     os.ftruncate(fd, 0)
     written = 0
     while written < len(payload):

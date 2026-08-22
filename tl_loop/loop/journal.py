@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from tl_loop.client.effects import ToolResult
+from tl_loop.state.serialization import dumps as dumps_json
+from tl_loop.state.serialization import to_jsonable
 
 MUTATING_OPERATIONS = frozenset(
     {
@@ -47,16 +49,12 @@ def stable_action_key(
         "target": target,
         "arguments": _canonical(arguments),
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    encoded = dumps_json(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _canonical(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {str(key): _canonical(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_canonical(item) for item in value]
-    return value
+    return to_jsonable(value)
 
 
 class EffectJournal(list[Any]):
@@ -97,7 +95,7 @@ class EffectJournal(list[Any]):
                 "run_id": self.run_id,
                 "operation": intent.operation,
                 "target": intent.target,
-                "arguments": dict(intent.arguments),
+                "arguments": to_jsonable(intent.arguments),
                 "status": "intended",
             }
         )
@@ -194,7 +192,7 @@ class EffectJournal(list[Any]):
     def _write(self, entries: list[dict[str, object]]) -> None:
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(
-            json.dumps(entries, sort_keys=True, separators=(",", ":")),
+            dumps_json(entries, sort_keys=True, separators=(",", ":")),
             encoding="utf-8",
         )
         temporary.replace(self.path)
