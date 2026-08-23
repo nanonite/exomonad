@@ -170,6 +170,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Add replay-safe recovery intents and invocation lineage (#954)
 - Add the pre-publication execution recovery FSM (#953)
 - Add real-server acceptance coverage for unstable-base escalation (#951)
 - Add same-owner resumption for blocked leaves without PRs (#949)
