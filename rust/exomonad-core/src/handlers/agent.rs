@@ -4226,6 +4226,7 @@ mod tests {
             state: "open".to_string(),
             merged: false,
             head_sha: Some("abc123".to_string()),
+            base_sha: None,
         }
     }
 
@@ -5103,6 +5104,7 @@ mod tests {
             state: "open".to_string(),
             merged: false,
             head_sha: Some("abc123".to_string()),
+            base_sha: None,
         }
     }
 

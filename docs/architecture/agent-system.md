@@ -461,6 +461,8 @@ Without Forgejo Actions producing a CI status, the canonical merge rule cannot
 pass even when the TL has adjudicated GO. Review timeout is never approval; it
 parks the slice with a named gate.
 
+CI failures are attributed only against an immutable pair of snapshots: the verified base SHA and the observed PR head SHA. A failed check whose identity was already failing on the base is reported as base CI instability and emits task-blocked telemetry; a head-introduced check remains on the normal PR repair path. Missing SHA or check identity evidence is indeterminate and requires human confirmation rather than repairing the base.
+
 ### Controller-side merge gates
 
 `tl_loop` applies the canonical merge rule before it calls `merge_pr`:

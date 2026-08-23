@@ -40,6 +40,7 @@ pub struct ForgejoPullRequest {
     pub state: String,
     pub merged: bool,
     pub head_sha: Option<String>,
+    pub base_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1600,6 +1601,7 @@ impl TryFrom<PullRequestResponse> for ForgejoPullRequest {
             state: value.state,
             merged: value.merged,
             head_sha: value.head.sha,
+            base_sha: value.base.sha,
         })
     }
 }

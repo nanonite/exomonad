@@ -888,6 +888,7 @@ mod tests {
             state: "open".to_string(),
             merged: false,
             head_sha: None,
+            base_sha: None,
         }
     }
 

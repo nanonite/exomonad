@@ -262,6 +262,7 @@ mod tests {
             state: state.to_string(),
             merged,
             head_sha: head_sha.map(ToString::to_string),
+            base_sha: None,
         }
     }
 

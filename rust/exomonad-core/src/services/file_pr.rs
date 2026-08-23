@@ -469,6 +469,7 @@ mod tests {
             state: "open".to_string(),
             merged: false,
             head_sha: head_sha.map(ToOwned::to_owned),
+            base_sha: None,
         }
     }
 

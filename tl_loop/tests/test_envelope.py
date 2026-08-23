@@ -126,6 +126,38 @@ def test_unmapped_allowlisted_event_type_is_rejected_at_read_time() -> None:
     assert error.value.event_type == "agent.guidance.delivery"
 
 
+@pytest.mark.parametrize(
+    ("attribution", "expected"),
+    [
+        ("base_pre_existing", ReviewStallClassification.CI_BASE_UNSTABLE),
+        ("head_introduced", ReviewStallClassification.CI_FAILED),
+        ("indeterminate", ReviewStallClassification.CI_INDETERMINATE),
+    ],
+)
+def test_ci_stall_classification_requires_immutable_attribution(
+    attribution: str, expected: ReviewStallClassification
+) -> None:
+    event = project(
+        {
+            "type": "pr.review",
+            "run_seq": 901,
+            "run_id": "run-a",
+            "agent_id": "leaf-a",
+            "lifecycle_state": "running",
+            "observed_at": "2026-08-23T00:00:00Z",
+            "data": {
+                "slice_id": "slice-a",
+                "kind": "ci_blocked",
+                "ci_status": "failure",
+                "base_sha": "base-1",
+                "head_sha": "head-1",
+                "attribution": attribution,
+            },
+        }
+    )
+    assert event.stall_classification is expected
+
+
 def test_stall_classification_is_derived_from_raw_review_evidence() -> None:
     base = {
         "type": "pr.review",

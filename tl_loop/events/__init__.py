@@ -27,7 +27,7 @@ from .reader import (
     SequenceStatus,
     sequence_status,
 )
-from .stall import ReviewStallClassification, classify_review_stall
+from .stall import CiFailureAttribution, ReviewStallClassification, classify_review_stall
 
 __all__ = [
     "DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS",
@@ -38,6 +38,7 @@ __all__ = [
     "SERVER_EMIT_HEAD_SHA_GAPS",
     "ActiveTail",
     "BridgeError",
+    "CiFailureAttribution",
     "EnvelopeError",
     "EventBridge",
     "EventEnvelope",

@@ -4,6 +4,7 @@ use crate::services::agent_control::{AgentIdentityRecord, AgentType};
 use crate::services::event_log::{
     canonical_review_wakeup_data, canonical_sibling_merged_data, PR_REVIEW_EVENT_TYPE,
 };
+use crate::services::forgejo::ForgejoCommitStatus;
 use crate::services::pr_registry::{
     read_published_heads, ForgejoReviewState, PrEntry, PrRegistry, PrState, PublicationProvenance,
     PublishedHead, ReviewerAttempt, ReviewerAttemptPhase,
@@ -32,6 +33,70 @@ const DEFAULT_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INBOX_POKE_INTERVAL: Duration = Duration::from_secs(600);
 const WATCHER_CAPTURE_TEXT_CHARS: usize = 160;
 const WATCHER_CAPTURE_SHA_CHARS: usize = 80;
+
+/// Attribution for a failed check, bound to immutable base/head snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CiFailureAttribution {
+    HeadIntroduced,
+    BasePreExisting,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CiBlockEvidence {
+    base_sha: String,
+    head_sha: Option<String>,
+    failed_checks: Vec<String>,
+    attribution: CiFailureAttribution,
+}
+
+fn failed_check_identities(statuses: &[ForgejoCommitStatus]) -> BTreeSet<String> {
+    statuses
+        .iter()
+        .filter(|status| status.status == CIStatus::Failure)
+        .map(|status| {
+            status
+                .context
+                .clone()
+                .unwrap_or_else(|| "<unnamed>".to_string())
+        })
+        .collect()
+}
+
+fn classify_ci_failure(
+    base_sha: Option<&str>,
+    head_sha: Option<&str>,
+    base_statuses: Option<&[ForgejoCommitStatus]>,
+    head_statuses: Option<&[ForgejoCommitStatus]>,
+) -> CiBlockEvidence {
+    let failed_checks = head_statuses
+        .map(failed_check_identities)
+        .unwrap_or_default();
+    let attribution = match (base_sha, head_sha, base_statuses, head_statuses) {
+        (Some(base), Some(_), Some(base_statuses), Some(_))
+            if !base.trim().is_empty() && !failed_checks.is_empty() =>
+        {
+            let base_failed = failed_check_identities(base_statuses);
+            if !failed_checks.is_empty()
+                && failed_checks
+                    .iter()
+                    .all(|check| base_failed.contains(check))
+            {
+                CiFailureAttribution::BasePreExisting
+            } else {
+                CiFailureAttribution::HeadIntroduced
+            }
+        }
+        _ => CiFailureAttribution::Indeterminate,
+    };
+    CiBlockEvidence {
+        base_sha: base_sha.unwrap_or_default().to_string(),
+        head_sha: head_sha.map(str::to_string),
+        failed_checks: failed_checks.into_iter().collect(),
+        attribution,
+    }
+}
 
 fn inbox_poke_message(unread_count: usize) -> String {
     format!(
@@ -85,6 +150,9 @@ enum PendingAction {
         head_sha: String,
         comments: Option<Vec<ForgejoReviewComment>>,
         reviews: Option<Vec<ForgejoReview>>,
+    },
+    EmitTaskBlocked {
+        evidence: CiBlockEvidence,
     },
     WriteRegistryStuck {
         pr_number: u64,
@@ -509,7 +577,12 @@ enum EventActionResponse {
     #[serde(rename = "inject_message")]
     InjectMessage { message: String },
     #[serde(rename = "notify_parent")]
-    NotifyParent { message: String, pr_number: i64 },
+    NotifyParent {
+        message: String,
+        pr_number: i64,
+        #[serde(default)]
+        status: Option<String>,
+    },
     #[serde(rename = "no_action")]
     NoAction,
 }
@@ -699,6 +772,7 @@ fn native_leaf_pr_review_action(payload: &serde_json::Value) -> Option<EventActi
                     value_str(payload, "branch")?,
                 ),
                 pr_number: pr_number as i64,
+                status: Some("blocked".to_string()),
             })
         }
         "stuck" => Some(EventActionResponse::InjectMessage {
@@ -739,6 +813,7 @@ fn native_ci_status_action(payload: &serde_json::Value, role: &str) -> Option<Ev
         return Some(EventActionResponse::NotifyParent {
             message: ci_blocked_message(pr_number, status, branch),
             pr_number: pr_number as i64,
+            status: Some("blocked".to_string()),
         });
     }
 
@@ -759,6 +834,7 @@ struct Observation {
     changes_requested_rounds: u32,
     ci_status: CIStatus,
     forgejo_review_present: bool,
+    ci_block_evidence: Option<CiBlockEvidence>,
 }
 
 /// Replaces `github_poller.rs` and `copilot_review.rs` by observing Forgejo
@@ -905,6 +981,34 @@ where
             }
         }
     }
+
+    async fn ci_failure_evidence(&self, pr_number: u64, head_sha: &str) -> Option<CiBlockEvidence> {
+        let forgejo = self.ctx.forgejo_client()?;
+        let repo_info = repo::get_repo_info(self.ctx.project_dir()).await.ok()?;
+        let pull_request = forgejo
+            .get_pull_request(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
+            .await
+            .ok();
+        let base_sha = pull_request.as_ref().and_then(|pr| pr.base_sha.clone());
+        let head_statuses = forgejo
+            .list_commit_statuses(&repo_info.owner, &repo_info.repo, head_sha)
+            .await
+            .ok();
+        let base_statuses = match base_sha.as_deref() {
+            Some(base_sha) => forgejo
+                .list_commit_statuses(&repo_info.owner, &repo_info.repo, base_sha)
+                .await
+                .ok(),
+            None => None,
+        };
+        Some(classify_ci_failure(
+            base_sha.as_deref(),
+            Some(head_sha),
+            base_statuses.as_deref(),
+            head_statuses.as_deref(),
+        ))
+    }
+
     pub async fn run(&self) {
         tracing::info!(
             poll_interval_secs = self.poll_interval.as_secs(),
@@ -1429,6 +1533,11 @@ where
             let branch = BranchName::try_from_str(pr.head_branch.as_str())
                 .expect("validated string input is non-empty");
             let ci_status = self.observed_ci_status(&branch, &head_sha).await;
+            let ci_block_evidence = if ci_status == CIStatus::Failure {
+                self.ci_failure_evidence(*number, &head_sha).await
+            } else {
+                None
+            };
 
             observations.insert(
                 *number,
@@ -1441,6 +1550,7 @@ where
                     changes_requested_rounds,
                     ci_status,
                     forgejo_review_present,
+                    ci_block_evidence,
                 },
             );
         }
@@ -1504,6 +1614,7 @@ where
                 changes_requested_rounds: 0,
                 ci_status,
                 forgejo_review_present,
+                ci_block_evidence: None,
             },
         );
         self.process_observations(&registry, &observations).await
@@ -1691,6 +1802,11 @@ where
                     actions
                 };
 
+                let mut actions = actions;
+                if let Some(evidence) = obs.ci_block_evidence.as_ref() {
+                    attach_ci_block_evidence(&mut actions, evidence);
+                }
+
                 if !actions.is_empty() {
                     pending_actions.push(PendingPrActions {
                         pr_number: *pr_number,
@@ -1827,6 +1943,9 @@ where
                             reviews,
                         )
                         .await;
+                    }
+                    PendingAction::EmitTaskBlocked { evidence } => {
+                        self.emit_task_blocked(&pending, &evidence);
                     }
                     PendingAction::WriteRegistryStuck { pr_number, rounds } => {
                         if let Err(e) = self.set_pr_stuck(pr_number, rounds).await {
@@ -2223,6 +2342,7 @@ where
             EventActionResponse::NotifyParent {
                 message,
                 pr_number: _pr_number,
+                status,
             } => {
                 if self.skip_legacy_delivery(branch, "notify_parent").await {
                     return true;
@@ -2257,7 +2377,12 @@ where
                         &agent_name,
                         &parent_session_id,
                         &parent_tab,
-                        crate::services::delivery::NotifyStatus::Success,
+                        status
+                            .as_deref()
+                            .and_then(|value| {
+                                crate::services::delivery::NotifyStatus::parse_wire(value).ok()
+                            })
+                            .unwrap_or(crate::services::delivery::NotifyStatus::Success),
                         &message,
                         None,
                         "event_handler",
@@ -2447,6 +2572,90 @@ where
 
         let event = watcher_agent_message(agent_id, status, message);
         self.ctx.event_queue().notify_event(branch, event).await;
+    }
+
+    fn emit_task_blocked(&self, pending: &PendingPrActions, evidence: &CiBlockEvidence) {
+        let Some(slice_id) = pending
+            .slice_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            warn!(
+                pr_number = pending.pr_number,
+                agent = %pending.agent_name,
+                "Cannot emit task-blocked telemetry without a verified slice id"
+            );
+            return;
+        };
+        let (cause, scope, recovery) = match evidence.attribution {
+            CiFailureAttribution::BasePreExisting => {
+                ("base_ci_unstable", "base", "await_base_ci_recovery")
+            }
+            CiFailureAttribution::Indeterminate => (
+                "human_decision_required",
+                "ci_attribution_indeterminate",
+                "confirm_ci_failure_scope",
+            ),
+            CiFailureAttribution::HeadIntroduced => return,
+        };
+        let data = serde_json::json!({
+            "outcome": "blocked",
+            "slice_id": slice_id,
+            "cause": cause,
+            "scope_attribution": scope,
+            "needs_human": true,
+            "retryable": false,
+            "recovery_action": recovery,
+            "declared_difficulty": "standard",
+            "matched_difficulty_rule": "watcher_ci_attribution",
+            "attempt": 1,
+            "runtime_agent_id": pending.agent_name,
+            "branch": pending.branch,
+            "pr_number": pending.pr_number,
+            "base_sha": evidence.base_sha,
+            "head_sha": evidence.head_sha,
+            "failed_checks": evidence.failed_checks,
+            "attribution": evidence.attribution,
+        });
+        if let Some(log) = self.ctx.event_log() {
+            if let Err(error) = log.append("agent.task_blocked", &pending.agent_name, &data) {
+                warn!(
+                    agent = %pending.agent_name,
+                    slice_id,
+                    %error,
+                    "Failed to append canonical task-blocked telemetry"
+                );
+            }
+        }
+    }
+}
+
+fn attach_ci_block_evidence(actions: &mut Vec<PendingAction>, evidence: &CiBlockEvidence) {
+    let evidence_value = serde_json::to_value(evidence).expect("CI evidence is serializable");
+    for action in actions.iter_mut() {
+        let PendingAction::WasmEvent { payload, .. } = action else {
+            continue;
+        };
+        if payload.get("kind").and_then(serde_json::Value::as_str) != Some("ci_blocked") {
+            continue;
+        }
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("base_sha".to_string(), evidence_value["base_sha"].clone());
+            object.insert("head_sha".to_string(), evidence_value["head_sha"].clone());
+            object.insert(
+                "failed_checks".to_string(),
+                evidence_value["failed_checks"].clone(),
+            );
+            object.insert(
+                "attribution".to_string(),
+                evidence_value["attribution"].clone(),
+            );
+        }
+    }
+    if !matches!(evidence.attribution, CiFailureAttribution::HeadIntroduced) {
+        actions.push(PendingAction::EmitTaskBlocked {
+            evidence: evidence.clone(),
+        });
     }
 }
 
@@ -3274,6 +3483,90 @@ mod tests {
         );
     }
 
+    fn ci_status(context: &str, status: CIStatus) -> ForgejoCommitStatus {
+        ForgejoCommitStatus {
+            status,
+            context: Some(context.to_string()),
+        }
+    }
+
+    #[test]
+    fn ci_failure_attribution_distinguishes_base_head_and_unknown() {
+        let base = vec![ci_status("lint", CIStatus::Failure)];
+        let head_same = vec![ci_status("lint", CIStatus::Failure)];
+        let head_new = vec![ci_status("tests", CIStatus::Failure)];
+
+        assert_eq!(
+            classify_ci_failure(
+                Some("base-1"),
+                Some("head-1"),
+                Some(base.as_slice()),
+                Some(head_same.as_slice()),
+            )
+            .attribution,
+            CiFailureAttribution::BasePreExisting
+        );
+        assert_eq!(
+            classify_ci_failure(
+                Some("base-1"),
+                Some("head-2"),
+                Some(base.as_slice()),
+                Some(head_new.as_slice()),
+            )
+            .attribution,
+            CiFailureAttribution::HeadIntroduced
+        );
+        assert_eq!(
+            classify_ci_failure(Some("base-1"), Some("head-3"), None, None).attribution,
+            CiFailureAttribution::Indeterminate
+        );
+    }
+
+    #[test]
+    fn ci_blocked_action_carries_immutable_attribution() {
+        let mut actions = vec![PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": "ci_blocked",
+                "ci_status": "failure",
+            }),
+        }];
+        let evidence = CiBlockEvidence {
+            base_sha: "base-1".to_string(),
+            head_sha: Some("head-1".to_string()),
+            failed_checks: vec!["lint".to_string()],
+            attribution: CiFailureAttribution::BasePreExisting,
+        };
+        attach_ci_block_evidence(&mut actions, &evidence);
+        assert_eq!(actions.len(), 2);
+        match &actions[0] {
+            PendingAction::WasmEvent { payload, .. } => {
+                assert_eq!(payload["base_sha"], "base-1");
+                assert_eq!(payload["head_sha"], "head-1");
+                assert_eq!(payload["attribution"], "base_pre_existing");
+            }
+            other => panic!("expected CI event, got {other:?}"),
+        }
+        assert!(matches!(actions[1], PendingAction::EmitTaskBlocked { .. }));
+    }
+
+    #[test]
+    fn head_introduced_ci_failure_stays_on_pr_repair_path() {
+        let mut actions = vec![PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({"kind": "ci_blocked"}),
+        }];
+        let evidence = CiBlockEvidence {
+            base_sha: "base-1".to_string(),
+            head_sha: Some("head-2".to_string()),
+            failed_checks: vec!["tests".to_string()],
+            attribution: CiFailureAttribution::HeadIntroduced,
+        };
+        attach_ci_block_evidence(&mut actions, &evidence);
+        assert_eq!(actions.len(), 1);
+        assert!(!matches!(actions[0], PendingAction::EmitTaskBlocked { .. }));
+    }
+
     #[test]
     fn test_native_leaf_fallback_does_not_duplicate_review_received_text() {
         let payload = serde_json::json!({
@@ -3310,8 +3603,13 @@ mod tests {
         });
 
         match native_event_action("ci_status", &payload, "dev") {
-            Some(EventActionResponse::NotifyParent { message, pr_number }) => {
+            Some(EventActionResponse::NotifyParent {
+                message,
+                pr_number,
+                status,
+            }) => {
                 assert_eq!(pr_number, 44);
+                assert_eq!(status.as_deref(), Some("blocked"));
                 assert_eq!(
                     message,
                     "[CI BLOCKED: PR #44] CI finished with status failure on main.feature-codex. The TL owns the next decision and may use resume_pr."
@@ -3467,6 +3765,7 @@ mod tests {
                     EventActionResponse::NotifyParent {
                         message: "ledger parent event".to_string(),
                         pr_number: 714,
+                        status: None,
                     },
                     branch,
                     AgentType::Codex,
@@ -4800,6 +5099,7 @@ mod tests {
             changes_requested_rounds: 0,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
+            ci_block_evidence: None,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ForgejoReviewVerdict::None);
@@ -4817,6 +5117,7 @@ mod tests {
             changes_requested_rounds: 0,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
+            ci_block_evidence: None,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ForgejoReviewVerdict::Approved);
@@ -4836,6 +5137,7 @@ mod tests {
             changes_requested_rounds: 1,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
+            ci_block_evidence: None,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ForgejoReviewVerdict::ChangesRequested);
@@ -4862,6 +5164,7 @@ mod tests {
             changes_requested_rounds: 0,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: true,
+            ci_block_evidence: None,
         };
         let (reviews, state) = obs_to_review_parts(&obs);
         assert_eq!(state, ForgejoReviewVerdict::Commented);
@@ -5338,6 +5641,7 @@ mod tests {
             changes_requested_rounds: 0,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: false,
+            ci_block_evidence: None,
         }
     }
 
@@ -5366,6 +5670,7 @@ mod tests {
             changes_requested_rounds: 2,
             ci_status: CIStatus::Unknown,
             forgejo_review_present: true,
+            ci_block_evidence: None,
         }
     }
 
@@ -5605,6 +5910,7 @@ mod tests {
                 changes_requested_rounds: 0,
                 ci_status: CIStatus::Unknown,
                 forgejo_review_present: false,
+                ci_block_evidence: None,
             },
         );
 
@@ -5803,6 +6109,7 @@ mod tests {
                 changes_requested_rounds: 0,
                 ci_status: CIStatus::Unknown,
                 forgejo_review_present: true,
+                ci_block_evidence: None,
             },
         );
 
@@ -5922,6 +6229,7 @@ mod tests {
                 changes_requested_rounds: 0,
                 ci_status: CIStatus::Unknown,
                 forgejo_review_present: true,
+                ci_block_evidence: None,
             },
         );
 
