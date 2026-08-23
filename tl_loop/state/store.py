@@ -52,6 +52,7 @@ from .schema import (
     SliceMap,
     SliceState,
     SliceStatus,
+    SuspendedDependencyState,
     Verdict,
     validate,
 )
@@ -707,6 +708,12 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["task_timeout_source"] = value.task_timeout_source
         if value.recovery is not None:
             record["recovery"] = encode_recovery(value.recovery)
+        if value.suspended_dependency is not None:
+            record["suspended_dependency"] = {
+                "blocked_by": value.suspended_dependency.blocked_by,
+                "prior_status": value.suspended_dependency.prior_status.value,
+                "recovery_generation": value.suspended_dependency.recovery_generation,
+            }
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
@@ -1107,6 +1114,17 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         task_timeout_seconds=cast(float | None, value.get("task_timeout_seconds")),
         task_timeout_source=cast(str | None, value.get("task_timeout_source")),
         recovery=decode_recovery(value.get("recovery")),
+        suspended_dependency=_decode_suspended_dependency(value.get("suspended_dependency")),
+    )
+
+
+def _decode_suspended_dependency(value: object) -> SuspendedDependencyState | None:
+    if not isinstance(value, Mapping):
+        return None
+    return SuspendedDependencyState(
+        blocked_by=cast(str, value["blocked_by"]),
+        prior_status=SliceStatus(cast(str, value["prior_status"])),
+        recovery_generation=cast(int, value["recovery_generation"]),
     )
 
 

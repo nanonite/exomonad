@@ -187,6 +187,7 @@ def park(
                 raw_dependent["status"] = SliceStatus.BLOCKED.value
                 raw_dependent["blocked_by"] = slice.id
                 raw_dependent["park_issue_id"] = issue_id
+                raw_dependent.pop("suspended_dependency", None)
                 blocked_ids.add(dependent_id)
                 blocked.append(dependent_id)
                 changed = True

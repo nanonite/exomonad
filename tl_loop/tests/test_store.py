@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
     BudgetLedger,
@@ -18,6 +20,7 @@ from tl_loop.state.schema import (
     OrderedStageState,
     SliceState,
     SliceStatus,
+    SuspendedDependencyState,
     Verdict,
 )
 from tl_loop.state.store import (
@@ -75,6 +78,42 @@ def test_legacy_checkpoint_defaults_new_review_state(tmp_path: Path) -> None:
     assert restored.ci_state == {}
     assert restored.reviewer_attempt == {}
     assert restored.repair_attempts == 0
+
+
+def test_dependency_recovery_suspension_round_trips(tmp_path: Path) -> None:
+    store = RunStore("recovery-run", tmp_path)
+    create("recovery-run", {}, root_dir=tmp_path)
+    dependent = replace(
+        _slice("dependent", SliceStatus.PENDING, "src/dependent.py"),
+        depends_on=("blocker",),
+        recovery=None,
+        suspended_dependency=SuspendedDependencyState(
+            blocked_by="blocker",
+            prior_status=SliceStatus.PENDING,
+            recovery_generation=1,
+        ),
+    )
+    blocker = replace(
+        _slice("blocker", SliceStatus.SPAWNED, "src/blocker.py"),
+        recovery=begin_recovery(
+            cause="external_dependency",
+            owner_run_id="recovery-run",
+            slice_attempt=1,
+            owner_agent_id="agent",
+            entered_at=1,
+        ),
+    )
+
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("blocker",)),
+        {"blocker": blocker, "dependent": dependent},
+        BudgetLedger(tokens=0, wall_seconds=0),
+        offset=0,
+    )
+
+    restored = load(store.path)
+    assert restored.slices["dependent"].suspended_dependency == dependent.suspended_dependency
+    assert restored.slices["blocker"].recovery == blocker.recovery
 
 
 def test_ordered_state_round_trips_and_resume_preserves_progress(tmp_path: Path) -> None:

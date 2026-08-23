@@ -66,7 +66,7 @@ from tl_loop.loop.review import (
     watcher_head,
     watcher_patch_digest,
 )
-from tl_loop.loop.schedule import ScheduleDeadlock, ready
+from tl_loop.loop.schedule import ScheduleDeadlock, ready, suspend_dependents
 from tl_loop.ordered import (
     AggregateCandidate,
     IntegrationContract,
@@ -4919,7 +4919,8 @@ def _record_task_blocked_recovery(
             raise TLLoopError(
                 f"slice {slice_id!r} already recovers cause {current.recovery.cause!r}"
             )
-        return store.checkpoint(phase, state.slices, state.budgets, event_seq)
+        suspended = suspend_dependents(state.slices, slice_id, current.recovery.recovery_round)
+        return store.checkpoint(phase, suspended, state.budgets, event_seq)
     generation = audit.get("generation")
     recovery = begin_recovery(
         cause=cause.value,
@@ -4939,6 +4940,7 @@ def _record_task_blocked_recovery(
             evidence=audit,
         )
     updated = {**state.slices, slice_id: replace(current, recovery=recovery)}
+    updated = suspend_dependents(updated, slice_id, recovery.recovery_round)
     return store.checkpoint(phase, updated, state.budgets, event_seq)
 
 

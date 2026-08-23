@@ -41,6 +41,7 @@ from tl_loop.fsm.phase import (
 from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import blocked_gate_name
+from tl_loop.loop.schedule import propagate_abandonment, restore_dependents, suspend_dependents
 from tl_loop.state.schema import GateStatus, RunState, SliceState, SliceStatus
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
@@ -410,12 +411,17 @@ def _update_slices(
         current = updated.get(target_id) if target_id is not None else None
         if current is None:
             return updated
+        recovery_generation = (
+            current.recovery.recovery_round if current.recovery is not None else None
+        )
         if current.reviewed_head == event.head_sha:
             updated[target_id] = replace(
                 current,
                 pr_number=event.pr_number,
                 recovery=None,
             )
+            if recovery_generation is not None:
+                updated = restore_dependents(updated, target_id, recovery_generation)
             return updated
         updated[target_id] = replace(
             current,
@@ -430,6 +436,8 @@ def _update_slices(
             stall_classification=None,
             recovery=None,
         )
+        if recovery_generation is not None:
+            updated = restore_dependents(updated, target_id, recovery_generation)
     elif isinstance(event, ChildSpawned):
         if not allow_spawn_confirmation:
             return updated
@@ -466,6 +474,10 @@ def _update_slices(
     elif isinstance(event, ChildFailed):
         current = updated.get(event.slug)
         if current is not None:
+            if current.recovery is not None:
+                updated = propagate_abandonment(
+                    updated, event.slug, current.recovery.recovery_round
+                )
             updated[event.slug] = replace(current, status=SliceStatus.FAILED)
     elif isinstance(event, ChildBlocked):
         current = updated.get(event.slug)
@@ -486,6 +498,13 @@ def _update_slices(
                     evidence=audit,
                     next_action=event.recovery_action or "diagnose",
                 ),
+            )
+            updated = suspend_dependents(
+                updated,
+                event.slug,
+                updated[event.slug].recovery.recovery_round
+                if updated[event.slug].recovery is not None
+                else 0,
             )
     return updated
 

@@ -31,6 +31,29 @@ class SliceStatus(str, Enum):
     BLOCKED = "blocked"
 
 
+class WaitReason(str, Enum):
+    """Why a nonterminal slice is temporarily withheld from scheduling."""
+
+    DEPENDENCY_RECOVERY = "dependency_recovery"
+
+
+@dataclass(frozen=True)
+class SuspendedDependencyState:
+    """Durable suspension metadata for a dependency in recovery."""
+
+    blocked_by: str
+    prior_status: SliceStatus
+    recovery_generation: int
+
+    def __post_init__(self) -> None:
+        if not self.blocked_by.strip():
+            raise ValueError("suspended dependency blocker must be non-empty")
+        if type(self.prior_status) is not SliceStatus:
+            raise ValueError("suspended dependency prior_status must be SliceStatus")
+        if type(self.recovery_generation) is not int or self.recovery_generation < 0:
+            raise ValueError("suspended dependency recovery_generation must be non-negative")
+
+
 class ParkCause(str, Enum):
     """Closed reasons that can park a slice for human action."""
 
@@ -208,6 +231,7 @@ SLICE_KEYS = frozenset(
         "task_timeout_seconds",
         "task_timeout_source",
         "recovery",
+        "suspended_dependency",
     }
 )
 RECONCILIATION_KEYS = frozenset(
@@ -264,6 +288,7 @@ RECOVERY_KEYS = frozenset(
         "probe_count",
     }
 )
+SUSPENDED_DEPENDENCY_KEYS = frozenset({"blocked_by", "prior_status", "recovery_generation"})
 BUDGET_KEYS = frozenset({"ledger"})
 LEDGER_KEYS = frozenset(
     {
@@ -344,6 +369,7 @@ class SliceState:
     task_timeout_seconds: float | None = None
     task_timeout_source: str | None = None
     recovery: RecoveryState | None = None
+    suspended_dependency: SuspendedDependencyState | None = None
 
 
 @dataclass(frozen=True)
@@ -769,6 +795,7 @@ def _validate_slice(
     _nullable_number(value, "task_timeout_seconds", path, errors)
     _nullable_string(value, "task_timeout_source", path, errors)
     _validate_recovery(value.get("recovery"), path, errors)
+    _validate_suspended_dependency(value.get("suspended_dependency"), path, errors)
     if value.get("status") == SliceStatus.SPAWNED.value:
         _non_empty_string(value, "dispatch_intent_id", path, errors)
         _non_empty_string(value, "dispatch_agent_id", path, errors)
@@ -943,6 +970,28 @@ def _validate_recovery(value: object, path: str, errors: list[tuple[str, str]]) 
     evidence = recovery.get("evidence", {})
     if not isinstance(evidence, dict):
         errors.append((f"{path}.recovery.evidence", "must be an object"))
+
+
+def _validate_suspended_dependency(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    suspended = _object(value, f"{path}.suspended_dependency", SUSPENDED_DEPENDENCY_KEYS, errors)
+    if suspended is None:
+        return
+    _non_empty_string(suspended, "blocked_by", f"{path}.suspended_dependency", errors)
+    _enum_value(
+        suspended,
+        "prior_status",
+        f"{path}.suspended_dependency",
+        SliceStatus,
+        errors,
+    )
+    _non_negative_int(
+        suspended,
+        "recovery_generation",
+        f"{path}.suspended_dependency",
+        errors,
+    )
 
 
 def _budgets(value: object, errors: list[tuple[str, str]]) -> None:

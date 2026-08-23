@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import cast
 
 import pytest
 
 from tl_loop.fsm.phase import TLPhase
-from tl_loop.loop.schedule import ScheduleDeadlock, active_count, ready
+from tl_loop.fsm.recovery import begin_recovery
+from tl_loop.loop.schedule import (
+    ScheduleDeadlock,
+    active_count,
+    propagate_abandonment,
+    ready,
+    restore_dependents,
+    suspend_dependents,
+)
 from tl_loop.state.schema import SCHEMA_VERSION, SchemaError, SliceState, SliceStatus, validate
 
 
@@ -36,6 +45,64 @@ def test_width_gate_counts_active_repair_slices() -> None:
     assert active_count(slices) == 2
     assert [state.id for state in ready(slices, max_parallel_slices=3)] == ["c"]
     assert ready(slices, max_parallel_slices=2) == []
+
+
+def test_recovering_slice_frees_width_but_keeps_path_occupied() -> None:
+    recovery = begin_recovery(
+        cause="base_ci_unstable",
+        owner_run_id="run",
+        slice_attempt=1,
+        owner_agent_id="agent",
+        entered_at=1,
+    )
+    slices = {
+        "recovering": replace(
+            _slice("recovering", SliceStatus.SPAWNED, paths=("src/shared.py",)),
+            recovery=recovery,
+        ),
+        "sibling": _slice("sibling", paths=("src/sibling.py",)),
+        "conflict": _slice("conflict", paths=("src/shared.py",)),
+    }
+
+    assert active_count(slices) == 0
+    assert [state.id for state in ready(slices, max_parallel_slices=1)] == ["sibling"]
+
+
+def test_dependency_recovery_suspends_restores_and_abandons_idempotently() -> None:
+    slices = {
+        "blocker": replace(
+            _slice("blocker", SliceStatus.SPAWNED),
+            recovery=begin_recovery(
+                cause="external_dependency",
+                owner_run_id="run",
+                slice_attempt=1,
+                owner_agent_id="agent",
+                entered_at=1,
+            ),
+        ),
+        "dependent": _slice("dependent", depends_on=("blocker",)),
+        "transitive": _slice("transitive", depends_on=("dependent",)),
+        "sibling": _slice("sibling"),
+    }
+
+    suspended = suspend_dependents(slices, "blocker", 0)
+    assert suspended["dependent"].status is SliceStatus.PENDING
+    assert suspended["dependent"].suspended_dependency is not None
+    assert suspended["transitive"].suspended_dependency is not None
+    assert suspended["sibling"].suspended_dependency is None
+    assert suspend_dependents(suspended, "blocker", 0) == suspended
+
+    recovered = dict(suspended)
+    recovered["blocker"] = replace(recovered["blocker"], recovery=None)
+    restored = restore_dependents(recovered, "blocker", 0)
+    assert restored["dependent"].suspended_dependency is None
+    assert restored["transitive"].suspended_dependency is None
+    assert restore_dependents(restored, "blocker", 0) == restored
+
+    abandoned = propagate_abandonment(suspended, "blocker", 0)
+    assert abandoned["dependent"].status is SliceStatus.BLOCKED
+    assert abandoned["transitive"].status is SliceStatus.BLOCKED
+    assert abandoned["sibling"].status is SliceStatus.PENDING
 
 
 def test_overlapping_paths_are_serialized() -> None:
