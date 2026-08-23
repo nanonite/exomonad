@@ -288,6 +288,14 @@ class ShadowLoop:
                 event = self.source.get(timeout=timeout)
             except queue_module.Empty:
                 break
+            if event.kind is EventKind.AGENT_TASK_BLOCKED or (
+                event.kind is EventKind.AGENT_NOTIFY_PARENT
+                and event.data.get("status") == "blocked"
+            ):
+                # Blocked outcomes are telemetry-only until the durable human-gate
+                # transition lands; never reinterpret them as child failure.
+                self.source.acknowledge(event)
+                continue
             fsm_event = self.decoder.decode(event)
             if isinstance(fsm_event, ChildSpawned) and not _shadow_spawn_matches(
                 state.slices, event, fsm_event

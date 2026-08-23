@@ -116,6 +116,10 @@ fn validate_notify_parent_request(
             if !blocked.needs_human
                 || blocked.scope_attribution.trim().is_empty()
                 || blocked.recovery_action.trim().is_empty()
+                || blocked.slice_id.trim().is_empty()
+                || blocked.declared_difficulty.trim().is_empty()
+                || blocked.matched_difficulty_rule.trim().is_empty()
+                || blocked.attempt == 0
             {
                 return Err(crate::effects::EffectError::custom(
                     "events.invalid_input",
@@ -204,7 +208,6 @@ fn capture_parent_notification<C: HasSessionMemory + HasEventLog>(
         status,
         crate::services::delivery::NotifyStatus::Failure
             | crate::services::delivery::NotifyStatus::Stuck
-            | crate::services::delivery::NotifyStatus::Blocked
     ) && silent_noop_handoff(message)
     {
         if let Some(log) = services.event_log() {
@@ -691,6 +694,10 @@ mod tests {
                     failed_checks: vec!["ci/test".to_string()],
                     evidence_summary: "failure is reproducible on the base".to_string(),
                 }),
+                slice_id: "slice-a".to_string(),
+                declared_difficulty: "standard".to_string(),
+                matched_difficulty_rule: "standard_slice".to_string(),
+                attempt: 2,
             })),
         }
     }

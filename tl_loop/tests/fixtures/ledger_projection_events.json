@@ -356,4 +356,24 @@
     "lifecycle_state": "emitted",
     "data": {"slice_id": "task-a", "attempt": 1, "pr_number": 101, "head_sha": "bbb222", "invocation_id": "invocation-6", "operator_source": "cli", "cause": "operator_requested"}
   }
+,
+  {
+    "schema_version": 1,
+    "event_id": "task-blocked-event",
+    "id": "task-blocked-event",
+    "event_time": "2026-08-12T15:00:00Z",
+    "observed_at": "2026-08-12T15:00:00Z",
+    "run_seq": 99,
+    "type": "agent.task_blocked",
+    "agent_id": "worker-a",
+    "run_id": "run-a",
+    "session_id": "session-a",
+    "invocation_id": "inv-a",
+    "generation": 1,
+    "harness": "codex",
+    "role": "worker",
+    "source": "haskell",
+    "lifecycle_state": "authoritative",
+    "data": {"outcome": "blocked", "slice_id": "slice-a", "cause": "base_ci_unstable", "scope_attribution": "base", "needs_human": true, "retryable": true, "recovery_action": "repair base CI", "declared_difficulty": "standard", "matched_difficulty_rule": "standard_slice", "attempt": 2, "message": "DO NOT EXPORT THIS RAW MESSAGE", "evidence": {"base_sha": "secret"}}
+  }
 ]

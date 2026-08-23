@@ -590,3 +590,18 @@ the distinction between a missing observation and a failed workflow.
   — hook event protocol.
 - [`CLAUDE.md#tempo-observability`](../CLAUDE.md#tempo-observability) — local Tempo/
   observability configuration.
+
+
+## Canonical task-blocked outcome telemetry
+
+Externally blocked assignments emit exactly one aggregate-safe `agent.task_blocked`
+outcome. Its normalized payload contains the slice identity, closed blocker cause,
+scope attribution, human/retry policy, recovery action, declared difficulty and
+matched classifier rule, and one-based attempt. The envelope supplies harness, role,
+and invocation identity; consumers may derive the bounded attempt bucket (`1`, `2`,
+`3-4`, or `5+`).
+
+The detailed handoff message and structured evidence (including commit SHAs, failed
+checks, paths, and URLs) remain local evidence. They are not copied into the
+aggregate Failure Atlas projection. `agent.notify_parent` is delivery telemetry only
+and must never be interpreted as a second completion or failure outcome.

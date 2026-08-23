@@ -264,6 +264,9 @@
         "worktree",
         "poll_workers_missing"
       ]
+    },
+    "agent.task_blocked": {
+      "fields": ["outcome", "slice_id", "cause", "scope_attribution", "needs_human", "retryable", "recovery_action", "declared_difficulty", "matched_difficulty_rule", "attempt"]
     }
   }
 }

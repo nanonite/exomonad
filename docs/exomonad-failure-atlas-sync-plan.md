@@ -1092,3 +1092,11 @@ The plan is ready to implement when:
 - [`rust/exomonad/src/serve.rs`](../rust/exomonad/src/serve.rs) — project run ID and
   live `.exo/logs` initialization.
 - [`rust/exomonad/src/main.rs`](../rust/exomonad/src/main.rs) — current CLI surface.
+
+
+### Task-blocked attribution
+
+`agent.task_blocked` contributes only normalized dimensions: closed cause, scope,
+difficulty and matched rule, bounded attempt bucket, harness, role, and outcome.
+Raw handoff messages and evidence stay in the installation-local ledger. A blocked
+outcome is not a harness failure and does not create a contradictory completion row.

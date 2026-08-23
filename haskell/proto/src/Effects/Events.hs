@@ -2144,7 +2144,11 @@ data TaskBlocked
     taskBlockedScopeAttribution :: Hs.Text,
     taskBlockedRetryable :: Hs.Bool,
     taskBlockedRecoveryAction :: Hs.Text,
-    taskBlockedEvidence :: (Hs.Maybe Effects.Events.TaskBlockedEvidence)
+    taskBlockedEvidence :: (Hs.Maybe Effects.Events.TaskBlockedEvidence),
+    taskBlockedSliceId :: Hs.Text,
+    taskBlockedDeclaredDifficulty :: Hs.Text,
+    taskBlockedMatchedDifficultyRule :: Hs.Text,
+    taskBlockedAttempt :: Hs.Word32
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -2164,49 +2168,83 @@ instance (HsProtobuf.Message TaskBlocked) where
         taskBlockedScopeAttribution,
         taskBlockedRetryable,
         taskBlockedRecoveryAction,
-        taskBlockedEvidence
+        taskBlockedEvidence,
+        taskBlockedSliceId,
+        taskBlockedDeclaredDifficulty,
+        taskBlockedMatchedDifficultyRule,
+        taskBlockedAttempt
       } =
       Hs.mappend
         ( Hs.mappend
             ( Hs.mappend
                 ( Hs.mappend
                     ( Hs.mappend
-                        ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 1)
-                            taskBlockedCause
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( Hs.mappend
+                                    ( Hs.mappend
+                                        ( HsProtobuf.encodeMessageField
+                                            (HsProtobuf.FieldNumber 1)
+                                            taskBlockedCause
+                                        )
+                                        ( HsProtobuf.encodeMessageField
+                                            (HsProtobuf.FieldNumber 2)
+                                            taskBlockedNeedsHuman
+                                        )
+                                    )
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 3)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            taskBlockedScopeAttribution
+                                        )
+                                    )
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 4)
+                                    taskBlockedRetryable
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 5)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    taskBlockedRecoveryAction
+                                )
+                            )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 2)
-                            taskBlockedNeedsHuman
+                            (HsProtobuf.FieldNumber 6)
+                            ( ( Hs.coerce
+                                  @(Hs.Maybe Effects.Events.TaskBlockedEvidence)
+                                  @(HsProtobuf.Nested Effects.Events.TaskBlockedEvidence)
+                              )
+                                taskBlockedEvidence
+                            )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 3)
+                        (HsProtobuf.FieldNumber 7)
                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            taskBlockedScopeAttribution
+                            taskBlockedSliceId
                         )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 4)
-                    taskBlockedRetryable
+                    (HsProtobuf.FieldNumber 8)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        taskBlockedDeclaredDifficulty
+                    )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 5)
+                (HsProtobuf.FieldNumber 9)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    taskBlockedRecoveryAction
+                    taskBlockedMatchedDifficultyRule
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 6)
-            ( ( Hs.coerce
-                  @(Hs.Maybe Effects.Events.TaskBlockedEvidence)
-                  @(HsProtobuf.Nested Effects.Events.TaskBlockedEvidence)
-              )
-                taskBlockedEvidence
-            )
+            (HsProtobuf.FieldNumber 10)
+            taskBlockedAttempt
         )
   decodeMessage _ =
     Hs.pure TaskBlocked
@@ -2240,6 +2278,27 @@ instance (HsProtobuf.Message TaskBlocked) where
                   (HsProtobuf.FieldNumber 6)
               )
           )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 9)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 10)
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -2280,11 +2339,35 @@ instance (HsProtobuf.Message TaskBlocked) where
         )
         (HsProtobufAST.Single "evidence")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "slice_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "declared_difficulty")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "matched_difficulty_rule")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 10)
+        (HsProtobufAST.Prim HsProtobufAST.UInt32)
+        (HsProtobufAST.Single "attempt")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB TaskBlocked) where
-  toJSONPB (TaskBlocked f1 f2 f3 f4 f5 f6) =
+  toJSONPB (TaskBlocked f1 f2 f3 f4 f5 f6 f7 f8 f9 f10) =
     HsJSONPB.object
       [ "cause" .= f1,
         "needs_human" .= f2,
@@ -2299,9 +2382,16 @@ instance (HsJSONPB.ToJSONPB TaskBlocked) where
                    @(HsProtobuf.Nested Effects.Events.TaskBlockedEvidence)
                )
                  f6
-             )
+             ),
+        "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "declared_difficulty"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "matched_difficulty_rule"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+        "attempt" .= f10
       ]
-  toEncodingPB (TaskBlocked f1 f2 f3 f4 f5 f6) =
+  toEncodingPB (TaskBlocked f1 f2 f3 f4 f5 f6 f7 f8 f9 f10) =
     HsJSONPB.pairs
       [ "cause" .= f1,
         "needs_human" .= f2,
@@ -2316,7 +2406,14 @@ instance (HsJSONPB.ToJSONPB TaskBlocked) where
                    @(HsProtobuf.Nested Effects.Events.TaskBlockedEvidence)
                )
                  f6
-             )
+             ),
+        "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "declared_difficulty"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "matched_difficulty_rule"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+        "attempt" .= f10
       ]
 
 instance (HsJSONPB.FromJSONPB TaskBlocked) where
@@ -2340,6 +2437,16 @@ instance (HsJSONPB.FromJSONPB TaskBlocked) where
                   )
                     (obj .: "evidence")
                 )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "slice_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "declared_difficulty")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "matched_difficulty_rule")
+                )
+            <*> obj .: "attempt"
       )
 
 instance (HsJSONPB.ToJSON TaskBlocked) where

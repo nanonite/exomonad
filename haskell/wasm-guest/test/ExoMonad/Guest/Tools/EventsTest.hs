@@ -33,7 +33,9 @@ eventsTests =
       testCase "live schema exposes blocked status and evidence" $ do
         let schema = encode notifyParentSchema
         assertBool "schema must expose blocked" (isInfixOf "\"blocked\"" (L8.unpack schema))
-        assertBool "schema must expose evidence" (isInfixOf "\"evidence\"" (L8.unpack schema)),
+        assertBool "schema must expose evidence" (isInfixOf "\"evidence\"" (L8.unpack schema))
+        assertBool "schema must expose difficulty" (isInfixOf "\"declared_difficulty\"" (L8.unpack schema))
+        assertBool "schema must expose attempt" (isInfixOf "\"attempt\"" (L8.unpack schema)),
       testCase "status enum includes blocked" $
         decode (encode Blocked) @?= Just Blocked
     ]
@@ -56,7 +58,11 @@ validValue =
                   "head_sha" .= ("head-sha" :: String),
                   "failed_checks" .= (["ci/test"] :: [String]),
                   "evidence_summary" .= ("failure is reproducible on the base" :: String)
-                ]
+                ],
+            "slice_id" .= ("slice-a" :: String),
+            "declared_difficulty" .= ("standard" :: String),
+            "matched_difficulty_rule" .= ("standard_slice" :: String),
+            "attempt" .= (2 :: Int)
           ]
     ]
 

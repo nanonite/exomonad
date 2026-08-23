@@ -9,6 +9,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import TypeAlias, cast
 
+from tl_loop.select.classify import Difficulty
+
 from .stall import ReviewStallClassification, classify_review_stall
 
 LedgerEventInput: TypeAlias = Mapping[str, object]
@@ -43,6 +45,7 @@ class EventKind(str, Enum):
     CI_STATUS_CHANGED = "ci.status_changed"
     AGENT_SPAWNED = "agent.spawned"
     AGENT_COMPLETED = "agent.completed"
+    AGENT_TASK_BLOCKED = "agent.task_blocked"
     AGENT_STUCK = "agent.stuck"
     AGENT_NOTIFY_PARENT = "agent.notify_parent"
     AGENT_SIBLING_MERGED = "agent.sibling_merged"
@@ -59,6 +62,122 @@ KIND_BY_EVENT_TYPE: Mapping[str, EventKind] = MappingProxyType(
     {event_type: kind for kind, event_type in EVENT_TYPE_BY_KIND.items()}
 )
 MAPPED_EVENT_TYPES = frozenset(KIND_BY_EVENT_TYPE)
+
+
+class BlockCause(str, Enum):
+    """Closed, aggregate-safe vocabulary for why a task is blocked."""
+
+    BASE_CI_UNSTABLE = "base_ci_unstable"
+    EXTERNAL_DEPENDENCY = "external_dependency"
+    SCOPE_BOUNDARY = "scope_boundary"
+    HUMAN_DECISION_REQUIRED = "human_decision_required"
+    TOOLING_UNAVAILABLE = "tooling_unavailable"
+
+
+@dataclass(frozen=True)
+class TaskBlocked:
+    """Normalized task-blocked outcome with no raw evidence fields."""
+
+    slice_id: str
+    cause: BlockCause
+    scope_attribution: str
+    needs_human: bool
+    retryable: bool
+    recovery_action: str
+    declared_difficulty: Difficulty
+    matched_difficulty_rule: str
+    attempt: int
+    harness: str | None = None
+    role: str | None = None
+    invocation_id: str | None = None
+
+    @property
+    def attempt_bucket(self) -> str:
+        if self.attempt <= 1:
+            return "1"
+        if self.attempt == 2:
+            return "2"
+        if self.attempt <= 4:
+            return "3-4"
+        return "5+"
+
+    def aggregate_dimensions(self) -> dict[str, object]:
+        """Return the allowlisted Failure Atlas dimensions only."""
+        return {
+            "outcome": "blocked",
+            "slice_id": self.slice_id,
+            "cause": self.cause.value,
+            "scope_attribution": self.scope_attribution,
+            "needs_human": self.needs_human,
+            "retryable": self.retryable,
+            "recovery_action": self.recovery_action,
+            "declared_difficulty": self.declared_difficulty.value,
+            "matched_difficulty_rule": self.matched_difficulty_rule,
+            "attempt_bucket": self.attempt_bucket,
+            "harness": self.harness,
+            "role": self.role,
+        }
+
+    @classmethod
+    def from_payload(
+        cls,
+        data: Mapping[str, object],
+        *,
+        envelope_slice_id: str | None,
+        harness: str | None,
+        role: str | None,
+        invocation_id: str | None,
+        event_type: str,
+    ) -> TaskBlocked:
+        payload = data.get("blocked", data)
+        if not isinstance(payload, Mapping):
+            raise InvalidLedgerEvent(f"{event_type!r}: blocked payload must be an object")
+        slice_id = (
+            _required_string(payload, "slice_id", event_type)
+            if payload.get("slice_id") is not None
+            else envelope_slice_id
+        )
+        if not slice_id:
+            raise InvalidLedgerEvent(f"{event_type!r}: slice_id must be a non-empty string")
+        if payload.get("outcome", "blocked") != "blocked":
+            raise InvalidLedgerEvent(f"{event_type!r}: task-blocked outcome must be blocked")
+        cause_value = payload.get("cause")
+        try:
+            cause = BlockCause(cause_value)
+        except (TypeError, ValueError) as error:
+            raise InvalidLedgerEvent(
+                f"{event_type!r}: cause is outside the closed vocabulary"
+            ) from error
+        scope = _required_string(payload, "scope_attribution", event_type)
+        recovery = _required_string(payload, "recovery_action", event_type)
+        needs_human = payload.get("needs_human")
+        retryable = payload.get("retryable")
+        if type(needs_human) is not bool or type(retryable) is not bool:
+            raise InvalidLedgerEvent(f"{event_type!r}: needs_human and retryable must be booleans")
+        difficulty_value = payload.get("declared_difficulty")
+        try:
+            difficulty = Difficulty(difficulty_value)
+        except (TypeError, ValueError) as error:
+            raise InvalidLedgerEvent(f"{event_type!r}: declared_difficulty is invalid") from error
+        rule = _required_string(payload, "matched_difficulty_rule", event_type)
+        attempt = payload.get("attempt")
+        if type(attempt) is not int or attempt <= 0:
+            raise InvalidLedgerEvent(f"{event_type!r}: attempt must be a positive integer")
+        return cls(
+            slice_id=slice_id,
+            cause=cause,
+            scope_attribution=scope,
+            needs_human=needs_human,
+            retryable=retryable,
+            recovery_action=recovery,
+            declared_difficulty=difficulty,
+            matched_difficulty_rule=rule,
+            attempt=attempt,
+            harness=harness,
+            role=role,
+            invocation_id=invocation_id,
+        )
+
 
 # These event types still have server-side emitters without verified PR context.
 # This is a finding for M2.7 (#677), not permission for this projection to
@@ -97,6 +216,7 @@ class EventEnvelope:
     ci_status: str | None
     data: Mapping[str, object]
     parent_agent_id: str | None = None
+    task_blocked: TaskBlocked | None = None
 
     @property
     def reviewed_head(self) -> str | None:
@@ -148,6 +268,18 @@ def project(event: LedgerEventInput) -> EventEnvelope:
         parent_agent_id=_optional_string(event, "parent_agent_id", event_type)
         or _optional_string(data, "parent_agent_id", event_type),
         data=MappingProxyType(cast(dict[str, object], copy.deepcopy(dict(data)))),
+        task_blocked=(
+            TaskBlocked.from_payload(
+                data,
+                envelope_slice_id=_optional_string(data, "slice_id", event_type),
+                harness=_optional_string(event, "harness", event_type),
+                role=_optional_string(event, "role", event_type),
+                invocation_id=_optional_string(event, "invocation_id", event_type),
+                event_type=event_type,
+            )
+            if kind is EventKind.AGENT_TASK_BLOCKED
+            else None
+        ),
     )
 
 
@@ -213,11 +345,13 @@ __all__ = [
     "KIND_BY_EVENT_TYPE",
     "MAPPED_EVENT_TYPES",
     "SERVER_EMIT_HEAD_SHA_GAPS",
+    "BlockCause",
     "EnvelopeError",
     "EventEnvelope",
     "EventKind",
     "InvalidLedgerEvent",
     "LedgerEventInput",
+    "TaskBlocked",
     "UnmappedEventType",
     "project",
     "project_ledger_event",

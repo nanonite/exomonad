@@ -153,7 +153,11 @@ data BlockedReport = BlockedReport
     brScopeAttribution :: Text,
     brRetryable :: Bool,
     brRecoveryAction :: Text,
-    brEvidence :: BlockedEvidence
+    brEvidence :: BlockedEvidence,
+    brSliceId :: Text,
+    brDeclaredDifficulty :: Text,
+    brMatchedDifficultyRule :: Text,
+    brAttempt :: Int
   }
   deriving (Generic, Show, Eq)
 
@@ -167,6 +171,10 @@ instance FromJSON BlockedReport where
         <*> v .: "retryable"
         <*> v .: "recovery_action"
         <*> v .: "evidence"
+        <*> v .: "slice_id"
+        <*> v .: "declared_difficulty"
+        <*> v .: "matched_difficulty_rule"
+        <*> v .: "attempt"
     validateBlockedReport report
     pure report
 
@@ -178,7 +186,11 @@ instance ToJSON BlockedReport where
         "scope_attribution" .= brScopeAttribution report,
         "retryable" .= brRetryable report,
         "recovery_action" .= brRecoveryAction report,
-        "evidence" .= brEvidence report
+        "evidence" .= brEvidence report,
+        "slice_id" .= brSliceId report,
+        "declared_difficulty" .= brDeclaredDifficulty report,
+        "matched_difficulty_rule" .= brMatchedDifficultyRule report,
+        "attempt" .= brAttempt report
       ]
 
 instance JsonSchema BlockedReport where
@@ -190,7 +202,11 @@ instance JsonSchema BlockedReport where
           ("scope_attribution", "Whether the blocker is task, base, or external scope."),
           ("retryable", "Whether the same task can be retried after recovery."),
           ("recovery_action", "Concrete human or system recovery action."),
-          ("evidence", "Structured base/head/check evidence.")
+          ("evidence", "Structured base/head/check evidence."),
+          ("slice_id", "Canonical task slice identity."),
+          ("declared_difficulty", "Declared task difficulty: trivial, standard, or hard."),
+          ("matched_difficulty_rule", "Deterministic classifier rule that matched the task."),
+          ("attempt", "One-based attempt number for this task invocation.")
         ]
 
 validateBlockedReport :: BlockedReport -> Parser ()
@@ -198,6 +214,10 @@ validateBlockedReport report
   | not (brNeedsHuman report) = fail "blocked handoff requires needs_human=true"
   | T.null (T.strip (brScopeAttribution report)) = fail "blocked handoff requires scope_attribution"
   | T.null (T.strip (brRecoveryAction report)) = fail "blocked handoff requires recovery_action"
+  | T.null (T.strip (brSliceId report)) = fail "blocked handoff requires slice_id"
+  | brDeclaredDifficulty report `notElem` ["trivial", "standard", "hard"] = fail "blocked handoff requires a supported declared_difficulty"
+  | T.null (T.strip (brMatchedDifficultyRule report)) = fail "blocked handoff requires matched_difficulty_rule"
+  | brAttempt report <= 0 = fail "blocked handoff requires a positive attempt"
   | T.null (T.strip (beEvidenceSummary (brEvidence report))) = fail "blocked handoff requires evidence_summary"
   | null (beFailedChecks (brEvidence report)) && beBaseSha (brEvidence report) == Nothing && beHeadSha (brEvidence report) == Nothing =
       fail "blocked handoff requires a check, base SHA, or head SHA"
@@ -272,7 +292,23 @@ notifyParentSchema =
       ("message", "The message to send. Be concise — one or two sentences."),
       ("pr_number", "PR number if relevant. Helps parent locate the PR without searching."),
       ("tasks_completed", "Array of {what, how} pairs. 'what' = task description, 'how' = verification command that was run."),
-      ("blocked", "Required when status=blocked: cause, human-guidance requirement, scope, retry policy, recovery action, and structured evidence.")
+      ("blocked", "Required when status=blocked: cause, human-guidance requirement, scope, retry policy, recovery action, structured evidence, slice identity, difficulty, matched rule, and attempt.")
+    ]
+
+-- | Aggregate-only task-blocked telemetry. Evidence and message remain local.
+blockedTelemetryPayload :: BlockedReport -> Aeson.Value
+blockedTelemetryPayload report =
+  object
+    [ "outcome" .= ("blocked" :: Text),
+      "slice_id" .= brSliceId report,
+      "cause" .= brCause report,
+      "scope_attribution" .= brScopeAttribution report,
+      "needs_human" .= brNeedsHuman report,
+      "retryable" .= brRetryable report,
+      "recovery_action" .= brRecoveryAction report,
+      "declared_difficulty" .= brDeclaredDifficulty report,
+      "matched_difficulty_rule" .= brMatchedDifficultyRule report,
+      "attempt" .= brAttempt report
     ]
 
 -- | Core notify_parent I/O: emit event + deliver message to parent.
@@ -283,15 +319,17 @@ notifyParentCore args = do
   let eventPayload =
         BSL.toStrict $
           Aeson.encode $
-            object
-              [ "status" .= npStatus args,
-                "message" .= npMessage args,
-                "pr_number" .= npPrNumber args,
-                "tasks_completed" .= npTasksCompleted args,
-                "blocked" .= npBlocked args,
-                "head_sha" .= (Nothing :: Maybe Text),
-                "head_sha_finding" .= ("not_available_without_verified_pr_context" :: Text)
-              ]
+            case npBlocked args of
+              Just report -> blockedTelemetryPayload report
+              Nothing ->
+                object
+                  [ "status" .= npStatus args,
+                    "message" .= npMessage args,
+                    "pr_number" .= npPrNumber args,
+                    "tasks_completed" .= npTasksCompleted args,
+                    "head_sha" .= (Nothing :: Maybe Text),
+                    "head_sha_finding" .= ("not_available_without_verified_pr_context" :: Text)
+                  ]
   void $
     suspendEffect_ @LogEmitEvent
       ( Log.EmitEventRequest
@@ -348,7 +386,11 @@ protoBlocked (Just report) =
             ProtoEvents.taskBlockedScopeAttribution = TL.fromStrict (brScopeAttribution report),
             ProtoEvents.taskBlockedRetryable = brRetryable report,
             ProtoEvents.taskBlockedRecoveryAction = TL.fromStrict (brRecoveryAction report),
-            ProtoEvents.taskBlockedEvidence = Just (protoEvidence (brEvidence report))
+            ProtoEvents.taskBlockedEvidence = Just (protoEvidence (brEvidence report)),
+            ProtoEvents.taskBlockedSliceId = TL.fromStrict (brSliceId report),
+            ProtoEvents.taskBlockedDeclaredDifficulty = TL.fromStrict (brDeclaredDifficulty report),
+            ProtoEvents.taskBlockedMatchedDifficultyRule = TL.fromStrict (brMatchedDifficultyRule report),
+            ProtoEvents.taskBlockedAttempt = fromIntegral (brAttempt report)
           }
     )
 

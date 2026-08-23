@@ -167,6 +167,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Add canonical task-blocked telemetry and outcome attribution (#946)
 - Add typed blocked handoffs to the dev MCP contract (#945)
 - Configurable per-task time budgets with auditable kill and typed failure events (#927)
 - Add a versioned Chainlink issue export (#918)

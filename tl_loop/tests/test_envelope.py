@@ -12,7 +12,9 @@ from tl_loop.events.envelope import (
     EVENT_TYPE_BY_KIND,
     MAPPED_EVENT_TYPES,
     SERVER_EMIT_HEAD_SHA_GAPS,
+    BlockCause,
     EventEnvelope,
+    InvalidLedgerEvent,
     ReviewStallClassification,
     UnmappedEventType,
     project,
@@ -79,6 +81,38 @@ def test_review_and_ci_fields_are_projected_from_data_without_synthesis() -> Non
         == "not_available_without_verified_pr_context"
         for event_type in SERVER_EMIT_HEAD_SHA_GAPS
     )
+
+
+def test_task_blocked_projects_normalized_outcome_without_raw_evidence() -> None:
+    events = cast(list[dict[str, object]], json.loads(FIXTURE.read_text(encoding="utf-8")))
+    event = next(project(raw) for raw in events if raw["type"] == "agent.task_blocked")
+
+    assert event.task_blocked is not None
+    assert event.task_blocked.cause is BlockCause.BASE_CI_UNSTABLE
+    assert event.task_blocked.slice_id == "slice-a"
+    assert event.task_blocked.declared_difficulty.value == "standard"
+    assert event.task_blocked.matched_difficulty_rule == "standard_slice"
+    assert event.task_blocked.attempt == 2
+    assert event.task_blocked.attempt_bucket == "2"
+    assert event.task_blocked.harness == "codex"
+    assert event.task_blocked.role == "worker"
+    assert not hasattr(event.task_blocked, "evidence")
+    dimensions = event.task_blocked.aggregate_dimensions()
+    assert dimensions["attempt_bucket"] == "2"
+    assert dimensions["outcome"] == "blocked"
+    assert "message" not in dimensions
+    assert "evidence" not in dimensions
+
+
+def test_task_blocked_rejects_contradictory_outcome_and_unknown_cause() -> None:
+    events = cast(list[dict[str, object]], json.loads(FIXTURE.read_text(encoding="utf-8")))
+    raw = next(item for item in events if item["type"] == "agent.task_blocked")
+    with pytest.raises(InvalidLedgerEvent, match="outcome"):
+        project({**raw, "data": {**cast(dict[str, object], raw["data"]), "outcome": "completed"}})
+    with pytest.raises(InvalidLedgerEvent, match="closed vocabulary"):
+        project(
+            {**raw, "data": {**cast(dict[str, object], raw["data"]), "cause": "harness_failed"}}
+        )
 
 
 def test_unmapped_allowlisted_event_type_is_rejected_at_read_time() -> None:

@@ -783,6 +783,23 @@
                   "evidence_summary"
                 ],
                 "type": "object"
+              },
+              "slice_id": {
+                "type": "string"
+              },
+              "declared_difficulty": {
+                "enum": [
+                  "trivial",
+                  "standard",
+                  "hard"
+                ],
+                "type": "string"
+              },
+              "matched_difficulty_rule": {
+                "type": "string"
+              },
+              "attempt": {
+                "type": "integer"
               }
             },
             "required": [
@@ -791,7 +808,11 @@
               "scope_attribution",
               "retryable",
               "recovery_action",
-              "evidence"
+              "evidence",
+              "slice_id",
+              "declared_difficulty",
+              "matched_difficulty_rule",
+              "attempt"
             ],
             "type": "object"
           }
