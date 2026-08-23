@@ -161,7 +161,7 @@ def heartbeat_once(
                 emit_controller_event(
                     effects,
                     "worker.terminal_reconciled",
-                    evidence,
+                    _worker_event_payload(evidence),
                 )
                 park(
                     current_slice,
@@ -188,7 +188,11 @@ def heartbeat_once(
                     current.budgets,
                     current.events.last_consumed_offset,
                 )
-                emit_controller_event(effects, "worker.missing", evidence)
+                emit_controller_event(
+                    effects,
+                    "worker.missing",
+                    _worker_event_payload(evidence),
+                )
                 events.append(
                     _event(
                         "worker.missing",
@@ -729,6 +733,22 @@ def _missing_worker_evidence(
             context["reason"] = context["reason"] or "durable_invocation_finished"
             return True, context
     return False, context
+
+
+def _worker_event_payload(evidence: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "slice_id": evidence.get("slice_id"),
+        "runtime_agent_id": evidence.get("runtime_agent_id"),
+        "invocation_id": evidence.get("invocation_id"),
+        "generation": evidence.get("generation"),
+        "exit_code": evidence.get("exit_code"),
+        "classification": evidence.get("classification"),
+        "reason": evidence.get("reason"),
+        "stderr_tail": evidence.get("stderr_tail"),
+        "branch": evidence.get("branch"),
+        "worktree": evidence.get("worktree"),
+        "poll_workers_missing": evidence.get("poll_workers_missing"),
+    }
 
 
 def _read_invocation_record(

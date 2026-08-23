@@ -64,6 +64,14 @@ Add to `docs/observability/event-registry.json`, all with payload class
 Bodies stay local. These carry identities and bounded dimensions only —
 no utterances, no diffs, no repair prose, no plan documents.
 
+The complete field contract lives in
+`docs/observability/controller-event-contract.v1.json` and is consumed by both
+the Rust TL handler and the source-derived Python checker. Dispatch and spawn
+events carry task-outcome dimensions (`attempt`, timing, harness, agent type,
+and model); `error` is reserved for transport, binary, or other system faults.
+Task-budget and worker-reconciliation events use the same bounded contract, so
+timeout context remains task telemetry instead of being encoded in `error`.
+
 ### 2. Rust emits; Python decides
 
 `tl_loop` does not gain a ledger writer. It calls a new effect through the

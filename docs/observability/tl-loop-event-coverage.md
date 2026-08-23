@@ -101,21 +101,26 @@ is still part of the supported wakeup contract and is audited here.
 
 ## Controller event coverage
 
-The controller declares eight `tl.*` aggregate event types. Each is accepted by
-the Rust TL handler and written through the existing ledger writer; the Python
-controller remains the caller and does not open a second ledger writer. Emission
-is best-effort, so a failed write must not change the controller state transition.
+The controller declares its aggregate event types in
+`controller-event-contract.v1.json`. Each is accepted by the Rust TL handler and
+written through the existing ledger writer; the Python controller remains the
+caller and does not open a second ledger writer. Emission is best-effort, so a
+failed write must not change the controller state transition.
 
 | event | producer | status | notes |
 |---|---|---|---|
 | `tl.phase_changed` | `tl_loop/loop/driver.py:1531-1542`; `rust/exomonad-core/src/handlers/tl.rs:14-30` | covered | Phase transitions carry only bounded phase tags and run identity. |
 | `tl.slice_status_changed` | `tl_loop/loop/escalate.py:267-285`; `rust/exomonad-core/src/handlers/tl.rs:14-30` | covered | Status transitions are emitted from durable slice state changes. |
-| `tl.slice_parked` | `tl_loop/loop/escalate.py:286-293`; `tl_loop/loop/driver.py:747-756` | covered | Park cause and attempt count are bounded dimensions; no body is emitted. |
+| `tl.slice_parked` | `tl_loop/loop/escalate.py:286-293`; `tl_loop/loop/driver.py:747-756` | covered | Park cause, attempt count, and the bounded review-stuck reason are dimensions; no body is emitted. |
 | `tl.gate_opened` | `tl_loop/loop/driver.py:599-608`; `rust/exomonad-core/src/handlers/tl.rs:14-30` | covered | Timeout parking opens the named gate before the terminal failed phase. |
 | `tl.gate_answered` | `tl_loop/__main__.py:320-340` | covered | CLI/control answers carry gate name, decision, and source. |
 | `tl.merge_decided` | `tl_loop/loop/driver.py:1109-1118` | covered | The decision carries a PR number and bounded head-SHA hash, not the merge body. |
 | `tl.judgment` | `tl_loop/rlm/call.py:324-355`; `tl_loop/rlm/store.py:114-123` | covered | RLM calls project model, attempt, outcome, tokens, latency, replay, and bounded redacted result. |
 | `tl.plan_proposed` | `tl_loop/__main__.py:242-256` | covered | Proposal outcome is recorded without the plan document or rejection prose beyond the bounded reason. |
+| `tl.dispatch_intended`, `tl.spawn_requested`, `tl.spawn_request_accepted`, `tl.spawn_request_failed` | `tl_loop/loop/driver.py:1195-1315`; `rust/exomonad-core/src/handlers/tl.rs` | covered | Dispatch telemetry carries the attempt number and route dimensions; system faults remain in `error`. |
+| `tl.dispatch_confirmed`, `tl.dispatch_reconciliation_started`, `tl.dispatch_reconciliation_completed` | `tl_loop/loop/driver.py:1261-1975`; `rust/exomonad-core/src/handlers/tl.rs` | covered | Confirmation and reconciliation preserve the same attempt/task contract. |
+| `agent.task_budget_exceeded` | `tl_loop/loop/heartbeat.py:456-482`; `rust/exomonad-core/src/handlers/tl.rs` | covered | Timeout context is structured task-level data and correlates to the parked slice. |
+| `worker.terminal_reconciled`, `worker.missing` | `tl_loop/loop/heartbeat.py:161-198`; `rust/exomonad-core/src/handlers/tl.rs` | covered | Missing-worker evidence is projected to bounded fields before ledger emission. |
 
 ## Guidance-queue coverage
 

@@ -24,6 +24,7 @@ from .store import (
 
 MAX_ATTEMPTS = 3
 MAX_REDACTED_RESULT_BYTES = 512
+JUDGMENT_EVENT_TYPE = "tl.judgment"
 _SENSITIVE_KEY_PARTS = ("api_key", "authorization", "password", "secret", "token")
 LOGGER = logging.getLogger(__name__)
 
@@ -327,6 +328,7 @@ def _record_failure(
 
 def _emit_judgment(choice: RlmModelChoice, event: JsonObject) -> None:
     """Project a local call record into the aggregate event contract."""
+    LOGGER.debug("projecting controller event %s", JUDGMENT_EVENT_TYPE)
     try:
         choice.store.emit_judgment(_judgment_payload(event))
     except Exception as error:  # noqa: BLE001 - aggregate projection is fail-open

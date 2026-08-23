@@ -111,6 +111,11 @@ tl-loop-lint:
 tool-surface-check:
     python3 scripts/check_tool_surface.py --project-root .
 
+# Cross-check every statically discoverable controller payload against the
+# shared event field contract used by Rust.
+controller-event-contract-check:
+    python3 scripts/check_controller_event_contract.py --project-root .
+
 # Type-check the programmatic TL controller
 tl-loop-typecheck:
     mypy tl_loop
@@ -160,7 +165,7 @@ wasm-guest-test:
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
 # Run tests: Python checks, formatting, Rust check, WASM build/tests, Rust tests, proto freshness
-test: tl-loop-replay tl-loop-test tl-loop-lint tool-surface-check
+test: tl-loop-replay tl-loop-test tl-loop-lint tool-surface-check controller-event-contract-check
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/8] Observability contract checks..."

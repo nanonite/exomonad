@@ -1,0 +1,257 @@
+{
+  "contract_id": "exomonad.controller-event-fields",
+  "version": 1,
+  "events": {
+    "tl.phase_changed": {
+      "fields": ["from_phase", "to_phase", "run_id"]
+    },
+    "tl.slice_status_changed": {
+      "fields": ["slice_id", "from_status", "to_status"]
+    },
+    "tl.slice_parked": {
+      "fields": ["slice_id", "park_cause", "attempts", "reason"]
+    },
+    "tl.slice_abandoned": {
+      "fields": [
+        "slice_id",
+        "attempt",
+        "pr_number",
+        "head_sha",
+        "invocation_id",
+        "operator_source",
+        "cause"
+      ]
+    },
+    "tl.gate_opened": {
+      "fields": ["gate_name", "run_id", "reason"]
+    },
+    "tl.gate_answered": {
+      "fields": ["gate_name", "decision", "source"]
+    },
+    "tl.merge_decided": {
+      "fields": ["slice_id", "pr_number", "decision", "head_sha_hash"]
+    },
+    "tl.judgment": {
+      "fields": [
+        "judgment",
+        "attempt",
+        "outcome",
+        "tokens",
+        "replayed",
+        "model",
+        "latency_ms",
+        "redacted_result"
+      ]
+    },
+    "tl.plan_proposed": {
+      "fields": ["run_id", "accepted", "rejection_reason"]
+    },
+    "tl.dispatch_intended": {
+      "fields": [
+        "slice_id",
+        "intent_id",
+        "boundary",
+        "started_at",
+        "attempt",
+        "error",
+        "harness",
+        "agent_type",
+        "model"
+      ]
+    },
+    "tl.spawn_requested": {
+      "fields": [
+        "slice_id",
+        "intent_id",
+        "boundary",
+        "started_at",
+        "attempt",
+        "error",
+        "harness",
+        "agent_type",
+        "model"
+      ]
+    },
+    "tl.spawn_request_accepted": {
+      "fields": [
+        "slice_id",
+        "intent_id",
+        "boundary",
+        "started_at",
+        "attempt",
+        "error",
+        "harness",
+        "agent_type",
+        "model"
+      ]
+    },
+    "tl.spawn_request_failed": {
+      "fields": [
+        "slice_id",
+        "intent_id",
+        "boundary",
+        "started_at",
+        "attempt",
+        "error",
+        "harness",
+        "agent_type",
+        "model"
+      ]
+    },
+    "tl.dispatch_confirmed": {
+      "fields": [
+        "slice_id",
+        "intent_id",
+        "boundary",
+        "started_at",
+        "attempt",
+        "error",
+        "harness",
+        "agent_type",
+        "model"
+      ]
+    },
+    "tl.dispatch_reconciliation_started": {
+      "fields": [
+        "slice_id",
+        "intent_id",
+        "boundary",
+        "started_at",
+        "attempt",
+        "error",
+        "harness",
+        "agent_type",
+        "model"
+      ]
+    },
+    "tl.dispatch_reconciliation_completed": {
+      "fields": [
+        "slice_id",
+        "intent_id",
+        "boundary",
+        "started_at",
+        "attempt",
+        "error",
+        "harness",
+        "agent_type",
+        "model"
+      ]
+    },
+    "tl.stage_started": {
+      "fields": ["order", "sub_tl_ids", "run_id"],
+      "string_array_fields": ["sub_tl_ids"]
+    },
+    "tl.stage_completed": {
+      "fields": ["order", "sub_tl_ids", "run_id"],
+      "string_array_fields": ["sub_tl_ids"]
+    },
+    "tl.aggregate_pr_opened": {
+      "fields": [
+        "sub_tl_id",
+        "pr_number",
+        "head_sha",
+        "patch_digest",
+        "original_base_sha",
+        "integration_owner_id"
+      ]
+    },
+    "tl.integration_base_invalidated": {
+      "fields": ["slice_id", "base_sha", "head_sha", "reason"]
+    },
+    "tl.integration_conflict": {
+      "fields": [
+        "slice_id",
+        "pr_number",
+        "base_sha",
+        "head_sha",
+        "reason",
+        "repair_attempt"
+      ]
+    },
+    "tl.integration_evidence_invalidated": {
+      "fields": ["slice_id", "base_sha", "head_sha", "reason"]
+    },
+    "tl.integration_repair_requested": {
+      "fields": [
+        "slice_id",
+        "pr_number",
+        "owner_id",
+        "reason",
+        "repair_attempt"
+      ]
+    },
+    "tl.integration_revalidated": {
+      "fields": [
+        "slice_id",
+        "pr_number",
+        "base_sha",
+        "head_sha",
+        "merge_tree_sha",
+        "ci_status"
+      ]
+    },
+    "tl.integration_validated": {
+      "fields": [
+        "slice_id",
+        "pr_number",
+        "base_sha",
+        "head_sha",
+        "merge_tree_sha",
+        "ci_status"
+      ]
+    },
+    "tl.merge_reconciled": {
+      "fields": ["slice_id", "pr_number", "head_sha"]
+    },
+    "agent.task_budget_exceeded": {
+      "fields": [
+        "slice_id",
+        "runtime_agent_id",
+        "invocation_id",
+        "generation",
+        "harness",
+        "model",
+        "effort",
+        "branch",
+        "worktree",
+        "pr_number",
+        "configured_budget_seconds",
+        "budget_source_layer",
+        "dispatch_started_at",
+        "elapsed_seconds",
+        "last_authoritative_event_seq",
+        "stderr_tail"
+      ]
+    },
+    "worker.terminal_reconciled": {
+      "fields": [
+        "slice_id",
+        "runtime_agent_id",
+        "invocation_id",
+        "generation",
+        "exit_code",
+        "classification",
+        "reason",
+        "stderr_tail",
+        "branch",
+        "worktree",
+        "poll_workers_missing"
+      ]
+    },
+    "worker.missing": {
+      "fields": [
+        "slice_id",
+        "runtime_agent_id",
+        "invocation_id",
+        "generation",
+        "exit_code",
+        "classification",
+        "reason",
+        "stderr_tail",
+        "branch",
+        "worktree",
+        "poll_workers_missing"
+      ]
+    }
+  }
+}

@@ -8,124 +8,65 @@ use crate::effects::{dispatch_tl_effect, EffectError, EffectHandler, EffectResul
 use crate::services::HasEventLog;
 use async_trait::async_trait;
 use exomonad_proto::effects::tl::*;
+use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
-const CONTROLLER_EVENT_TYPES: [&str; 26] = [
-    "tl.phase_changed",
-    "tl.slice_status_changed",
-    "tl.slice_parked",
-    "tl.slice_abandoned",
-    "tl.gate_opened",
-    "tl.gate_answered",
-    "tl.merge_decided",
-    "tl.judgment",
-    "tl.plan_proposed",
-    "tl.dispatch_intended",
-    "tl.spawn_requested",
-    "tl.spawn_request_accepted",
-    "tl.spawn_request_failed",
-    "tl.dispatch_confirmed",
-    "tl.dispatch_reconciliation_started",
-    "tl.dispatch_reconciliation_completed",
-    "tl.stage_started",
-    "tl.stage_completed",
-    "tl.aggregate_pr_opened",
-    "tl.integration_base_invalidated",
-    "tl.integration_conflict",
-    "tl.integration_evidence_invalidated",
-    "tl.integration_repair_requested",
-    "tl.integration_revalidated",
-    "tl.integration_validated",
-    "tl.merge_reconciled",
-];
+const CONTROLLER_EVENT_CONTRACT: &str =
+    include_str!("../../../../docs/observability/controller-event-contract.v1.json");
 
-fn allowed_fields(event_type: &str) -> &'static [&'static str] {
-    match event_type {
-        "tl.phase_changed" => &["from_phase", "to_phase", "run_id"],
-        "tl.slice_status_changed" => &["slice_id", "from_status", "to_status"],
-        "tl.slice_parked" => &["slice_id", "park_cause", "attempts"],
-        "tl.slice_abandoned" => &[
-            "slice_id",
-            "attempt",
-            "pr_number",
-            "head_sha",
-            "invocation_id",
-            "operator_source",
-            "cause",
-        ],
-        "tl.gate_opened" => &["gate_name", "run_id", "reason"],
-        "tl.gate_answered" => &["gate_name", "decision", "source"],
-        "tl.merge_decided" => &["slice_id", "pr_number", "decision", "head_sha_hash"],
-        "tl.judgment" => &[
-            "judgment",
-            "attempt",
-            "outcome",
-            "tokens",
-            "replayed",
-            "model",
-            "latency_ms",
-            "redacted_result",
-        ],
-        "tl.plan_proposed" => &["run_id", "accepted", "rejection_reason"],
-        "tl.dispatch_intended"
-        | "tl.spawn_requested"
-        | "tl.spawn_request_accepted"
-        | "tl.spawn_request_failed"
-        | "tl.dispatch_confirmed"
-        | "tl.dispatch_reconciliation_started"
-        | "tl.dispatch_reconciliation_completed" => &[
-            "slice_id",
-            "intent_id",
-            "boundary",
-            "started_at",
-            "error",
-            "harness",
-            "agent_type",
-            "model",
-        ],
-        "tl.stage_started" | "tl.stage_completed" => &["order", "sub_tl_ids", "run_id"],
-        "tl.aggregate_pr_opened" => &[
-            "sub_tl_id",
-            "pr_number",
-            "head_sha",
-            "patch_digest",
-            "original_base_sha",
-            "integration_owner_id",
-        ],
-        "tl.integration_base_invalidated" | "tl.integration_evidence_invalidated" => {
-            &["slice_id", "base_sha", "head_sha", "reason"]
-        }
-        "tl.integration_conflict" => &[
-            "slice_id",
-            "pr_number",
-            "base_sha",
-            "head_sha",
-            "reason",
-            "repair_attempt",
-        ],
-        "tl.integration_repair_requested" => &[
-            "slice_id",
-            "pr_number",
-            "owner_id",
-            "reason",
-            "repair_attempt",
-        ],
-        "tl.integration_revalidated" | "tl.integration_validated" => &[
-            "slice_id",
-            "pr_number",
-            "base_sha",
-            "head_sha",
-            "merge_tree_sha",
-            "ci_status",
-        ],
-        "tl.merge_reconciled" => &["slice_id", "pr_number", "head_sha"],
-        _ => &[],
-    }
+#[derive(Debug, Deserialize)]
+struct EventDefinition {
+    fields: Vec<String>,
+    #[serde(default)]
+    string_array_fields: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControllerEventContract {
+    contract_id: String,
+    version: u32,
+    events: BTreeMap<String, EventDefinition>,
+}
+
+fn event_contract() -> &'static ControllerEventContract {
+    static CONTRACT: OnceLock<ControllerEventContract> = OnceLock::new();
+    CONTRACT.get_or_init(|| {
+        let contract: ControllerEventContract = serde_json::from_str(CONTROLLER_EVENT_CONTRACT)
+            .expect("controller event contract must be valid JSON");
+        assert_eq!(
+            contract.contract_id, "exomonad.controller-event-fields",
+            "controller event contract id drifted"
+        );
+        assert_eq!(
+            contract.version, 1,
+            "unsupported controller event contract version"
+        );
+        contract
+    })
+}
+
+fn allowed_fields(event_type: &str) -> Option<&'static [String]> {
+    event_contract()
+        .events
+        .get(event_type)
+        .map(|definition| definition.fields.as_slice())
 }
 
 fn valid_field_value(event_type: &str, key: &str, value: &Value) -> bool {
-    if matches!(event_type, "tl.stage_started" | "tl.stage_completed") && key == "sub_tl_ids" {
+    let Some(definition) = event_contract().events.get(event_type) else {
+        return false;
+    };
+    if value.is_null() {
+        return true;
+    }
+    if definition
+        .string_array_fields
+        .iter()
+        .any(|field| field == key)
+    {
         return value
             .as_array()
             .is_some_and(|items| items.iter().all(Value::is_string));
@@ -167,7 +108,7 @@ impl<C: HasEventLog + 'static> TlEffects for TlHandler<C> {
         req: EmitEventRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<EmitEventResponse> {
-        if !CONTROLLER_EVENT_TYPES.contains(&req.event_type.as_str()) {
+        if allowed_fields(req.event_type.as_str()).is_none() {
             return Err(EffectError::invalid_input(format!(
                 "unsupported controller event type: {}",
                 req.event_type
@@ -195,7 +136,9 @@ impl<C: HasEventLog + 'static> TlEffects for TlHandler<C> {
             EffectError::invalid_input("controller event payload must be a JSON object")
         })?;
         for (key, value) in payload_object {
-            if !allowed_fields(req.event_type.as_str()).contains(&key.as_str()) {
+            if !allowed_fields(req.event_type.as_str())
+                .is_some_and(|fields| fields.iter().any(|field| field == key))
+            {
                 return Err(EffectError::invalid_input(format!(
                     "field '{key}' is not allowed for {}",
                     req.event_type
@@ -280,6 +223,90 @@ mod tests {
             .unwrap();
 
         assert!(!response.event_id.is_empty());
+    }
+
+    #[test]
+    fn shared_contract_carries_attempt_and_review_reason() {
+        let dispatch_fields = allowed_fields("tl.dispatch_confirmed").unwrap();
+        assert!(dispatch_fields.iter().any(|field| field == "attempt"));
+        let parked_fields = allowed_fields("tl.slice_parked").unwrap();
+        assert!(parked_fields.iter().any(|field| field == "reason"));
+    }
+
+    #[tokio::test]
+    async fn accepts_dispatch_attempt_and_review_park_reason() {
+        let directory = tempdir().unwrap();
+        let mut services = Services::test();
+        services.event_log = Some(Arc::new(
+            EventLog::open(directory.path().join("logs")).unwrap(),
+        ));
+        let handler = TlHandler::new(Arc::new(services));
+
+        for event_type in [
+            "tl.dispatch_intended",
+            "tl.spawn_requested",
+            "tl.spawn_request_accepted",
+            "tl.spawn_request_failed",
+            "tl.dispatch_confirmed",
+            "tl.dispatch_reconciliation_started",
+            "tl.dispatch_reconciliation_completed",
+        ] {
+            handler
+                .emit_event(
+                    EmitEventRequest {
+                        event_type: event_type.to_string(),
+                        payload: format!(
+                            r#"{{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"{event_type}","started_at":1,"attempt":2}}"#
+                        )
+                        .into_bytes(),
+                    },
+                    &context(),
+                )
+                .await
+                .unwrap();
+        }
+
+        handler
+            .emit_event(
+                EmitEventRequest {
+                    event_type: "tl.slice_parked".to_string(),
+                    payload: br#"{"slice_id":"leaf-a","park_cause":"review_stuck","reason":"reviewer unavailable"}"#.to_vec(),
+                },
+                &context(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_task_budget_and_worker_reconciliation_events() {
+        let directory = tempdir().unwrap();
+        let mut services = Services::test();
+        services.event_log = Some(Arc::new(
+            EventLog::open(directory.path().join("logs")).unwrap(),
+        ));
+        let handler = TlHandler::new(Arc::new(services));
+        for (event_type, payload) in [
+            (
+                "agent.task_budget_exceeded",
+                br#"{"slice_id":"leaf-a","runtime_agent_id":"agent-leaf-a","generation":null,"elapsed_seconds":3601}"#.to_vec(),
+            ),
+            (
+                "worker.terminal_reconciled",
+                br#"{"slice_id":"leaf-a","runtime_agent_id":"agent-leaf-a","classification":"terminal_exit","stderr_tail":null}"#.to_vec(),
+            ),
+        ] {
+            handler
+                .emit_event(
+                    EmitEventRequest {
+                        event_type: event_type.to_string(),
+                        payload,
+                    },
+                    &context(),
+                )
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
