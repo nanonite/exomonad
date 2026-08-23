@@ -1,0 +1,18 @@
+# Recursive parallel pre-publication recovery
+
+This acceptance starts the real ExoMonad server, development WASM, Unix MCP
+transport, disposable Git remote, tmux workers, nested ledger-backed
+controllers, and the Forgejo-shaped API. It runs the production controller
+through nested dispatch, sibling scheduling, restart barriers, base
+revalidation, PR publication, watcher delivery, and review handoff.
+
+The harness records a recovery trace at dispatch, aggregate-review,
+base-revalidation, and merge boundaries. It asserts that a sibling completes
+while the blocked path waits, the same owner and dirty worktree survive the
+restart, action journals converge without duplicate keys, and review/CI events
+follow PR publication. The complete scenario runs three consecutive disposable
+sessions and cleans every server, tmux session, worktree, and mock API.
+
+Mutation smoke checks operate only on the captured evidence object. They cover
+eager gating, duplicate resume, timeout override, parent takeover, scope
+expansion, and no-op recovery; no production source is copied or mutated.

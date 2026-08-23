@@ -447,6 +447,17 @@ check-e2e-task-blocked-human-gate:
     bash -n tests/e2e/task-blocked-human-gate/run.sh
     {{py}} -m py_compile tests/e2e/task-blocked-human-gate/run.py
 
+e2e-pre-pr-recovery-fsm:
+    nix develop --command cargo build -p exomonad
+    just wasm devswarm
+    ./tests/e2e/pre-pr-recovery-fsm/run.sh
+
+check-e2e-pre-pr-recovery-fsm:
+    bash -n tests/e2e/pre-pr-recovery-fsm/run.sh
+    {{py}} -m py_compile tests/e2e/pre-pr-recovery-fsm/run.py
+    test -s tests/e2e/pre-pr-recovery-fsm/e2e-test.md
+    test -s tests/e2e/pre-pr-recovery-fsm/testrunner.md
+
 check-e2e-tl-loop-active:
     bash -n tests/e2e/tl-loop-active/run.sh
     {{py}} -m py_compile tests/e2e/tl-loop-active/active_run.py

@@ -922,6 +922,7 @@ def run_root_recursive_lifecycle_probe(
             EffectClient(client, role="tl", name="root"),
             config=TLLoopConfig(
                 active=True,
+                keep_alive_on_waiting=False,
                 max_events=256,
                 poll_interval=0.01,
                 root_dir=state_root,
@@ -1818,7 +1819,7 @@ def _run_restart_case(
     forgejo_url: str,
     *,
     boundary: str,
-) -> None:
+) -> RecoveryTrace:
     if boundary == "dispatch":
         run_id, plan, pr_count_before, merge_count_before = seed_dispatch_restart_run(
             root, repo
@@ -2085,6 +2086,7 @@ def _run_restart_case(
                 f"dispatch restart did not preserve unique owners and branches: "
                 f"slices={result.final_state.slices!r}"
             )
+    return trace
 
 
 def server_event_count(repo: Path, event_type: str) -> int:
@@ -2123,16 +2125,18 @@ def run_delayed_restart_probe(
     root: Path,
     repo: Path,
     forgejo_url: str,
-) -> None:
+) -> dict[str, RecoveryTrace]:
     """Exercise restart recovery at every ordered-controller boundary."""
+    traces: dict[str, RecoveryTrace] = {}
     for boundary in ("dispatch", "aggregate_review", "base_revalidation", "merging"):
-        _run_restart_case(
+        traces[boundary] = _run_restart_case(
             client,
             root,
             repo,
             forgejo_url,
             boundary=boundary,
         )
+    return traces
 
 
 def assert_stage_events(repo: Path, expected_run_id: str | None = None) -> None:
