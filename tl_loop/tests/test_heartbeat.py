@@ -11,6 +11,7 @@ import pytest
 
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.transport import JsonObject
+from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.loop.heartbeat import (
     HeartbeatConfig,
     HeartbeatError,
@@ -20,6 +21,7 @@ from tl_loop.loop.heartbeat import (
     heartbeat_once,
 )
 from tl_loop.state.schema import (
+    DeadlineLedger,
     ParkCause,
     RunState,
     SliceStatus,
@@ -630,6 +632,80 @@ def test_zero_task_budget_disables_enforcement(tmp_path: Path) -> None:
 
     assert result.state.slices["slice-a"].status is SliceStatus.SPAWNED
     assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+
+
+def test_recovery_wait_is_not_charged_to_execution_budget(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    current = state.slices["slice-a"]
+    recovered = replace(
+        current,
+        dispatch_started_at=10.0,
+        task_timeout_seconds=5.0,
+        task_timeout_source="slice",
+        recovery=begin_recovery(
+            cause="external_dependency",
+            owner_run_id=state.run_id,
+            slice_attempt=1,
+            owner_agent_id="agent-slice-a",
+            entered_at=20.0,
+        ),
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": recovered},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    transport = HeartbeatTransport()
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=100.0,
+        project_root=tmp_path,
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.status is SliceStatus.SPAWNED
+    assert observed.recovery is not None
+    assert observed.deadline_ledger == DeadlineLedger(
+        execution_deadline_at=15.0,
+        recovery_deadline_at=1820.0,
+        run_deadline_at=1000.0,
+        suspended_at=20.0,
+        execution_seconds=10.0,
+        recovery_wait_seconds=80.0,
+    )
+    assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+
+
+def test_deadline_ledger_is_durable_and_restart_safe(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    current = state.slices["slice-a"]
+    updated = replace(
+        current,
+        dispatch_started_at=10.0,
+        deadline_ledger=DeadlineLedger(
+            execution_deadline_at=20.0,
+            recovery_deadline_at=None,
+            run_deadline_at=1000.0,
+            suspended_at=None,
+            execution_seconds=7.5,
+            recovery_wait_seconds=0.0,
+        ),
+    )
+    checkpointed = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    restored = store.load().slices["slice-a"]
+    assert checkpointed.slices["slice-a"].deadline_ledger == updated.deadline_ledger
+    assert restored.deadline_ledger == updated.deadline_ledger
 
 
 def _state(

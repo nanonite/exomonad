@@ -62,6 +62,13 @@ for the same heartbeat tick. This rule amends the older liveness wording in
 #893 so silence remains observational while declared resource budgets remain
 auditable enforcement.
 
+Each active slice also carries a durable deadline ledger. `execution_seconds`
+stops at `suspended_at` when recovery begins, `recovery_wait_seconds` measures
+the bounded recovery wait, and the three `*_deadline_at` fields preserve the
+execution, recovery-policy, and run ceilings used for restart reconciliation.
+Recovery waits never consume the execution ceiling, and a terminal invocation
+observation wins over an expiry in the heartbeat that sees both.
+
 ### Pre-publication execution recovery
 
 Execution recovery is independent of the review FSM. A typed

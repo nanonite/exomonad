@@ -28,6 +28,7 @@ from tl_loop.loop.recovery_policy import (
     schedule_probe,
 )
 from tl_loop.state.schema import (
+    DeadlineLedger,
     GoalState,
     ParkCause,
     RunState,
@@ -160,6 +161,13 @@ def heartbeat_once(
         if recovery_progress:
             progress = True
         slice_state = current.slices[slice_state.id]
+        current, slice_state = _record_deadline_ledger(
+            current,
+            slice_state,
+            config=config,
+            now=current_time,
+            store=store,
+        )
         row = worker_rows.get(slice_state.id)
         if row is None:
             runtime_agent_id = slice_state.dispatch_agent_id or slice_state.id
@@ -456,6 +464,74 @@ class _BudgetIntent:
     active: bool = True
 
 
+def _record_deadline_ledger(
+    current: RunState,
+    slice_state: SliceState,
+    *,
+    config: HeartbeatConfig,
+    now: float,
+    store: RunStore,
+) -> tuple[RunState, SliceState]:
+    """Persist the deadline clocks without charging declared recovery waits."""
+    budget = slice_state.task_timeout_seconds
+    source = slice_state.task_timeout_source
+    if budget is None and source is None:
+        budget = config.task_timeout_seconds
+    started_at = slice_state.dispatch_started_at
+    execution_deadline_at = (
+        started_at + budget
+        if started_at is not None and budget is not None and budget > 0
+        else None
+    )
+    recovery = slice_state.recovery
+    recovery_deadline_at = None
+    suspended_at = None
+    previous_recovery_wait = (
+        slice_state.deadline_ledger.recovery_wait_seconds
+        if slice_state.deadline_ledger is not None
+        else 0.0
+    )
+    prior_recovery_wait = previous_recovery_wait
+    if recovery is not None:
+        suspended_at = recovery.entered_at
+        if (
+            slice_state.deadline_ledger is not None
+            and slice_state.deadline_ledger.suspended_at == recovery.entered_at
+        ):
+            prior_recovery_wait = 0.0
+        current_recovery_wait = max(0.0, now - recovery.entered_at)
+        recovery_wait_seconds = prior_recovery_wait + current_recovery_wait
+        policy = policy_for_cause(recovery.cause)
+        if policy.max_wait_seconds > 0:
+            recovery_deadline_at = recovery.entered_at + policy.max_wait_seconds
+    else:
+        recovery_wait_seconds = previous_recovery_wait
+    execution_end = suspended_at if suspended_at is not None else now
+    execution_seconds = (
+        max(0.0, execution_end - started_at - prior_recovery_wait)
+        if started_at is not None
+        else 0.0
+    )
+    deadline_ledger = DeadlineLedger(
+        execution_deadline_at=execution_deadline_at,
+        recovery_deadline_at=recovery_deadline_at,
+        run_deadline_at=current.goals.deadline or None,
+        suspended_at=suspended_at,
+        execution_seconds=execution_seconds,
+        recovery_wait_seconds=recovery_wait_seconds,
+    )
+    if slice_state.deadline_ledger == deadline_ledger:
+        return current, slice_state
+    updated = replace(slice_state, deadline_ledger=deadline_ledger)
+    current = store.checkpoint(
+        current.fsm,
+        {**current.slices, slice_state.id: updated},
+        current.budgets,
+        current.events.last_consumed_offset,
+    )
+    return current, current.slices[slice_state.id]
+
+
 def _enforce_task_budget(
     *,
     current: RunState,
@@ -467,12 +543,16 @@ def _enforce_task_budget(
     project_root: Path,
     store: RunStore,
 ) -> SyntheticHeartbeatEvent | None:
+    # Recovery is a declared blocker, not leaf execution. Its bounded wait is
+    # governed by the recovery policy and must not consume the task budget.
+    if slice_state.recovery is not None:
+        return None
     budget = slice_state.task_timeout_seconds
     budget_source = slice_state.task_timeout_source
     if budget is None and budget_source is None:
         budget = config.task_timeout_seconds
         budget_source = "built_in"
-    if budget is None or slice_state.dispatch_started_at is None:
+    if budget is None or budget <= 0 or slice_state.dispatch_started_at is None:
         return None
     elapsed = max(0.0, now - slice_state.dispatch_started_at)
     if elapsed < budget:

@@ -69,6 +69,33 @@ class SuspendedDependencyState:
             raise ValueError("suspended dependency recovery_generation must be non-negative")
 
 
+@dataclass(frozen=True)
+class DeadlineLedger:
+    """Deterministic execution, recovery, and run deadline telemetry."""
+
+    execution_deadline_at: float | None
+    recovery_deadline_at: float | None
+    run_deadline_at: float | None
+    suspended_at: float | None
+    execution_seconds: float
+    recovery_wait_seconds: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "execution_deadline_at",
+            "recovery_deadline_at",
+            "run_deadline_at",
+            "suspended_at",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"deadline {name} must be non-negative or null")
+        for name in ("execution_seconds", "recovery_wait_seconds"):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"deadline {name} must be non-negative")
+
+
 class ParkCause(str, Enum):
     """Closed reasons that can park a slice for human action."""
 
@@ -258,6 +285,7 @@ SLICE_KEYS = frozenset(
         "task_timeout_source",
         "recovery",
         "suspended_dependency",
+        "deadline_ledger",
     }
 )
 RECONCILIATION_KEYS = frozenset(
@@ -315,6 +343,16 @@ RECOVERY_KEYS = frozenset(
     }
 )
 SUSPENDED_DEPENDENCY_KEYS = frozenset({"blocked_by", "prior_status", "recovery_generation"})
+DEADLINE_LEDGER_KEYS = frozenset(
+    {
+        "execution_deadline_at",
+        "recovery_deadline_at",
+        "run_deadline_at",
+        "suspended_at",
+        "execution_seconds",
+        "recovery_wait_seconds",
+    }
+)
 BUDGET_KEYS = frozenset({"ledger"})
 LEDGER_KEYS = frozenset(
     {
@@ -396,6 +434,7 @@ class SliceState:
     task_timeout_source: str | None = None
     recovery: RecoveryState | None = None
     suspended_dependency: SuspendedDependencyState | None = None
+    deadline_ledger: DeadlineLedger | None = None
 
 
 @dataclass(frozen=True)
@@ -843,6 +882,7 @@ def _validate_slice(
     _nullable_string(value, "task_timeout_source", path, errors)
     _validate_recovery(value.get("recovery"), path, errors)
     _validate_suspended_dependency(value.get("suspended_dependency"), path, errors)
+    _validate_deadline_ledger(value.get("deadline_ledger"), path, errors)
     if value.get("status") == SliceStatus.SPAWNED.value:
         _non_empty_string(value, "dispatch_intent_id", path, errors)
         _non_empty_string(value, "dispatch_agent_id", path, errors)
@@ -1039,6 +1079,23 @@ def _validate_suspended_dependency(value: object, path: str, errors: list[tuple[
         f"{path}.suspended_dependency",
         errors,
     )
+
+
+def _validate_deadline_ledger(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    ledger = _object(value, f"{path}.deadline_ledger", DEADLINE_LEDGER_KEYS, errors)
+    if ledger is None:
+        return
+    for key in (
+        "execution_deadline_at",
+        "recovery_deadline_at",
+        "run_deadline_at",
+        "suspended_at",
+    ):
+        _nullable_number(ledger, key, f"{path}.deadline_ledger", errors)
+    for key in ("execution_seconds", "recovery_wait_seconds"):
+        _non_negative_number(ledger, key, f"{path}.deadline_ledger", errors)
 
 
 def _budgets(value: object, errors: list[tuple[str, str]]) -> None:

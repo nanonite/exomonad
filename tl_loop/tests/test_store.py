@@ -13,6 +13,7 @@ from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 from tl_loop.state.schema import (
     BudgetLedger,
+    DeadlineLedger,
     FSMState,
     GateStatus,
     IntegrationCandidateState,
@@ -114,6 +115,33 @@ def test_dependency_recovery_suspension_round_trips(tmp_path: Path) -> None:
     restored = load(store.path)
     assert restored.slices["dependent"].suspended_dependency == dependent.suspended_dependency
     assert restored.slices["blocker"].recovery == blocker.recovery
+
+
+def test_deadline_ledger_round_trips(tmp_path: Path) -> None:
+    store = RunStore("deadline-run", tmp_path)
+    create("deadline-run", {}, root_dir=tmp_path)
+    value = replace(
+        _slice("leaf", SliceStatus.SPAWNED, "src/leaf.py"),
+        dispatch_intent_id="intent",
+        dispatch_agent_id="agent-leaf",
+        dispatch_authoritative_event_seq=1,
+        deadline_ledger=DeadlineLedger(
+            execution_deadline_at=100.0,
+            recovery_deadline_at=200.0,
+            run_deadline_at=300.0,
+            suspended_at=50.0,
+            execution_seconds=40.0,
+            recovery_wait_seconds=10.0,
+        ),
+    )
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("leaf",)),
+        {"leaf": value},
+        BudgetLedger(tokens=0, wall_seconds=0),
+        offset=0,
+    )
+
+    assert load(store.path).slices["leaf"].deadline_ledger == value.deadline_ledger
 
 
 def test_nested_child_recovery_projection_round_trips(tmp_path: Path) -> None:

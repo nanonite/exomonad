@@ -38,6 +38,7 @@ from .schema import (
     ActualTokens,
     BudgetCharge,
     BudgetLedger,
+    DeadlineLedger,
     EventCursor,
     FSMState,
     GateState,
@@ -714,6 +715,15 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
                 "prior_status": value.suspended_dependency.prior_status.value,
                 "recovery_generation": value.suspended_dependency.recovery_generation,
             }
+        if value.deadline_ledger is not None:
+            record["deadline_ledger"] = {
+                "execution_deadline_at": value.deadline_ledger.execution_deadline_at,
+                "recovery_deadline_at": value.deadline_ledger.recovery_deadline_at,
+                "run_deadline_at": value.deadline_ledger.run_deadline_at,
+                "suspended_at": value.deadline_ledger.suspended_at,
+                "execution_seconds": value.deadline_ledger.execution_seconds,
+                "recovery_wait_seconds": value.deadline_ledger.recovery_wait_seconds,
+            }
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
@@ -1159,6 +1169,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         task_timeout_source=cast(str | None, value.get("task_timeout_source")),
         recovery=decode_recovery(value.get("recovery")),
         suspended_dependency=_decode_suspended_dependency(value.get("suspended_dependency")),
+        deadline_ledger=_decode_deadline_ledger(value.get("deadline_ledger")),
     )
 
 
@@ -1169,6 +1180,19 @@ def _decode_suspended_dependency(value: object) -> SuspendedDependencyState | No
         blocked_by=cast(str, value["blocked_by"]),
         prior_status=SliceStatus(cast(str, value["prior_status"])),
         recovery_generation=cast(int, value["recovery_generation"]),
+    )
+
+
+def _decode_deadline_ledger(value: object) -> DeadlineLedger | None:
+    if not isinstance(value, Mapping):
+        return None
+    return DeadlineLedger(
+        execution_deadline_at=cast(float | None, value.get("execution_deadline_at")),
+        recovery_deadline_at=cast(float | None, value.get("recovery_deadline_at")),
+        run_deadline_at=cast(float | None, value.get("run_deadline_at")),
+        suspended_at=cast(float | None, value.get("suspended_at")),
+        execution_seconds=cast(float, value.get("execution_seconds", 0.0)),
+        recovery_wait_seconds=cast(float, value.get("recovery_wait_seconds", 0.0)),
     )
 
 

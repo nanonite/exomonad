@@ -91,6 +91,14 @@ then project `tl_task_timeout_seconds` in `.exo/config.toml`, then the built-in
 controller persists the resolved value and dispatch timestamp, and only the
 heartbeat may enforce it; observational stall thresholds never kill a worker.
 
+The checkpoint's `deadline_ledger` makes the accounting auditable across a
+restart. `execution_seconds` excludes time after a slice enters recovery;
+`recovery_wait_seconds` records that separate bounded wait, while
+`execution_deadline_at`, `recovery_deadline_at`, and `run_deadline_at` identify
+the three ceilings. A terminal invocation record is reconciled before a task
+budget disposal in the same heartbeat, so elapsed time never overrides
+authoritative lifecycle evidence.
+
 ### How the selector spends this
 
 Before a spawn is written to run state, the selector estimates its cost and
@@ -863,6 +871,7 @@ the only operator mutation; do not manually mark a stage merged.
 | `review_stuck` | Review rounds exceeded without convergence | Human reads the PR |
 | `harness_switch_requested` | The configured harness could not proceed | Approve explicitly; set `EXOMONAD_ALLOW_HARNESS_SWITCH=1` |
 | `stall_detected` | Dead pane or no progress past the heartbeat threshold | Investigate the worker |
+| `task_budget_exceeded` | A declared slice execution ceiling elapsed | Inspect the deadline ledger and adjust the task budget or plan |
 
 The controller does not retry past a ceiling, coax a model into continuing, or
 pick a different harness on its own. Every one of these becomes a durable,
