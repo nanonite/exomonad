@@ -188,6 +188,7 @@ pub enum NotifyStatus {
     Success,
     Failure,
     Stuck,
+    Blocked,
 }
 
 impl NotifyStatus {
@@ -196,7 +197,18 @@ impl NotifyStatus {
         match s {
             "failure" => NotifyStatus::Failure,
             "stuck" => NotifyStatus::Stuck,
+            "blocked" => NotifyStatus::Blocked,
             _ => NotifyStatus::Success,
+        }
+    }
+
+    /// Parse a wire status fail-closed at the MCP boundary.
+    pub fn parse_wire(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "success" => Ok(NotifyStatus::Success),
+            "failure" => Ok(NotifyStatus::Failure),
+            "blocked" => Ok(NotifyStatus::Blocked),
+            _ => Err("status must be one of success, failure, or blocked"),
         }
     }
 
@@ -205,6 +217,7 @@ impl NotifyStatus {
             NotifyStatus::Success => "success",
             NotifyStatus::Failure => "failure",
             NotifyStatus::Stuck => "stuck",
+            NotifyStatus::Blocked => "blocked",
         }
     }
 }
@@ -225,6 +238,7 @@ pub fn format_parent_notification(
     let default_msg = match status {
         NotifyStatus::Failure => "Task failed.",
         NotifyStatus::Stuck => "Review did not converge. Human intervention required.",
+        NotifyStatus::Blocked => "Task is externally blocked. Human intervention required.",
         NotifyStatus::Success => "Status update.",
     };
     let msg = if message.is_empty() {
@@ -235,6 +249,7 @@ pub fn format_parent_notification(
     match status {
         NotifyStatus::Failure => format!("[FAILED: {}] {}", agent_id, msg),
         NotifyStatus::Stuck => format!("[STUCK: {}] {}", agent_id, msg),
+        NotifyStatus::Blocked => format!("[BLOCKED: {}] {}", agent_id, msg),
         NotifyStatus::Success => format!("[from: {}] {}", agent_id, msg),
     }
 }

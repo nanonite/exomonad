@@ -24,6 +24,9 @@ module ExoMonad.Guest.Tools.Events
     -- * Args types (role wrappers need these)
     NotifyParentArgs (..),
     NotifyStatus (..),
+    BlockedCause (..),
+    BlockedEvidence (..),
+    BlockedReport (..),
     TaskReport (..),
     SendMessageArgs (..),
 
@@ -34,12 +37,14 @@ where
 
 import Control.Monad (void)
 import Control.Monad.Freer (Eff)
-import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.!=), (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
+import Data.Aeson.Types (Parser)
 import Data.ByteString.Lazy qualified as BSL
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
+import Data.Vector qualified as V
 import Effects.Log qualified as Log
 import ExoMonad.Effects.Events qualified as ProtoEvents
 import ExoMonad.Effects.Log (LogEmitEvent)
@@ -48,30 +53,162 @@ import ExoMonad.Guest.Tool.Schema (JsonSchema (..), genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
 import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
+import Proto3.Suite.Types (Enumerated (..))
 
 -- | Notify parent tool (for workers/subtrees to call on completion)
 data NotifyParent = NotifyParent
 
 -- | Status for notify_parent tool.
-data NotifyStatus = Success | Failure
-  deriving (Show, Eq, Generic, JsonSchema)
+data NotifyStatus = Success | Failure | Blocked
+  deriving (Show, Eq, Generic)
+
+instance JsonSchema NotifyStatus where
+  toSchema =
+    object
+      [ "type" .= ("string" :: Text),
+        "enum" .= (["success", "failure", "blocked"] :: [Text])
+      ]
 
 instance FromJSON NotifyStatus where
   parseJSON = Aeson.withText "NotifyStatus" $ \case
     "success" -> pure Success
     "failure" -> pure Failure
+    "blocked" -> pure Blocked
     other -> fail $ "Unknown status: " <> T.unpack other
 
 instance ToJSON NotifyStatus where
   toJSON Success = Aeson.String "success"
   toJSON Failure = Aeson.String "failure"
+  toJSON Blocked = Aeson.String "blocked"
+
+data BlockedCause
+  = BaseCiUnstable
+  | ExternalDependency
+  | ScopeBoundary
+  | HumanDecisionRequired
+  | ToolingUnavailable
+  deriving (Show, Eq, Generic)
+
+instance JsonSchema BlockedCause where
+  toSchema =
+    object
+      [ "type" .= ("string" :: Text),
+        "enum" .= (["base_ci_unstable", "external_dependency", "scope_boundary", "human_decision_required", "tooling_unavailable"] :: [Text])
+      ]
+
+instance FromJSON BlockedCause where
+  parseJSON = Aeson.withText "BlockedCause" $ \case
+    "base_ci_unstable" -> pure BaseCiUnstable
+    "external_dependency" -> pure ExternalDependency
+    "scope_boundary" -> pure ScopeBoundary
+    "human_decision_required" -> pure HumanDecisionRequired
+    "tooling_unavailable" -> pure ToolingUnavailable
+    other -> fail $ "Unknown blocked cause: " <> T.unpack other
+
+instance ToJSON BlockedCause where
+  toJSON BaseCiUnstable = Aeson.String "base_ci_unstable"
+  toJSON ExternalDependency = Aeson.String "external_dependency"
+  toJSON ScopeBoundary = Aeson.String "scope_boundary"
+  toJSON HumanDecisionRequired = Aeson.String "human_decision_required"
+  toJSON ToolingUnavailable = Aeson.String "tooling_unavailable"
+
+data BlockedEvidence = BlockedEvidence
+  { beBaseSha :: Maybe Text,
+    beHeadSha :: Maybe Text,
+    beFailedChecks :: [Text],
+    beEvidenceSummary :: Text
+  }
+  deriving (Generic, Show, Eq)
+
+instance FromJSON BlockedEvidence where
+  parseJSON = withObject "BlockedEvidence" $ \v ->
+    BlockedEvidence
+      <$> v .:? "base_sha"
+      <*> v .:? "head_sha"
+      <*> v .:? "failed_checks" .!= []
+      <*> v .: "evidence_summary"
+
+instance ToJSON BlockedEvidence where
+  toJSON evidence =
+    object
+      [ "base_sha" .= beBaseSha evidence,
+        "head_sha" .= beHeadSha evidence,
+        "failed_checks" .= beFailedChecks evidence,
+        "evidence_summary" .= beEvidenceSummary evidence
+      ]
+
+instance JsonSchema BlockedEvidence where
+  toSchema =
+    Aeson.Object $
+      genericToolSchemaWith @BlockedEvidence
+        [ ("base_sha", "Verified base commit SHA, when available."),
+          ("head_sha", "Verified task head SHA, when available."),
+          ("failed_checks", "Failed checks attributable to the blocker."),
+          ("evidence_summary", "Bounded, human-readable evidence summary.")
+        ]
+
+data BlockedReport = BlockedReport
+  { brCause :: BlockedCause,
+    brNeedsHuman :: Bool,
+    brScopeAttribution :: Text,
+    brRetryable :: Bool,
+    brRecoveryAction :: Text,
+    brEvidence :: BlockedEvidence
+  }
+  deriving (Generic, Show, Eq)
+
+instance FromJSON BlockedReport where
+  parseJSON = withObject "BlockedReport" $ \v -> do
+    report <-
+      BlockedReport
+        <$> v .: "cause"
+        <*> v .: "needs_human"
+        <*> v .: "scope_attribution"
+        <*> v .: "retryable"
+        <*> v .: "recovery_action"
+        <*> v .: "evidence"
+    validateBlockedReport report
+    pure report
+
+instance ToJSON BlockedReport where
+  toJSON report =
+    object
+      [ "cause" .= brCause report,
+        "needs_human" .= brNeedsHuman report,
+        "scope_attribution" .= brScopeAttribution report,
+        "retryable" .= brRetryable report,
+        "recovery_action" .= brRecoveryAction report,
+        "evidence" .= brEvidence report
+      ]
+
+instance JsonSchema BlockedReport where
+  toSchema =
+    Aeson.Object $
+      genericToolSchemaWith @BlockedReport
+        [ ("cause", "Closed vocabulary for the external blocker."),
+          ("needs_human", "Must be true for a blocked handoff."),
+          ("scope_attribution", "Whether the blocker is task, base, or external scope."),
+          ("retryable", "Whether the same task can be retried after recovery."),
+          ("recovery_action", "Concrete human or system recovery action."),
+          ("evidence", "Structured base/head/check evidence.")
+        ]
+
+validateBlockedReport :: BlockedReport -> Parser ()
+validateBlockedReport report
+  | not (brNeedsHuman report) = fail "blocked handoff requires needs_human=true"
+  | T.null (T.strip (brScopeAttribution report)) = fail "blocked handoff requires scope_attribution"
+  | T.null (T.strip (brRecoveryAction report)) = fail "blocked handoff requires recovery_action"
+  | T.null (T.strip (beEvidenceSummary (brEvidence report))) = fail "blocked handoff requires evidence_summary"
+  | null (beFailedChecks (brEvidence report)) && beBaseSha (brEvidence report) == Nothing && beHeadSha (brEvidence report) == Nothing =
+      fail "blocked handoff requires a check, base SHA, or head SHA"
+  | otherwise = pure ()
 
 -- | Structured task report for enriched notifications.
 data TaskReport = TaskReport
   { trWhat :: Text,
     trHow :: Text
   }
-  deriving (Generic, Show)
+  deriving (Generic, Show, Eq)
 
 instance JsonSchema TaskReport where
   toSchema =
@@ -92,17 +229,26 @@ data NotifyParentArgs = NotifyParentArgs
   { npStatus :: NotifyStatus,
     npMessage :: Text,
     npPrNumber :: Maybe Int,
-    npTasksCompleted :: Maybe [TaskReport]
+    npTasksCompleted :: Maybe [TaskReport],
+    npBlocked :: Maybe BlockedReport
   }
-  deriving (Generic, Show)
+  deriving (Generic, Show, Eq)
 
 instance FromJSON NotifyParentArgs where
-  parseJSON = withObject "NotifyParentArgs" $ \v ->
-    NotifyParentArgs
-      <$> v .: "status"
-      <*> v .: "message"
-      <*> v .:? "pr_number"
-      <*> v .:? "tasks_completed"
+  parseJSON = withObject "NotifyParentArgs" $ \v -> do
+    args <-
+      NotifyParentArgs
+        <$> v .: "status"
+        <*> v .: "message"
+        <*> v .:? "pr_number"
+        <*> v .:? "tasks_completed"
+        <*> v .:? "blocked"
+    case (npStatus args, npBlocked args) of
+      (Blocked, Nothing) -> fail "status=blocked requires blocked evidence"
+      (Blocked, Just _) | T.null (T.strip (npMessage args)) -> fail "blocked handoff requires message"
+      (Success, Just _) -> fail "blocked evidence is only valid with status=blocked"
+      (Failure, Just _) -> fail "blocked evidence is only valid with status=blocked"
+      _ -> pure args
 
 instance ToJSON NotifyParentArgs where
   toJSON args =
@@ -110,7 +256,8 @@ instance ToJSON NotifyParentArgs where
       [ "status" .= npStatus args,
         "message" .= npMessage args,
         "pr_number" .= npPrNumber args,
-        "tasks_completed" .= npTasksCompleted args
+        "tasks_completed" .= npTasksCompleted args,
+        "blocked" .= npBlocked args
       ]
 
 -- | Shared tool description for notify_parent.
@@ -121,10 +268,11 @@ notifyParentDescription = "Send a message to your parent agent. Use for status u
 notifyParentSchema :: Aeson.Object
 notifyParentSchema =
   genericToolSchemaWith @NotifyParentArgs
-    [ ("status", "'success' = normal message (status update, progress report). 'failure' = escalation, something went wrong."),
+    [ ("status", "'success' = normal message. 'failure' = task failure. 'blocked' = typed external blocker requiring human action."),
       ("message", "The message to send. Be concise — one or two sentences."),
       ("pr_number", "PR number if relevant. Helps parent locate the PR without searching."),
-      ("tasks_completed", "Array of {what, how} pairs. 'what' = task description, 'how' = verification command that was run.")
+      ("tasks_completed", "Array of {what, how} pairs. 'what' = task description, 'how' = verification command that was run."),
+      ("blocked", "Required when status=blocked: cause, human-guidance requirement, scope, retry policy, recovery action, and structured evidence.")
     ]
 
 -- | Core notify_parent I/O: emit event + deliver message to parent.
@@ -140,13 +288,16 @@ notifyParentCore args = do
                 "message" .= npMessage args,
                 "pr_number" .= npPrNumber args,
                 "tasks_completed" .= npTasksCompleted args,
+                "blocked" .= npBlocked args,
                 "head_sha" .= (Nothing :: Maybe Text),
                 "head_sha_finding" .= ("not_available_without_verified_pr_context" :: Text)
               ]
   void $
     suspendEffect_ @LogEmitEvent
       ( Log.EmitEventRequest
-          { Log.emitEventRequestEventType = "agent.completed",
+          { Log.emitEventRequestEventType = case npStatus args of
+              Blocked -> "agent.task_blocked"
+              _ -> "agent.completed",
             Log.emitEventRequestPayload = eventPayload,
             Log.emitEventRequestTimestamp = 0
           }
@@ -156,13 +307,15 @@ notifyParentCore args = do
   let statusText = case npStatus args of
         Success -> "success" :: Text
         Failure -> "failure"
+        Blocked -> "blocked"
   result <-
     suspendEffect @ProtoEvents.EventsNotifyParent
       ( ProtoEvents.NotifyParentRequest
           { ProtoEvents.notifyParentRequestAgentId = "",
             ProtoEvents.notifyParentRequestStatus = TL.fromStrict statusText,
             ProtoEvents.notifyParentRequestMessage = TL.fromStrict richMessage,
-            ProtoEvents.notifyParentRequestOverrideRecipient = Nothing
+            ProtoEvents.notifyParentRequestOverrideRecipient = Nothing,
+            ProtoEvents.notifyParentRequestTaskOutcome = protoBlocked (npBlocked args)
           }
       )
   case result of
@@ -179,7 +332,41 @@ composeNotifyMessage args =
       taskLines = case npTasksCompleted args of
         Just tasks -> T.concat ["\n  - " <> trWhat t <> " (verified: " <> trHow t <> ")" | t <- tasks]
         Nothing -> ""
-   in base <> prSuffix <> taskLines
+      blockedLine = case npBlocked args of
+        Just report -> "\n  blocker: " <> T.pack (show (brCause report)) <> "; recovery: " <> brRecoveryAction report
+        Nothing -> ""
+   in base <> prSuffix <> taskLines <> blockedLine
+
+protoBlocked :: Maybe BlockedReport -> Maybe ProtoEvents.NotifyParentRequestTaskOutcome
+protoBlocked Nothing = Nothing
+protoBlocked (Just report) =
+  Just
+    ( ProtoEvents.NotifyParentRequestTaskOutcomeBlocked $
+        ProtoEvents.TaskBlocked
+          { ProtoEvents.taskBlockedCause = Enumerated (Right (protoCause (brCause report))),
+            ProtoEvents.taskBlockedNeedsHuman = brNeedsHuman report,
+            ProtoEvents.taskBlockedScopeAttribution = TL.fromStrict (brScopeAttribution report),
+            ProtoEvents.taskBlockedRetryable = brRetryable report,
+            ProtoEvents.taskBlockedRecoveryAction = TL.fromStrict (brRecoveryAction report),
+            ProtoEvents.taskBlockedEvidence = Just (protoEvidence (brEvidence report))
+          }
+    )
+
+protoEvidence :: BlockedEvidence -> ProtoEvents.TaskBlockedEvidence
+protoEvidence evidence =
+  ProtoEvents.TaskBlockedEvidence
+    { ProtoEvents.taskBlockedEvidenceBaseSha = TL.fromStrict (maybe "" id (beBaseSha evidence)),
+      ProtoEvents.taskBlockedEvidenceHeadSha = TL.fromStrict (maybe "" id (beHeadSha evidence)),
+      ProtoEvents.taskBlockedEvidenceFailedChecks = V.fromList (TL.fromStrict <$> beFailedChecks evidence),
+      ProtoEvents.taskBlockedEvidenceEvidenceSummary = TL.fromStrict (beEvidenceSummary evidence)
+    }
+
+protoCause :: BlockedCause -> ProtoEvents.TaskBlockCause
+protoCause BaseCiUnstable = ProtoEvents.TaskBlockCauseTASK_BLOCK_CAUSE_BASE_CI_UNSTABLE
+protoCause ExternalDependency = ProtoEvents.TaskBlockCauseTASK_BLOCK_CAUSE_EXTERNAL_DEPENDENCY
+protoCause ScopeBoundary = ProtoEvents.TaskBlockCauseTASK_BLOCK_CAUSE_SCOPE_BOUNDARY
+protoCause HumanDecisionRequired = ProtoEvents.TaskBlockCauseTASK_BLOCK_CAUSE_HUMAN_DECISION_REQUIRED
+protoCause ToolingUnavailable = ProtoEvents.TaskBlockCauseTASK_BLOCK_CAUSE_TOOLING_UNAVAILABLE
 
 -- | Shared args for agent-to-agent message tools.
 data SendMessageArgs = SendMessageArgs

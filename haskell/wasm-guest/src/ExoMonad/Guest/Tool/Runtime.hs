@@ -272,7 +272,8 @@ handleWorkerExit hookInput = do
                 { ProtoEvents.notifyParentRequestAgentId = TL.fromStrict agentId,
                   ProtoEvents.notifyParentRequestStatus = TL.fromStrict status,
                   ProtoEvents.notifyParentRequestMessage = TL.fromStrict statusMsg,
-                  ProtoEvents.notifyParentRequestOverrideRecipient = Nothing
+                  ProtoEvents.notifyParentRequestOverrideRecipient = Nothing,
+                  ProtoEvents.notifyParentRequestTaskOutcome = Nothing
                 }
             )
         case res of

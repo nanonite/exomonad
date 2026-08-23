@@ -91,6 +91,69 @@ fn is_parent_alias(address: &Address) -> bool {
     matches!(address, Address::Agent(name) if name.as_str() == "parent")
 }
 
+fn validate_notify_parent_request(
+    req: &NotifyParentRequest,
+) -> EffectResult<crate::services::delivery::NotifyStatus> {
+    let status = crate::services::delivery::NotifyStatus::parse_wire(&req.status)
+        .map_err(|message| crate::effects::EffectError::custom("events.invalid_input", message))?;
+    match (status, req.task_outcome.as_ref()) {
+        (
+            crate::services::delivery::NotifyStatus::Blocked,
+            Some(notify_parent_request::TaskOutcome::Blocked(blocked)),
+        ) => {
+            let cause = TaskBlockCause::try_from(blocked.cause).map_err(|_| {
+                crate::effects::EffectError::custom(
+                    "events.invalid_input",
+                    "blocked handoff has an unknown task block cause",
+                )
+            })?;
+            if cause == TaskBlockCause::Unspecified {
+                return Err(crate::effects::EffectError::custom(
+                    "events.invalid_input",
+                    "blocked handoff requires a concrete task block cause",
+                ));
+            }
+            if !blocked.needs_human
+                || blocked.scope_attribution.trim().is_empty()
+                || blocked.recovery_action.trim().is_empty()
+            {
+                return Err(crate::effects::EffectError::custom(
+                    "events.invalid_input",
+                    "blocked handoff requires human guidance, scope attribution, and recovery action",
+                ));
+            }
+            let evidence = blocked.evidence.as_ref().ok_or_else(|| {
+                crate::effects::EffectError::custom(
+                    "events.invalid_input",
+                    "blocked handoff requires structured evidence",
+                )
+            })?;
+            if evidence.evidence_summary.trim().is_empty()
+                || (evidence.base_sha.is_empty()
+                    && evidence.head_sha.is_empty()
+                    && evidence.failed_checks.is_empty())
+            {
+                return Err(crate::effects::EffectError::custom(
+                    "events.invalid_input",
+                    "blocked handoff evidence must include a summary and a check or SHA",
+                ));
+            }
+            Ok(status)
+        }
+        (crate::services::delivery::NotifyStatus::Blocked, _) => {
+            Err(crate::effects::EffectError::custom(
+                "events.invalid_input",
+                "status=blocked requires the structured blocked handoff",
+            ))
+        }
+        (_, Some(_)) => Err(crate::effects::EffectError::custom(
+            "events.invalid_input",
+            "structured blocked handoff is only valid with status=blocked",
+        )),
+        (status, None) => Ok(status),
+    }
+}
+
 fn silent_noop_handoff(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
@@ -128,7 +191,8 @@ fn capture_parent_notification<C: HasSessionMemory + HasEventLog>(
     let kind = match status {
         crate::services::delivery::NotifyStatus::Success => MemoryKind::ChildHandoff,
         crate::services::delivery::NotifyStatus::Failure
-        | crate::services::delivery::NotifyStatus::Stuck => MemoryKind::Blocker,
+        | crate::services::delivery::NotifyStatus::Stuck
+        | crate::services::delivery::NotifyStatus::Blocked => MemoryKind::Blocker,
     };
     let summary = match kind {
         MemoryKind::ChildHandoff => format!("Child handoff reported to parent {parent_session_id}"),
@@ -140,6 +204,7 @@ fn capture_parent_notification<C: HasSessionMemory + HasEventLog>(
         status,
         crate::services::delivery::NotifyStatus::Failure
             | crate::services::delivery::NotifyStatus::Stuck
+            | crate::services::delivery::NotifyStatus::Blocked
     ) && silent_noop_handoff(message)
     {
         if let Some(log) = services.event_log() {
@@ -305,6 +370,7 @@ impl<
         req: NotifyParentRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<NotifyParentResponse> {
+        let status = validate_notify_parent_request(&req)?;
         let birth_branch = &ctx.birth_branch;
         let agent_name = &ctx.agent_name;
 
@@ -373,7 +439,6 @@ impl<
                 Address::Supervisor => unreachable!(),
             };
 
-            let status = crate::services::delivery::NotifyStatus::parse(&req.status);
             let delivery_result = crate::services::delivery::notify_parent_delivery(
                 &*self.ctx,
                 &agent_id,
@@ -413,7 +478,6 @@ impl<
                 Some(self.ctx.agent_resolver()),
             );
 
-            let status = crate::services::delivery::NotifyStatus::parse(&req.status);
             let delivery_result = crate::services::delivery::notify_parent_delivery(
                 &*self.ctx,
                 &agent_id,
@@ -458,7 +522,6 @@ impl<
             Some(self.ctx.agent_resolver()),
         );
 
-        let status = crate::services::delivery::NotifyStatus::parse(&req.status);
         let delivery_result = crate::services::delivery::notify_parent_delivery(
             &*self.ctx,
             &agent_id,
@@ -610,6 +673,73 @@ mod tests {
         assert_eq!(handler.namespace(), "events");
     }
 
+    fn valid_blocked_request() -> NotifyParentRequest {
+        NotifyParentRequest {
+            status: "blocked".to_string(),
+            message: "base CI is unstable".to_string(),
+            agent_id: "leaf".to_string(),
+            override_recipient: None,
+            task_outcome: Some(notify_parent_request::TaskOutcome::Blocked(TaskBlocked {
+                cause: TaskBlockCause::BaseCiUnstable as i32,
+                needs_human: true,
+                scope_attribution: "base".to_string(),
+                retryable: true,
+                recovery_action: "rebase after CI repair".to_string(),
+                evidence: Some(TaskBlockedEvidence {
+                    base_sha: "base-sha".to_string(),
+                    head_sha: "head-sha".to_string(),
+                    failed_checks: vec!["ci/test".to_string()],
+                    evidence_summary: "failure is reproducible on the base".to_string(),
+                }),
+            })),
+        }
+    }
+
+    #[test]
+    fn blocked_notify_parent_request_validates() {
+        assert_eq!(
+            validate_notify_parent_request(&valid_blocked_request())
+                .expect("valid blocked request"),
+            crate::services::delivery::NotifyStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn blocked_notify_parent_rejects_unknown_cause() {
+        let mut request = valid_blocked_request();
+        if let Some(notify_parent_request::TaskOutcome::Blocked(blocked)) =
+            request.task_outcome.as_mut()
+        {
+            blocked.cause = 99;
+        }
+        assert!(validate_notify_parent_request(&request).is_err());
+    }
+
+    #[test]
+    fn blocked_notify_parent_rejects_missing_evidence() {
+        let mut request = valid_blocked_request();
+        if let Some(notify_parent_request::TaskOutcome::Blocked(blocked)) =
+            request.task_outcome.as_mut()
+        {
+            blocked.evidence = None;
+        }
+        assert!(validate_notify_parent_request(&request).is_err());
+    }
+
+    #[test]
+    fn blocked_notify_parent_rejects_contradictory_status() {
+        let mut request = valid_blocked_request();
+        request.status = "success".to_string();
+        assert!(validate_notify_parent_request(&request).is_err());
+    }
+
+    #[test]
+    fn blocked_notify_parent_rejects_unknown_status() {
+        let mut request = valid_blocked_request();
+        request.status = "stuck".to_string();
+        assert!(validate_notify_parent_request(&request).is_err());
+    }
+
     fn test_ctx(agent_name: &str, birth_branch: &str) -> crate::effects::EffectContext {
         crate::effects::EffectContext {
             agent_name: AgentName::try_from_str(agent_name)
@@ -712,6 +842,7 @@ mod tests {
                     status: "success".to_string(),
                     message: body.clone(),
                     override_recipient: None,
+                    task_outcome: None,
                 },
                 &ctx,
             )
@@ -787,6 +918,7 @@ mod tests {
                 override_recipient: Some(ProtoAddress {
                     kind: Some(Kind::Agent("parent".to_string())),
                 }),
+                task_outcome: None,
             },
             &ctx,
         )
@@ -835,6 +967,7 @@ mod tests {
                 status: "success".to_string(),
                 message: "finished the assigned work".to_string(),
                 override_recipient: proto_agent_address("root"),
+                task_outcome: None,
             },
             &ctx,
         )
@@ -871,6 +1004,7 @@ mod tests {
                 status: "failure".to_string(),
                 message: "the implementation is blocked".to_string(),
                 override_recipient: proto_agent_address("root"),
+                task_outcome: None,
             },
             &ctx,
         )
@@ -919,6 +1053,7 @@ mod tests {
                 status: "success".to_string(),
                 message: "delivery remains authoritative".to_string(),
                 override_recipient: proto_agent_address("root"),
+                task_outcome: None,
             },
             &ctx,
         )

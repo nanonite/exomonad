@@ -72,7 +72,7 @@ instance MCPTool DevFilePR where
             (PRCreated (fpoNumber output) (fpoUrl output) (fpoHeadBranch output))
         pure $ successResult (Aeson.toJSON output)
 
--- | Dev-specific notify_parent: notifies parent, then transitions to DevDone/DevFailed.
+-- | Dev-specific notify_parent: notifies parent, then transitions successful/failed work; blocked handoffs remain parked for TL recovery.
 data DevNotifyParent
 
 instance MCPTool DevNotifyParent where
@@ -89,6 +89,7 @@ instance MCPTool DevNotifyParent where
         case npStatus args of
           Success -> void $ applyEvent @DevPhase @DevEvent branch DevSpawned (NotifyParentSuccess (npMessage args))
           Failure -> void $ applyEvent @DevPhase @DevEvent branch DevSpawned (NotifyParentFailure (npMessage args))
+          Blocked -> pure ()
         pure $ successResult $ object ["success" .= True]
 
 data DevTaskList

@@ -103,11 +103,39 @@ message SendMailboxMessageResponse {
 // NotifyParent - Notify parent session of worker completion
 // ============================================================================
 
+enum TaskBlockCause {
+  TASK_BLOCK_CAUSE_UNSPECIFIED = 0;
+  TASK_BLOCK_CAUSE_BASE_CI_UNSTABLE = 1;
+  TASK_BLOCK_CAUSE_EXTERNAL_DEPENDENCY = 2;
+  TASK_BLOCK_CAUSE_SCOPE_BOUNDARY = 3;
+  TASK_BLOCK_CAUSE_HUMAN_DECISION_REQUIRED = 4;
+  TASK_BLOCK_CAUSE_TOOLING_UNAVAILABLE = 5;
+}
+
+message TaskBlockedEvidence {
+  string base_sha = 1;
+  string head_sha = 2;
+  repeated string failed_checks = 3;
+  string evidence_summary = 4;
+}
+
+message TaskBlocked {
+  TaskBlockCause cause = 1;
+  bool needs_human = 2;
+  string scope_attribution = 3;
+  bool retryable = 4;
+  string recovery_action = 5;
+  TaskBlockedEvidence evidence = 6;
+}
+
 message NotifyParentRequest {
-  string status = 1;    // "success" | "failure"
+  string status = 1;    // "success" | "failure" | "blocked"
   string message = 2;   // completion message
   string agent_id = 3;  // identity of the notifying agent
   Address override_recipient = 4;  // optional: bypass default supervisor routing
+  oneof task_outcome {
+    TaskBlocked blocked = 5;
+  }
 }
 
 message NotifyParentResponse {

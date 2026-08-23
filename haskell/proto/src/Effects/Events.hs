@@ -1880,12 +1880,482 @@ instance (HsJSONPB.ToJSON SendMailboxMessageResponse) where
 instance (HsJSONPB.FromJSON SendMailboxMessageResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
+data TaskBlockCause
+  = TaskBlockCauseTASK_BLOCK_CAUSE_UNSPECIFIED
+  | TaskBlockCauseTASK_BLOCK_CAUSE_BASE_CI_UNSTABLE
+  | TaskBlockCauseTASK_BLOCK_CAUSE_EXTERNAL_DEPENDENCY
+  | TaskBlockCauseTASK_BLOCK_CAUSE_SCOPE_BOUNDARY
+  | TaskBlockCauseTASK_BLOCK_CAUSE_HUMAN_DECISION_REQUIRED
+  | TaskBlockCauseTASK_BLOCK_CAUSE_TOOLING_UNAVAILABLE
+  deriving (Hs.Show, Hs.Eq, Hs.Generic, Hs.NFData)
+
+instance (HsProtobuf.Named TaskBlockCause) where
+  nameOf _ = Hs.fromString "TaskBlockCause"
+
+instance (HsProtobuf.HasDefault TaskBlockCause)
+
+instance (Hs.Bounded TaskBlockCause) where
+  minBound = TaskBlockCauseTASK_BLOCK_CAUSE_UNSPECIFIED
+  maxBound = TaskBlockCauseTASK_BLOCK_CAUSE_TOOLING_UNAVAILABLE
+
+instance (Hs.Ord TaskBlockCause) where
+  compare x y =
+    Hs.compare
+      (HsProtobuf.fromProtoEnum x)
+      (HsProtobuf.fromProtoEnum y)
+
+instance (HsProtobuf.ProtoEnum TaskBlockCause) where
+  toProtoEnumMay 0 =
+    Hs.Just TaskBlockCauseTASK_BLOCK_CAUSE_UNSPECIFIED
+  toProtoEnumMay 1 =
+    Hs.Just TaskBlockCauseTASK_BLOCK_CAUSE_BASE_CI_UNSTABLE
+  toProtoEnumMay 2 =
+    Hs.Just TaskBlockCauseTASK_BLOCK_CAUSE_EXTERNAL_DEPENDENCY
+  toProtoEnumMay 3 =
+    Hs.Just TaskBlockCauseTASK_BLOCK_CAUSE_SCOPE_BOUNDARY
+  toProtoEnumMay 4 =
+    Hs.Just TaskBlockCauseTASK_BLOCK_CAUSE_HUMAN_DECISION_REQUIRED
+  toProtoEnumMay 5 =
+    Hs.Just TaskBlockCauseTASK_BLOCK_CAUSE_TOOLING_UNAVAILABLE
+  toProtoEnumMay _ = Hs.Nothing
+  fromProtoEnum TaskBlockCauseTASK_BLOCK_CAUSE_UNSPECIFIED = 0
+  fromProtoEnum TaskBlockCauseTASK_BLOCK_CAUSE_BASE_CI_UNSTABLE = 1
+  fromProtoEnum TaskBlockCauseTASK_BLOCK_CAUSE_EXTERNAL_DEPENDENCY =
+    2
+  fromProtoEnum TaskBlockCauseTASK_BLOCK_CAUSE_SCOPE_BOUNDARY = 3
+  fromProtoEnum
+    TaskBlockCauseTASK_BLOCK_CAUSE_HUMAN_DECISION_REQUIRED =
+      4
+  fromProtoEnum TaskBlockCauseTASK_BLOCK_CAUSE_TOOLING_UNAVAILABLE =
+    5
+
+instance (HsJSONPB.ToJSONPB TaskBlockCause) where
+  toJSONPB x _ = HsJSONPB.enumFieldString x
+  toEncodingPB x _ = HsJSONPB.enumFieldEncoding x
+
+instance (HsJSONPB.FromJSONPB TaskBlockCause) where
+  parseJSONPB (HsJSONPB.String "TASK_BLOCK_CAUSE_UNSPECIFIED") =
+    Hs.pure TaskBlockCauseTASK_BLOCK_CAUSE_UNSPECIFIED
+  parseJSONPB (HsJSONPB.String "TASK_BLOCK_CAUSE_BASE_CI_UNSTABLE") =
+    Hs.pure TaskBlockCauseTASK_BLOCK_CAUSE_BASE_CI_UNSTABLE
+  parseJSONPB
+    (HsJSONPB.String "TASK_BLOCK_CAUSE_EXTERNAL_DEPENDENCY") =
+      Hs.pure TaskBlockCauseTASK_BLOCK_CAUSE_EXTERNAL_DEPENDENCY
+  parseJSONPB (HsJSONPB.String "TASK_BLOCK_CAUSE_SCOPE_BOUNDARY") =
+    Hs.pure TaskBlockCauseTASK_BLOCK_CAUSE_SCOPE_BOUNDARY
+  parseJSONPB
+    (HsJSONPB.String "TASK_BLOCK_CAUSE_HUMAN_DECISION_REQUIRED") =
+      Hs.pure TaskBlockCauseTASK_BLOCK_CAUSE_HUMAN_DECISION_REQUIRED
+  parseJSONPB
+    (HsJSONPB.String "TASK_BLOCK_CAUSE_TOOLING_UNAVAILABLE") =
+      Hs.pure TaskBlockCauseTASK_BLOCK_CAUSE_TOOLING_UNAVAILABLE
+  parseJSONPB v = HsJSONPB.typeMismatch "TaskBlockCause" v
+
+instance (HsJSONPB.ToJSON TaskBlockCause) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON TaskBlockCause) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+instance (HsProtobuf.Finite TaskBlockCause)
+
+data TaskBlockedEvidence
+  = TaskBlockedEvidence
+  { taskBlockedEvidenceBaseSha :: Hs.Text,
+    taskBlockedEvidenceHeadSha :: Hs.Text,
+    taskBlockedEvidenceFailedChecks :: (Hs.Vector Hs.Text),
+    taskBlockedEvidenceEvidenceSummary :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData TaskBlockedEvidence)
+
+instance (HsProtobuf.Named TaskBlockedEvidence) where
+  nameOf _ = Hs.fromString "TaskBlockedEvidence"
+
+instance (HsProtobuf.HasDefault TaskBlockedEvidence)
+
+instance (HsProtobuf.Message TaskBlockedEvidence) where
+  encodeMessage
+    _
+    TaskBlockedEvidence
+      { taskBlockedEvidenceBaseSha,
+        taskBlockedEvidenceHeadSha,
+        taskBlockedEvidenceFailedChecks,
+        taskBlockedEvidenceEvidenceSummary
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 1)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        taskBlockedEvidenceBaseSha
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 2)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        taskBlockedEvidenceHeadSha
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 3)
+                ( ( Hs.coerce
+                      @(Hs.Vector Hs.Text)
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                  )
+                    taskBlockedEvidenceFailedChecks
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 4)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                taskBlockedEvidenceEvidenceSummary
+            )
+        )
+  decodeMessage _ =
+    Hs.pure TaskBlockedEvidence
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "base_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "head_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "failed_checks")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "evidence_summary")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB TaskBlockedEvidence) where
+  toJSONPB (TaskBlockedEvidence f1 f2 f3 f4) =
+    HsJSONPB.object
+      [ "base_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "failed_checks"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f3
+             ),
+        "evidence_summary"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4)
+      ]
+  toEncodingPB (TaskBlockedEvidence f1 f2 f3 f4) =
+    HsJSONPB.pairs
+      [ "base_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "failed_checks"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f3
+             ),
+        "evidence_summary"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4)
+      ]
+
+instance (HsJSONPB.FromJSONPB TaskBlockedEvidence) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "TaskBlockedEvidence"
+      ( \obj ->
+          Hs.pure TaskBlockedEvidence
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "base_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "head_sha")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "failed_checks")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "evidence_summary")
+                )
+      )
+
+instance (HsJSONPB.ToJSON TaskBlockedEvidence) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON TaskBlockedEvidence) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data TaskBlocked
+  = TaskBlocked
+  { taskBlockedCause :: (HsProtobuf.Enumerated Effects.Events.TaskBlockCause),
+    taskBlockedNeedsHuman :: Hs.Bool,
+    taskBlockedScopeAttribution :: Hs.Text,
+    taskBlockedRetryable :: Hs.Bool,
+    taskBlockedRecoveryAction :: Hs.Text,
+    taskBlockedEvidence :: (Hs.Maybe Effects.Events.TaskBlockedEvidence)
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData TaskBlocked)
+
+instance (HsProtobuf.Named TaskBlocked) where
+  nameOf _ = Hs.fromString "TaskBlocked"
+
+instance (HsProtobuf.HasDefault TaskBlocked)
+
+instance (HsProtobuf.Message TaskBlocked) where
+  encodeMessage
+    _
+    TaskBlocked
+      { taskBlockedCause,
+        taskBlockedNeedsHuman,
+        taskBlockedScopeAttribution,
+        taskBlockedRetryable,
+        taskBlockedRecoveryAction,
+        taskBlockedEvidence
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 1)
+                            taskBlockedCause
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 2)
+                            taskBlockedNeedsHuman
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 3)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            taskBlockedScopeAttribution
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 4)
+                    taskBlockedRetryable
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 5)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    taskBlockedRecoveryAction
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 6)
+            ( ( Hs.coerce
+                  @(Hs.Maybe Effects.Events.TaskBlockedEvidence)
+                  @(HsProtobuf.Nested Effects.Events.TaskBlockedEvidence)
+              )
+                taskBlockedEvidence
+            )
+        )
+  decodeMessage _ =
+    Hs.pure TaskBlocked
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 2)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 4)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Events.TaskBlockedEvidence)
+                @(Hs.Maybe Effects.Events.TaskBlockedEvidence)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 6)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "TaskBlockCause"))
+        )
+        (HsProtobufAST.Single "cause")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "needs_human")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "scope_attribution")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "retryable")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "recovery_action")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "TaskBlockedEvidence"))
+        )
+        (HsProtobufAST.Single "evidence")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB TaskBlocked) where
+  toJSONPB (TaskBlocked f1 f2 f3 f4 f5 f6) =
+    HsJSONPB.object
+      [ "cause" .= f1,
+        "needs_human" .= f2,
+        "scope_attribution"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "retryable" .= f4,
+        "recovery_action"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "evidence"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Events.TaskBlockedEvidence)
+                   @(HsProtobuf.Nested Effects.Events.TaskBlockedEvidence)
+               )
+                 f6
+             )
+      ]
+  toEncodingPB (TaskBlocked f1 f2 f3 f4 f5 f6) =
+    HsJSONPB.pairs
+      [ "cause" .= f1,
+        "needs_human" .= f2,
+        "scope_attribution"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "retryable" .= f4,
+        "recovery_action"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "evidence"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Events.TaskBlockedEvidence)
+                   @(HsProtobuf.Nested Effects.Events.TaskBlockedEvidence)
+               )
+                 f6
+             )
+      ]
+
+instance (HsJSONPB.FromJSONPB TaskBlocked) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "TaskBlocked"
+      ( \obj ->
+          Hs.pure TaskBlocked
+            <*> obj .: "cause"
+            <*> obj .: "needs_human"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "scope_attribution")
+                )
+            <*> obj .: "retryable"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "recovery_action")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Events.TaskBlockedEvidence)
+                      @(Hs.Maybe Effects.Events.TaskBlockedEvidence)
+                  )
+                    (obj .: "evidence")
+                )
+      )
+
+instance (HsJSONPB.ToJSON TaskBlocked) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON TaskBlocked) where
+  parseJSON = HsJSONPB.parseJSONPB
+
 data NotifyParentRequest
   = NotifyParentRequest
   { notifyParentRequestStatus :: Hs.Text,
     notifyParentRequestMessage :: Hs.Text,
     notifyParentRequestAgentId :: Hs.Text,
-    notifyParentRequestOverrideRecipient :: (Hs.Maybe Effects.Events.Address)
+    notifyParentRequestOverrideRecipient :: (Hs.Maybe Effects.Events.Address),
+    notifyParentRequestTaskOutcome :: (Hs.Maybe NotifyParentRequestTaskOutcome)
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -1903,39 +2373,56 @@ instance (HsProtobuf.Message NotifyParentRequest) where
       { notifyParentRequestStatus,
         notifyParentRequestMessage,
         notifyParentRequestAgentId,
-        notifyParentRequestOverrideRecipient
+        notifyParentRequestOverrideRecipient,
+        notifyParentRequestTaskOutcome
       } =
       Hs.mappend
         ( Hs.mappend
             ( Hs.mappend
-                ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 1)
-                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        notifyParentRequestStatus
+                ( Hs.mappend
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 1)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            notifyParentRequestStatus
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 2)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            notifyParentRequestMessage
+                        )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 2)
+                    (HsProtobuf.FieldNumber 3)
                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        notifyParentRequestMessage
+                        notifyParentRequestAgentId
                     )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 3)
-                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    notifyParentRequestAgentId
+                (HsProtobuf.FieldNumber 4)
+                ( ( Hs.coerce
+                      @(Hs.Maybe Effects.Events.Address)
+                      @(HsProtobuf.Nested Effects.Events.Address)
+                  )
+                    notifyParentRequestOverrideRecipient
                 )
             )
         )
-        ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 4)
-            ( ( Hs.coerce
-                  @(Hs.Maybe Effects.Events.Address)
-                  @(HsProtobuf.Nested Effects.Events.Address)
-              )
-                notifyParentRequestOverrideRecipient
-            )
+        ( case notifyParentRequestTaskOutcome of
+            Hs.Nothing -> Hs.mempty
+            Hs.Just x ->
+              case x of
+                NotifyParentRequestTaskOutcomeBlocked y ->
+                  HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 5)
+                    ( ( Hs.coerce
+                          @(Hs.Maybe Effects.Events.TaskBlocked)
+                          @(HsProtobuf.Nested Effects.Events.TaskBlocked)
+                      )
+                        (Hs.Just y)
+                    )
         )
   decodeMessage _ =
     Hs.pure NotifyParentRequest
@@ -1966,6 +2453,18 @@ instance (HsProtobuf.Message NotifyParentRequest) where
                   (HsProtobuf.FieldNumber 4)
               )
           )
+      <*> HsProtobuf.oneof
+        Hs.Nothing
+        [ ( (HsProtobuf.FieldNumber 5),
+            Hs.pure (Hs.fmap NotifyParentRequestTaskOutcomeBlocked)
+              <*> ( ( HsProtobuf.coerceOver
+                        @(HsProtobuf.Nested Effects.Events.TaskBlocked)
+                        @(Hs.Maybe Effects.Events.TaskBlocked)
+                    )
+                      HsProtobuf.decodeMessageField
+                  )
+          )
+        ]
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -1996,7 +2495,7 @@ instance (HsProtobuf.Message NotifyParentRequest) where
     ]
 
 instance (HsJSONPB.ToJSONPB NotifyParentRequest) where
-  toJSONPB (NotifyParentRequest f1 f2 f3 f4) =
+  toJSONPB (NotifyParentRequest f1 f2 f3 f4 f5) =
     HsJSONPB.object
       [ "status"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -2010,9 +2509,26 @@ instance (HsJSONPB.ToJSONPB NotifyParentRequest) where
                    @(HsProtobuf.Nested Effects.Events.Address)
                )
                  f4
-             )
+             ),
+        ( let encodeTask_outcome =
+                ( case f5 of
+                    Hs.Just (NotifyParentRequestTaskOutcomeBlocked f5) ->
+                      HsJSONPB.pair "blocked" f5
+                    Hs.Nothing -> Hs.mempty
+                )
+           in ( \options ->
+                  if HsJSONPB.optEmitNamedOneof options
+                    then
+                      ( "task_outcome"
+                          .= HsJSONPB.objectOrNull [encodeTask_outcome] options
+                      )
+                        options
+                    else
+                      encodeTask_outcome options
+              )
+        )
       ]
-  toEncodingPB (NotifyParentRequest f1 f2 f3 f4) =
+  toEncodingPB (NotifyParentRequest f1 f2 f3 f4 f5) =
     HsJSONPB.pairs
       [ "status"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -2026,7 +2542,24 @@ instance (HsJSONPB.ToJSONPB NotifyParentRequest) where
                    @(HsProtobuf.Nested Effects.Events.Address)
                )
                  f4
-             )
+             ),
+        ( let encodeTask_outcome =
+                ( case f5 of
+                    Hs.Just (NotifyParentRequestTaskOutcomeBlocked f5) ->
+                      HsJSONPB.pair "blocked" f5
+                    Hs.Nothing -> Hs.mempty
+                )
+           in ( \options ->
+                  if HsJSONPB.optEmitNamedOneof options
+                    then
+                      ( "task_outcome"
+                          .= HsJSONPB.pairsOrNull [encodeTask_outcome] options
+                      )
+                        options
+                    else
+                      encodeTask_outcome options
+              )
+        )
       ]
 
 instance (HsJSONPB.FromJSONPB NotifyParentRequest) where
@@ -2050,6 +2583,17 @@ instance (HsJSONPB.FromJSONPB NotifyParentRequest) where
                   )
                     (obj .: "override_recipient")
                 )
+            <*> ( let parseTask_outcome parseObj =
+                        Hs.msum
+                          [ Hs.Just Hs.. NotifyParentRequestTaskOutcomeBlocked
+                              <$> HsJSONPB.parseField parseObj "blocked",
+                            Hs.pure Hs.Nothing
+                          ]
+                   in ( obj .: "task_outcome"
+                          Hs.>>= HsJSONPB.withObject "task_outcome" parseTask_outcome
+                      )
+                        <|> (parseTask_outcome obj)
+                )
       )
 
 instance (HsJSONPB.ToJSON NotifyParentRequest) where
@@ -2058,6 +2602,15 @@ instance (HsJSONPB.ToJSON NotifyParentRequest) where
 
 instance (HsJSONPB.FromJSON NotifyParentRequest) where
   parseJSON = HsJSONPB.parseJSONPB
+
+newtype NotifyParentRequestTaskOutcome
+  = NotifyParentRequestTaskOutcomeBlocked Effects.Events.TaskBlocked
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData NotifyParentRequestTaskOutcome)
+
+instance (HsProtobuf.Named NotifyParentRequestTaskOutcome) where
+  nameOf _ = Hs.fromString "NotifyParentRequestTaskOutcome"
 
 newtype NotifyParentResponse
   = NotifyParentResponse {notifyParentResponseAck :: Hs.Bool}

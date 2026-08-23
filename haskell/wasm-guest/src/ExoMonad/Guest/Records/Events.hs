@@ -12,6 +12,9 @@ module ExoMonad.Guest.Records.Events
     notifyParentDescription,
     notifyParentSchema,
     NotifyStatus (..),
+    BlockedCause (..),
+    BlockedEvidence (..),
+    BlockedReport (..),
     TaskReport (..),
   )
 where

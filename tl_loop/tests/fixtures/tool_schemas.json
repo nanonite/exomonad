@@ -707,10 +707,11 @@
             "type": "integer"
           },
           "status": {
-            "description": "'success' = normal message (status update, progress report). 'failure' = escalation, something went wrong.",
+            "description": "'success' = normal message. 'failure' = task failure. 'blocked' = typed external blocker requiring human action.",
             "enum": [
               "success",
-              "failure"
+              "failure",
+              "blocked"
             ],
             "type": "string"
           },
@@ -734,6 +735,65 @@
               "type": "object"
             },
             "type": "array"
+          },
+          "blocked": {
+            "description": "Required when status=blocked: typed cause, human-guidance requirement, scope, retry policy, recovery action, and structured evidence.",
+            "properties": {
+              "cause": {
+                "enum": [
+                  "base_ci_unstable",
+                  "external_dependency",
+                  "scope_boundary",
+                  "human_decision_required",
+                  "tooling_unavailable"
+                ],
+                "type": "string"
+              },
+              "needs_human": {
+                "type": "boolean"
+              },
+              "scope_attribution": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "recovery_action": {
+                "type": "string"
+              },
+              "evidence": {
+                "properties": {
+                  "base_sha": {
+                    "type": "string"
+                  },
+                  "head_sha": {
+                    "type": "string"
+                  },
+                  "failed_checks": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "evidence_summary": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "evidence_summary"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "cause",
+              "needs_human",
+              "scope_attribution",
+              "retryable",
+              "recovery_action",
+              "evidence"
+            ],
+            "type": "object"
           }
         },
         "required": [
