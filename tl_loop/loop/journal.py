@@ -34,6 +34,7 @@ MUTATING_OPERATIONS = frozenset(
         "close_worker_pane",
         "close_issue_and_cleanup",
         "emit_controller_event",
+        "recovery_command",
     }
 )
 RECOVERY_INTENT_STATES = frozenset({"intended", "confirmed", "unknown", "reconciled"})

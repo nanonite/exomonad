@@ -11,6 +11,7 @@ mod control;
 mod control_gate;
 mod control_plan;
 mod control_read_model;
+mod control_recovery;
 mod dashboard;
 #[cfg(debug_assertions)]
 mod experiment_analysis;

@@ -139,6 +139,22 @@ kind and confidence. A legacy inbox read can be recorded as
 `ack_kind="runtime_accepted"`. A transport success alone never emits the
 stronger event.
 
+### Authenticated recovery control
+
+The `/control/runs/{run_id}/slices/{slice_id}/recovery` route is the only
+control-plane mutation surface for pre-publication recovery. It accepts the
+closed actions `inspect`, `retry`, `wait`, `approve_scope`, and `abandon`, and
+requires the exact invocation ID, generation, preserved worktree fingerprint,
+and an idempotency key. The checkpoint's `next_action` and recovery identity
+are compare-and-set guards; stale or descendant-owned requests fail closed.
+
+`policy` authorization is limited to allowlisted automatic causes and can only
+retry or wait. Scope approval and abandonment require a named human gate and
+the current decision revision. Commands are journaled before mutation and a
+duplicate idempotency key replays its one durable result. This surface cannot
+approve reviews, merge PRs, widen harness policy, alter budgets, or set an
+arbitrary FSM phase.
+
 ## Adapter matrix
 
 | Runtime | Current offer path | Acceptance boundary | Decision |

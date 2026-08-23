@@ -3,6 +3,7 @@ use crate::control;
 use crate::control_gate;
 use crate::control_plan;
 use crate::control_read_model;
+use crate::control_recovery;
 use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV};
 use std::time::Duration;
 
@@ -952,7 +953,12 @@ async fn control_root() -> Json<serde_json::Value> {
         "allowed_actions": [
             "read_projection",
             "answer_named_gate",
-            "propose_plan_mutation"
+            "propose_plan_mutation",
+            "inspect_recovery",
+            "retry_recovery",
+            "wait_for_recovery",
+            "approve_recovery_scope",
+            "abandon_recovery"
         ],
         "forbidden_actions": [
             "merge_pr",
@@ -1053,6 +1059,21 @@ async fn control_propose_plan(
             )
                 .into_response()
         }
+    }
+}
+
+async fn control_recovery_command(
+    Path((run_id, slice_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<control_recovery::ResumeRecoveryRequest>,
+) -> Response {
+    match control_recovery::execute(&state.project_dir, &run_id, &slice_id, request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            control_recovery::status_code(&error),
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1867,6 +1888,10 @@ Run `exomonad recompile` first to build it.",
             post(control_answer_gate),
         )
         .route("/runs/{run_id}/plan/proposals", post(control_propose_plan))
+        .route(
+            "/runs/{run_id}/slices/{slice_id}/recovery",
+            post(control_recovery_command),
+        )
         .layer(middleware::from_fn_with_state(
             route_auth.clone(),
             control::require_control,
@@ -1991,6 +2016,11 @@ mod tests {
         assert_eq!(document["allowed_actions"][0], "read_projection");
         assert_eq!(document["allowed_actions"][1], "answer_named_gate");
         assert_eq!(document["allowed_actions"][2], "propose_plan_mutation");
+        assert_eq!(document["allowed_actions"][3], "inspect_recovery");
+        assert_eq!(document["allowed_actions"][4], "retry_recovery");
+        assert_eq!(document["allowed_actions"][5], "wait_for_recovery");
+        assert_eq!(document["allowed_actions"][6], "approve_recovery_scope");
+        assert_eq!(document["allowed_actions"][7], "abandon_recovery");
         for action in [
             "merge_pr",
             "approve_review",

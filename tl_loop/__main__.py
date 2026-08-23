@@ -22,6 +22,11 @@ from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.loop.heartbeat import HeartbeatConfig
 from tl_loop.loop.observability import emit_controller_event
+from tl_loop.loop.recovery_control import (
+    RecoveryCommandError,
+    ResumeRecoveryRequest,
+    execute_recovery_command,
+)
 from tl_loop.loop.redispatch import (
     DEFAULT_ABANDONMENT_RETRY_CEILING,
     redispatch_slice,
@@ -62,6 +67,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "abandon",
         "redispatch",
         "plan-proposal",
+        "recovery-command",
         "preflight",
         "-h",
         "--help",
@@ -86,6 +92,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 "TL preflight passed: config.toml, harness_policy.toml, review-policy.toml, harness_capability.toml"
             )
+        elif args.command == "recovery-command":
+            _recovery_command(args)
         elif args.command == "abandon":
             _abandon(args)
         elif args.command == "redispatch":
@@ -218,6 +226,13 @@ def _parser() -> argparse.ArgumentParser:
         "--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID)
     )
     proposal.set_defaults(command="plan-proposal")
+
+    recovery_command = subcommands.add_parser(
+        "recovery-command", help="apply one authenticated, compare-and-set recovery command"
+    )
+    _add_project_options(recovery_command)
+    recovery_command.add_argument("--run-id", required=True)
+    recovery_command.set_defaults(command="recovery-command")
 
     preflight = subcommands.add_parser("preflight", help="validate required TL controller files")
     _add_project_options(preflight)
@@ -577,6 +592,23 @@ def _abandon(args: argparse.Namespace) -> None:
         raise LauncherError("abandon requires explicit --confirm")
     project_root = args.project_root.expanduser().resolve()
     result = abandon_slice(project_root, args.run_id, args.slice_id)
+    print(json.dumps(result, sort_keys=True))
+
+
+def _recovery_command(args: argparse.Namespace) -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except (OSError, json.JSONDecodeError) as error:
+        raise LauncherError(f"recovery command input is not valid JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise LauncherError("recovery command input must be a JSON object")
+    if payload.get("run_id") != args.run_id:
+        raise LauncherError("recovery command run_id does not match the control route")
+    try:
+        request = ResumeRecoveryRequest.from_mapping(payload)
+        result = execute_recovery_command(args.project_root.expanduser().resolve(), request)
+    except RecoveryCommandError as error:
+        raise LauncherError(str(error)) from error
     print(json.dumps(result, sort_keys=True))
 
 
