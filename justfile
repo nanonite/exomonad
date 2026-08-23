@@ -437,6 +437,16 @@ check-e2e-slice-abandon-redispatch:
     bash -n tests/e2e/slice-abandon-redispatch/run.sh
     {{py}} -m py_compile tests/e2e/slice-abandon-redispatch/run.py
 
+# Run the real-server base-CI blocked handoff, durable gate, and same-owner resume scenario three times.
+e2e-task-blocked-human-gate:
+    nix develop --command cargo build -p exomonad
+    just wasm devswarm
+    ./tests/e2e/task-blocked-human-gate/run.sh
+
+check-e2e-task-blocked-human-gate:
+    bash -n tests/e2e/task-blocked-human-gate/run.sh
+    {{py}} -m py_compile tests/e2e/task-blocked-human-gate/run.py
+
 check-e2e-tl-loop-active:
     bash -n tests/e2e/tl-loop-active/run.sh
     {{py}} -m py_compile tests/e2e/tl-loop-active/active_run.py

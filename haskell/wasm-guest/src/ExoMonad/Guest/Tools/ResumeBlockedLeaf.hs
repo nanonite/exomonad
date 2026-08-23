@@ -77,7 +77,9 @@ resumeBlockedLeafCore args
             { AC.slcTask = T.strip (rblTask args),
               AC.slcBranchName = "",
               AC.slcIntentId = Nothing,
-              AC.slcRole = Just "dev",
+              -- The host resolves the persisted owner role. Sending a role
+              -- here makes the request fail the parked-leaf proof contract.
+              AC.slcRole = Nothing,
               AC.slcAgentType = Nothing,
               AC.slcModel = Nothing,
               AC.slcPerms = AC.defaultPermFlags,
