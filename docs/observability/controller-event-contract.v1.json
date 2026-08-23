@@ -247,7 +247,13 @@
         "stderr_tail",
         "branch",
         "worktree",
-        "poll_workers_missing"
+        "poll_workers_missing",
+        "has_commit",
+        "has_uncommitted_changes",
+        "has_pr",
+        "guidance_required",
+        "attempt",
+        "handoff_event_type"
       ]
     },
     "worker.missing": {
@@ -262,7 +268,13 @@
         "stderr_tail",
         "branch",
         "worktree",
-        "poll_workers_missing"
+        "poll_workers_missing",
+        "has_commit",
+        "has_uncommitted_changes",
+        "has_pr",
+        "guidance_required",
+        "attempt",
+        "handoff_event_type"
       ]
     },
     "agent.task_blocked": {

@@ -76,6 +76,13 @@ observation. Reviewed-head SHA binding prevents merging a verdict for another
 head. Review repair uses `resume_pr` and never creates a stacked or duplicate
 owner.
 
+A dev invocation that exits without an authoritative completion, notify-parent,
+or PR handoff is never treated as successful, including exit code 0. The
+heartbeat records the invocation and Git evidence, preserves the worktree, and
+parks a `missing_handoff` blocker behind a durable human gate. A later matching
+ledger handoff wins over pane death; repeated observations do not emit another
+blocker.
+
 Externally blocked leaves without a PR use `resume_blocked_leaf` only after the
 operator approves the named durable gate. The request must carry the exact
 dormant invocation, branch, and dirty-worktree fingerprint; the host resolves

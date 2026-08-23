@@ -16,6 +16,7 @@ from tl_loop.loop.heartbeat import (
     HeartbeatError,
     _poll_workers,
     _result_object,
+    _classify_missing_handoff,
     heartbeat_once,
 )
 from tl_loop.state.schema import (
@@ -416,11 +417,13 @@ def test_missing_worker_row_after_invocation_finished_is_parked_once(tmp_path: P
 
     parked = result.state.slices["slice-a"]
     assert parked.status is SliceStatus.PARKED
-    assert parked.park_cause is ParkCause.WORKER_TERMINAL
+    assert parked.park_cause is ParkCause.MISSING_HANDOFF
     assert result.parked_slice_ids == ("slice-a",)
     assert result.events[0].kind == "worker.terminal_reconciled"
     assert result.events[0].payload["generation"] == 3
     assert result.events[0].payload["stderr_tail"] == "worker crashed"
+    assert result.events[0].payload["guidance_required"] is True
+    assert result.events[0].payload["attempt"] == 1
     event_calls = [
         arguments
         for name, arguments in transport.calls
@@ -428,6 +431,63 @@ def test_missing_worker_row_after_invocation_finished_is_parked_once(tmp_path: P
         and arguments.get("event_type") == "worker.terminal_reconciled"
     ]
     assert len(event_calls) == 1
+    blocked_calls = [
+        arguments
+        for name, arguments in transport.calls
+        if name == "emit_controller_event" and arguments.get("event_type") == "agent.task_blocked"
+    ]
+    assert blocked_calls[0]["payload"]["outcome"] == "blocked"
+    assert blocked_calls[0]["payload"]["cause"] == "human_decision_required"
+
+
+def test_late_authoritative_handoff_wins_over_missing_worker_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    monkeypatch.setattr(
+        "tl_loop.loop.heartbeat._read_authoritative_handoff",
+        lambda *_args, **_kwargs: "agent.completed",
+    )
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(HeartbeatTransport(worker_present=False)),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    assert result.state.slices["slice-a"].status is SliceStatus.SPAWNED
+    assert not any(event.kind == "worker.terminal_reconciled" for event in result.events)
+
+
+@pytest.mark.parametrize(
+    ("context", "expected"),
+    [
+        ({"classification": "terminal_exit", "exit_code": 0}, "clean_no_op"),
+        (
+            {"classification": "terminal_exit", "exit_code": 1, "has_uncommitted_changes": True},
+            "dirty_worktree_no_commit",
+        ),
+        (
+            {
+                "classification": "terminal_exit",
+                "exit_code": 0,
+                "has_commit": True,
+                "has_pr": False,
+            },
+            "commit_no_pr",
+        ),
+        ({"exit_code": None}, "missing_exit_marker"),
+        ({"classification": "worker_crashed", "exit_code": 1}, "worker_crashed"),
+        ({"classification": "terminal_exit", "exit_code": 1}, "unknown"),
+    ],
+)
+def test_missing_handoff_classification_is_explicit(
+    context: dict[str, object], expected: str
+) -> None:
+    assert _classify_missing_handoff(context) == expected
 
 
 def test_missing_worker_evidence_uses_project_root_not_tl_state_root(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -144,10 +145,16 @@ def heartbeat_once(
                 Path(project_root),
                 slice_state,
                 poll_workers_missing=runtime_agent_id in worker_snapshot.missing_agents,
+                ledger_cursor=state.events.last_consumed_offset,
             )
+            if evidence.get("authoritative_handoff"):
+                # A late PR/completion/notify event is authoritative. Leave
+                # the slice active so the normal event consumer can apply it;
+                # pane absence never wins the race against lifecycle evidence.
+                continue
             current = store.load()
             current_slice = current.slices[slice_state.id]
-            reconciliation = _missing_worker_reconciliation(terminal)
+            reconciliation = _missing_worker_reconciliation(terminal, evidence)
             if current_slice.reconciliation == reconciliation and not (
                 terminal and current_slice.status in _active_statuses()
             ):
@@ -163,13 +170,21 @@ def heartbeat_once(
                     "worker.terminal_reconciled",
                     _worker_event_payload(evidence),
                 )
+                missing_handoff = bool(evidence.get("missing_handoff"))
                 park(
                     current_slice,
-                    ParkCause.WORKER_TERMINAL,
+                    ParkCause.MISSING_HANDOFF if missing_handoff else ParkCause.WORKER_TERMINAL,
                     store=store,
                     issue_creator=effects,
                     ledger=current.budgets,
+                    audit=evidence,
                 )
+                if missing_handoff:
+                    emit_controller_event(
+                        effects,
+                        "agent.task_blocked",
+                        _missing_handoff_payload(evidence),
+                    )
                 parked.append(slice_state.id)
                 progress = True
                 events.append(
@@ -524,7 +539,6 @@ def _mark_invocation_timed_out(
 
 
 def _active_slices(state: RunState) -> tuple[SliceState, ...]:
-
     active_statuses = {
         SliceStatus.SPAWNED,
         SliceStatus.IN_REVIEW,
@@ -710,6 +724,7 @@ def _missing_worker_evidence(
     slice_state: SliceState,
     *,
     poll_workers_missing: bool,
+    ledger_cursor: int = 0,
 ) -> tuple[bool, dict[str, object]]:
     runtime_agent_id = slice_state.dispatch_agent_id or slice_state.id
     record = _read_invocation_record(root_dir, runtime_agent_id, slice_state.id)
@@ -733,7 +748,22 @@ def _missing_worker_evidence(
         if isinstance(record, Mapping)
         else slice_state.worktree,
         "poll_workers_missing": poll_workers_missing,
+        "attempt": slice_state.attempts,
+        "has_pr": slice_state.pr_number is not None,
+        "guidance_required": False,
     }
+    context.update(_git_handoff_evidence(root_dir, context["worktree"]))
+    handoff = _read_authoritative_handoff(
+        root_dir,
+        runtime_agent_id,
+        slice_state.id,
+        _text(record, "invocation_id"),
+        ledger_cursor=ledger_cursor,
+    )
+    if handoff is not None:
+        context["authoritative_handoff"] = True
+        context["handoff_event_type"] = handoff
+        return False, context
     if isinstance(record, Mapping):
         status = _text(record, "status")
         terminal = (
@@ -741,10 +771,10 @@ def _missing_worker_evidence(
             or record.get("ended_at") is not None
         )
         if terminal:
-            context["classification"] = context["classification"] or (
-                "missing_exit_marker" if context["exit_code"] is None else "terminal_exit"
-            )
+            context["classification"] = _classify_missing_handoff(context)
             context["reason"] = context["reason"] or "durable_invocation_finished"
+            context["missing_handoff"] = True
+            context["guidance_required"] = True
             return True, context
     return False, context
 
@@ -762,6 +792,45 @@ def _worker_event_payload(evidence: Mapping[str, object]) -> dict[str, object]:
         "branch": evidence.get("branch"),
         "worktree": evidence.get("worktree"),
         "poll_workers_missing": evidence.get("poll_workers_missing"),
+        "has_commit": evidence.get("has_commit"),
+        "has_uncommitted_changes": evidence.get("has_uncommitted_changes"),
+        "has_pr": evidence.get("has_pr"),
+        "guidance_required": evidence.get("guidance_required"),
+        "attempt": evidence.get("attempt"),
+        "handoff_event_type": evidence.get("handoff_event_type"),
+    }
+
+
+def _classify_missing_handoff(context: Mapping[str, object]) -> str:
+    """Classify an exited invocation without inferring success from exit code."""
+    existing = context.get("classification")
+    if isinstance(existing, str) and existing not in {"", "terminal_exit", "clean_exit"}:
+        return existing
+    if context.get("exit_code") is None:
+        return "missing_exit_marker"
+    if context.get("has_uncommitted_changes") is True:
+        return "dirty_worktree_no_commit"
+    if context.get("has_commit") is True and context.get("has_pr") is False:
+        return "commit_no_pr"
+    if context.get("exit_code") == 0:
+        return "clean_no_op"
+    return "unknown"
+
+
+def _missing_handoff_payload(evidence: Mapping[str, object]) -> dict[str, object]:
+    """Project a terminal no-handoff observation into the typed blocker contract."""
+    classification = str(evidence.get("classification") or "unknown")
+    return {
+        "outcome": "blocked",
+        "slice_id": evidence.get("slice_id"),
+        "cause": "human_decision_required",
+        "scope_attribution": "agent_lifecycle",
+        "needs_human": True,
+        "retryable": True,
+        "recovery_action": "inspect preserved worktree and resume or abandon the invocation",
+        "declared_difficulty": "standard",
+        "matched_difficulty_rule": f"missing_handoff:{classification}",
+        "attempt": evidence.get("attempt") or 1,
     }
 
 
@@ -802,13 +871,83 @@ def _read_terminal_invocation_event(
         return None
 
 
-def _missing_worker_reconciliation(terminal: bool) -> dict[str, object]:
+def _read_authoritative_handoff(
+    root_dir: Path,
+    runtime_agent_id: str,
+    slice_id: str,
+    invocation_id: str | None,
+    *,
+    ledger_cursor: int = 0,
+) -> str | None:
+    """Return a later authoritative lifecycle event before pane death wins."""
+    try:
+        events = LedgerReader(root_dir / ".exo/ledger/segments").read_from(ledger_cursor).events
+    except (LedgerReadError, ValueError) as error:
+        LOGGER.warning("Unable to read authoritative handoff evidence: %s", error)
+        return None
+    authoritative = {
+        "agent.completed",
+        "agent.notify_parent",
+        "pr.filed",
+        "pr.published",
+        "pr.updated",
+        "pr.merged",
+    }
+    for event in reversed(events):
+        if event.event_type not in authoritative:
+            continue
+        if invocation_id is not None and event.invocation_id != invocation_id:
+            continue
+        if event.slice_id == slice_id or event.agent_id == runtime_agent_id:
+            return event.event_type
+    return None
+
+
+def _git_handoff_evidence(root_dir: Path, worktree: object) -> dict[str, object]:
+    """Collect bounded Git booleans without mutating the preserved worktree."""
+    if not isinstance(worktree, str) or not worktree:
+        return {"has_commit": None, "has_uncommitted_changes": None}
+    path = Path(worktree)
+    if not path.is_absolute():
+        path = root_dir / path
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"has_commit": None, "has_uncommitted_changes": None}
     return {
-        "confirmed_stage": "worker_terminal" if terminal else "worker_row_missing",
+        "has_commit": commit.returncode == 0,
+        "has_uncommitted_changes": status.returncode == 0 and bool(status.stdout),
+    }
+
+
+def _missing_worker_reconciliation(
+    terminal: bool,
+    evidence: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    missing_handoff = bool(evidence and evidence.get("missing_handoff"))
+    return {
+        "confirmed_stage": "missing_handoff"
+        if missing_handoff
+        else ("worker_terminal" if terminal else "worker_row_missing"),
         "authoritative_evidence": ["invocation.finished"] if terminal else [],
         "missing_evidence": [] if terminal else ["worker.row"],
         "conflicts": [],
-        "next_action": "park_slice" if terminal else "continue_observing",
+        "next_action": "park_missing_handoff"
+        if missing_handoff
+        else ("park_slice" if terminal else "continue_observing"),
     }
 
 

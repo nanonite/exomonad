@@ -41,6 +41,7 @@ class ParkCause(str, Enum):
     HARNESS_SWITCH_REQUESTED = "harness_switch_requested"
     STALL_DETECTED = "stall_detected"
     WORKER_TERMINAL = "worker_terminal"
+    MISSING_HANDOFF = "missing_handoff"
     TASK_BUDGET_EXCEEDED = "task_budget_exceeded"
     ATTEMPT_ABANDONED = "attempt_abandoned"
     PR_CLOSED_UNMERGED = "pr_closed_unmerged"
