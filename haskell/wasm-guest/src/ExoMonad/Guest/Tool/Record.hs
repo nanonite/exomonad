@@ -37,7 +37,7 @@ import Data.Kind (Type)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import Data.Text qualified as T
-import ExoMonad.Guest.Tool.Class (MCPCallOutput (..), MCPTool (..), ToolDefinition (..), WasmResult (..), errorResult)
+import ExoMonad.Guest.Tool.Class (MCPCallOutput (..), MCPTool (..), ToolDefinition (..), WasmResult (..), errorResult, errorResultWithKind)
 import ExoMonad.Guest.Tool.Mode (AsHandler, AsSchema, Handler (..), Schema (..))
 import GHC.Generics
 
@@ -71,8 +71,8 @@ instance (GDispatchTool left, GDispatchTool right) => GDispatchTool (left :*: ri
     res <- gDispatch l name args
     case res of
       Done output ->
-        case mcpError output of
-          Just err | "Unknown tool:" `T.isPrefixOf` err -> gDispatch r name args
+        case errorKind output of
+          Just "tool_unavailable" -> gDispatch r name args
           _ -> pure res
       Suspend _ _ -> pure res
 
@@ -85,7 +85,7 @@ instance
     | name == toolName @tool = case Aeson.fromJSON args of
         Aeson.Success a -> handler a
         Aeson.Error e -> pure $ Done $ errorResult $ "Parse error for " <> name <> ": " <> T.pack e
-    | otherwise = pure $ Done $ errorResult $ "Unknown tool: " <> name
+    | otherwise = pure $ Done $ errorResultWithKind "tool_unavailable" $ "Unknown tool: " <> name
 
 -- Nested sub-record: recurse into it
 instance

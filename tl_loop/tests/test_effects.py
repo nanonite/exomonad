@@ -12,6 +12,7 @@ from tl_loop.client.effects import (
     CompletedTask,
     EffectClient,
     ToolResult,
+    ToolUnavailableError,
 )
 from tl_loop.client.transport import JsonObject, JsonValue
 
@@ -66,6 +67,39 @@ def test_effect_result_decodes_the_server_envelope() -> None:
     assert result.success is True
     assert result.result is None
     assert result.error is None
+
+
+def test_tool_unavailable_is_typed_and_actionable() -> None:
+    result = ToolResult.from_raw(
+        {
+            "success": False,
+            "result": None,
+            "error": "reworded missing-tool message",
+            "error_kind": "tool_unavailable",
+            "error_context": {
+                "tool_name": "resolve_live_pr_for_slice",
+                "role": "tl",
+                "wasm_path": "/project/.exo/wasm/wasm-guest-devswarm.wasm",
+                "wasm_mtime": 1787440000,
+                "remediation": "just install-all-dev or exomonad reload",
+            },
+        }
+    )
+
+    error = ToolUnavailableError("resolve_live_pr_for_slice", result, target="slice-a")
+
+    assert error.target == "slice-a"
+    assert error.tool_name == "resolve_live_pr_for_slice"
+    assert "role 'tl'" in str(error)
+    assert "/project/.exo/wasm/wasm-guest-devswarm.wasm" in str(error)
+    assert "just install-all-dev" in str(error)
+
+
+def test_missing_error_kind_remains_unknown_for_domain_failure() -> None:
+    result = ToolResult.from_raw({"success": False, "result": None, "error": "domain rejected"})
+
+    assert result.error_kind is None
+    assert result.error_context is None
 
 
 def test_merge_pr_emits_compare_and_swap_evidence() -> None:

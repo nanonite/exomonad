@@ -223,6 +223,18 @@
         "stderr_tail"
       ]
     },
+    "tl.tool_unavailable": {
+      "fields": [
+        "slice_id",
+        "tool_name",
+        "role",
+        "wasm_path",
+        "wasm_mtime",
+        "remediation",
+        "message",
+        "error_kind"
+      ]
+    },
     "worker.terminal_reconciled": {
       "fields": [
         "slice_id",

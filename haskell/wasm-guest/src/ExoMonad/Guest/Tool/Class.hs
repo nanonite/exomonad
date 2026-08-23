@@ -18,6 +18,7 @@ module ExoMonad.Guest.Tool.Class
     EffectRequest (..),
     successResult,
     errorResult,
+    errorResultWithKind,
 
     -- * Coroutine suspension
     SuspendYield,
@@ -78,25 +79,31 @@ mkToolDef =
 data MCPCallOutput = MCPCallOutput
   { success :: Bool,
     result :: Maybe Value,
-    mcpError :: Maybe Text
+    mcpError :: Maybe Text,
+    errorKind :: Maybe Text
   }
   deriving (Show, Eq)
 
 instance ToJSON MCPCallOutput where
-  toJSON (MCPCallOutput s r e) =
+  toJSON (MCPCallOutput s r e k) =
     object
       [ "success" .= s,
         "result" .= r,
-        "error" .= e
+        "error" .= e,
+        "error_kind" .= k
       ]
 
 -- | Create a successful result.
 successResult :: Value -> MCPCallOutput
-successResult v = MCPCallOutput True (Just v) Nothing
+successResult v = MCPCallOutput True (Just v) Nothing Nothing
 
 -- | Create an error result.
 errorResult :: Text -> MCPCallOutput
-errorResult msg = MCPCallOutput False Nothing (Just msg)
+errorResult msg = MCPCallOutput False Nothing (Just msg) Nothing
+
+-- | Create a typed error result while preserving the operator-facing message.
+errorResultWithKind :: Text -> Text -> MCPCallOutput
+errorResultWithKind kind msg = MCPCallOutput False Nothing (Just msg) (Just kind)
 
 -- ============================================================================
 -- Coroutine Suspension

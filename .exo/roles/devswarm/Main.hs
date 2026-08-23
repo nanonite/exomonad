@@ -218,7 +218,7 @@ dispatchHook cfg hookInput =
 
 -- | Output an error in WasmResult MCPCallOutput format.
 outputError :: Text -> IO ()
-outputError msg = output (BSL.toStrict $ Aeson.encode $ Done $ MCPCallOutput False Nothing (Just msg))
+outputError msg = output (BSL.toStrict $ Aeson.encode $ Done $ MCPCallOutput False Nothing (Just msg) Nothing)
 
 -- | Resume a suspended continuation.
 resume :: IO CInt

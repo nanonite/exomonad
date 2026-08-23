@@ -1645,6 +1645,10 @@ async fn wasm_tool_unknown_name_returns_error() {
     let output = call_tool(&runtime, "tl", "nonexistent_tool_xyz", json!({})).await;
 
     assert_tool_error(&output, "nonexistent tool");
+    assert_eq!(
+        output["error_kind"], "tool_unavailable",
+        "missing tools must be typed so the controller can park deployment skew"
+    );
 }
 
 // ============================================================================

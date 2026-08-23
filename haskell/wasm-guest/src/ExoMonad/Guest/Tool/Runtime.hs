@@ -93,7 +93,7 @@ mcpHandlerRecord handlers = do
       res <- logError_ ("MCP parse error: " <> T.pack err)
       case res of
         Done () -> do
-          let resp = Done $ MCPCallOutput False Nothing (Just $ "Parse error: " <> T.pack err)
+          let resp = Done $ MCPCallOutput False Nothing (Just $ "Parse error: " <> T.pack err) Nothing
           output (BSL.toStrict $ Aeson.encode resp)
         Suspend k req -> output (BSL.toStrict $ Aeson.encode (Suspend @MCPCallOutput k req))
       pure 0
@@ -121,7 +121,7 @@ resumeHandler = do
       res <- logError_ ("Resume parse error: " <> T.pack err)
       case res of
         Done () -> do
-          let resp = Done $ MCPCallOutput False Nothing (Just $ "Resume parse error: " <> T.pack err)
+          let resp = Done $ MCPCallOutput False Nothing (Just $ "Resume parse error: " <> T.pack err) Nothing
           output (BSL.toStrict $ Aeson.encode resp)
         Suspend k req -> output (BSL.toStrict $ Aeson.encode (Suspend @MCPCallOutput k req))
       pure 0
@@ -131,7 +131,7 @@ resumeHandler = do
           res_ <- logError_ ("Resume input error: " <> err)
           case res_ of
             Done () -> do
-              let resp = Done $ MCPCallOutput False Nothing (Just $ "Resume input error: " <> err)
+              let resp = Done $ MCPCallOutput False Nothing (Just $ "Resume input error: " <> err) Nothing
               output (BSL.toStrict $ Aeson.encode resp)
             Suspend k req -> output (BSL.toStrict $ Aeson.encode (Suspend @MCPCallOutput k req))
           pure 0
@@ -142,7 +142,7 @@ resumeHandler = do
               r <- logError_ ("Continuation not found: " <> k)
               case r of
                 Done () -> do
-                  let resp = Done $ MCPCallOutput False Nothing (Just $ "Continuation not found: " <> k)
+                  let resp = Done $ MCPCallOutput False Nothing (Just $ "Continuation not found: " <> k) Nothing
                   output (BSL.toStrict $ Aeson.encode resp)
                 Suspend k_ req -> output (BSL.toStrict $ Aeson.encode (Suspend @MCPCallOutput k_ req))
               pure 0
@@ -305,7 +305,8 @@ wrapHandler action = do
               MCPCallOutput
                 { success = False,
                   result = Nothing,
-                  mcpError = Just $ T.pack ("Exception in WASM handler: " <> show err)
+                  mcpError = Just $ T.pack ("Exception in WASM handler: " <> show err),
+                  errorKind = Nothing
                 }
       output (BSL.toStrict $ Aeson.encode resp)
       pure 0

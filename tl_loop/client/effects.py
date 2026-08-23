@@ -44,6 +44,8 @@ class ToolResult:
     success: bool | None
     result: JsonValue | None
     error: str | None
+    error_kind: str | None = None
+    error_context: JsonObject | None = None
 
     @classmethod
     def from_raw(cls, raw: JsonObject) -> ToolResult:
@@ -54,7 +56,53 @@ class ToolResult:
         error = raw.get("error")
         if error is not None and not isinstance(error, str):
             raise DecodeError(f"Tool result error is not a string: {raw!r}")
-        return cls(raw=raw, success=success, result=raw.get("result"), error=error)
+        error_kind = raw.get("error_kind")
+        if error_kind is not None and not isinstance(error_kind, str):
+            raise DecodeError(f"Tool result error_kind is not a string: {raw!r}")
+        error_context = raw.get("error_context")
+        if error_context is not None and not isinstance(error_context, dict):
+            raise DecodeError(f"Tool result error_context is not an object: {raw!r}")
+        return cls(
+            raw=raw,
+            success=success,
+            result=raw.get("result"),
+            error=error,
+            error_kind=error_kind,
+            error_context=error_context,
+        )
+
+
+class ToolUnavailableError(RuntimeError):
+    """A typed deployment mismatch: the loaded WASM lacks a controller tool."""
+
+    def __init__(
+        self,
+        operation: str,
+        result: ToolResult,
+        *,
+        target: str | None = None,
+    ) -> None:
+        context = result.error_context or {}
+        self.operation = operation
+        self.target = target
+        self.tool_name = _context_text(context, "tool_name") or operation
+        self.role = _context_text(context, "role") or "unknown"
+        self.wasm_path = _context_text(context, "wasm_path") or "unknown"
+        self.wasm_mtime = context.get("wasm_mtime")
+        self.remediation = (
+            _context_text(context, "remediation") or "just install-all-dev or exomonad reload"
+        )
+        self.detail = result.error or f"{operation} is unavailable"
+        super().__init__(
+            f"Tool {self.tool_name!r} is unavailable for role {self.role!r}; "
+            f"loaded WASM {self.wasm_path!r} (mtime={self.wasm_mtime!r}). "
+            f"Remediation: {self.remediation}. {self.detail}"
+        )
+
+
+def _context_text(context: JsonObject, key: str) -> str | None:
+    value = context.get(key)
+    return value if isinstance(value, str) and value else None
 
 
 TOOL_METHODS: tuple[str, ...] = (
@@ -241,9 +289,7 @@ class EffectClient:
         _put(arguments, "model", model)
         return self._call("resume_pr", arguments)
 
-    def watcher_pr_state(
-        self, *, pr_number: int
-    ) -> ToolResult:
+    def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
         return self._call("watcher_pr_state", {"pr_number": pr_number})
 
     def resolve_live_pr_for_slice(self, *, slice_id: str) -> ToolResult:

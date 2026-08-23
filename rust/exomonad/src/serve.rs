@@ -1238,7 +1238,7 @@ pub async fn call_tool(
         plugin.call("handle_mcp_call", &input).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let output = match result {
+    let mut output = match result {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(tool = %body.name, error = %e, "WASM call failed");
@@ -1273,6 +1273,16 @@ pub async fn call_tool(
         }
     };
 
+    if output.error_kind.as_deref() == Some("tool_unavailable") {
+        output.error_context = Some(serde_json::json!({
+            "tool_name": body.name,
+            "role": role,
+            "wasm_path": plugin.wasm_path(),
+            "wasm_mtime": plugin.wasm_mtime(),
+            "remediation": "just install-all-dev or exomonad reload",
+        }));
+    }
+
     tracing::info!(
         otel.name = "tool.called",
         tool_name = %body.name,
@@ -1292,6 +1302,8 @@ pub async fn call_tool(
                 "duration_ms": duration_ms,
                 "success": output.success,
                 "error": output.error,
+                "error_kind": output.error_kind,
+                "error_context": output.error_context,
             }),
         );
     }
@@ -1323,6 +1335,8 @@ fn finalize_tool_response(
         "success": output.success,
         "result": output.result,
         "error": output.error,
+        "error_kind": output.error_kind,
+        "error_context": output.error_context,
     })
 }
 
@@ -2107,6 +2121,8 @@ mod tests {
                 "isError": false
             })),
             error: None,
+            error_kind: None,
+            error_context: None,
         };
 
         append_unread_mail_block(&mut output, &[message()]);
@@ -2125,6 +2141,8 @@ mod tests {
             success: true,
             result: Some(serde_json::json!({"ok": true})),
             error: None,
+            error_kind: None,
+            error_context: None,
         };
 
         append_unread_mail_block(&mut output, &[message()]);
@@ -2142,6 +2160,8 @@ mod tests {
             success: false,
             result: None,
             error: Some("boom".to_string()),
+            error_kind: None,
+            error_context: None,
         };
 
         append_unread_mail_block(&mut output, &[message()]);
@@ -2168,6 +2188,8 @@ mod tests {
                 success: true,
                 result: Some(structured_result.clone()),
                 error: None,
+                error_kind: None,
+                error_context: None,
             },
             &axum::http::HeaderMap::new(),
             "root",
@@ -2190,6 +2212,8 @@ mod tests {
                 success: true,
                 result: Some(structured_result),
                 error: None,
+                error_kind: None,
+                error_context: None,
             },
             &headers,
             "root",

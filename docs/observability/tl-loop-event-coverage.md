@@ -120,6 +120,7 @@ failed write must not change the controller state transition.
 | `tl.dispatch_intended`, `tl.spawn_requested`, `tl.spawn_request_accepted`, `tl.spawn_request_failed` | `tl_loop/loop/driver.py:1195-1315`; `rust/exomonad-core/src/handlers/tl.rs` | covered | Dispatch telemetry carries the attempt number and route dimensions; system faults remain in `error`. |
 | `tl.dispatch_confirmed`, `tl.dispatch_reconciliation_started`, `tl.dispatch_reconciliation_completed` | `tl_loop/loop/driver.py:1261-1975`; `rust/exomonad-core/src/handlers/tl.rs` | covered | Confirmation and reconciliation preserve the same attempt/task contract. |
 | `agent.task_budget_exceeded` | `tl_loop/loop/heartbeat.py:456-482`; `rust/exomonad-core/src/handlers/tl.rs` | covered | Timeout context is structured task-level data and correlates to the parked slice. |
+| `tl.tool_unavailable` | `tl_loop/loop/driver.py:_recover_tool_unavailable`; `rust/exomonad-core/src/handlers/tl.rs` | covered | Deployment skew records the tool, role, loaded WASM artifact, mtime, and remediation before parking. |
 | `worker.terminal_reconciled`, `worker.missing` | `tl_loop/loop/heartbeat.py:161-198`; `rust/exomonad-core/src/handlers/tl.rs` | covered | Missing-worker evidence is projected to bounded fields before ledger emission. |
 
 ## Guidance-queue coverage

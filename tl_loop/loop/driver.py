@@ -18,7 +18,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, cast
 
-from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.envelope import EnvelopeError, EventEnvelope, EventKind, project
@@ -51,6 +51,7 @@ from tl_loop.fsm.phase import (
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
+from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.review import (
     IntegrationEvidenceMismatch,
     ReviewGateError,
@@ -707,6 +708,8 @@ def run_tl_loop(
             effects_log,
             decoder or TLEventDecoder(),
         )
+    except ToolUnavailableError as error:
+        return _recover_tool_unavailable(store, effects, effects_log, error)
     except DurableWriteError as error:
         return _recover_durable_write_failure(store, effects, effects_log, error)
 
@@ -752,6 +755,65 @@ def _recover_durable_write_failure(
     if state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
         state = store.checkpoint(
             TLFailed(f"durable write failed for {slice_state.id!r}"),
+            state.slices,
+            state.budgets,
+            state.events.last_consumed_offset,
+        )
+    return TLRunResult(state, tuple(effects_log), (), ())
+
+
+def _recover_tool_unavailable(
+    store: RunStore,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    error: ToolUnavailableError,
+) -> TLRunResult:
+    """Park deployment skew instead of terminating the controller."""
+    if not isinstance(effects, EffectClient):
+        store.record_exit_reason("tool unavailable in shadow mode", error=error)
+        raise error
+    state = store.load()
+    slice_state = state.slices.get(error.target or "")
+    if slice_state is None:
+        slice_state = next(
+            (
+                candidate
+                for candidate in state.slices.values()
+                if candidate.status
+                not in {
+                    SliceStatus.MERGED,
+                    SliceStatus.FAILED,
+                    SliceStatus.PARKED,
+                    SliceStatus.BLOCKED,
+                }
+            ),
+            None,
+        )
+    if slice_state is None:
+        store.record_exit_reason("tool unavailable without an active slice", error=error)
+        raise error
+    payload = {
+        "slice_id": slice_state.id,
+        "tool_name": error.tool_name,
+        "role": error.role,
+        "wasm_path": error.wasm_path,
+        "wasm_mtime": error.wasm_mtime,
+        "remediation": error.remediation,
+        "message": str(error),
+        "error_kind": "tool_unavailable",
+    }
+    emit_controller_event(effects, "tl.tool_unavailable", payload)
+    park(
+        slice_state,
+        ParkCause.TOOL_UNAVAILABLE,
+        store=store,
+        issue_creator=effects,
+        audit=payload,
+    )
+    state = store.load()
+    if state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
+        state = store.checkpoint(
+            TLFailed(f"tool unavailable for {slice_state.id!r}"),
             state.slices,
             state.budgets,
             state.events.last_consumed_offset,
@@ -3954,6 +4016,10 @@ def _merge_completed_leaf(
         )
         watcher_result = live.watcher_pr_state(pr_number=pr_number)
         if watcher_result.success is False:
+            if watcher_result.error_kind == "tool_unavailable":
+                raise ToolUnavailableError(
+                    "watcher_pr_state", watcher_result, target=completion.slug
+                )
             raise EffectFailed(watcher_result.error or "watcher_pr_state returned failure")
         try:
             freshness_window_secs = (
@@ -4719,6 +4785,8 @@ def _invoke(
         status = prior.get("status")
         if status in {"confirmed", "rejected"}:
             result = journal.replay(prior)
+            if result.error_kind == "tool_unavailable":
+                raise ToolUnavailableError(operation, result, target=target)
             if result.success is False and raise_on_failure:
                 detail = result.error or f"{operation} returned failure"
                 raise EffectFailed(f"{operation} for {target!r}: {detail}")
@@ -4768,6 +4836,8 @@ def _invoke(
             journal.mark_result(intent, result)
         except DurableWriteError as error:
             raise error.with_context(operation=operation, target=target) from error
+    if result.error_kind == "tool_unavailable":
+        raise ToolUnavailableError(operation, result, target=target)
     if result.success is False and raise_on_failure:
         detail = result.error or f"{operation} returned failure"
         raise EffectFailed(f"{operation} for {target!r}: {detail}")

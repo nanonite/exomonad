@@ -44,6 +44,10 @@ pub struct MCPCallOutput {
     pub success: bool,
     pub result: Option<Value>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub error_kind: Option<String>,
+    #[serde(default)]
+    pub error_context: Option<Value>,
 }
 
 impl MCPCallOutput {
@@ -155,6 +159,15 @@ mod tests {
         assert!(!output.success);
         assert!(output.result.is_none());
         assert_eq!(output.error, Some("something failed".to_string()));
+        assert!(output.error_kind.is_none());
+    }
+
+    #[test]
+    fn mcp_call_output_preserves_typed_error_kind() {
+        let json = r#"{"success": false, "result": null, "error": "stale plugin", "error_kind": "tool_unavailable"}"#;
+        let output: MCPCallOutput = serde_json::from_str(json).unwrap();
+
+        assert_eq!(output.error_kind.as_deref(), Some("tool_unavailable"));
     }
 
     #[test]

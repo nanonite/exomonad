@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TypeAlias
 
-from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.reader import LedgerReader, LedgerReadError
 from tl_loop.loop.escalate import park
@@ -269,7 +269,7 @@ def heartbeat_once(
                 )
                 progress = True
             slice_state = current.slices[slice_state.id]
-        watcher = _watch_pr(effects, pr_number)
+        watcher = _watch_pr(effects, pr_number, slice_state.id)
         terminal_cause = _pr_terminal_cause(watcher)
         if terminal_cause is not None:
             if isinstance(effects, ReadOnlyEffectClient):
@@ -451,6 +451,8 @@ def _enforce_task_budget(
             raise
         journal.mark_result(intent, result)
     if result.success is False:
+        if result.error_kind == "tool_unavailable":
+            raise ToolUnavailableError("close_worker_pane", result, target=slice_state.id)
         raise HeartbeatError(result.error or f"unable to dispose {slice_state.id!r}")
     record = _read_invocation_record(project_root, runtime_agent_id, slice_state.id)
     evidence = dict(terminal_evidence)
@@ -611,14 +613,19 @@ def _index_worker_rows(
         indexed[slice_id] = {**row, "pane_alive": False} if dead else row
 
 
-def _watch_pr(effects: LiveEffects, pr_number: int) -> JsonMapping:
-    return _result_object(effects.watcher_pr_state(pr_number=pr_number), "watcher_pr_state")
+def _watch_pr(effects: LiveEffects, pr_number: int, slice_id: str) -> JsonMapping:
+    return _result_object(
+        effects.watcher_pr_state(pr_number=pr_number),
+        "watcher_pr_state",
+        target=slice_id,
+    )
 
 
 def _resolve_live_pr(effects: LiveEffects, slice_id: str) -> tuple[str, int | None]:
     result = _result_object(
         effects.resolve_live_pr_for_slice(slice_id=slice_id),
         "resolve_live_pr_for_slice",
+        target=slice_id,
     )
     resolution = result.get("resolution")
     if resolution not in {"never_published", "all_attempts_abandoned", "live"}:
@@ -634,8 +641,15 @@ def _resolve_live_pr(effects: LiveEffects, slice_id: str) -> tuple[str, int | No
     return resolution, pr_number
 
 
-def _result_object(result: ToolResult, operation: str) -> JsonMapping:
+def _result_object(
+    result: ToolResult,
+    operation: str,
+    *,
+    target: str | None = None,
+) -> JsonMapping:
     if result.success is False:
+        if result.error_kind == "tool_unavailable":
+            raise ToolUnavailableError(operation, result, target=target)
         raise HeartbeatError(result.error or f"{operation} returned failure")
     if not isinstance(result.result, Mapping):
         raise HeartbeatError(f"{operation} result must be an object")

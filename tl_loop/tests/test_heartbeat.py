@@ -9,9 +9,15 @@ from typing import cast
 
 import pytest
 
-from tl_loop.client.effects import EffectClient
+from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.transport import JsonObject
-from tl_loop.loop.heartbeat import HeartbeatConfig, HeartbeatError, _poll_workers, heartbeat_once
+from tl_loop.loop.heartbeat import (
+    HeartbeatConfig,
+    HeartbeatError,
+    _poll_workers,
+    _result_object,
+    heartbeat_once,
+)
 from tl_loop.state.schema import (
     ParkCause,
     RunState,
@@ -79,19 +85,17 @@ class HeartbeatTransport:
                 {
                     "success": True,
                     "result": {
-                    "head_sha": "head-new",
-                    "review_state": "approved",
-                    "ci_status": "success",
-                    "found": True,
-                    "pr_state": self.pr_state,
-                    "merged": self.merged,
-                    "head_reachable": self.head_reachable,
-                    "evidence_error": (
-                        "pr_head_unreachable: object missing"
-                        if not self.head_reachable
-                        else ""
-                    ),
-                },
+                        "head_sha": "head-new",
+                        "review_state": "approved",
+                        "ci_status": "success",
+                        "found": True,
+                        "pr_state": self.pr_state,
+                        "merged": self.merged,
+                        "head_reachable": self.head_reachable,
+                        "evidence_error": (
+                            "pr_head_unreachable: object missing" if not self.head_reachable else ""
+                        ),
+                    },
                 },
             )
         if tool_name == "resolve_live_pr_for_slice":
@@ -132,6 +136,35 @@ def test_idle_heartbeat_waits_for_configured_interval_without_polling(
         "resolve_live_pr_for_slice",
         "watcher_pr_state",
     ]
+
+
+def test_result_object_classifies_typed_tool_unavailability_without_message_matching() -> None:
+    result = ToolResult(
+        raw={
+            "success": False,
+            "error": "arbitrary deployment wording",
+            "error_kind": "tool_unavailable",
+        },
+        success=False,
+        result=None,
+        error="arbitrary deployment wording",
+        error_kind="tool_unavailable",
+    )
+
+    with pytest.raises(ToolUnavailableError, match="arbitrary deployment wording"):
+        _result_object(result, "resolve_live_pr_for_slice", target="slice-a")
+
+
+def test_result_object_keeps_domain_failure_as_heartbeat_error() -> None:
+    result = ToolResult(
+        raw={"success": False, "error": "domain rejected"},
+        success=False,
+        result=None,
+        error="domain rejected",
+    )
+
+    with pytest.raises(HeartbeatError, match="domain rejected"):
+        _result_object(result, "resolve_live_pr_for_slice", target="slice-a")
 
 
 def test_silently_dead_worker_is_parked(tmp_path: Path) -> None:

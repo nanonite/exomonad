@@ -16,7 +16,7 @@ use extism::{Manifest, Plugin, PluginBuilder};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::instrument;
 
@@ -229,6 +229,23 @@ impl PluginManager {
             .read()
             .map(|g| g.clone())
             .unwrap_or_else(|_| "unknown".to_string())
+    }
+
+    /// Return the resolved runtime WASM path, when the plugin is file-backed.
+    pub fn wasm_path(&self) -> Option<String> {
+        self.wasm_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+    }
+
+    /// Return the loaded WASM modification time as Unix seconds.
+    pub fn wasm_mtime(&self) -> Option<u64> {
+        self.last_mtime
+            .read()
+            .ok()
+            .and_then(|mtime| *mtime)
+            .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
     }
 
     /// Call a WASM guest function with trampoline support for suspend/resume.

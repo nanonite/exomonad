@@ -14,7 +14,7 @@ from typing import cast
 
 import pytest
 
-from tl_loop.client.effects import EffectClient
+from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.envelope import EventEnvelope, project
@@ -39,6 +39,7 @@ from tl_loop.loop.driver import (
     _initial_slices,
     _record_review_event,
     _repair_model,
+    _recover_tool_unavailable,
     _route_ci_event,
     _route_review_event,
     _spawn_invocation_id,
@@ -64,6 +65,7 @@ from tl_loop.state.schema import (
     OrderedStageState,
     SliceState,
     SliceStatus,
+    ParkCause,
     Verdict,
 )
 from tl_loop.state.store import RunStore, create
@@ -240,9 +242,9 @@ def test_recursive_tl_waiting_child_is_not_marked_failed(
         config=TLLoopConfig(
             active=True,
             keep_alive_on_waiting=False,
-          max_parallel_slices=1,
-          poll_interval=0.001,
-      ),
+            max_parallel_slices=1,
+            poll_interval=0.001,
+        ),
         root_dir=tmp_path,
     )
 
@@ -615,10 +617,10 @@ def test_dispatch_waits_for_delayed_authoritative_confirmation(tmp_path: Path) -
                 source,
                 EffectClient(transport),
                 config=TLLoopConfig(
-                      max_workers=0,
-                      max_leaves=1,
-                      poll_interval=0.001,
-                      cancel_event=cancel_event,
+                    max_workers=0,
+                    max_leaves=1,
+                    poll_interval=0.001,
+                    cancel_event=cancel_event,
                 ),
                 root_dir=tmp_path,
             )
@@ -664,7 +666,7 @@ def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None
         plan,
         SyntheticQueue([]),
         EffectClient(transport),
-          config=TLLoopConfig(poll_interval=0.001),
+        config=TLLoopConfig(poll_interval=0.001),
         root_dir=tmp_path,
     )
 
@@ -909,9 +911,9 @@ def test_ledger_run_id_mismatch_reaches_driver_diagnostics(tmp_path: Path) -> No
                 WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
                 source,
                 EffectClient(transport),
-                  config=TLLoopConfig(
-                      poll_interval=0.001,
-                      ledger_run_id=current_swarm,
+                config=TLLoopConfig(
+                    poll_interval=0.001,
+                    ledger_run_id=current_swarm,
                 ),
                 root_dir=tmp_path,
             )
@@ -1096,9 +1098,9 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
             enable_reviewer_spawn=True,
             max_workers=0,
             max_leaves=1,
-              max_events=2,
-              poll_interval=0.001,
-          ),
+            max_events=2,
+            poll_interval=0.001,
+        ),
         root_dir=tmp_path,
     )
 
@@ -1617,6 +1619,61 @@ def _review_store(
     return store
 
 
+def test_tool_unavailable_recovery_parks_without_consuming_attempts(tmp_path: Path) -> None:
+    class IssueTransport(RecordingTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            if tool_name == "chainlink_issue_create":
+                self.calls.append((tool_name, arguments))
+                return {"success": True, "result": {"issue_id": 9411}}
+            return super().call_tool(role, name, tool_name, arguments)
+
+    store = _review_store(tmp_path)
+    before = store.load()
+    effects = EffectClient(IssueTransport())
+    error = ToolUnavailableError(
+        "resolve_live_pr_for_slice",
+        ToolResult(
+            raw={
+                "success": False,
+                "error": "reworded missing tool",
+                "error_kind": "tool_unavailable",
+                "error_context": {
+                    "tool_name": "resolve_live_pr_for_slice",
+                    "role": "tl",
+                    "wasm_path": "/project/.exo/wasm/wasm-guest-devswarm.wasm",
+                    "wasm_mtime": 1787440000,
+                },
+            },
+            success=False,
+            result=None,
+            error="reworded missing tool",
+            error_kind="tool_unavailable",
+            error_context={
+                "tool_name": "resolve_live_pr_for_slice",
+                "role": "tl",
+                "wasm_path": "/project/.exo/wasm/wasm-guest-devswarm.wasm",
+                "wasm_mtime": 1787440000,
+            },
+        ),
+        target="leaf-a",
+    )
+
+    result = _recover_tool_unavailable(store, effects, [], error)
+
+    parked = result.final_state.slices["leaf-a"]
+    assert result.final_state.fsm.phase is TLPhase.TLFailed
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.TOOL_UNAVAILABLE
+    assert parked.attempts == before.slices["leaf-a"].attempts
+    assert result.final_state.budgets == before.budgets
+
+
 def _review_event(*, finding_severity: str = "blocking") -> EventEnvelope:
     return project(
         {
@@ -1717,9 +1774,9 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
         requested_model="gpt-5.5",
         max_workers=1,
         max_leaves=1,
-      max_events=5,
-      poll_interval=0.001,
-  )
+        max_events=5,
+        poll_interval=0.001,
+    )
 
     result = tl_run({"run_id": run_id, "plan": _plan()}, config, BudgetLedger(0, 0))
 
@@ -1756,10 +1813,10 @@ def test_tl_run_width_gate_dispatches_next_ready_slice_after_completion(
         ),
         max_workers=2,
         max_leaves=0,
-          max_parallel_slices=1,
-          max_events=5,
-          poll_interval=0.001,
-      )
+        max_parallel_slices=1,
+        max_events=5,
+        poll_interval=0.001,
+    )
     plan = WorkPlan(
         workers=(
             WorkerTask("worker-a", "first"),
@@ -1812,9 +1869,9 @@ def test_canonical_completion_and_parent_notification_are_idempotent(
         config=TLLoopConfig(
             max_workers=1,
             max_leaves=1,
-              max_events=6,
-              poll_interval=0.001,
-          ),
+            max_events=6,
+            poll_interval=0.001,
+        ),
         root_dir=tmp_path,
     )
 
@@ -1849,10 +1906,10 @@ def test_loop_rejects_an_event_stream_over_its_event_ceiling(tmp_path: Path) -> 
             source,
             EffectClient(RecordingTransport()),
             config=TLLoopConfig(
-                  max_events=1,
-                  test_harness=True,
-                  poll_interval=0.001,
-              ),
+                max_events=1,
+                test_harness=True,
+                poll_interval=0.001,
+            ),
             root_dir=tmp_path,
         )
 
@@ -1883,10 +1940,10 @@ def test_idle_silence_preserves_spawned_state_until_explicit_cancellation(
                 source,
                 EffectClient(RecordingTransport()),
                 config=TLLoopConfig(
-                      max_workers=0,
-                      max_leaves=1,
-                      poll_interval=0.001,
-                      cancel_event=cancel_event,
+                    max_workers=0,
+                    max_leaves=1,
+                    poll_interval=0.001,
+                    cancel_event=cancel_event,
                 ),
                 root_dir=tmp_path,
             )
@@ -1941,9 +1998,9 @@ def _config(*, active: bool = True) -> TLLoopConfig:
         active=active,
         max_workers=1,
         max_leaves=1,
-         max_events=5,
-         poll_interval=0.001,
-     )
+        max_events=5,
+        poll_interval=0.001,
+    )
 
 
 def _lifecycle_events(run_id: str) -> list[EventEnvelope]:

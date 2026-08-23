@@ -93,6 +93,7 @@
     {"type": "agent.invocation.started", "payload_class": "aggregate_dimensions", "producers": ["lifecycle"]},
     {"type": "agent.invocation.finished", "payload_class": "aggregate_dimensions", "producers": ["lifecycle"]},
     {"type": "agent.task_budget_exceeded", "payload_class": "aggregate_dimensions", "producers": ["tl_loop", "lifecycle"]},
+    {"type": "tl.tool_unavailable", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "agent.guidance.delivery", "payload_class": "aggregate_dimensions", "producers": ["lifecycle", "rust"]},
     {"type": "tl.phase_changed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.slice_status_changed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
