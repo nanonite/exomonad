@@ -309,7 +309,9 @@ Gemini is retired; old configurations fail closed with: `agent_type 'gemini' is 
 root, worker/companion, and reviewer harnesses independently. Effort precedence is
 CLI flag > local config > global config > medium default. Worker effort is inherited
 by forked TLs, leaves, ephemeral workers, and companions. OpenCode receives the
-resolved level as its model `--variant`; Codex and Shoal log that effort is ignored.
+resolved level as its model `--variant`; Codex receives the resolved level as
+`model_reasoning_effort` in its rendered config, while Shoal alone logs that effort is
+ignored because it has no stable effort interface.
 
 **TL-loop harness policy:** `.exo/harness_policy.toml` is the required human-authored
 allowlist and budget boundary for the programmatic controller. It must contain exactly
