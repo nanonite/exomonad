@@ -1514,9 +1514,10 @@ impl<
                     trigger,
                     pr_number: options.invocation_pr_number,
                     head_sha: options.invocation_head_sha.clone(),
-                      model: model.clone(),
-                      effort: effort.clone(),
-                      identity: None,
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    recovery_lineage: None,
+                    identity: None,
                 },
             )
                 .await?;
@@ -1991,6 +1992,7 @@ impl<
                       head_sha: options.start_point.clone(),
                       model: model.clone(),
                       effort: effort.clone(),
+                      recovery_lineage: options.recovery_lineage.clone(),
                       identity: None,
                   },
             )
@@ -2617,7 +2619,9 @@ mod tests {
             "reviewer instructions must not tell the sandboxed shell to curl Forgejo directly: {CODEX_REVIEWER_INSTRUCTIONS}"
         );
         assert!(
-            !lower.contains("fj pr review") && !lower.contains("fj pr view") && !lower.contains("fj pr files"),
+            !lower.contains("fj pr review")
+                && !lower.contains("fj pr view")
+                && !lower.contains("fj pr files"),
             "reviewer instructions must not tell the sandboxed shell to run fj against Forgejo: {CODEX_REVIEWER_INSTRUCTIONS}"
         );
         assert!(

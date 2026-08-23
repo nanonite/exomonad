@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from tl_loop.client.effects import ToolResult
+from tl_loop.fsm.recovery import (
+    RecoveryIntent,
+    decode_recovery_intent,
+    encode_recovery_intent,
+)
 from tl_loop.state.serialization import dumps as dumps_json
 from tl_loop.state.serialization import to_jsonable
 
@@ -31,6 +36,7 @@ MUTATING_OPERATIONS = frozenset(
         "emit_controller_event",
     }
 )
+RECOVERY_INTENT_STATES = frozenset({"intended", "confirmed", "unknown", "reconciled"})
 
 
 class ActionJournalError(RuntimeError):
@@ -87,6 +93,9 @@ class EffectJournal(list[Any]):
         )
 
     def append(self, intent: Any) -> None:
+        if isinstance(intent, RecoveryIntent):
+            self.append_recovery_intent(intent)
+            return
         super().append(intent)
         if intent.operation not in MUTATING_OPERATIONS:
             return
@@ -100,6 +109,86 @@ class EffectJournal(list[Any]):
                 "status": "intended",
             }
         )
+
+    def recovery_key(self, intent: RecoveryIntent) -> str:
+        """Return a stable key for one recovery identity and action."""
+        payload = encode_recovery_intent(intent)
+        payload.pop("state", None)
+        payload["run_id"] = self.run_id
+        encoded = dumps_json(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def append_recovery_intent(self, intent: RecoveryIntent) -> None:
+        """Journal recovery intent before its probe, resume, gate, or abandon effect."""
+        entry = {
+            "kind": "recovery",
+            "key": self.recovery_key(intent),
+            **encode_recovery_intent(intent),
+        }
+        self._upsert(entry)
+
+    def existing_recovery(self, intent: RecoveryIntent) -> Mapping[str, object] | None:
+        """Read a recovery intent by immutable identity."""
+        key = self.recovery_key(intent)
+        return next(
+            (
+                entry
+                for entry in self._read()
+                if isinstance(entry, dict)
+                and entry.get("kind") == "recovery"
+                and entry.get("key") == key
+            ),
+            None,
+        )
+
+    def mark_recovery_intent(
+        self,
+        intent: RecoveryIntent,
+        state: str,
+        *,
+        result: object | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Record confirmed, unknown, or reconciled recovery outcome."""
+        if state not in RECOVERY_INTENT_STATES:
+            raise ActionJournalError(f"invalid recovery intent state {state!r}")
+        entry = self.existing_recovery(intent)
+        if entry is None:
+            raise ActionJournalError(f"recovery intent {intent.intent_id} was not recorded")
+        updates: dict[str, object] = {"state": state}
+        if result is not None:
+            updates["result"] = to_jsonable(result)
+        if error is not None:
+            updates["error"] = error
+        self.resolve_recovery_by_key(self.recovery_key(intent), **updates)
+
+    def pending_recovery_entries(self) -> list[dict[str, object]]:
+        """Return recovery intents whose effects need restart reconciliation."""
+        return [
+            entry
+            for entry in self._read()
+            if isinstance(entry, dict)
+            and entry.get("kind") == "recovery"
+            and entry.get("state") in {"intended", "unknown"}
+        ]
+
+    def load_recovery_intent(self, entry: Mapping[str, object]) -> RecoveryIntent:
+        """Decode one journal entry without trusting caller-provided identity."""
+        return decode_recovery_intent(entry)
+
+    def resolve_recovery_by_key(self, key: str, **updates: object) -> None:
+        """Apply a durable restart reconciliation to one recovery intent."""
+        entries = self._read()
+        for entry in entries:
+            if (
+                isinstance(entry, dict)
+                and entry.get("kind") == "recovery"
+                and entry.get("key") == key
+            ):
+                entry.update(updates)
+                self._write(entries)
+                return
+        raise ActionJournalError(f"recovery intent {key} was not recorded")
 
     def mark_not_dispatched(self, intent: Any) -> None:
         if intent.operation in MUTATING_OPERATIONS:

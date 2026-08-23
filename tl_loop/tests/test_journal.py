@@ -9,6 +9,11 @@ from types import SimpleNamespace
 import pytest
 
 from tl_loop.client.effects import ToolResult
+from tl_loop.fsm.recovery import (
+    RecoveryIdentity,
+    RecoveryIntent,
+    assert_recovery_identity,
+)
 from tl_loop.loop.driver import EffectFailed, TLLoopError, _invoke
 from tl_loop.loop.journal import EffectJournal, stable_action_key
 
@@ -19,6 +24,24 @@ def _intent(operation: str = "merge_pr") -> SimpleNamespace:
         target="slice-a",
         arguments={"head_sha": "head-a", "pr_number": 42},
         active=True,
+    )
+
+
+def _recovery_intent(action: str = "resume_same_owner") -> RecoveryIntent:
+    return RecoveryIntent(
+        intent_id="recovery-intent-1",
+        recovery_identity=RecoveryIdentity(
+            run_id="run-a",
+            slice_id="slice-a",
+            owner_agent_id="agent-a",
+            invocation_id="inv-1",
+            invocation_generation=3,
+            recovery_round=1,
+            branch="task/slice-a",
+            worktree=".worktrees/slice-a",
+        ),
+        action=action,
+        expected_worktree_fingerprint="sha256:worktree-1",
     )
 
 
@@ -35,9 +58,7 @@ def test_nested_mappingproxy_arguments_are_durable(tmp_path) -> None:
         operation="spawn_worker",
         target="slice-a",
         arguments={
-            "payload": MappingProxyType(
-                {"nested": MappingProxyType({"value": "preserved"})}
-            )
+            "payload": MappingProxyType({"nested": MappingProxyType({"value": "preserved"})})
         },
     )
 
@@ -190,3 +211,43 @@ def test_replayed_rejection_preserves_failure_semantics(tmp_path) -> None:
             lambda _: pytest.fail("confirmed rejection must not be dispatched again"),
             journal,
         )
+
+
+def test_recovery_intent_is_durable_and_idempotent(tmp_path) -> None:
+    path = tmp_path / "action-journal.json"
+    journal = EffectJournal("run-a", path)
+    intent = _recovery_intent()
+
+    journal.append_recovery_intent(intent)
+    journal.append_recovery_intent(intent)
+
+    assert len(journal.pending_recovery_entries()) == 1
+    entry = journal.pending_recovery_entries()[0]
+    assert journal.load_recovery_intent(entry) == intent
+
+
+def test_recovery_intent_unknown_outcome_is_reconciled_without_replay(tmp_path) -> None:
+    path = tmp_path / "action-journal.json"
+    journal = EffectJournal("run-a", path)
+    intent = _recovery_intent("probe")
+    journal.append(intent)
+    journal.mark_recovery_intent(intent, "unknown", error="server restarted")
+
+    assert len(journal.pending_recovery_entries()) == 1
+    journal.mark_recovery_intent(intent, "reconciled", result={"healthy": False})
+
+    assert journal.pending_recovery_entries() == []
+    restored = journal.existing_recovery(intent)
+    assert restored is not None
+    assert restored["state"] == "reconciled"
+    assert restored["result"] == {"healthy": False}
+
+
+def test_recovery_identity_compare_and_set_fails_closed() -> None:
+    expected = _recovery_intent().recovery_identity
+    observed = RecoveryIdentity(
+        **{**expected.__dict__, "invocation_generation": expected.invocation_generation + 1}
+    )
+
+    with pytest.raises(ValueError, match="compare-and-set failed"):
+        assert_recovery_identity(expected, observed)

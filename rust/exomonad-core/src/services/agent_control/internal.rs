@@ -1630,6 +1630,7 @@ mod tests {
             base_branch: None,
             expected_agent_name: None,
             invocation_pr_number: None,
+            recovery_lineage: None,
         };
         let command = service.leaf_launch_command(
             AgentType::OpenCode,

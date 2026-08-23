@@ -598,6 +598,9 @@ mod tests {
             exit_reason: None,
             exit_classification: None,
             stderr_tail: None,
+            prior_invocation_id: None,
+            recovery_round: 0,
+            authorization_source: None,
         };
         let telemetry = LifecycleTelemetry::from_invocation(&record, "finished");
         let value = serde_json::to_value(telemetry).expect("telemetry JSON");
@@ -646,6 +649,9 @@ mod tests {
             exit_reason: None,
             exit_classification: None,
             stderr_tail: None,
+            prior_invocation_id: None,
+            recovery_round: 0,
+            authorization_source: None,
         };
         record_invocation_started(&agent_dir, &record);
         let files = fs::read_dir(root.path().join(".exo/events"))

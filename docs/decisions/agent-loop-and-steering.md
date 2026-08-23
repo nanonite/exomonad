@@ -76,6 +76,16 @@ existing `AgentInbox` may remain temporarily as a transport worker cache, but
 it must be reconstructible from durable pending or expired rows and its
 in-memory deduplication window cannot determine durable identity.
 
+Recovery resumes use the same durable identity discipline. Before a probe,
+same-owner resume, gate, or abandonment effect, the controller records a
+recovery intent containing run, slice, owner, invocation generation, recovery
+round, branch, worktree, and worktree-fingerprint expectations. A restart may
+reconcile an `intended` or `unknown` intent, but it may not dispatch it again
+until the persisted identity compare-and-set succeeds. A fresh invocation
+records its prior invocation ID, generation, recovery round, and authorization
+source in `invocation.json`; it never increments the logical slice attempt or
+creates a sibling owner.
+
 ### 3. Consume only at an adapter-reported safe boundary
 
 The queue does not infer a turn boundary from pane liveness, input-buffer

@@ -16,7 +16,7 @@ pub use invocation::{
     start_invocation, start_invocation_with_provenance,
     start_invocation_with_provenance_and_context, InvocationExitContext, InvocationFinishResult,
     InvocationIdentityContext, InvocationMetadata, InvocationRecord, InvocationStatus,
-    InvocationTrigger, INVOCATION_FILENAME,
+    InvocationTrigger, RecoveryAuthorization, RecoveryInvocationLineage, INVOCATION_FILENAME,
 };
 pub use spawn::{
     CODEX_DEV_INSTRUCTIONS, CODEX_REVIEWER_INSTRUCTIONS, CODEX_TL_RUNTIME_NOTES,
@@ -592,6 +592,9 @@ pub struct SpawnLeafOptions {
     /// PR number when this starts a resume_pr invocation.
     #[serde(default)]
     pub invocation_pr_number: Option<u64>,
+    /// Recovery lineage for a same-owner invocation restart.
+    #[serde(default)]
+    pub recovery_lineage: Option<RecoveryInvocationLineage>,
 }
 
 /// Result of spawning an agent.
@@ -1082,6 +1085,7 @@ impl<
                 model,
                 effort,
                 identity: Some(identity_context),
+                recovery_lineage: None,
             },
         )
         .await
@@ -1128,6 +1132,7 @@ impl<
             metadata.model,
             metadata.effort,
             identity_context,
+            metadata.recovery_lineage,
         )
         .await?;
         let effective_routing = RoutingInfo::read_from_dir(&agent_config_dir).await?;

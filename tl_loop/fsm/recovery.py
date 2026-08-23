@@ -6,7 +6,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import cast
+from typing import Literal, cast
 
 
 class RecoveryPhase(str, Enum):
@@ -58,6 +58,60 @@ class RecoveryState:
 
 class RecoveryTransitionError(ValueError):
     """Raised when a recovery phase transition is not legal."""
+
+
+@dataclass(frozen=True)
+class RecoveryIdentity:
+    """Compare-and-set identity for one recovery owner and invocation."""
+
+    run_id: str
+    slice_id: str
+    owner_agent_id: str
+    invocation_id: str
+    invocation_generation: int
+    recovery_round: int
+    branch: str
+    worktree: str
+    plan_revision: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("run_id", "slice_id", "owner_agent_id", "invocation_id", "branch", "worktree"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
+                raise ValueError(f"recovery identity {name} must be non-empty")
+        for name in ("invocation_generation", "recovery_round", "plan_revision"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"recovery identity {name} must be non-negative")
+
+
+RecoveryIntentAction = Literal["probe", "resume_same_owner", "open_gate", "abandon"]
+RecoveryIntentStatus = Literal["intended", "confirmed", "unknown", "reconciled"]
+
+
+@dataclass(frozen=True)
+class RecoveryIntent:
+    """A journaled recovery effect with immutable owner expectations."""
+
+    intent_id: str
+    recovery_identity: RecoveryIdentity
+    action: RecoveryIntentAction
+    expected_worktree_fingerprint: str
+    state: RecoveryIntentStatus = "intended"
+
+    def __post_init__(self) -> None:
+        if not self.intent_id.strip():
+            raise ValueError("recovery intent_id must be non-empty")
+        if not self.expected_worktree_fingerprint.strip():
+            raise ValueError("recovery expected_worktree_fingerprint must be non-empty")
+
+
+def assert_recovery_identity(expected: RecoveryIdentity, observed: RecoveryIdentity) -> None:
+    """Fail closed when any owner or invocation fingerprint changed."""
+    if expected != observed:
+        raise RecoveryTransitionError(
+            "recovery identity compare-and-set failed: owner, invocation, branch, "
+            "worktree, generation, or recovery round changed"
+        )
 
 
 _LEGAL_TRANSITIONS: dict[RecoveryPhase, frozenset[RecoveryPhase]] = {
@@ -187,12 +241,83 @@ def encode_recovery(value: RecoveryState) -> dict[str, object]:
     }
 
 
+def encode_recovery_identity(value: RecoveryIdentity) -> dict[str, object]:
+    """Encode immutable compare-and-set identity for a journal entry."""
+    return {
+        "run_id": value.run_id,
+        "slice_id": value.slice_id,
+        "owner_agent_id": value.owner_agent_id,
+        "invocation_id": value.invocation_id,
+        "invocation_generation": value.invocation_generation,
+        "recovery_round": value.recovery_round,
+        "branch": value.branch,
+        "worktree": value.worktree,
+        "plan_revision": value.plan_revision,
+    }
+
+
+def decode_recovery_identity(value: object) -> RecoveryIdentity:
+    """Decode a validated journal identity."""
+    if not isinstance(value, Mapping):
+        raise TypeError("recovery identity must be an object")
+    return RecoveryIdentity(
+        run_id=cast(str, value["run_id"]),
+        slice_id=cast(str, value["slice_id"]),
+        owner_agent_id=cast(str, value["owner_agent_id"]),
+        invocation_id=cast(str, value["invocation_id"]),
+        invocation_generation=cast(int, value["invocation_generation"]),
+        recovery_round=cast(int, value["recovery_round"]),
+        branch=cast(str, value["branch"]),
+        worktree=cast(str, value["worktree"]),
+        plan_revision=cast(int, value.get("plan_revision", 0)),
+    )
+
+
+def encode_recovery_intent(value: RecoveryIntent) -> dict[str, object]:
+    """Encode a journaled recovery intent."""
+    return {
+        "intent_id": value.intent_id,
+        "recovery_identity": encode_recovery_identity(value.recovery_identity),
+        "action": value.action,
+        "expected_worktree_fingerprint": value.expected_worktree_fingerprint,
+        "state": value.state,
+    }
+
+
+def decode_recovery_intent(value: object) -> RecoveryIntent:
+    """Decode a persisted recovery intent."""
+    if not isinstance(value, Mapping):
+        raise TypeError("recovery intent must be an object")
+    action = value.get("action")
+    state = value.get("state", "intended")
+    if action not in {"probe", "resume_same_owner", "open_gate", "abandon"}:
+        raise ValueError(f"unknown recovery intent action {action!r}")
+    if state not in {"intended", "confirmed", "unknown", "reconciled"}:
+        raise ValueError(f"unknown recovery intent state {state!r}")
+    return RecoveryIntent(
+        intent_id=cast(str, value["intent_id"]),
+        recovery_identity=decode_recovery_identity(value["recovery_identity"]),
+        action=cast(RecoveryIntentAction, action),
+        expected_worktree_fingerprint=cast(str, value["expected_worktree_fingerprint"]),
+        state=cast(RecoveryIntentStatus, state),
+    )
+
+
 __all__ = [
+    "RecoveryIdentity",
+    "RecoveryIntent",
+    "RecoveryIntentAction",
+    "RecoveryIntentStatus",
     "RecoveryPhase",
     "RecoveryState",
     "RecoveryTransitionError",
+    "assert_recovery_identity",
     "begin_recovery",
     "decode_recovery",
+    "decode_recovery_identity",
+    "decode_recovery_intent",
     "encode_recovery",
+    "encode_recovery_identity",
+    "encode_recovery_intent",
     "transition_recovery",
 ]

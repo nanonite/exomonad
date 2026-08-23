@@ -16,7 +16,8 @@ use crate::services::agent_control::{
     finish_invocation_and_tombstone, read_invocation, slugify, AgentControlService, AgentIdentity,
     AgentIdentityRecord, AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags,
     InvocationFinishResult, InvocationRecord, InvocationStatus, InvocationTrigger,
-    SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
+    RecoveryAuthorization, RecoveryInvocationLineage, SpawnLeafOptions, SpawnOptions,
+    SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
 };
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::configured_tl_preflight_runtime_paths;
@@ -1483,7 +1484,7 @@ impl<
             None => {
                 return Ok(replace_closed_pr_error(&format!(
                     "PR #{old_pr_number} has no exact head SHA; refusing replacement"
-                )))
+                )));
             }
         };
         let old_head_branch = pr.head_ref.to_string();
@@ -1614,6 +1615,7 @@ impl<
             base_branch: Some(original_base_branch.clone()),
             expected_agent_name: None,
             invocation_pr_number: None,
+            recovery_lineage: None,
             model: None,
         };
         info!(
@@ -1952,6 +1954,7 @@ impl<
             base_branch: None,
             expected_agent_name: None,
             invocation_pr_number: None,
+            recovery_lineage: None,
         };
 
         let result = match self
@@ -2913,14 +2916,14 @@ impl<
                 return Err(EffectError::invalid_input(format!(
                     "PR #{} owner is unresolved for head branch '{}'; use replace_close_pr only with human approval",
                     req.resume_pr_number, head_branch
-                )))
+                )));
             }
             [owner] => owner,
             _ => {
                 return Err(EffectError::invalid_input(format!(
                     "PR #{} has multiple owners for head branch '{}'; refusing to resume it",
                     req.resume_pr_number, head_branch
-                )))
+                )));
             }
         };
         if let Some(metadata_agent) = metadata.author_agent.as_deref() {
@@ -2965,6 +2968,7 @@ impl<
             base_branch: Some(pr.base_ref.to_string()),
             expected_agent_name: Some(owner.agent_name.clone()),
             invocation_pr_number: Some(req.resume_pr_number),
+            recovery_lineage: None,
             model: non_empty(req.model.clone()),
         };
         let options = with_resume_task(options, continuation_prefix.as_deref());
@@ -3133,17 +3137,17 @@ impl<
             .into_iter()
             .rev()
             .any(|record| {
-                record.event.event_type == "tl.slice_parked"
-                    && record
+                let slice_matches = record
+                    .event
+                    .data
+                    .get("slice_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(parked_slice_id);
+                let cause_matches = |key: &str| {
+                    record
                         .event
                         .data
-                        .get("slice_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(parked_slice_id)
-                    && record
-                        .event
-                        .data
-                        .get("park_cause")
+                        .get(key)
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|cause| {
                             matches!(
@@ -3154,6 +3158,18 @@ impl<
                                     | "human_decision_required"
                             )
                         })
+                };
+                slice_matches
+                    && ((record.event.event_type == "tl.slice_parked"
+                        && cause_matches("park_cause"))
+                        || (record.event.event_type == "agent.task_blocked"
+                            && record
+                                .event
+                                .data
+                                .get("outcome")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("blocked")
+                            && cause_matches("cause")))
             });
         if !parked_event_seen {
             return Err(EffectError::invalid_input(format!(
@@ -3231,6 +3247,12 @@ impl<
             base_branch: Some(owner.parent_branch.to_string()),
             expected_agent_name: Some(owner.agent_name.clone()),
             invocation_pr_number: None,
+            recovery_lineage: Some(RecoveryInvocationLineage {
+                prior_invocation_id: invocation.invocation_id.clone(),
+                invocation_generation: invocation.generation.saturating_add(1),
+                recovery_round: invocation.recovery_round.saturating_add(1),
+                authorization_source: RecoveryAuthorization::HumanApproved,
+            }),
             model: owner.model.clone(),
         };
         let result = self
@@ -5130,6 +5152,7 @@ mod tests {
                 AgentName::try_from_str("owner-slug-codex").expect("literal is a valid agent name"),
             ),
             invocation_pr_number: Some(104),
+            recovery_lineage: None,
             model: None,
         };
         let composed = with_resume_task(options.clone(), Some("continuation"));
@@ -5183,6 +5206,9 @@ mod tests {
             exit_reason: None,
             exit_classification: None,
             stderr_tail: None,
+            prior_invocation_id: None,
+            recovery_round: 0,
+            authorization_source: None,
         };
         let same_generation = InvocationRecord {
             invocation_id: current.invocation_id.clone(),

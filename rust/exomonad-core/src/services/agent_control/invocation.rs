@@ -24,6 +24,22 @@ pub enum InvocationTrigger {
     Review,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAuthorization {
+    Controller,
+    HumanApproved,
+    Reconciler,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryInvocationLineage {
+    pub prior_invocation_id: String,
+    pub invocation_generation: u64,
+    pub recovery_round: u32,
+    pub authorization_source: RecoveryAuthorization,
+}
+
 #[derive(Debug, Clone)]
 pub struct InvocationMetadata {
     pub runtime: AgentType,
@@ -33,6 +49,7 @@ pub struct InvocationMetadata {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub identity: Option<InvocationIdentityContext>,
+    pub recovery_lineage: Option<RecoveryInvocationLineage>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,6 +97,12 @@ pub struct InvocationRecord {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_invocation_id: Option<String>,
+    #[serde(default)]
+    pub recovery_round: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_source: Option<RecoveryAuthorization>,
     #[serde(default)]
     pub generation: u64,
     #[serde(default)]
@@ -247,6 +270,9 @@ async fn start_invocation_with_context(
         exit_reason: None,
         exit_classification: None,
         stderr_tail: None,
+        prior_invocation_id: None,
+        recovery_round: 0,
+        authorization_source: None,
     };
     write_atomic(agent_dir, &record).await?;
     persist_routing_ownership(
@@ -279,7 +305,7 @@ pub async fn start_invocation_with_provenance(
     effort: Option<String>,
 ) -> Result<InvocationRecord> {
     start_invocation_with_provenance_and_context(
-        agent_dir, runtime, trigger, routing, pr_number, head_sha, model, effort, None,
+        agent_dir, runtime, trigger, routing, pr_number, head_sha, model, effort, None, None,
     )
     .await
 }
@@ -297,9 +323,19 @@ pub async fn start_invocation_with_provenance_and_context(
     model: Option<String>,
     effort: Option<String>,
     identity: Option<InvocationIdentityContext>,
+    recovery_lineage: Option<RecoveryInvocationLineage>,
 ) -> Result<InvocationRecord> {
     let _guard = mutation_lock().lock().await;
     let generation = next_generation(agent_dir).await?;
+    if let Some(lineage) = recovery_lineage.as_ref() {
+        if lineage.invocation_generation != generation {
+            return Err(anyhow::anyhow!(
+                "recovery invocation generation mismatch: expected {}, allocated {}",
+                lineage.invocation_generation,
+                generation
+            ));
+        }
+    }
     let identity = identity.unwrap_or_default();
     let record = InvocationRecord {
         invocation_id: Uuid::new_v4().to_string(),
@@ -314,6 +350,16 @@ pub async fn start_invocation_with_provenance_and_context(
         head_sha,
         model,
         effort,
+        prior_invocation_id: recovery_lineage
+            .as_ref()
+            .map(|lineage| lineage.prior_invocation_id.clone()),
+        recovery_round: recovery_lineage
+            .as_ref()
+            .map(|lineage| lineage.recovery_round)
+            .unwrap_or(0),
+        authorization_source: recovery_lineage
+            .as_ref()
+            .map(|lineage| lineage.authorization_source),
         generation,
         runtime_agent_id: identity.runtime_agent_id,
         slice_id: identity.slice_id,
@@ -520,6 +566,7 @@ mod tests {
                 branch: Some("main.tunable-operator-body".to_string()),
                 worktree: Some(".exo/worktrees/tunable-operator-body-opencode".to_string()),
             }),
+            None,
         )
         .await
         .expect("start invocation");
@@ -555,6 +602,43 @@ mod tests {
             .expect("persisted invocation");
         assert!(persisted.contains("missing_exit_marker"));
         assert!(persisted.contains("tunable-operator-body-opencode"));
+    }
+
+    #[tokio::test]
+    async fn recovery_lineage_persists_and_requires_next_generation() {
+        let dir = tempdir().expect("tempdir");
+        let lineage = RecoveryInvocationLineage {
+            prior_invocation_id: "prior-invocation".to_string(),
+            invocation_generation: 1,
+            recovery_round: 2,
+            authorization_source: RecoveryAuthorization::HumanApproved,
+        };
+        let record = start_invocation_with_provenance_and_context(
+            dir.path(),
+            AgentType::Codex,
+            InvocationTrigger::Spawn,
+            routing(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(lineage.clone()),
+        )
+        .await
+        .expect("lineage invocation");
+
+        assert_eq!(record.generation, 1);
+        assert_eq!(
+            record.prior_invocation_id.as_deref(),
+            Some("prior-invocation")
+        );
+        assert_eq!(record.recovery_round, 2);
+        assert_eq!(
+            record.authorization_source,
+            Some(RecoveryAuthorization::HumanApproved)
+        );
+        assert_eq!(read_invocation(dir.path()).await.unwrap(), Some(record));
     }
 
     #[tokio::test]
