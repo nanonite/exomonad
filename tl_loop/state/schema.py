@@ -50,6 +50,10 @@ class ParkCause(str, Enum):
     CORRUPT_STATE = "corrupt_state"
     DURABLE_WRITE_FAILED = "durable_write_failed"
     TOOL_UNAVAILABLE = "tool_unavailable"
+    BASE_CI_UNSTABLE = "base_ci_unstable"
+    EXTERNAL_DEPENDENCY = "external_dependency"
+    SCOPE_BOUNDARY = "scope_boundary"
+    HUMAN_DECISION_REQUIRED = "human_decision_required"
 
 
 class Verdict(str, Enum):
@@ -76,6 +80,8 @@ STALL_CLASSIFICATION_VALUES = frozenset(
         "reviewer_not_responding",
         "reviewer_never_started",
         "ci_failed",
+        "ci_base_unstable",
+        "ci_indeterminate",
         "review_stuck",
     }
 )
@@ -223,6 +229,18 @@ PARK_AUDIT_KEYS = frozenset(
         "effort",
         "agent_id",
         "recovered",
+        "attempt",
+        "gate_name",
+        "recovery_action",
+        "needs_human",
+        "base_sha",
+        "head_sha",
+        "failed_checks",
+        "attribution",
+        "scope_attribution",
+        "retryable",
+        "declared_difficulty",
+        "matched_difficulty_rule",
     }
 )
 BUDGET_KEYS = frozenset({"ledger"})
@@ -838,6 +856,22 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
         _non_negative_int(audit, "attempts", f"{path}.park_audit", errors)
     if "verdict" in audit:
         _nullable_enum_value(audit, "verdict", f"{path}.park_audit", Verdict, errors)
+    if "attempt" in audit:
+        _non_negative_int(audit, "attempt", f"{path}.park_audit", errors)
+    for key in (
+        "gate_name",
+        "recovery_action",
+        "base_sha",
+        "head_sha",
+        "scope_attribution",
+        "declared_difficulty",
+        "matched_difficulty_rule",
+    ):
+        if key in audit:
+            _nullable_string(audit, key, f"{path}.park_audit", errors)
+    for key in ("needs_human", "retryable"):
+        if key in audit:
+            _boolean(audit, key, f"{path}.park_audit", errors)
     for key in ("harness", "model", "from_harness", "to_harness", "reason", "effort"):
         if key in audit:
             _nullable_string(audit, key, f"{path}.park_audit", errors)

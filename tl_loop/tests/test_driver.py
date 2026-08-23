@@ -463,6 +463,95 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert result.final_state.slices["worker-a"].dispatch_last_boundary == "agent.spawned"
     assert result.final_state.slices["leaf-a"].dispatch_last_boundary == "agent.spawned"
     assert source.acknowledged == [1, 2, 3, 4, 5]
+
+
+def test_active_loop_parks_typed_task_block_without_failing_controller(
+    tmp_path: Path,
+) -> None:
+    run_id = "task-blocked-run"
+    cancel_event = threading.Event()
+    source = SyntheticQueue([_blocked_event(1, "leaf-a", run_id)])
+    outcome: dict[str, BaseException] = {}
+
+    class BlockedTransport(RecordingTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            result = super().call_tool(role, name, tool_name, arguments)
+            if tool_name == "chainlink_issue_create":
+                return {"success": True, "result": {"issue_id": 704}}
+            return result
+
+    def run() -> None:
+        try:
+            run_tl_loop(
+                run_id,
+                _plan(),
+                source,
+                EffectClient(BlockedTransport()),
+                config=TLLoopConfig(
+                    max_workers=1,
+                    max_leaves=1,
+                    poll_interval=0.001,
+                    cancel_event=cancel_event,
+                ),
+                root_dir=tmp_path,
+            )
+        except BaseException as error:  # noqa: BLE001 - assert cancellation boundary
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while source.acknowledged != [1] and time.monotonic() < deadline:
+        time.sleep(0.001)
+    cancel_event.set()
+    thread.join(timeout=2)
+
+    state = RunStore(run_id, tmp_path).load()
+    assert isinstance(outcome.get("error"), LoopCancelled)
+    assert state.fsm.phase is not TLPhase.TLFailed
+    assert state.slices["leaf-a"].status is SliceStatus.PARKED
+    assert state.slices["leaf-a"].park_cause is ParkCause.BASE_CI_UNSTABLE
+    assert any(gate.name.startswith("task-blocked:") for gate in state.gates)
+
+
+def _blocked_event(run_seq: int, slug: str, run_id: str) -> EventEnvelope:
+    return project(
+        {
+            "schema_version": 1,
+            "event_id": f"blocked-{run_seq}",
+            "id": f"blocked-{run_seq}",
+            "event_time": "2026-08-11T00:00:00Z",
+            "observed_at": "2026-08-11T00:00:00Z",
+            "run_seq": run_seq,
+            "type": "agent.task_blocked",
+            "agent_id": slug,
+            "run_id": run_id,
+            "session_id": "session-1",
+            "invocation_id": "inv-1",
+            "generation": 1,
+            "harness": "codex",
+            "role": "worker",
+            "lifecycle_state": "authoritative",
+            "data": {
+                "outcome": "blocked",
+                "slice_id": slug,
+                "cause": "base_ci_unstable",
+                "scope_attribution": "base",
+                "needs_human": True,
+                "retryable": True,
+                "recovery_action": "repair base CI",
+                "declared_difficulty": "standard",
+                "matched_difficulty_rule": "standard_slice",
+                "attempt": 1,
+            },
+        }
+    )
     lifecycle_payloads = [
         arguments["payload"]
         for name, arguments in transport.calls

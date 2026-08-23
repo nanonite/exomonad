@@ -34,6 +34,17 @@ class ChildFailed(TLEvent):
 
 
 @dataclass(frozen=True)
+class ChildBlocked(TLEvent):
+    """A child is externally blocked and requires a durable human gate."""
+
+    slug: str
+    cause: str
+    needs_human: bool
+    recovery_action: str
+    attempt: int
+
+
+@dataclass(frozen=True)
 class PRMerged(TLEvent):
     """A child PR merged."""
 

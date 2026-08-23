@@ -1115,6 +1115,13 @@ def _run_loop(
             fsm_event = decoder.decode(event)
         except Exception as error:
             raise TLLoopError(str(error)) from error
+        if event.kind is EventKind.AGENT_TASK_BLOCKED:
+            state = _park_task_blocked_event(event, state, store, effects)
+            phase = _phase_from_state(state)
+            _ack_event(source, event, replaying, diagnostics)
+            _release_replayed_event(store, event, replaying)
+            diagnostics.correlated += 1
+            continue
         if _duplicate_event(phase, fsm_event, state):
             diagnostics.filtered += 1
             _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
@@ -4857,6 +4864,53 @@ def _next_event(
         if config.poll_interval == 0:
             time.sleep(0.01)
         return None
+
+
+def _park_task_blocked_event(
+    event: EventEnvelope,
+    state: RunState,
+    store: RunStore,
+    effects: EffectClient | ReadOnlyEffectClient,
+) -> RunState:
+    """Durably park one externally blocked slice without failing its TL."""
+    blocked = event.task_blocked
+    if blocked is None:
+        raise TLLoopError("agent.task_blocked has no typed blocked payload")
+    if not isinstance(effects, EffectClient):
+        raise TLLoopError("agent.task_blocked requires active effect capabilities")
+    slice_id = blocked.slice_id or event.slice_id or event.agent_id
+    if not isinstance(slice_id, str) or slice_id not in state.slices:
+        raise TLLoopError(f"agent.task_blocked names unknown slice {slice_id!r}")
+    cause_by_wire = {
+        "base_ci_unstable": ParkCause.BASE_CI_UNSTABLE,
+        "external_dependency": ParkCause.EXTERNAL_DEPENDENCY,
+        "scope_boundary": ParkCause.SCOPE_BOUNDARY,
+        "human_decision_required": ParkCause.HUMAN_DECISION_REQUIRED,
+        "tooling_unavailable": ParkCause.TOOL_UNAVAILABLE,
+    }
+    cause = cause_by_wire.get(blocked.cause.value)
+    if cause is None:
+        raise TLLoopError(f"agent.task_blocked has unsupported cause {blocked.cause.value!r}")
+    audit = dict(event.data)
+    audit.update(
+        {
+            "attempt": blocked.attempt,
+            "recovery_action": blocked.recovery_action,
+            "needs_human": blocked.needs_human,
+            "scope_attribution": blocked.scope_attribution,
+            "retryable": blocked.retryable,
+            "declared_difficulty": blocked.declared_difficulty.value,
+            "matched_difficulty_rule": blocked.matched_difficulty_rule,
+        }
+    )
+    park(
+        state.slices[slice_id],
+        cause,
+        store=store,
+        issue_creator=effects,
+        audit=audit,
+    )
+    return store.load()
 
 
 def _checkpoint_and_ack(

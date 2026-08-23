@@ -13,7 +13,7 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
-from tl_loop.fsm.event import ChildSpawned
+from tl_loop.fsm.event import ChildBlocked, ChildSpawned
 from tl_loop.fsm.phase import ChildHandle
 from tl_loop.loop.shadow import ShadowLoop, TLEventDecoder
 from tl_loop.state.store import create
@@ -60,6 +60,42 @@ def test_shadow_decoder_accepts_canonical_spawn_payload() -> None:
     decoded = TLEventDecoder().decode(project(raw))
 
     assert decoded == ChildSpawned(ChildHandle("child-a", "main.child-a", "codex"))
+
+
+def test_shadow_decoder_accepts_typed_task_blocked_payload() -> None:
+    raw = {
+        "schema_version": 1,
+        "event_id": "blocked-event",
+        "id": "blocked-event",
+        "event_time": "2026-08-11T00:00:00Z",
+        "observed_at": "2026-08-11T00:00:00Z",
+        "run_seq": 2,
+        "type": "agent.task_blocked",
+        "agent_id": "worker-a",
+        "run_id": "run-1",
+        "session_id": "session-1",
+        "invocation_id": "inv-1",
+        "generation": 1,
+        "harness": "codex",
+        "role": "worker",
+        "lifecycle_state": "authoritative",
+        "data": {
+            "outcome": "blocked",
+            "slice_id": "slice-a",
+            "cause": "base_ci_unstable",
+            "scope_attribution": "base",
+            "needs_human": True,
+            "retryable": True,
+            "recovery_action": "repair base CI",
+            "declared_difficulty": "standard",
+            "matched_difficulty_rule": "standard_slice",
+            "attempt": 2,
+        },
+    }
+
+    decoded = TLEventDecoder().decode(project(raw))
+
+    assert decoded == ChildBlocked("slice-a", "base_ci_unstable", True, "repair base CI", 2)
 
 
 def test_shadow_loop_reaches_terminal_phase_and_records_intended_sequence(tmp_path: Path) -> None:

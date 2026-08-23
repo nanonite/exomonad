@@ -17,6 +17,7 @@ from tl_loop.loop.escalate import (
     ParkResult,
     _create_issue,
     authorize_harness_switch,
+    blocked_gate_name,
     park,
     switch_harness,
 )
@@ -88,6 +89,39 @@ def test_effect_issue_creation_has_needs_human_label(tmp_path: Path) -> None:
     assert isinstance(result, ParkResult)
     assert creator.labels == ("needs-human",)
     assert creator.priority == "high"
+
+
+def test_externally_blocked_parking_is_gate_and_issue_idempotent(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    created: list[tuple[str, str]] = []
+
+    def create_issue(title: str, description: str) -> int:
+        created.append((title, description))
+        return 703
+
+    first = park(
+        _slice(),
+        ParkCause.BASE_CI_UNSTABLE,
+        store=store,
+        issue_creator=create_issue,
+        audit={"attempt": 2, "recovery_action": "repair base CI", "needs_human": True},
+    )
+    second = park(
+        _slice(),
+        ParkCause.BASE_CI_UNSTABLE,
+        store=store,
+        issue_creator=create_issue,
+        audit={"attempt": 2, "recovery_action": "repair base CI", "needs_human": True},
+    )
+
+    assert first == ParkResult(703, "root", ("child", "grandchild"))
+    assert second == ParkResult(703, "root", ())
+    assert len(created) == 1
+    assert store.load().fsm.phase.value != "tl_failed"
+    assert any(
+        gate.name == blocked_gate_name("escalate-test", "root", 2, "base_ci_unstable")
+        for gate in store.load().gates
+    )
 
 
 def test_failed_issue_creation_does_not_mutate_state(tmp_path: Path) -> None:

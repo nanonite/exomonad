@@ -14,6 +14,7 @@ from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.envelope import EventEnvelope, EventKind
 from tl_loop.fsm.event import (
     AllChildrenDone,
+    ChildBlocked,
     ChildCompleted,
     ChildFailed,
     ChildSpawned,
@@ -38,7 +39,8 @@ from tl_loop.fsm.phase import (
     TLWaiting,
 )
 from tl_loop.fsm.transition import IllegalTransition, transition
-from tl_loop.state.schema import RunState, SliceState, SliceStatus
+from tl_loop.loop.escalate import blocked_gate_name
+from tl_loop.state.schema import GateStatus, ParkCause, RunState, SliceState, SliceStatus
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 DEFAULT_SHADOW_ROOT = DEFAULT_ROOT / "shadow"
@@ -137,6 +139,18 @@ class TLEventDecoder:
         explicit = event.data.get("shadow_event")
         if explicit is not None:
             return self._decode_explicit(explicit)
+        if event.kind is EventKind.AGENT_TASK_BLOCKED:
+            blocked = event.task_blocked
+            if blocked is None:
+                raise ShadowLoopError("agent.task_blocked has no typed blocked payload")
+            slug = blocked.slice_id or event.slice_id or _agent(event)
+            return ChildBlocked(
+                slug,
+                blocked.cause.value,
+                blocked.needs_human,
+                blocked.recovery_action,
+                blocked.attempt,
+            )
         if event.kind is EventKind.AGENT_NOTIFY_PARENT:
             return self._decode_parent_notification(event)
         if event.kind is EventKind.AGENT_SPAWNED:
@@ -288,12 +302,13 @@ class ShadowLoop:
                 event = self.source.get(timeout=timeout)
             except queue_module.Empty:
                 break
-            if event.kind is EventKind.AGENT_TASK_BLOCKED or (
+            if (
                 event.kind is EventKind.AGENT_NOTIFY_PARENT
                 and event.data.get("status") == "blocked"
             ):
-                # Blocked outcomes are telemetry-only until the durable human-gate
-                # transition lands; never reinterpret them as child failure.
+                # Legacy blocked notifications do not carry the typed cause and
+                # remain telemetry-only; canonical task-blocked events are decoded
+                # below and parked durably.
                 self.source.acknowledge(event)
                 continue
             fsm_event = self.decoder.decode(event)
@@ -311,7 +326,10 @@ class ShadowLoop:
                 raise ShadowLoopError(f"event {event.event_type!r} has no run_seq")
             judgment = _judgment(self.judgments, fsm_event, phase, next_phase)
             slices = _update_slices(
-                state.slices, fsm_event, slice_id=event.slice_id or event.agent_id
+                state.slices,
+                fsm_event,
+                slice_id=event.slice_id or event.agent_id,
+                run_id=self.store.run_id,
             )
             if isinstance(fsm_event, ChildSpawned):
                 current = slices.get(fsm_event.handle.slug)
@@ -338,6 +356,15 @@ class ShadowLoop:
                 _phase_tag(next_phase),
             )
             state = self.store.checkpoint(next_phase, slices, state.budgets, event_seq)
+            if isinstance(fsm_event, ChildBlocked):
+                gate_name = blocked_gate_name(
+                    self.store.run_id,
+                    fsm_event.slug,
+                    fsm_event.attempt,
+                    fsm_event.cause,
+                )
+                if not any(gate.name == gate_name for gate in state.gates):
+                    state = self.store.set_gate(gate_name, GateStatus.PENDING)
             if self.recorder is not None:
                 self.recorder.record(action)
             self.source.acknowledge(event)
@@ -354,7 +381,7 @@ def _judgment(
     before: PhaseValue,
     after: PhaseValue,
 ) -> Judgment:
-    if isinstance(event, ChildFailed):
+    if isinstance(event, (ChildFailed, ChildBlocked)):
         return judgments.choose_repair(event, before, after)
     if isinstance(event, PRMerged):
         return judgments.choose_merge(event, before, after)
@@ -367,6 +394,7 @@ def _update_slices(
     *,
     slice_id: str | None = None,
     allow_spawn_confirmation: bool = True,
+    run_id: str = "shadow",
 ) -> dict[str, SliceState]:
     updated = dict(slices)
     if isinstance(event, (PRFiled, PRUpdated)):
@@ -433,6 +461,20 @@ def _update_slices(
         current = updated.get(event.slug)
         if current is not None:
             updated[event.slug] = replace(current, status=SliceStatus.FAILED)
+    elif isinstance(event, ChildBlocked):
+        current = updated.get(event.slug)
+        if current is not None:
+            updated[event.slug] = replace(
+                current,
+                status=SliceStatus.PARKED,
+                park_cause=ParkCause(event.cause),
+                park_audit={
+                    "gate_name": blocked_gate_name(run_id, event.slug, event.attempt, event.cause),
+                    "attempt": event.attempt,
+                    "recovery_action": event.recovery_action,
+                    "needs_human": event.needs_human,
+                },
+            )
     return updated
 
 
@@ -494,7 +536,7 @@ def _target(event: EventEnvelope, fsm_event: TLEvent) -> str:
         return event.agent_id
     if isinstance(fsm_event, ChildSpawned):
         return fsm_event.handle.slug
-    if isinstance(fsm_event, (ChildCompleted, ChildFailed, PRMerged)):
+    if isinstance(fsm_event, (ChildCompleted, ChildFailed, ChildBlocked, PRMerged)):
         return fsm_event.slug
     if isinstance(fsm_event, (PRFiled, PRUpdated)):
         return fsm_event.slice_id or event.agent_id or "controller"

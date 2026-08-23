@@ -6,6 +6,7 @@ from collections.abc import Mapping
 
 from .event import (
     AllChildrenDone,
+    ChildBlocked,
     ChildCompleted,
     ChildFailed,
     ChildSpawned,
@@ -34,9 +35,7 @@ class IllegalTransition(Exception):
     def __init__(self, phase: Phase, event: TLEvent) -> None:
         self.phase = phase
         self.event = event
-        super().__init__(
-            f"No TL transition for {type(phase).__name__} and {type(event).__name__}"
-        )
+        super().__init__(f"No TL transition for {type(phase).__name__} and {type(event).__name__}")
 
 
 def transition(phase: PhaseValue, event: TLEvent) -> PhaseValue:
@@ -55,6 +54,14 @@ def transition(phase: PhaseValue, event: TLEvent) -> PhaseValue:
         raise IllegalTransition(phase, event)
     if isinstance(event, ChildFailed):
         return TLFailed(f"{event.slug}: {event.reason}")
+    if isinstance(event, ChildBlocked):
+        # External blockers are parked behind a human gate; they are not a
+        # controller failure and must leave unrelated siblings runnable.
+        if isinstance(phase, TLWaiting):
+            children = dict(phase.children)
+            children.pop(event.slug, None)
+            return TLWaiting(children)
+        return phase
     if isinstance(event, PRMerged):
         if isinstance(phase, (TLMerging, TLWaiting)):
             return _without_child(phase.children, event.slug)

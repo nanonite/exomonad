@@ -32,6 +32,25 @@ _TERMINAL_STATUSES = frozenset(
     }
 )
 _AUDIT_FIELDS = frozenset({"from_harness", "to_harness", "reason", "model", "effort"})
+_BLOCKED_AUDIT_FIELDS = frozenset(
+    {
+        "attempt",
+        "recovery_action",
+        "needs_human",
+        "base_sha",
+        "head_sha",
+        "failed_checks",
+        "attribution",
+    }
+)
+_BLOCKED_GATE_CAUSES = frozenset(
+    {
+        ParkCause.BASE_CI_UNSTABLE,
+        ParkCause.EXTERNAL_DEPENDENCY,
+        ParkCause.SCOPE_BOUNDARY,
+        ParkCause.HUMAN_DECISION_REQUIRED,
+    }
+)
 
 
 class EscalationError(RuntimeError):
@@ -40,6 +59,13 @@ class EscalationError(RuntimeError):
 
 class IssueCreationError(EscalationError):
     """The needs-human issue was not created with a usable ID."""
+
+
+def blocked_gate_name(run_id: str, slice_id: str, attempt: int, cause: str) -> str:
+    """Return the stable identity for one externally blocked attempt."""
+    if not run_id or not slice_id or type(attempt) is not int or attempt <= 0 or not cause:
+        raise ValueError("blocked gate identity requires run, slice, positive attempt, and cause")
+    return f"task-blocked:{run_id}:{slice_id}:{attempt}:{cause}"
 
 
 class IssueCreator(Protocol):
@@ -105,6 +131,22 @@ def park(
             park_audit=parked_audit,
             blocked_by=None,
         )
+    gate_name: str | None = None
+    gate_created = False
+    current_state = store.load()
+    current_slice = current_state.slices.get(slice.id)
+    if parsed_cause in _BLOCKED_GATE_CAUSES:
+        raw_attempt = (audit or {}).get("attempt", slice.attempts)
+        attempt = raw_attempt if type(raw_attempt) is int and raw_attempt > 0 else slice.attempts
+        gate_name = blocked_gate_name(store.run_id, slice.id, attempt, parsed_cause.value)
+        parked_audit = {**dict(parked_audit), "gate_name": gate_name, "attempt": attempt}
+        if isinstance(current_slice, SliceState) and (
+            current_slice.park_cause is parsed_cause and current_slice.park_issue_id is not None
+        ):
+            gate_created = _ensure_gate(store, gate_name)
+            if gate_created and isinstance(issue_creator, EffectClient):
+                _emit_gate_opened(issue_creator, store.run_id, gate_name, parsed_cause)
+            return ParkResult(current_slice.park_issue_id, slice.id, ())
     if issue_creator is None:
         raise EscalationError("a needs-human issue creator is required for durable parking")
 
@@ -152,15 +194,18 @@ def park(
             waiting = raw_fsm.get("waiting")
             if isinstance(waiting, list):
                 waiting[:] = [item for item in waiting if item not in blocked_ids]
-                if not waiting and raw_fsm.get("phase") in {
-                    TLPhase.TLWaiting.value,
-                    TLPhase.TLMerging.value,
-                }:
+                if (
+                    not waiting
+                    and raw_fsm.get("phase") in {TLPhase.TLWaiting.value, TLPhase.TLMerging.value}
+                    and parsed_cause not in _BLOCKED_GATE_CAUSES
+                ):
                     raw_fsm["phase"] = TLPhase.TLFailed.value
         return document
 
     prior_phase = store.load().fsm.phase.value
     apply(store.run_dir, mutate)
+    if gate_name is not None:
+        gate_created = _ensure_gate(store, gate_name)
     if isinstance(issue_creator, EffectClient):
         _emit_park_events(
             issue_creator,
@@ -171,6 +216,8 @@ def park(
             store.load().fsm.phase.value,
             store.run_id,
         )
+        if gate_name is not None and gate_created:
+            _emit_gate_opened(issue_creator, store.run_id, gate_name, parsed_cause)
     return ParkResult(issue_id, slice.id, tuple(blocked))
 
 
@@ -318,7 +365,7 @@ def _build_audit(
         "ledger": _ledger_snapshot(ledger),
     }
     if extra is not None:
-        for key in _AUDIT_FIELDS:
+        for key in _AUDIT_FIELDS | _BLOCKED_AUDIT_FIELDS:
             if key in extra:
                 result[key] = to_jsonable(extra[key])
     return result
@@ -359,6 +406,26 @@ def _ledger_snapshot(ledger: LedgerInput | None) -> dict[str, object]:
     return value
 
 
+def _ensure_gate(store: RunStore, gate_name: str) -> bool:
+    """Create a pending gate only when this identity has not been seen."""
+    if any(gate.name == gate_name for gate in store.load().gates):
+        return False
+    store.set_gate(gate_name)
+    return True
+
+
+def _emit_gate_opened(effects: EffectClient, run_id: str, gate_name: str, cause: ParkCause) -> None:
+    emit_controller_event(
+        effects,
+        "tl.gate_opened",
+        {
+            "gate_name": gate_name,
+            "run_id": run_id,
+            "reason": f"externally blocked slice: {cause.value}",
+        },
+    )
+
+
 def _create_issue(
     creator: IssueCreator | EffectClient | Callable[[str, str], int],
     slice: SliceState,
@@ -370,6 +437,11 @@ def _create_issue(
         f"Slice {slice.id} is parked for human action. "
         f"Cause: {cause.value}. Audit: {dumps_json(audit, sort_keys=True)}"
     )
+    if cause in _BLOCKED_GATE_CAUSES:
+        description += (
+            "\n\nOperator choices: retry same owner; wait for recovery; "
+            "authorize scope expansion; or abandon the attempt."
+        )
     if callable(creator) and not hasattr(creator, "chainlink_issue_create"):
         value: object = creator(title, description)
     else:
@@ -407,6 +479,7 @@ __all__ = [
     "ParkCause",
     "ParkResult",
     "authorize_harness_switch",
+    "blocked_gate_name",
     "park",
     "switch_harness",
 ]
