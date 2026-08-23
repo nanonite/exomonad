@@ -170,6 +170,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Propagate recoverable states through recursive sub-TLs (#958)
 - Preserve parallel scheduling during slice recovery (#957)
 - Add bounded plan-drift diagnosis and clarification (#956)
 - Add bounded recovery policy and orchestration probes (#955)
