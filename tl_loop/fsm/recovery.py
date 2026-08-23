@@ -35,6 +35,9 @@ class RecoveryState:
     invocation_generation: int = 0
     plan_revision: int = 0
     evidence: Mapping[str, object] = field(default_factory=dict)
+    last_probe_at: float | None = None
+    next_probe_at: float | None = None
+    probe_count: int = 0
 
     def __post_init__(self) -> None:
         if not self.cause:
@@ -54,6 +57,12 @@ class RecoveryState:
                 raise ValueError(f"recovery {name} must be a non-negative integer")
         if self.entered_at < 0:
             raise ValueError("recovery entered_at must be non-negative")
+        for name in ("last_probe_at", "next_probe_at"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"recovery {name} must be non-negative or null")
+        if type(self.probe_count) is not int or self.probe_count < 0:
+            raise ValueError("recovery probe_count must be a non-negative integer")
 
 
 class RecoveryTransitionError(ValueError):
@@ -221,6 +230,9 @@ def decode_recovery(value: object) -> RecoveryState | None:
         invocation_generation=cast(int, value.get("invocation_generation", 0)),
         plan_revision=cast(int, value.get("plan_revision", 0)),
         evidence=dict(cast(Mapping[str, object], value.get("evidence", {}))),
+        last_probe_at=cast(float | None, value.get("last_probe_at")),
+        next_probe_at=cast(float | None, value.get("next_probe_at")),
+        probe_count=cast(int, value.get("probe_count", 0)),
     )
 
 
@@ -238,6 +250,9 @@ def encode_recovery(value: RecoveryState) -> dict[str, object]:
         "invocation_generation": value.invocation_generation,
         "plan_revision": value.plan_revision,
         "evidence": dict(value.evidence),
+        "last_probe_at": value.last_probe_at,
+        "next_probe_at": value.next_probe_at,
+        "probe_count": value.probe_count,
     }
 
 

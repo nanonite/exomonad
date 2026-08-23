@@ -49,11 +49,12 @@ from tl_loop.fsm.phase import (
     TLPlanning,
     TLWaiting,
 )
-from tl_loop.fsm.recovery import begin_recovery
+from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
 from tl_loop.loop.observability import emit_controller_event
+from tl_loop.loop.recovery_policy import policy_for_cause
 from tl_loop.loop.review import (
     IntegrationEvidenceMismatch,
     ReviewGateError,
@@ -4929,6 +4930,14 @@ def _record_task_blocked_recovery(
         plan_revision=state.revision,
         evidence=audit,
     )
+    policy = policy_for_cause(blocked.cause.value)
+    if policy.immediate_human_gate:
+        recovery = transition_recovery(
+            recovery,
+            RecoveryPhase.HUMAN_GATE,
+            next_action="open_human_gate",
+            evidence=audit,
+        )
     updated = {**state.slices, slice_id: replace(current, recovery=recovery)}
     return store.checkpoint(phase, updated, state.budgets, event_seq)
 

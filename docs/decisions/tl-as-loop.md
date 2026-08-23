@@ -74,6 +74,24 @@ Recovery may move through `WAITING_SIGNAL`, `REVALIDATING`, `RESUME_INTENDED`,
 Recovery identity, attempt/generation, plan revision, evidence, and next action
 are checkpointed so replay and restart preserve the same diagnosis.
 
+Recovery policy is a closed cause-to-action table, not a message classifier:
+
+| cause | probe | rounds | wait ceiling | action |
+| --- | --- | ---: | ---: | --- |
+| `base_ci_unstable` | independent base CI | 3 | 1800s | same-owner resume on a newer healthy signal |
+| `external_dependency` | declared dependency | 3 | 1800s | same-owner resume on a newer healthy signal |
+| `scope_boundary` | none | 0 | 0s | human gate immediately |
+| `human_decision_required` | none | 0 | 0s | human gate immediately |
+| `tooling_unavailable` | none | 0 | 0s | human gate immediately |
+
+Automatic probes are checkpointed with their round, count, last observation,
+and next backoff time before any effect is dispatched. A recovery signal must
+carry a newer authoritative event sequence; base-CI recovery additionally
+requires the watcher attribution to remain `base_pre_existing` with the
+independent base scope. Head-introduced failures can therefore never be
+reclassified as base recovery, and replay cannot issue the same probe twice
+while its durable backoff is active.
+
 The only handoff from this pre-publication state into review is an authoritative
 `pr.filed` event. That event clears the recovery record and establishes the
 normal `IN_REVIEW` state; review, merge, or process-exit observations cannot

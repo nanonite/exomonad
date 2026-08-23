@@ -259,6 +259,9 @@ RECOVERY_KEYS = frozenset(
         "invocation_generation",
         "plan_revision",
         "evidence",
+        "last_probe_at",
+        "next_probe_at",
+        "probe_count",
     }
 )
 BUDGET_KEYS = frozenset({"ledger"})
@@ -934,6 +937,9 @@ def _validate_recovery(value: object, path: str, errors: list[tuple[str, str]]) 
     _nullable_string(recovery, "owner_agent_id", f"{path}.recovery", errors)
     _non_negative_int(recovery, "invocation_generation", f"{path}.recovery", errors)
     _non_negative_int(recovery, "plan_revision", f"{path}.recovery", errors)
+    _nullable_number(recovery, "last_probe_at", f"{path}.recovery", errors)
+    _nullable_number(recovery, "next_probe_at", f"{path}.recovery", errors)
+    _non_negative_int(recovery, "probe_count", f"{path}.recovery", errors)
     evidence = recovery.get("evidence", {})
     if not isinstance(evidence, dict):
         errors.append((f"{path}.recovery.evidence", "must be an object"))

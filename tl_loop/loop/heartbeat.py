@@ -9,15 +9,24 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TypeAlias
+from typing import TypeAlias, cast
 
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.reader import LedgerReader, LedgerReadError
-from tl_loop.fsm.recovery import begin_recovery
+from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
 from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observability import emit_controller_event
+from tl_loop.loop.recovery_policy import (
+    ProbeResult,
+    RecoveryAction,
+    RecoveryPolicyError,
+    apply_probe_result,
+    decide_recovery,
+    policy_for_cause,
+    schedule_probe,
+)
 from tl_loop.state.schema import (
     GoalState,
     ParkCause,
@@ -139,6 +148,18 @@ def heartbeat_once(
     progress = False
 
     for slice_state in active:
+        current, recovery_event, recovery_progress = _reconcile_recovery(
+            store.load(),
+            slice_state,
+            worker_rows.get(slice_state.id),
+            now=current_time,
+            store=store,
+        )
+        if recovery_event is not None:
+            events.append(recovery_event)
+        if recovery_progress:
+            progress = True
+        slice_state = current.slices[slice_state.id]
         row = worker_rows.get(slice_state.id)
         if row is None:
             runtime_agent_id = slice_state.dispatch_agent_id or slice_state.id
@@ -749,6 +770,76 @@ def _retired_or_unrouted(row: JsonMapping) -> bool:
         return False
     normalized = lifecycle.upper()
     return normalized.startswith("RETIRED") or normalized == "NO-ROUTING-RECORDED"
+
+
+def _reconcile_recovery(
+    current: RunState,
+    slice_state: SliceState,
+    row: JsonMapping | None,
+    *,
+    now: float,
+    store: RunStore,
+) -> tuple[RunState, SyntheticHeartbeatEvent | None, bool]:
+    """Advance one bounded recovery probe using only structured observations."""
+    recovery = slice_state.recovery
+    if recovery is None:
+        return current, None, False
+    try:
+        policy = policy_for_cause(recovery.cause)
+        probe_result = None
+        if row is not None and isinstance(row.get("recovery_probe"), Mapping):
+            probe_result = ProbeResult.from_mapping(
+                cast(Mapping[str, object], row["recovery_probe"])
+            )
+        decision = decide_recovery(recovery, now=now, probe_result=probe_result)
+    except RecoveryPolicyError as error:
+        raise HeartbeatError(f"invalid recovery state for {slice_state.id!r}: {error}") from error
+
+    if probe_result is not None and decision.action is RecoveryAction.RESUME:
+        updated_recovery = apply_probe_result(recovery, probe_result, now=now)
+        action = "resume_same_owner"
+    elif decision.action is RecoveryAction.PROBE:
+        updated_recovery = schedule_probe(
+            recovery, now=now, event_seq=current.goals.last_authoritative_event_seq
+        )
+        action = "probe"
+    elif decision.action is RecoveryAction.EXHAUSTED:
+        updated_recovery = transition_recovery(
+            recovery,
+            RecoveryPhase.HUMAN_GATE,
+            next_action="open_human_gate",
+            entered_at=now,
+            evidence={**recovery.evidence, "exhausted_reason": decision.reason},
+        )
+        action = "human_gate"
+    else:
+        return current, None, False
+
+    if updated_recovery == recovery:
+        return current, None, False
+    updated_slice = replace(slice_state, recovery=updated_recovery)
+    current = store.checkpoint(
+        current.fsm,
+        {**current.slices, slice_state.id: updated_slice},
+        current.budgets,
+        current.events.last_consumed_offset,
+    )
+    event = _event(
+        f"recovery.{action}",
+        "heartbeat",
+        slice_state.id,
+        {
+            "cause": recovery.cause,
+            "probe_kind": policy.probe_kind,
+            "recovery_round": updated_recovery.recovery_round,
+            "probe_count": updated_recovery.probe_count,
+            "next_probe_at": updated_recovery.next_probe_at,
+            "max_rounds": policy.max_rounds,
+            "max_wait_seconds": policy.max_wait_seconds,
+            "reason": decision.reason,
+        },
+    )
+    return current, event, True
 
 
 def _missing_worker_evidence(
