@@ -392,17 +392,13 @@ def run_case(index: int) -> dict[str, Any]:
                 body="The scoped leaf did not introduce the failing base check.",
                 base_branch="main",
             )
-            if not published.success:
-                raise real.HarnessError(
-                    f"PR publication after resume failed: {published.raw!r}"
-                )
-            if not (repo / ".exo/published-heads.json").is_file():
-                raise real.HarnessError(
-                    "resume publication did not persist verified PR evidence"
-                )
             published_after_resume = published.success and (
                 repo / ".exo/published-heads.json"
             ).is_file()
+            if not published_after_resume:
+                raise real.HarnessError(
+                    f"PR publication after resume failed: {published.raw!r}"
+                )
             result = {
                 "run": index,
                 "blocked_event": {
