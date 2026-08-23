@@ -428,6 +428,14 @@ check-e2e-tl-loop-shadow:
 e2e-tl-loop-active:
     ./tests/e2e/tl-loop-active/run.sh
 
+# Run the real-server closed-PR abandonment and redispatch acceptance scenario three times.
+e2e-slice-abandon-redispatch:
+    ./tests/e2e/slice-abandon-redispatch/run.sh
+
+check-e2e-slice-abandon-redispatch:
+    bash -n tests/e2e/slice-abandon-redispatch/run.sh
+    {{py}} -m py_compile tests/e2e/slice-abandon-redispatch/run.py
+
 check-e2e-tl-loop-active:
     bash -n tests/e2e/tl-loop-active/run.sh
     {{py}} -m py_compile tests/e2e/tl-loop-active/active_run.py

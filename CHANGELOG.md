@@ -363,6 +363,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Real-server E2E proving the abandon and re-dispatch acceptance scenario (#943)
 - Park on tool-unavailable instead of killing the controller (#940 step 6) (#941)
 - Controller event payloads silently dropped: restore attempt/task telemetry and cross-validate the field contract (#942)
 - Tool declared but registered by no role: resolve_live_pr_for_slice crashes the TL; add registration-coverage checks (#940)

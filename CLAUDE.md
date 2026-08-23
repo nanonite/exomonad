@@ -658,6 +658,7 @@ just e2e-messaging         # Teams inbox delivery pipeline
 just e2e-oc-rewrite        # BeforeModel/AfterModel PII rewriting
 just e2e-tl-loop-shadow    # Live TL trajectory beside the read-only shadow loop
 just e2e-tl-loop-active    # Programmatic TL loop over a scratch repository
+just e2e-slice-abandon-redispatch # Real-server closed-PR recovery acceptance
 ```
 
 `just e2e-tl-loop-active` is intentionally non-interactive: it uses a bounded

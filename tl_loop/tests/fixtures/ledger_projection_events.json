@@ -334,5 +334,26 @@
     "source": "rust",
     "lifecycle_state": "emitted",
     "data": {"child_agent": "task-b", "agent_type": "codex", "spawn_type": "leaf", "branch": "task-b"}
+  },
+  {
+    "schema_version": 1,
+    "event_id": "00000000-0000-4000-8000-000000000017",
+    "id": "00000000-0000-4000-8000-000000000017",
+    "event_time": "2026-08-10T04:48:03.263Z",
+    "observed_at": "2026-08-10T04:48:03.263Z",
+    "run_seq": 117,
+    "type": "tl.slice_abandoned",
+    "agent_id": "root",
+    "run_id": "run-1",
+    "session_id": "session-1",
+    "invocation_id": "invocation-6",
+    "generation": 2,
+    "provider": "openai",
+    "runtime": "codex",
+    "harness": "codex",
+    "role": "tl",
+    "source": "rust",
+    "lifecycle_state": "emitted",
+    "data": {"slice_id": "task-a", "attempt": 1, "pr_number": 101, "head_sha": "bbb222", "invocation_id": "invocation-6", "operator_source": "cli", "cause": "operator_requested"}
   }
 ]

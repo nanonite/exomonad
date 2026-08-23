@@ -49,6 +49,7 @@ class EventKind(str, Enum):
     ISSUE_CLOSED = "issue.closed"
     INBOX_MESSAGE = "inbox.message"
     INBOX_POKE = "inbox.poke"
+    SLICE_ABANDONED = "tl.slice_abandoned"
 
 
 EVENT_TYPE_BY_KIND: Mapping[EventKind, str] = MappingProxyType(
