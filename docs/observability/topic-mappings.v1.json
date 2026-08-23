@@ -13,6 +13,8 @@
     {"topic": "obs/event/inbox.message", "event_type": "inbox.message"},
     {"topic": "obs/event/inbox.poke", "event_type": "inbox.poke"},
     {"topic": "obs/event/agent.task_blocked", "event_type": "agent.task_blocked"},
+    {"topic": "obs/event/agent.recovery.started", "event_type": "agent.recovery.started"},
+    {"topic": "obs/event/agent.recovery.outcome", "event_type": "agent.recovery.outcome"},
     {"topic": "obs/event/agent.completed", "event_type": "agent.completed"},
     {"topic": "obs/event/agent.stop_check", "event_type": "agent.stop_check"},
     {"topic": "obs/event/agent.invocation.started", "event_type": "agent.invocation.started"},

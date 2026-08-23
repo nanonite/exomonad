@@ -219,6 +219,8 @@ def validate_expected_events(contract: dict[str, Any], event_types: set[str]) ->
         "gate_opened_requires_answer",
         "merge_decision_requires_pr_outcome",
         "judgment_failure_requires_retry_or_park",
+        "task_blocked_requires_recovery_start",
+        "recovery_start_requires_one_outcome",
     }
     if rule_ids != expected_rules:
         raise ContractError(f"expected-event contract: rules must be {sorted(expected_rules)}")

@@ -155,6 +155,7 @@ def heartbeat_once(
             worker_rows.get(slice_state.id),
             now=current_time,
             store=store,
+            effects=effects,
         )
         if recovery_event is not None:
             events.append(recovery_event)
@@ -859,6 +860,7 @@ def _reconcile_recovery(
     *,
     now: float,
     store: RunStore,
+    effects: LiveEffects,
 ) -> tuple[RunState, SyntheticHeartbeatEvent | None, bool]:
     """Advance one bounded recovery probe using only structured observations."""
     recovery = slice_state.recovery
@@ -904,6 +906,40 @@ def _reconcile_recovery(
         current.budgets,
         current.events.last_consumed_offset,
     )
+    if action in {"resume_same_owner", "human_gate"} and not isinstance(
+        effects, ReadOnlyEffectClient
+    ):
+        ledger = updated_slice.deadline_ledger
+        emit_controller_event(
+            effects,
+            "agent.recovery.outcome",
+            {
+                "slice_id": slice_state.id,
+                "invocation_id": recovery.evidence.get(
+                    "invocation_id", slice_state.dispatch_invocation_id
+                ),
+                "generation": recovery.invocation_generation,
+                "cause": recovery.cause,
+                "slice_attempt": recovery.slice_attempt,
+                "invocation_generation": recovery.invocation_generation,
+                "recovery_round": updated_recovery.recovery_round,
+                "authorization_source": "policy",
+                "outcome": "recovered" if action == "resume_same_owner" else "escalated",
+                "recursive_depth": current.depth,
+                "parallel_impact": _parallel_impact(current, slice_state.id),
+                "policy_decision": "retry" if action == "resume_same_owner" else "wait",
+                "execution_seconds": ledger.execution_seconds if ledger else None,
+                "recovery_wait_seconds": ledger.recovery_wait_seconds if ledger else None,
+                "human_wait_seconds": (
+                    now - recovery.entered_at if action == "human_gate" else None
+                ),
+                "review_seconds": None,
+                "declared_difficulty": recovery.evidence.get("declared_difficulty", "standard"),
+                "matched_difficulty_rule": recovery.evidence.get(
+                    "matched_difficulty_rule", "recovery"
+                ),
+            },
+        )
     event = _event(
         f"recovery.{action}",
         "heartbeat",
@@ -920,6 +956,21 @@ def _reconcile_recovery(
         },
     )
     return current, event, True
+
+
+def _parallel_impact(state: RunState, slice_id: str) -> str:
+    """Report whether recovery withheld siblings without exporting their IDs."""
+    sibling_statuses = [
+        sibling.status for name, sibling in state.slices.items() if name != slice_id
+    ]
+    if any(status in {SliceStatus.READY, SliceStatus.PENDING} for status in sibling_statuses):
+        return "sibling_progress"
+    if any(
+        status not in {SliceStatus.MERGED, SliceStatus.FAILED, SliceStatus.PARKED}
+        for status in sibling_statuses
+    ):
+        return "sibling_wait"
+    return "none"
 
 
 def _missing_worker_evidence(

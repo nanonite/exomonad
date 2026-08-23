@@ -37,6 +37,28 @@
       "denominator_effect": "Add one expected task-budget failure event for each budget-caused slice park."
     },
     {
+      "rule_id": "task_blocked_requires_recovery_start",
+      "prerequisite_event": "agent.task_blocked",
+      "required_event": "agent.recovery.started",
+      "allowed_delay_ms": null,
+      "allowed_window": "until session termination or explicit abandonment",
+      "applicable_sources": ["haskell", "tl_loop", "lifecycle"],
+      "legacy_confidence_rule": "A blocked task without a recovery start is unknown, not an implementation failure.",
+      "denominator_effect": "Add one expected recovery-start event for each typed blocked task.",
+      "correlation_fields": ["slice_id", "invocation_id", "generation"]
+    },
+    {
+      "rule_id": "recovery_start_requires_one_outcome",
+      "prerequisite_event": "agent.recovery.started",
+      "required_event": "agent.recovery.outcome",
+      "allowed_delay_ms": null,
+      "allowed_window": "until session termination or explicit abandonment",
+      "applicable_sources": ["tl_loop", "lifecycle"],
+      "legacy_confidence_rule": "Multiple outcomes for one invocation generation are contradictory and excluded from aggregate rates.",
+      "denominator_effect": "Add one expected recovery outcome per invocation generation.",
+      "correlation_fields": ["slice_id", "invocation_id", "generation"]
+    },
+    {
       "rule_id": "parent_notification_requires_delivery",
       "prerequisite_event": "agent.notify_parent",
       "required_event": "message.delivery",

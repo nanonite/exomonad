@@ -12,6 +12,7 @@ from tl_loop.client.transport import TransportClient
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryTransitionError, transition_recovery
 from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.journal import EffectJournal
+from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.recovery_policy import policy_for_cause
 from tl_loop.state.schema import RunState, SliceState, SliceStatus
 from tl_loop.state.store import RunStore
@@ -166,7 +167,36 @@ def _apply_command(
                 SliceStatus.REPAIRING,
             }:
                 raise RecoveryCommandError("abandon requires a live invocation")
-            return abandon_slice(project_root, request.run_id, request.slice_id, effects=client)
+            result = abandon_slice(project_root, request.run_id, request.slice_id, effects=client)
+            emit_controller_event(
+                client,
+                "agent.recovery.outcome",
+                {
+                    "slice_id": request.slice_id,
+                    "invocation_id": request.expected_invocation_id,
+                    "generation": request.expected_generation,
+                    "cause": recovery.cause,
+                    "slice_attempt": recovery.slice_attempt,
+                    "invocation_generation": recovery.invocation_generation,
+                    "recovery_round": recovery.recovery_round,
+                    "authorization_source": "human",
+                    "outcome": "abandoned",
+                    "recursive_depth": state.depth,
+                    "parallel_impact": "none",
+                    "policy_decision": "abandon",
+                    "execution_seconds": None,
+                    "recovery_wait_seconds": None,
+                    "human_wait_seconds": None,
+                    "review_seconds": None,
+                    "declared_difficulty": recovery.evidence.get(
+                        "declared_difficulty", "standard"
+                    ),
+                    "matched_difficulty_rule": recovery.evidence.get(
+                        "matched_difficulty_rule", "recovery"
+                    ),
+                },
+            )
+            return result
         phase = {
             "retry": RecoveryPhase.RESUME_INTENDED,
             "wait": RecoveryPhase.WAITING_SIGNAL,

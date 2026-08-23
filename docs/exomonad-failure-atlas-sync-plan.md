@@ -356,7 +356,10 @@ scanner runs only after allowlist projection as a backstop.
 
 Allowlist aggregate dimensions: event type, detector type, outcome class, status class,
 coarse provider/runtime/harness/role, duration buckets, attempt buckets, topology
-counts, and normalized error categories. Exclude by default:
+counts, recovery-round and recursive-depth buckets, authorization source, sibling
+impact, policy decision, declared difficulty, and normalized error categories. Recovery
+exports must retain separate execution, recovery-wait, human-wait, and review duration
+buckets. Exclude by default:
 
 - transcript text and tool input/result text;
 - Haskell `custom` payloads and arbitrary `log.emit_event` payloads;

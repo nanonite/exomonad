@@ -95,6 +95,8 @@ pub const fn provider_delivery_contract(agent_type: AgentType) -> &'static str {
 pub enum LifecycleEventKind {
     InvocationStarted,
     InvocationFinished,
+    RecoveryStarted,
+    RecoveryOutcome,
     TaskBudgetExceeded,
     GuidanceDelivery,
 }
@@ -104,6 +106,8 @@ impl LifecycleEventKind {
         match self {
             Self::InvocationStarted => "agent.invocation.started",
             Self::InvocationFinished => "agent.invocation.finished",
+            Self::RecoveryStarted => "agent.recovery.started",
+            Self::RecoveryOutcome => "agent.recovery.outcome",
             Self::TaskBudgetExceeded => "agent.task_budget_exceeded",
             Self::GuidanceDelivery => "agent.guidance.delivery",
         }

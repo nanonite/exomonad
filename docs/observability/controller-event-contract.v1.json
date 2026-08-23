@@ -279,6 +279,12 @@
     },
     "agent.task_blocked": {
       "fields": ["outcome", "slice_id", "cause", "scope_attribution", "needs_human", "retryable", "recovery_action", "declared_difficulty", "matched_difficulty_rule", "attempt"]
+    },
+    "agent.recovery.started": {
+      "fields": ["slice_id", "invocation_id", "generation", "cause", "slice_attempt", "invocation_generation", "recovery_round", "authorization_source", "recursive_depth", "parallel_impact", "policy_decision"]
+    },
+    "agent.recovery.outcome": {
+      "fields": ["slice_id", "invocation_id", "generation", "cause", "slice_attempt", "invocation_generation", "recovery_round", "authorization_source", "outcome", "recursive_depth", "parallel_impact", "policy_decision", "execution_seconds", "recovery_wait_seconds", "human_wait_seconds", "review_seconds", "declared_difficulty", "matched_difficulty_rule"]
     }
   }
 }

@@ -11,7 +11,9 @@ from typing import TypeAlias, cast
 
 from tl_loop.select.classify import Difficulty
 
+from .recovery import RecoveryDimensions, RecoveryTelemetryError
 from .stall import ReviewStallClassification, classify_review_stall
+from .types import BlockCause
 
 LedgerEventInput: TypeAlias = Mapping[str, object]
 
@@ -46,6 +48,8 @@ class EventKind(str, Enum):
     AGENT_SPAWNED = "agent.spawned"
     AGENT_COMPLETED = "agent.completed"
     AGENT_TASK_BLOCKED = "agent.task_blocked"
+    AGENT_RECOVERY_STARTED = "agent.recovery.started"
+    AGENT_RECOVERY_OUTCOME = "agent.recovery.outcome"
     AGENT_STUCK = "agent.stuck"
     AGENT_NOTIFY_PARENT = "agent.notify_parent"
     AGENT_SIBLING_MERGED = "agent.sibling_merged"
@@ -62,16 +66,6 @@ KIND_BY_EVENT_TYPE: Mapping[str, EventKind] = MappingProxyType(
     {event_type: kind for kind, event_type in EVENT_TYPE_BY_KIND.items()}
 )
 MAPPED_EVENT_TYPES = frozenset(KIND_BY_EVENT_TYPE)
-
-
-class BlockCause(str, Enum):
-    """Closed, aggregate-safe vocabulary for why a task is blocked."""
-
-    BASE_CI_UNSTABLE = "base_ci_unstable"
-    EXTERNAL_DEPENDENCY = "external_dependency"
-    SCOPE_BOUNDARY = "scope_boundary"
-    HUMAN_DECISION_REQUIRED = "human_decision_required"
-    TOOLING_UNAVAILABLE = "tooling_unavailable"
 
 
 @dataclass(frozen=True)
@@ -217,6 +211,7 @@ class EventEnvelope:
     data: Mapping[str, object]
     parent_agent_id: str | None = None
     task_blocked: TaskBlocked | None = None
+    recovery_dimensions: RecoveryDimensions | None = None
 
     @property
     def reviewed_head(self) -> str | None:
@@ -280,7 +275,21 @@ def project(event: LedgerEventInput) -> EventEnvelope:
             if kind is EventKind.AGENT_TASK_BLOCKED
             else None
         ),
+        recovery_dimensions=(
+            _recovery_dimensions(data, generation=event.get("generation"))
+            if kind is EventKind.AGENT_RECOVERY_OUTCOME
+            else None
+        ),
     )
+
+
+def _recovery_dimensions(data: Mapping[str, object], *, generation: object) -> RecoveryDimensions:
+    """Project one recovery outcome without exposing local evidence."""
+    envelope_generation = generation if type(generation) is int else None
+    try:
+        return RecoveryDimensions.from_payload(data, envelope_generation=envelope_generation)
+    except RecoveryTelemetryError as error:
+        raise InvalidLedgerEvent(f"agent.recovery.outcome: {error}") from error
 
 
 def project_ledger_event(event: LedgerEventInput) -> EventEnvelope:
@@ -351,6 +360,7 @@ __all__ = [
     "EventKind",
     "InvalidLedgerEvent",
     "LedgerEventInput",
+    "RecoveryDimensions",
     "TaskBlocked",
     "UnmappedEventType",
     "project",

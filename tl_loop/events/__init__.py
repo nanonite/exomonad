@@ -27,6 +27,14 @@ from .reader import (
     SequenceStatus,
     sequence_status,
 )
+from .recovery import (
+    AuthorizationSource,
+    ParallelImpact,
+    PolicyDecision,
+    RecoveryDimensions,
+    RecoveryOutcome,
+    RecoveryTelemetryError,
+)
 from .stall import CiFailureAttribution, ReviewStallClassification, classify_review_stall
 
 __all__ = [
@@ -37,6 +45,7 @@ __all__ = [
     "MAPPED_EVENT_TYPES",
     "SERVER_EMIT_HEAD_SHA_GAPS",
     "ActiveTail",
+    "AuthorizationSource",
     "BridgeError",
     "CiFailureAttribution",
     "EnvelopeError",
@@ -51,8 +60,13 @@ __all__ = [
     "LedgerReadError",
     "LedgerReader",
     "LedgerRow",
+    "ParallelImpact",
+    "PolicyDecision",
     "QueueError",
     "ReadResult",
+    "RecoveryDimensions",
+    "RecoveryOutcome",
+    "RecoveryTelemetryError",
     "ReviewStallClassification",
     "SequenceStatus",
     "UnmappedEventType",

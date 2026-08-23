@@ -605,3 +605,19 @@ The detailed handoff message and structured evidence (including commit SHAs, fai
 checks, paths, and URLs) remain local evidence. They are not copied into the
 aggregate Failure Atlas projection. `agent.notify_parent` is delivery telemetry only
 and must never be interpreted as a second completion or failure outcome.
+
+## Recovery lifecycle and attribution
+
+Pre-publication recovery has its own lifecycle rows: `agent.recovery.started` and
+`agent.recovery.outcome`. The pair is correlated by slice, invocation, and generation;
+one generation may have at most one terminal outcome (`recovered`, `escalated`, or
+`abandoned`). Recovery rounds and slice attempts remain separate dimensions so a retry
+cannot be mistaken for a new invocation.
+
+The aggregate projection keeps declared task difficulty and its classifier rule while
+adding `difficulty_attribution=environmental_recovery` for base-CI, external-dependency,
+tooling, scope, and human-decision causes. Such recovery is not evidence that a harness
+lacks capability. Execution, recovery wait, human wait, and review elapsed time are
+exported as bounded duration buckets. Recursive depth, sibling impact, authorization
+source, and policy decision are bounded vocabularies; messages, paths, branches, URLs,
+SHAs, and worktree fingerprints remain local evidence.

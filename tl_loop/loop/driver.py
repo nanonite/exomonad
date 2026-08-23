@@ -1128,6 +1128,7 @@ def _run_loop(
                 store,
                 phase,
                 checkpoint_seq,
+                effects,
             )
             phase = _phase_from_state(state)
             _ack_event(source, event, replaying, diagnostics)
@@ -4987,6 +4988,7 @@ def _record_task_blocked_recovery(
     store: RunStore,
     phase: PhaseValue,
     event_seq: int,
+    effects: EffectClient,
 ) -> RunState:
     """Record one externally blocked slice in nonterminal DIAGNOSING state."""
     blocked = event.task_blocked
@@ -5018,6 +5020,8 @@ def _record_task_blocked_recovery(
         }
     )
     current = state.slices[slice_id]
+    audit.setdefault("invocation_id", event.invocation_id or current.dispatch_invocation_id)
+    audit.setdefault("generation", event.generation)
     if current.recovery is not None:
         if current.recovery.cause != cause.value:
             raise TLLoopError(
@@ -5045,7 +5049,44 @@ def _record_task_blocked_recovery(
         )
     updated = {**state.slices, slice_id: replace(current, recovery=recovery)}
     updated = suspend_dependents(updated, slice_id, recovery.recovery_round)
-    return store.checkpoint(phase, updated, state.budgets, event_seq)
+    checkpointed = store.checkpoint(phase, updated, state.budgets, event_seq)
+    emit_controller_event(
+        effects,
+        "agent.recovery.started",
+        {
+            "slice_id": slice_id,
+            "invocation_id": recovery.evidence.get(
+                "invocation_id", current.dispatch_invocation_id
+            ),
+            "generation": recovery.invocation_generation,
+            "cause": recovery.cause,
+            "slice_attempt": recovery.slice_attempt,
+            "invocation_generation": recovery.invocation_generation,
+            "recovery_round": recovery.recovery_round,
+            "authorization_source": "policy",
+            "recursive_depth": checkpointed.depth,
+            "parallel_impact": _recovery_parallel_impact(checkpointed, slice_id),
+            "policy_decision": "wait",
+        },
+    )
+    return checkpointed
+
+
+def _recovery_parallel_impact(state: RunState, slice_id: str) -> str:
+    """Bound sibling scheduling impact without exporting sibling identities."""
+    siblings = [
+        sibling.status
+        for name, sibling in state.slices.items()
+        if name != slice_id
+    ]
+    if any(status in {SliceStatus.READY, SliceStatus.PENDING} for status in siblings):
+        return "sibling_progress"
+    if any(
+        status not in {SliceStatus.MERGED, SliceStatus.FAILED, SliceStatus.PARKED}
+        for status in siblings
+    ):
+        return "sibling_wait"
+    return "none"
 
 
 def _checkpoint_and_ack(

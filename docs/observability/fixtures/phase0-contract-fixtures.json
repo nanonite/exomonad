@@ -58,6 +58,8 @@
       "spawn_requires_invocation_start",
       "invocation_requires_finish",
       "task_budget_requires_typed_failure",
+      "task_blocked_requires_recovery_start",
+      "recovery_start_requires_one_outcome",
       "parent_notification_requires_delivery",
     "delivery_requires_consumption_observation",
     "published_pr_requires_observation",
