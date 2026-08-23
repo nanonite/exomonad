@@ -1,1 +1,3 @@
-review_freshness_window_secs = 999999
+# Replay timestamps are historical fixture data; keep the policy wider than
+# the fixture age so the trajectory tests merge behavior rather than wall time.
+review_freshness_window_secs = 2000000
