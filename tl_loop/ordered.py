@@ -39,6 +39,37 @@ class IntegrationLifecycle(str, Enum):
     PARKED = "PARKED"
 
 
+class SubTLLifecycle(str, Enum):
+    """Quiescent child outcomes that are not integration terminal states."""
+
+    RECOVERING = "recovering"
+    HUMAN_GATE = "human_gate"
+
+
+@dataclass(frozen=True)
+class ChildRecoverySummary:
+    """Durable recovery projection owned by the nearest child TL."""
+
+    owner_run_id: str
+    child_path: tuple[str, ...]
+    slice_id: str
+    cause: str
+    recovery_round: int
+    next_probe_at: float | None
+
+    def __post_init__(self) -> None:
+        if not self.owner_run_id or not self.slice_id:
+            raise ValueError("child recovery owner and slice must be non-empty")
+        if not self.child_path or any(not item for item in self.child_path):
+            raise ValueError("child recovery path must contain non-empty names")
+        if not isinstance(self.cause, str) or not self.cause:
+            raise ValueError("child recovery cause must be non-empty")
+        if type(self.recovery_round) is not int or self.recovery_round < 0:
+            raise ValueError("child recovery round must be non-negative")
+        if self.next_probe_at is not None and self.next_probe_at < 0:
+            raise ValueError("child recovery next_probe_at must be non-negative or null")
+
+
 class IntegrationTransition(str, Enum):
     """Events accepted by the centralized integration transition table."""
 

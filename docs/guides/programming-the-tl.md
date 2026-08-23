@@ -377,6 +377,11 @@ one parent's direct sub-TL siblings:
   base without changing its reviewed head.
 - A child that ends in TLFailed blocks all higher numeric orders and leaves the
   parent failed or parked; it is never silently skipped.
+- A child with an authoritative pre-publication recovery checkpoint is
+  projected as `recovering` or `human_gate`, not `TLFailed`. Same-order
+  siblings continue, while higher orders remain pending. The projection keeps
+  the owning run, complete child path, blocked slice, recovery round, and next
+  probe time; only the nearest child TL may resume that checkpoint.
 
 The parent's top-level execution is therefore: dispatch any top-level
 workers/leaves, run order 1, integrate it, then advance through the remaining

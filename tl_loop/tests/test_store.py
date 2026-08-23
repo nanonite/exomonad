@@ -10,7 +10,7 @@ import pytest
 
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.recovery import begin_recovery
-from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 from tl_loop.state.schema import (
     BudgetLedger,
     FSMState,
@@ -114,6 +114,33 @@ def test_dependency_recovery_suspension_round_trips(tmp_path: Path) -> None:
     restored = load(store.path)
     assert restored.slices["dependent"].suspended_dependency == dependent.suspended_dependency
     assert restored.slices["blocker"].recovery == blocker.recovery
+
+
+def test_nested_child_recovery_projection_round_trips(tmp_path: Path) -> None:
+    store = RunStore("parent", tmp_path)
+    create("parent", {}, root_dir=tmp_path)
+    summary = ChildRecoverySummary(
+        owner_run_id="child",
+        child_path=("parent", "child", "leaf"),
+        slice_id="leaf",
+        cause="external_dependency",
+        recovery_round=1,
+        next_probe_at=10.0,
+    )
+    store.checkpoint(
+        FSMState(TLPhase.TLPlanning, ()),
+        {},
+        BudgetLedger(tokens=0, wall_seconds=0),
+        offset=0,
+        integration=IntegrationRuntimeState(
+            sub_tl_states={"child": SubTLLifecycle.HUMAN_GATE},
+            sub_tl_recovery={"child": summary},
+        ),
+    )
+
+    restored = load(store.path)
+    assert restored.integration.sub_tl_states["child"] is SubTLLifecycle.HUMAN_GATE
+    assert restored.integration.sub_tl_recovery["child"] == summary
 
 
 def test_ordered_state_round_trips_and_resume_preserves_progress(tmp_path: Path) -> None:

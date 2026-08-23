@@ -22,6 +22,7 @@ from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader
 from tl_loop.fsm.event import PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning
+from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.loop.driver import (
     DispatchAttempt,
     DepthLimitExceeded,
@@ -43,6 +44,7 @@ from tl_loop.loop.driver import (
     _route_ci_event,
     _route_review_event,
     _spawn_invocation_id,
+    _child_recovery_projection,
     _run_sub_tl_batch,
     _supervise_live_sub_tl,
     run_tl_loop,
@@ -50,7 +52,7 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
-from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
@@ -250,6 +252,91 @@ def test_recursive_tl_waiting_child_is_not_marked_failed(
 
     assert result.final_state.fsm.phase is TLPhase.TLWaiting
     assert result.final_state.slices["waiting-child"].status is SliceStatus.SPAWNED
+
+
+def test_recursive_recovery_is_projected_without_advancing_higher_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recovery = begin_recovery(
+        cause="external_dependency",
+        owner_run_id="recovering-child",
+        slice_attempt=1,
+        owner_agent_id="leaf-agent",
+        entered_at=1,
+    )
+    recovering = SimpleNamespace(
+        run_id="recovering-child",
+        fsm=SimpleNamespace(phase=TLPhase.TLWaiting),
+        slices={"leaf": SimpleNamespace(recovery=recovery)},
+    )
+    completed = SimpleNamespace(
+        run_id="sibling-child",
+        fsm=SimpleNamespace(phase=TLPhase.TLDone),
+        slices={},
+    )
+
+    def fake_tl_run(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
+        del config, budgets
+        child_name = cast(dict[str, object], root_spec)["run_id"]
+        return SimpleNamespace(
+            final_state=recovering if child_name == "recovering-child" else completed
+        )
+
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", fake_tl_run)
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("recovering-child", WorkPlan(), order=1),
+            SubTLTask("sibling-child", WorkPlan(), order=1),
+            SubTLTask("later-child", WorkPlan(), order=2),
+        )
+    )
+    result = run_tl_loop(
+        "recovery-parent",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=TLLoopConfig(
+            max_parallel_slices=2,
+            max_workers=0,
+            keep_alive_on_waiting=False,
+            poll_interval=0.001,
+        ),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLWaiting
+    assert (
+        result.final_state.integration.sub_tl_states["recovering-child"]
+        is SubTLLifecycle.RECOVERING
+    )
+    summary = result.final_state.integration.sub_tl_recovery["recovering-child"]
+    assert summary.owner_run_id == "recovering-child"
+    assert summary.child_path == ("recovery-parent", "recovering-child", "leaf")
+    assert result.final_state.slices["sibling-child"].status is SliceStatus.MERGED
+    assert result.final_state.slices["later-child"].status is SliceStatus.PENDING
+
+
+def test_nested_recovery_projection_preserves_complete_owner_path() -> None:
+    summary = ChildRecoverySummary(
+        owner_run_id="inner",
+        child_path=("outer", "inner", "leaf"),
+        slice_id="leaf",
+        cause="external_dependency",
+        recovery_round=2,
+        next_probe_at=12.0,
+    )
+    outer = SimpleNamespace(
+        run_id="outer",
+        slices={"inner": SimpleNamespace(recovery=None)},
+        integration=SimpleNamespace(
+            sub_tl_states={"inner": SubTLLifecycle.HUMAN_GATE},
+            sub_tl_recovery={"inner": summary},
+        ),
+    )
+
+    lifecycle, projected = _child_recovery_projection(outer, "root")
+    assert lifecycle is SubTLLifecycle.HUMAN_GATE
+    assert projected.child_path == ("root", "outer", "inner", "leaf")
 
 
 def test_live_waiting_child_is_terminated_on_explicit_cancellation() -> None:

@@ -22,7 +22,7 @@ from typing import Protocol, cast
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject, TransportClient
-from tl_loop.events.envelope import EnvelopeError, EventEnvelope, EventKind, project
+from tl_loop.events.envelope import BlockCause, EnvelopeError, EventEnvelope, EventKind, project
 from tl_loop.events.identity import (
     IdentityResolution,
     envelope_document,
@@ -69,6 +69,7 @@ from tl_loop.loop.review import (
 from tl_loop.loop.schedule import ScheduleDeadlock, ready, suspend_dependents
 from tl_loop.ordered import (
     AggregateCandidate,
+    ChildRecoverySummary,
     IntegrationContract,
     IntegrationLifecycle,
     IntegrationState,
@@ -76,6 +77,7 @@ from tl_loop.ordered import (
     IntegrationTransitionError,
     OrderedStage,
     ReviewOwner,
+    SubTLLifecycle,
     transition_integration,
 )
 from tl_loop.rlm.adjudicate import adjudicate_review
@@ -2196,6 +2198,61 @@ def _dispatch_children(
     return updated
 
 
+def _child_recovery_projection(
+    child_state: RunState | None,
+    parent_run_id: str,
+) -> tuple[SubTLLifecycle, ChildRecoverySummary] | None:
+    """Project one child's authoritative recovery to its nearest parent."""
+    if child_state is None:
+        return None
+    slices = getattr(child_state, "slices", {})
+    if not isinstance(slices, Mapping):
+        return None
+    for slice_id, slice_state in slices.items():
+        recovery = slice_state.recovery
+        if recovery is None:
+            continue
+        cause = BlockCause(recovery.cause)
+        lifecycle = (
+            SubTLLifecycle.HUMAN_GATE
+            if recovery.phase is RecoveryPhase.HUMAN_GATE
+            else SubTLLifecycle.RECOVERING
+        )
+        owner_run_id = getattr(child_state, "run_id", parent_run_id)
+        child_path = tuple(
+            item
+            for item in (parent_run_id, owner_run_id, slice_id)
+            if isinstance(item, str) and item
+        )
+        return lifecycle, ChildRecoverySummary(
+            owner_run_id=owner_run_id,
+            child_path=child_path,
+            slice_id=slice_id,
+            cause=cause,
+            recovery_round=recovery.recovery_round,
+            next_probe_at=recovery.next_probe_at,
+        )
+    integration = getattr(child_state, "integration", None)
+    nested_recoveries = getattr(integration, "sub_tl_recovery", {})
+    if isinstance(nested_recoveries, Mapping):
+        nested_states = getattr(integration, "sub_tl_states", {})
+        for child_name, summary in nested_recoveries.items():
+            if not isinstance(summary, ChildRecoverySummary):
+                continue
+            lifecycle = (
+                nested_states.get(child_name, SubTLLifecycle.RECOVERING)
+                if isinstance(nested_states, Mapping)
+                else SubTLLifecycle.RECOVERING
+            )
+            if not isinstance(lifecycle, SubTLLifecycle):
+                lifecycle = SubTLLifecycle.RECOVERING
+            path = summary.child_path
+            if not path or path[0] != parent_run_id:
+                path = (parent_run_id, *path)
+            return lifecycle, replace(summary, child_path=path)
+    return None
+
+
 def _run_sub_tls(
     plan: WorkPlan,
     state: RunState,
@@ -2277,6 +2334,7 @@ def _run_sub_tls(
             pending, state, config, source, effects, store, effects_log, stage.order
         )
         width = config.max_parallel_slices or len(spawned)
+        stage_recovery = False
         for batch_start in range(0, len(spawned), width):
             batch = spawned[batch_start : batch_start + width]
             outcomes = _run_sub_tl_batch(batch, config, source, effects, store, state.budgets)
@@ -2287,6 +2345,9 @@ def _run_sub_tls(
                 return _fail_recursive_parent(
                     state, config, effects, store, effects_log, "recursive child failed"
                 )
+            if any(task.name in state.integration.sub_tl_recovery for task in stage_tasks):
+                stage_recovery = True
+                break
         state = _integrate_stage_candidates(stage_tasks, state, config, effects, store, effects_log)
         _emit_stage_completion(
             stage,
@@ -2300,6 +2361,8 @@ def _run_sub_tls(
             state.slices[task.name].status in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
             for task in stage_tasks
         ):
+            break
+        if stage_recovery:
             break
     if plan.sub_tls and not plan.workers and not plan.leaves:
         awaiting_integration = tuple(
@@ -2477,7 +2540,8 @@ def _prepare_sub_tl_stage(
         prepared.append(task)
     states = dict(state.integration.sub_tl_states)
     for task in prepared:
-        states[task.name] = IntegrationLifecycle.RUNNING
+        if not isinstance(states.get(task.name), SubTLLifecycle):
+            states[task.name] = IntegrationLifecycle.RUNNING
     integration = replace(state.integration, sub_tl_states=states)
     previous_slices = state.slices
     state = store.checkpoint(
@@ -2523,6 +2587,8 @@ def _run_sub_tl_batch(
             child_phase = child_state.fsm.phase
             if child_phase in {TLPhase.TLDone, TLPhase.TLFailed}:
                 return task, child_phase, child_state
+            if _child_recovery_projection(child_state, store.run_id) is not None:
+                return task, child_phase, child_state
         child_config = _child_config(config, task, source, effects, store, branch, worktree)
         try:
             child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
@@ -2548,6 +2614,20 @@ def _run_live_sub_tl_batch(
     if "fork" not in multiprocessing.get_all_start_methods():
         raise TLLoopError("live ordered sub-TLs require fork-capable controller isolation")
     context = multiprocessing.get_context("fork")
+    existing: dict[str, tuple[SubTLTask, TLPhase | None, RunState | None]] = {}
+    runnable: list[SubTLTask] = []
+    for task in tasks:
+        child_store = RunStore(task.name, store.run_dir)
+        if child_store.path.exists():
+            child_state = child_store.load()
+            child_phase = child_state.fsm.phase
+            if (
+                child_phase in {TLPhase.TLDone, TLPhase.TLFailed}
+                or _child_recovery_projection(child_state, store.run_id) is not None
+            ):
+                existing[task.name] = (task, child_phase, child_state)
+                continue
+        runnable.append(task)
     processes = [
         (
             task,
@@ -2557,17 +2637,19 @@ def _run_live_sub_tl_batch(
                 name=f"tl-sub-{task.name}",
             ),
         )
-        for task in tasks
+        for task in runnable
     ]
     for _, process in processes:
         process.start()
-    outcomes: list[tuple[SubTLTask, TLPhase | None, RunState | None]] = []
+    outcomes_by_name: dict[str, tuple[SubTLTask, TLPhase | None, RunState | None]] = {
+        task.name: existing[task.name] for task in tasks if task.name in existing
+    }
     for task, process in processes:
         child_store = RunStore(task.name, store.run_dir)
         child_state = _supervise_live_sub_tl(process, child_store, config)
         phase = child_state.fsm.phase if child_state is not None else TLPhase.TLFailed
-        outcomes.append((task, phase, child_state))
-    return tuple(outcomes)
+        outcomes_by_name[task.name] = (task, phase, child_state)
+    return tuple(outcomes_by_name[task.name] for task in tasks)
 
 
 def _supervise_live_sub_tl(
@@ -2585,6 +2667,12 @@ def _supervise_live_sub_tl(
             process.join()
             child_store.record_exit_reason("sub-TL controller cancelled explicitly")
             break
+        try:
+            child_state = child_store.load()
+        except (OSError, ValueError):
+            child_state = None
+        if _child_recovery_projection(child_state, getattr(child_store, "run_id", "")) is not None:
+            return child_state
         process.join(timeout=poll_interval)
     exitcode = getattr(process, "exitcode", None)
     if not cancelled and exitcode is not None:
@@ -2592,6 +2680,12 @@ def _supervise_live_sub_tl(
             child_state = child_store.load()
         except (OSError, ValueError):
             child_state = None
+        if (
+            child_state is not None
+            and _child_recovery_projection(child_state, getattr(child_store, "run_id", ""))
+            is not None
+        ):
+            return child_state
         if child_state is None or child_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
             child_store.record_exit_reason(
                 f"sub-TL controller exited before authoritative resolution with code {exitcode}"
@@ -2639,14 +2733,23 @@ def _complete_sub_tl_batch(
     del tasks
     updated_slices = dict(state.slices)
     sub_tl_states = dict(state.integration.sub_tl_states)
+    sub_tl_recovery = dict(state.integration.sub_tl_recovery)
     candidate_records = dict(state.integration.candidates)
     for task, phase, child_state in outcomes:
         if phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
             current = updated_slices[task.name]
             updated_slices[task.name] = replace(current, status=SliceStatus.SPAWNED)
+            projection = _child_recovery_projection(child_state, state.run_id)
+            if projection is not None:
+                lifecycle, summary = projection
+                sub_tl_states[task.name] = lifecycle
+                sub_tl_recovery[task.name] = summary
             continue
         status = SliceStatus.MERGED if phase is TLPhase.TLDone else SliceStatus.FAILED
         previous_lifecycle = sub_tl_states.get(task.name, IntegrationLifecycle.RUNNING)
+        if isinstance(previous_lifecycle, SubTLLifecycle):
+            previous_lifecycle = IntegrationLifecycle.RUNNING
+        sub_tl_recovery.pop(task.name, None)
         lifecycle = _transition_sub_tl_lifecycle(
             previous_lifecycle,
             (
@@ -2729,6 +2832,7 @@ def _complete_sub_tl_batch(
     integration = replace(
         state.integration,
         sub_tl_states=sub_tl_states,
+        sub_tl_recovery=sub_tl_recovery,
         candidates=candidate_records,
     )
     previous_slices = state.slices

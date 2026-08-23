@@ -9,7 +9,22 @@ from typing import Literal, TypeAlias, cast
 
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState
-from tl_loop.ordered import CI_STATUSES, IntegrationLifecycle
+from tl_loop.ordered import (
+    CI_STATUSES,
+    ChildRecoverySummary,
+    IntegrationLifecycle,
+    SubTLLifecycle,
+)
+
+BLOCK_CAUSE_VALUES = frozenset(
+    {
+        "base_ci_unstable",
+        "external_dependency",
+        "scope_boundary",
+        "human_decision_required",
+        "tooling_unavailable",
+    }
+)
 
 SCHEMA_VERSION = 2
 
@@ -149,6 +164,7 @@ INTEGRATION_KEYS = frozenset(
     {
         "lifecycle",
         "sub_tl_states",
+        "sub_tl_recovery",
         "candidates",
         "aggregate_pr_number",
         "aggregate_head_sha",
@@ -167,6 +183,16 @@ INTEGRATION_KEYS = frozenset(
         "merge_attempts",
         "base_revalidation_count",
         "stage_verification",
+    }
+)
+CHILD_RECOVERY_KEYS = frozenset(
+    {
+        "owner_run_id",
+        "child_path",
+        "slice_id",
+        "cause",
+        "recovery_round",
+        "next_probe_at",
     }
 )
 INTEGRATION_CANDIDATE_KEYS = frozenset(
@@ -476,7 +502,8 @@ class IntegrationRuntimeState:
     """Persisted evidence and lifecycle for one parent stage fold."""
 
     lifecycle: IntegrationLifecycle = IntegrationLifecycle.RUNNING
-    sub_tl_states: Mapping[str, IntegrationLifecycle] = field(default_factory=dict)
+    sub_tl_states: Mapping[str, IntegrationLifecycle | SubTLLifecycle] = field(default_factory=dict)
+    sub_tl_recovery: Mapping[str, ChildRecoverySummary] = field(default_factory=dict)
     aggregate_pr_number: int | None = None
     aggregate_head_sha: str | None = None
     aggregate_patch_digest: str | None = None
@@ -629,10 +656,30 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
                 errors.append(("run.integration.sub_tl_states", "keys must be non-empty strings"))
             if not isinstance(lifecycle, str) or lifecycle not in {
                 item.value for item in IntegrationLifecycle
-            }:
+            } | {item.value for item in SubTLLifecycle}:
                 errors.append(
                     (f"run.integration.sub_tl_states[{name!r}]", "is not a lifecycle state")
                 )
+    recoveries_value = integration.get("sub_tl_recovery")
+    if recoveries_value is not None and not isinstance(recoveries_value, dict):
+        errors.append(("run.integration.sub_tl_recovery", "must be an object"))
+    recoveries = recoveries_value if isinstance(recoveries_value, dict) else None
+    if recoveries is not None:
+        for name, raw_recovery in recoveries.items():
+            path = f"run.integration.sub_tl_recovery[{name!r}]"
+            if not isinstance(name, str) or not name:
+                errors.append(("run.integration.sub_tl_recovery", "keys must be non-empty strings"))
+                continue
+            recovery = _object(raw_recovery, path, CHILD_RECOVERY_KEYS, errors)
+            if recovery is None:
+                continue
+            _non_empty_string(recovery, "owner_run_id", path, errors)
+            _string_list(recovery, "child_path", path, errors, allow_empty=False)
+            _non_empty_string(recovery, "slice_id", path, errors)
+            if recovery.get("cause") not in BLOCK_CAUSE_VALUES:
+                errors.append((f"{path}.cause", "is not a recognised block cause"))
+            _non_negative_int(recovery, "recovery_round", path, errors)
+            _nullable_number(recovery, "next_probe_at", path, errors)
     _nullable_positive_int(integration, "aggregate_pr_number", "run.integration", errors)
     for key in (
         "aggregate_head_sha",

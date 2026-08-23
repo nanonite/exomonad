@@ -25,7 +25,7 @@ from tl_loop.fsm.phase import (
     TLWaiting,
 )
 from tl_loop.fsm.recovery import decode_recovery, encode_recovery
-from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 
 from .migration import (
     MigrationError,
@@ -780,6 +780,10 @@ def _encode_integration(value: IntegrationInput) -> dict[str, object]:
             "sub_tl_states": {
                 name: lifecycle.value for name, lifecycle in value.sub_tl_states.items()
             },
+            "sub_tl_recovery": {
+                name: _encode_child_recovery(summary)
+                for name, summary in value.sub_tl_recovery.items()
+            },
             "aggregate_pr_number": value.aggregate_pr_number,
             "aggregate_head_sha": value.aggregate_head_sha,
             "aggregate_patch_digest": value.aggregate_patch_digest,
@@ -905,7 +909,7 @@ def _decode_integration(value: object) -> IntegrationRuntimeState:
     raw_states = value.get("sub_tl_states")
     states = (
         {
-            name: IntegrationLifecycle(cast(str, lifecycle))
+            name: _decode_sub_tl_lifecycle(cast(str, lifecycle))
             for name, lifecycle in raw_states.items()
             if isinstance(name, str) and isinstance(lifecycle, str)
         }
@@ -915,6 +919,15 @@ def _decode_integration(value: object) -> IntegrationRuntimeState:
     return IntegrationRuntimeState(
         lifecycle=IntegrationLifecycle(cast(str, value.get("lifecycle", "RUNNING"))),
         sub_tl_states=MappingProxyType(states),
+        sub_tl_recovery=MappingProxyType(
+            {
+                name: _decode_child_recovery(cast(dict[str, object], summary))
+                for name, summary in cast(
+                    dict[str, object], value.get("sub_tl_recovery", {})
+                ).items()
+                if isinstance(name, str) and isinstance(summary, dict)
+            }
+        ),
         aggregate_pr_number=cast(int | None, value.get("aggregate_pr_number")),
         aggregate_head_sha=cast(str | None, value.get("aggregate_head_sha")),
         aggregate_patch_digest=cast(str | None, value.get("aggregate_patch_digest")),
@@ -939,6 +952,37 @@ def _decode_integration(value: object) -> IntegrationRuntimeState:
                 if isinstance(name, str) and isinstance(candidate, dict)
             }
         ),
+    )
+
+
+def _decode_sub_tl_lifecycle(value: str) -> IntegrationLifecycle | SubTLLifecycle:
+    try:
+        return IntegrationLifecycle(value)
+    except ValueError:
+        return SubTLLifecycle(value)
+
+
+def _encode_child_recovery(value: ChildRecoverySummary) -> dict[str, object]:
+    return {
+        "owner_run_id": value.owner_run_id,
+        "child_path": list(value.child_path),
+        "slice_id": value.slice_id,
+        "cause": getattr(value.cause, "value", value.cause),
+        "recovery_round": value.recovery_round,
+        "next_probe_at": value.next_probe_at,
+    }
+
+
+def _decode_child_recovery(value: dict[str, object]) -> ChildRecoverySummary:
+    from tl_loop.events.envelope import BlockCause
+
+    return ChildRecoverySummary(
+        owner_run_id=cast(str, value["owner_run_id"]),
+        child_path=tuple(cast(list[str], value["child_path"])),
+        slice_id=cast(str, value["slice_id"]),
+        cause=BlockCause(cast(str, value["cause"])),
+        recovery_round=cast(int, value["recovery_round"]),
+        next_probe_at=cast(float | None, value.get("next_probe_at")),
     )
 
 
