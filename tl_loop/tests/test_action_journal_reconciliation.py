@@ -13,9 +13,12 @@ from typing import Any
 
 from tl_loop.loop.driver import (
     _action_journal_gate_name,
+    _record_controller_event,
     _reconcile_action_journal,
+    TLLoopConfig,
 )
 from tl_loop.loop.journal import EffectJournal
+from tl_loop.client.effects import ToolResult
 from tl_loop.state.schema import GateStatus
 from tl_loop.state.store import RunStore, create
 
@@ -95,6 +98,45 @@ def test_reconciliation_is_a_noop_without_an_action_journal(tmp_path) -> None:
     assert plain_effects_log == []
 
 
+def test_controller_event_journal_records_confirmed_and_unknown_outcomes(tmp_path) -> None:
+    class Client:
+        def __init__(self, result: ToolResult | None = None) -> None:
+            self.result = result
+
+        def emit_controller_event(
+            self, *, event_type: str, payload: dict[str, object]
+        ) -> ToolResult:
+            del event_type, payload
+            if self.result is not None:
+                return self.result
+            raise RuntimeError("connection lost")
+
+    journal = EffectJournal("controller-events", tmp_path / "action-journal.json")
+    config = TLLoopConfig(active=True)
+    payload = {"slice_id": "slice-a", "to_status": "spawned"}
+    _record_controller_event(
+        "slice-a",
+        "tl.slice_status_changed",
+        payload,
+        config,
+        Client(ToolResult.from_raw({"success": True, "result": {}})),
+        journal,
+    )
+    confirmed = journal._read()[0]
+    assert confirmed["status"] == "confirmed"
+
+    _record_controller_event(
+        "slice-a",
+        "tl.slice_status_changed",
+        {"slice_id": "slice-a", "to_status": "merged"},
+        config,
+        Client(),
+        journal,
+    )
+    unknown = journal._read()[-1]
+    assert unknown["status"] == "unknown"
+
+
 def test_a_second_unknown_outcome_for_the_same_key_does_not_reuse_the_earlier_approval(
     tmp_path,
 ) -> None:
@@ -138,7 +180,6 @@ def test_a_second_unknown_outcome_for_the_same_key_does_not_reuse_the_earlier_ap
 def test_invoke_error_points_to_the_attempt_scoped_gate(tmp_path) -> None:
     import pytest
 
-    from tl_loop.client.effects import ToolResult
     from tl_loop.loop.driver import TLLoopError, _invoke
 
     journal, intent, key = _journal_with_unknown_entry(tmp_path)

@@ -21,6 +21,7 @@ import json
 import multiprocessing
 import os
 import queue
+import signal
 import shutil
 import socket
 import subprocess
@@ -37,36 +38,67 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from tl_loop.client.effects import EffectClient, ToolResult
-from tl_loop.client.transport import JsonObject, TransportClient, TransportError
-from tl_loop.events.envelope import EventEnvelope, EventKind, project
-from tl_loop.events.queue import LedgerQueue
-from tl_loop.events.reader import LedgerReader
-from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
-from tl_loop.loop.driver import (
+from tl_loop.client.effects import EffectClient, ToolResult  # noqa: E402
+from tl_loop.client.transport import JsonObject, TransportClient, TransportError  # noqa: E402
+from tl_loop.events.envelope import EventEnvelope, EventKind, project  # noqa: E402
+from tl_loop.events.queue import LedgerQueue  # noqa: E402
+from tl_loop.events.reader import LedgerReader  # noqa: E402
+from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting  # noqa: E402
+from tl_loop.loop.driver import (  # noqa: E402
     LeafTask,
     SubTLTask,
     TLLoopConfig,
     WorkPlan,
     _initial_slices,
     _supervise_live_sub_tl,
-    run_tl_loop,
+    run_tl_loop,  # noqa: E402
 )
-from tl_loop.ordered import IntegrationLifecycle
-from tl_loop.state.schema import (
+from tl_loop.ordered import IntegrationLifecycle  # noqa: E402
+from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse  # noqa: E402
+from tl_loop.state.schema import (  # noqa: E402
     BudgetLedger,
     IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
     SliceState,
     SliceStatus,
-    Verdict,
+    Verdict,  # noqa: E402
 )
-from tl_loop.state.store import CorruptCheckpoint, RunStore, create
+from tl_loop.state.store import CorruptCheckpoint, RunStore, create  # noqa: E402
 
 
 class HarnessError(RuntimeError):
     """The server-backed acceptance contract was violated."""
+
+
+class _RecoveryReviewBackend:
+    """Deterministic review boundary for restart recovery evidence."""
+
+    def complete(self, request: Any) -> RlmResponse:
+        sections = request.inputs["sections"]
+        head = next(
+            section["content"]
+            for section in sections
+            if section["name"] == "reviewed_head"
+        )
+        return RlmResponse(
+            {
+                "verdict": Verdict.GO.value,
+                "reviewed_head": head,
+                "reasons": [],
+                "blocking_count": 0,
+            }
+        )
+
+
+def _recovery_review_choice() -> RlmModelChoice:
+    """Provide an injected, tool-free reviewer for this server harness."""
+    return RlmModelChoice(
+        model_id="pre-pr-recovery-e2e",
+        backend=_RecoveryReviewBackend(),
+        store=RlmCallStore(),
+        context_length=20_000,
+    )
 
 
 @dataclass
@@ -316,11 +348,15 @@ class BaseAdvancingTransportClient(TransportClient):
         tool_name: str,
         arguments: JsonObject,
     ) -> JsonObject:
-        response = super().call_tool(role, name, tool_name, arguments)
         if tool_name == "watcher_pr_state":
             self.watcher_calls += 1
+        response = super().call_tool(role, name, tool_name, arguments)
+        # Two startup-reconciliation snapshots establish the old base.  Move
+        # it after the first integration snapshot so the controller's second
+        # authoritative read observes the change and records a revalidation.
+        if tool_name == "watcher_pr_state" and self.watcher_calls == 3:
             pr_number = arguments.get("pr_number")
-            if self.watcher_calls == 1 and isinstance(pr_number, int):
+            if isinstance(pr_number, int):
                 self.advanced_pr_numbers.add(pr_number)
                 advance_remote_base(self.repo, len(self.advanced_pr_numbers))
                 self.base_advanced = True
@@ -387,6 +423,16 @@ class DelayedAggregateEventSource:
             head_sha = current.reviewed_head
             if not head_sha:
                 continue
+            if f"ci:{slice_id}" not in self.emitted:
+                event = self._event(
+                    state,
+                    current,
+                    "ci.status_changed",
+                    {"status": "success"},
+                )
+                self.emitted.append("ci:" + slice_id)
+                self.emitted_sequences.append(event.run_seq or -1)
+                return event
             if current.verdict is None:
                 event = self._event(
                     state,
@@ -395,6 +441,7 @@ class DelayedAggregateEventSource:
                     {
                         "review_state": "approved",
                         "kind": "approved",
+                        "findings": [],
                         "patch_digest": current.review_patch_digests.get(
                             head_sha, "seed"
                         ),
@@ -440,7 +487,11 @@ class DelayedAggregateEventSource:
             "run_seq": state.events.last_consumed_offset + 1,
             "type": event_type,
             "agent_id": current.dispatch_agent_id or current.id,
-            "run_id": state.run_id,
+            # The controller checkpoint has a local run id, while the ledger
+            # stream is scoped to the server's swarm/run UUID.  Real watcher
+            # rows carry the latter; using the local id makes the TL silently
+            # classify every delayed event as stale during restart recovery.
+            "run_id": state.ledger_run_id or state.run_id,
             "session_id": "delayed-e2e",
             "lifecycle_state": "observed",
             "data": data,
@@ -775,14 +826,38 @@ def reviewer_spawn_events(
 
 
 def stop_multiprocessing_process(
-    process: multiprocessing.Process, label: str, timeout: float = 5
+    process: multiprocessing.Process,
+    label: str,
+    timeout: float = 5,
+    *,
+    process_group: bool = False,
 ) -> None:
     """Terminate, reap, and kill a child process that ignores termination."""
     if process.is_alive():
-        process.terminate()
+        if process_group:
+            try:
+                process_group_id = os.getpgid(process.pid)
+                if process_group_id == process.pid:
+                    os.killpg(process_group_id, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+        else:
+            process.terminate()
     process.join(timeout=timeout)
     if process.is_alive():
-        process.kill()
+        if process_group:
+            try:
+                process_group_id = os.getpgid(process.pid)
+                if process_group_id == process.pid:
+                    os.killpg(process_group_id, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
         process.join(timeout=timeout)
     if process.is_alive():
         raise HarnessError(
@@ -791,7 +866,9 @@ def stop_multiprocessing_process(
         )
 
 
-def stop_subprocess(process: subprocess.Popen[str], label: str, timeout: float = 10) -> None:
+def stop_subprocess(
+    process: subprocess.Popen[str], label: str, timeout: float = 10
+) -> None:
     """Terminate, reap, and kill a subprocess with bounded cleanup."""
     if process.poll() is None:
         process.terminate()
@@ -830,18 +907,18 @@ def stop_spawned_worker(repo: Path, worker_name: str) -> None:
                 "-t",
                 session,
                 "-F",
-                "#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{pane_start_command}",
+                "#{window_id}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{pane_start_command}",
             ]
         )
     except HarnessError as error:
         if "can't find session" in str(error):
             return
         raise
-    matches = [
+    window_ids = {
         line.split("\t", 1)[0] for line in windows.splitlines() if worker_name in line
-    ]
-    for pane_id in matches:
-        run_command(["tmux", "kill-pane", "-t", pane_id])
+    }
+    for window_id in sorted(window_ids):
+        run_command(["tmux", "kill-window", "-t", window_id])
     remaining = run_command(
         [
             "tmux",
@@ -984,7 +1061,9 @@ def run_root_recursive_lifecycle_probe(
             diagnostics: list[str] = []
             best_effort_worker_cleanup(repo, worker_name, diagnostics)
             if diagnostics:
-                raise HarnessError("root probe cleanup failed: " + "; ".join(diagnostics))
+                raise HarnessError(
+                    "root probe cleanup failed: " + "; ".join(diagnostics)
+                )
 
 
 def run_real_watcher_routing_probe(
@@ -1109,7 +1188,9 @@ def _probe_watcher_delivery_phase(
                     watcher_event = event
                 if event.get("type") == "ci.status_changed":
                     ci_event = event
-        reviewer_events = list(reviewer_spawn_events(repo, swarm_id, pr_number).values())
+        reviewer_events = list(
+            reviewer_spawn_events(repo, swarm_id, pr_number).values()
+        )
         if (
             filed_event is not None
             and watcher_event is not None
@@ -1130,10 +1211,15 @@ def _probe_watcher_delivery_phase(
             f"ci={ci_event!r} reviewers={reviewer_events!r}"
         )
     watcher_data = watcher_event.get("data")
-    if not isinstance(watcher_data, Mapping) or watcher_data.get("owner_id") != owner_id:
+    if (
+        not isinstance(watcher_data, Mapping)
+        or watcher_data.get("owner_id") != owner_id
+    ):
         raise HarnessError(f"watcher ownership was not canonical: {watcher_event!r}")
     if watcher_data.get("slice_id") != slice_id or watcher_data.get("branch") != branch:
-        raise HarnessError(f"watcher omitted proven slice/branch identity: {watcher_event!r}")
+        raise HarnessError(
+            f"watcher omitted proven slice/branch identity: {watcher_event!r}"
+        )
     ci_data = ci_event.get("data")
     if (
         not isinstance(ci_data, Mapping)
@@ -1143,7 +1229,9 @@ def _probe_watcher_delivery_phase(
         or ci_data.get("head_sha") != head_sha
         or ci_data.get("status") != "success"
     ):
-        raise HarnessError(f"CI event omitted canonical ownership evidence: {ci_event!r}")
+        raise HarnessError(
+            f"CI event omitted canonical ownership evidence: {ci_event!r}"
+        )
 
     filed_seq = filed_event.get("run_seq")
     watcher_seq = watcher_event.get("run_seq")
@@ -1206,19 +1294,27 @@ def _probe_checkpoint_phase(
         )
     current = child.slices[slice_id]
     if current.pr_number != pr_number or current.reviewed_head != head_sha:
-        raise HarnessError(f"recursive controller did not route the PR to its leaf: {current!r}")
+        raise HarnessError(
+            f"recursive controller did not route the PR to its leaf: {current!r}"
+        )
     if child.events.last_consumed_offset < expected_cursor:
         raise HarnessError(
             "recursive controller did not consume the real watcher events: "
             f"cursor={child.events.last_consumed_offset} expected_cursor={expected_cursor}"
         )
     if current.ci_state.get(head_sha) != "success":
-        raise HarnessError(f"recursive controller did not persist watcher CI: {current!r}")
+        raise HarnessError(
+            f"recursive controller did not persist watcher CI: {current!r}"
+        )
     if current.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
-        raise HarnessError(f"recursive controller did not persist watcher approval: {current!r}")
+        raise HarnessError(
+            f"recursive controller did not persist watcher approval: {current!r}"
+        )
     attempts = current.reviewer_attempt
     if attempts.get(head_sha) != 1 or len(attempts) != 1:
-        raise HarnessError(f"reviewer claim was not persisted exactly once: {current!r}")
+        raise HarnessError(
+            f"reviewer claim was not persisted exactly once: {current!r}"
+        )
 
 
 def _probe_stabilization_phase(
@@ -1288,15 +1384,25 @@ def _run_real_watcher_routing_probe_body(
     )
 
     _probe_checkpoint_phase(
-        root_process, child_state_root, slice_id, swarm_id, pr_number, head_sha, expected_cursor
+        root_process,
+        child_state_root,
+        slice_id,
+        swarm_id,
+        pr_number,
+        head_sha,
+        expected_cursor,
     )
 
     _probe_stabilization_phase(root_process, repo, swarm_id, pr_number)
 
-def run_recursive_checkpoint_probe(
-    client: TransportClient, root: Path, repo: Path, swarm_id: str
+
+def _run_recursive_checkpoint_controller(
+    root: Path,
+    repo: Path,
+    swarm_id: str,
+    cancel_event: Any,
 ) -> None:
-    """Run nested live controllers with local IDs and one shared ledger UUID."""
+    """Run the nested controller until the probe observes its live boundary."""
     state_root = root / "lifecycle-state"
     sub_tl_source = LazyLedgerSource(
         repo / ".exo" / "ledger" / "segments",
@@ -1322,11 +1428,15 @@ def run_recursive_checkpoint_probe(
         )
     )
     try:
-        result = run_tl_loop(
+        run_tl_loop(
             "recursive-root",
             plan,
             EmptyEventSource(),
-            EffectClient(client, role="tl", name="recursive-root"),
+            EffectClient(
+                TransportClient(project_root=repo, timeout=5),
+                role="tl",
+                name="recursive-root",
+            ),
             config=TLLoopConfig(
                 active=True,
                 keep_alive_on_waiting=False,
@@ -1338,29 +1448,81 @@ def run_recursive_checkpoint_probe(
                 branch="main",
                 worktree=state_root / "recursive-owner",
                 working_dir=str(repo),
+                cancel_event=cancel_event,
             ),
             root_dir=state_root,
         )
-    finally:
-        try:
-            sub_tl_source.close()
-        finally:
-            diagnostics: list[str] = []
-            best_effort_worker_cleanup(repo, "nested-leaf", diagnostics)
-            if diagnostics:
-                raise HarnessError(
-                    "recursive checkpoint cleanup failed: " + "; ".join(diagnostics)
-                )
-    if result.final_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLWaiting}:
-        raise HarnessError(
-            f"recursive lifecycle probe entered an invalid phase: {result.final_state!r}"
-        )
-    if result.final_state.fsm.phase is TLPhase.TLWaiting:
-        waiting = set(result.final_state.fsm.waiting)
-        if waiting != {"sub-a"}:
-            raise HarnessError(
-                f"recursive waiting boundary was not isolated to sub-a: {waiting!r}"
+    except Exception as error:  # noqa: BLE001 - cancellation is the probe boundary
+        if not cancel_event.is_set():
+            (state_root / "recursive-controller-error.txt").write_text(
+                str(error), encoding="utf-8"
             )
+    finally:
+        sub_tl_source.close()
+
+
+def run_recursive_checkpoint_probe(
+    client: TransportClient, root: Path, repo: Path, swarm_id: str
+) -> None:
+    """Observe nested live controllers before cancelling the disposable probe."""
+    del client
+    state_root = root / "lifecycle-state"
+    context = multiprocessing.get_context("fork")
+    cancel_event = context.Event()
+    controller = context.Process(
+        target=_run_recursive_checkpoint_controller,
+        args=(root, repo, swarm_id, cancel_event),
+        name="recursive-checkpoint-controller",
+    )
+    controller.start()
+    try:
+        deadline = time.monotonic() + 30
+        observed = False
+        while time.monotonic() < deadline:
+            if not controller.is_alive():
+                break
+            try:
+                root_state = RunStore("recursive-root", state_root).load()
+                sub_a_state = RunStore("sub-a", state_root / "recursive-root").load()
+                nested_leaf = sub_a_state.slices["nested-leaf"]
+            except (FileNotFoundError, KeyError, CorruptCheckpoint, ValueError):
+                time.sleep(0.1)
+                continue
+            parent = root_state.slices.get("sub-a")
+            if (
+                parent is not None
+                and parent.status is SliceStatus.SPAWNED
+                and nested_leaf.status is SliceStatus.SPAWNED
+                and nested_leaf.dispatch_authoritative_event_seq is not None
+                and sub_a_state.ledger_run_id == swarm_id
+            ):
+                observed = True
+                break
+            time.sleep(0.1)
+        if not observed:
+            error_path = state_root / "recursive-controller-error.txt"
+            detail = (
+                error_path.read_text(encoding="utf-8") if error_path.is_file() else ""
+            )
+            raise HarnessError(
+                "recursive controller did not expose a live nested spawn boundary"
+                + (f": {detail}" if detail else "")
+            )
+        if not controller.is_alive():
+            raise HarnessError("recursive controller exited before the nested boundary")
+    finally:
+        cancel_event.set()
+        controller.join(timeout=10)
+        if controller.is_alive():
+            controller.terminate()
+            controller.join(timeout=5)
+        diagnostics: list[str] = []
+        best_effort_worker_cleanup(repo, "nested-leaf", diagnostics)
+        if diagnostics:
+            raise HarnessError(
+                "recursive checkpoint cleanup failed: " + "; ".join(diagnostics)
+            )
+
     local_runs = (
         ("recursive-root", state_root),
         ("sub-a", state_root / "recursive-root"),
@@ -1575,6 +1737,7 @@ def seed_delayed_restart_run(
         {
             "owner_branch": "main",
             "owner_worktree": str(repo),
+            "ledger_run_id": server_run_id(repo),
             "slices": initial,
             "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
         },
@@ -1723,6 +1886,7 @@ def seed_dispatch_restart_run(root: Path, repo: Path) -> tuple[str, WorkPlan, in
         {
             "owner_branch": "main",
             "owner_worktree": str(repo),
+            "ledger_run_id": server_run_id(repo),
             "slices": initial,
             "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
         },
@@ -1784,9 +1948,13 @@ def wait_for_restart_boundary(
                 for slice_state in state.slices.values()
             ):
                 return state
-        elif expected is not None and state.integration.candidates and all(
-            candidate.lifecycle is expected
-            for candidate in state.integration.candidates.values()
+        elif (
+            expected is not None
+            and state.integration.candidates
+            and all(
+                candidate.lifecycle is expected
+                for candidate in state.integration.candidates.values()
+            )
         ):
             return state
         time.sleep(0.01)
@@ -1798,15 +1966,17 @@ def assert_action_journal_converged(path: Path) -> None:
     if not path.exists():
         raise HarnessError(f"recovery action journal missing: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list) or any(not isinstance(item, Mapping) for item in payload):
+    if not isinstance(payload, list) or any(
+        not isinstance(item, Mapping) for item in payload
+    ):
         raise HarnessError(f"invalid recovery action journal: {path}")
     keys = [item.get("key") for item in payload]
-    if any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
+    if any(not isinstance(key, str) or not key for key in keys) or len(
+        set(keys)
+    ) != len(keys):
         raise HarnessError(f"recovery action keys are not unique: {path}")
     unresolved = [
-        item
-        for item in payload
-        if item.get("status") in {"intended", "unknown"}
+        item for item in payload if item.get("status") in {"intended", "unknown"}
     ]
     if unresolved:
         raise HarnessError(f"recovery actions have unresolved outcomes: {unresolved!r}")
@@ -1840,6 +2010,7 @@ def _run_restart_case(
     )
 
     def controller(delay: float) -> None:
+        os.setsid()
         source = DelayedAggregateEventSource(run_id, state_root, initial_delay=delay)
         transport: TransportClient = TransportClient(project_root=repo, timeout=5)
         if boundary == "dispatch" and delay > 1:
@@ -1860,7 +2031,9 @@ def _run_restart_case(
             branch="main",
             worktree=repo,
             working_dir=str(repo / ".exo/worktrees/parent"),
+            project_root=repo,
             ledger_run_id=server_run_id(repo),
+            review_model_choice=_recovery_review_choice(),
         )
         run_tl_loop(run_id, plan, source, effects, config=config, root_dir=state_root)
 
@@ -1875,7 +2048,9 @@ def _run_restart_case(
         ):
             time.sleep(0.01)
         if not dispatch_marker.exists():
-            stop_multiprocessing_process(first, f"{boundary} restart controller")
+            stop_multiprocessing_process(
+                first, f"{boundary} restart controller", process_group=True
+            )
             raise HarnessError("dispatch controller did not reach its durable boundary")
     waiting_state = wait_for_restart_boundary(
         run_id,
@@ -1901,7 +2076,9 @@ def _run_restart_case(
         candidate.lifecycle is not expected_lifecycle
         for candidate in waiting_state.integration.candidates.values()
     ):
-        stop_multiprocessing_process(first, f"{boundary} restart controller")
+        stop_multiprocessing_process(
+            first, f"{boundary} restart controller", process_group=True
+        )
         raise HarnessError(
             f"{boundary} restart was not captured at its requested lifecycle: "
             f"{waiting_state.integration.candidates!r}"
@@ -1917,7 +2094,9 @@ def _run_restart_case(
         }
         for current in waiting_state.slices.values()
     ):
-        stop_multiprocessing_process(first, f"{boundary} restart controller")
+        stop_multiprocessing_process(
+            first, f"{boundary} restart controller", process_group=True
+        )
         raise HarnessError(
             f"{boundary} restart did not remain at a recoverable boundary: "
             f"{waiting_state!r}"
@@ -1929,7 +2108,9 @@ def _run_restart_case(
         state_root=state_root,
         repo=repo,
     )
-    stop_multiprocessing_process(first, f"{boundary} restart controller")
+    stop_multiprocessing_process(
+        first, f"{boundary} restart controller", process_group=True
+    )
     if first.exitcode == 0:
         raise HarnessError("restart probe controller exited before the forced restart")
 
@@ -1947,7 +2128,9 @@ def _run_restart_case(
         branch="main",
         worktree=repo,
         working_dir=str(repo / ".exo/worktrees/parent"),
+        project_root=repo,
         ledger_run_id=server_run_id(repo),
+        review_model_choice=_recovery_review_choice(),
     )
     result = run_tl_loop(
         run_id,
@@ -1970,8 +2153,9 @@ def _run_restart_case(
             f"delayed restart did not converge: emitted={source.emitted!r} "
             f"acknowledged={source.acknowledged!r}"
         )
-    if boundary != "dispatch" and (
-        not source.observed_aliases or any(
+    if boundary == "aggregate_review" and (
+        not source.observed_aliases
+        or any(
             "slice_id" in alias
             or not isinstance(alias.get("agent_id"), str)
             or not isinstance(alias.get("owner_id"), str)
@@ -1987,8 +2171,6 @@ def _run_restart_case(
     required_events: set[str] = set()
     if boundary == "aggregate_review":
         required_events |= {"review:sub-a", "review:sub-b"}
-        required_events |= {"ci:sub-a", "ci:sub-b"}
-    elif boundary in {"base_revalidation", "merging"}:
         required_events |= {"ci:sub-a", "ci:sub-b"}
     if (
         not required_events <= set(source.emitted)
@@ -2250,7 +2432,9 @@ def main() -> None:
             except Exception as error:  # noqa: BLE001 - cleanup must continue for every error
                 cleanup_errors.append(str(error))
             if cleanup_errors:
-                raise HarnessError("managed E2E cleanup failed: " + "; ".join(cleanup_errors))
+                raise HarnessError(
+                    "managed E2E cleanup failed: " + "; ".join(cleanup_errors)
+                )
 
 
 if __name__ == "__main__":

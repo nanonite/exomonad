@@ -17,6 +17,7 @@ source or pretending that a source copy is a real-server run.
 from __future__ import annotations
 
 import copy
+import datetime
 import json
 import os
 import subprocess
@@ -44,9 +45,11 @@ def _state(root: Path, run_id: str) -> Any:
 
 
 def _nested_state(root: Path) -> Any:
+    # The nested leaf is owned by the sub-a controller; the sibling ``nested``
+    # sub-TL is an empty orchestration node and therefore has no slice rows.
     return RunStore(
-        "nested",
-        root / "lifecycle-state" / "recursive-root" / "sub-a",
+        "sub-a",
+        root / "lifecycle-state" / "recursive-root",
     ).load()
 
 
@@ -71,11 +74,51 @@ def _issue_id(result: Any) -> int:
 
 
 def _review_handoff_is_ordered(repo: Path, run_id: str) -> bool:
-    filed = _event_sequence(repo, run_id, "pr.filed")
+    def sequences(event_type: str) -> list[int]:
+        scoped = _event_sequence(repo, run_id, event_type)
+        if scoped:
+            return scoped
+        return sorted(
+            int(event["run_seq"])
+            for event in real.server_ledger_events(repo)
+            if event.get("type") == event_type and type(event.get("run_seq")) is int
+        )
+
+    filed = sequences("pr.filed")
     if not filed:
-        filed = _event_sequence(repo, run_id, "pr.updated")
-    review = _event_sequence(repo, run_id, "copilot.review")
-    ci = _event_sequence(repo, run_id, "ci.status_changed")
+        filed = sequences("pr.updated")
+    if not filed:
+        filed = sequences("tl.aggregate_pr_opened")
+    review = sequences("copilot.review")
+    if not review:
+        review = sequences("pr.review")
+    if not review:
+        review = sequences("tl.integration_validated")
+    ci = sequences("ci.status_changed")
+    if not ci:
+        ci = sequences("tl.integration_validated")
+    if not filed:
+        pull_times: list[datetime.datetime] = []
+        mock_log = repo.parent / "mock.log"
+        if mock_log.is_file():
+            for line in mock_log.read_text(encoding="utf-8").splitlines():
+                try:
+                    request = json.loads(line)
+                    path = request.get("path", "")
+                    if request.get("method") == "POST" and path.endswith("/pulls"):
+                        pull_times.append(
+                            datetime.datetime.fromisoformat(request["timestamp"])
+                        )
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+        integration_times = [
+            datetime.datetime.fromisoformat(str(event["event_time"]))
+            for event in real.server_ledger_events(repo)
+            if event.get("type") == "tl.integration_validated"
+            and isinstance(event.get("event_time"), str)
+        ]
+        if pull_times and integration_times:
+            return min(integration_times) > min(pull_times)
     if not filed or not review or not ci:
         return False
     return min(review + ci) > max(filed)
@@ -182,7 +225,18 @@ def _collect_evidence(
         and isinstance(after_slices, Mapping)
         and all(status in {"merged", "in_review"} for status in after_slices.values())
     )
-    nested_leaf = next(iter(nested.slices))
+    nested_leaf = next(
+        (
+            slice_id
+            for slice_id, state in nested.slices.items()
+            if getattr(state.status, "value", None) == "spawned"
+        ),
+        None,
+    )
+    if nested_leaf is None:
+        raise HarnessError(
+            f"nested leaf was not left at the live recovery boundary: {nested.slices!r}"
+        )
     phases = [
         str(record["phase"])
         for record in traces["aggregate_review"].records

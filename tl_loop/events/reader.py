@@ -229,6 +229,23 @@ class LedgerReader:
             match = data
         return match
 
+    def has_record(self, event_type: str, payload: Mapping[str, object]) -> bool:
+        """Return whether one authoritative raw ledger record matches payload."""
+        if not isinstance(event_type, str) or not event_type:
+            raise ValueError("event_type must be a non-empty string")
+        rows = _resolve_superseded(list(self._read_rows().rows))
+        for row in rows:
+            if _raw_event_type(row.document) != event_type:
+                continue
+            if self.ledger_run_id is not None and row.document.get("run_id") != self.ledger_run_id:
+                continue
+            data = row.document.get("data")
+            if isinstance(data, Mapping) and all(
+                data.get(key) == value for key, value in payload.items()
+            ):
+                return True
+        return False
+
     def _in_scope(self, event: EventEnvelope) -> bool:
         """Keep one run and its directly owned child events in scope."""
         if self.ledger_run_id is not None and event.run_id != self.ledger_run_id:

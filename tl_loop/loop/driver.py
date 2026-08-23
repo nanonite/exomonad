@@ -28,7 +28,7 @@ from tl_loop.events.identity import (
     envelope_document,
     resolve_event_slice,
 )
-from tl_loop.events.reader import FindingKind, LedgerFinding
+from tl_loop.events.reader import FindingKind, LedgerFinding, LedgerReader, LedgerReadError
 from tl_loop.fsm.event import (
     AllChildrenDone,
     ChildCompleted,
@@ -696,7 +696,13 @@ def run_tl_loop(
         else []
     )
     try:
-        state = _reconcile_action_journal(state, store, effects_log)
+        state = _reconcile_action_journal(
+            state,
+            store,
+            effects_log,
+            project_root=selected.project_root,
+            ledger_run_id=effective_ledger_run_id,
+        )
         state = _reconcile_dispatches(state, selected, effects, store, effects_log)
         state = _reconcile_nonterminal_slices(
             work_plan, state, selected, effects, store, effects_log
@@ -1427,6 +1433,9 @@ def _reconcile_action_journal(
     state: RunState,
     store: RunStore,
     effects_log: list[EffectIntent],
+    *,
+    project_root: str | Path | None = None,
+    ledger_run_id: str | None = None,
 ) -> RunState:
     """Resolve action-journal entries stuck at intended/unknown so a restart
     does not crash permanently on the same blocked lifecycle effect.
@@ -1455,6 +1464,18 @@ def _reconcile_action_journal(
         key = entry.get("key")
         if not isinstance(key, str) or not key:
             continue
+        if _controller_event_was_committed(
+            entry,
+            store,
+            project_root=project_root,
+            ledger_run_id=ledger_run_id,
+        ):
+            effects_log.resolve_by_key(
+                key,
+                status="confirmed",
+                result={"success": True, "result": {"reconciled": True}},
+            )
+            continue
         attempt = _action_journal_compensation_attempt(entry)
         gate_name = _action_journal_gate_name(key, attempt)
         gate = next((candidate for candidate in state.gates if candidate.name == gate_name), None)
@@ -1481,6 +1502,36 @@ def _reconcile_action_journal(
                 },
             )
     return state
+
+
+def _controller_event_was_committed(
+    entry: Mapping[str, object],
+    store: RunStore,
+    *,
+    project_root: str | Path | None,
+    ledger_run_id: str | None,
+) -> bool:
+    """Use the authoritative ledger to resolve an interrupted event emission."""
+    if project_root is None or ledger_run_id is None:
+        return False
+    if entry.get("operation") != "emit_controller_event":
+        return False
+    arguments = entry.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return False
+    event_type = arguments.get("event_type")
+    payload = arguments.get("payload")
+    if not isinstance(event_type, str) or not isinstance(payload, Mapping):
+        return False
+    try:
+        reader = LedgerReader(
+            Path(project_root) / ".exo" / "ledger" / "segments",
+            run_dir=store.run_dir,
+            ledger_run_id=ledger_run_id,
+        )
+        return reader.has_record(event_type, payload)
+    except (LedgerReadError, OSError, ValueError):
+        return False
 
 
 def _reconcile_dispatches(
@@ -4860,13 +4911,42 @@ def _record_controller_event(
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
 ) -> ToolResult | None:
-    effects_log.append(EffectIntent("emit_controller_event", target, payload, config.active))
     LOGGER.info(
         "[TL loop] effect=emit_controller_event target=%s event_type=%s active=%s",
         target,
         event_type,
         config.active,
     )
+    if isinstance(effects_log, EffectJournal):
+        arguments = {"event_type": event_type, "payload": dict(payload)}
+        try:
+            result = _invoke(
+                "emit_controller_event",
+                target,
+                arguments,
+                config.active,
+                cast(EffectClient, effects),
+                lambda client: client.emit_controller_event(
+                    event_type=event_type,
+                    payload=cast(JsonObject, dict(payload)),
+                ),
+                effects_log,
+                raise_on_failure=False,
+            )
+        except DurableWriteError:
+            raise
+        except Exception as error:  # noqa: BLE001 - observability is fail-open
+            LOGGER.warning("controller event %s failed: %s", event_type, error)
+            return None
+        if result is not None and result.success is False:
+            LOGGER.warning(
+                "controller event %s failed: %s",
+                event_type,
+                result.error or "effect returned failure",
+            )
+        return result
+    intent = EffectIntent("emit_controller_event", target, payload, config.active)
+    effects_log.append(intent)
     if not config.active:
         return None
     live = cast(EffectClient, effects)
@@ -5055,9 +5135,7 @@ def _record_task_blocked_recovery(
         "agent.recovery.started",
         {
             "slice_id": slice_id,
-            "invocation_id": recovery.evidence.get(
-                "invocation_id", current.dispatch_invocation_id
-            ),
+            "invocation_id": recovery.evidence.get("invocation_id", current.dispatch_invocation_id),
             "generation": recovery.invocation_generation,
             "cause": recovery.cause,
             "slice_attempt": recovery.slice_attempt,
@@ -5074,11 +5152,7 @@ def _record_task_blocked_recovery(
 
 def _recovery_parallel_impact(state: RunState, slice_id: str) -> str:
     """Bound sibling scheduling impact without exporting sibling identities."""
-    siblings = [
-        sibling.status
-        for name, sibling in state.slices.items()
-        if name != slice_id
-    ]
+    siblings = [sibling.status for name, sibling in state.slices.items() if name != slice_id]
     if any(status in {SliceStatus.READY, SliceStatus.PENDING} for status in siblings):
         return "sibling_progress"
     if any(
