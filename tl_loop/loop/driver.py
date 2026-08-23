@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
 from types import MappingProxyType
@@ -492,6 +493,7 @@ class TLLoopConfig:
     requested_model: str | None = None
     role: str = "worker"
     review_policy_path: str | Path | None = None
+    review_clock: Callable[[], datetime] | None = None
     enable_reviewer_spawn: bool = False
     dispatch_names: Mapping[str, str] = field(default_factory=dict)
     review_model_choice: object | None = None
@@ -4039,6 +4041,7 @@ def _merge_completed_leaf(
             verify_review(
                 current,
                 current_head,
+                now=config.review_clock() if config.review_clock is not None else None,
                 freshness_window_secs=freshness_window_secs,
                 current_patch_digest=current_patch_digest,
             )

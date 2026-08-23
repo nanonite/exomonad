@@ -6,6 +6,7 @@ import copy
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -24,6 +25,7 @@ from tl_loop.state.store import RunStore
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "replay"
 POLICY_ROOT = Path(__file__).parent / "fixtures"
+REPLAY_REVIEW_NOW = datetime(2026, 8, 11, 17, 20, tzinfo=UTC)
 
 
 @dataclass
@@ -126,6 +128,7 @@ def replay_fixture(fixture: str | Path, root_dir: str | Path) -> ReplayResult:
         max_events=32,
         poll_interval=0.001,
         review_policy_path=FIXTURE_ROOT / "review-policy.toml",
+        review_clock=lambda: REPLAY_REVIEW_NOW,
     )
     try:
         tl_run({"run_id": run_id, "plan": plan}, config, {"tokens": 0, "wall_seconds": 0})
