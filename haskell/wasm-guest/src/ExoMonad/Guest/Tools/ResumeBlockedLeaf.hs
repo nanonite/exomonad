@@ -99,16 +99,17 @@ resumeBlockedLeafCore args
               [ "success" .= True,
                 "chainlink_issue_id" .= rblChainlinkIssueId args,
                 "agent" .= agent,
-                "invocation" .= object
-                  [ "invocation_id" .= AC.invocationId agent,
-                    "trigger" .= AC.invocationTrigger agent,
-                    "runtime" .= AC.invocationRuntime agent,
-                    "target_type" .= AC.routingTargetType agent,
-                    "target_id" .= AC.routingTargetId agent,
-                    "fresh" .= AC.invocationFresh agent,
-                    "ready" .= AC.invocationReady agent,
-                    "outcome" .= AC.invocationOutcome agent
-                  ]
+                "invocation"
+                  .= object
+                    [ "invocation_id" .= AC.invocationId agent,
+                      "trigger" .= AC.invocationTrigger agent,
+                      "runtime" .= AC.invocationRuntime agent,
+                      "target_type" .= AC.routingTargetType agent,
+                      "target_id" .= AC.routingTargetId agent,
+                      "fresh" .= AC.invocationFresh agent,
+                      "ready" .= AC.invocationReady agent,
+                      "outcome" .= AC.invocationOutcome agent
+                    ]
               ]
 
 instance MCPTool ResumeBlockedLeaf where

@@ -8,7 +8,7 @@ import Data.Aeson.KeyMap qualified as KeyMap
 import ExoMonad.Guest.Tool.Class (MCPTool (toolName))
 import ExoMonad.Guest.Tools.ResumeBlockedLeaf
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit ((@=?), (@?=), testCase)
+import Test.Tasty.HUnit (testCase, (@=?), (@?=))
 
 resumeBlockedLeafTests :: TestTree
 resumeBlockedLeafTests =
