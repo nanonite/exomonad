@@ -170,6 +170,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Add bounded pre-publication recovery orchestration (#952)
 - Add recursive parallel recovery acceptance coverage (#962)
 - Add recovery telemetry and difficulty attribution (#961)
 - Add authenticated recovery commands and policy authorization (#960)
