@@ -168,6 +168,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Add same-owner resumption for blocked leaves without PRs (#949)
 - Park externally blocked TL slices behind durable human gates (#947)
 - Add canonical task-blocked telemetry and outcome attribution (#946)
 - Add typed blocked handoffs to the dev MCP contract (#945)

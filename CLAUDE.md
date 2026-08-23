@@ -416,6 +416,7 @@ Spawn heterogeneous agent teams as a recursive tree:
 
 - **`spawn_leaf`** — Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields (steps, verify, boundary, context, read_first). Continuation context is prefixed automatically when available, while the caller's task remains verbatim after a blank-line separator.
 - **`resume_pr`** — Resume the existing issue-owned PR worktree and invocation after review or CI feedback. Continuation context is prefixed automatically and review feedback is scoped to the exact current PR head SHA.
+- **`resume_blocked_leaf`** — Resume one externally blocked, no-PR leaf after explicit human gate approval. The host verifies the parked event, exact dormant invocation, branch, and dirty-worktree fingerprint, then reuses the same owner/worktree/harness.
 - **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
 - **`spawn_codex`** — Spawn a Codex leaf agent in its own worktree+branch. Files PR when done.
 

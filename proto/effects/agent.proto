@@ -457,6 +457,13 @@ message SpawnLeafSubtreeRequest {
   string intent_id = 14;
   // Optional per-spawn model override, separate from the agent type.
   string model = 15;
+  // Existing parked leaf issue to resume in-place (no PR required).
+  uint64 blocked_issue_id = 16;
+  // Host-verified identity of the dormant invocation and worktree.
+  string expected_invocation_id = 17;
+  string expected_branch = 18;
+  string expected_worktree_fingerprint = 19;
+  bool human_approved = 20;
 }
 
 message SpawnLeafSubtreeResponse {

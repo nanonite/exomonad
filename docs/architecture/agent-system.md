@@ -112,6 +112,7 @@ raw ledger payloads. `NEEDS_BASE_REVALIDATION` refreshes base-bound evidence;
 | `spawn_worker` | x | x | | | |
 | `spawn_reviewer` | x | x | | | |
 | `resume_pr` | x | x | | | |
+| `resume_blocked_leaf` | x | x | | | |
 | `close_worker_pane` | x | x | | | |
 | `close_issue_and_cleanup` | x | x | | | |
 | `cleanup_reviewer_leaf` | x | x | | | |
@@ -157,6 +158,17 @@ Retries return an already-spawned replacement or resume cleanup/spawn after a
 partial failure; they never silently reuse a different slug or create a second
 replacement. Open PRs must use `restart_review`, merged PRs are rejected, and
 the Chainlink issue is never closed by this command.
+
+### Parked-leaf resumption
+
+`resume_blocked_leaf` is the only recovery path for an externally blocked leaf
+that has no PR. It requires an open Chainlink issue, the exact dormant
+invocation, branch, and dirty-worktree fingerprint, plus explicit human
+approval. The host requires a matching authoritative `tl.slice_parked` event,
+resolves exactly one persisted owner, verifies its tmux target is dead, and
+starts a fresh invocation with the same owner, worktree, branch, harness, and
+model. Stale, live, ambiguous, cross-owner, or unapproved requests fail before
+any mutation; the dirty worktree is never discarded.
 
 ### Chainlink tools
 

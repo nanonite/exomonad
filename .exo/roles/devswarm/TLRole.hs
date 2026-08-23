@@ -61,6 +61,7 @@ import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.ResolveLivePrForSlice (ResolveLivePrForSlice (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
 import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
+import ExoMonad.Guest.Tools.ResumeBlockedLeaf (ResumeBlockedLeaf (..))
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
@@ -273,6 +274,7 @@ data Tools mode = Tools
     restartReview :: mode :- RestartReview,
     replaceClosedPr :: mode :- ReplaceClosedPr,
     resumePr :: mode :- ResumePr,
+    resumeBlockedLeaf :: mode :- ResumeBlockedLeaf,
     resolveLivePrForSlice :: mode :- ResolveLivePrForSlice,
     watcherPrState :: mode :- WatcherPrState,
     discardWorkerOutput :: mode :- DiscardWorkerOutput,
@@ -331,6 +333,7 @@ config =
             restartReview = mkHandler @RestartReview,
             replaceClosedPr = mkHandler @ReplaceClosedPr,
             resumePr = mkHandler @ResumePr,
+            resumeBlockedLeaf = mkHandler @ResumeBlockedLeaf,
             resolveLivePrForSlice = mkHandler @ResolveLivePrForSlice,
             watcherPrState = mkHandler @WatcherPrState,
             discardWorkerOutput = mkHandler @DiscardWorkerOutput,

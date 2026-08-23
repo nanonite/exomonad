@@ -51,6 +51,7 @@ import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
 import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
+import ExoMonad.Guest.Tools.ResumeBlockedLeaf (ResumeBlockedLeaf (..))
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
@@ -170,6 +171,7 @@ data Tools mode = Tools
     restartReview :: mode :- RestartReview,
     replaceClosedPr :: mode :- ReplaceClosedPr,
     resumePr :: mode :- ResumePr,
+    resumeBlockedLeaf :: mode :- ResumeBlockedLeaf,
     disposeLeaf :: mode :- DisposeLeaf,
     watcherPrState :: mode :- WatcherPrState,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
@@ -223,6 +225,7 @@ config =
             restartReview = mkHandler @RestartReview,
             replaceClosedPr = mkHandler @ReplaceClosedPr,
             resumePr = mkHandler @ResumePr,
+            resumeBlockedLeaf = mkHandler @ResumeBlockedLeaf,
             disposeLeaf = mkHandler @DisposeLeaf,
             watcherPrState = mkHandler @WatcherPrState,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,

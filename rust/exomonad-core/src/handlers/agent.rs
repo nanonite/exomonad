@@ -14,9 +14,9 @@ use crate::effects::{
 use super::non_empty;
 use crate::services::agent_control::{
     finish_invocation_and_tombstone, read_invocation, slugify, AgentControlService, AgentIdentity,
-    AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags, InvocationFinishResult,
-    InvocationRecord, InvocationStatus, InvocationTrigger, SpawnLeafOptions, SpawnOptions,
-    SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
+    AgentIdentityRecord, AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags,
+    InvocationFinishResult, InvocationRecord, InvocationStatus, InvocationTrigger,
+    SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
 };
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::configured_tl_preflight_runtime_paths;
@@ -35,11 +35,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use exomonad_proto::effects::agent::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::process::Command;
+use tokio::{fs, process::Command};
 use tracing::{info, warn};
 
 use crate::services::{
@@ -1892,6 +1893,13 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
         self.ensure_tl_spawn_preflight(ctx).await?;
+        if req.blocked_issue_id != 0
+            || !req.expected_invocation_id.trim().is_empty()
+            || !req.expected_branch.trim().is_empty()
+            || !req.expected_worktree_fingerprint.trim().is_empty()
+        {
+            return self.resume_blocked_leaf(&req, ctx).await;
+        }
         if req.resume_pr_number != 0 || !req.expected_head_sha.trim().is_empty() {
             return self.resume_existing_pr(&req, ctx).await;
         }
@@ -3071,6 +3079,216 @@ impl<
             invocation: Some(invocation_handoff),
         })
     }
+
+    async fn resume_blocked_leaf(
+        &self,
+        req: &SpawnLeafSubtreeRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SpawnLeafSubtreeResponse> {
+        validate_blocked_resume_request(req)?;
+        ensure_chainlink_issue_open(self.ctx.project_dir(), req.blocked_issue_id)
+            .await
+            .map_err(EffectError::invalid_input)?;
+
+        let records = self.ctx.agent_resolver().all().await;
+        let mut owners = Vec::new();
+        for record in records {
+            let agent_dir = self
+                .ctx
+                .project_dir()
+                .join(".exo/agents")
+                .join(record.agent_name.as_str());
+            let active_issue = match fs::read_to_string(agent_dir.join("active_issue")).await {
+                Ok(value) => value.trim().parse::<u64>().ok(),
+                Err(_) => None,
+            };
+            if active_issue == Some(req.blocked_issue_id) {
+                owners.push((record, agent_dir));
+            }
+        }
+        let [(owner, owner_dir)] = owners.as_slice() else {
+            return Err(EffectError::invalid_input(format!(
+                "blocked issue #{} must resolve to exactly one dormant owner (found {})",
+                req.blocked_issue_id,
+                owners.len()
+            )));
+        };
+        if owner.topology != Topology::WorktreePerAgent {
+            return Err(EffectError::invalid_input(
+                "blocked leaf resume requires an isolated worktree owner",
+            ));
+        }
+        let parked_slice_id = owner.slice_id.as_deref().unwrap_or(owner.slug.as_str());
+        let parked_event_seen = self
+            .ctx
+            .event_log()
+            .ok_or_else(|| {
+                EffectError::invalid_input(
+                    "blocked leaf resume requires an authoritative parked event",
+                )
+            })?
+            .ledger()
+            .read_events()
+            .effect_err("agent")?
+            .into_iter()
+            .rev()
+            .any(|record| {
+                record.event.event_type == "tl.slice_parked"
+                    && record
+                        .event
+                        .data
+                        .get("slice_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(parked_slice_id)
+                    && record
+                        .event
+                        .data
+                        .get("park_cause")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|cause| {
+                            matches!(
+                                cause,
+                                "base_ci_unstable"
+                                    | "external_dependency"
+                                    | "scope_boundary"
+                                    | "human_decision_required"
+                            )
+                        })
+            });
+        if !parked_event_seen {
+            return Err(EffectError::invalid_input(format!(
+                "blocked owner has no authoritative parked event for slice {parked_slice_id:?}"
+            )));
+        }
+        let invocation = read_invocation(owner_dir)
+            .await
+            .effect_err("agent")?
+            .ok_or_else(|| {
+                EffectError::invalid_input(
+                    "blocked owner has no invocation record; refusing resume",
+                )
+            })?;
+        if invocation.invocation_id != req.expected_invocation_id {
+            return Err(EffectError::invalid_input(format!(
+                "blocked owner invocation changed: expected {}, found {}",
+                req.expected_invocation_id, invocation.invocation_id
+            )));
+        }
+        if invocation.is_live() {
+            return Err(EffectError::invalid_input(
+                "blocked owner invocation is still live; refusing duplicate resume",
+            ));
+        }
+        if invocation.pr_number.is_some() {
+            return Err(EffectError::invalid_input(
+                "blocked owner already has PR context; use resume_pr",
+            ));
+        }
+        if owner.birth_branch.as_str() != req.expected_branch {
+            return Err(EffectError::invalid_input(format!(
+                "blocked owner branch changed: expected {}, found {}",
+                req.expected_branch, owner.birth_branch
+            )));
+        }
+
+        let worktree = resolve_owner_worktree(self.ctx.project_dir(), owner)?;
+        let actual_branch = git_current_branch(&worktree).await?;
+        if actual_branch != req.expected_branch {
+            return Err(EffectError::invalid_input(format!(
+                "blocked worktree branch changed: expected {}, found {}",
+                req.expected_branch, actual_branch
+            )));
+        }
+        let fingerprint = worktree_fingerprint(&worktree).await?;
+        if fingerprint != req.expected_worktree_fingerprint {
+            return Err(EffectError::invalid_input(
+                "blocked worktree fingerprint changed; refusing resume",
+            ));
+        }
+        let agents = self.service.list_agents().await.effect_err("agent")?;
+        if agents
+            .iter()
+            .any(|agent| agent.internal_name == owner.agent_name && agent.has_tab)
+        {
+            return Err(EffectError::invalid_input(
+                "blocked owner still has a live tmux target; refusing duplicate resume",
+            ));
+        }
+
+        let options = SpawnLeafOptions {
+            task: format!(
+                "{}\n\nResume the existing parked assignment for Chainlink issue #{}. Preserve the current branch and worktree; do not create a new owner or PR until the task is complete.",
+                req.task.trim(),
+                req.blocked_issue_id
+            ),
+            branch_name: owner.slug.to_string(),
+            role: Some(crate::domain::Role::dev()),
+            agent_type: owner.agent_type,
+            claude_flags: ClaudeSpawnFlags::default(),
+            standalone_repo: false,
+            allowed_dirs: Vec::new(),
+            start_point: None,
+            base_branch: Some(owner.parent_branch.to_string()),
+            expected_agent_name: Some(owner.agent_name.clone()),
+            invocation_pr_number: None,
+            model: owner.model.clone(),
+        };
+        let result = self
+            .service
+            .spawn_leaf_subtree(&options, &ctx.birth_branch)
+            .await
+            .effect_err_preserve("agent")?;
+        let fresh_invocation = read_invocation(owner_dir)
+            .await
+            .effect_err("agent")?
+            .ok_or_else(|| {
+                EffectError::invalid_input("blocked resume did not persist a fresh invocation")
+            })?;
+        if fresh_invocation.invocation_id == invocation.invocation_id || !fresh_invocation.is_live()
+        {
+            return Err(EffectError::invalid_input(
+                "blocked resume did not start a fresh live invocation",
+            ));
+        }
+        let target_alive = self.service.routing_liveness(owner_dir).await == Some(true);
+        if !target_alive {
+            return Err(EffectError::invalid_input(
+                "blocked resume target was not live at readiness confirmation",
+            ));
+        }
+        let mut agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
+        agent_info.alive = true;
+        agent_info.is_alive = true;
+        let invocation_handoff = invocation_handoff_to_proto(
+            &fresh_invocation,
+            &result.branch_name,
+            true,
+            true,
+            "started",
+        );
+        if let Some(log) = self.ctx.event_log() {
+            let _ = log.append(
+                "agent.resumed",
+                ctx.agent_name.as_ref(),
+                &serde_json::json!({
+                    "child_agent": owner.agent_name,
+                    "agent_type": owner.agent_type.suffix(),
+                    "branch": owner.birth_branch,
+                    "spawn_type": "resume_blocked",
+                    "chainlink_issue_id": req.blocked_issue_id,
+                    "previous_invocation_id": invocation.invocation_id,
+                    "invocation_id": fresh_invocation.invocation_id,
+                    "generation": fresh_invocation.generation,
+                    "worktree_fingerprint": fingerprint,
+                    "same_owner": true,
+                }),
+            );
+        }
+        Ok(SpawnLeafSubtreeResponse {
+            agent: Some(agent_info),
+            invocation: Some(invocation_handoff),
+        })
+    }
     async fn reject_orphan_pr_spawn(&self, req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
         let Some(pr_number) = referenced_pr_number(&req.task) else {
             return Ok(());
@@ -3157,6 +3375,120 @@ fn validate_resume_request(req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_blocked_resume_request(req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
+    if req.blocked_issue_id == 0 {
+        return Err(EffectError::invalid_input(
+            "blocked_issue_id is required for a parked-leaf resume",
+        ));
+    }
+    for (name, value) in [
+        ("expected_invocation_id", req.expected_invocation_id.trim()),
+        ("expected_branch", req.expected_branch.trim()),
+        (
+            "expected_worktree_fingerprint",
+            req.expected_worktree_fingerprint.trim(),
+        ),
+        ("task", req.task.trim()),
+    ] {
+        if value.is_empty() {
+            return Err(EffectError::invalid_input(format!("{name} is required")));
+        }
+    }
+    if !req.human_approved {
+        return Err(EffectError::invalid_input(
+            "human_approved must be true before resuming a parked leaf",
+        ));
+    }
+    if req.resume_pr_number != 0 || !req.expected_head_sha.trim().is_empty() {
+        return Err(EffectError::invalid_input(
+            "a parked-leaf resume cannot include PR resume fields",
+        ));
+    }
+    if !req.intent_id.trim().is_empty() {
+        return Err(EffectError::invalid_input(
+            "parked-leaf resume intent is host-owned and must be omitted",
+        ));
+    }
+    if !req.branch_name.trim().is_empty()
+        || !req.role.trim().is_empty()
+        || req.agent_type() != AgentType::Unspecified
+        || !req.permission_mode.trim().is_empty()
+        || !req.allowed_tools.is_empty()
+        || !req.disallowed_tools.is_empty()
+        || !req.model.trim().is_empty()
+        || req.standalone_repo
+        || !req.allowed_dirs.is_empty()
+    {
+        return Err(EffectError::invalid_input(
+            "parked-leaf resume accepts only issue, identity proofs, task, and approval",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_owner_worktree(
+    project_dir: &Path,
+    owner: &AgentIdentityRecord,
+) -> EffectResult<PathBuf> {
+    let path = if owner.working_dir.is_absolute() {
+        owner.working_dir.clone()
+    } else {
+        project_dir.join(&owner.working_dir)
+    };
+    if !path.starts_with(project_dir) {
+        return Err(EffectError::invalid_input(
+            "blocked owner worktree is outside the project",
+        ));
+    }
+    if !path.is_dir() {
+        return Err(EffectError::invalid_input(format!(
+            "blocked owner worktree does not exist: {}",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+async fn git_current_branch(worktree: &Path) -> EffectResult<String> {
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(worktree)
+        .output()
+        .await
+        .map_err(|error| {
+            EffectError::invalid_input(format!("failed to inspect worktree branch: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(EffectError::invalid_input(
+            "git could not determine the blocked worktree branch",
+        ));
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        return Err(EffectError::invalid_input(
+            "blocked worktree is detached; refusing resume",
+        ));
+    }
+    Ok(branch)
+}
+
+async fn worktree_fingerprint(worktree: &Path) -> EffectResult<String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "-z"])
+        .current_dir(worktree)
+        .output()
+        .await
+        .map_err(|error| {
+            EffectError::invalid_input(format!("failed to inspect worktree state: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(EffectError::invalid_input(
+            "git could not determine the blocked worktree fingerprint",
+        ));
+    }
+    Ok(format!("sha256:{:x}", Sha256::digest(&output.stdout)))
 }
 
 fn with_resume_task(options: SpawnLeafOptions, prefix: Option<&str>) -> SpawnLeafOptions {
@@ -4720,6 +5052,46 @@ mod tests {
         let mut caller_selected_runtime = resume_request();
         caller_selected_runtime.agent_type = AgentType::Codex as i32;
         assert!(validate_resume_request(&caller_selected_runtime).is_err());
+    }
+
+    fn blocked_resume_request() -> SpawnLeafSubtreeRequest {
+        SpawnLeafSubtreeRequest {
+            task: "continue the blocked task".to_string(),
+            blocked_issue_id: 949,
+            expected_invocation_id: "invocation-1".to_string(),
+            expected_branch: "main.leaf".to_string(),
+            expected_worktree_fingerprint: "sha256:abc".to_string(),
+            human_approved: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn blocked_resume_requires_all_host_proofs_and_human_approval() {
+        assert!(validate_blocked_resume_request(&blocked_resume_request()).is_ok());
+
+        let mut missing_issue = blocked_resume_request();
+        missing_issue.blocked_issue_id = 0;
+        assert!(validate_blocked_resume_request(&missing_issue).is_err());
+
+        let mut missing_invocation = blocked_resume_request();
+        missing_invocation.expected_invocation_id.clear();
+        assert!(validate_blocked_resume_request(&missing_invocation).is_err());
+
+        let mut unapproved = blocked_resume_request();
+        unapproved.human_approved = false;
+        assert!(validate_blocked_resume_request(&unapproved).is_err());
+
+        let mut caller_selected_identity = blocked_resume_request();
+        caller_selected_identity.branch_name = "invented-branch".to_string();
+        assert!(validate_blocked_resume_request(&caller_selected_identity).is_err());
+
+        let mut caller_selected_intent = blocked_resume_request();
+        caller_selected_intent.intent_id = "caller-intent".to_string();
+        let error = validate_blocked_resume_request(&caller_selected_intent)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("intent is host-owned"));
     }
 
     #[test]

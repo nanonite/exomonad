@@ -76,6 +76,13 @@ observation. Reviewed-head SHA binding prevents merging a verdict for another
 head. Review repair uses `resume_pr` and never creates a stacked or duplicate
 owner.
 
+Externally blocked leaves without a PR use `resume_blocked_leaf` only after the
+operator approves the named durable gate. The request must carry the exact
+dormant invocation, branch, and dirty-worktree fingerprint; the host resolves
+one persisted owner and starts a fresh invocation in that same worktree. Never
+invent a sibling identity, infer approval from a message, or discard dirty
+state.
+
 ### 4. Merge, park, or gate
 
 An approved current head with passing CI is mergeable. A timeout is never an

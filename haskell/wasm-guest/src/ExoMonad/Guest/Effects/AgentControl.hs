@@ -205,7 +205,12 @@ data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
     slcModel :: Maybe Text,
     slcPerms :: PermissionFlags,
     slcStandaloneRepo :: Bool,
-    slcAllowedDirs :: [Text]
+    slcAllowedDirs :: [Text],
+    slcBlockedIssueId :: Maybe Word64,
+    slcExpectedInvocationId :: Maybe Text,
+    slcExpectedBranch :: Maybe Text,
+    slcExpectedWorktreeFingerprint :: Maybe Text,
+    slcHumanApproved :: Bool
   }
   deriving (Show, Eq, Generic)
 
@@ -300,7 +305,12 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestAllowedDirs = V.fromList (map fromText (slcAllowedDirs cfg)),
               PA.spawnLeafSubtreeRequestResumePrNumber = 0,
               PA.spawnLeafSubtreeRequestExpectedHeadSha = fromText "",
-              PA.spawnLeafSubtreeRequestIntentId = fromText (fromMaybe "" (slcIntentId cfg))
+              PA.spawnLeafSubtreeRequestIntentId = fromText (fromMaybe "" (slcIntentId cfg)),
+              PA.spawnLeafSubtreeRequestBlockedIssueId = fromMaybe 0 (slcBlockedIssueId cfg),
+              PA.spawnLeafSubtreeRequestExpectedInvocationId = fromText (fromMaybe "" (slcExpectedInvocationId cfg)),
+              PA.spawnLeafSubtreeRequestExpectedBranch = fromText (fromMaybe "" (slcExpectedBranch cfg)),
+              PA.spawnLeafSubtreeRequestExpectedWorktreeFingerprint = fromText (fromMaybe "" (slcExpectedWorktreeFingerprint cfg)),
+              PA.spawnLeafSubtreeRequestHumanApproved = slcHumanApproved cfg
             }
     result <- suspendEffect @Agent.AgentSpawnLeafSubtree req
     pure $ case result of
@@ -325,7 +335,12 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestAllowedDirs = V.empty,
               PA.spawnLeafSubtreeRequestResumePrNumber = rpcPrNumber cfg,
               PA.spawnLeafSubtreeRequestExpectedHeadSha = fromText (rpcExpectedHeadSha cfg),
-              PA.spawnLeafSubtreeRequestIntentId = fromText ""
+              PA.spawnLeafSubtreeRequestIntentId = fromText "",
+              PA.spawnLeafSubtreeRequestBlockedIssueId = 0,
+              PA.spawnLeafSubtreeRequestExpectedInvocationId = fromText "",
+              PA.spawnLeafSubtreeRequestExpectedBranch = fromText "",
+              PA.spawnLeafSubtreeRequestExpectedWorktreeFingerprint = fromText "",
+              PA.spawnLeafSubtreeRequestHumanApproved = False
             }
     result <- suspendEffect @Agent.AgentSpawnLeafSubtree req
     pure $ case result of

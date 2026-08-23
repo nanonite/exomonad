@@ -59,6 +59,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
+import Data.Word (Word64)
 import Effects.EffectError (Custom (..), EffectError (..), EffectErrorKind (..), InvalidInput (..), NetworkError (..), NotFound (..), PermissionDenied (..), Timeout (..))
 import Effects.Git qualified as Git
 import Effects.Log qualified as Log
@@ -111,7 +112,12 @@ data SpawnLeafSubtreeArgs = SpawnLeafSubtreeArgs
     slsAllowedTools :: Maybe [Text],
     slsDisallowedTools :: Maybe [Text],
     slsStandaloneRepo :: Maybe Bool,
-    slsAllowedDirs :: Maybe [Text]
+    slsAllowedDirs :: Maybe [Text],
+    slsBlockedIssueId :: Maybe Int,
+    slsExpectedInvocationId :: Maybe Text,
+    slsExpectedBranch :: Maybe Text,
+    slsExpectedWorktreeFingerprint :: Maybe Text,
+    slsHumanApproved :: Maybe Bool
   }
   deriving (Show, Eq, Generic)
 
@@ -128,6 +134,11 @@ instance FromJSON SpawnLeafSubtreeArgs where
       <*> v .:? "disallowed_tools"
       <*> v .:? "standalone_repo"
       <*> v .:? "allowed_dirs"
+      <*> v .:? "blocked_issue_id"
+      <*> v .:? "expected_invocation_id"
+      <*> v .:? "expected_branch"
+      <*> v .:? "expected_worktree_fingerprint"
+      <*> v .:? "human_approved"
 
 -- | Shared tool description for spawn_leaf_subtree.
 spawnLeafSubtreeDescription :: Text
@@ -146,39 +157,57 @@ spawnLeafSubtreeSchema =
       ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
       ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction."),
       ("standalone_repo", "When true, creates a standalone git repo instead of a worktree for information isolation."),
-      ("allowed_dirs", "Directories from the parent project to be copied into the agent's context (only for standalone_repo).")
+      ("allowed_dirs", "Directories from the parent project to be copied into the agent's context (only for standalone_repo)."),
+      ("blocked_issue_id", "Existing parked Chainlink issue to resume in the same owner worktree."),
+      ("expected_invocation_id", "Exact dormant invocation identity required for a same-owner resume."),
+      ("expected_branch", "Exact branch identity required for a same-owner resume."),
+      ("expected_worktree_fingerprint", "SHA-256 fingerprint of the dirty worktree status."),
+      ("human_approved", "Required explicit human approval for a parked-leaf resume.")
     ]
 
 -- | Core spawn_leaf_subtree I/O.
 -- Returns (actualSlug, spawnResult) on success.
 spawnLeafSubtreeCore :: SpawnLeafSubtreeArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
 spawnLeafSubtreeCore args = do
-  let renderedTask = slsTask args <> "\n\n" <> leafProfileText <> "\n\n" <> leafAcceptanceCriteriaText
-      standaloneRepo = fromMaybe False (slsStandaloneRepo args)
-      perms =
-        AC.PermissionFlags
-          { AC.permMode = slsPermissionMode args,
-            AC.allowedTools = fromMaybe [] (slsAllowedTools args),
-            AC.disallowedTools = fromMaybe [] (slsDisallowedTools args)
-          }
-      cfg =
-        AC.SpawnLeafSubtreeConfig
-          { AC.slcTask = renderedTask,
-            AC.slcBranchName = slsBranchName args,
-            AC.slcIntentId = slsIntentId args,
-            AC.slcRole = Nothing,
-            AC.slcAgentType = slsAgentType args,
-            AC.slcModel = slsModel args,
-            AC.slcPerms = perms,
-            AC.slcStandaloneRepo = standaloneRepo,
-            AC.slcAllowedDirs = fromMaybe [] (slsAllowedDirs args)
-          }
-  result <- AC.spawnLeafSubtree cfg
-  case result of
-    Left err -> pure $ Left (spawnErrorMessage err)
-    Right spawnResult -> do
-      emitSpawnEvent (slsIntentId args) (slsBranchName args) "auto" (slsTask args)
-      pure $ Right (slsBranchName args, spawnResult)
+  let blockedIssueId = case slsBlockedIssueId args of
+        Nothing -> Right Nothing
+        Just issueId
+          | issueId >= 0 -> Right (Just (fromIntegral issueId :: Word64))
+          | otherwise -> Left "blocked_issue_id must be non-negative"
+  case blockedIssueId of
+    Left err -> pure (Left err)
+    Right blockedIssueId' -> do
+      let renderedTask = slsTask args <> "\n\n" <> leafProfileText <> "\n\n" <> leafAcceptanceCriteriaText
+          standaloneRepo = fromMaybe False (slsStandaloneRepo args)
+          perms =
+            AC.PermissionFlags
+              { AC.permMode = slsPermissionMode args,
+                AC.allowedTools = fromMaybe [] (slsAllowedTools args),
+                AC.disallowedTools = fromMaybe [] (slsDisallowedTools args)
+              }
+          cfg =
+            AC.SpawnLeafSubtreeConfig
+              { AC.slcTask = renderedTask,
+                AC.slcBranchName = slsBranchName args,
+                AC.slcIntentId = slsIntentId args,
+                AC.slcRole = Nothing,
+                AC.slcAgentType = slsAgentType args,
+                AC.slcModel = slsModel args,
+                AC.slcPerms = perms,
+                AC.slcStandaloneRepo = standaloneRepo,
+                AC.slcAllowedDirs = fromMaybe [] (slsAllowedDirs args),
+                AC.slcBlockedIssueId = blockedIssueId',
+                AC.slcExpectedInvocationId = slsExpectedInvocationId args,
+                AC.slcExpectedBranch = slsExpectedBranch args,
+                AC.slcExpectedWorktreeFingerprint = slsExpectedWorktreeFingerprint args,
+                AC.slcHumanApproved = fromMaybe False (slsHumanApproved args)
+              }
+      result <- AC.spawnLeafSubtree cfg
+      case result of
+        Left err -> pure $ Left (spawnErrorMessage err)
+        Right spawnResult -> do
+          emitSpawnEvent (slsIntentId args) (slsBranchName args) "auto" (slsTask args)
+          pure $ Right (slsBranchName args, spawnResult)
 
 -- | Render a spawn leaf result to MCPCallOutput.
 spawnLeafRender :: Either Text (Text, AC.SpawnResult) -> MCPCallOutput
@@ -396,7 +425,12 @@ spawnLeafCore args = do
             slsAllowedTools = Nothing,
             slsDisallowedTools = Nothing,
             slsStandaloneRepo = Just False,
-            slsAllowedDirs = Nothing
+            slsAllowedDirs = Nothing,
+            slsBlockedIssueId = Nothing,
+            slsExpectedInvocationId = Nothing,
+            slsExpectedBranch = Nothing,
+            slsExpectedWorktreeFingerprint = Nothing,
+            slsHumanApproved = Nothing
           }
   spawnLeafSubtreeCore leafArgs
 

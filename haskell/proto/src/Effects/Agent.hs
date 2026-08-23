@@ -5836,7 +5836,12 @@ data SpawnLeafSubtreeRequest
     spawnLeafSubtreeRequestResumePrNumber :: Hs.Word64,
     spawnLeafSubtreeRequestExpectedHeadSha :: Hs.Text,
     spawnLeafSubtreeRequestIntentId :: Hs.Text,
-    spawnLeafSubtreeRequestModel :: Hs.Text
+    spawnLeafSubtreeRequestModel :: Hs.Text,
+    spawnLeafSubtreeRequestBlockedIssueId :: Hs.Word64,
+    spawnLeafSubtreeRequestExpectedInvocationId :: Hs.Text,
+    spawnLeafSubtreeRequestExpectedBranch :: Hs.Text,
+    spawnLeafSubtreeRequestExpectedWorktreeFingerprint :: Hs.Text,
+    spawnLeafSubtreeRequestHumanApproved :: Hs.Bool
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -5863,7 +5868,12 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
         spawnLeafSubtreeRequestResumePrNumber,
         spawnLeafSubtreeRequestExpectedHeadSha,
         spawnLeafSubtreeRequestIntentId,
-        spawnLeafSubtreeRequestModel
+        spawnLeafSubtreeRequestModel,
+        spawnLeafSubtreeRequestBlockedIssueId,
+        spawnLeafSubtreeRequestExpectedInvocationId,
+        spawnLeafSubtreeRequestExpectedBranch,
+        spawnLeafSubtreeRequestExpectedWorktreeFingerprint,
+        spawnLeafSubtreeRequestHumanApproved
       } =
       Hs.mappend
         ( Hs.mappend
@@ -5877,97 +5887,142 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
                                         ( Hs.mappend
                                             ( Hs.mappend
                                                 ( Hs.mappend
-                                                    ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 1)
-                                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                            spawnLeafSubtreeRequestTask
+                                                    ( Hs.mappend
+                                                        ( Hs.mappend
+                                                            ( Hs.mappend
+                                                                ( Hs.mappend
+                                                                    ( Hs.mappend
+                                                                        ( HsProtobuf.encodeMessageField
+                                                                            (HsProtobuf.FieldNumber 1)
+                                                                            ( ( Hs.coerce
+                                                                                  @Hs.Text
+                                                                                  @(HsProtobuf.String Hs.Text)
+                                                                              )
+                                                                                spawnLeafSubtreeRequestTask
+                                                                            )
+                                                                        )
+                                                                        ( HsProtobuf.encodeMessageField
+                                                                            (HsProtobuf.FieldNumber 2)
+                                                                            ( ( Hs.coerce
+                                                                                  @Hs.Text
+                                                                                  @(HsProtobuf.String Hs.Text)
+                                                                              )
+                                                                                spawnLeafSubtreeRequestBranchName
+                                                                            )
+                                                                        )
+                                                                    )
+                                                                    ( HsProtobuf.encodeMessageField
+                                                                        (HsProtobuf.FieldNumber 3)
+                                                                        ( ( Hs.coerce
+                                                                              @Hs.Text
+                                                                              @(HsProtobuf.String Hs.Text)
+                                                                          )
+                                                                            spawnLeafSubtreeRequestRole
+                                                                        )
+                                                                    )
+                                                                )
+                                                                ( HsProtobuf.encodeMessageField
+                                                                    (HsProtobuf.FieldNumber 4)
+                                                                    spawnLeafSubtreeRequestAgentType
+                                                                )
+                                                            )
+                                                            ( HsProtobuf.encodeMessageField
+                                                                (HsProtobuf.FieldNumber 5)
+                                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                                    spawnLeafSubtreeRequestPermissionMode
+                                                                )
+                                                            )
+                                                        )
+                                                        ( HsProtobuf.encodeMessageField
+                                                            (HsProtobuf.FieldNumber 6)
+                                                            ( ( Hs.coerce
+                                                                  @(Hs.Vector Hs.Text)
+                                                                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                                              )
+                                                                spawnLeafSubtreeRequestAllowedTools
+                                                            )
                                                         )
                                                     )
                                                     ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 2)
-                                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                            spawnLeafSubtreeRequestBranchName
+                                                        (HsProtobuf.FieldNumber 7)
+                                                        ( ( Hs.coerce
+                                                              @(Hs.Vector Hs.Text)
+                                                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                                          )
+                                                            spawnLeafSubtreeRequestDisallowedTools
                                                         )
                                                     )
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 3)
-                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                        spawnLeafSubtreeRequestRole
-                                                    )
+                                                    (HsProtobuf.FieldNumber 10)
+                                                    spawnLeafSubtreeRequestStandaloneRepo
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 4)
-                                                spawnLeafSubtreeRequestAgentType
+                                                (HsProtobuf.FieldNumber 11)
+                                                ( ( Hs.coerce
+                                                      @(Hs.Vector Hs.Text)
+                                                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                                  )
+                                                    spawnLeafSubtreeRequestAllowedDirs
+                                                )
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 5)
-                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                spawnLeafSubtreeRequestPermissionMode
-                                            )
+                                            (HsProtobuf.FieldNumber 12)
+                                            spawnLeafSubtreeRequestResumePrNumber
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 6)
-                                        ( ( Hs.coerce
-                                              @(Hs.Vector Hs.Text)
-                                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                                          )
-                                            spawnLeafSubtreeRequestAllowedTools
+                                        (HsProtobuf.FieldNumber 13)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            spawnLeafSubtreeRequestExpectedHeadSha
                                         )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 7)
-                                    ( ( Hs.coerce
-                                          @(Hs.Vector Hs.Text)
-                                          @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                                      )
-                                        spawnLeafSubtreeRequestDisallowedTools
+                                    (HsProtobuf.FieldNumber 14)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        spawnLeafSubtreeRequestIntentId
                                     )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 10)
-                                spawnLeafSubtreeRequestStandaloneRepo
+                                (HsProtobuf.FieldNumber 15)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    spawnLeafSubtreeRequestModel
+                                )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 11)
-                            ( ( Hs.coerce
-                                  @(Hs.Vector Hs.Text)
-                                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                              )
-                                spawnLeafSubtreeRequestAllowedDirs
-                            )
+                            (HsProtobuf.FieldNumber 16)
+                            spawnLeafSubtreeRequestBlockedIssueId
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 12)
-                        spawnLeafSubtreeRequestResumePrNumber
+                        (HsProtobuf.FieldNumber 17)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            spawnLeafSubtreeRequestExpectedInvocationId
+                        )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 13)
+                    (HsProtobuf.FieldNumber 18)
                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        spawnLeafSubtreeRequestExpectedHeadSha
+                        spawnLeafSubtreeRequestExpectedBranch
                     )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 14)
+                (HsProtobuf.FieldNumber 19)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    spawnLeafSubtreeRequestIntentId
+                    spawnLeafSubtreeRequestExpectedWorktreeFingerprint
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 15)
-            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                spawnLeafSubtreeRequestModel
-            )
+            (HsProtobuf.FieldNumber 20)
+            spawnLeafSubtreeRequestHumanApproved
         )
   decodeMessage _ =
     Hs.pure SpawnLeafSubtreeRequest
@@ -6049,6 +6104,30 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
                   (HsProtobuf.FieldNumber 15)
               )
           )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 16)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 17)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 18)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 19)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 20)
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -6129,6 +6208,36 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "model")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 16)
+        (HsProtobufAST.Prim HsProtobufAST.UInt64)
+        (HsProtobufAST.Single "blocked_issue_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 17)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_invocation_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 18)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 19)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_worktree_fingerprint")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 20)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "human_approved")
+        []
         ""
     ]
 
@@ -6148,6 +6257,11 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
         f13
         f14
         f15
+        f16
+        f17
+        f18
+        f19
+        f20
       ) =
       HsJSONPB.object
         [ "task" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -6184,7 +6298,15 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
           "intent_id"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
-          "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15)
+          "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15),
+          "blocked_issue_id" .= f16,
+          "expected_invocation_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f17),
+          "expected_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f18),
+          "expected_worktree_fingerprint"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f19),
+          "human_approved" .= f20
         ]
   toEncodingPB
     ( SpawnLeafSubtreeRequest
@@ -6201,6 +6323,11 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
         f13
         f14
         f15
+        f16
+        f17
+        f18
+        f19
+        f20
       ) =
       HsJSONPB.pairs
         [ "task" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -6237,7 +6364,15 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
           "intent_id"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
-          "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15)
+          "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15),
+          "blocked_issue_id" .= f16,
+          "expected_invocation_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f17),
+          "expected_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f18),
+          "expected_worktree_fingerprint"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f19),
+          "human_approved" .= f20
         ]
 
 instance (HsJSONPB.FromJSONPB SpawnLeafSubtreeRequest) where
@@ -6288,6 +6423,17 @@ instance (HsJSONPB.FromJSONPB SpawnLeafSubtreeRequest) where
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "model")
                 )
+            <*> obj .: "blocked_issue_id"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_invocation_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_worktree_fingerprint")
+                )
+            <*> obj .: "human_approved"
       )
 
 instance (HsJSONPB.ToJSON SpawnLeafSubtreeRequest) where
